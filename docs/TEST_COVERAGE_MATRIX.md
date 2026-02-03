@@ -39,7 +39,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `src/providers/openai.rs` | ✅ | ❌ | ❌ | ❌ | Unit tests only; no VCR/streaming fixtures. |
 | `src/providers/mod.rs` | ❌ | ❌ | ❌ | ❌ | **Gap**: no tests. |
 | `src/resources.rs` | ✅ | ❌ | ❌ | ❌ | Unit coverage only. |
-| `src/rpc.rs` | ❌ | `tests/rpc_mode.rs` | ❌ | ❌ | **Uses MockProvider** in RPC tests. |
+| `src/rpc.rs` | ❌ | `tests/rpc_mode.rs` | ❌ | ❌ | Uses a deterministic `TestProvider` in RPC tests. |
 | `src/session.rs` | ✅ | `tests/session_conformance.rs` | ❌ | ❌ | Session JSONL conformance coverage. |
 | `src/session_index.rs` | ❌ | ❌ | ❌ | ❌ | **Gap**: no tests. |
 | `src/sse.rs` | ✅ | ❌ | ❌ | ❌ | Unit coverage for SSE parser. |
@@ -57,7 +57,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `tests/tools_conformance.rs` | Integration | `src/tools.rs` | Direct tool execution tests. |
 | `tests/conformance_fixtures.rs` | Conformance | `src/tools.rs`, truncation | Fixture runner for tool parity. |
 | `tests/session_conformance.rs` | Conformance | `src/session.rs` | JSONL session format v3. |
-| `tests/rpc_mode.rs` | Integration | `src/rpc.rs`, `src/agent.rs`, `src/session.rs` | **MockProvider** used. |
+| `tests/rpc_mode.rs` | Integration | `src/rpc.rs`, `src/agent.rs`, `src/session.rs` | Uses a deterministic `TestProvider`. |
 | `tests/conformance/mod.rs` | Conformance infra | Fixture schema | Not a test on its own. |
 | `tests/conformance/fixture_runner.rs` | Conformance infra | Fixtures execution | Not a test on its own. |
 | `tests/common/harness.rs` | Test infra | Harness utilities | Real FS, no mocks. |
@@ -69,10 +69,14 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 
 ## 3) Mock / Fake / Stub Audit (No‑Mock Policy)
 
-**Found mock usage:**
-- `tests/rpc_mode.rs`: `MockProvider` (custom Provider impl returning canned stream events).
+**Found mock usage:** none.
 
-**Recommendation:** replace with VCR‑backed real provider (Anthropic/OpenAI/Gemini) once `bd-1pf` (VCR infra) is complete, or use a deterministic local test provider that exercises the real streaming parser without mocking internal APIs.
+**Allowlisted exceptions (audited):**
+- `tests/common/harness.rs`: `MockHttp{Server,Request,Response}` — real local TCP server used for deterministic offline test infra (name contains `Mock*`, but it is not a mocking framework).
+
+**Enforcement:** CI fails if `Mock*` / `Fake*` / `Stub*` identifiers are introduced in `tests/` outside the allowlist (see `.github/workflows/ci.yml`, step `No-mock code guard`).
+
+**Recommendation:** prefer VCR‑backed real provider fixtures (Anthropic/OpenAI/Gemini) once `bd-1pf` (VCR infra) is complete, or build deterministic local providers that exercise real parsing/IO without mocking internal APIs.
 
 ---
 
@@ -108,7 +112,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 
 - Conformance suite is strongest for built‑in tools (fixtures + direct tests).
 - E2E automation is currently missing; all end‑to‑end runs are manual.
-- No‑mock policy is currently violated only by `MockProvider` in RPC tests.
+- No‑mock policy violations are prevented via CI guardrails; the only current allowlist entry is the `MockHttp*` test harness types.
 
 ---
 

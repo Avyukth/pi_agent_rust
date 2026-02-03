@@ -55,6 +55,28 @@ jobs:
             exit 1
           fi
 
+      - name: No-mock code guard
+        run: |
+          set -euxo pipefail
+
+          # Allowlisted exceptions (audited):
+          # - MockHttp{Server,Request,Response}: deterministic local TCP server test infra.
+          allow_re='^(MockHttp(Server|Request|Response))$'
+
+          matches="$(rg -n --column --no-heading --color never -o '\b(Mock|Fake|Stub)[A-Za-z0-9_]+\b' tests || true)"
+          if [ -z "$matches" ]; then
+            exit 0
+          fi
+
+          violations="$(echo "$matches" | awk -F: -v allow_re="$allow_re" '$4 !~ allow_re { print }')"
+          if [ -n "$violations" ]; then
+            echo "$violations"
+            echo
+            echo "No-mock policy violation: Mock*/Fake*/Stub* identifiers are forbidden in tests."
+            echo "Use VCR fixtures or real deps instead. See docs/TEST_COVERAGE_MATRIX.md."
+            exit 1
+          fi
+
       - name: cargo fmt
         run: cargo fmt --check
 

@@ -16,23 +16,23 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-struct MockProvider;
+struct TestProvider;
 
 #[async_trait::async_trait]
-impl Provider for MockProvider {
+impl Provider for TestProvider {
     #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
-        "mock"
+        "test"
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn api(&self) -> &str {
-        "mock"
+        "test"
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn model_id(&self) -> &str {
-        "mock-model"
+        "test-model"
     }
 
     async fn stream(
@@ -45,9 +45,9 @@ impl Provider for MockProvider {
         let now = chrono::Utc::now().timestamp_millis();
         let message = AssistantMessage {
             content: vec![ContentBlock::Text(TextContent::new("hello"))],
-            api: "mock".to_string(),
-            provider: "mock".to_string(),
-            model: "mock-model".to_string(),
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
             usage: Usage {
                 input: 10,
                 output: 5,
@@ -100,15 +100,14 @@ fn rpc_get_state_and_prompt() {
     let handle = runtime.handle();
 
     runtime.block_on(async move {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+        let provider: Arc<dyn Provider> = Arc::new(TestProvider);
         let tools = ToolRegistry::new(&[], &std::env::current_dir().unwrap(), None);
-        let mut config = AgentConfig::default();
-        config.stream_options.api_key = Some("test-key".to_string());
+        let config = AgentConfig::default();
         let agent = Agent::new(provider, tools, config);
 
         let mut session = Session::in_memory();
-        session.header.provider = Some("mock".to_string());
-        session.header.model_id = Some("mock-model".to_string());
+        session.header.provider = Some("test".to_string());
+        session.header.model_id = Some("test-model".to_string());
         session.header.thinking_level = Some("off".to_string());
 
         let agent_session = AgentSession::new(agent, session, false);
@@ -224,16 +223,15 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
     let handle = runtime.handle();
 
     runtime.block_on(async move {
-        let provider: Arc<dyn Provider> = Arc::new(MockProvider);
+        let provider: Arc<dyn Provider> = Arc::new(TestProvider);
         let tools = ToolRegistry::new(&[], &std::env::current_dir().unwrap(), None);
-        let mut config = AgentConfig::default();
-        config.stream_options.api_key = Some("test-key".to_string());
+        let config = AgentConfig::default();
         let agent = Agent::new(provider, tools, config);
 
         let now = chrono::Utc::now().timestamp_millis();
         let mut session = Session::in_memory();
-        session.header.provider = Some("mock".to_string());
-        session.header.model_id = Some("mock-model".to_string());
+        session.header.provider = Some("test".to_string());
+        session.header.model_id = Some("test-model".to_string());
         session.header.thinking_level = Some("off".to_string());
         session.append_message(SessionMessage::User {
             content: pi::model::UserContent::Text("hi".to_string()),
@@ -247,9 +245,9 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
                     arguments: serde_json::json!({ "path": "test.txt" }),
                     thought_signature: None,
                 })],
-                api: "mock".to_string(),
-                provider: "mock".to_string(),
-                model: "mock-model".to_string(),
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test-model".to_string(),
                 usage: Usage {
                     input: 2,
                     output: 3,
