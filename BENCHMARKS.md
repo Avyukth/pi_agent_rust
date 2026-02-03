@@ -12,6 +12,7 @@ cargo bench
 cargo bench "truncation"
 cargo bench "sse_parsing"
 cargo bench "ext_policy"
+cargo bench "ext_js_runtime"
 
 # Run with baseline comparison
 cargo bench -- --save-baseline main
@@ -42,6 +43,8 @@ These are the target performance metrics. Regressions beyond these thresholds sh
 | ext_policy/evaluate | <1μs | ~20ns | ✅ |
 | ext_dispatch/decision | <10μs | ~100ns | ✅ |
 | ext_protocol/parse | <100μs | ~5μs | ✅ |
+| ext_js_runtime/cold_start | <200ms | ~315μs | ✅ |
+| ext_js_runtime/warm_eval_noop | <25ms | ~3.48μs | ✅ |
 
 ### Extension Runtime (Planned)
 
@@ -115,6 +118,7 @@ benches/
 │   ├── ext_required_capability
 │   ├── ext_dispatch
 │   └── ext_protocol
+│   └── ext_js_runtime     # QuickJS cold/warm start + no-op eval
 └── system.rs         # System-level benchmarks (process spawn)
     ├── startup       # Startup time (version, help, list_models)
     ├── memory        # RSS memory measurement
@@ -232,6 +236,36 @@ System benchmarks spawn real processes, so variance is higher than micro-benchma
 - **Percentiles**: Report p95/p99 for budgets, not just mean
 
 ## Profiling Tips
+
+### bd-1pb: Profile-Driven Optimization Loop
+
+This workstream uses a strict **baseline → profile → prove → implement → verify** loop.
+
+#### 1) Baseline
+
+- Use Criterion for stable micro-bench artifacts: `cargo bench --bench extensions -- ext_js_runtime`.
+- Use `hyperfine` for end-to-end CLI paths (if installed):
+
+```bash
+hyperfine --warmup 3 --runs 10 'target/release/pi --version'
+```
+
+#### 2) Profile
+
+- CPU hotspots: `cargo flamegraph --bench extensions` (requires `cargo install flamegraph`).
+- Allocations: `heaptrack cargo bench --bench extensions` (Linux).
+
+#### 3) Prove (No “silent regressions”)
+
+- Keep outputs reproducible: record environment (`[bench-env] ... config_hash=...` emitted by `benches/extensions.rs`).
+- Store benchmark artifacts in `target/criterion/` (Criterion JSON + reports).
+- Use `--save-baseline` / `--baseline` comparisons for regression detection.
+
+#### 4) Opportunity Matrix (Template)
+
+| Opportunity | Evidence | Expected impact | Confidence | Effort | Score | Notes |
+|-------------|----------|-----------------|------------|--------|-------|-------|
+| (fill) | (bench/flamegraph link) | (ms/μs) | 1–5 | 1–5 | impact×confidence/effort | (guardrails) |
 
 ### CPU Profiling with perf
 

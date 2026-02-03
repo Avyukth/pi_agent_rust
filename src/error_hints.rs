@@ -12,6 +12,7 @@
 //! - Prefer specific, actionable guidance over generic messages
 
 use crate::error::Error;
+use std::fmt::Write as _;
 
 /// A remediation hint for an error.
 #[derive(Debug, Clone)]
@@ -28,37 +29,55 @@ pub struct ErrorHint {
 ///
 /// Returns structured hints that can be rendered in any output mode
 /// (interactive, print, RPC).
+#[allow(clippy::too_many_lines)]
 pub fn hints_for_error(error: &Error) -> ErrorHint {
     match error {
-        // ====================================================================
-        // Configuration Errors
-        // ====================================================================
-        Error::Config(msg) if msg.contains("settings.json") => ErrorHint {
+        Error::Config(msg) => config_hints(msg),
+        Error::SessionNotFound { .. } | Error::Session(_) => session_hints(error),
+        Error::Auth(msg) => auth_hints(msg),
+        Error::Provider { message, .. } => provider_hints(message),
+        Error::Tool { tool, message } => tool_hints(tool, message),
+        Error::Validation(msg) => validation_hints(msg),
+        Error::Extension(msg) => extension_hints(msg),
+        Error::Io(err) => io_hints(err),
+        Error::Json(err) => json_hints(err),
+        Error::Sqlite(err) => sqlite_hints(err),
+        Error::Aborted => aborted_hints(),
+        Error::Api(msg) => api_hints(msg),
+    }
+}
+
+fn config_hints(msg: &str) -> ErrorHint {
+    if msg.contains("settings.json") {
+        return ErrorHint {
             summary: "Invalid or missing configuration file",
             hints: &[
                 "Check that ~/.pi/agent/settings.json exists and is valid JSON",
                 "Run 'pi config' to see configuration paths and precedence",
             ],
             context_fields: &["file_path"],
-        },
-        Error::Config(msg) if msg.contains("models.json") => ErrorHint {
+        };
+    }
+    if msg.contains("models.json") {
+        return ErrorHint {
             summary: "Invalid models configuration",
             hints: &[
                 "Verify ~/.pi/agent/models.json has valid JSON syntax",
                 "Check that 'providers' key exists in models.json",
             ],
             context_fields: &["file_path", "parse_error"],
-        },
-        Error::Config(_) => ErrorHint {
-            summary: "Configuration error",
-            hints: &["Check configuration file syntax and required fields"],
-            context_fields: &[],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Configuration error",
+        hints: &["Check configuration file syntax and required fields"],
+        context_fields: &[],
+    }
+}
 
-        // ====================================================================
-        // Session Errors
-        // ====================================================================
-        Error::SessionNotFound { path: _ } => ErrorHint {
+fn session_hints(error: &Error) -> ErrorHint {
+    match error {
+        Error::SessionNotFound { .. } => ErrorHint {
             summary: "Session file not found",
             hints: &[
                 "Use 'pi' without --session to start a new session",
@@ -79,347 +98,370 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
             hints: &["Close other Pi instances using this session"],
             context_fields: &["path"],
         },
-        Error::Session(_) => ErrorHint {
+        _ => ErrorHint {
             summary: "Session error",
             hints: &["Try starting a new session with 'pi'"],
             context_fields: &[],
         },
+    }
+}
 
-        // ====================================================================
-        // Authentication Errors
-        // ====================================================================
-        Error::Auth(msg) if msg.contains("API key") || msg.contains("api_key") => ErrorHint {
+fn auth_hints(msg: &str) -> ErrorHint {
+    if msg.contains("API key") || msg.contains("api_key") {
+        return ErrorHint {
             summary: "API key not configured",
             hints: &[
                 "Set ANTHROPIC_API_KEY environment variable",
                 "Or add key to ~/.pi/agent/auth.json",
             ],
             context_fields: &["provider"],
-        },
-        Error::Auth(msg) if msg.contains("401") || msg.contains("unauthorized") => ErrorHint {
+        };
+    }
+    if msg.contains("401") || msg.contains("unauthorized") {
+        return ErrorHint {
             summary: "API key is invalid or expired",
             hints: &[
                 "Verify your API key is correct and active",
                 "Check API key permissions at your provider's console",
             ],
             context_fields: &["provider", "status_code"],
-        },
-        Error::Auth(msg) if msg.contains("OAuth") || msg.contains("refresh") => ErrorHint {
+        };
+    }
+    if msg.contains("OAuth") || msg.contains("refresh") {
+        return ErrorHint {
             summary: "OAuth token expired or invalid",
             hints: &[
                 "Run 'pi login <provider>' to re-authenticate",
                 "Or set API key directly via environment variable",
             ],
             context_fields: &["provider"],
-        },
-        Error::Auth(msg) if msg.contains("lock") => ErrorHint {
+        };
+    }
+    if msg.contains("lock") {
+        return ErrorHint {
             summary: "Auth file locked by another process",
             hints: &["Close other Pi instances that may be using auth.json"],
             context_fields: &["path"],
-        },
-        Error::Auth(_) => ErrorHint {
-            summary: "Authentication error",
-            hints: &["Check your API credentials"],
-            context_fields: &[],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Authentication error",
+        hints: &["Check your API credentials"],
+        context_fields: &[],
+    }
+}
 
-        // ====================================================================
-        // Provider/API Errors
-        // ====================================================================
-        Error::Provider { provider, message }
-            if message.contains("429") || message.contains("rate limit") =>
-        {
-            ErrorHint {
-                summary: "Rate limit exceeded",
-                hints: &[
-                    "Wait a moment and try again",
-                    "Consider using a different model or reducing request frequency",
-                ],
-                context_fields: &["provider", "retry_after"],
-            }
-        }
-        Error::Provider {
-            provider: _,
-            message,
-        } if message.contains("500") || message.contains("server error") => ErrorHint {
+fn provider_hints(message: &str) -> ErrorHint {
+    if message.contains("429") || message.contains("rate limit") {
+        return ErrorHint {
+            summary: "Rate limit exceeded",
+            hints: &[
+                "Wait a moment and try again",
+                "Consider using a different model or reducing request frequency",
+            ],
+            context_fields: &["provider", "retry_after"],
+        };
+    }
+    if message.contains("500") || message.contains("server error") {
+        return ErrorHint {
             summary: "Provider server error",
             hints: &[
                 "This is a temporary issue - try again shortly",
                 "Check provider status page for outages",
             ],
             context_fields: &["provider", "status_code"],
-        },
-        Error::Provider {
-            provider: _,
-            message,
-        } if message.contains("connection") || message.contains("network") => ErrorHint {
+        };
+    }
+    if message.contains("connection") || message.contains("network") {
+        return ErrorHint {
             summary: "Network connection error",
             hints: &[
                 "Check your internet connection",
                 "If using a proxy, verify proxy settings",
             ],
             context_fields: &["provider", "url"],
-        },
-        Error::Provider {
-            provider: _,
-            message,
-        } if message.contains("timeout") => ErrorHint {
+        };
+    }
+    if message.contains("timeout") {
+        return ErrorHint {
             summary: "Request timed out",
             hints: &[
                 "Try again - the provider may be slow",
                 "Consider using a smaller context or simpler request",
             ],
             context_fields: &["provider", "timeout_seconds"],
-        },
-        Error::Provider {
-            provider: _,
-            message,
-        } if message.contains("model") && message.contains("not found") => ErrorHint {
+        };
+    }
+    if message.contains("model") && message.contains("not found") {
+        return ErrorHint {
             summary: "Model not found or unavailable",
             hints: &[
                 "Check that the model ID is correct",
                 "Use 'pi --list-models' to see available models",
             ],
             context_fields: &["provider", "model_id"],
-        },
-        Error::Provider { .. } => ErrorHint {
-            summary: "Provider API error",
-            hints: &["Check provider documentation for this error"],
-            context_fields: &["provider", "status_code"],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Provider API error",
+        hints: &["Check provider documentation for this error"],
+        context_fields: &["provider", "status_code"],
+    }
+}
 
-        // ====================================================================
-        // Tool Errors
-        // ====================================================================
-        Error::Tool { tool, message } if *tool == "read" && message.contains("not found") => {
-            ErrorHint {
-                summary: "File not found",
-                hints: &[
-                    "Verify the file path is correct",
-                    "Use 'ls' or 'find' to locate the file",
-                ],
-                context_fields: &["path"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "read" && message.contains("permission") => {
-            ErrorHint {
-                summary: "Permission denied reading file",
-                hints: &["Check file permissions"],
-                context_fields: &["path"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "write" && message.contains("permission") => {
-            ErrorHint {
-                summary: "Permission denied writing file",
-                hints: &["Check directory permissions"],
-                context_fields: &["path"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "edit" && message.contains("not found") => {
-            ErrorHint {
-                summary: "Text to replace not found in file",
-                hints: &[
-                    "Verify the old_text exactly matches content in the file",
-                    "Use 'read' to see the current file content",
-                ],
-                context_fields: &["path", "old_text_preview"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "edit" && message.contains("ambiguous") => {
-            ErrorHint {
-                summary: "Multiple matches found for replacement",
-                hints: &["Provide more context in old_text to make it unique"],
-                context_fields: &["path", "match_count"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "bash" && message.contains("timeout") => {
-            ErrorHint {
-                summary: "Command timed out",
-                hints: &[
-                    "Increase timeout with 'timeout' parameter",
-                    "Consider breaking into smaller commands",
-                ],
-                context_fields: &["command", "timeout_seconds"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "bash" && message.contains("exit code") => {
-            ErrorHint {
-                summary: "Command failed with non-zero exit code",
-                hints: &["Review command output for error details"],
-                context_fields: &["command", "exit_code", "stderr"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "grep" && message.contains("pattern") => {
-            ErrorHint {
-                summary: "Invalid regex pattern",
-                hints: &["Check regex syntax - special characters may need escaping"],
-                context_fields: &["pattern"],
-            }
-        }
-        Error::Tool { tool, message } if *tool == "find" && message.contains("fd") => ErrorHint {
+fn tool_hints(tool: &str, message: &str) -> ErrorHint {
+    if tool == "read" && message.contains("not found") {
+        return ErrorHint {
+            summary: "File not found",
+            hints: &[
+                "Verify the file path is correct",
+                "Use 'ls' or 'find' to locate the file",
+            ],
+            context_fields: &["path"],
+        };
+    }
+    if tool == "read" && message.contains("permission") {
+        return ErrorHint {
+            summary: "Permission denied reading file",
+            hints: &["Check file permissions"],
+            context_fields: &["path"],
+        };
+    }
+    if tool == "write" && message.contains("permission") {
+        return ErrorHint {
+            summary: "Permission denied writing file",
+            hints: &["Check directory permissions"],
+            context_fields: &["path"],
+        };
+    }
+    if tool == "edit" && message.contains("not found") {
+        return ErrorHint {
+            summary: "Text to replace not found in file",
+            hints: &[
+                "Verify the old_text exactly matches content in the file",
+                "Use 'read' to see the current file content",
+            ],
+            context_fields: &["path", "old_text_preview"],
+        };
+    }
+    if tool == "edit" && message.contains("ambiguous") {
+        return ErrorHint {
+            summary: "Multiple matches found for replacement",
+            hints: &["Provide more context in old_text to make it unique"],
+            context_fields: &["path", "match_count"],
+        };
+    }
+    if tool == "bash" && message.contains("timeout") {
+        return ErrorHint {
+            summary: "Command timed out",
+            hints: &[
+                "Increase timeout with 'timeout' parameter",
+                "Consider breaking into smaller commands",
+            ],
+            context_fields: &["command", "timeout_seconds"],
+        };
+    }
+    if tool == "bash" && message.contains("exit code") {
+        return ErrorHint {
+            summary: "Command failed with non-zero exit code",
+            hints: &["Review command output for error details"],
+            context_fields: &["command", "exit_code", "stderr"],
+        };
+    }
+    if tool == "grep" && message.contains("pattern") {
+        return ErrorHint {
+            summary: "Invalid regex pattern",
+            hints: &["Check regex syntax - special characters may need escaping"],
+            context_fields: &["pattern"],
+        };
+    }
+    if tool == "find" && message.contains("fd") {
+        return ErrorHint {
             summary: "fd command not found",
             hints: &[
                 "Install fd: 'apt install fd-find' or 'brew install fd'",
                 "The binary may be named 'fdfind' on some systems",
             ],
             context_fields: &[],
-        },
-        Error::Tool { .. } => ErrorHint {
-            summary: "Tool execution error",
-            hints: &["Review the tool parameters and try again"],
-            context_fields: &["tool", "command"],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Tool execution error",
+        hints: &["Review the tool parameters and try again"],
+        context_fields: &["tool", "command"],
+    }
+}
 
-        // ====================================================================
-        // Validation Errors
-        // ====================================================================
-        Error::Validation(msg) if msg.contains("required") => ErrorHint {
+fn validation_hints(msg: &str) -> ErrorHint {
+    if msg.contains("required") {
+        return ErrorHint {
             summary: "Required field missing",
             hints: &["Provide all required parameters"],
             context_fields: &["field_name"],
-        },
-        Error::Validation(msg) if msg.contains("type") => ErrorHint {
+        };
+    }
+    if msg.contains("type") {
+        return ErrorHint {
             summary: "Invalid parameter type",
             hints: &["Check parameter types match expected schema"],
             context_fields: &["field_name", "expected_type"],
-        },
-        Error::Validation(_) => ErrorHint {
-            summary: "Validation error",
-            hints: &["Check input parameters"],
-            context_fields: &[],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Validation error",
+        hints: &["Check input parameters"],
+        context_fields: &[],
+    }
+}
 
-        // ====================================================================
-        // Extension Errors
-        // ====================================================================
-        Error::Extension(msg) if msg.contains("not found") => ErrorHint {
+fn extension_hints(msg: &str) -> ErrorHint {
+    if msg.contains("not found") {
+        return ErrorHint {
             summary: "Extension not found",
             hints: &[
                 "Check extension name is correct",
                 "Use 'pi list' to see installed extensions",
             ],
             context_fields: &["extension_name"],
-        },
-        Error::Extension(msg) if msg.contains("manifest") => ErrorHint {
+        };
+    }
+    if msg.contains("manifest") {
+        return ErrorHint {
             summary: "Invalid extension manifest",
             hints: &[
                 "Check extension manifest.json syntax",
                 "Verify required fields are present",
             ],
             context_fields: &["extension_name", "manifest_path"],
-        },
-        Error::Extension(msg) if msg.contains("capability") || msg.contains("permission") => {
-            ErrorHint {
-                summary: "Extension capability denied",
-                hints: &[
-                    "Extension requires capabilities not granted by policy",
-                    "Review extension security settings",
-                ],
-                context_fields: &["extension_name", "capability"],
-            }
-        }
-        Error::Extension(_) => ErrorHint {
-            summary: "Extension error",
-            hints: &["Check extension configuration"],
-            context_fields: &["extension_name"],
-        },
+        };
+    }
+    if msg.contains("capability") || msg.contains("permission") {
+        return ErrorHint {
+            summary: "Extension capability denied",
+            hints: &[
+                "Extension requires capabilities not granted by policy",
+                "Review extension security settings",
+            ],
+            context_fields: &["extension_name", "capability"],
+        };
+    }
+    ErrorHint {
+        summary: "Extension error",
+        hints: &["Check extension configuration"],
+        context_fields: &["extension_name"],
+    }
+}
 
-        // ====================================================================
-        // IO Errors
-        // ====================================================================
-        Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound => ErrorHint {
+fn io_hints(err: &std::io::Error) -> ErrorHint {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => ErrorHint {
             summary: "File or directory not found",
             hints: &["Verify the path exists"],
             context_fields: &["path"],
         },
-        Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => ErrorHint {
+        std::io::ErrorKind::PermissionDenied => ErrorHint {
             summary: "Permission denied",
             hints: &["Check file/directory permissions"],
             context_fields: &["path"],
         },
-        Error::Io(e) if e.kind() == std::io::ErrorKind::AlreadyExists => ErrorHint {
+        std::io::ErrorKind::AlreadyExists => ErrorHint {
             summary: "File already exists",
             hints: &["Use a different path or remove existing file first"],
             context_fields: &["path"],
         },
-        Error::Io(_) => ErrorHint {
+        _ => ErrorHint {
             summary: "I/O error",
             hints: &["Check file system and permissions"],
             context_fields: &["path"],
         },
+    }
+}
 
-        // ====================================================================
-        // JSON Errors
-        // ====================================================================
-        Error::Json(e) if e.is_syntax() => ErrorHint {
+fn json_hints(err: &serde_json::Error) -> ErrorHint {
+    if err.is_syntax() {
+        return ErrorHint {
             summary: "Invalid JSON syntax",
             hints: &[
                 "Check for missing commas, brackets, or quotes",
                 "Validate JSON at jsonlint.com or similar",
             ],
             context_fields: &["line", "column"],
-        },
-        Error::Json(e) if e.is_data() => ErrorHint {
+        };
+    }
+    if err.is_data() {
+        return ErrorHint {
             summary: "JSON data does not match expected structure",
             hints: &["Check that JSON fields match expected schema"],
             context_fields: &["field_path"],
-        },
-        Error::Json(_) => ErrorHint {
-            summary: "JSON error",
-            hints: &["Verify JSON syntax and structure"],
-            context_fields: &[],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "JSON error",
+        hints: &["Verify JSON syntax and structure"],
+        context_fields: &[],
+    }
+}
 
-        // ====================================================================
-        // SQLite Errors
-        // ====================================================================
-        Error::Sqlite(e) if e.to_string().contains("locked") => ErrorHint {
+fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHint {
+    let message = err.to_string();
+    if message.contains("locked") {
+        return ErrorHint {
             summary: "Database locked",
             hints: &["Close other Pi instances using this database"],
             context_fields: &["db_path"],
-        },
-        Error::Sqlite(e) if e.to_string().contains("corrupt") => ErrorHint {
+        };
+    }
+    if message.contains("corrupt") {
+        return ErrorHint {
             summary: "Database corrupted",
             hints: &[
                 "The session index may need to be rebuilt",
                 "Delete ~/.pi/agent/sessions/index.db to rebuild",
             ],
             context_fields: &["db_path"],
-        },
-        Error::Sqlite(_) => ErrorHint {
-            summary: "Database error",
-            hints: &["Check database file permissions and integrity"],
-            context_fields: &["db_path"],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "Database error",
+        hints: &["Check database file permissions and integrity"],
+        context_fields: &["db_path"],
+    }
+}
 
-        // ====================================================================
-        // Generic/Other Errors
-        // ====================================================================
-        Error::Aborted => ErrorHint {
-            summary: "Operation cancelled by user",
-            hints: &[],
-            context_fields: &[],
-        },
-        Error::Api(msg) if msg.contains("401") => ErrorHint {
+const fn aborted_hints() -> ErrorHint {
+    ErrorHint {
+        summary: "Operation cancelled by user",
+        hints: &[],
+        context_fields: &[],
+    }
+}
+
+fn api_hints(msg: &str) -> ErrorHint {
+    if msg.contains("401") {
+        return ErrorHint {
             summary: "Unauthorized API request",
             hints: &["Check your API credentials"],
             context_fields: &["url", "status_code"],
-        },
-        Error::Api(msg) if msg.contains("403") => ErrorHint {
+        };
+    }
+    if msg.contains("403") {
+        return ErrorHint {
             summary: "Forbidden API request",
             hints: &["Check API key permissions for this resource"],
             context_fields: &["url", "status_code"],
-        },
-        Error::Api(msg) if msg.contains("404") => ErrorHint {
+        };
+    }
+    if msg.contains("404") {
+        return ErrorHint {
             summary: "API resource not found",
             hints: &["Check the API endpoint URL"],
             context_fields: &["url"],
-        },
-        Error::Api(_) => ErrorHint {
-            summary: "API error",
-            hints: &["Check API documentation"],
-            context_fields: &["url", "status_code"],
-        },
+        };
+    }
+    ErrorHint {
+        summary: "API error",
+        hints: &["Check API documentation"],
+        context_fields: &["url", "status_code"],
     }
 }
 
@@ -431,18 +473,20 @@ pub fn format_error_with_hints(error: &Error) -> String {
     let mut output = String::new();
 
     // Error message
-    output.push_str(&format!("Error: {}\n", error));
+    let _ = writeln!(&mut output, "Error: {error}");
 
     // Summary if different from error message
     if !error.to_string().contains(hint.summary) {
-        output.push_str(&format!("\n{}\n", hint.summary));
+        output.push('\n');
+        output.push_str(hint.summary);
+        output.push('\n');
     }
 
     // Hints
     if !hint.hints.is_empty() {
         output.push_str("\nSuggestions:\n");
-        for h in hint.hints {
-            output.push_str(&format!("  • {}\n", h));
+        for &h in hint.hints {
+            let _ = writeln!(&mut output, "  • {h}");
         }
     }
 

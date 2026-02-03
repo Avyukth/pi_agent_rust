@@ -301,122 +301,6 @@ Then:
 - `extension.json` (manifest)
 - Source files (TS/JS or Rust/WASM)
 
-### 2.1 Extension Manifest (`extension.json`) (Normative)
-
-`extension.json` is the **canonical manifest** used by extc and the runtime to
-understand entrypoint and capability requirements. If it is absent, extc MAY
-read equivalent fields from `package.json` under the `pi` key.
-
-Schema (v1):
-```json
-{
-  "schema": "pi.ext.manifest.v1",
-  "name": "acme.tools",
-  "version": "1.2.3",
-  "entrypoint": "src/index.ts",
-  "runtime": "pijs",
-  "capabilities": [
-    { "capability": "read", "scope": { "paths": ["src/**"] } },
-    { "capability": "http", "scope": { "hosts": ["api.github.com"] } }
-  ]
-}
-```
-
-Required fields:
-- `schema`: must be `pi.ext.manifest.v1`.
-- `name`: extension identifier (string).
-- `version`: semver (string).
-- `entrypoint`: path **inside** the extension root.
-
-Optional fields:
-- `runtime`: `pijs` (default) or `wasm`. If `wasm`, `entrypoint` MUST end in
-  `.wasm` and be a component/wasm artifact.
-- `capabilities`: recommended. Each entry uses the **same shape** as
-  `pi.ext.cap.v1` (§3.3).
-
-`package.json` embedding (if no `extension.json`):
-```json
-{
-  "name": "acme.tools",
-  "version": "1.2.3",
-  "pi": {
-    "schema": "pi.ext.manifest.v1",
-    "entrypoint": "src/index.ts",
-    "runtime": "pijs",
-    "capabilities": [{ "capability": "read" }]
-  }
-}
-```
-
-Rules:
-- If both `extension.json` and `package.json#pi` exist, `extension.json` wins.
-- Parsing the manifest is **static only**: no code execution, no dynamic imports.
-- Invalid `capabilities` entries (unknown capability or malformed scope) MUST
-  fail validation.
-
-### 2.2 Capability Inference + Merge Policy (Normative)
-
-Capability resolution is a **deterministic** merge of declared + inferred
-requirements, with explicit user overrides.
-
-**Inputs**
-- **Declared**: from manifest (`extension.json` or `package.json#pi`).
-- **Inferred**: from static analysis (imports, call sites, literals).
-- **Overrides**: `extensions.policy.default_caps` (add) and
-  `extensions.policy.deny_caps` (remove).
-
-#### Inference rules (v1)
-
-1) **Pi APIs (preferred, exact):**
-   - `pi.tool(read/grep/find/ls)` → `read`
-   - `pi.tool(write/edit)` → `write`
-   - `pi.tool(bash)` or `pi.exec(...)` → `exec`
-   - `pi.http(...)` → `http`
-   - `pi.session.*` → `session`
-   - `pi.ui.*` → `ui`
-   - `pi.log(...)` → `log`
-   - `pi.tool(<non-core>)` → `tool`
-
-2) **Node/Bun builtins or shims (conservative):**
-   - `fs`, `fs/promises`, `node:fs*` → `read` + `write`
-   - `child_process`, `node:child_process` → `exec`
-   - `http`, `https`, `undici`, `fetch` → `http`
-   - `process.env`, `node:os` → `env`
-
-3) **Literal scope extraction (best-effort, deterministic):**
-   - Literal URL passed to `fetch`/`http.request` adds `hosts` scope.
-   - Literal file paths passed to fs APIs add `paths` scope.
-   - If a scope cannot be proven, omit it (policy will prompt/deny).
-
-**Normalization (required):**
-- De‑duplicate by `(capability, methods, scope)`.
-- Sort by `capability`, then `methods`, then `scope` values (lexicographic).
-
-#### Merge policy
-
-1) `resolved = declared ∪ inferred ∪ default_caps`
-2) Remove any `deny_caps`
-3) If policy denies a **declared** capability:
-   - `strict` → registration fails
-   - `prompt` → user decision required
-   - `permissive` → allow but log
-
-The resolved set is emitted as `capabilities_required` in `artifact.json` and
-used as the default for policy prompts.
-
-#### Capability resolution log (required)
-
-At registration time, emit a `pi.ext.log.v1` entry with:
-```json
-{
-  "event": "capability_resolution",
-  "declared": [{ "capability": "read", "scope": { "paths": ["src/**"] } }],
-  "inferred": [{ "capability": "http", "evidence": [{ "file": "index.ts", "line": 12 }] }],
-  "merged": [{ "capability": "read" }, { "capability": "http" }],
-  "policy": { "mode": "prompt", "default_caps": ["read"], "deny_caps": ["exec"] }
-}
-```
-
 **Pipeline**
 1. **SWC build**: TS/JS → bundle (tree‑shaken/minified).
 2. **Compatibility scan**: static analysis for forbidden APIs.
@@ -581,7 +465,7 @@ Risky constructs that require evidence logging but don't block compilation:
   }
   ```
 
-- `capabilities_required` MUST be computed per §2.2 (declared ∪ inferred) with
+- `capabilities_required` MUST be computed per §2B.3 (declared ∪ inferred) with
   deterministic ordering.
 
 #### Side-Effect Policy
@@ -673,6 +557,11 @@ This is the contract used by:
 
 **Location:** `<extension_root>/extension.json`
 
+**Fallback:** if `extension.json` is missing, extc MAY read the same schema from
+`package.json#pi`. In that case, `name` / `version` default to top‑level
+`package.json` fields unless overridden inside `pi`. If both exist,
+`extension.json` wins.
+
 **Canonicalization (v1):**
 - Manifest hashing MUST use **canonical JSON** (UTF‑8, no whitespace, object keys
   sorted lexicographically, arrays preserve order).
@@ -729,6 +618,10 @@ records. The inferred set is written into `artifact.json` as:
   stable scopes (paths/hosts).
 
 **Evidence sources (v1, ordered):**
+0) **Config files (when source is unavailable):**
+   - `package.json#pi.capabilities` may be treated as coarse evidence.
+   - Dependency signatures MAY be used for coarse inference (e.g., `node-fetch`,
+     `axios`, `undici` → `http`) with `kind=config_hint`.
 1) **Import specifiers** (post‑rewrite):
    - `pi:node/fs` / `pi:node/fs_promises` → infer `read` and/or `write` based on
      used APIs (see rules below).
@@ -767,6 +660,10 @@ Define:
 2) Apply user **deny** overrides:
    - Removing a capability is allowed; runtime hostcalls will return `denied`.
    - Narrowing scope is allowed; apply scope intersection.
+   - If a **declared** capability is denied:
+     - `strict` → registration fails
+     - `prompt` → user decision required
+     - `permissive` → allow but log
 3) Apply user **allow** overrides (add capability / widen scope).
 4) Emit a `capability.resolve` log (see §2B.5) with the full breakdown.
 
@@ -1061,7 +958,7 @@ Notes:
   treated as a coarse capability set until all extensions emit a manifest.
 - The manifest applies **equally to JS and WASM** runtimes; capability names and
   scope semantics are identical across both.
-- Extensions SHOULD mirror the resolved set (declared ∪ inferred, §2.2) in
+- Extensions SHOULD mirror the resolved set (declared ∪ inferred, §2B.3) in
   `capability_manifest`; hosts MUST log any drift.
 
 ---

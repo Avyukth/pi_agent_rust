@@ -1289,9 +1289,55 @@ globalThis.pi = pi;
 ";
 
 #[cfg(test)]
+#[allow(clippy::future_not_send)]
 mod tests {
     use super::*;
     use crate::scheduler::DeterministicClock;
+
+    #[allow(clippy::future_not_send)]
+    async fn get_global_json<C: SchedulerClock + 'static>(
+        runtime: &PiJsRuntime<C>,
+        name: &str,
+    ) -> serde_json::Value {
+        runtime
+            .context
+            .with(|ctx| {
+                let global = ctx.globals();
+                let value: Value<'_> = global.get(name)?;
+                js_to_json(&value)
+            })
+            .await
+            .expect("js context")
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn drain_until_idle(
+        runtime: &PiJsRuntime<Arc<DeterministicClock>>,
+        clock: &Arc<DeterministicClock>,
+    ) {
+        for _ in 0..10_000 {
+            if !runtime.has_pending() {
+                break;
+            }
+
+            let stats = runtime.tick().await.expect("tick");
+            if stats.ran_macrotask {
+                continue;
+            }
+
+            let next_deadline = runtime.scheduler.borrow().next_timer_deadline();
+            let Some(next_deadline) = next_deadline else {
+                break;
+            };
+
+            let now = runtime.now_ms();
+            assert!(
+                next_deadline > now,
+                "expected future timer deadline (deadline={next_deadline}, now={now})"
+            );
+            clock.set(next_deadline);
+        }
+    }
 
     #[test]
     fn hostcall_completions_run_before_due_timers() {
@@ -1562,6 +1608,269 @@ mod tests {
 
             let stats = runtime.tick().await.expect("tick");
             assert!(stats.ran_macrotask);
+        });
+    }
+
+    #[test]
+    fn pijs_microtasks_drain_before_next_macrotask() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(r"globalThis.order = []; globalThis.__pi_done = false;")
+                .await
+                .expect("init order");
+
+            let timer_id = runtime.set_timeout(10);
+            runtime
+                .eval(&format!(
+                    r#"__pi_register_timer({timer_id}, () => {{
+                        globalThis.order.push("timer");
+                        Promise.resolve().then(() => globalThis.order.push("timer-micro"));
+                    }});"#
+                ))
+                .await
+                .expect("register timer");
+
+            runtime
+                .eval(
+                    r#"
+                    pi.tool("read", {}).then(() => {
+                        globalThis.order.push("hostcall");
+                        Promise.resolve().then(() => globalThis.order.push("hostcall-micro"));
+                    });
+                    "#,
+                )
+                .await
+                .expect("enqueue hostcall");
+
+            let requests = runtime.drain_hostcall_requests();
+            let call_id = requests
+                .into_iter()
+                .next()
+                .expect("hostcall request")
+                .call_id;
+
+            runtime.complete_hostcall(call_id, HostcallOutcome::Success(serde_json::json!(null)));
+
+            // Make the timer due as well.
+            clock.set(10);
+
+            // Tick 1: hostcall completion runs first, and its microtasks drain immediately.
+            runtime.tick().await.expect("tick hostcall");
+            let after_first = get_global_json(&runtime, "order").await;
+            assert_eq!(
+                after_first,
+                serde_json::json!(["hostcall", "hostcall-micro"])
+            );
+
+            // Tick 2: timer runs, and its microtasks drain before the next macrotask.
+            runtime.tick().await.expect("tick timer");
+            let after_second = get_global_json(&runtime, "order").await;
+            assert_eq!(
+                after_second,
+                serde_json::json!(["hostcall", "hostcall-micro", "timer", "timer-micro"])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_clear_timeout_prevents_timer_callback() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(r"globalThis.order = []; ")
+                .await
+                .expect("init order");
+
+            let timer_id = runtime.set_timeout(10);
+            runtime
+                .eval(&format!(
+                    r#"__pi_register_timer({timer_id}, () => globalThis.order.push("timer"));"#
+                ))
+                .await
+                .expect("register timer");
+
+            assert!(runtime.clear_timeout(timer_id));
+            clock.set(10);
+
+            let stats = runtime.tick().await.expect("tick");
+            assert!(!stats.ran_macrotask);
+
+            let order = get_global_json(&runtime, "order").await;
+            assert_eq!(order, serde_json::json!([]));
+        });
+    }
+
+    #[test]
+    fn pijs_inbound_event_fifo_and_microtask_fixpoint() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.order = [];
+                    __pi_add_event_listener("evt", (payload) => {
+                        globalThis.order.push(payload.n);
+                        Promise.resolve().then(() => globalThis.order.push(payload.n + 1000));
+                    });
+                    "#,
+                )
+                .await
+                .expect("install listener");
+
+            runtime.enqueue_event("evt", serde_json::json!({ "n": 1 }));
+            runtime.enqueue_event("evt", serde_json::json!({ "n": 2 }));
+
+            runtime.tick().await.expect("tick 1");
+            let after_first = get_global_json(&runtime, "order").await;
+            assert_eq!(after_first, serde_json::json!([1, 1001]));
+
+            runtime.tick().await.expect("tick 2");
+            let after_second = get_global_json(&runtime, "order").await;
+            assert_eq!(after_second, serde_json::json!([1, 1001, 2, 1002]));
+        });
+    }
+
+    #[derive(Debug, Clone)]
+    struct XorShift64 {
+        state: u64,
+    }
+
+    impl XorShift64 {
+        const fn new(seed: u64) -> Self {
+            let seed = seed ^ 0x9E37_79B9_7F4A_7C15;
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        fn next_range_u64(&mut self, upper_exclusive: u64) -> u64 {
+            if upper_exclusive == 0 {
+                return 0;
+            }
+            self.next_u64() % upper_exclusive
+        }
+
+        fn next_usize(&mut self, upper_exclusive: usize) -> usize {
+            let upper = u64::try_from(upper_exclusive).expect("usize fits u64");
+            let value = self.next_range_u64(upper);
+            usize::try_from(value).expect("value < upper_exclusive")
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_seeded_runtime_trace(seed: u64) -> serde_json::Value {
+        let clock = Arc::new(DeterministicClock::new(0));
+        let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+            .await
+            .expect("create runtime");
+
+        runtime
+            .eval(
+                r#"
+                globalThis.order = [];
+                __pi_add_event_listener("evt", (payload) => {
+                    globalThis.order.push("event:" + payload.step);
+                    Promise.resolve().then(() => globalThis.order.push("event-micro:" + payload.step));
+                });
+                "#,
+            )
+            .await
+            .expect("init");
+
+        let mut rng = XorShift64::new(seed);
+        let mut timers = Vec::new();
+
+        for step in 0..64u64 {
+            match rng.next_range_u64(6) {
+                0 => {
+                    runtime
+                        .eval(&format!(
+                            r#"
+                            pi.tool("test", {{ step: {step} }}).then(() => {{
+                                globalThis.order.push("hostcall:{step}");
+                                Promise.resolve().then(() => globalThis.order.push("hostcall-micro:{step}"));
+                            }});
+                            "#
+                        ))
+                        .await
+                        .expect("enqueue hostcall");
+
+                    for request in runtime.drain_hostcall_requests() {
+                        runtime.complete_hostcall(
+                            request.call_id,
+                            HostcallOutcome::Success(serde_json::json!({ "step": step })),
+                        );
+                    }
+                }
+                1 => {
+                    let delay_ms = rng.next_range_u64(25);
+                    let timer_id = runtime.set_timeout(delay_ms);
+                    timers.push(timer_id);
+                    runtime
+                        .eval(&format!(
+                            r#"__pi_register_timer({timer_id}, () => {{
+                                globalThis.order.push("timer:{step}");
+                                Promise.resolve().then(() => globalThis.order.push("timer-micro:{step}"));
+                            }});"#
+                        ))
+                        .await
+                        .expect("register timer");
+                }
+                2 => {
+                    runtime.enqueue_event("evt", serde_json::json!({ "step": step }));
+                }
+                3 => {
+                    if !timers.is_empty() {
+                        let idx = rng.next_usize(timers.len());
+                        let _ = runtime.clear_timeout(timers[idx]);
+                    }
+                }
+                4 => {
+                    let delta_ms = rng.next_range_u64(50);
+                    clock.advance(delta_ms);
+                }
+                _ => {}
+            }
+
+            // Drive the loop a bit.
+            for _ in 0..3 {
+                if !runtime.has_pending() {
+                    break;
+                }
+                let _ = runtime.tick().await.expect("tick");
+            }
+        }
+
+        drain_until_idle(&runtime, &clock).await;
+        get_global_json(&runtime, "order").await
+    }
+
+    #[test]
+    fn pijs_seeded_trace_is_deterministic() {
+        futures::executor::block_on(async {
+            let a = run_seeded_runtime_trace(0x00C0_FFEE).await;
+            let b = run_seeded_runtime_trace(0x00C0_FFEE).await;
+            assert_eq!(a, b);
         });
     }
 }

@@ -741,6 +741,15 @@ impl Session {
         }
     }
 
+    /// Reset the leaf pointer to root (before any entries).
+    ///
+    /// After calling this, the next appended entry will become a new root entry
+    /// (`parent_id = None`). This is used by interactive `/tree` navigation when
+    /// re-editing the first user message.
+    pub fn reset_leaf(&mut self) {
+        self.leaf_id = None;
+    }
+
     /// Create a new branch starting from a specific entry.
     /// Sets the leaf_id to the specified entry so new entries branch from there.
     /// Returns true if the entry exists.
@@ -765,7 +774,7 @@ impl Session {
     /// Entries along the current leaf path, in chronological order.
     pub fn entries_for_current_path(&self) -> Vec<&SessionEntry> {
         let Some(leaf_id) = &self.leaf_id else {
-            return self.entries.iter().collect();
+            return Vec::new();
         };
 
         let path = self.get_path_to_entry(leaf_id);
@@ -1816,6 +1825,23 @@ mod tests {
                 assert_eq!(text, "D");
             }
         }
+    }
+
+    #[test]
+    fn test_reset_leaf_produces_empty_current_path() {
+        let mut session = Session::in_memory();
+
+        let _id_a = session.append_message(make_test_message("A"));
+        let _id_b = session.append_message(make_test_message("B"));
+
+        session.reset_leaf();
+        assert!(session.entries_for_current_path().is_empty());
+        assert!(session.to_messages_for_current_path().is_empty());
+
+        // After reset, the next entry becomes a new root.
+        let id_root = session.append_message(make_test_message("Root"));
+        let entry = session.get_entry(&id_root).expect("entry");
+        assert!(entry.base().parent_id.is_none());
     }
 
     #[test]

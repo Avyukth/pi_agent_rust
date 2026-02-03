@@ -16,7 +16,7 @@ use crate::session::{Session, SessionEntry, SessionHeader, encode_cwd};
 use crate::session_index::{SessionIndex, SessionMeta};
 
 /// Format a timestamp for display.
-fn format_time(timestamp: &str) -> String {
+pub fn format_time(timestamp: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(timestamp).map_or_else(
         |_| timestamp.to_string(),
         |dt| dt.format("%Y-%m-%d %H:%M").to_string(),
@@ -63,7 +63,7 @@ impl SessionPicker {
     }
 
     #[allow(clippy::needless_pass_by_value)] // Required by Model trait
-    fn update(&mut self, msg: Message) -> Option<Cmd> {
+    pub fn update(&mut self, msg: Message) -> Option<Cmd> {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             match key.key_type {
                 KeyType::Up => {
@@ -106,7 +106,7 @@ impl SessionPicker {
         None
     }
 
-    fn view(&self) -> String {
+    pub fn view(&self) -> String {
         let mut output = String::new();
 
         // Header
@@ -230,7 +230,7 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
     }
 }
 
-fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
+pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
     let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
     let project_session_dir = base_dir.join(encode_cwd(cwd));
     if !project_session_dir.exists() {

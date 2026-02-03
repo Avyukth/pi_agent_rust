@@ -10,11 +10,13 @@ use pi::agent::{Agent, AgentConfig};
 use pi::config::Config;
 use pi::extensions::ExtensionUiRequest;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
-use pi::model::{ContentBlock, Cost, StopReason, StreamEvent, TextContent, Usage};
+use pi::keybindings::KeyBindings;
+use pi::model::{ContentBlock, Cost, StopReason, StreamEvent, TextContent, Usage, UserContent};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
+use pi::session::SessionMessage;
 use pi::tools::ToolRegistry;
 use regex::Regex;
 use serde_json::json;
@@ -89,13 +91,16 @@ fn dummy_model_entry() -> ModelEntry {
     }
 }
 
-fn build_app(harness: &TestHarness, pending_inputs: Vec<PendingInput>) -> PiApp {
+fn build_app_with_session(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+) -> PiApp {
     let config = Config::default();
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
-    let session = Session::in_memory();
     let resources = ResourceLoader::empty(config.enable_skill_commands());
     let resource_cli = ResourceCliOptions {
         no_skills: false,
@@ -127,9 +132,14 @@ fn build_app(harness: &TestHarness, pending_inputs: Vec<PendingInput>) -> PiApp 
         test_runtime_handle(),
         false,
         None,
+        Some(KeyBindings::new()),
     );
     app.set_terminal_size(80, 24);
     app
+}
+
+fn build_app(harness: &TestHarness, pending_inputs: Vec<PendingInput>) -> PiApp {
+    build_app_with_session(harness, pending_inputs, Session::in_memory())
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1071,6 +1081,47 @@ fn tui_state_slash_new_resets_conversation_and_sets_status() {
     assert_after_not_contains(&harness, &step, "world");
     assert_after_contains(&harness, &step, "Model set to dummy/dummy-model");
     assert_after_contains(&harness, &step, "Thinking level: off");
+}
+
+#[test]
+fn tui_state_slash_tree_select_root_user_message_prefills_editor_and_resets_leaf() {
+    let harness = TestHarness::new(
+        "tui_state_slash_tree_select_root_user_message_prefills_editor_and_resets_leaf",
+    );
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Build a simple two-node chain: Root -> Child, so current leaf is Child.
+    {
+        let session = app.session_handle();
+        let Ok(mut session_guard) = session.try_lock() else {
+            panic!("session try_lock");
+        };
+        session_guard.append_message(SessionMessage::User {
+            content: UserContent::Text("Root".to_string()),
+            timestamp: Some(0),
+        });
+        session_guard.append_message(SessionMessage::User {
+            content: UserContent::Text("Child".to_string()),
+            timestamp: Some(0),
+        });
+    }
+
+    type_text(&harness, &mut app, "/tree");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Session Tree");
+
+    // Move selection from Child to Root, then select.
+    press_up(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Branch Summary");
+
+    // Default choice is "No summary".
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched to root");
+    assert_after_contains(&harness, &step, "Root");
+    // Conversation should be empty after resetting leaf.
+    assert_after_not_contains(&harness, &step, "You: Root");
 }
 
 #[test]

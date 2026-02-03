@@ -307,13 +307,17 @@ fn build_meta(
 }
 
 fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
-    let content = fs::read_to_string(path)?;
+    let content = fs::read_to_string(path)
+        .map_err(|err| Error::session(format!("Read session file {}: {err}", path.display())))?;
     let mut lines = content.lines();
     let header: SessionHeader = lines
         .next()
-        .map(serde_json::from_str)
-        .transpose()?
-        .ok_or_else(|| Error::session("Empty session file"))?;
+        .ok_or_else(|| Error::session(format!("Empty session file {}", path.display())))
+        .and_then(|line| {
+            serde_json::from_str(line).map_err(|err| {
+                Error::session(format!("Parse session header {}: {err}", path.display()))
+            })
+        })?;
 
     let mut entries = Vec::new();
     for line in lines {
@@ -397,5 +401,428 @@ struct LockGuard<'a> {
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         let _ = FileExt::unlock(self.file);
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use super::test_common::TestHarness;
+    use crate::model::UserContent;
+    use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
+    use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::time::Duration;
+
+    fn write_session_jsonl(path: &Path, header: &SessionHeader, entries: &[SessionEntry]) {
+        let mut jsonl = String::new();
+        jsonl.push_str(&serde_json::to_string(header).expect("serialize session header"));
+        jsonl.push('\n');
+        for entry in entries {
+            jsonl.push_str(&serde_json::to_string(entry).expect("serialize session entry"));
+            jsonl.push('\n');
+        }
+        fs::write(path, jsonl).expect("write session jsonl");
+    }
+
+    fn make_header(id: &str, cwd: &str) -> SessionHeader {
+        let mut header = SessionHeader::new();
+        header.id = id.to_string();
+        header.cwd = cwd.to_string();
+        header
+    }
+
+    fn make_user_entry(parent_id: Option<String>, id: &str, text: &str) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            base: EntryBase::new(parent_id, id.to_string()),
+            message: SessionMessage::User {
+                content: UserContent::Text(text.to_string()),
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+            },
+        })
+    }
+
+    fn make_session_info_entry(
+        parent_id: Option<String>,
+        id: &str,
+        name: Option<&str>,
+    ) -> SessionEntry {
+        SessionEntry::SessionInfo(SessionInfoEntry {
+            base: EntryBase::new(parent_id, id.to_string()),
+            name: name.map(ToString::to_string),
+        })
+    }
+
+    fn read_meta_last_sync_epoch_ms(index: &SessionIndex) -> String {
+        index
+            .with_lock(|conn| {
+                init_schema(conn)?;
+                let rows = conn
+                    .query_sync(
+                        "SELECT value FROM meta WHERE key='last_sync_epoch_ms' LIMIT 1",
+                        &[],
+                    )
+                    .map_err(|err| Error::session(format!("Query meta failed: {err}")))?;
+                let row = rows
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::session("Missing meta row".to_string()))?;
+                row.get_named::<String>("value")
+                    .map_err(|err| Error::session(format!("get meta value: {err}")))
+            })
+            .expect("read meta.last_sync_epoch_ms")
+    }
+
+    #[test]
+    fn index_session_on_in_memory_session_is_noop() {
+        let harness = TestHarness::new("index_session_on_in_memory_session_is_noop");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+        let session = Session::in_memory();
+
+        index
+            .index_session(&session)
+            .expect("index in-memory session");
+
+        harness
+            .log()
+            .info_ctx("verify", "No index files created", |ctx| {
+                ctx.push(("db_path".into(), index.db_path.display().to_string()));
+                ctx.push(("lock_path".into(), index.lock_path.display().to_string()));
+            });
+        assert!(!index.db_path.exists());
+        assert!(!index.lock_path.exists());
+    }
+
+    #[test]
+    fn index_session_inserts_row_and_updates_meta() {
+        let harness = TestHarness::new("index_session_inserts_row_and_updates_meta");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let session_path = harness.temp_path("sessions/project/a.jsonl");
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("create session dir");
+        fs::write(&session_path, "hello").expect("write session file");
+
+        let mut session = Session::in_memory();
+        session.header = make_header("id-a", "cwd-a");
+        session.path = Some(session_path.clone());
+        session.entries.push(make_user_entry(None, "m1", "hi"));
+
+        index.index_session(&session).expect("index session");
+
+        let sessions = index.list_sessions(Some("cwd-a")).expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "id-a");
+        assert_eq!(sessions[0].cwd, "cwd-a");
+        assert_eq!(sessions[0].message_count, 1);
+        assert_eq!(sessions[0].path, session_path.display().to_string());
+
+        let meta_value = read_meta_last_sync_epoch_ms(&index);
+        harness
+            .log()
+            .info_ctx("verify", "meta.last_sync_epoch_ms present", |ctx| {
+                ctx.push(("value".into(), meta_value.clone()));
+            });
+        assert!(
+            meta_value.parse::<i64>().is_ok(),
+            "Expected meta value to be an integer epoch ms"
+        );
+    }
+
+    #[test]
+    fn index_session_updates_existing_row() {
+        let harness = TestHarness::new("index_session_updates_existing_row");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let session_path = harness.temp_path("sessions/project/update.jsonl");
+        fs::create_dir_all(session_path.parent().expect("parent")).expect("create session dir");
+        fs::write(&session_path, "first").expect("write session file");
+
+        let mut session = Session::in_memory();
+        session.header = make_header("id-update", "cwd-update");
+        session.path = Some(session_path.clone());
+        session.entries.push(make_user_entry(None, "m1", "hi"));
+
+        index
+            .index_session(&session)
+            .expect("index session first time");
+        let first_meta = index
+            .list_sessions(Some("cwd-update"))
+            .expect("list sessions")[0]
+            .clone();
+        let first_sync = read_meta_last_sync_epoch_ms(&index);
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&session_path, "second-longer").expect("rewrite session file");
+        session
+            .entries
+            .push(make_user_entry(Some("m1".to_string()), "m2", "again"));
+
+        index
+            .index_session(&session)
+            .expect("index session second time");
+        let second_meta = index
+            .list_sessions(Some("cwd-update"))
+            .expect("list sessions")[0]
+            .clone();
+        let second_sync = read_meta_last_sync_epoch_ms(&index);
+
+        harness.log().info_ctx("verify", "row updated", |ctx| {
+            ctx.push((
+                "first_message_count".into(),
+                first_meta.message_count.to_string(),
+            ));
+            ctx.push((
+                "second_message_count".into(),
+                second_meta.message_count.to_string(),
+            ));
+            ctx.push(("first_size".into(), first_meta.size_bytes.to_string()));
+            ctx.push(("second_size".into(), second_meta.size_bytes.to_string()));
+            ctx.push(("first_sync".into(), first_sync.clone()));
+            ctx.push(("second_sync".into(), second_sync.clone()));
+        });
+
+        assert_eq!(second_meta.message_count, 2);
+        assert!(second_meta.size_bytes >= first_meta.size_bytes);
+        assert!(second_meta.last_modified_ms >= first_meta.last_modified_ms);
+        assert!(second_sync.parse::<i64>().unwrap_or(0) >= first_sync.parse::<i64>().unwrap_or(0));
+    }
+
+    #[test]
+    fn list_sessions_orders_by_last_modified_desc() {
+        let harness = TestHarness::new("list_sessions_orders_by_last_modified_desc");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let path_a = harness.temp_path("sessions/project/a.jsonl");
+        fs::create_dir_all(path_a.parent().expect("parent")).expect("create dirs");
+        fs::write(&path_a, "a").expect("write file a");
+
+        let mut session_a = Session::in_memory();
+        session_a.header = make_header("id-a", "cwd-a");
+        session_a.path = Some(path_a);
+        session_a.entries.push(make_user_entry(None, "m1", "a"));
+        index.index_session(&session_a).expect("index a");
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let path_b = harness.temp_path("sessions/project/b.jsonl");
+        fs::create_dir_all(path_b.parent().expect("parent")).expect("create dirs");
+        fs::write(&path_b, "bbbbb").expect("write file b");
+
+        let mut session_b = Session::in_memory();
+        session_b.header = make_header("id-b", "cwd-b");
+        session_b.path = Some(path_b);
+        session_b.entries.push(make_user_entry(None, "m1", "b"));
+        index.index_session(&session_b).expect("index b");
+
+        let sessions = index.list_sessions(None).expect("list sessions");
+        harness
+            .log()
+            .info("verify", format!("listed {} sessions", sessions.len()));
+        assert!(sessions.len() >= 2);
+        assert_eq!(sessions[0].id, "id-b");
+        assert_eq!(sessions[1].id, "id-a");
+        assert!(sessions[0].last_modified_ms >= sessions[1].last_modified_ms);
+    }
+
+    #[test]
+    fn list_sessions_filters_by_cwd() {
+        let harness = TestHarness::new("list_sessions_filters_by_cwd");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        for (id, cwd) in [("id-a", "cwd-a"), ("id-b", "cwd-b")] {
+            let path = harness.temp_path(format!("sessions/project/{id}.jsonl"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+            fs::write(&path, id).expect("write session file");
+
+            let mut session = Session::in_memory();
+            session.header = make_header(id, cwd);
+            session.path = Some(path);
+            session.entries.push(make_user_entry(None, "m1", id));
+            index.index_session(&session).expect("index session");
+        }
+
+        let only_a = index
+            .list_sessions(Some("cwd-a"))
+            .expect("list sessions cwd-a");
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].id, "id-a");
+    }
+
+    #[test]
+    fn reindex_all_is_noop_when_sessions_root_missing() {
+        let harness = TestHarness::new("reindex_all_is_noop_when_sessions_root_missing");
+        let missing_root = harness.temp_path("does-not-exist");
+        let index = SessionIndex::for_sessions_root(&missing_root);
+
+        index.reindex_all().expect("reindex_all");
+        assert!(!index.db_path.exists());
+        assert!(!index.lock_path.exists());
+    }
+
+    #[test]
+    fn reindex_all_rebuilds_index_from_disk() {
+        let harness = TestHarness::new("reindex_all_rebuilds_index_from_disk");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let path = harness.temp_path("sessions/project/reindex.jsonl");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+
+        let header = make_header("id-reindex", "cwd-reindex");
+        let entries = vec![
+            make_user_entry(None, "m1", "hello"),
+            make_session_info_entry(Some("m1".to_string()), "info1", Some("My Session")),
+            make_user_entry(Some("info1".to_string()), "m2", "world"),
+        ];
+        write_session_jsonl(&path, &header, &entries);
+
+        index.reindex_all().expect("reindex_all");
+
+        let sessions = index
+            .list_sessions(Some("cwd-reindex"))
+            .expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "id-reindex");
+        assert_eq!(sessions[0].message_count, 2);
+        assert_eq!(sessions[0].name.as_deref(), Some("My Session"));
+
+        let meta_value = read_meta_last_sync_epoch_ms(&index);
+        harness.log().info_ctx("verify", "meta updated", |ctx| {
+            ctx.push(("value".into(), meta_value.clone()));
+        });
+        assert!(meta_value.parse::<i64>().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn reindex_all_skips_invalid_jsonl_files() {
+        let harness = TestHarness::new("reindex_all_skips_invalid_jsonl_files");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let good = harness.temp_path("sessions/project/good.jsonl");
+        fs::create_dir_all(good.parent().expect("parent")).expect("create dirs");
+        let header = make_header("id-good", "cwd-good");
+        let entries = vec![make_user_entry(None, "m1", "ok")];
+        write_session_jsonl(&good, &header, &entries);
+
+        let bad = harness.temp_path("sessions/project/bad.jsonl");
+        fs::write(&bad, "not-json\n{").expect("write bad jsonl");
+
+        index.reindex_all().expect("reindex_all should succeed");
+        let sessions = index.list_sessions(None).expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "id-good");
+    }
+
+    #[test]
+    fn build_meta_from_file_returns_session_error_on_invalid_header() {
+        let harness =
+            TestHarness::new("build_meta_from_file_returns_session_error_on_invalid_header");
+        let path = harness.temp_path("bad_header.jsonl");
+        fs::write(&path, "not json\n").expect("write bad header");
+
+        let err = build_meta_from_file(&path).expect_err("expected error");
+        harness.log().info("verify", format!("error: {err}"));
+
+        match err {
+            Error::Session(msg) => assert!(msg.contains("Parse session header")),
+            other => panic!("Expected Error::Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_meta_from_file_returns_session_error_on_empty_file() {
+        let harness = TestHarness::new("build_meta_from_file_returns_session_error_on_empty_file");
+        let path = harness.temp_path("empty.jsonl");
+        fs::write(&path, "").expect("write empty");
+
+        let err = build_meta_from_file(&path).expect_err("expected error");
+        match err {
+            Error::Session(msg) => {
+                harness.log().info("verify", msg.clone());
+                assert!(msg.contains("Empty session file"));
+            }
+            other => panic!("Expected Error::Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_sessions_returns_session_error_when_db_path_is_directory() {
+        let harness =
+            TestHarness::new("list_sessions_returns_session_error_when_db_path_is_directory");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+
+        let db_dir = root.join("session-index.sqlite");
+        fs::create_dir_all(&db_dir).expect("create db dir to force sqlite open failure");
+
+        let index = SessionIndex::for_sessions_root(&root);
+        let err = index.list_sessions(None).expect_err("expected error");
+        match err {
+            Error::Session(msg) => {
+                harness.log().info("verify", msg.clone());
+                assert!(msg.contains("SQLite open"));
+            }
+            other => panic!("Expected Error::Session, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_file_guard_prevents_concurrent_access() {
+        let harness = TestHarness::new("lock_file_guard_prevents_concurrent_access");
+        let path = harness.temp_path("lockfile.lock");
+        fs::write(&path, "").expect("create lock file");
+
+        let file1 = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open file1");
+        let file2 = File::options()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open file2");
+
+        let guard1 = lock_file_guard(&file1, Duration::from_millis(50)).expect("acquire lock");
+        let Err(err) = lock_file_guard(&file2, Duration::from_millis(50)) else {
+            panic!("expected lock timeout");
+        };
+        drop(guard1);
+
+        match err {
+            Error::Session(msg) => assert!(msg.contains("Timed out")),
+            other => panic!("Expected Error::Session, got {other:?}"),
+        }
+
+        let _guard2 =
+            lock_file_guard(&file2, Duration::from_millis(50)).expect("lock after release");
+    }
+
+    #[test]
+    fn should_reindex_returns_true_when_db_missing() {
+        let harness = TestHarness::new("should_reindex_returns_true_when_db_missing");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(&root).expect("create root dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        assert!(index.should_reindex(Duration::from_secs(60)));
     }
 }

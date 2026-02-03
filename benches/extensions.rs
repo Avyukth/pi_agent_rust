@@ -8,6 +8,7 @@ use std::hint::black_box;
 use std::sync::OnceLock;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use futures::executor::block_on;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sysinfo::System;
@@ -262,6 +263,38 @@ fn bench_protocol_parse_and_validate(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_js_runtime(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ext_js_runtime");
+    group.bench_function("cold_start", |b| {
+        b.iter(|| {
+            block_on(async {
+                let rt = pi::extensions_js::QuickJsRuntime::new().await.unwrap();
+                rt.run_pending_jobs().await.unwrap();
+            });
+        });
+    });
+
+    let rt = block_on(pi::extensions_js::QuickJsRuntime::new()).unwrap();
+    group.bench_function("warm_eval_noop", |b| {
+        b.iter(|| {
+            block_on(async {
+                rt.eval("1 + 1;").await.unwrap();
+                rt.run_pending_jobs().await.unwrap();
+            });
+        });
+    });
+
+    group.bench_function("warm_run_pending_jobs_empty", |b| {
+        b.iter(|| {
+            block_on(async {
+                rt.run_pending_jobs().await.unwrap();
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = criterion_config();
@@ -269,6 +302,7 @@ criterion_group!(
         bench_extension_policy,
         bench_required_capability_for_host_call,
         bench_dispatch_decision,
-        bench_protocol_parse_and_validate
+        bench_protocol_parse_and_validate,
+        bench_js_runtime
 );
 criterion_main!(benches);

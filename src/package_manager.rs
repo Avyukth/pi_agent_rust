@@ -8,6 +8,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::extensions::CompatibilityScanner;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -15,6 +16,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageScope {
@@ -292,7 +294,9 @@ impl PackageManager {
             &roots.project_base_dir,
         );
 
-        Ok(accumulator.into_resolved_paths())
+        let resolved = accumulator.into_resolved_paths();
+        maybe_emit_compat_ledgers(&resolved.extensions);
+        Ok(resolved)
     }
 
     /// Resolve resources for extension sources specified via CLI `-e/--extension`.
@@ -324,7 +328,9 @@ impl PackageManager {
             .collect::<Vec<_>>();
 
         Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
-        Ok(accumulator.into_resolved_paths())
+        let resolved = accumulator.into_resolved_paths();
+        maybe_emit_compat_ledgers(&resolved.extensions);
+        Ok(resolved)
     }
 
     pub fn add_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -2246,6 +2252,59 @@ fn write_settings_json_atomic(path: &Path, value: &Value) -> Result<()> {
         .persist(path)
         .map_err(|e| Error::Io(Box::new(e.error)))?;
     Ok(())
+}
+
+fn compat_scan_enabled() -> bool {
+    let value = std::env::var("PI_EXT_COMPAT_SCAN").unwrap_or_default();
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn maybe_emit_compat_ledgers(extensions: &[ResolvedResource]) {
+    if !compat_scan_enabled() {
+        return;
+    }
+
+    let mut enabled = extensions.iter().filter(|r| r.enabled).collect::<Vec<_>>();
+    enabled.sort_by(|left, right| left.path.cmp(&right.path));
+
+    for resource in enabled {
+        let root = if resource.path.is_dir() {
+            resource.path.clone()
+        } else {
+            resource
+                .path
+                .parent()
+                .map_or_else(|| resource.path.clone(), Path::to_path_buf)
+        };
+        let scanner = CompatibilityScanner::new(root);
+        let ledger = match scanner.scan_path(&resource.path) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                warn!(event = "ext.compat_ledger_error", error = %err);
+                continue;
+            }
+        };
+
+        if ledger.is_empty() {
+            continue;
+        }
+
+        match serde_json::to_string(&ledger) {
+            Ok(ledger_json) => {
+                info!(
+                    event = "ext.compat_ledger",
+                    schema = %ledger.schema,
+                    ledger = %ledger_json
+                );
+            }
+            Err(err) => {
+                warn!(event = "ext.compat_ledger_serialize_error", error = %err);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

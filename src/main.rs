@@ -41,6 +41,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
+        .with_writer(io::stderr)
         .init();
 
     // Parse CLI arguments

@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 /// Monotonically increasing sequence counter for deterministic ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -166,6 +167,12 @@ impl Ord for Macrotask {
 pub trait Clock: Send + Sync {
     /// Get the current time in milliseconds since epoch.
     fn now_ms(&self) -> u64;
+}
+
+impl<C: Clock> Clock for Arc<C> {
+    fn now_ms(&self) -> u64 {
+        self.as_ref().now_ms()
+    }
 }
 
 /// Real wall clock implementation.
@@ -749,5 +756,136 @@ mod tests {
         let debug = format!("{sched:?}");
         assert!(debug.contains("Scheduler"));
         assert!(debug.contains("seq"));
+    }
+
+    #[derive(Debug, Clone)]
+    struct XorShift64 {
+        state: u64,
+    }
+
+    impl XorShift64 {
+        const fn new(seed: u64) -> Self {
+            // Avoid the all-zero state so the stream doesn't get stuck.
+            let seed = seed ^ 0x9E37_79B9_7F4A_7C15;
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        fn next_range_u64(&mut self, upper_exclusive: u64) -> u64 {
+            if upper_exclusive == 0 {
+                return 0;
+            }
+            self.next_u64() % upper_exclusive
+        }
+
+        fn next_usize(&mut self, upper_exclusive: usize) -> usize {
+            let upper = u64::try_from(upper_exclusive).expect("usize fits in u64");
+            let value = self.next_range_u64(upper);
+            usize::try_from(value).expect("value < upper_exclusive")
+        }
+    }
+
+    fn trace_entry(task: &Macrotask) -> String {
+        match &task.kind {
+            MacrotaskKind::TimerFired { timer_id } => {
+                format!("seq={}:timer:{timer_id}", task.seq.value())
+            }
+            MacrotaskKind::HostcallComplete { call_id, outcome } => {
+                let outcome_tag = match outcome {
+                    HostcallOutcome::Success(_) => "ok",
+                    HostcallOutcome::Error { .. } => "err",
+                };
+                format!("seq={}:hostcall:{call_id}:{outcome_tag}", task.seq.value())
+            }
+            MacrotaskKind::InboundEvent { event_id, payload } => {
+                format!(
+                    "seq={}:event:{event_id}:payload={payload}",
+                    task.seq.value()
+                )
+            }
+        }
+    }
+
+    fn run_seeded_script(seed: u64) -> Vec<String> {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+        let mut rng = XorShift64::new(seed);
+        let mut timers = Vec::new();
+        let mut trace = Vec::new();
+
+        for step in 0..256u64 {
+            match rng.next_range_u64(6) {
+                0 => {
+                    let delay_ms = rng.next_range_u64(250);
+                    let timer_id = sched.set_timeout(delay_ms);
+                    timers.push(timer_id);
+                }
+                1 => {
+                    if !timers.is_empty() {
+                        let idx = rng.next_usize(timers.len());
+                        let _cancelled = sched.clear_timeout(timers[idx]);
+                    }
+                }
+                2 => {
+                    let call_id = format!("call-{step}-{}", rng.next_u64());
+                    let outcome = HostcallOutcome::Success(serde_json::json!({ "step": step }));
+                    sched.enqueue_hostcall_complete(call_id, outcome);
+                }
+                3 => {
+                    let event_id = format!("evt-{step}");
+                    let payload = serde_json::json!({ "step": step, "entropy": rng.next_u64() });
+                    sched.enqueue_event(event_id, payload);
+                }
+                4 => {
+                    let delta_ms = rng.next_range_u64(50);
+                    sched.clock.advance(delta_ms);
+                }
+                _ => {}
+            }
+
+            if rng.next_range_u64(3) == 0 {
+                if let Some(task) = sched.tick() {
+                    trace.push(trace_entry(&task));
+                }
+            }
+        }
+
+        // Drain remaining tasks and timers deterministically.
+        for _ in 0..10_000 {
+            if let Some(task) = sched.tick() {
+                trace.push(trace_entry(&task));
+                continue;
+            }
+
+            let Some(next_deadline) = sched.next_timer_deadline() else {
+                break;
+            };
+
+            let now = sched.now_ms();
+            assert!(
+                next_deadline > now,
+                "expected future timer deadline (deadline={next_deadline}, now={now})"
+            );
+            sched.clock.set(next_deadline);
+        }
+
+        trace
+    }
+
+    #[test]
+    fn scheduler_seeded_trace_is_deterministic() {
+        for seed in [0_u64, 1, 2, 3, 0xDEAD_BEEF] {
+            let a = run_seeded_script(seed);
+            let b = run_seeded_script(seed);
+            assert_eq!(a, b, "trace mismatch for seed={seed}");
+        }
     }
 }

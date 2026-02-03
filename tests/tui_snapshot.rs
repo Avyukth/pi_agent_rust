@@ -9,6 +9,7 @@ use futures::stream;
 use pi::agent::{Agent, AgentConfig};
 use pi::config::Config;
 use pi::interactive::{ConversationMessage, MessageRole, PiApp, PiMsg};
+use pi::keybindings::KeyBindings;
 use pi::model::{ContentBlock, Cost, StopReason, StreamEvent, TextContent, Usage};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
@@ -125,6 +126,7 @@ fn build_app(harness: &TestHarness) -> PiApp {
         test_runtime_handle(),
         true,
         None,
+        Some(KeyBindings::new()),
     );
     app.set_terminal_size(80, 24);
     app

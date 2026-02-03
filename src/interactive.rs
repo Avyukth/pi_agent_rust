@@ -27,7 +27,7 @@ use glamour::{Renderer as MarkdownRenderer, Style as GlamourStyle};
 use lipgloss::Style;
 use serde_json::{Value, json};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,7 +41,6 @@ use crate::autocomplete::{
 };
 use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
-    summarize_entries,
 };
 use crate::config::Config;
 use crate::extensions::{
@@ -58,6 +57,8 @@ use crate::package_manager::PackageManager;
 use crate::providers;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage};
+use crate::session_index::SessionMeta;
+use crate::session_picker::list_sessions_for_cwd;
 
 // ============================================================================
 // Slash Commands
@@ -158,12 +159,12 @@ impl SlashCommand {
   /share             - Export to a temp HTML file and show path
   /exit, /quit, /q   - Exit Pi
 
-Tips:
-  • Use ↑/↓ arrows or Ctrl+P/N to navigate input history
-  • Use Alt+Enter to submit multi-line input
-  • Use PageUp/PageDown to scroll conversation history
-  • Use Escape to cancel current input
-  • Use /skill:name or /template to expand resources"
+  Tips:
+    • Use ↑/↓ arrows or Ctrl+P/N to navigate input history
+    • Use Shift+Enter (Ctrl+Enter on Windows) to insert a newline
+    • Use PageUp/PageDown to scroll conversation history
+    • Use Escape to cancel current input
+    • Use /skill:name or /template to expand resources"
     }
 }
 
@@ -209,6 +210,8 @@ pub enum PiMsg {
         usage: Usage,
         status: Option<String>,
     },
+    /// Set the editor contents (used by /tree selection of user/custom messages).
+    SetEditorText(String),
     /// Reloaded skills/prompts/themes/extensions.
     ResourcesReloaded {
         resources: ResourceLoader,
@@ -216,6 +219,578 @@ pub enum PiMsg {
     },
     /// Extension UI request (select/confirm/input/editor/notify).
     ExtensionUiRequest(ExtensionUiRequest),
+}
+
+// ============================================================================
+// /tree navigation UI
+// ============================================================================
+
+#[derive(Debug, Clone)]
+enum TreeUiState {
+    Selector(TreeSelectorState),
+    SummaryPrompt(TreeSummaryPromptState),
+    CustomPrompt(TreeCustomPromptState),
+}
+
+#[derive(Debug, Clone)]
+struct TreeSelectorRow {
+    id: String,
+    parent_id: Option<String>,
+    display: String,
+    resubmit_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TreeSelectorState {
+    rows: Vec<TreeSelectorRow>,
+    selected: usize,
+    scroll: usize,
+    max_visible_lines: usize,
+    user_only: bool,
+    show_all: bool,
+    current_leaf_id: Option<String>,
+    last_selected_id: Option<String>,
+    parent_by_id: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTreeNavigation {
+    session_id: String,
+    old_leaf_id: Option<String>,
+    selected_entry_id: String,
+    new_leaf_id: Option<String>,
+    editor_text: Option<String>,
+    entries_to_summarize: Vec<SessionEntry>,
+    summary_from_id: String,
+    api_key_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeSummaryChoice {
+    NoSummary,
+    Summarize,
+    SummarizeWithCustomPrompt,
+}
+
+impl TreeSummaryChoice {
+    const fn all() -> [Self; 3] {
+        [
+            Self::NoSummary,
+            Self::Summarize,
+            Self::SummarizeWithCustomPrompt,
+        ]
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::NoSummary => "No summary",
+            Self::Summarize => "Summarize",
+            Self::SummarizeWithCustomPrompt => "Summarize with custom prompt",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TreeSummaryPromptState {
+    pending: PendingTreeNavigation,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TreeCustomPromptState {
+    pending: PendingTreeNavigation,
+    instructions: String,
+}
+
+impl TreeSelectorState {
+    fn new(session: &Session, term_height: usize, initial_selected_id: Option<&str>) -> Self {
+        let max_visible_lines = (term_height / 2).max(5);
+        let current_leaf_id = session.leaf_id.clone();
+
+        let mut state = Self {
+            rows: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            max_visible_lines,
+            user_only: false,
+            show_all: false,
+            current_leaf_id,
+            last_selected_id: None,
+            parent_by_id: HashMap::new(),
+        };
+
+        state.rebuild(session);
+
+        let target_id = initial_selected_id.or(state.current_leaf_id.as_deref());
+        state.selected = state.find_nearest_visible_index(target_id);
+        state.last_selected_id = state.rows.get(state.selected).map(|row| row.id.clone());
+        state.ensure_scroll_visible();
+        state
+    }
+
+    fn rebuild(&mut self, session: &Session) {
+        (self.rows, self.parent_by_id) = build_tree_selector_rows(
+            session,
+            self.user_only,
+            self.show_all,
+            self.current_leaf_id.as_deref(),
+        );
+
+        if self.rows.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            let target = self
+                .last_selected_id
+                .as_deref()
+                .or(self.current_leaf_id.as_deref());
+            self.selected = self.find_nearest_visible_index(target);
+            self.last_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+            self.ensure_scroll_visible();
+        }
+    }
+
+    fn ensure_scroll_visible(&mut self) {
+        if self.rows.is_empty() {
+            self.scroll = 0;
+            return;
+        }
+
+        let max_visible = self.max_visible_lines.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll + max_visible {
+            self.scroll = self.selected + 1 - max_visible;
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let max_index = self.rows.len() - 1;
+        if delta.is_negative() {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            let delta = usize::try_from(delta).unwrap_or(usize::MAX);
+            self.selected = (self.selected + delta).min(max_index);
+        }
+        self.last_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
+        self.ensure_scroll_visible();
+    }
+
+    fn find_nearest_visible_index(&self, target_id: Option<&str>) -> usize {
+        if self.rows.is_empty() {
+            return 0;
+        }
+
+        let visible: HashMap<&str, usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(idx, row)| (row.id.as_str(), idx))
+            .collect();
+
+        let mut current = target_id.map(str::to_string);
+        while let Some(id) = current.take() {
+            if let Some(&idx) = visible.get(id.as_str()) {
+                return idx;
+            }
+            current = self.parent_by_id.get(&id).and_then(Clone::clone);
+        }
+
+        self.rows.len().saturating_sub(1)
+    }
+}
+
+fn resolve_tree_selector_initial_id(session: &Session, args: &str) -> Option<String> {
+    let arg = args.trim();
+    if arg.is_empty() {
+        return None;
+    }
+
+    // Backwards compatible: `/tree <index>` where index refers to leaf list.
+    if let Ok(index) = arg.parse::<usize>() {
+        let leaves = session.list_leaves();
+        if index > 0 && index <= leaves.len() {
+            return Some(leaves[index - 1].clone());
+        }
+        return None;
+    }
+
+    if session.get_entry(arg).is_some() {
+        return Some(arg.to_string());
+    }
+
+    // Prefix match (only if unambiguous).
+    let matches = session
+        .entries
+        .iter()
+        .filter_map(SessionEntry::base_id)
+        .filter(|id| id.starts_with(arg))
+        .take(2)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return Some(matches[0].clone());
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_tree_selector_rows(
+    session: &Session,
+    user_only: bool,
+    show_all: bool,
+    current_leaf_id: Option<&str>,
+) -> (Vec<TreeSelectorRow>, HashMap<String, Option<String>>) {
+    const fn is_settings_entry(entry: &SessionEntry) -> bool {
+        matches!(
+            entry,
+            SessionEntry::Label(_)
+                | SessionEntry::Custom(_)
+                | SessionEntry::ModelChange(_)
+                | SessionEntry::ThinkingLevelChange(_)
+        )
+    }
+
+    const fn entry_is_user_message(entry: &SessionEntry) -> bool {
+        match entry {
+            SessionEntry::Message(message_entry) => {
+                matches!(message_entry.message, SessionMessage::User { .. })
+            }
+            _ => false,
+        }
+    }
+
+    const fn entry_is_visible(entry: &SessionEntry, user_only: bool, show_all: bool) -> bool {
+        if user_only {
+            return entry_is_user_message(entry);
+        }
+        if show_all {
+            return true;
+        }
+        !is_settings_entry(entry)
+    }
+
+    fn extract_user_text(content: &UserContent) -> Option<String> {
+        match content {
+            UserContent::Text(text) => Some(text.clone()),
+            UserContent::Blocks(blocks) => {
+                let mut out = String::new();
+                for block in blocks {
+                    if let ContentBlock::Text(t) = block {
+                        out.push_str(&t.text);
+                    }
+                }
+                if out.trim().is_empty() {
+                    None
+                } else {
+                    Some(out)
+                }
+            }
+        }
+    }
+
+    fn truncate_inline(text: &str, max: usize) -> String {
+        let normalized = text.replace('\n', " ");
+        if normalized.chars().count() <= max {
+            return normalized;
+        }
+        normalized
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
+
+    fn describe_entry(entry: &SessionEntry) -> (String, Option<String>) {
+        match entry {
+            SessionEntry::Message(message_entry) => match &message_entry.message {
+                SessionMessage::User { content, .. } => {
+                    let text = extract_user_text(content).unwrap_or_default();
+                    let preview = truncate_inline(text.trim(), 60);
+                    (format!("user: \"{preview}\""), Some(text))
+                }
+                SessionMessage::Custom {
+                    custom_type,
+                    content,
+                    ..
+                } => {
+                    let preview = truncate_inline(content.trim(), 60);
+                    (
+                        format!("custom:{custom_type}: \"{preview}\""),
+                        Some(content.clone()),
+                    )
+                }
+                SessionMessage::Assistant { message } => {
+                    let (text, _) = assistant_content_to_text(&message.content);
+                    let preview = truncate_inline(text.trim(), 60);
+                    if preview.is_empty() {
+                        ("assistant".to_string(), None)
+                    } else {
+                        (format!("assistant: \"{preview}\""), None)
+                    }
+                }
+                SessionMessage::ToolResult { tool_name, .. } => {
+                    (format!("tool_result: {tool_name}"), None)
+                }
+                SessionMessage::BashExecution { command, .. } => (format!("bash: {command}"), None),
+                SessionMessage::BranchSummary { .. } => ("branch_summary".to_string(), None),
+                SessionMessage::CompactionSummary { .. } => {
+                    ("compaction_summary".to_string(), None)
+                }
+            },
+            SessionEntry::Compaction(entry) => (
+                format!("[compaction: {} tokens]", entry.tokens_before),
+                None,
+            ),
+            SessionEntry::BranchSummary(_entry) => ("[branch_summary]".to_string(), None),
+            SessionEntry::ModelChange(entry) => (
+                format!("[model: {}/{}]", entry.provider, entry.model_id),
+                None,
+            ),
+            SessionEntry::ThinkingLevelChange(entry) => {
+                (format!("[thinking: {}]", entry.thinking_level), None)
+            }
+            SessionEntry::Label(entry) => (
+                format!(
+                    "[label: {} -> {}]",
+                    entry.target_id,
+                    entry.label.as_deref().unwrap_or("(cleared)")
+                ),
+                None,
+            ),
+            SessionEntry::SessionInfo(entry) => (
+                format!(
+                    "[session_info: {}]",
+                    entry.name.as_deref().unwrap_or("(unnamed)")
+                ),
+                None,
+            ),
+            SessionEntry::Custom(entry) => (format!("[custom: {}]", entry.custom_type), None),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct DisplayNode {
+        id: String,
+        parent_id: Option<String>,
+        text: String,
+        resubmit_text: Option<String>,
+        children: Vec<Self>,
+    }
+
+    fn build_display_nodes(
+        id: &str,
+        session: &Session,
+        entry_index_by_id: &HashMap<String, usize>,
+        children_by_parent: &HashMap<Option<String>, Vec<String>>,
+        labels_by_target: &HashMap<String, String>,
+        user_only: bool,
+        show_all: bool,
+    ) -> Vec<DisplayNode> {
+        let Some(&idx) = entry_index_by_id.get(id) else {
+            return Vec::new();
+        };
+        let entry = &session.entries[idx];
+        let is_visible = entry_is_visible(entry, user_only, show_all);
+
+        let mut children_out = Vec::new();
+        let child_ids = children_by_parent
+            .get(&Some(id.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        for child_id in child_ids {
+            children_out.extend(build_display_nodes(
+                &child_id,
+                session,
+                entry_index_by_id,
+                children_by_parent,
+                labels_by_target,
+                user_only,
+                show_all,
+            ));
+        }
+
+        if !is_visible {
+            return children_out;
+        }
+
+        let (mut text, resubmit_text) = describe_entry(entry);
+        if let Some(label) = labels_by_target.get(id) {
+            let _ = write!(text, " [{label}]");
+        }
+
+        vec![DisplayNode {
+            id: id.to_string(),
+            parent_id: entry.base().parent_id.clone(),
+            text,
+            resubmit_text,
+            children: children_out,
+        }]
+    }
+
+    fn flatten_display_nodes(
+        nodes: &[DisplayNode],
+        prefix: &mut Vec<bool>,
+        out: &mut Vec<TreeSelectorRow>,
+        current_leaf_id: Option<&str>,
+    ) {
+        for (idx, node) in nodes.iter().enumerate() {
+            let is_last = idx + 1 == nodes.len();
+
+            let mut line = String::new();
+            for has_more in prefix.iter().copied() {
+                if has_more {
+                    line.push_str("│  ");
+                } else {
+                    line.push_str("   ");
+                }
+            }
+            line.push_str(if is_last { "└─ " } else { "├─ " });
+            line.push_str(&node.text);
+
+            if current_leaf_id.is_some_and(|leaf| leaf == node.id) {
+                line.push_str(" ← active");
+            }
+
+            out.push(TreeSelectorRow {
+                id: node.id.clone(),
+                parent_id: node.parent_id.clone(),
+                display: line,
+                resubmit_text: node.resubmit_text.clone(),
+            });
+
+            prefix.push(!is_last);
+            flatten_display_nodes(&node.children, prefix, out, current_leaf_id);
+            prefix.pop();
+        }
+    }
+
+    let mut parent_by_id: HashMap<String, Option<String>> = HashMap::new();
+    let mut timestamp_by_id: HashMap<String, String> = HashMap::new();
+    let mut entry_index_by_id: HashMap<String, usize> = HashMap::new();
+    let mut children_by_parent: HashMap<Option<String>, Vec<String>> = HashMap::new();
+    let mut labels_by_target: HashMap<String, String> = HashMap::new();
+
+    for (idx, entry) in session.entries.iter().enumerate() {
+        let Some(id) = entry.base_id().cloned() else {
+            continue;
+        };
+        entry_index_by_id.insert(id.clone(), idx);
+        parent_by_id.insert(id.clone(), entry.base().parent_id.clone());
+        timestamp_by_id.insert(id.clone(), entry.base().timestamp.clone());
+
+        children_by_parent
+            .entry(entry.base().parent_id.clone())
+            .or_default()
+            .push(id.clone());
+
+        if let SessionEntry::Label(label_entry) = entry {
+            if let Some(label) = &label_entry.label {
+                labels_by_target.insert(label_entry.target_id.clone(), label.clone());
+            } else {
+                labels_by_target.remove(&label_entry.target_id);
+            }
+        }
+    }
+
+    // Sort children by timestamp (oldest first).
+    for children in children_by_parent.values_mut() {
+        children.sort_by(|a, b| {
+            let ta = timestamp_by_id
+                .get(a)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let tb = timestamp_by_id
+                .get(b)
+                .map(String::as_str)
+                .unwrap_or_default();
+            ta.cmp(tb)
+        });
+    }
+
+    let roots = children_by_parent.get(&None).cloned().unwrap_or_default();
+    let mut display_roots = Vec::new();
+    for root_id in roots {
+        display_roots.extend(build_display_nodes(
+            &root_id,
+            session,
+            &entry_index_by_id,
+            &children_by_parent,
+            &labels_by_target,
+            user_only,
+            show_all,
+        ));
+    }
+
+    let mut rows = Vec::new();
+    flatten_display_nodes(&display_roots, &mut Vec::new(), &mut rows, current_leaf_id);
+
+    (rows, parent_by_id)
+}
+
+fn collect_tree_branch_entries(
+    session: &Session,
+    old_leaf_id: Option<&str>,
+    target_leaf_id: Option<&str>,
+) -> (Vec<SessionEntry>, String) {
+    let Some(old_leaf_id) = old_leaf_id else {
+        return (Vec::new(), "root".to_string());
+    };
+
+    let common_ancestor_id: Option<String> = target_leaf_id.and_then(|target_id| {
+        let old_path = session.get_path_to_entry(old_leaf_id);
+        let target_path = session.get_path_to_entry(target_id);
+        let mut lca: Option<String> = None;
+        for (a, b) in old_path.iter().zip(target_path.iter()) {
+            if a == b {
+                lca = Some(a.clone());
+            } else {
+                break;
+            }
+        }
+        lca
+    });
+
+    let mut entries_rev: Vec<SessionEntry> = Vec::new();
+    let mut current = Some(old_leaf_id.to_string());
+    let mut boundary_id: Option<String> = None;
+
+    while let Some(id) = current.clone() {
+        if common_ancestor_id
+            .as_ref()
+            .is_some_and(|ancestor| ancestor == &id)
+        {
+            boundary_id = Some(id);
+            break;
+        }
+
+        let Some(entry) = session.get_entry(&id).cloned() else {
+            break;
+        };
+
+        if matches!(entry, SessionEntry::Compaction(_)) {
+            boundary_id = Some(id);
+            entries_rev.push(entry);
+            break;
+        }
+
+        current.clone_from(&entry.base().parent_id);
+        entries_rev.push(entry);
+        if current.is_none() {
+            boundary_id = Some("root".to_string());
+            break;
+        }
+    }
+
+    entries_rev.reverse();
+
+    let boundary = boundary_id
+        .or(common_ancestor_id)
+        .unwrap_or_else(|| "root".to_string());
+    (entries_rev, boundary)
 }
 
 /// State of the agent processing.
@@ -234,7 +809,7 @@ pub enum AgentState {
 pub enum InputMode {
     /// Single-line input mode (default).
     SingleLine,
-    /// Multi-line input mode (activated with Alt+Enter or \).
+    /// Multi-line input mode (activated with Shift+Enter or \).
     MultiLine,
 }
 
@@ -379,6 +954,12 @@ pub struct PiApp {
 
     // Autocomplete state
     autocomplete: AutocompleteState,
+
+    // Session picker overlay for /resume
+    session_picker: Option<SessionPickerOverlay>,
+
+    // Tree navigation UI state (for /tree command)
+    tree_ui: Option<TreeUiState>,
 }
 
 /// Autocomplete dropdown state.
@@ -451,6 +1032,72 @@ impl AutocompleteState {
         } else {
             self.selected - self.max_visible + 1
         }
+    }
+}
+
+/// Session picker overlay state for /resume command.
+#[derive(Debug)]
+struct SessionPickerOverlay {
+    /// List of available sessions.
+    sessions: Vec<SessionMeta>,
+    /// Index of the currently selected session.
+    selected: usize,
+    /// Maximum number of sessions to display.
+    max_visible: usize,
+    /// Whether we're in delete confirmation mode.
+    confirm_delete: bool,
+}
+
+impl SessionPickerOverlay {
+    const fn new(sessions: Vec<SessionMeta>) -> Self {
+        Self {
+            sessions,
+            selected: 0,
+            max_visible: 10,
+            confirm_delete: false,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = (self.selected + 1) % self.sessions.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.sessions.is_empty() {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.sessions.len() - 1);
+        }
+    }
+
+    fn selected_session(&self) -> Option<&SessionMeta> {
+        self.sessions.get(self.selected)
+    }
+
+    /// Returns the scroll offset for the dropdown view.
+    const fn scroll_offset(&self) -> usize {
+        if self.selected < self.max_visible {
+            0
+        } else {
+            self.selected - self.max_visible + 1
+        }
+    }
+
+    /// Remove the selected session from the list and adjust selection.
+    fn remove_selected(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        self.sessions.remove(self.selected);
+        // Adjust selection to stay in bounds
+        if self.selected >= self.sessions.len() && self.selected > 0 {
+            self.selected = self.sessions.len() - 1;
+        }
+        // Clear confirmation state
+        self.confirm_delete = false;
     }
 }
 
@@ -589,6 +1236,7 @@ impl PiApp {
         runtime_handle: RuntimeHandle,
         save_enabled: bool,
         extensions: Option<ExtensionManager>,
+        keybindings_override: Option<KeyBindings>,
     ) -> Self {
         // Get terminal size
         let (term_width, term_height) =
@@ -597,7 +1245,7 @@ impl PiApp {
         // Configure text area for input
         let mut input = TextArea::new();
         input.placeholder =
-            "Type your message... (Enter to send, Alt+Enter for multi-line, Ctrl+C twice to quit)"
+            "Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)"
                 .to_string();
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
@@ -672,15 +1320,17 @@ impl PiApp {
             );
         }
 
-        // Load keybindings from user config (with defaults as fallback)
-        let keybindings_result = KeyBindings::load_from_user_config();
-        if keybindings_result.has_warnings() {
-            tracing::warn!(
-                "Keybindings warnings: {}",
-                keybindings_result.format_warnings()
-            );
-        }
-        let keybindings = keybindings_result.bindings;
+        let keybindings = keybindings_override.unwrap_or_else(|| {
+            // Load keybindings from user config (with defaults as fallback).
+            let keybindings_result = KeyBindings::load_from_user_config();
+            if keybindings_result.has_warnings() {
+                tracing::warn!(
+                    "Keybindings warnings: {}",
+                    keybindings_result.format_warnings()
+                );
+            }
+            keybindings_result.bindings
+        });
 
         // Initialize autocomplete with catalog from resources
         let autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
@@ -729,6 +1379,8 @@ impl PiApp {
             keybindings,
             last_ctrlc_time: None,
             autocomplete,
+            session_picker: None,
+            tree_ui: None,
         };
 
         if let Some(manager) = app.extensions.clone() {
@@ -745,6 +1397,11 @@ impl PiApp {
 
         app.scroll_to_bottom();
         app
+    }
+
+    #[must_use]
+    pub fn session_handle(&self) -> Arc<Mutex<Session>> {
+        Arc::clone(&self.session)
     }
 
     /// Initialize the application.
@@ -772,6 +1429,7 @@ impl PiApp {
     }
 
     /// Handle messages (keyboard input, async events, etc.).
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Message) -> Option<Cmd> {
         // Handle our custom Pi messages
         if let Some(pi_msg) = msg.downcast_ref::<PiMsg>() {
@@ -782,6 +1440,102 @@ impl PiApp {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             // Clear status message on any key press
             self.status_message = None;
+
+            // /tree modal captures all input while active.
+            if self.tree_ui.is_some() {
+                return self.handle_tree_ui_key(key);
+            }
+
+            // Handle session picker navigation when overlay is open
+            if let Some(ref mut picker) = self.session_picker {
+                // If in delete confirmation mode, handle y/n/Esc/Enter
+                if picker.confirm_delete {
+                    match key.key_type {
+                        KeyType::Runes if key.runes == ['y'] || key.runes == ['Y'] => {
+                            // Confirm delete - clone path first to avoid borrow conflict
+                            let (path_to_delete, sessions_empty) =
+                                if let Some(session_meta) = picker.selected_session().cloned() {
+                                    let path = session_meta.path;
+                                    picker.remove_selected();
+                                    (Some(path), picker.sessions.is_empty())
+                                } else {
+                                    (None, false)
+                                };
+                            // Picker borrow ends here; can now call &mut self methods.
+                            if let Some(path) = path_to_delete {
+                                self.delete_session_file(&path);
+                            }
+                            if sessions_empty {
+                                self.session_picker = None;
+                                self.status_message = Some("No sessions remaining".to_string());
+                            }
+                            return None;
+                        }
+                        KeyType::Runes if key.runes == ['n'] || key.runes == ['N'] => {
+                            // Cancel delete
+                            picker.confirm_delete = false;
+                            return None;
+                        }
+                        KeyType::Esc => {
+                            // Cancel delete
+                            picker.confirm_delete = false;
+                            return None;
+                        }
+                        _ => {
+                            // Ignore other keys in confirmation mode
+                            return None;
+                        }
+                    }
+                }
+
+                // Normal picker mode
+                match key.key_type {
+                    KeyType::Up => {
+                        picker.select_prev();
+                        return None;
+                    }
+                    KeyType::Down => {
+                        picker.select_next();
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['k'] => {
+                        picker.select_prev();
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['j'] => {
+                        picker.select_next();
+                        return None;
+                    }
+                    KeyType::Enter => {
+                        // Load the selected session
+                        if let Some(session_meta) = picker.selected_session().cloned() {
+                            self.session_picker = None;
+                            return self.load_session_from_path(&session_meta.path);
+                        }
+                        self.session_picker = None;
+                        return None;
+                    }
+                    KeyType::CtrlD => {
+                        // Start delete confirmation
+                        if picker.selected_session().is_some() {
+                            picker.confirm_delete = true;
+                        }
+                        return None;
+                    }
+                    KeyType::Esc => {
+                        self.session_picker = None;
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['q'] => {
+                        self.session_picker = None;
+                        return None;
+                    }
+                    _ => {
+                        // Ignore other keys while picker is open
+                        return None;
+                    }
+                }
+            }
 
             // Handle autocomplete navigation when dropdown is open
             if self.autocomplete.open {
@@ -830,7 +1584,7 @@ impl PiApp {
             }
 
             // Handle raw keys that don't map to actions but need special behavior
-            // (e.g., Enter in multi-line mode inserts newline via TextArea)
+            // (e.g., text input handled by TextArea)
         }
 
         // Forward to appropriate component based on state
@@ -854,6 +1608,13 @@ impl PiApp {
         // Header
         output.push_str(&self.render_header());
         output.push('\n');
+
+        // Modal overlays (e.g. /tree) take over the main view.
+        if let Some(tree_ui) = &self.tree_ui {
+            output.push_str(&Self::view_tree_ui(tree_ui));
+            output.push_str(&self.render_footer());
+            return output;
+        }
 
         // Build conversation content for viewport
         let conversation_content = self.build_conversation_content();
@@ -907,15 +1668,20 @@ impl PiApp {
             let _ = write!(output, "\n  {}\n", status_style.render(status));
         }
 
-        // Input area (only when idle)
-        if self.agent_state == AgentState::Idle {
+        // Session picker overlay (if open)
+        if let Some(ref picker) = self.session_picker {
+            output.push_str(&self.render_session_picker(picker));
+        }
+
+        // Input area (only when idle and no picker open)
+        if self.agent_state == AgentState::Idle && self.session_picker.is_none() {
             output.push_str(&self.render_input());
 
             // Autocomplete dropdown (if open)
             if self.autocomplete.open && !self.autocomplete.items.is_empty() {
                 output.push_str(&self.render_autocomplete_dropdown());
             }
-        } else {
+        } else if self.agent_state != AgentState::Idle {
             // Show spinner when processing
             let style = Style::new().foreground("212");
             let _ = write!(
@@ -930,6 +1696,526 @@ impl PiApp {
         output.push_str(&self.render_footer());
 
         output
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_tree_ui_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
+        let tree_ui = self.tree_ui.take()?;
+
+        match tree_ui {
+            TreeUiState::Selector(mut selector) => {
+                match key.key_type {
+                    KeyType::Up => selector.move_selection(-1),
+                    KeyType::Down => selector.move_selection(1),
+                    KeyType::CtrlU => {
+                        selector.user_only = !selector.user_only;
+                        if let Ok(session_guard) = self.session.try_lock() {
+                            selector.rebuild(&session_guard);
+                        }
+                    }
+                    KeyType::CtrlO => {
+                        selector.show_all = !selector.show_all;
+                        if let Ok(session_guard) = self.session.try_lock() {
+                            selector.rebuild(&session_guard);
+                        }
+                    }
+                    KeyType::Esc | KeyType::CtrlC => {
+                        self.status_message = Some("Tree navigation cancelled".to_string());
+                        self.tree_ui = None;
+                        return None;
+                    }
+                    KeyType::Enter => {
+                        if selector.rows.is_empty() {
+                            self.tree_ui = None;
+                            return None;
+                        }
+
+                        let selected = selector.rows[selector.selected].clone();
+                        selector.last_selected_id = Some(selected.id.clone());
+
+                        let (new_leaf_id, editor_text) = if let Some(text) = selected.resubmit_text
+                        {
+                            (selected.parent_id.clone(), Some(text))
+                        } else {
+                            (Some(selected.id.clone()), None)
+                        };
+
+                        // No-op if already at target leaf.
+                        if selector.current_leaf_id.as_deref() == new_leaf_id.as_deref() {
+                            self.status_message = Some("Already on that branch".to_string());
+                            self.tree_ui = None;
+                            return None;
+                        }
+
+                        let Ok(session_guard) = self.session.try_lock() else {
+                            self.status_message = Some("Session busy; try again".to_string());
+                            self.tree_ui = None;
+                            return None;
+                        };
+
+                        let old_leaf_id = session_guard.leaf_id.clone();
+                        let (entries_to_summarize, summary_from_id) = collect_tree_branch_entries(
+                            &session_guard,
+                            old_leaf_id.as_deref(),
+                            new_leaf_id.as_deref(),
+                        );
+                        let session_id = session_guard.header.id.clone();
+                        drop(session_guard);
+
+                        let api_key_present = self.agent.try_lock().is_ok_and(|agent_guard| {
+                            agent_guard.stream_options().api_key.is_some()
+                        });
+
+                        let pending = PendingTreeNavigation {
+                            session_id,
+                            old_leaf_id,
+                            selected_entry_id: selected.id,
+                            new_leaf_id,
+                            editor_text,
+                            entries_to_summarize,
+                            summary_from_id,
+                            api_key_present,
+                        };
+
+                        if pending.entries_to_summarize.is_empty() {
+                            // Nothing to summarize; switch immediately.
+                            self.start_tree_navigation(pending, TreeSummaryChoice::NoSummary, None);
+                            return None;
+                        }
+
+                        self.tree_ui = Some(TreeUiState::SummaryPrompt(TreeSummaryPromptState {
+                            pending,
+                            selected: 0,
+                        }));
+                        return None;
+                    }
+                    _ => {}
+                }
+
+                self.tree_ui = Some(TreeUiState::Selector(selector));
+            }
+            TreeUiState::SummaryPrompt(mut prompt) => {
+                match key.key_type {
+                    KeyType::Up => {
+                        if prompt.selected > 0 {
+                            prompt.selected -= 1;
+                        }
+                    }
+                    KeyType::Down => {
+                        if prompt.selected < TreeSummaryChoice::all().len().saturating_sub(1) {
+                            prompt.selected += 1;
+                        }
+                    }
+                    KeyType::Esc | KeyType::CtrlC => {
+                        self.status_message = Some("Tree navigation cancelled".to_string());
+                        self.tree_ui = None;
+                        return None;
+                    }
+                    KeyType::Enter => {
+                        let choice = TreeSummaryChoice::all()[prompt.selected];
+                        match choice {
+                            TreeSummaryChoice::NoSummary | TreeSummaryChoice::Summarize => {
+                                let pending = prompt.pending;
+                                self.start_tree_navigation(pending, choice, None);
+                                return None;
+                            }
+                            TreeSummaryChoice::SummarizeWithCustomPrompt => {
+                                self.tree_ui =
+                                    Some(TreeUiState::CustomPrompt(TreeCustomPromptState {
+                                        pending: prompt.pending,
+                                        instructions: String::new(),
+                                    }));
+                                return None;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.tree_ui = Some(TreeUiState::SummaryPrompt(prompt));
+            }
+            TreeUiState::CustomPrompt(mut custom) => {
+                match key.key_type {
+                    KeyType::Esc | KeyType::CtrlC => {
+                        self.tree_ui = Some(TreeUiState::SummaryPrompt(TreeSummaryPromptState {
+                            pending: custom.pending,
+                            selected: 2,
+                        }));
+                        return None;
+                    }
+                    KeyType::Backspace => {
+                        custom.instructions.pop();
+                    }
+                    KeyType::Enter => {
+                        let pending = custom.pending;
+                        let instructions = if custom.instructions.trim().is_empty() {
+                            None
+                        } else {
+                            Some(custom.instructions)
+                        };
+                        self.start_tree_navigation(
+                            pending,
+                            TreeSummaryChoice::SummarizeWithCustomPrompt,
+                            instructions,
+                        );
+                        return None;
+                    }
+                    KeyType::Runes => {
+                        for ch in key.runes.iter().copied() {
+                            custom.instructions.push(ch);
+                        }
+                    }
+                    _ => {}
+                }
+                self.tree_ui = Some(TreeUiState::CustomPrompt(custom));
+            }
+        }
+
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_tree_navigation(
+        &mut self,
+        pending: PendingTreeNavigation,
+        choice: TreeSummaryChoice,
+        custom_instructions: Option<String>,
+    ) {
+        let summary_requested = matches!(
+            choice,
+            TreeSummaryChoice::Summarize | TreeSummaryChoice::SummarizeWithCustomPrompt
+        );
+
+        // Fast path: no summary + no extensions. Keep it synchronous so unit tests can drive it
+        // without running the async runtime.
+        if !summary_requested && self.extensions.is_none() {
+            let Ok(mut session_guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return;
+            };
+
+            if let Some(target_id) = &pending.new_leaf_id {
+                if !session_guard.navigate_to(target_id) {
+                    self.status_message = Some(format!("Branch target not found: {target_id}"));
+                    return;
+                }
+            } else {
+                session_guard.reset_leaf();
+            }
+
+            let (messages, usage) = load_conversation_from_session(&session_guard);
+            let agent_messages = session_guard.to_messages_for_current_path();
+            let status_leaf = pending
+                .new_leaf_id
+                .clone()
+                .unwrap_or_else(|| "root".to_string());
+            drop(session_guard);
+
+            self.spawn_save_session();
+
+            if let Ok(mut agent_guard) = self.agent.try_lock() {
+                agent_guard.replace_messages(agent_messages);
+            }
+
+            self.messages = messages;
+            self.total_usage = usage;
+            self.current_response.clear();
+            self.current_thinking.clear();
+            self.agent_state = AgentState::Idle;
+            self.current_tool = None;
+            self.abort_handle = None;
+            self.status_message = Some(format!("Switched to {status_leaf}"));
+            self.scroll_to_bottom();
+
+            if let Some(text) = pending.editor_text {
+                self.input.set_value(&text);
+            }
+            self.input.focus();
+
+            return;
+        }
+
+        let event_tx = self.event_tx.clone();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let extensions = self.extensions.clone();
+        let reserve_tokens = self.config.branch_summary_reserve_tokens();
+        let runtime_handle = self.runtime_handle.clone();
+
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            self.agent_state = AgentState::Idle;
+            return;
+        };
+        let provider = agent_guard.provider();
+        let api_key = agent_guard.stream_options().api_key.clone();
+
+        self.tree_ui = None;
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Switching branches...".to_string());
+
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+
+            let from_id_for_event = pending
+                .old_leaf_id
+                .clone()
+                .unwrap_or_else(|| "root".to_string());
+            let to_id_for_event = pending
+                .new_leaf_id
+                .clone()
+                .unwrap_or_else(|| "root".to_string());
+
+            if let Some(manager) = extensions.clone() {
+                let cancelled = manager
+                    .dispatch_cancellable_event(
+                        ExtensionEventName::SessionBeforeSwitch,
+                        Some(json!({
+                            "fromId": from_id_for_event.clone(),
+                            "toId": to_id_for_event.clone(),
+                            "sessionId": pending.session_id.clone(),
+                        })),
+                        EXTENSION_EVENT_TIMEOUT_MS,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if cancelled {
+                    let _ = event_tx.try_send(PiMsg::System(
+                        "Session switch cancelled by extension".to_string(),
+                    ));
+                    return;
+                }
+            }
+
+            let summary_skipped =
+                summary_requested && api_key.is_none() && !pending.entries_to_summarize.is_empty();
+            let summary_text = if !summary_requested || pending.entries_to_summarize.is_empty() {
+                None
+            } else if let Some(api_key) = api_key.as_deref() {
+                match crate::compaction::summarize_entries(
+                    &pending.entries_to_summarize,
+                    provider,
+                    api_key,
+                    reserve_tokens,
+                    custom_instructions.as_deref(),
+                )
+                .await
+                {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Branch summary failed: {err}")));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let messages_for_agent = {
+                let mut guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+
+                if let Some(target_id) = &pending.new_leaf_id {
+                    if !guard.navigate_to(target_id) {
+                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                            "Branch target not found: {target_id}"
+                        )));
+                        return;
+                    }
+                } else {
+                    guard.reset_leaf();
+                }
+
+                if let Some(summary_text) = summary_text {
+                    guard.append_branch_summary(
+                        pending.summary_from_id.clone(),
+                        summary_text,
+                        None,
+                        None,
+                    );
+                }
+
+                let _ = guard.save().await;
+                guard.to_messages_for_current_path()
+            };
+
+            {
+                let mut agent_guard = match agent.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        return;
+                    }
+                };
+                agent_guard.replace_messages(messages_for_agent);
+            }
+
+            let (messages, usage) = {
+                let guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+                load_conversation_from_session(&guard)
+            };
+
+            let status = if summary_skipped {
+                Some(format!(
+                    "Switched to {to_id_for_event} (no summary: missing API key)"
+                ))
+            } else {
+                Some(format!("Switched to {to_id_for_event}"))
+            };
+
+            let _ = event_tx.try_send(PiMsg::ConversationReset {
+                messages,
+                usage,
+                status,
+            });
+
+            if let Some(text) = pending.editor_text {
+                let _ = event_tx.try_send(PiMsg::SetEditorText(text));
+            }
+
+            if let Some(manager) = extensions {
+                let _ = manager
+                    .dispatch_event(
+                        ExtensionEventName::SessionSwitch,
+                        Some(json!({
+                            "fromId": from_id_for_event,
+                            "toId": to_id_for_event,
+                            "sessionId": pending.session_id,
+                        })),
+                    )
+                    .await;
+            }
+        });
+    }
+
+    fn view_tree_ui(tree_ui: &TreeUiState) -> String {
+        match tree_ui {
+            TreeUiState::Selector(state) => Self::view_tree_selector(state),
+            TreeUiState::SummaryPrompt(state) => Self::view_tree_summary_prompt(state),
+            TreeUiState::CustomPrompt(state) => Self::view_tree_custom_prompt(state),
+        }
+    }
+
+    fn view_tree_selector(state: &TreeSelectorState) -> String {
+        let mut out = String::new();
+        let title_style = Style::new().bold().foreground("212");
+        let _ = writeln!(out, "  {}", title_style.render("Session Tree"));
+
+        let filter_style = Style::new().foreground("241");
+        let filters = format!(
+            "  Filters: user-only={}  show-all={}",
+            if state.user_only { "on" } else { "off" },
+            if state.show_all { "on" } else { "off" }
+        );
+        let _ = writeln!(out, "{}", filter_style.render(&filters));
+        out.push('\n');
+
+        if state.rows.is_empty() {
+            let dim_style = Style::new().foreground("241").italic();
+            let _ = writeln!(out, "  {}", dim_style.render("(no entries)"));
+        } else {
+            let start = state.scroll.min(state.rows.len().saturating_sub(1));
+            let end = (start + state.max_visible_lines).min(state.rows.len());
+            let selected_style = Style::new().bold().foreground("cyan");
+
+            for (idx, row) in state.rows.iter().enumerate().take(end).skip(start) {
+                let prefix = if idx == state.selected { ">" } else { " " };
+                let rendered = if idx == state.selected {
+                    selected_style.render(&row.display)
+                } else {
+                    row.display.clone()
+                };
+                let _ = writeln!(out, "{prefix} {rendered}");
+            }
+        }
+
+        out.push('\n');
+        let help_style = Style::new().foreground("241");
+        let _ = writeln!(
+            out,
+            "  {}",
+            help_style.render(
+                "↑/↓: navigate  Enter: select  Esc: cancel  Ctrl+U: user-only  Ctrl+O: show-all"
+            )
+        );
+        out
+    }
+
+    fn view_tree_summary_prompt(state: &TreeSummaryPromptState) -> String {
+        let mut out = String::new();
+        let title_style = Style::new().bold().foreground("212");
+        let _ = writeln!(out, "  {}", title_style.render("Branch Summary"));
+        out.push('\n');
+
+        if !state.pending.api_key_present {
+            let warn_style = Style::new().foreground("yellow");
+            let _ = writeln!(
+                out,
+                "  {}",
+                warn_style.render(
+                    "Note: no API key configured; summarize options will behave like no summary."
+                )
+            );
+            out.push('\n');
+        }
+
+        let options = TreeSummaryChoice::all();
+        for (idx, opt) in options.iter().enumerate() {
+            let prefix = if idx == state.selected { ">" } else { " " };
+            let label = opt.label();
+            let line = format!("{prefix} {label}");
+            out.push_str("  ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+
+        out.push('\n');
+        let help_style = Style::new().foreground("241");
+        let _ = writeln!(
+            out,
+            "  {}",
+            help_style.render("↑/↓: choose  Enter: confirm  Esc: cancel")
+        );
+        out
+    }
+
+    fn view_tree_custom_prompt(state: &TreeCustomPromptState) -> String {
+        let mut out = String::new();
+        let title_style = Style::new().bold().foreground("212");
+        let _ = writeln!(out, "  {}", title_style.render("Custom Summary Prompt"));
+        out.push('\n');
+
+        let help_style = Style::new().foreground("241");
+        let _ = writeln!(
+            out,
+            "  {}",
+            help_style
+                .render("Type extra instructions to guide the summary. Enter: run  Esc: back")
+        );
+        out.push('\n');
+
+        let input_style = Style::new().foreground("cyan");
+        let shown = if state.instructions.is_empty() {
+            "(empty)".to_string()
+        } else {
+            state.instructions.clone()
+        };
+        let _ = writeln!(out, "  {}", input_style.render(&shown));
+        out
     }
 
     /// Build the conversation content string for the viewport.
@@ -1146,6 +2432,10 @@ impl PiApp {
                 self.abort_handle = None;
                 self.status_message = status;
                 self.scroll_to_bottom();
+                self.input.focus();
+            }
+            PiMsg::SetEditorText(text) => {
+                self.input.set_value(&text);
                 self.input.focus();
             }
             PiMsg::ResourcesReloaded { resources, status } => {
@@ -2084,40 +3374,46 @@ impl PiApp {
             // Text input actions
             // =========================================================
             AppAction::Submit => {
-                // Enter: Submit in single-line mode, forward to TextArea in multi-line
+                // Enter: Submit when idle, queue steering when busy
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::Steering);
                     return None;
                 }
-                if self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine
-                {
-                    let value = self.input.value();
-                    if !value.trim().is_empty() {
-                        return self.submit_message(value.trim());
-                    }
+                if self.input_mode == InputMode::MultiLine {
+                    // In multi-line mode, Enter inserts a newline (Alt+Enter submits).
+                    self.input.insert_rune('\n');
+                    return None;
                 }
-                // Don't consume - let TextArea handle Enter in multi-line mode
+                let value = self.input.value();
+                if !value.trim().is_empty() {
+                    return self.submit_message(value.trim());
+                }
+                // Don't consume - let TextArea handle Enter if needed
                 None
             }
             AppAction::FollowUp => {
-                // Alt+Enter: Toggle multi-line or submit in multi-line mode
+                // Alt+Enter: queue follow-up when busy. When idle, toggles multi-line mode if the
+                // editor is empty; otherwise it submits like Enter.
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::FollowUp);
                     return None;
                 }
-                if self.agent_state == AgentState::Idle {
-                    if self.input_mode == InputMode::MultiLine {
-                        let value = self.input.value();
-                        if !value.trim().is_empty() {
-                            return self.submit_message(value.trim());
-                        }
-                    } else {
-                        self.input_mode = InputMode::MultiLine;
-                        self.input.set_height(6);
-                        self.status_message =
-                            Some("Multi-line mode: Alt+Enter to submit".to_string());
-                    }
+                let value = self.input.value();
+                if self.input_mode == InputMode::SingleLine && value.trim().is_empty() {
+                    self.input_mode = InputMode::MultiLine;
+                    self.input.set_height(6);
+                    self.status_message = Some("Multi-line mode".to_string());
+                    return None;
                 }
+                if !value.trim().is_empty() {
+                    return self.submit_message(value.trim());
+                }
+                None
+            }
+            AppAction::NewLine => {
+                self.input.insert_rune('\n');
+                self.input_mode = InputMode::MultiLine;
+                self.input.set_height(6);
                 None
             }
 
@@ -2201,9 +3497,6 @@ impl PiApp {
             AppAction::CursorUp | AppAction::CursorDown => {
                 self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine
             }
-            AppAction::Submit => {
-                self.agent_state != AgentState::Idle || self.input_mode == InputMode::SingleLine
-            }
 
             // Exit (Ctrl+D) only consumed when editor is empty (otherwise deleteCharForward)
             AppAction::Exit => {
@@ -2212,12 +3505,15 @@ impl PiApp {
 
             // Viewport scrolling should always be consumed.
             // FollowUp (Alt+Enter) should be consumed so TextArea doesn't insert text.
+            // NewLine is handled directly (Shift+Enter / Ctrl+Enter).
             // Interrupt/Clear/Copy are always consumed.
             // Suspend/ExternalEditor are always consumed.
             // Tab is consumed (autocomplete).
             AppAction::PageUp
             | AppAction::PageDown
             | AppAction::FollowUp
+            | AppAction::NewLine
+            | AppAction::Submit
             | AppAction::Dequeue
             | AppAction::Interrupt
             | AppAction::Clear
@@ -2669,10 +3965,20 @@ impl PiApp {
                 self.scroll_to_bottom();
             }
             SlashCommand::Resume => {
-                self.status_message = Some(
-                    "Resume session: use --resume flag on startup, or restart with `pi -r`"
-                        .to_string(),
-                );
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot resume while processing".to_string());
+                    return None;
+                }
+
+                // List available sessions for the current project
+                let sessions = list_sessions_for_cwd();
+                if sessions.is_empty() {
+                    self.status_message = Some("No sessions found for this project".to_string());
+                    return None;
+                }
+
+                // Open the session picker overlay
+                self.session_picker = Some(SessionPickerOverlay::new(sessions));
             }
             SlashCommand::New => {
                 if self.agent_state != AgentState::Idle {
@@ -2821,250 +4127,14 @@ impl PiApp {
                     return None;
                 };
                 session_guard.ensure_entry_ids();
-                let info = session_guard.branch_summary();
-                let leaves = session_guard.list_leaves();
-
-                if args.is_empty() {
-                    let mut lines = Vec::new();
-                    let current = info
-                        .current_leaf
-                        .clone()
-                        .unwrap_or_else(|| "(none)".to_string());
-                    lines.push(format!(
-                        "Session tree: {} leaf/leaves, {} branch point(s). Current leaf: {current}",
-                        info.leaf_count, info.branch_point_count
-                    ));
-
-                    if leaves.is_empty() {
-                        lines.push("No branches yet.".to_string());
-                    } else {
-                        lines.push("Leaves:".to_string());
-                        for (idx, leaf_id) in leaves.iter().enumerate() {
-                            let summary = summarize_leaf(&session_guard, leaf_id)
-                                .unwrap_or_else(|| "(no user messages)".to_string());
-                            lines.push(format!("  {}. {} - {}", idx + 1, leaf_id, summary));
-                        }
-                        lines.push("Use /tree <id|index> to switch branches.".to_string());
-                    }
-
-                    // Drop the guard before mutating self
-                    drop(session_guard);
-
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: lines.join("\n"),
-                        thinking: None,
-                    });
-                    self.scroll_to_bottom();
-                    return None;
-                }
-
-                let target_id = if let Ok(index) = args.parse::<usize>() {
-                    if index == 0 || index > leaves.len() {
-                        drop(session_guard);
-                        self.status_message =
-                            Some(format!("Invalid leaf index: {index} (1-{})", leaves.len()));
-                        return None;
-                    }
-                    leaves[index - 1].clone()
-                } else if session_guard.get_entry(args).is_some() {
-                    args.to_string()
-                } else {
-                    drop(session_guard);
-                    self.status_message = Some(format!("Unknown entry id: {args}"));
-                    return None;
-                };
-
-                let Some(current_leaf) = session_guard.leaf_id.clone() else {
-                    drop(session_guard);
-                    self.status_message =
-                        Some("No current leaf available to switch from".to_string());
-                    return None;
-                };
-                let session_id = session_guard.header.id.clone();
-
-                if current_leaf == target_id {
-                    drop(session_guard);
-                    self.status_message = Some("Already on that branch".to_string());
-                    return None;
-                }
-
-                let current_path = session_guard.get_path_to_entry(&current_leaf);
-                let target_path = session_guard.get_path_to_entry(&target_id);
-                let mut lca_index = None;
-                for (idx, (a, b)) in current_path.iter().zip(target_path.iter()).enumerate() {
-                    if a == b {
-                        lca_index = Some(idx);
-                    } else {
-                        break;
-                    }
-                }
-
-                let from_id = lca_index
-                    .and_then(|idx| current_path.get(idx).cloned())
-                    .unwrap_or_else(|| "root".to_string());
-
-                let branch_ids = if let Some(idx) = lca_index {
-                    current_path.get(idx + 1..).unwrap_or_default().to_vec()
-                } else {
-                    current_path
-                };
-
-                let mut branch_entries = Vec::new();
-                for entry_id in branch_ids {
-                    if let Some(entry) = session_guard.get_entry(&entry_id) {
-                        branch_entries.push(entry.clone());
-                    }
-                }
+                let initial_selected_id = resolve_tree_selector_initial_id(&session_guard, args);
+                let state = TreeSelectorState::new(
+                    &session_guard,
+                    self.term_height,
+                    initial_selected_id.as_deref(),
+                );
                 drop(session_guard);
-
-                let event_tx = self.event_tx.clone();
-                let session = Arc::clone(&self.session);
-                let agent = Arc::clone(&self.agent);
-                let extensions = self.extensions.clone();
-                let current_leaf_for_event = current_leaf;
-                let target_id_for_event = target_id.clone();
-                let session_id_for_event = session_id;
-                let reserve_tokens = self.config.branch_summary_reserve_tokens();
-                let (provider, api_key) = {
-                    let Ok(agent_guard) = self.agent.try_lock() else {
-                        self.status_message = Some("Agent busy; try again".to_string());
-                        return None;
-                    };
-                    (
-                        agent_guard.provider(),
-                        agent_guard.stream_options().api_key.clone(),
-                    )
-                };
-                let summary_skipped = !branch_entries.is_empty() && api_key.is_none();
-
-                self.agent_state = AgentState::Processing;
-                self.status_message = Some("Switching branches...".to_string());
-
-                let runtime_handle = self.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
-                    if let Some(manager) = extensions.clone() {
-                        let cancelled = manager
-                            .dispatch_cancellable_event(
-                                ExtensionEventName::SessionBeforeSwitch,
-                                Some(json!({
-                                    "fromId": current_leaf_for_event.clone(),
-                                    "toId": target_id_for_event.clone(),
-                                    "sessionId": session_id_for_event.clone(),
-                                })),
-                                EXTENSION_EVENT_TIMEOUT_MS,
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if cancelled {
-                            let _ = event_tx.try_send(PiMsg::System(
-                                "Session switch cancelled by extension".to_string(),
-                            ));
-                            return;
-                        }
-                    }
-
-                    let summary = if branch_entries.is_empty() {
-                        None
-                    } else if let Some(api_key) = api_key {
-                        match summarize_entries(
-                            &branch_entries,
-                            provider,
-                            &api_key,
-                            reserve_tokens,
-                            None,
-                        )
-                        .await
-                        {
-                            Ok(summary) => summary,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Branch summary failed: {err}"
-                                )));
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let messages_for_agent = {
-                        let mut guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        if !guard.navigate_to(&target_id) {
-                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                "Branch target not found: {target_id}"
-                            )));
-                            return;
-                        }
-                        if let Some(summary) = summary {
-                            guard.append_branch_summary(from_id, summary, None, None);
-                        }
-                        let _ = guard.save().await;
-                        guard.to_messages_for_current_path()
-                    };
-
-                    {
-                        let mut agent_guard = match agent.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock agent: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        agent_guard.replace_messages(messages_for_agent);
-                    }
-
-                    let (messages, usage) = {
-                        let guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        load_conversation_from_session(&guard)
-                    };
-
-                    let status = if summary_skipped {
-                        Some(format!(
-                            "Switched to branch {target_id} (no summary: missing API key)"
-                        ))
-                    } else {
-                        Some(format!("Switched to branch {target_id}"))
-                    };
-
-                    let _ = event_tx.try_send(PiMsg::ConversationReset {
-                        messages,
-                        usage,
-                        status,
-                    });
-
-                    if let Some(manager) = extensions {
-                        let _ = manager
-                            .dispatch_event(
-                                ExtensionEventName::SessionSwitch,
-                                Some(json!({
-                                    "fromId": current_leaf_for_event,
-                                    "toId": target_id_for_event,
-                                    "sessionId": session_id_for_event,
-                                })),
-                            )
-                            .await;
-                    }
-                });
+                self.tree_ui = Some(TreeUiState::Selector(state));
             }
             SlashCommand::Fork => {
                 if self.agent_state != AgentState::Idle {
@@ -3574,6 +4644,121 @@ impl PiApp {
         });
     }
 
+    /// Load a session from a path (used by /resume session picker).
+    fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
+        let path = path.to_string();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        // Get the session_dir from current session to preserve it
+        let session_dir = {
+            let Ok(guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            guard.session_dir.clone()
+        };
+
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+
+            // Open the session from path
+            let mut loaded_session = match Session::open(&path).await {
+                Ok(s) => s,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to open session: {err}")));
+                    return;
+                }
+            };
+
+            // Preserve the session_dir from the current session
+            loaded_session.session_dir = session_dir;
+
+            // Get messages for agent from the loaded session
+            let messages_for_agent = loaded_session.to_messages_for_current_path();
+
+            // Lock and replace the session
+            {
+                let mut session_guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+                *session_guard = loaded_session;
+            }
+
+            // Update the agent's messages
+            {
+                let mut agent_guard = match agent.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        return;
+                    }
+                };
+                agent_guard.replace_messages(messages_for_agent);
+            }
+
+            // Get the messages and usage for UI
+            let (messages, usage) = {
+                let session_guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+                load_conversation_from_session(&session_guard)
+            };
+
+            // Notify UI to reset conversation
+            let _ = event_tx.try_send(PiMsg::ConversationReset {
+                messages,
+                usage,
+                status: Some("Session resumed".to_string()),
+            });
+        });
+
+        // Set loading state
+        self.status_message = Some("Loading session...".to_string());
+        None
+    }
+
+    /// Delete a session file, preferring `trash` CLI if available.
+    fn delete_session_file(&mut self, path: &str) {
+        use std::process::Command;
+
+        let path = PathBuf::from(path);
+
+        // Try to use trash CLI first for non-destructive deletion
+        let trash_result = Command::new("trash").arg(&path).output();
+
+        match trash_result {
+            Ok(output) if output.status.success() => {
+                self.status_message = Some("Session moved to trash".to_string());
+            }
+            _ => {
+                // Fallback to direct file removal
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        self.status_message = Some("Session deleted".to_string());
+                    }
+                    Err(err) => {
+                        self.status_message = Some(format!("Failed to delete session: {err}"));
+                    }
+                }
+            }
+        }
+    }
+
     /// Scroll the conversation viewport to the bottom.
     fn scroll_to_bottom(&mut self) {
         // Calculate total lines in conversation
@@ -3705,8 +4890,12 @@ impl PiApp {
         // Mode indicator
         let mode_style = Style::new().foreground("241");
         let mode_text = match self.input_mode {
-            InputMode::SingleLine => "[single-line] Enter to send",
-            InputMode::MultiLine => "[multi-line] Alt+Enter to send, Esc to cancel",
+            InputMode::SingleLine => {
+                "[single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)"
+            }
+            InputMode::MultiLine => {
+                "[multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)"
+            }
         };
         let _ = writeln!(output, "\n  {}", mode_style.render(mode_text));
 
@@ -3735,8 +4924,8 @@ impl PiApp {
         let input = self.total_usage.input;
         let output_tokens = self.total_usage.output;
         let mode_hint = match self.input_mode {
-            InputMode::SingleLine => "Alt+Enter: multi-line",
-            InputMode::MultiLine => "Esc: single-line",
+            InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
+            InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
         };
         let footer = format!(
             "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
@@ -3926,6 +5115,121 @@ impl PiApp {
             "\n  {}",
             hint_style.render("↑/↓ navigate  Enter/Tab accept  Esc cancel")
         );
+
+        output
+    }
+
+    /// Render the session picker overlay.
+    #[allow(clippy::unused_self)] // self kept for consistency with other render methods
+    fn render_session_picker(&self, picker: &SessionPickerOverlay) -> String {
+        let mut output = String::new();
+
+        // Styles
+        let title_style = Style::new().bold().foreground("212");
+        let border_style = Style::new().foreground("241");
+        let header_style = Style::new().foreground("241").bold();
+        let selected_style = Style::new().bold().foreground("cyan");
+        let normal_style = Style::new();
+        let hint_style = Style::new().foreground("241").italic();
+
+        // Header
+        let _ = writeln!(
+            output,
+            "\n  {}\n",
+            title_style.render("Select a session to resume")
+        );
+
+        if picker.sessions.is_empty() {
+            let dim_style = Style::new().foreground("241");
+            let _ = writeln!(
+                output,
+                "  {}",
+                dim_style.render("No sessions found for this project.")
+            );
+        } else {
+            // Column headers
+            let _ = writeln!(
+                output,
+                "  {:<20}  {:<30}  {:<8}  {}",
+                header_style.render("Time"),
+                header_style.render("Name"),
+                header_style.render("Messages"),
+                header_style.render("Session ID")
+            );
+            output.push_str("  ");
+            output.push_str(&"-".repeat(78));
+            output.push('\n');
+
+            // Calculate visible range with scrolling
+            let offset = picker.scroll_offset();
+            let visible_count = picker.max_visible.min(picker.sessions.len());
+            let end = (offset + visible_count).min(picker.sessions.len());
+
+            // Session rows
+            for (idx, session) in picker.sessions[offset..end].iter().enumerate() {
+                let global_idx = offset + idx;
+                let is_selected = global_idx == picker.selected;
+
+                let row_style = if is_selected {
+                    &selected_style
+                } else {
+                    &normal_style
+                };
+
+                let prefix = if is_selected { ">" } else { " " };
+                let time = crate::session_picker::format_time(&session.timestamp);
+                let name = session
+                    .name
+                    .as_deref()
+                    .unwrap_or("-")
+                    .chars()
+                    .take(28)
+                    .collect::<String>();
+                let messages = session.message_count.to_string();
+                let id = &session.id[..8.min(session.id.len())];
+
+                let _ = writeln!(
+                    output,
+                    "{prefix} {}",
+                    row_style.render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
+                );
+            }
+
+            // Scroll indicator
+            if picker.sessions.len() > visible_count {
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    border_style.render(&format!(
+                        "({}-{} of {})",
+                        offset + 1,
+                        end,
+                        picker.sessions.len()
+                    ))
+                );
+            }
+        }
+
+        // Delete confirmation or help text
+        output.push('\n');
+        if picker.confirm_delete {
+            if let Some(session) = picker.selected_session() {
+                let name = session.name.as_deref().unwrap_or(&session.id);
+                let warn_style = Style::new().foreground("yellow").bold();
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    warn_style.render(&format!("Delete session \"{name}\"? (y/n)"))
+                );
+            }
+        } else {
+            let _ = writeln!(
+                output,
+                "  {}",
+                hint_style
+                    .render("↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel")
+            );
+        }
 
         output
     }
@@ -4640,6 +5944,7 @@ pub async fn run_interactive(
         runtime_handle,
         save_enabled,
         extensions,
+        None,
     );
 
     // Run the TUI program

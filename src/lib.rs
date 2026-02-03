@@ -46,6 +46,7 @@ pub mod session;
 pub mod session_index;
 pub mod session_picker;
 pub mod sse;
+pub mod theme;
 pub mod tools;
 pub mod tui;
 pub mod vcr;

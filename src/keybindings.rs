@@ -668,6 +668,9 @@ impl KeyBinding {
             KeyType::CtrlK => ("k", KeyModifiers::CTRL),
             KeyType::CtrlL => ("l", KeyModifiers::CTRL),
             KeyType::Enter => ("enter", KeyModifiers::NONE),
+            KeyType::ShiftEnter => ("enter", KeyModifiers::SHIFT),
+            KeyType::CtrlEnter => ("enter", KeyModifiers::CTRL),
+            KeyType::CtrlShiftEnter => ("enter", KeyModifiers::CTRL_SHIFT),
             KeyType::CtrlN => ("n", KeyModifiers::CTRL),
             KeyType::CtrlO => ("o", KeyModifiers::CTRL),
             KeyType::CtrlP => ("p", KeyModifiers::CTRL),
@@ -1349,7 +1352,10 @@ impl KeyBindings {
         m.insert(AppAction::DeleteToLineEnd, vec![KeyBinding::ctrl("k")]);
 
         // Text Input
-        m.insert(AppAction::NewLine, vec![KeyBinding::shift("enter")]);
+        m.insert(
+            AppAction::NewLine,
+            vec![KeyBinding::shift("enter"), KeyBinding::ctrl("enter")],
+        );
         m.insert(AppAction::Submit, vec![KeyBinding::plain("enter")]);
         m.insert(AppAction::Tab, vec![KeyBinding::plain("tab")]);
 

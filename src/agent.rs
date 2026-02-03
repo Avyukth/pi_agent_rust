@@ -1332,6 +1332,23 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 mod tests {
     use super::*;
 
+    fn user_message(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    fn assert_user_text(message: &Message, expected: &str) {
+        match message {
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) => assert_eq!(text, expected),
+            other => panic!("expected user text message, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_extract_tool_calls() {
         let content = vec![
@@ -1362,5 +1379,78 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.max_tool_iterations, 50);
         assert!(config.system_prompt.is_none());
+    }
+
+    #[test]
+    fn message_queue_push_increments_seq_and_counts_both_queues() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        assert_eq!(queue.pending_count(), 0);
+
+        assert_eq!(queue.push_steering(user_message("s1")), 0);
+        assert_eq!(queue.push_follow_up(user_message("f1")), 1);
+        assert_eq!(queue.push_steering(user_message("s2")), 2);
+
+        assert_eq!(queue.pending_count(), 3);
+    }
+
+    #[test]
+    fn message_queue_pop_steering_one_at_a_time_preserves_order() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_steering(user_message("s1"));
+        queue.push_steering(user_message("s2"));
+
+        let first = queue.pop_steering();
+        assert_eq!(first.len(), 1);
+        assert_user_text(&first[0], "s1");
+        assert_eq!(queue.pending_count(), 1);
+
+        let second = queue.pop_steering();
+        assert_eq!(second.len(), 1);
+        assert_user_text(&second[0], "s2");
+        assert_eq!(queue.pending_count(), 0);
+
+        let empty = queue.pop_steering();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn message_queue_pop_respects_queue_modes_per_kind() {
+        let mut queue = MessageQueue::new(QueueMode::All, QueueMode::OneAtATime);
+        queue.push_steering(user_message("s1"));
+        queue.push_steering(user_message("s2"));
+        queue.push_follow_up(user_message("f1"));
+        queue.push_follow_up(user_message("f2"));
+
+        let steering = queue.pop_steering();
+        assert_eq!(steering.len(), 2);
+        assert_user_text(&steering[0], "s1");
+        assert_user_text(&steering[1], "s2");
+        assert_eq!(queue.pending_count(), 2);
+
+        let follow_up = queue.pop_follow_up();
+        assert_eq!(follow_up.len(), 1);
+        assert_user_text(&follow_up[0], "f1");
+        assert_eq!(queue.pending_count(), 1);
+
+        let follow_up = queue.pop_follow_up();
+        assert_eq!(follow_up.len(), 1);
+        assert_user_text(&follow_up[0], "f2");
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn message_queue_set_modes_applies_to_existing_messages() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_steering(user_message("s1"));
+        queue.push_steering(user_message("s2"));
+
+        let first = queue.pop_steering();
+        assert_eq!(first.len(), 1);
+        assert_user_text(&first[0], "s1");
+
+        queue.set_modes(QueueMode::All, QueueMode::OneAtATime);
+        let remaining = queue.pop_steering();
+        assert_eq!(remaining.len(), 1);
+        assert_user_text(&remaining[0], "s2");
     }
 }

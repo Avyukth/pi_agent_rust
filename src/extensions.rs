@@ -11,19 +11,723 @@ use asupersync::channel::{mpsc, oneshot};
 use asupersync::time::{timeout, wall_now};
 use async_trait::async_trait;
 use base64::Engine as _;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 pub const LOG_SCHEMA_VERSION: &str = "pi.ext.log.v1";
+pub const COMPAT_LEDGER_SCHEMA_VERSION: &str = "pi.ext.compat_ledger.v1";
+
+// ============================================================================
+// Compatibility Scanner (bd-3bs)
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatEvidence {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub snippet: String,
+}
+
+impl CompatEvidence {
+    #[must_use]
+    pub const fn new(file: String, line: usize, column: usize, snippet: String) -> Self {
+        Self {
+            file,
+            line,
+            column,
+            snippet,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatCapabilityEvidence {
+    pub capability: String,
+    pub reason: String,
+    pub evidence: Vec<CompatEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatRewriteEvidence {
+    pub from: String,
+    pub to: String,
+    pub evidence: Vec<CompatEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatIssueEvidence {
+    pub rule: String,
+    pub message: String,
+    pub evidence: Vec<CompatEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompatLedger {
+    pub schema: String,
+    pub capabilities: Vec<CompatCapabilityEvidence>,
+    pub rewrites: Vec<CompatRewriteEvidence>,
+    pub forbidden: Vec<CompatIssueEvidence>,
+    pub flagged: Vec<CompatIssueEvidence>,
+}
+
+impl CompatLedger {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            schema: COMPAT_LEDGER_SCHEMA_VERSION.to_string(),
+            capabilities: Vec::new(),
+            rewrites: Vec::new(),
+            forbidden: Vec::new(),
+            flagged: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+            && self.rewrites.is_empty()
+            && self.forbidden.is_empty()
+            && self.flagged.is_empty()
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompatibilityScanner {
+    root: PathBuf,
+}
+
+impl CompatibilityScanner {
+    #[must_use]
+    pub const fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn scan_path(&self, path: &Path) -> Result<CompatLedger> {
+        let files = collect_js_like_files(path)?;
+        Ok(self.scan_files(&files))
+    }
+
+    pub fn scan_root(&self) -> Result<CompatLedger> {
+        self.scan_path(&self.root)
+    }
+
+    fn scan_files(&self, files: &[PathBuf]) -> CompatLedger {
+        let mut caps: BTreeMap<(String, String, String), Vec<CompatEvidence>> = BTreeMap::new();
+        let mut rewrites: BTreeMap<(String, String), Vec<CompatEvidence>> = BTreeMap::new();
+        let mut forbidden: BTreeMap<(String, String, String), Vec<CompatEvidence>> =
+            BTreeMap::new();
+        let mut flagged: BTreeMap<(String, String, String), Vec<CompatEvidence>> = BTreeMap::new();
+
+        for path in files {
+            self.scan_file(path, &mut caps, &mut rewrites, &mut forbidden, &mut flagged);
+        }
+
+        let capabilities = caps
+            .into_iter()
+            .map(|((capability, reason, remediation), mut evidence)| {
+                sort_evidence(&mut evidence);
+                CompatCapabilityEvidence {
+                    capability,
+                    reason,
+                    evidence,
+                    remediation: if remediation.is_empty() {
+                        None
+                    } else {
+                        Some(remediation)
+                    },
+                }
+            })
+            .collect();
+
+        let rewrites = rewrites
+            .into_iter()
+            .map(|((from, to), mut evidence)| {
+                sort_evidence(&mut evidence);
+                CompatRewriteEvidence { from, to, evidence }
+            })
+            .collect();
+
+        let forbidden = forbidden
+            .into_iter()
+            .map(|((rule, message, remediation), mut evidence)| {
+                sort_evidence(&mut evidence);
+                CompatIssueEvidence {
+                    rule,
+                    message,
+                    evidence,
+                    remediation: if remediation.is_empty() {
+                        None
+                    } else {
+                        Some(remediation)
+                    },
+                }
+            })
+            .collect();
+
+        let flagged = flagged
+            .into_iter()
+            .map(|((rule, message, remediation), mut evidence)| {
+                sort_evidence(&mut evidence);
+                CompatIssueEvidence {
+                    rule,
+                    message,
+                    evidence,
+                    remediation: if remediation.is_empty() {
+                        None
+                    } else {
+                        Some(remediation)
+                    },
+                }
+            })
+            .collect();
+
+        CompatLedger {
+            schema: COMPAT_LEDGER_SCHEMA_VERSION.to_string(),
+            capabilities,
+            rewrites,
+            forbidden,
+            flagged,
+        }
+    }
+
+    fn scan_file(
+        &self,
+        path: &Path,
+        caps: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        rewrites: &mut BTreeMap<(String, String), Vec<CompatEvidence>>,
+        forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        let Ok(content) = fs::read_to_string(path) else {
+            return;
+        };
+
+        let rel = relative_posix(&self.root, path);
+
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let trimmed = line.trim_end().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            Self::scan_imports_in_line(&rel, line_no, &trimmed, caps, rewrites, forbidden, flagged);
+            Self::scan_pi_apis_in_line(&rel, line_no, &trimmed, caps);
+            Self::scan_flagged_apis_in_line(&rel, line_no, &trimmed, flagged);
+            Self::scan_forbidden_patterns_in_line(&rel, line_no, &trimmed, forbidden);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_imports_in_line(
+        file: &str,
+        line: usize,
+        text: &str,
+        caps: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        rewrites: &mut BTreeMap<(String, String), Vec<CompatEvidence>>,
+        forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        for (specifier, column) in extract_import_specifiers(text) {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            Self::classify_import(&specifier, evidence, caps, rewrites, forbidden, flagged);
+        }
+
+        for (specifier, column) in extract_require_specifiers(text) {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            Self::classify_import(&specifier, evidence, caps, rewrites, forbidden, flagged);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify_import(
+        specifier: &str,
+        evidence: CompatEvidence,
+        caps: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        rewrites: &mut BTreeMap<(String, String), Vec<CompatEvidence>>,
+        forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+        flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        let specifier = specifier.trim();
+        if specifier.is_empty() {
+            return;
+        }
+
+        let normalized = specifier.strip_prefix("node:").unwrap_or(specifier);
+        let module_root = normalized.split('/').next().unwrap_or(normalized);
+
+        if let Some(forbidden_reason) = forbidden_builtin_reason(module_root) {
+            forbidden
+                .entry((
+                    "forbidden_import".to_string(),
+                    format!("import of forbidden builtin `{specifier}`"),
+                    forbidden_reason.to_string(),
+                ))
+                .or_default()
+                .push(evidence);
+            return;
+        }
+
+        if let Some((to, inferred_caps, hint)) = rewrite_target_and_caps(normalized) {
+            rewrites
+                .entry((specifier.to_string(), to.to_string()))
+                .or_default()
+                .push(evidence.clone());
+
+            for cap in inferred_caps {
+                caps.entry((
+                    cap.to_string(),
+                    format!("import:{normalized}"),
+                    hint.to_string(),
+                ))
+                .or_default()
+                .push(evidence.clone());
+            }
+            return;
+        }
+
+        if looks_like_node_builtin(module_root) {
+            flagged
+                .entry((
+                    "unsupported_import".to_string(),
+                    format!("import of unsupported builtin `{specifier}`"),
+                    "No extc rewrite contract entry; replace with pi APIs or add a generic rewrite rule."
+                        .to_string(),
+                ))
+                .or_default()
+                .push(evidence);
+        }
+    }
+
+    fn scan_pi_apis_in_line(
+        file: &str,
+        line: usize,
+        text: &str,
+        caps: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        for (cap, reason, column) in extract_pi_capabilities(text) {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            caps.entry((cap, reason, String::new()))
+                .or_default()
+                .push(evidence);
+        }
+
+        if let Some(column) = find_substring_column(text, "process.env") {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            caps.entry((
+                "env".to_string(),
+                "process.env".to_string(),
+                "Declare `env` capability (scoped) or avoid reading host env vars.".to_string(),
+            ))
+            .or_default()
+            .push(evidence);
+        }
+    }
+
+    fn scan_flagged_apis_in_line(
+        file: &str,
+        line: usize,
+        text: &str,
+        flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        if let Some(column) = find_regex_column(text, new_function_regex()) {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            flagged
+                .entry((
+                    "flagged_api".to_string(),
+                    "new Function(...)".to_string(),
+                    "Avoid dynamic code generation when possible; prefer static bundling. If required, ensure the function body is a literal and keep it minimal."
+                        .to_string(),
+                ))
+                .or_default()
+                .push(evidence);
+        }
+
+        if let Some(column) = find_regex_column(text, eval_regex()) {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            flagged
+                .entry((
+                    "flagged_api".to_string(),
+                    "eval(...)".to_string(),
+                    "Avoid eval; prefer parsing/dispatch on structured data. If unavoidable, keep the evaluated string literal and log evidence."
+                        .to_string(),
+                ))
+                .or_default()
+                .push(evidence);
+        }
+    }
+
+    fn scan_forbidden_patterns_in_line(
+        file: &str,
+        line: usize,
+        text: &str,
+        forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
+    ) {
+        for (pattern, message, remediation) in forbidden_inline_patterns() {
+            if let Some(column) = find_substring_column(text, pattern) {
+                let evidence =
+                    CompatEvidence::new(file.to_string(), line, column, text.to_string());
+                forbidden
+                    .entry((
+                        "forbidden_api".to_string(),
+                        message.to_string(),
+                        remediation.to_string(),
+                    ))
+                    .or_default()
+                    .push(evidence);
+            }
+        }
+    }
+}
+
+fn collect_js_like_files(path: &Path) -> Result<Vec<PathBuf>> {
+    if path.is_file() {
+        if is_js_like(path) {
+            return Ok(vec![path.to_path_buf()]);
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    collect_js_like_files_recursive(path, &mut out)?;
+    out.sort_by_key(|entry| relative_posix(path, entry));
+    Ok(out)
+}
+
+fn collect_js_like_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if should_ignore_dir(&path) {
+                continue;
+            }
+            collect_js_like_files_recursive(&path, out)?;
+        } else if file_type.is_file() && is_js_like(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_ignore_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    matches!(name, "node_modules" | "target" | "dist" | ".git")
+}
+
+fn is_js_like(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(ext, "ts" | "js" | "tsx" | "jsx" | "mts" | "cts")
+}
+
+fn relative_posix(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn sort_evidence(evidence: &mut [CompatEvidence]) {
+    evidence.sort_by(|left, right| {
+        (&left.file, left.line, left.column, &left.snippet).cmp(&(
+            &right.file,
+            right.line,
+            right.column,
+            &right.snippet,
+        ))
+    });
+}
+
+fn find_substring_column(haystack: &str, needle: &str) -> Option<usize> {
+    haystack.find(needle).map(|idx| idx + 1)
+}
+
+fn find_regex_column(haystack: &str, regex: &Regex) -> Option<usize> {
+    regex.find(haystack).map(|m| m.start() + 1)
+}
+
+fn import_from_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\s*import(?:\s+type)?\s+[^;]*?\s+from\s+["']([^"']+)["']"#)
+            .expect("import from regex")
+    })
+}
+
+fn import_side_effect_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"^\s*import\s+["']([^"']+)["']"#).expect("import regex"))
+}
+
+fn import_dynamic_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"\bimport\s*\(\s*["']([^"']+)["']\s*\)"#).expect("import()"))
+}
+
+fn require_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"\brequire\s*\(\s*["']([^"']+)["']\s*\)"#).expect("require"))
+}
+
+fn new_function_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bnew\s+Function\s*\(").expect("new Function"))
+}
+
+fn eval_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\beval\s*\(").expect("eval"))
+}
+
+fn pi_tool_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"\bpi\.tool\s*\(\s*["']([^"']+)["']"#).expect("pi.tool"))
+}
+
+fn pi_exec_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bpi\.exec\s*\(").expect("pi.exec"))
+}
+
+fn pi_http_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bpi\.http\s*\(").expect("pi.http"))
+}
+
+fn pi_log_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bpi\.log\s*\(").expect("pi.log"))
+}
+
+fn pi_session_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bpi\.session\.").expect("pi.session"))
+}
+
+fn pi_ui_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bpi\.ui\.").expect("pi.ui"))
+}
+
+fn extract_import_specifiers(line: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+
+    if let Some(caps) = import_from_regex().captures(line) {
+        if let Some(m) = caps.get(1) {
+            out.push((m.as_str().to_string(), m.start() + 1));
+        }
+    }
+
+    if let Some(caps) = import_side_effect_regex().captures(line) {
+        if let Some(m) = caps.get(1) {
+            out.push((m.as_str().to_string(), m.start() + 1));
+        }
+    }
+
+    for caps in import_dynamic_regex().captures_iter(line) {
+        if let Some(m) = caps.get(1) {
+            out.push((m.as_str().to_string(), m.start() + 1));
+        }
+    }
+
+    out
+}
+
+fn extract_require_specifiers(line: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for caps in require_regex().captures_iter(line) {
+        if let Some(m) = caps.get(1) {
+            out.push((m.as_str().to_string(), m.start() + 1));
+        }
+    }
+    out
+}
+
+fn extract_pi_capabilities(line: &str) -> Vec<(String, String, usize)> {
+    let mut out = Vec::new();
+
+    for caps in pi_tool_regex().captures_iter(line) {
+        let Some(tool) = caps.get(1) else { continue };
+        let tool_name = tool.as_str().trim().to_ascii_lowercase();
+        let (capability, reason) = match tool_name.as_str() {
+            "read" | "grep" | "find" | "ls" => ("read", format!("pi.tool({tool_name})")),
+            "write" | "edit" => ("write", format!("pi.tool({tool_name})")),
+            "bash" => ("exec", "pi.tool(bash)".to_string()),
+            _ => ("tool", format!("pi.tool({tool_name})")),
+        };
+        out.push((capability.to_string(), reason, tool.start() + 1));
+    }
+
+    if let Some(column) = find_regex_column(line, pi_exec_regex()) {
+        out.push(("exec".to_string(), "pi.exec".to_string(), column));
+    }
+
+    if let Some(column) = find_regex_column(line, pi_http_regex()) {
+        out.push(("http".to_string(), "pi.http".to_string(), column));
+    }
+
+    if let Some(column) = find_regex_column(line, pi_log_regex()) {
+        out.push(("log".to_string(), "pi.log".to_string(), column));
+    }
+
+    if let Some(column) = find_regex_column(line, pi_session_regex()) {
+        out.push(("session".to_string(), "pi.session.*".to_string(), column));
+    }
+
+    if let Some(column) = find_regex_column(line, pi_ui_regex()) {
+        out.push(("ui".to_string(), "pi.ui.*".to_string(), column));
+    }
+
+    out
+}
+
+fn forbidden_builtin_reason(module_root: &str) -> Option<&'static str> {
+    match module_root {
+        "vm" => Some("Arbitrary code execution; use hostcalls only."),
+        "worker_threads" | "cluster" => Some("Unsupported concurrency model; use PiJS scheduler."),
+        "dgram" => Some("Raw UDP sockets are not supported."),
+        "net" | "tls" => Some("Raw sockets bypass HTTP policy; use fetch/pi.http."),
+        "inspector" => Some("Debugger access is not allowed."),
+        "perf_hooks" => Some("Timing oracle; use host-provided timing APIs if needed."),
+        "v8" => Some("Engine internals are not allowed."),
+        "repl" => Some("Interactive eval is not allowed."),
+        _ => None,
+    }
+}
+
+fn rewrite_target_and_caps(
+    normalized: &str,
+) -> Option<(&'static str, Vec<&'static str>, &'static str)> {
+    match normalized {
+        "fs" | "node:fs" => Some((
+            "pi:node/fs",
+            vec!["read", "write"],
+            "Extc rewrites to `pi:node/fs`; declare `read`/`write` capabilities or use `pi.tool(...)` directly.",
+        )),
+        "fs/promises" | "node:fs/promises" => Some((
+            "pi:node/fs_promises",
+            vec!["read", "write"],
+            "Extc rewrites to `pi:node/fs_promises`; declare `read`/`write` capabilities or use `pi.tool(...)` directly.",
+        )),
+        "path" | "node:path" => Some((
+            "pi:node/path",
+            Vec::new(),
+            "Extc rewrites to `pi:node/path` (pure).",
+        )),
+        "os" | "node:os" => Some((
+            "pi:node/os",
+            vec!["env"],
+            "Extc rewrites to `pi:node/os`; declare `env` capability (scoped) when reading host-derived values.",
+        )),
+        "url" | "node:url" => Some((
+            "pi:node/url",
+            Vec::new(),
+            "Extc rewrites to `pi:node/url` (pure).",
+        )),
+        "crypto" | "node:crypto" => Some((
+            "pi:node/crypto",
+            Vec::new(),
+            "Extc rewrites to `pi:node/crypto` (pure).",
+        )),
+        "child_process" | "node:child_process" => Some((
+            "pi:node/child_process",
+            vec!["exec"],
+            "Extc rewrites to `pi:node/child_process`; declare `exec` or use `pi.exec(...)`.",
+        )),
+        "module" | "node:module" => Some((
+            "pi:node/module",
+            Vec::new(),
+            "Extc rewrites to `pi:node/module`.",
+        )),
+        _ => None,
+    }
+}
+
+fn looks_like_node_builtin(module_root: &str) -> bool {
+    // Heuristic: common Node builtin module names. If it matches, we treat it as a builtin.
+    // This keeps the scanner conservative without needing a full Node builtin registry.
+    matches!(
+        module_root,
+        "assert"
+            | "buffer"
+            | "child_process"
+            | "cluster"
+            | "console"
+            | "constants"
+            | "crypto"
+            | "dgram"
+            | "dns"
+            | "domain"
+            | "events"
+            | "fs"
+            | "http"
+            | "https"
+            | "inspector"
+            | "module"
+            | "net"
+            | "os"
+            | "path"
+            | "perf_hooks"
+            | "process"
+            | "punycode"
+            | "querystring"
+            | "readline"
+            | "repl"
+            | "stream"
+            | "string_decoder"
+            | "sys"
+            | "timers"
+            | "tls"
+            | "tty"
+            | "url"
+            | "util"
+            | "v8"
+            | "vm"
+            | "worker_threads"
+            | "zlib"
+    )
+}
+
+fn forbidden_inline_patterns() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "process.binding(",
+            "process.binding(...)",
+            "Native module access is forbidden; remove this usage.",
+        ),
+        (
+            "process.dlopen(",
+            "process.dlopen(...)",
+            "Native addon loading is forbidden; remove this usage.",
+        ),
+    ]
+}
 
 // ============================================================================
 // Policy

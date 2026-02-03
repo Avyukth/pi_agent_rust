@@ -2,42 +2,47 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pi Extension Manifest",
   "type": "object",
-  "required": ["schema", "extension_id", "name", "version", "api_version", "runtime", "entrypoint"],
+  "required": [
+    "schema",
+    "extension_id",
+    "name",
+    "version",
+    "api_version",
+    "runtime",
+    "entrypoint"
+  ],
   "properties": {
-    "schema": {
-      "type": "string",
-      "enum": ["pi.ext.manifest.v1"],
-      "description": "Manifest schema identifier"
-    },
+    "schema": { "type": "string", "enum": ["pi.ext.manifest.v1"] },
     "extension_id": {
       "type": "string",
-      "description": "Stable identifier used in logs and harness fixtures"
+      "description": "Stable extension identifier. Used for install dirs, policy decisions, and log correlation.",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
     },
-    "name": { "type": "string" },
-    "version": { "type": "string" },
-    "api_version": {
-      "type": "string",
-      "description": "Extension protocol version (e.g., 1.0)"
-    },
+    "name": { "type": "string", "description": "Human-readable display name." },
+    "version": { "type": "string", "description": "Extension version (semver recommended)." },
+    "description": { "type": "string" },
     "runtime": {
       "type": "string",
-      "enum": ["js", "wasm"],
-      "description": "Extension runtime tier"
+      "description": "Runtime that executes the entrypoint.",
+      "enum": ["js", "wasm"]
     },
     "entrypoint": {
       "type": "string",
-      "description": "Entrypoint path relative to extension root"
+      "description": "Relative path to the extension entry module (PiJS) or component (WASM)."
+    },
+    "api_version": {
+      "type": "string",
+      "description": "Protocol API version expected by the extension runtime (e.g. register payload api_version).",
+      "default": "1.0"
     },
     "capabilities": {
       "type": "array",
-      "items": { "type": "string" },
-      "description": "Legacy flat capability list (coarse)"
+      "description": "Legacy flat capability list (coarse). Prefer capability_manifest.",
+      "items": { "type": "string" }
     },
-    "capability_manifest": { "$ref": "#/$defs/capability_manifest" },
-    "metadata": {
-      "type": "object",
-      "description": "Arbitrary non-policy metadata",
-      "additionalProperties": true
+    "capability_manifest": {
+      "description": "Structured, scoped capability requirements requested by the extension.",
+      "$ref": "#/$defs/capability_manifest"
     }
   },
   "additionalProperties": false,
