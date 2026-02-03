@@ -20,7 +20,9 @@ use bubbles::spinner::{SpinnerModel, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, batch, quit};
+use chrono::Utc;
 use crossterm::terminal;
+use futures::future::BoxFuture;
 use glamour::{Renderer as MarkdownRenderer, Style as GlamourStyle};
 use lipgloss::Style;
 use serde_json::{Value, json};
@@ -32,7 +34,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::agent::{AbortHandle, Agent, AgentEvent};
+use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind, AutocompleteProvider,
     AutocompleteResponse,
@@ -49,7 +51,7 @@ use crate::extensions::{
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
     AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, ThinkingLevel, Usage,
-    UserContent,
+    UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
 use crate::package_manager::PackageManager;
@@ -242,6 +244,69 @@ pub enum PendingInput {
     Content(Vec<ContentBlock>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedMessageKind {
+    Steering,
+    FollowUp,
+}
+
+#[derive(Debug)]
+struct InteractiveMessageQueue {
+    steering: VecDeque<String>,
+    follow_up: VecDeque<String>,
+    steering_mode: QueueMode,
+    follow_up_mode: QueueMode,
+}
+
+impl InteractiveMessageQueue {
+    const fn new(steering_mode: QueueMode, follow_up_mode: QueueMode) -> Self {
+        Self {
+            steering: VecDeque::new(),
+            follow_up: VecDeque::new(),
+            steering_mode,
+            follow_up_mode,
+        }
+    }
+
+    const fn set_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
+        self.steering_mode = steering_mode;
+        self.follow_up_mode = follow_up_mode;
+    }
+
+    fn push_steering(&mut self, text: String) {
+        self.steering.push_back(text);
+    }
+
+    fn push_follow_up(&mut self, text: String) {
+        self.follow_up.push_back(text);
+    }
+
+    fn pop_steering(&mut self) -> Vec<String> {
+        self.pop_kind(QueuedMessageKind::Steering)
+    }
+
+    fn pop_follow_up(&mut self) -> Vec<String> {
+        self.pop_kind(QueuedMessageKind::FollowUp)
+    }
+
+    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<String> {
+        let (queue, mode) = match kind {
+            QueuedMessageKind::Steering => (&mut self.steering, self.steering_mode),
+            QueuedMessageKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
+        };
+        match mode {
+            QueueMode::All => queue.drain(..).collect(),
+            QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
+        }
+    }
+
+    fn clear_all(&mut self) -> (Vec<String>, Vec<String>) {
+        let steering = self.steering.drain(..).collect();
+        let follow_up = self.follow_up.drain(..).collect();
+        (steering, follow_up)
+    }
+}
+
 /// The main interactive TUI application model.
 #[derive(bubbletea::Model)]
 pub struct PiApp {
@@ -251,6 +316,7 @@ pub struct PiApp {
     history_index: Option<usize>,
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
+    message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
 
     // Display state - viewport for scrollable conversation
     conversation_viewport: Viewport,
@@ -507,6 +573,7 @@ pub enum MessageRole {
 impl PiApp {
     /// Create a new Pi application.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         agent: Agent,
         session: Session,
@@ -561,6 +628,49 @@ impl PiApp {
         let model_entry_shared = Arc::new(StdMutex::new(model_entry.clone()));
         let extension_streaming = Arc::new(AtomicBool::new(false));
         let extension_compacting = Arc::new(AtomicBool::new(false));
+        let steering_mode = parse_queue_mode(config.steering_mode.as_deref());
+        let follow_up_mode = parse_queue_mode(config.follow_up_mode.as_deref());
+        let message_queue = Arc::new(StdMutex::new(InteractiveMessageQueue::new(
+            steering_mode,
+            follow_up_mode,
+        )));
+
+        let mut agent = agent;
+        agent.set_queue_modes(steering_mode, follow_up_mode);
+        {
+            let steering_queue = Arc::clone(&message_queue);
+            let follow_up_queue = Arc::clone(&message_queue);
+            let steering_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+                let steering_queue = Arc::clone(&steering_queue);
+                Box::pin(async move {
+                    let Ok(mut queue) = steering_queue.lock() else {
+                        return Vec::new();
+                    };
+                    queue
+                        .pop_steering()
+                        .into_iter()
+                        .map(build_user_message)
+                        .collect()
+                })
+            };
+            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+                let follow_up_queue = Arc::clone(&follow_up_queue);
+                Box::pin(async move {
+                    let Ok(mut queue) = follow_up_queue.lock() else {
+                        return Vec::new();
+                    };
+                    queue
+                        .pop_follow_up()
+                        .into_iter()
+                        .map(build_user_message)
+                        .collect()
+                })
+            };
+            agent.set_message_fetchers(
+                Some(Arc::new(steering_fetcher)),
+                Some(Arc::new(follow_up_fetcher)),
+            );
+        }
 
         // Load keybindings from user config (with defaults as fallback)
         let keybindings_result = KeyBindings::load_from_user_config();
@@ -582,6 +692,7 @@ impl PiApp {
             history_index: None,
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
+            message_queue,
             conversation_viewport,
             spinner,
             agent_state: AgentState::Idle,
@@ -1162,6 +1273,91 @@ impl PiApp {
         match next {
             PendingInput::Text(text) => self.submit_message(&text),
             PendingInput::Content(content) => self.submit_content(content),
+        }
+    }
+
+    fn queue_input(&mut self, kind: QueuedMessageKind) {
+        let raw_text = self.input.value();
+        let trimmed = raw_text.trim();
+        if trimmed.is_empty() {
+            self.status_message = Some("No input to queue".to_string());
+            return;
+        }
+
+        if let Some((command, _args)) = parse_extension_command(trimmed) {
+            if let Some(manager) = &self.extensions {
+                if manager.has_command(&command) {
+                    self.status_message = Some(format!(
+                        "Extension command '/{command}' cannot be queued while busy"
+                    ));
+                    return;
+                }
+            }
+        }
+
+        let expanded = self.resources.expand_input(trimmed);
+
+        // Track input history
+        self.input_history.push(trimmed.to_string());
+        self.history_index = None;
+
+        if let Ok(mut queue) = self.message_queue.lock() {
+            match kind {
+                QueuedMessageKind::Steering => queue.push_steering(expanded),
+                QueuedMessageKind::FollowUp => queue.push_follow_up(expanded),
+            }
+        }
+
+        // Clear input and reset to single-line mode
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.input.set_height(3);
+
+        let label = match kind {
+            QueuedMessageKind::Steering => "steering",
+            QueuedMessageKind::FollowUp => "follow-up",
+        };
+        self.status_message = Some(format!("Queued {label} message"));
+    }
+
+    fn restore_queued_messages_to_editor(&mut self, abort: bool) -> usize {
+        let (steering, follow_up) = self
+            .message_queue
+            .lock()
+            .map_or_else(|_| (Vec::new(), Vec::new()), |mut queue| queue.clear_all());
+        let mut all = steering;
+        all.extend(follow_up);
+        if all.is_empty() {
+            if abort {
+                self.abort_agent();
+            }
+            return 0;
+        }
+
+        let queued_text = all.join("\n\n");
+        let current_text = self.input.value();
+        let combined = [queued_text, current_text]
+            .into_iter()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.input.set_value(&combined);
+        if combined.contains('\n') {
+            self.input_mode = InputMode::MultiLine;
+            self.input.set_height(6);
+        }
+        self.input.focus();
+
+        if abort {
+            self.abort_agent();
+        }
+
+        all.len()
+    }
+
+    fn abort_agent(&self) {
+        if let Some(handle) = &self.abort_handle {
+            handle.abort();
         }
     }
 
@@ -1783,10 +1979,15 @@ impl PiApp {
             AppAction::Interrupt => {
                 // Escape: Abort if processing, otherwise context-dependent
                 if self.agent_state != AgentState::Idle {
-                    if let Some(handle) = &self.abort_handle {
-                        handle.abort();
+                    let restored = self.restore_queued_messages_to_editor(true);
+                    if restored > 0 {
+                        self.status_message = Some(format!(
+                            "Restored {restored} queued message{}",
+                            if restored == 1 { "" } else { "s" }
+                        ));
+                    } else {
+                        self.status_message = Some("Aborting request...".to_string());
                     }
-                    self.status_message = Some("Aborting request...".to_string());
                     return None;
                 }
                 // When idle, Escape exits multi-line mode (but does NOT quit)
@@ -1881,6 +2082,10 @@ impl PiApp {
             // =========================================================
             AppAction::Submit => {
                 // Enter: Submit in single-line mode, forward to TextArea in multi-line
+                if self.agent_state != AgentState::Idle {
+                    self.queue_input(QueuedMessageKind::Steering);
+                    return None;
+                }
                 if self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine
                 {
                     let value = self.input.value();
@@ -1893,6 +2098,10 @@ impl PiApp {
             }
             AppAction::FollowUp => {
                 // Alt+Enter: Toggle multi-line or submit in multi-line mode
+                if self.agent_state != AgentState::Idle {
+                    self.queue_input(QueuedMessageKind::FollowUp);
+                    return None;
+                }
                 if self.agent_state == AgentState::Idle {
                     if self.input_mode == InputMode::MultiLine {
                         let value = self.input.value();
@@ -1952,6 +2161,22 @@ impl PiApp {
             }
 
             // =========================================================
+            // Message queue actions
+            // =========================================================
+            AppAction::Dequeue => {
+                let restored = self.restore_queued_messages_to_editor(false);
+                if restored == 0 {
+                    self.status_message = Some("No queued messages to restore".to_string());
+                } else {
+                    self.status_message = Some(format!(
+                        "Restored {restored} queued message{}",
+                        if restored == 1 { "" } else { "s" }
+                    ));
+                }
+                None
+            }
+
+            // =========================================================
             // Actions not yet implemented - let through to component
             // =========================================================
             _ => {
@@ -1970,8 +2195,11 @@ impl PiApp {
         match action {
             // History navigation and Submit consume in single-line mode (otherwise TextArea
             // handles arrow keys or inserts a newline on Enter)
-            AppAction::CursorUp | AppAction::CursorDown | AppAction::Submit => {
+            AppAction::CursorUp | AppAction::CursorDown => {
                 self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine
+            }
+            AppAction::Submit => {
+                self.agent_state != AgentState::Idle || self.input_mode == InputMode::SingleLine
             }
 
             // Exit (Ctrl+D) only consumed when editor is empty (otherwise deleteCharForward)
@@ -1987,6 +2215,7 @@ impl PiApp {
             AppAction::PageUp
             | AppAction::PageDown
             | AppAction::FollowUp
+            | AppAction::Dequeue
             | AppAction::Interrupt
             | AppAction::Clear
             | AppAction::Copy
@@ -3939,6 +4168,21 @@ fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
     }
     let args = parts.map(ToString::to_string).collect::<Vec<_>>();
     Some((cmd.to_string(), args))
+}
+
+fn parse_queue_mode(mode: Option<&str>) -> QueueMode {
+    match mode {
+        Some("all") => QueueMode::All,
+        _ => QueueMode::OneAtATime,
+    }
+}
+
+fn build_user_message(text: String) -> ModelMessage {
+    let timestamp = Utc::now().timestamp_millis();
+    ModelMessage::User(UserMessage {
+        content: UserContent::Text(text),
+        timestamp,
+    })
 }
 
 fn extension_model_from_entry(entry: &ModelEntry) -> Value {

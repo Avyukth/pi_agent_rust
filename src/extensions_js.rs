@@ -24,12 +24,9 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::scheduler::{
-    Clock as SchedulerClock, DeterministicClock, HostcallOutcome, Macrotask as SchedulerMacrotask,
-    MacrotaskKind as SchedulerMacrotaskKind, Scheduler, WallClock,
-};
+use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, Scheduler, WallClock};
 use rquickjs::function::Func;
-use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Function, IntoJs, Object, Promise, Value};
+use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Function, IntoJs, Object, Value};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -326,26 +323,27 @@ impl<'js> PendingHostcalls<'js> {
     }
 }
 
-impl<'js> Default for PendingHostcalls<'js> {
+impl Default for PendingHostcalls<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// Convert a serde_json::Value to a rquickjs Value.
+#[allow(clippy::option_if_let_else)]
 fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
     match value {
         serde_json::Value::Null => Ok(Value::new_null(ctx.clone())),
         serde_json::Value::Bool(b) => Ok(Value::new_bool(ctx.clone(), *b)),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Value::new_int(ctx.clone(), i as i32))
-            } else if let Some(f) = n.as_f64() {
-                Ok(Value::new_float(ctx.clone(), f))
-            } else {
-                Ok(Value::new_null(ctx.clone()))
-            }
-        }
+        serde_json::Value::Number(n) => n.as_i64().and_then(|i| i32::try_from(i).ok()).map_or_else(
+            || {
+                n.as_f64().map_or_else(
+                    || Ok(Value::new_null(ctx.clone())),
+                    |f| Ok(Value::new_float(ctx.clone(), f)),
+                )
+            },
+            |i| Ok(Value::new_int(ctx.clone(), i)),
+        ),
         serde_json::Value::String(s) => s.clone().into_js(ctx),
         serde_json::Value::Array(arr) => {
             let js_arr = rquickjs::Array::new(ctx.clone())?;
@@ -367,7 +365,7 @@ fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Resul
 }
 
 /// Convert a rquickjs Value to a serde_json::Value.
-fn js_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<serde_json::Value> {
+fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Value> {
     if value.is_null() || value.is_undefined() {
         return Ok(serde_json::Value::Null);
     }
@@ -387,16 +385,16 @@ fn js_to_json<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> rquickjs::Result<serde_
     if let Some(arr) = value.as_array() {
         let mut result = Vec::new();
         for i in 0..arr.len() {
-            let v: Value<'js> = arr.get(i)?;
-            result.push(js_to_json(ctx, v)?);
+            let v: Value<'_> = arr.get(i)?;
+            result.push(js_to_json(&v)?);
         }
         return Ok(serde_json::Value::Array(result));
     }
     if let Some(obj) = value.as_object() {
         let mut result = serde_json::Map::new();
-        for item in obj.props::<String, Value<'js>>() {
+        for item in obj.props::<String, Value<'_>>() {
             let (k, v) = item?;
-            result.insert(k, js_to_json(ctx, v)?);
+            result.insert(k, js_to_json(&v)?);
         }
         return Ok(serde_json::Value::Object(result));
     }
@@ -748,8 +746,10 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     trace_seq: AtomicU64,
 }
 
+#[allow(clippy::future_not_send)]
 impl PiJsRuntime<WallClock> {
     /// Create a new PiJS runtime with the default wall clock.
+    #[allow(clippy::future_not_send)]
     pub async fn new() -> Result<Self> {
         Self::with_clock(WallClock).await
     }
@@ -758,6 +758,7 @@ impl PiJsRuntime<WallClock> {
 #[allow(clippy::future_not_send)]
 impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Create a new PiJS runtime with a custom clock.
+    #[allow(clippy::future_not_send)]
     pub async fn with_clock(clock: C) -> Result<Self> {
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
         let context = AsyncContext::full(&runtime)
@@ -869,7 +870,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             // Handle the macrotask inside the JS context
             self.context
                 .with(|ctx| {
-                    self.handle_macrotask(&ctx, &task)?;
+                    Self::handle_macrotask(&ctx, &task)?;
                     Ok::<_, rquickjs::Error>(())
                 })
                 .await
@@ -901,11 +902,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Handle a macrotask by resolving/rejecting Promises or dispatching events.
-    fn handle_macrotask(
-        &self,
-        ctx: &Ctx<'_>,
-        task: &crate::scheduler::Macrotask,
-    ) -> rquickjs::Result<()> {
+    fn handle_macrotask(ctx: &Ctx<'_>, task: &crate::scheduler::Macrotask) -> rquickjs::Result<()> {
         use crate::scheduler::MacrotaskKind as SMK;
 
         match &task.kind {
@@ -918,7 +915,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 );
                 // The actual Promise resolution is handled by the global
                 // __pi_complete_hostcall function installed in JS
-                self.deliver_hostcall_completion(ctx, call_id, outcome)?;
+                Self::deliver_hostcall_completion(ctx, call_id, outcome)?;
             }
             SMK::TimerFired { timer_id } => {
                 tracing::debug!(
@@ -928,7 +925,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "Timer fired"
                 );
                 // Timer callbacks are stored in a JS-side map
-                self.deliver_timer_fire(ctx, *timer_id)?;
+                Self::deliver_timer_fire(ctx, *timer_id)?;
             }
             SMK::InboundEvent { event_id, payload } => {
                 tracing::debug!(
@@ -937,7 +934,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     seq = task.seq.value(),
                     "Delivering inbound event"
                 );
-                self.deliver_inbound_event(ctx, event_id, payload)?;
+                Self::deliver_inbound_event(ctx, event_id, payload)?;
             }
         }
         Ok(())
@@ -945,7 +942,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Deliver a hostcall completion to JS.
     fn deliver_hostcall_completion(
-        &self,
         ctx: &Ctx<'_>,
         call_id: &str,
         outcome: &HostcallOutcome,
@@ -972,7 +968,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Deliver a timer fire event to JS.
-    fn deliver_timer_fire(&self, ctx: &Ctx<'_>, timer_id: u64) -> rquickjs::Result<()> {
+    fn deliver_timer_fire(ctx: &Ctx<'_>, timer_id: u64) -> rquickjs::Result<()> {
         let global = ctx.globals();
         let fire_fn: Function<'_> = global.get("__pi_fire_timer")?;
         fire_fn.call::<_, ()>((timer_id,))?;
@@ -981,7 +977,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Deliver an inbound event to JS.
     fn deliver_inbound_event(
-        &self,
         ctx: &Ctx<'_>,
         event_id: &str,
         payload: &serde_json::Value,
@@ -999,6 +994,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Install the pi.* bridge with Promise-returning hostcall methods.
+    ///
+    /// The bridge uses a two-layer design:
+    /// 1. Rust native functions (`__pi_*_native`) that return call_id strings
+    /// 2. JS wrappers (`pi.*`) that create Promises and register them
+    ///
+    /// This avoids lifetime issues with returning Promises from Rust closures.
+    #[allow(clippy::too_many_lines)]
     async fn install_pi_bridge(&self) -> Result<()> {
         let hostcall_queue = self.hostcall_queue.clone();
 
@@ -1006,214 +1008,147 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .with(|ctx| {
                 let global = ctx.globals();
 
-                // Install the pending hostcalls storage and helper functions
-                ctx.eval::<(), _>(PI_BRIDGE_JS)?;
+                // Install native functions that return call_ids
+                // These are wrapped by JS to create Promises
 
-                // Create the pi object
-                let pi = Object::new(ctx.clone())?;
-
-                // Helper to create a hostcall function
-                let queue = hostcall_queue.clone();
-                let make_hostcall =
-                    |kind_factory: fn(String, serde_json::Value) -> HostcallKind| {
-                        let queue = queue.clone();
-                        move |ctx: Ctx<'_>,
-                              name: String,
-                              input: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, input)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            // Get call_id from JS bridge
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
-                            // Enqueue the hostcall request
-                            let request = HostcallRequest {
-                                call_id,
-                                kind: kind_factory(name, payload.clone()),
-                                payload,
-                                trace_id: 0, // Will be set by scheduler
-                            };
-                            queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
-                        }
-                    };
-
-                // pi.tool(name, input)
-                pi.set(
-                    "tool",
+                // __pi_tool_native(name, input) -> call_id
+                global.set(
+                    "__pi_tool_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>,
+                        move |_ctx: Ctx<'_>,
                               name: String,
                               input: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, input)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                              -> rquickjs::Result<String> {
+                            let payload = js_to_json(&input)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Tool { name },
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                // pi.exec(cmd, args)
-                pi.set(
-                    "exec",
+                // __pi_exec_native(cmd, args) -> call_id
+                global.set(
+                    "__pi_exec_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>,
+                        move |_ctx: Ctx<'_>,
                               cmd: String,
                               args: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, args)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                              -> rquickjs::Result<String> {
+                            let payload = js_to_json(&args)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Exec { cmd },
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                // pi.http(request)
-                pi.set(
-                    "http",
+                // __pi_http_native(request) -> call_id
+                global.set(
+                    "__pi_http_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, req)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                        move |_ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<String> {
+                            let payload = js_to_json(&req)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Http,
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                // pi.session(op, args)
-                pi.set(
-                    "session",
+                // __pi_session_native(op, args) -> call_id
+                global.set(
+                    "__pi_session_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>,
+                        move |_ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, args)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                              -> rquickjs::Result<String> {
+                            let payload = js_to_json(&args)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Session { op },
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                // pi.ui(op, args)
-                pi.set(
-                    "ui",
+                // __pi_ui_native(op, args) -> call_id
+                global.set(
+                    "__pi_ui_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>,
+                        move |_ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, args)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                              -> rquickjs::Result<String> {
+                            let payload = js_to_json(&args)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Ui { op },
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                // pi.events(op, args)
-                pi.set(
-                    "events",
+                // __pi_events_native(op, args) -> call_id
+                global.set(
+                    "__pi_events_native",
                     Func::from({
                         let queue = hostcall_queue.clone();
-                        move |ctx: Ctx<'_>,
+                        move |_ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
-                              -> rquickjs::Result<Promise<'_>> {
-                            let payload = js_to_json(&ctx, args)?;
-                            let (promise, resolve, reject) = Promise::new(&ctx)?;
-
-                            let global = ctx.globals();
-                            let register_fn: Function<'_> = global.get("__pi_register_hostcall")?;
-                            let call_id: String = register_fn.call((resolve, reject))?;
-
+                              -> rquickjs::Result<String> {
+                            let payload = js_to_json(&args)?;
+                            let call_id = format!("call-{}", generate_call_id());
                             let request = HostcallRequest {
-                                call_id,
+                                call_id: call_id.clone(),
                                 kind: HostcallKind::Events { op },
                                 payload,
                                 trace_id: 0,
                             };
                             queue.borrow_mut().push_back(request);
-
-                            Ok(promise)
+                            Ok(call_id)
                         }
                     }),
                 )?;
 
-                global.set("pi", pi)?;
+                // Install the JS bridge that creates Promises and wraps the native functions
+                ctx.eval::<(), _>(PI_BRIDGE_JS)?;
+
                 Ok(())
             })
             .await
@@ -1223,24 +1158,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 }
 
+/// Generate a unique call_id using a thread-local counter.
+fn generate_call_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// JavaScript bridge code for managing pending hostcalls and timer callbacks.
-const PI_BRIDGE_JS: &str = r#"
+///
+/// This code creates the `pi` global object with Promise-returning methods.
+/// Each method wraps a native Rust function (`__pi_*_native`) that returns a call_id.
+const PI_BRIDGE_JS: &str = r"
 // Pending hostcalls: call_id -> { resolve, reject }
 const __pi_pending_hostcalls = new Map();
-let __pi_next_call_id = 1;
 
 // Timer callbacks: timer_id -> callback
 const __pi_timer_callbacks = new Map();
 
 // Event listeners: event_id -> [callback, ...]
 const __pi_event_listeners = new Map();
-
-// Register a new pending hostcall, returns the call_id
-function __pi_register_hostcall(resolve, reject) {
-    const call_id = `call-${__pi_next_call_id++}`;
-    __pi_pending_hostcalls.set(call_id, { resolve, reject });
-    return call_id;
-}
 
 // Complete a hostcall (called from Rust)
 function __pi_complete_hostcall(call_id, outcome) {
@@ -1315,11 +1252,46 @@ function __pi_remove_event_listener(event_id, callback) {
         }
     }
 }
-"#;
+
+// Helper to create a Promise-returning hostcall wrapper
+function __pi_make_hostcall(nativeFn) {
+    return function(...args) {
+        return new Promise((resolve, reject) => {
+            const call_id = nativeFn(...args);
+            __pi_pending_hostcalls.set(call_id, { resolve, reject });
+        });
+    };
+}
+
+// Create the pi global object with Promise-returning methods
+const pi = {
+    // pi.tool(name, input) - invoke a tool
+    tool: __pi_make_hostcall(__pi_tool_native),
+
+    // pi.exec(cmd, args) - execute a shell command
+    exec: __pi_make_hostcall(__pi_exec_native),
+
+    // pi.http(request) - make an HTTP request
+    http: __pi_make_hostcall(__pi_http_native),
+
+    // pi.session(op, args) - session operations
+    session: __pi_make_hostcall(__pi_session_native),
+
+    // pi.ui(op, args) - UI operations
+    ui: __pi_make_hostcall(__pi_ui_native),
+
+    // pi.events(op, args) - event operations
+    events: __pi_make_hostcall(__pi_events_native),
+};
+
+// Make pi available globally
+globalThis.pi = pi;
+";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scheduler::DeterministicClock;
 
     #[test]
     fn hostcall_completions_run_before_due_timers() {
@@ -1408,5 +1380,188 @@ mod tests {
         assert!(result.ran_macrotask);
         assert_eq!(result.microtasks_drained, 2);
         assert_eq!(drain_calls, 3);
+    }
+
+    // Tests for the Promise bridge (bd-2ke)
+
+    #[test]
+    fn pijs_runtime_creates_hostcall_request() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Call pi.tool() which should enqueue a hostcall request
+            runtime
+                .eval(r#"pi.tool("read", { path: "test.txt" });"#)
+                .await
+                .expect("eval");
+
+            // Check that a hostcall request was enqueued
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let req = &requests[0];
+            assert!(matches!(&req.kind, HostcallKind::Tool { name } if name == "read"));
+            assert_eq!(req.payload["path"], "test.txt");
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_multiple_hostcalls() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+            pi.tool("read", { path: "a.txt" });
+            pi.exec("ls", ["-la"]);
+            pi.http({ url: "https://example.com" });
+        "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 3);
+
+            assert!(matches!(&requests[0].kind, HostcallKind::Tool { name } if name == "read"));
+            assert!(matches!(&requests[1].kind, HostcallKind::Exec { cmd } if cmd == "ls"));
+            assert!(matches!(&requests[2].kind, HostcallKind::Http));
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_hostcall_completion_resolves_promise() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Set up a promise handler that stores the result
+            runtime
+                .eval(
+                    r#"
+            globalThis.result = null;
+            pi.tool("read", { path: "test.txt" }).then(r => {
+                globalThis.result = r;
+            });
+        "#,
+                )
+                .await
+                .expect("eval");
+
+            // Get the hostcall request
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = requests[0].call_id.clone();
+
+            // Complete the hostcall
+            runtime.complete_hostcall(
+                call_id,
+                HostcallOutcome::Success(serde_json::json!({ "content": "hello world" })),
+            );
+
+            // Tick to deliver the completion
+            let stats = runtime.tick().await.expect("tick");
+            assert!(stats.ran_macrotask);
+
+            // Verify the promise was resolved with the correct value
+            runtime
+                .eval(
+                    r#"
+            if (globalThis.result === null) {
+                throw new Error("Promise not resolved");
+            }
+            if (globalThis.result.content !== "hello world") {
+                throw new Error("Wrong result: " + JSON.stringify(globalThis.result));
+            }
+        "#,
+                )
+                .await
+                .expect("verify result");
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_hostcall_error_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Set up a promise handler that captures rejection
+            runtime
+                .eval(
+                    r#"
+            globalThis.error = null;
+            pi.tool("read", { path: "nonexistent.txt" }).catch(e => {
+                globalThis.error = { code: e.code, message: e.message };
+            });
+        "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            let call_id = requests[0].call_id.clone();
+
+            // Complete with an error
+            runtime.complete_hostcall(
+                call_id,
+                HostcallOutcome::Error {
+                    code: "ENOENT".to_string(),
+                    message: "File not found".to_string(),
+                },
+            );
+
+            runtime.tick().await.expect("tick");
+
+            // Verify the promise was rejected
+            runtime
+                .eval(
+                    r#"
+            if (globalThis.error === null) {
+                throw new Error("Promise not rejected");
+            }
+            if (globalThis.error.code !== "ENOENT") {
+                throw new Error("Wrong error code: " + globalThis.error.code);
+            }
+        "#,
+                )
+                .await
+                .expect("verify error");
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_tick_stats() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // No pending tasks
+            let stats = runtime.tick().await.expect("tick");
+            assert!(!stats.ran_macrotask);
+            assert_eq!(stats.pending_hostcalls, 0);
+
+            // Create a hostcall
+            runtime.eval(r#"pi.tool("test", {});"#).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // Complete it
+            runtime.complete_hostcall(
+                requests[0].call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+
+            let stats = runtime.tick().await.expect("tick");
+            assert!(stats.ran_macrotask);
+        });
     }
 }
