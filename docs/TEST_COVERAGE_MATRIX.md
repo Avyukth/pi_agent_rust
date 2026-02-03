@@ -109,3 +109,14 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 - Conformance suite is strongest for built‑in tools (fixtures + direct tests).
 - E2E automation is currently missing; all end‑to‑end runs are manual.
 - No‑mock policy is currently violated only by `MockProvider` in RPC tests.
+
+---
+
+## 6) Coverage Tooling
+
+Coverage reports are generated with `cargo-llvm-cov` (see the **Coverage** section in `README.md`).
+
+Baseline (2026-02-03): **31.07% line coverage** from `cargo llvm-cov --all-targets --workspace --summary-only`.
+CI currently gates on **>= 30% line coverage** (see `.github/workflows/ci.yml`).
+
+CI runs llvm-cov in VCR playback mode (`VCR_MODE=playback`) and uploads artifacts (summary + LCOV + HTML) via `.github/workflows/ci.yml`.

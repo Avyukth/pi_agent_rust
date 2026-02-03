@@ -1,0 +1,14 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+
+  Assistant:
+  Thinking: Considering options...
+  Partial answer.
+
+  ⣾  Processing...
+
+  Tokens: 0 in / 0 out  |  Alt+Enter: multi-line  |  /help  |  Esc: quit

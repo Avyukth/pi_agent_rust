@@ -1,0 +1,16 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+  Welcome to Pi! Type a message to begin, or /help for commands.
+
+  Reloaded resources
+
+  [single-line] Enter to send
+    > Type your message... (Enter to send, Alt+Enter for multi-line, Esc to quit)
+  >
+  >
+
+  Tokens: 0 in / 0 out  |  Alt+Enter: multi-line  |  /help  |  Esc: quit

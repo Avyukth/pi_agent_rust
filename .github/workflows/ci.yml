@@ -1,0 +1,96 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      VCR_CASSETTE_DIR: "tests/fixtures/vcr"
+      RUST_BACKTRACE: "1"
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+
+      - name: Checkout path dependencies
+        run: |
+          set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/charmed_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust
+
+      - name: Install system deps (fd, rg)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: No-mock dependency guard
+        run: |
+          set -euxo pipefail
+          if rg -n --fixed-strings -e mockall -e mockito -e wiremock Cargo.toml Cargo.lock; then
+            echo "Mocking crates are forbidden in dependencies."
+            exit 1
+          fi
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-targets
+
+      - name: Coverage summary (llvm-cov)
+        run: |
+          set -euxo pipefail
+          start=$(date +%s)
+          echo "env: CI=$CI VCR_MODE=$VCR_MODE VCR_CASSETTE_DIR=$VCR_CASSETTE_DIR"
+          cargo llvm-cov --all-targets --workspace --summary-only | tee llvm-cov-summary.txt
+          end=$(date +%s)
+          echo "coverage_summary_duration_s=$((end-start))"
+
+      - name: Coverage gate (lcov)
+        run: |
+          set -euxo pipefail
+          start=$(date +%s)
+          # Baseline (2026-02-03): 31.07% line coverage (cargo llvm-cov --summary-only)
+          cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 30
+          ls -lah lcov.info
+          end=$(date +%s)
+          echo "coverage_lcov_duration_s=$((end-start))"
+
+      - name: Coverage report (html)
+        run: cargo llvm-cov --all-targets --workspace --html
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            pi_agent_rust/llvm-cov-summary.txt
+            pi_agent_rust/lcov.info
+            pi_agent_rust/target/llvm-cov/html

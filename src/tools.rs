@@ -5,15 +5,18 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
+use asupersync::io::AsyncWriteExt;
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 // ============================================================================
@@ -914,7 +917,7 @@ impl Tool for ReadTool {
 
         let path = resolve_read_path(&input.path, &self.cwd);
 
-        let bytes = tokio::fs::read(&path)
+        let bytes = asupersync::fs::read(&path)
             .await
             .map_err(|e| Error::tool("read", e.to_string()))?;
 
@@ -1203,63 +1206,57 @@ impl Tool for BashTool {
             .take()
             .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
-        tokio::spawn(pump_stream(stdout, tx.clone()));
-        tokio::spawn(pump_stream(stderr, tx));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let tx_stdout = tx.clone();
+        thread::spawn(move || pump_stream(stdout, &tx_stdout));
+        thread::spawn(move || pump_stream(stderr, &tx));
 
         let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
         let mut bash_output = BashOutputState::new(max_chunks_bytes);
 
         let mut timed_out = false;
         let mut exit_code: Option<i32> = None;
-        let child_pid = child.id();
+        let child_pid = Some(child.id());
+        let start = Instant::now();
+        let timeout = timeout_secs.map(Duration::from_secs);
 
-        let timeout_sleep =
-            timeout_secs.map(|t| tokio::time::sleep(tokio::time::Duration::from_secs(t)));
-        tokio::pin!(timeout_sleep);
-
+        let tick = Duration::from_millis(10);
         loop {
-            tokio::select! {
-                maybe_chunk = rx.recv() => {
-                    if let Some(chunk) = maybe_chunk {
-                        process_bash_chunk(&chunk, &mut bash_output, on_update.as_deref()).await?;
-                    } else {
-                        break;
-                    }
-                }
-                status = child.wait() => {
-                    exit_code = status
-                        .map_err(|e| Error::tool("bash", e.to_string()))?
-                        .code();
+            while let Ok(chunk) = rx.try_recv() {
+                process_bash_chunk(&chunk, &mut bash_output, on_update.as_deref()).await?;
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_code = status.code();
                     break;
                 }
-                () = async {
-                    if let Some(sleep) = timeout_sleep.as_mut().as_pin_mut() {
-                        sleep.await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
+                Ok(None) => {}
+                Err(err) => return Err(Error::tool("bash", err.to_string())),
+            }
+
+            if let Some(timeout) = timeout {
+                if start.elapsed() >= timeout {
                     timed_out = true;
                     kill_process_tree(child_pid);
-                    let _ = child.wait().await;
+                    let _ = child.kill();
+                    let _ = child.wait();
                     break;
                 }
             }
+
+            sleep(wall_now(), tick).await;
         }
 
-        // Drain any remaining output.
-        while let Some(chunk) = rx.recv().await {
-            process_bash_chunk(&chunk, &mut bash_output, None).await?;
-        }
-
-        // Wait for exit code if we haven't gotten it yet (channel closed before child.wait() was selected)
-        if exit_code.is_none() && !timed_out {
-            exit_code = child
-                .wait()
-                .await
-                .map_err(|e| Error::tool("bash", e.to_string()))?
-                .code();
+        // Drain any remaining output (including anything still queued after the senders drop).
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => process_bash_chunk(&chunk, &mut bash_output, None).await?,
+                Err(mpsc::TryRecvError::Empty) => {
+                    sleep(wall_now(), tick).await;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
         }
 
         drop(bash_output.temp_file.take());
@@ -1758,7 +1755,7 @@ impl Tool for EditTool {
         let absolute_path = resolve_path(&input.path, &self.cwd);
 
         // Match legacy behavior: any access failure is reported as "File not found".
-        if tokio::fs::OpenOptions::new()
+        if asupersync::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&absolute_path)
@@ -1772,7 +1769,7 @@ impl Tool for EditTool {
         }
 
         // Read bytes and decode lossily as UTF-8 (Node Buffer.toString("utf-8") behavior).
-        let raw = tokio::fs::read(&absolute_path)
+        let raw = asupersync::fs::read(&absolute_path)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
         let raw_content = String::from_utf8_lossy(&raw).to_string();
@@ -1848,7 +1845,7 @@ impl Tool for EditTool {
         let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("edit", format!("Failed to create temp file: {e}")))?;
-        tokio::fs::write(temp_file.path(), &final_content)
+        asupersync::fs::write(temp_file.path(), &final_content)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to write temp file: {e}")))?;
         temp_file
@@ -1942,7 +1939,7 @@ impl Tool for WriteTool {
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+            asupersync::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::tool("write", format!("Failed to create directories: {e}")))?;
         }
@@ -1954,7 +1951,7 @@ impl Tool for WriteTool {
         let temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("write", format!("Failed to create temp file: {e}")))?;
 
-        tokio::fs::write(temp_file.path(), &input.content)
+        asupersync::fs::write(temp_file.path(), input.content.as_bytes())
             .await
             .map_err(|e| Error::tool("write", format!("Failed to write temp file: {e}")))?;
 
@@ -2146,11 +2143,10 @@ impl Tool for GrepTool {
             .take()
             .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
 
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
+        let stderr_task = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf).await;
+            let _ = reader.read_to_end(&mut buf);
             buf
         });
 
@@ -2158,15 +2154,13 @@ impl Tool for GrepTool {
         let mut match_count: usize = 0;
         let mut match_limit_reached = false;
 
-        while let Some(line) = stdout_lines
-            .next_line()
-            .await
-            .map_err(|e| Error::tool("grep", e.to_string()))?
-        {
+        let stdout_reader = std::io::BufReader::new(stdout);
+        for line in stdout_reader.lines() {
             if match_count >= effective_limit {
                 break;
             }
 
+            let line = line.map_err(|e| Error::tool("grep", e.to_string()))?;
             if line.trim().is_empty() {
                 continue;
             }
@@ -2196,17 +2190,16 @@ impl Tool for GrepTool {
 
             if match_count >= effective_limit {
                 match_limit_reached = true;
-                let _ = child.kill().await;
+                let _ = child.kill();
                 break;
             }
         }
 
         let status = child
             .wait()
-            .await
             .map_err(|e| Error::tool("grep", e.to_string()))?;
 
-        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let stderr_bytes = stderr_task.join().unwrap_or_default();
         let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         let code = status.code().unwrap_or(0);
 
@@ -2447,7 +2440,6 @@ impl Tool for FindTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .await
             .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2632,17 +2624,14 @@ impl Tool for LsTool {
         }
 
         let mut entries = Vec::new();
-        let mut read_dir = tokio::fs::read_dir(&dir_path)
-            .await
+        let read_dir = std::fs::read_dir(&dir_path)
             .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
 
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?
-        {
+        for entry in read_dir {
+            let entry =
+                entry.map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
             let name = entry.file_name().to_string_lossy().to_string();
-            let Ok(meta) = entry.metadata().await else {
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
             entries.push((name, meta.is_dir()));
@@ -2727,16 +2716,13 @@ fn rg_available() -> bool {
         .is_ok()
 }
 
-async fn pump_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
-    mut reader: R,
-    tx: mpsc::Sender<Vec<u8>>,
-) {
+fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::Sender<Vec<u8>>) {
     let mut buf = vec![0u8; 8192];
     loop {
-        match reader.read(&mut buf).await {
+        match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tx.send(buf[..n].to_vec()).await.is_err() {
+                if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
             }
@@ -2756,7 +2742,7 @@ fn concat_chunks(chunks: &VecDeque<Vec<u8>>) -> Vec<u8> {
 struct BashOutputState {
     total_bytes: usize,
     temp_file_path: Option<PathBuf>,
-    temp_file: Option<tokio::fs::File>,
+    temp_file: Option<asupersync::fs::File>,
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
     max_chunks_bytes: usize,
@@ -2786,7 +2772,7 @@ async fn process_bash_chunk(
         let id_full = Uuid::new_v4().simple().to_string();
         let id = &id_full[..16];
         let path = std::env::temp_dir().join(format!("pi-bash-{id}.log"));
-        let mut file = tokio::fs::File::create(&path)
+        let mut file = asupersync::fs::File::create(&path)
             .await
             .map_err(|e| Error::tool("bash", e.to_string()))?;
 

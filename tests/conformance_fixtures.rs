@@ -14,38 +14,40 @@ use conformance::load_fixture;
 /// Helper macro to generate fixture tests for each tool.
 macro_rules! fixture_test {
     ($name:ident, $fixture:literal) => {
-        #[tokio::test]
-        async fn $name() {
-            let fixture = load_fixture($fixture)
-                .unwrap_or_else(|e| panic!("Failed to load fixture '{}': {}", $fixture, e));
+        #[test]
+        fn $name() {
+            asupersync::test_utils::run_test(|| async {
+                let fixture = load_fixture($fixture)
+                    .unwrap_or_else(|e| panic!("Failed to load fixture '{}': {}", $fixture, e));
 
-            let results: Vec<conformance::TestResult> =
-                fixture_runner::run_fixture_tests(&fixture).await;
+                let results: Vec<conformance::TestResult> =
+                    fixture_runner::run_fixture_tests(&fixture).await;
 
-            let mut failures = Vec::new();
-            for result in &results {
-                if !result.passed {
-                    failures.push(format!(
-                        "  {} FAILED: {}",
-                        result.name,
-                        result.message.as_deref().unwrap_or("unknown error")
-                    ));
+                let mut failures = Vec::new();
+                for result in &results {
+                    if !result.passed {
+                        failures.push(format!(
+                            "  {} FAILED: {}",
+                            result.name,
+                            result.message.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
                 }
-            }
 
-            if !failures.is_empty() {
-                panic!(
-                    "Fixture tests for '{}' had failures:\n{}",
-                    $fixture,
-                    failures.join("\n")
+                if !failures.is_empty() {
+                    panic!(
+                        "Fixture tests for '{}' had failures:\n{}",
+                        $fixture,
+                        failures.join("\n")
+                    );
+                }
+
+                println!(
+                    "✓ {} fixture tests passed for '{}'",
+                    results.len(),
+                    $fixture
                 );
-            }
-
-            println!(
-                "✓ {} fixture tests passed for '{}'",
-                results.len(),
-                $fixture
-            );
+            });
         }
     };
 }

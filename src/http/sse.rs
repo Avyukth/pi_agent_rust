@@ -102,7 +102,7 @@ impl SseParser {
                         self.has_data = true;
                     }
                     "id" => self.current.id = Some(String::new()),
-                    _ => {} 
+                    _ => {}
                 }
             }
         }
@@ -336,7 +336,7 @@ mod tests {
 
         // Simulate Anthropic API response
         let events = parser.feed(
-            r###"event: message_start
+            r#"event: message_start
 data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\"}}
 
 event: content_block_start
@@ -351,7 +351,7 @@ data: {\"type\":\"content_block_stop\",\"index\":0}
 event: message_stop
 data: {\"type\":\"message_stop\"}
 
-"###,
+"#,
         );
 
         assert_eq!(events.len(), 5);

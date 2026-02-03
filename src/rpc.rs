@@ -26,22 +26,27 @@ use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
+use asupersync::Cx;
+use asupersync::channel::{mpsc, oneshot};
+use asupersync::runtime::RuntimeHandle;
+use asupersync::sync::Mutex;
+use asupersync::time::{sleep, wall_now};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcOptions {
     pub config: Config,
     pub resources: ResourceLoader,
     pub available_models: Vec<ModelEntry>,
     pub scoped_models: Vec<RpcScopedModel>,
     pub auth: AuthStorage,
+    pub runtime_handle: RuntimeHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -203,15 +208,44 @@ struct RunningBash {
 }
 
 pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    run(
-        session,
-        options,
-        tokio::io::BufReader::new(stdin),
-        tokio::io::BufWriter::new(stdout),
-    )
-    .await
+    let (in_tx, in_rx) = mpsc::channel::<String>(1024);
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        let mut reader = io::BufReader::new(stdin.lock());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let send_line = std::mem::take(&mut line);
+                    if in_tx.try_send(send_line).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    std::thread::spawn(move || {
+        let stdout = io::stdout();
+        let mut writer = io::BufWriter::new(stdout.lock());
+        for line in out_rx {
+            if writer.write_all(line.as_bytes()).is_err() {
+                break;
+            }
+            if writer.write_all(b"\n").is_err() {
+                break;
+            }
+            if writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    run(session, options, in_rx, out_tx).await
 }
 
 #[allow(clippy::too_many_lines)]
@@ -219,43 +253,49 @@ pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()>
     clippy::significant_drop_tightening,
     clippy::significant_drop_in_scrutinee
 )]
-pub async fn run<R, W>(
+pub async fn run(
     session: AgentSession,
     options: RpcOptions,
-    mut reader: R,
-    writer: W,
-) -> Result<()>
-where
-    R: AsyncBufRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
+    in_rx: mpsc::Receiver<String>,
+    out_tx: std::sync::mpsc::Sender<String>,
+) -> Result<()> {
+    let cx = Cx::for_request();
     let session = Arc::new(Mutex::new(session));
     let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
     let is_streaming = Arc::new(AtomicBool::new(false));
     let is_compacting = Arc::new(AtomicBool::new(false));
     let abort_handle: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
     let bash_state: Arc<Mutex<Option<RunningBash>>> = Arc::new(Mutex::new(None));
-    let (retry_abort_tx, _) = watch::channel(false);
-
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let retry_abort = Arc::new(AtomicBool::new(false));
 
     {
         use futures::future::BoxFuture;
         let steering_state = Arc::clone(&shared_state);
         let follow_state = Arc::clone(&shared_state);
-        let mut guard = session.lock().await;
+        let steering_cx = cx.clone();
+        let follow_cx = cx.clone();
+        let mut guard = session
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
         let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
             let steering_state = Arc::clone(&steering_state);
+            let steering_cx = steering_cx.clone();
             Box::pin(async move {
-                let mut state = steering_state.lock().await;
-                state.pop_steering()
+                steering_state
+                    .lock(&steering_cx)
+                    .await
+                    .map_or_else(|_| Vec::new(), |mut state| state.pop_steering())
             })
         };
         let follow_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
             let follow_state = Arc::clone(&follow_state);
+            let follow_cx = follow_cx.clone();
             Box::pin(async move {
-                let mut state = follow_state.lock().await;
-                state.pop_follow_up()
+                follow_state
+                    .lock(&follow_cx)
+                    .await
+                    .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up())
             })
         };
         guard.agent.set_message_fetchers(
@@ -264,23 +304,7 @@ where
         );
     }
 
-    let writer_task = tokio::spawn(async move {
-        let mut writer = writer;
-        while let Some(line) = out_rx.recv().await {
-            writer.write_all(line.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
-        }
-        Ok::<(), std::io::Error>(())
-    });
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            break; // EOF
-        }
+    while let Ok(line) = in_rx.recv(&cx).await {
         if line.trim().is_empty() {
             continue;
         }
@@ -337,7 +361,10 @@ where
 
                 if is_streaming.load(Ordering::SeqCst) {
                     let queued = {
-                        let mut state = shared_state.lock().await;
+                        let mut state = shared_state
+                            .lock(&cx)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                         match streaming_behavior {
                             Some(StreamingBehavior::Steer) => {
                                 state.push_steering(build_user_message(&expanded, &images));
@@ -374,10 +401,12 @@ where
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
                 let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort_tx = retry_abort_tx.clone();
+                let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
-                tokio::spawn(async move {
+                let runtime_handle = options.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -385,10 +414,11 @@ where
                         is_compacting,
                         abort_handle_slot,
                         out_tx,
-                        retry_abort_tx,
+                        retry_abort,
                         options,
                         expanded,
                         images,
+                        cx,
                     )
                     .await;
                 });
@@ -418,8 +448,9 @@ where
 
                 if is_streaming.load(Ordering::SeqCst) {
                     shared_state
-                        .lock()
+                        .lock(&cx)
                         .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
                         .push_steering(build_user_message(&expanded, &[]));
                     let _ = out_tx.send(response_ok(id, "steer", None));
                     continue;
@@ -433,10 +464,12 @@ where
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
                 let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort_tx = retry_abort_tx.clone();
+                let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
-                tokio::spawn(async move {
+                let runtime_handle = options.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -444,10 +477,11 @@ where
                         is_compacting,
                         abort_handle_slot,
                         out_tx,
-                        retry_abort_tx,
+                        retry_abort,
                         options,
                         expanded,
                         Vec::new(),
+                        cx,
                     )
                     .await;
                 });
@@ -477,8 +511,9 @@ where
 
                 if is_streaming.load(Ordering::SeqCst) {
                     shared_state
-                        .lock()
+                        .lock(&cx)
                         .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
                         .push_follow_up(build_user_message(&expanded, &[]));
                     let _ = out_tx.send(response_ok(id, "follow_up", None));
                     continue;
@@ -492,10 +527,12 @@ where
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
                 let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort_tx = retry_abort_tx.clone();
+                let retry_abort = retry_abort.clone();
                 let options = options.clone();
                 let expanded = expanded.clone();
-                tokio::spawn(async move {
+                let runtime_handle = options.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -503,17 +540,22 @@ where
                         is_compacting,
                         abort_handle_slot,
                         out_tx,
-                        retry_abort_tx,
+                        retry_abort,
                         options,
                         expanded,
                         Vec::new(),
+                        cx,
                     )
                     .await;
                 });
             }
 
             "abort" => {
-                let handle = abort_handle.lock().await.clone();
+                let handle = abort_handle
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("abort lock failed: {err}")))?
+                    .clone();
                 if let Some(handle) = handle {
                     handle.abort();
                 }
@@ -522,11 +564,17 @@ where
 
             "get_state" => {
                 let snapshot = {
-                    let state = shared_state.lock().await;
+                    let state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     RpcStateSnapshot::from(&*state)
                 };
                 let data = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     session_state(
                         &guard,
                         &options,
@@ -540,7 +588,10 @@ where
 
             "get_session_stats" => {
                 let data = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     session_stats(&guard.session)
                 };
                 let _ = out_tx.send(response_ok(id, "get_session_stats", Some(data)));
@@ -548,7 +599,10 @@ where
 
             "get_messages" => {
                 let messages = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     guard
                         .session
                         .entries_for_current_path()
@@ -632,7 +686,10 @@ where
                 };
 
                 {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     guard
                         .agent
                         .set_provider(providers::create_provider(&entry)?);
@@ -665,7 +722,10 @@ where
 
             "cycle_model" => {
                 let (entry, thinking_level, is_scoped) = {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let Some(result) = cycle_model_for_rpc(&mut guard, &options).await? else {
                         let _ =
                             out_tx.send(response_ok(id.clone(), "cycle_model", Some(Value::Null)));
@@ -704,7 +764,10 @@ where
                 };
 
                 {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let level = current_model_entry(&guard.session, &options)
                         .map_or(level, |entry| clamp_thinking_level(level, entry));
                     if let Err(err) = apply_thinking_level(&mut guard, level).await {
@@ -721,7 +784,10 @@ where
 
             "cycle_thinking_level" => {
                 let next = {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let Some(entry) = current_model_entry(&guard.session, &options) else {
                         let _ =
                             out_tx.send(response_ok(id, "cycle_thinking_level", Some(Value::Null)));
@@ -771,7 +837,10 @@ where
                     ));
                     continue;
                 };
-                let mut state = shared_state.lock().await;
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.steering_mode = mode;
                 drop(state);
                 let _ = out_tx.send(response_ok(id, "set_steering_mode", None));
@@ -794,7 +863,10 @@ where
                     ));
                     continue;
                 };
-                let mut state = shared_state.lock().await;
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.follow_up_mode = mode;
                 drop(state);
                 let _ = out_tx.send(response_ok(id, "set_follow_up_mode", None));
@@ -809,7 +881,10 @@ where
                     ));
                     continue;
                 };
-                let mut state = shared_state.lock().await;
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.auto_compaction_enabled = enabled;
                 drop(state);
                 let _ = out_tx.send(response_ok(id, "set_auto_compaction", None));
@@ -824,14 +899,17 @@ where
                     ));
                     continue;
                 };
-                let mut state = shared_state.lock().await;
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                 state.auto_retry_enabled = enabled;
                 drop(state);
                 let _ = out_tx.send(response_ok(id, "set_auto_retry", None));
             }
 
             "abort_retry" => {
-                let _ = retry_abort_tx.send(true);
+                retry_abort.store(true, Ordering::SeqCst);
                 let _ = out_tx.send(response_ok(id, "abort_retry", None));
             }
 
@@ -845,7 +923,10 @@ where
                     continue;
                 };
                 {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     guard.session.append_session_info(Some(name.to_string()));
                     guard.persist_session().await?;
                 }
@@ -854,7 +935,10 @@ where
 
             "get_last_assistant_text" => {
                 let text = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     last_assistant_text(&guard.session)
                 };
                 let _ = out_tx.send(response_ok(
@@ -870,7 +954,10 @@ where
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let path = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     export_html(&guard.session, output_path.as_deref()).await?
                 };
                 let _ = out_tx.send(response_ok(
@@ -886,7 +973,10 @@ where
                     continue;
                 };
 
-                let mut running = bash_state.lock().await;
+                let mut running = bash_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?;
                 if running.is_some() {
                     let _ = out_tx.send(response_error(
                         id,
@@ -904,26 +994,28 @@ where
                 let bash_state = Arc::clone(&bash_state);
                 let command = command.to_string();
                 let id_clone = id.clone();
+                let runtime_handle = options.runtime_handle.clone();
 
-                tokio::spawn(async move {
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let result = run_bash_rpc(&cwd, &command, abort_rx).await;
 
                     let response = match result {
                         Ok(result) => {
-                            let mut guard = session.lock().await;
-                            guard.session.append_message(SessionMessage::BashExecution {
-                                command: command.clone(),
-                                output: result.output.clone(),
-                                exit_code: result.exit_code,
-                                cancelled: Some(result.cancelled),
-                                truncated: Some(result.truncated),
-                                full_output_path: result.full_output_path.clone(),
-                                timestamp: Some(chrono::Utc::now().timestamp_millis()),
-                                extra: std::collections::HashMap::default(),
-                            });
-                            let _ = guard.persist_session().await;
-                            drop(guard);
+                            if let Ok(mut guard) = session.lock(&cx).await {
+                                guard.session.append_message(SessionMessage::BashExecution {
+                                    command: command.clone(),
+                                    output: result.output.clone(),
+                                    exit_code: result.exit_code,
+                                    cancelled: Some(result.cancelled),
+                                    truncated: Some(result.truncated),
+                                    full_output_path: result.full_output_path.clone(),
+                                    timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                                    extra: std::collections::HashMap::default(),
+                                });
+                                let _ = guard.persist_session().await;
+                            }
 
                             response_ok(
                                 id_clone,
@@ -941,15 +1033,19 @@ where
                     };
 
                     let _ = out_tx.send(response);
-                    let mut running = bash_state.lock().await;
-                    *running = None;
+                    if let Ok(mut running) = bash_state.lock(&cx).await {
+                        *running = None;
+                    }
                 });
             }
 
             "abort_bash" => {
-                let mut running = bash_state.lock().await;
+                let mut running = bash_state
+                    .lock(&cx)
+                    .await
+                    .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?;
                 if let Some(running_bash) = running.take() {
-                    let _ = running_bash.abort_tx.send(());
+                    let _ = running_bash.abort_tx.send(&cx, ());
                 }
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
             }
@@ -961,7 +1057,10 @@ where
                     .map(str::to_string);
 
                 let data = {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     guard.session.ensure_entry_ids();
 
                     let api_key = guard
@@ -1026,7 +1125,10 @@ where
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let session_dir = guard.session.session_dir.clone();
                     let mut new_session = if guard.save_enabled() {
                         crate::session::Session::create_with_dir(session_dir)
@@ -1054,7 +1156,10 @@ where
                         Some(guard.session.header.id.clone());
                 }
                 {
-                    let mut state = shared_state.lock().await;
+                    let mut state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     state.steering.clear();
                     state.follow_up.clear();
                 }
@@ -1078,7 +1183,10 @@ where
                 let loaded = crate::session::Session::open(session_path).await;
                 match loaded {
                     Ok(new_session) => {
-                        let mut guard = session.lock().await;
+                        let mut guard = session
+                            .lock(&cx)
+                            .await
+                            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                         guard.session = new_session;
                         let messages = guard.session.to_messages_for_current_path();
                         guard.agent.replace_messages(messages);
@@ -1089,7 +1197,10 @@ where
                             "switch_session",
                             Some(json!({ "cancelled": false })),
                         ));
-                        let mut state = shared_state.lock().await;
+                        let mut state = shared_state
+                            .lock(&cx)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                         state.steering.clear();
                         state.follow_up.clear();
                     }
@@ -1106,12 +1217,18 @@ where
                 };
 
                 let (selected_text, cancelled) = {
-                    let mut guard = session.lock().await;
+                    let mut guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     fork_session(&mut guard, entry_id)?
                 };
 
                 {
-                    let mut state = shared_state.lock().await;
+                    let mut state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                     state.steering.clear();
                     state.follow_up.clear();
                 }
@@ -1125,7 +1242,10 @@ where
 
             "get_fork_messages" => {
                 let messages = {
-                    let guard = session.lock().await;
+                    let guard = session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     fork_messages(&guard.session)
                 };
                 let _ = out_tx.send(response_ok(
@@ -1158,8 +1278,6 @@ where
         }
     }
 
-    drop(out_tx);
-    let _ = writer_task.await;
     Ok(())
 }
 
@@ -1174,13 +1292,14 @@ async fn run_prompt_with_retry(
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
-    out_tx: mpsc::UnboundedSender<String>,
-    retry_abort_tx: watch::Sender<bool>,
+    out_tx: std::sync::mpsc::Sender<String>,
+    retry_abort: Arc<AtomicBool>,
     options: RpcOptions,
     message: String,
     images: Vec<ImageContent>,
+    cx: Cx,
 ) {
-    let _ = retry_abort_tx.send(false);
+    retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
 
     let max_retries = options.config.retry_max_retries();
@@ -1190,7 +1309,12 @@ async fn run_prompt_with_retry(
 
     loop {
         let (abort_handle, abort_signal) = AbortHandle::new();
-        *abort_handle_slot.lock().await = Some(abort_handle);
+        if let Ok(mut guard) = abort_handle_slot.lock(&cx).await {
+            *guard = Some(abort_handle);
+        } else {
+            is_streaming.store(false, Ordering::SeqCst);
+            return;
+        }
 
         let event_tx = out_tx.clone();
         let event_handler = move |event: AgentEvent| {
@@ -1200,7 +1324,13 @@ async fn run_prompt_with_retry(
         };
 
         let result = {
-            let mut guard = session.lock().await;
+            let mut guard = match session.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    final_error = Some(format!("session lock failed: {err}"));
+                    break;
+                }
+            };
             if images.is_empty() {
                 guard
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
@@ -1216,7 +1346,9 @@ async fn run_prompt_with_retry(
             }
         };
 
-        *abort_handle_slot.lock().await = None;
+        if let Ok(mut guard) = abort_handle_slot.lock(&cx).await {
+            *guard = None;
+        }
 
         match result {
             Ok(message) => {
@@ -1238,7 +1370,10 @@ async fn run_prompt_with_retry(
             }
         }
 
-        let retry_enabled = { shared_state.lock().await.auto_retry_enabled };
+        let retry_enabled = shared_state
+            .lock(&cx)
+            .await
+            .is_ok_and(|state| state.auto_retry_enabled);
         if !retry_enabled || retry_count >= max_retries {
             break;
         }
@@ -1256,14 +1391,16 @@ async fn run_prompt_with_retry(
             "errorMessage": error_message,
         })));
 
-        let mut abort_rx = retry_abort_tx.subscribe();
         let delay = Duration::from_millis(delay_ms as u64);
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = abort_rx.changed() => {}
+        let start = std::time::Instant::now();
+        while start.elapsed() < delay {
+            if retry_abort.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(wall_now(), Duration::from_millis(50)).await;
         }
 
-        if *abort_rx.borrow() {
+        if retry_abort.load(Ordering::SeqCst) {
             final_error = Some("Retry aborted".to_string());
             break;
         }
@@ -1291,7 +1428,10 @@ async fn run_prompt_with_retry(
         return;
     }
 
-    let auto_compaction_enabled = { shared_state.lock().await.auto_compaction_enabled };
+    let auto_compaction_enabled = shared_state
+        .lock(&cx)
+        .await
+        .is_ok_and(|state| state.auto_compaction_enabled);
     if auto_compaction_enabled {
         maybe_auto_compact(session, options, is_compacting, out_tx).await;
     }
@@ -1353,10 +1493,13 @@ async fn maybe_auto_compact(
     session: Arc<Mutex<AgentSession>>,
     options: RpcOptions,
     is_compacting: Arc<AtomicBool>,
-    out_tx: mpsc::UnboundedSender<String>,
+    out_tx: std::sync::mpsc::Sender<String>,
 ) {
+    let cx = Cx::for_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
-        let mut guard = session.lock().await;
+        let Ok(mut guard) = session.lock(&cx).await else {
+            return;
+        };
         guard.session.ensure_entry_ids();
         let Some(entry) = current_model_entry(&guard.session, &options) else {
             return;
@@ -1398,7 +1541,10 @@ async fn maybe_auto_compact(
     is_compacting.store(true, Ordering::SeqCst);
 
     let (provider, api_key) = {
-        let guard = session.lock().await;
+        let Ok(guard) = session.lock(&cx).await else {
+            is_compacting.store(false, Ordering::SeqCst);
+            return;
+        };
         let Some(api_key) = guard.agent.stream_options().api_key.clone() else {
             is_compacting.store(false, Ordering::SeqCst);
             let _ = out_tx.send(event(&json!({
@@ -1432,7 +1578,9 @@ async fn maybe_auto_compact(
                 }
             };
 
-            let mut guard = session.lock().await;
+            let Ok(mut guard) = session.lock(&cx).await else {
+                return;
+            };
             guard.session.append_compaction(
                 result.summary.clone(),
                 result.first_kept_entry_id.clone(),
@@ -1717,9 +1865,9 @@ async fn export_html(
     );
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        tokio::fs::create_dir_all(parent).await?;
+        asupersync::fs::create_dir_all(parent).await?;
     }
-    tokio::fs::write(&path, html).await?;
+    asupersync::fs::write(&path, html).await?;
     Ok(path.display().to_string())
 }
 
@@ -1735,15 +1883,47 @@ struct BashRpcResult {
 async fn run_bash_rpc(
     cwd: &std::path::Path,
     command: &str,
-    mut abort_rx: oneshot::Receiver<()>,
+    abort_rx: oneshot::Receiver<()>,
 ) -> Result<BashRpcResult> {
+    #[derive(Clone, Copy)]
+    enum StreamKind {
+        Stdout,
+        Stderr,
+    }
+
+    struct StreamChunk {
+        kind: StreamKind,
+        bytes: Vec<u8>,
+    }
+
+    fn pump_stream(
+        mut reader: impl std::io::Read,
+        tx: std::sync::mpsc::Sender<StreamChunk>,
+        kind: StreamKind,
+    ) {
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let chunk = StreamChunk {
+                kind,
+                bytes: buf[..read].to_vec(),
+            };
+            if tx.send(chunk).is_err() {
+                break;
+            }
+        }
+    }
+
     let shell = if std::path::Path::new("/bin/bash").exists() {
         "/bin/bash"
     } else {
         "sh"
     };
 
-    let child = tokio::process::Command::new(shell)
+    let mut child = std::process::Command::new(shell)
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -1752,32 +1932,76 @@ async fn run_bash_rpc(
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
 
-    let child_pid = child.id();
-    let mut output_fut = Box::pin(child.wait_with_output());
-    let (cancelled, output) = tokio::select! {
-        output = &mut output_fut => (false, output),
-        _ = &mut abort_rx => {
-            kill_process_tree(child_pid);
-            (true, output_fut.await)
-        }
+    let child_pid = Some(child.id());
+    let Some(stdout) = child.stdout.take() else {
+        return Err(Error::tool("bash", "Missing stdout".to_string()));
     };
-    let output =
-        output.map_err(|e| Error::tool("bash", format!("Failed to wait for process: {e}")))?;
+    let Some(stderr) = child.stderr.take() else {
+        return Err(Error::tool("bash", "Missing stderr".to_string()));
+    };
 
-    let mut combined = Vec::new();
-    combined.extend_from_slice(&output.stdout);
-    combined.extend_from_slice(&output.stderr);
+    let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
+    let tx_stdout = tx.clone();
+    std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
+    std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
 
+    let tick = Duration::from_millis(10);
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut cancelled = false;
+
+    let exit_code = loop {
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk.kind {
+                StreamKind::Stdout => stdout_bytes.extend_from_slice(&chunk.bytes),
+                StreamKind::Stderr => stderr_bytes.extend_from_slice(&chunk.bytes),
+            }
+        }
+
+        if !cancelled && abort_rx.try_recv().is_ok() {
+            cancelled = true;
+            kill_process_tree(child_pid);
+            let _ = child.kill();
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(None) => {}
+            Err(err) => {
+                return Err(Error::tool(
+                    "bash",
+                    format!("Failed to wait for process: {err}"),
+                ));
+            }
+        }
+
+        sleep(wall_now(), tick).await;
+    };
+
+    // Drain remaining output (including anything still queued after senders drop).
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => match chunk.kind {
+                StreamKind::Stdout => stdout_bytes.extend_from_slice(&chunk.bytes),
+                StreamKind::Stderr => stderr_bytes.extend_from_slice(&chunk.bytes),
+            },
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), tick).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+
+    let mut combined = stdout_bytes;
+    combined.extend_from_slice(&stderr_bytes);
     let full_output = String::from_utf8_lossy(&combined).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-
     let truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
     let truncated = truncation.truncated;
 
     let (output_text, full_output_path) = if truncated {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let path = std::env::temp_dir().join(format!("pi-rpc-bash-{id}.log"));
-        tokio::fs::write(&path, &full_output).await?;
+        asupersync::fs::write(&path, &full_output).await?;
         (truncation.content, Some(path.display().to_string()))
     } else {
         (truncation.content, None)

@@ -11,6 +11,11 @@
 //! - **Token tracking**: Real-time cost and token usage display
 //! - **Markdown rendering**: Assistant responses rendered with syntax highlighting
 
+use asupersync::Cx;
+use asupersync::channel::mpsc;
+use asupersync::runtime::RuntimeHandle;
+use asupersync::sync::Mutex;
+use async_trait::async_trait;
 use bubbles::spinner::{SpinnerModel, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -18,13 +23,14 @@ use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program,
 use crossterm::terminal;
 use glamour::{Renderer as MarkdownRenderer, Style as GlamourStyle};
 use lipgloss::Style;
-use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use serde_json::{Value, json};
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent::{AbortHandle, Agent, AgentEvent};
 use crate::compaction::{
@@ -32,6 +38,10 @@ use crate::compaction::{
     summarize_entries,
 };
 use crate::config::Config;
+use crate::extensions::{
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionSession,
+    ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent,
+};
 use crate::model::{
     AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, ThinkingLevel, Usage,
     UserContent,
@@ -198,6 +208,8 @@ pub enum PiMsg {
         resources: ResourceLoader,
         status: String,
     },
+    /// Extension UI request (select/confirm/input/editor/notify).
+    ExtensionUiRequest(ExtensionUiRequest),
 }
 
 /// State of the agent processing.
@@ -259,6 +271,7 @@ pub struct PiApp {
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
     model_entry: ModelEntry,
+    model_entry_shared: Arc<StdMutex<ModelEntry>>,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
     model: String,
@@ -270,19 +283,125 @@ pub struct PiApp {
     total_usage: Usage,
 
     // Async channel for agent events
-    event_tx: mpsc::UnboundedSender<PiMsg>,
+    event_tx: mpsc::Sender<PiMsg>,
+    runtime_handle: RuntimeHandle,
+
+    // Extension session state
+    extension_streaming: Arc<AtomicBool>,
+    extension_compacting: Arc<AtomicBool>,
+    extension_ui_queue: VecDeque<ExtensionUiRequest>,
+    active_extension_ui: Option<ExtensionUiRequest>,
 
     // Status message (for slash command feedback)
     status_message: Option<String>,
 
     // OAuth login flow state (awaiting code paste)
     pending_oauth: Option<PendingOAuth>,
+
+    // Extension system
+    extensions: Option<ExtensionManager>,
 }
 
 #[derive(Debug, Clone)]
 struct PendingOAuth {
     provider: String,
     verifier: String,
+}
+
+struct InteractiveExtensionSession {
+    session: Arc<Mutex<Session>>,
+    model_entry: Arc<StdMutex<ModelEntry>>,
+    is_streaming: Arc<AtomicBool>,
+    is_compacting: Arc<AtomicBool>,
+    config: Config,
+    save_enabled: bool,
+}
+
+#[async_trait]
+impl ExtensionSession for InteractiveExtensionSession {
+    async fn get_state(&self) -> Value {
+        let model = {
+            let guard = self.model_entry.lock().unwrap();
+            extension_model_from_entry(&guard)
+        };
+
+        let cx = Cx::for_request();
+        let (session_file, session_id, session_name, message_count, thinking_level) =
+            self.session.lock(&cx).await.map_or_else(
+                |_| (None, String::new(), None, 0, "off".to_string()),
+                |guard| {
+                    let message_count = guard
+                        .entries_for_current_path()
+                        .iter()
+                        .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+                        .count();
+                    let session_name = guard.get_name();
+                    let thinking_level = guard
+                        .header
+                        .thinking_level
+                        .clone()
+                        .unwrap_or_else(|| "off".to_string());
+                    (
+                        guard.path.as_ref().map(|p| p.display().to_string()),
+                        guard.header.id.clone(),
+                        session_name,
+                        message_count,
+                        thinking_level,
+                    )
+                },
+            );
+
+        json!({
+            "model": model,
+            "thinkingLevel": thinking_level,
+            "isStreaming": self.is_streaming.load(Ordering::SeqCst),
+            "isCompacting": self.is_compacting.load(Ordering::SeqCst),
+            "steeringMode": "one-at-a-time",
+            "followUpMode": "one-at-a-time",
+            "sessionFile": session_file,
+            "sessionId": session_id,
+            "sessionName": session_name,
+            "autoCompactionEnabled": self.config.compaction_enabled(),
+            "messageCount": message_count,
+            "pendingMessageCount": 0,
+        })
+    }
+
+    async fn get_messages(&self) -> Vec<SessionMessage> {
+        let cx = Cx::for_request();
+        let Ok(guard) = self.session.lock(&cx).await else {
+            return Vec::new();
+        };
+        guard
+            .entries_for_current_path()
+            .iter()
+            .filter_map(|entry| match entry {
+                SessionEntry::Message(msg) => match msg.message {
+                    SessionMessage::User { .. }
+                    | SessionMessage::Assistant { .. }
+                    | SessionMessage::ToolResult { .. }
+                    | SessionMessage::BashExecution { .. } => Some(msg.message.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    }
+
+    async fn set_name(&self, name: String) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.set_name(&name);
+        if self.save_enabled {
+            guard.save().await?;
+            let index = SessionIndex::new();
+            index.index_session(&guard)?;
+        }
+        Ok(())
+    }
 }
 
 /// A message in the conversation history.
@@ -315,8 +434,10 @@ impl PiApp {
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
         pending_inputs: Vec<PendingInput>,
-        event_tx: mpsc::UnboundedSender<PiMsg>,
+        event_tx: mpsc::Sender<PiMsg>,
+        runtime_handle: RuntimeHandle,
         save_enabled: bool,
+        extensions: Option<ExtensionManager>,
     ) -> Self {
         // Get terminal size
         let (term_width, term_height) =
@@ -353,6 +474,10 @@ impl PiApp {
             model_entry.model.id.as_str()
         );
 
+        let model_entry_shared = Arc::new(StdMutex::new(model_entry.clone()));
+        let extension_streaming = Arc::new(AtomicBool::new(false));
+        let extension_compacting = Arc::new(AtomicBool::new(false));
+
         let mut app = Self {
             input,
             input_history: Vec::new(),
@@ -375,17 +500,36 @@ impl PiApp {
             resource_cli,
             cwd,
             model_entry,
+            model_entry_shared: model_entry_shared.clone(),
             model_scope,
             available_models,
             model,
             agent: Arc::new(Mutex::new(agent)),
             total_usage,
             event_tx,
+            runtime_handle,
+            extension_streaming: extension_streaming.clone(),
+            extension_compacting: extension_compacting.clone(),
+            extension_ui_queue: VecDeque::new(),
+            active_extension_ui: None,
             status_message: None,
             save_enabled,
             abort_handle: None,
             pending_oauth: None,
+            extensions,
         };
+
+        if let Some(manager) = app.extensions.clone() {
+            let session_handle = Arc::new(InteractiveExtensionSession {
+                session: Arc::clone(&app.session),
+                model_entry: model_entry_shared,
+                is_streaming: extension_streaming,
+                is_compacting: extension_compacting,
+                config: app.config.clone(),
+                save_enabled: app.save_enabled,
+            });
+            manager.set_session(session_handle);
+        }
 
         app.scroll_to_bottom();
         app
@@ -394,8 +538,17 @@ impl PiApp {
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
         // Start text input cursor blink and spinner
-        let input_cmd = BubbleteaModel::init(&self.input);
-        let spinner_cmd = BubbleteaModel::init(&self.spinner);
+        let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+        let input_cmd = if test_mode {
+            None
+        } else {
+            BubbleteaModel::init(&self.input)
+        };
+        let spinner_cmd = if test_mode {
+            None
+        } else {
+            BubbleteaModel::init(&self.spinner)
+        };
         let pending_cmd = if self.pending_inputs.is_empty() {
             None
         } else {
@@ -669,6 +822,7 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.extension_streaming.store(true, Ordering::SeqCst);
             }
             PiMsg::RunPending => {
                 return self.run_next_pending();
@@ -736,6 +890,7 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
+                self.extension_streaming.store(false, Ordering::SeqCst);
 
                 if stop_reason == StopReason::Aborted {
                     self.status_message = Some("Request aborted".to_string());
@@ -769,6 +924,7 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
+                self.extension_streaming.store(false, Ordering::SeqCst);
                 self.input.focus();
 
                 if !self.pending_inputs.is_empty() {
@@ -814,6 +970,111 @@ impl PiApp {
                 self.status_message = Some(status);
                 self.input.focus();
             }
+            PiMsg::ExtensionUiRequest(request) => {
+                return self.handle_extension_ui_request(request);
+            }
+        }
+        None
+    }
+
+    fn handle_extension_ui_request(&mut self, request: ExtensionUiRequest) -> Option<Cmd> {
+        if request.expects_response() {
+            self.extension_ui_queue.push_back(request);
+            self.advance_extension_ui_queue();
+        } else {
+            self.apply_extension_ui_effect(&request);
+        }
+        None
+    }
+
+    fn apply_extension_ui_effect(&mut self, request: &ExtensionUiRequest) {
+        match request.method.as_str() {
+            "notify" => {
+                let title = request
+                    .payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Notification");
+                let message = request
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let level = request
+                    .payload
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!("Extension notify ({level}): {title} {message}"),
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+            }
+            "setStatus" | "set_status" => {
+                if let Some(text) = request.payload.get("text").and_then(Value::as_str) {
+                    self.status_message = Some(text.to_string());
+                }
+            }
+            "setWidget" | "set_widget" => {
+                if let Some(content) = request.payload.get("content").and_then(Value::as_str) {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("Extension widget:\n{content}"),
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                }
+            }
+            "setTitle" | "set_title" => {
+                if let Some(title) = request.payload.get("title").and_then(Value::as_str) {
+                    self.status_message = Some(format!("Title: {title}"));
+                }
+            }
+            "set_editor_text" => {
+                if let Some(text) = request.payload.get("text").and_then(Value::as_str) {
+                    self.input.set_value(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn send_extension_ui_response(&mut self, response: ExtensionUiResponse) {
+        if let Some(manager) = &self.extensions {
+            if !manager.respond_ui(response) {
+                self.status_message = Some("No pending extension UI request".to_string());
+            }
+        } else {
+            self.status_message = Some("Extensions are disabled".to_string());
+        }
+    }
+
+    fn advance_extension_ui_queue(&mut self) {
+        if self.active_extension_ui.is_some() {
+            return;
+        }
+        if let Some(next) = self.extension_ui_queue.pop_front() {
+            let prompt = format_extension_ui_prompt(&next);
+            self.active_extension_ui = Some(next);
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: prompt,
+                thinking: None,
+            });
+            self.scroll_to_bottom();
+            self.input.focus();
+        }
+    }
+
+    fn dispatch_extension_command(&mut self, command: &str, _args: Vec<String>) -> Option<Cmd> {
+        if self.extensions.is_some() {
+            self.status_message = Some(format!(
+                "Extension command '/{command}' is not available (runtime not enabled)"
+            ));
+        } else {
+            self.status_message = Some("Extensions are disabled".to_string());
         }
         None
     }
@@ -839,7 +1100,7 @@ impl PiApp {
         if !display.trim().is_empty() {
             self.messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: display,
+                content: display.clone(),
                 thinking: None,
             });
         }
@@ -851,8 +1112,6 @@ impl PiApp {
 
         // Start processing
         self.agent_state = AgentState::Processing;
-        self.extension_streaming.store(true, Ordering::SeqCst);
-        self.extension_streaming.store(true, Ordering::SeqCst);
 
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
@@ -862,27 +1121,53 @@ impl PiApp {
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
+        let extensions = self.extensions.clone();
+        let runtime_handle = self.runtime_handle.clone();
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
-        tokio::spawn(async move {
-            let mut agent_guard = agent.lock().await;
+        if let Some(manager) = extensions.clone() {
+            let message = display;
+            runtime_handle.spawn(async move {
+                let _ = manager
+                    .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
+                    .await;
+                let _ = manager
+                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
+                    .await;
+            });
+        }
+
+        let runtime_handle_for_task = runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let mut agent_guard = match agent.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                    return;
+                }
+            };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
+            let extensions = extensions.clone();
+            let runtime_handle = runtime_handle_for_task.clone();
             let result = agent_guard
                 .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
-                    let mapped = match event {
+                    let extension_event = extension_event_from_agent(&event);
+                    let mapped = match &event {
                         AgentEvent::AgentStart => Some(PiMsg::AgentStart),
                         AgentEvent::MessageUpdate {
                             assistant_message_event,
                             ..
-                        } => match *assistant_message_event {
+                        } => match assistant_message_event.as_ref() {
                             AssistantMessageEvent::TextDelta { delta, .. } => {
-                                Some(PiMsg::TextDelta(delta))
+                                Some(PiMsg::TextDelta(delta.clone()))
                             }
                             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                Some(PiMsg::ThinkingDelta(delta))
+                                Some(PiMsg::ThinkingDelta(delta.clone()))
                             }
                             _ => None,
                         },
@@ -891,8 +1176,8 @@ impl PiApp {
                             tool_call_id,
                             ..
                         } => Some(PiMsg::ToolStart {
-                            name: tool_name,
-                            tool_id: tool_call_id,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
                         }),
                         AgentEvent::ToolExecutionUpdate {
                             tool_name,
@@ -900,10 +1185,10 @@ impl PiApp {
                             partial_result,
                             ..
                         } => Some(PiMsg::ToolUpdate {
-                            name: tool_name,
-                            tool_id: tool_call_id,
-                            content: partial_result.content,
-                            details: partial_result.details,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
+                            content: partial_result.content.clone(),
+                            details: partial_result.details.clone(),
                         }),
                         AgentEvent::ToolExecutionEnd {
                             tool_name,
@@ -911,14 +1196,14 @@ impl PiApp {
                             is_error,
                             ..
                         } => Some(PiMsg::ToolEnd {
-                            name: tool_name,
-                            tool_id: tool_call_id,
-                            is_error,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
+                            is_error: *is_error,
                         }),
                         AgentEvent::AgentEnd { messages, .. } => {
-                            let last = last_assistant_message(&messages);
+                            let last = last_assistant_message(messages);
                             let mut usage = Usage::default();
-                            for message in &messages {
+                            for message in messages {
                                 if let ModelMessage::Assistant(assistant) = message {
                                     add_usage(&mut usage, &assistant.usage);
                                 }
@@ -937,7 +1222,17 @@ impl PiApp {
                     };
 
                     if let Some(msg) = mapped {
-                        let _ = event_sender.send(msg);
+                        let _ = event_sender.try_send(msg);
+                    }
+
+                    if let Some(manager) = &extensions {
+                        if let Some((event_name, data)) = extension_event {
+                            let manager = manager.clone();
+                            let runtime_handle = runtime_handle.clone();
+                            runtime_handle.spawn(async move {
+                                let _ = manager.dispatch_event(event_name, data).await;
+                            });
+                        }
                     }
                 })
                 .await;
@@ -946,7 +1241,14 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
-            let mut session_guard = session.lock().await;
+            let mut session_guard = match session.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    return;
+                }
+            };
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
@@ -966,14 +1268,14 @@ impl PiApp {
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = event_tx.send(PiMsg::AgentError(err));
+                let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
             if let Some(err) = index_error {
-                let _ = event_tx.send(PiMsg::AgentError(err));
+                let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
 
             if let Err(err) = result {
-                let _ = event_tx.send(PiMsg::AgentError(err.to_string()));
+                let _ = event_tx.try_send(PiMsg::AgentError(err.to_string()));
             }
         });
 
@@ -988,6 +1290,22 @@ impl PiApp {
             return None;
         }
 
+        if let Some(active) = self.active_extension_ui.take() {
+            match parse_extension_ui_response(&active, message) {
+                Ok(response) => {
+                    self.send_extension_ui_response(response);
+                    self.advance_extension_ui_queue();
+                }
+                Err(err) => {
+                    self.status_message = Some(err);
+                    self.active_extension_ui = Some(active);
+                }
+            }
+            self.input.reset();
+            self.input.focus();
+            return None;
+        }
+
         if let Some(pending) = self.pending_oauth.take() {
             return self.submit_oauth_code(message, pending);
         }
@@ -997,17 +1315,26 @@ impl PiApp {
             return self.handle_slash_command(cmd, args);
         }
 
+        if let Some((command, args)) = parse_extension_command(message) {
+            if let Some(manager) = &self.extensions {
+                if manager.has_command(&command) {
+                    return self.dispatch_extension_command(&command, args);
+                }
+            }
+        }
+
         let message_owned = message.to_string();
         let message_for_agent = self.resources.expand_input(&message_owned);
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
+        let extensions = self.extensions.clone();
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
         // Add to history
-        self.input_history.push(message_owned);
+        self.input_history.push(message_owned.clone());
         self.history_index = None;
 
         // Add user message to display
@@ -1028,25 +1355,50 @@ impl PiApp {
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
+        let runtime_handle = self.runtime_handle.clone();
+
+        if let Some(manager) = extensions.clone() {
+            let message = message_owned;
+            runtime_handle.spawn(async move {
+                let _ = manager
+                    .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
+                    .await;
+                let _ = manager
+                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
+                    .await;
+            });
+        }
+
         // Spawn async task to run the agent
-        tokio::spawn(async move {
-            let mut agent_guard = agent.lock().await;
+        let runtime_handle_for_agent = runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let mut agent_guard = match agent.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                    return;
+                }
+            };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
+            let extensions = extensions.clone();
             let result = agent_guard
                 .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
-                    let mapped = match event {
+                    let extension_event = extension_event_from_agent(&event);
+                    let mapped = match &event {
                         AgentEvent::AgentStart => Some(PiMsg::AgentStart),
                         AgentEvent::MessageUpdate {
                             assistant_message_event,
                             ..
-                        } => match *assistant_message_event {
+                        } => match assistant_message_event.as_ref() {
                             AssistantMessageEvent::TextDelta { delta, .. } => {
-                                Some(PiMsg::TextDelta(delta))
+                                Some(PiMsg::TextDelta(delta.clone()))
                             }
                             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                Some(PiMsg::ThinkingDelta(delta))
+                                Some(PiMsg::ThinkingDelta(delta.clone()))
                             }
                             _ => None,
                         },
@@ -1055,8 +1407,8 @@ impl PiApp {
                             tool_call_id,
                             ..
                         } => Some(PiMsg::ToolStart {
-                            name: tool_name,
-                            tool_id: tool_call_id,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
                         }),
                         AgentEvent::ToolExecutionUpdate {
                             tool_name,
@@ -1064,10 +1416,10 @@ impl PiApp {
                             partial_result,
                             ..
                         } => Some(PiMsg::ToolUpdate {
-                            name: tool_name,
-                            tool_id: tool_call_id,
-                            content: partial_result.content,
-                            details: partial_result.details,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
+                            content: partial_result.content.clone(),
+                            details: partial_result.details.clone(),
                         }),
                         AgentEvent::ToolExecutionEnd {
                             tool_name,
@@ -1075,14 +1427,14 @@ impl PiApp {
                             is_error,
                             ..
                         } => Some(PiMsg::ToolEnd {
-                            name: tool_name,
-                            tool_id: tool_call_id,
-                            is_error,
+                            name: tool_name.clone(),
+                            tool_id: tool_call_id.clone(),
+                            is_error: *is_error,
                         }),
                         AgentEvent::AgentEnd { messages, .. } => {
-                            let last = last_assistant_message(&messages);
+                            let last = last_assistant_message(messages);
                             let mut usage = Usage::default();
-                            for message in &messages {
+                            for message in messages {
                                 if let ModelMessage::Assistant(assistant) = message {
                                     add_usage(&mut usage, &assistant.usage);
                                 }
@@ -1101,7 +1453,16 @@ impl PiApp {
                     };
 
                     if let Some(msg) = mapped {
-                        let _ = event_sender.send(msg);
+                        let _ = event_sender.try_send(msg);
+                    }
+
+                    if let Some(manager) = &extensions {
+                        if let Some((event_name, data)) = extension_event {
+                            let manager = manager.clone();
+                            runtime_handle_for_agent.spawn(async move {
+                                let _ = manager.dispatch_event(event_name, data).await;
+                            });
+                        }
                     }
                 })
                 .await;
@@ -1110,7 +1471,14 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
-            let mut session_guard = session.lock().await;
+            let mut session_guard = match session.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    return;
+                }
+            };
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
@@ -1130,14 +1498,14 @@ impl PiApp {
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = event_tx.send(PiMsg::AgentError(err));
+                let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
             if let Some(err) = index_error {
-                let _ = event_tx.send(PiMsg::AgentError(err));
+                let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
 
             if let Err(err) = result {
-                let _ = event_tx.send(PiMsg::AgentError(err.to_string()));
+                let _ = event_tx.try_send(PiMsg::AgentError(err.to_string()));
             }
         });
 
@@ -1157,18 +1525,25 @@ impl PiApp {
         let PendingOAuth { provider, verifier } = pending;
         let code_input = code_input.to_string();
 
-        tokio::spawn(async move {
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
             let auth_path = crate::config::Config::auth_path();
             let mut auth = match crate::auth::AuthStorage::load(auth_path) {
                 Ok(a) => a,
                 Err(e) => {
-                    let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                     return;
                 }
             };
 
             let credential = match provider.as_str() {
-                "anthropic" => crate::auth::complete_anthropic_oauth(&code_input, &verifier).await,
+                "anthropic" => {
+                    Box::pin(crate::auth::complete_anthropic_oauth(
+                        &code_input,
+                        &verifier,
+                    ))
+                    .await
+                }
                 _ => Err(crate::error::Error::auth(format!(
                     "OAuth provider not supported: {provider}"
                 ))),
@@ -1177,18 +1552,18 @@ impl PiApp {
             let credential = match credential {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                    let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                     return;
                 }
             };
 
             auth.set(provider.clone(), credential);
             if let Err(e) = auth.save() {
-                let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                 return;
             }
 
-            let _ = event_tx.send(PiMsg::System(format!(
+            let _ = event_tx.try_send(PiMsg::System(format!(
                 "OAuth login successful for {provider}. Credentials saved to auth.json."
             )));
         });
@@ -1307,29 +1682,30 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
 
                 let event_tx = self.event_tx.clone();
-                tokio::spawn(async move {
+                let runtime_handle = self.runtime_handle.clone();
+                runtime_handle.spawn(async move {
                     let auth_path = crate::config::Config::auth_path();
                     let mut auth = match crate::auth::AuthStorage::load(auth_path) {
                         Ok(a) => a,
                         Err(e) => {
-                            let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                            let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                             return;
                         }
                     };
 
                     if !auth.remove(&provider) {
-                        let _ = event_tx.send(PiMsg::System(format!(
+                        let _ = event_tx.try_send(PiMsg::System(format!(
                             "No stored credentials found for {provider}."
                         )));
                         return;
                     }
 
                     if let Err(e) = auth.save() {
-                        let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                        let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                         return;
                     }
 
-                    let _ = event_tx.send(PiMsg::System(format!(
+                    let _ = event_tx.try_send(PiMsg::System(format!(
                         "Logged out of {provider}. Credentials removed from auth.json."
                     )));
                 });
@@ -1378,7 +1754,10 @@ impl PiApp {
                     };
 
                     {
-                        let mut agent_guard = self.agent.blocking_lock();
+                        let Ok(mut agent_guard) = self.agent.try_lock() else {
+                            self.status_message = Some("Agent busy; try again".to_string());
+                            return None;
+                        };
                         agent_guard.set_provider(provider_impl);
                         let options = agent_guard.stream_options_mut();
                         options.api_key = Some(api_key);
@@ -1387,7 +1766,10 @@ impl PiApp {
                     }
 
                     {
-                        let mut session_guard = self.session.blocking_lock();
+                        let Ok(mut session_guard) = self.session.try_lock() else {
+                            self.status_message = Some("Session busy; try again".to_string());
+                            return None;
+                        };
                         session_guard.header.provider = Some(entry.model.provider.clone());
                         session_guard.header.model_id = Some(entry.model.id.clone());
                         session_guard.append_model_change(
@@ -1397,6 +1779,9 @@ impl PiApp {
                     }
 
                     self.model_entry = entry;
+                    if let Ok(mut shared) = self.model_entry_shared.lock() {
+                        *shared = self.model_entry.clone();
+                    }
                     self.model = format!(
                         "{}/{}",
                         self.model_entry.model.provider, self.model_entry.model.id
@@ -1413,9 +1798,11 @@ impl PiApp {
                 }
 
                 if args.is_empty() {
-                    let current = self
-                        .session
-                        .blocking_lock()
+                    let Ok(guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    let current = guard
                         .header
                         .thinking_level
                         .clone()
@@ -1433,12 +1820,18 @@ impl PiApp {
                 };
 
                 {
-                    let mut agent_guard = self.agent.blocking_lock();
+                    let Ok(mut agent_guard) = self.agent.try_lock() else {
+                        self.status_message = Some("Agent busy; try again".to_string());
+                        return None;
+                    };
                     agent_guard.stream_options_mut().thinking_level = Some(level);
                 }
 
                 {
-                    let mut session_guard = self.session.blocking_lock();
+                    let Ok(mut session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
                     let level_str = thinking_level_to_str(level).to_string();
                     session_guard.header.thinking_level = Some(level_str.clone());
                     session_guard.append_thinking_level_change(level_str);
@@ -1562,22 +1955,26 @@ impl PiApp {
                 }
             }
             SlashCommand::Export => {
-                let output_path = if args.is_empty() {
-                    let basename = {
-                        let session_guard = self.session.blocking_lock();
-                        session_guard
-                            .path
-                            .as_ref()
-                            .and_then(|p| p.file_stem())
-                            .and_then(|s| s.to_str())
-                            .map_or_else(|| "session".to_string(), ToString::to_string)
+                let (basename, html) = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
                     };
+                    let basename = session_guard
+                        .path
+                        .as_ref()
+                        .and_then(|p| p.file_stem())
+                        .and_then(|s| s.to_str())
+                        .map_or_else(|| "session".to_string(), ToString::to_string);
+                    let html = session_guard.to_html();
+                    (basename, html)
+                };
+
+                let output_path = if args.is_empty() {
                     std::path::PathBuf::from(format!("pi-session-{basename}.html"))
                 } else {
                     std::path::PathBuf::from(args)
                 };
-
-                let html = self.session.blocking_lock().to_html();
                 if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     if let Err(err) = std::fs::create_dir_all(parent) {
                         self.status_message = Some(format!(
@@ -1604,16 +2001,21 @@ impl PiApp {
                 }
             }
             SlashCommand::Session => {
-                let session_guard = self.session.blocking_lock();
-                let path_str = session_guard
-                    .path
-                    .as_ref()
-                    .map_or_else(|| "(ephemeral)".to_string(), |p| p.display().to_string());
-                let entry_count = session_guard.entries.len();
-                let name = session_guard
-                    .get_name()
-                    .unwrap_or_else(|| "(unnamed)".to_string());
-                drop(session_guard);
+                let (path_str, entry_count, name) = {
+                    let Ok(session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    let path_str = session_guard
+                        .path
+                        .as_ref()
+                        .map_or_else(|| "(ephemeral)".to_string(), |p| p.display().to_string());
+                    let entry_count = session_guard.entries.len();
+                    let name = session_guard
+                        .get_name()
+                        .unwrap_or_else(|| "(unnamed)".to_string());
+                    (path_str, entry_count, name)
+                };
 
                 let info = format!(
                     "Session Info:\n  Name: {name}\n  Path: {path_str}\n  Entries: {entry_count}\n  Model: {}\n  Tokens: {} in / {} out\n  Cost: ${:.4}",
@@ -1690,15 +2092,18 @@ impl PiApp {
             }
             SlashCommand::Name => {
                 if args.is_empty() {
-                    let current_name = self
-                        .session
-                        .blocking_lock()
-                        .get_name()
-                        .unwrap_or_else(|| "(unnamed)".to_string());
+                    let Ok(guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    let current_name = guard.get_name().unwrap_or_else(|| "(unnamed)".to_string());
                     self.status_message = Some(format!("Session name: {current_name}"));
                 } else {
                     {
-                        let mut session_guard = self.session.blocking_lock();
+                        let Ok(mut session_guard) = self.session.try_lock() else {
+                            self.status_message = Some("Session busy; try again".to_string());
+                            return None;
+                        };
                         session_guard.set_name(args);
                     }
                     self.spawn_save_session();
@@ -1745,7 +2150,10 @@ impl PiApp {
                     return None;
                 }
 
-                let mut session_guard = self.session.blocking_lock();
+                let Ok(mut session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
                 session_guard.ensure_entry_ids();
                 let info = session_guard.branch_summary();
                 let leaves = session_guard.list_leaves();
@@ -1807,6 +2215,7 @@ impl PiApp {
                         Some("No current leaf available to switch from".to_string());
                     return None;
                 };
+                let session_id = session_guard.header.id.clone();
 
                 if current_leaf == target_id {
                     drop(session_guard);
@@ -1846,9 +2255,16 @@ impl PiApp {
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
+                let extensions = self.extensions.clone();
+                let current_leaf_for_event = current_leaf;
+                let target_id_for_event = target_id.clone();
+                let session_id_for_event = session_id;
                 let reserve_tokens = self.config.branch_summary_reserve_tokens();
                 let (provider, api_key) = {
-                    let agent_guard = self.agent.blocking_lock();
+                    let Ok(agent_guard) = self.agent.try_lock() else {
+                        self.status_message = Some("Agent busy; try again".to_string());
+                        return None;
+                    };
                     (
                         agent_guard.provider(),
                         agent_guard.stream_options().api_key.clone(),
@@ -1859,7 +2275,30 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Switching branches...".to_string());
 
-                tokio::spawn(async move {
+                let runtime_handle = self.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
+                    if let Some(manager) = extensions.clone() {
+                        let cancelled = manager
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeSwitch,
+                                Some(json!({
+                                    "fromId": current_leaf_for_event.clone(),
+                                    "toId": target_id_for_event.clone(),
+                                    "sessionId": session_id_for_event.clone(),
+                                })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if cancelled {
+                            let _ = event_tx.try_send(PiMsg::System(
+                                "Session switch cancelled by extension".to_string(),
+                            ));
+                            return;
+                        }
+                    }
+
                     let summary = if branch_entries.is_empty() {
                         None
                     } else if let Some(api_key) = api_key {
@@ -1874,7 +2313,7 @@ impl PiApp {
                         {
                             Ok(summary) => summary,
                             Err(err) => {
-                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                     "Branch summary failed: {err}"
                                 )));
                                 return;
@@ -1885,9 +2324,17 @@ impl PiApp {
                     };
 
                     let messages_for_agent = {
-                        let mut guard = session.lock().await;
+                        let mut guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         if !guard.navigate_to(&target_id) {
-                            let _ = event_tx.send(PiMsg::AgentError(format!(
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                 "Branch target not found: {target_id}"
                             )));
                             return;
@@ -1900,12 +2347,28 @@ impl PiApp {
                     };
 
                     {
-                        let mut agent_guard = agent.lock().await;
+                        let mut agent_guard = match agent.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock agent: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         agent_guard.replace_messages(messages_for_agent);
                     }
 
                     let (messages, usage) = {
-                        let guard = session.lock().await;
+                        let guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         load_conversation_from_session(&guard)
                     };
 
@@ -1917,11 +2380,24 @@ impl PiApp {
                         Some(format!("Switched to branch {target_id}"))
                     };
 
-                    let _ = event_tx.send(PiMsg::ConversationReset {
+                    let _ = event_tx.try_send(PiMsg::ConversationReset {
                         messages,
                         usage,
                         status,
                     });
+
+                    if let Some(manager) = extensions {
+                        let _ = manager
+                            .dispatch_event(
+                                ExtensionEventName::SessionSwitch,
+                                Some(json!({
+                                    "fromId": current_leaf_for_event,
+                                    "toId": target_id_for_event,
+                                    "sessionId": session_id_for_event,
+                                })),
+                            )
+                            .await;
+                    }
                 });
             }
             SlashCommand::Fork => {
@@ -1931,9 +2407,12 @@ impl PiApp {
                     return None;
                 }
 
-                let session_guard = self.session.blocking_lock();
-                let candidates = fork_candidates(&session_guard);
-                drop(session_guard);
+                let candidates = if let Ok(session_guard) = self.session.try_lock() {
+                    fork_candidates(&session_guard)
+                } else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
                 if candidates.is_empty() {
                     self.status_message = Some("No user messages to fork from".to_string());
                     return None;
@@ -1986,16 +2465,52 @@ impl PiApp {
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
+                let extensions = self.extensions.clone();
                 let model_provider = self.model_entry.model.provider.clone();
                 let model_id = self.model_entry.model.id.clone();
-                let thinking_level = self.session.blocking_lock().header.thinking_level.clone();
+                let (thinking_level, session_id) = if let Ok(guard) = self.session.try_lock() {
+                    (guard.header.thinking_level.clone(), guard.header.id.clone())
+                } else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
 
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Forking session...".to_string());
 
-                tokio::spawn(async move {
+                let runtime_handle = self.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
+                    if let Some(manager) = extensions.clone() {
+                        let cancelled = manager
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeFork,
+                                Some(json!({
+                                    "entryId": selection.id.clone(),
+                                    "summary": selection.summary.clone(),
+                                    "sessionId": session_id.clone(),
+                                })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if cancelled {
+                            let _ = event_tx
+                                .try_send(PiMsg::System("Fork cancelled by extension".to_string()));
+                            return;
+                        }
+                    }
+
                     let (entries, parent_path, session_dir) = {
-                        let guard = session.lock().await;
+                        let guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         let path_ids = guard.get_path_to_entry(&selection.id);
                         let mut entries = Vec::new();
                         for entry_id in path_ids {
@@ -2010,7 +2525,7 @@ impl PiApp {
                     };
 
                     if entries.is_empty() {
-                        let _ = event_tx.send(PiMsg::AgentError(
+                        let _ = event_tx.try_send(PiMsg::AgentError(
                             "Failed to build fork (no entries found)".to_string(),
                         ));
                         return;
@@ -2026,10 +2541,11 @@ impl PiApp {
                     new_session.entries = entries;
                     new_session.leaf_id = Some(selection.id.clone());
                     new_session.ensure_entry_ids();
+                    let new_session_id = new_session.header.id.clone();
 
                     if let Err(err) = new_session.save().await {
-                        let _ =
-                            event_tx.send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
                         return;
                     }
 
@@ -2038,25 +2554,63 @@ impl PiApp {
 
                     let messages_for_agent = new_session.to_messages_for_current_path();
                     {
-                        let mut agent_guard = agent.lock().await;
+                        let mut agent_guard = match agent.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock agent: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         agent_guard.replace_messages(messages_for_agent);
                     }
 
                     {
-                        let mut guard = session.lock().await;
+                        let mut guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         *guard = new_session;
                     }
 
                     let (messages, usage) = {
-                        let guard = session.lock().await;
+                        let guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         load_conversation_from_session(&guard)
                     };
 
-                    let _ = event_tx.send(PiMsg::ConversationReset {
+                    let _ = event_tx.try_send(PiMsg::ConversationReset {
                         messages,
                         usage,
                         status: Some(format!("Forked new session from {}", selection.summary)),
                     });
+
+                    if let Some(manager) = extensions {
+                        let _ = manager
+                            .dispatch_event(
+                                ExtensionEventName::SessionFork,
+                                Some(json!({
+                                    "entryId": selection.id,
+                                    "summary": selection.summary,
+                                    "sessionId": session_id,
+                                    "newSessionId": new_session_id,
+                                })),
+                            )
+                            .await;
+                    }
                 });
             }
             SlashCommand::Compact => {
@@ -2075,6 +2629,7 @@ impl PiApp {
                 let event_tx = self.event_tx.clone();
                 let session = Arc::clone(&self.session);
                 let agent = Arc::clone(&self.agent);
+                let extensions = self.extensions.clone();
                 let save_enabled = self.save_enabled;
                 let settings = ResolvedCompactionSettings {
                     enabled: self.config.compaction_enabled(),
@@ -2085,9 +2640,52 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Compacting context...".to_string());
 
-                tokio::spawn(async move {
+                let runtime_handle = self.runtime_handle.clone();
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
+                    let session_id = {
+                        let guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
+                        guard.header.id.clone()
+                    };
+
+                    if let Some(manager) = extensions.clone() {
+                        let cancelled = manager
+                            .dispatch_cancellable_event(
+                                ExtensionEventName::SessionBeforeCompact,
+                                Some(json!({
+                                    "instructions": custom_instructions.clone(),
+                                    "sessionId": session_id.clone(),
+                                })),
+                                EXTENSION_EVENT_TIMEOUT_MS,
+                            )
+                            .await
+                            .unwrap_or(false);
+                        if cancelled {
+                            let _ = event_tx.try_send(PiMsg::System(
+                                "Compaction cancelled by extension".to_string(),
+                            ));
+                            return;
+                        }
+                    }
+
                     let path_entries = {
-                        let mut guard = session.lock().await;
+                        let mut guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         guard.ensure_entry_ids();
                         guard
                             .entries_for_current_path()
@@ -2097,7 +2695,7 @@ impl PiApp {
                     };
 
                     let Some(prep) = prepare_compaction(&path_entries, settings) else {
-                        let _ = event_tx.send(PiMsg::System(
+                        let _ = event_tx.try_send(PiMsg::System(
                             "Compaction not available (already compacted or missing IDs)"
                                 .to_string(),
                         ));
@@ -2105,13 +2703,21 @@ impl PiApp {
                     };
 
                     let (provider, api_key) = {
-                        let agent_guard = agent.lock().await;
+                        let agent_guard = match agent.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock agent: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         let api_key = agent_guard.stream_options().api_key.clone();
                         (agent_guard.provider(), api_key)
                     };
 
                     let Some(api_key) = api_key else {
-                        let _ = event_tx.send(PiMsg::AgentError(
+                        let _ = event_tx.try_send(PiMsg::AgentError(
                             "Missing API key for compaction".to_string(),
                         ));
                         return;
@@ -2123,8 +2729,9 @@ impl PiApp {
                         {
                             Ok(result) => result,
                             Err(err) => {
-                                let _ = event_tx
-                                    .send(PiMsg::AgentError(format!("Compaction failed: {err}")));
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Compaction failed: {err}"
+                                )));
                                 return;
                             }
                         };
@@ -2132,7 +2739,7 @@ impl PiApp {
                     let details_value = match compaction_details_to_value(&result.details) {
                         Ok(value) => value,
                         Err(err) => {
-                            let _ = event_tx.send(PiMsg::AgentError(format!(
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                 "Compaction details failed: {err}"
                             )));
                             return;
@@ -2140,7 +2747,15 @@ impl PiApp {
                     };
 
                     let (messages, usage) = {
-                        let mut guard = session.lock().await;
+                        let mut guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         guard.append_compaction(
                             result.summary.clone(),
                             result.first_kept_entry_id.clone(),
@@ -2150,14 +2765,14 @@ impl PiApp {
                         );
                         if save_enabled {
                             if let Err(err) = guard.save().await {
-                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                     "Failed to save session: {err}"
                                 )));
                                 return;
                             }
                             let index = SessionIndex::new();
                             if let Err(err) = index.index_session(&guard) {
-                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                     "Failed to index session: {err}"
                                 )));
                             }
@@ -2165,19 +2780,49 @@ impl PiApp {
                         let messages = guard.to_messages_for_current_path();
                         drop(guard);
 
-                        let mut agent_guard = agent.lock().await;
+                        let mut agent_guard = match agent.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock agent: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         agent_guard.replace_messages(messages);
                         drop(agent_guard);
 
-                        let guard = session.lock().await;
+                        let guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
                         load_conversation_from_session(&guard)
                     };
 
-                    let _ = event_tx.send(PiMsg::ConversationReset {
+                    let _ = event_tx.try_send(PiMsg::ConversationReset {
                         messages,
                         usage,
                         status: Some("Compaction complete".to_string()),
                     });
+
+                    if let Some(manager) = extensions {
+                        let _ = manager
+                            .dispatch_event(
+                                ExtensionEventName::SessionCompact,
+                                Some(json!({
+                                    "summary": result.summary,
+                                    "firstKeptEntryId": result.first_kept_entry_id,
+                                    "tokensBefore": result.tokens_before,
+                                    "sessionId": session_id,
+                                })),
+                            )
+                            .await;
+                    }
                 });
             }
             SlashCommand::Reload => {
@@ -2194,9 +2839,12 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Reloading resources...".to_string());
 
-                tokio::spawn(async move {
+                let runtime_handle = self.runtime_handle.clone();
+                runtime_handle.spawn(async move {
                     let manager = PackageManager::new(cwd.clone());
-                    match ResourceLoader::load(&manager, &cwd, &config, &resource_cli).await {
+                    match Box::pin(ResourceLoader::load(&manager, &cwd, &config, &resource_cli))
+                        .await
+                    {
                         Ok(resources) => {
                             let status = format!(
                                 "Reloaded {} skills, {} prompts, {} themes",
@@ -2204,17 +2852,24 @@ impl PiApp {
                                 resources.prompts().len(),
                                 resources.themes().len()
                             );
-                            let _ = event_tx.send(PiMsg::ResourcesReloaded { resources, status });
+                            let _ =
+                                event_tx.try_send(PiMsg::ResourcesReloaded { resources, status });
                         }
                         Err(err) => {
-                            let _ =
-                                event_tx.send(PiMsg::AgentError(format!("Reload failed: {err}")));
+                            let _ = event_tx
+                                .try_send(PiMsg::AgentError(format!("Reload failed: {err}")));
                         }
                     }
                 });
             }
             SlashCommand::Share => {
-                let html = self.session.blocking_lock().to_html();
+                let html = {
+                    let Ok(guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    guard.to_html()
+                };
                 let path =
                     std::env::temp_dir().join(format!("pi-share-{}.html", uuid::Uuid::new_v4()));
                 match std::fs::write(&path, html) {
@@ -2239,17 +2894,27 @@ impl PiApp {
 
         let session = Arc::clone(&self.session);
         let event_tx = self.event_tx.clone();
-
-        tokio::spawn(async move {
-            let mut session_guard = session.lock().await;
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            let mut session_guard = match session.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    return;
+                }
+            };
             if let Err(err) = session_guard.save().await {
-                let _ = event_tx.send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+                let _ =
+                    event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
                 return;
             }
 
             let index = SessionIndex::new();
             if let Err(err) = index.index_session(&session_guard) {
-                let _ = event_tx.send(PiMsg::AgentError(format!("Failed to index session: {err}")));
+                let _ =
+                    event_tx.try_send(PiMsg::AgentError(format!("Failed to index session: {err}")));
             }
             drop(session_guard);
         });
@@ -2263,6 +2928,18 @@ impl PiApp {
         self.conversation_viewport.set_content(&content);
         self.conversation_viewport.goto_bottom();
         let _ = line_count; // Avoid unused warning
+    }
+
+    pub fn set_terminal_size(&mut self, width: usize, height: usize) {
+        self.term_width = width.max(1);
+        self.term_height = height.max(1);
+        self.input.set_width(self.term_width.saturating_sub(4));
+        let viewport_height = self.term_height.saturating_sub(9);
+        let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
+        viewport.mouse_wheel_enabled = true;
+        viewport.mouse_wheel_delta = 3;
+        self.conversation_viewport = viewport;
+        self.scroll_to_bottom();
     }
 
     /// Render the header.
@@ -2626,6 +3303,265 @@ fn add_usage(total: &mut Usage, usage: &Usage) {
     total.cost.total += usage.cost.total;
 }
 
+fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next()?.trim_start_matches('/').trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let args = parts.map(ToString::to_string).collect::<Vec<_>>();
+    Some((cmd.to_string(), args))
+}
+
+fn extension_model_from_entry(entry: &ModelEntry) -> Value {
+    let input = entry
+        .model
+        .input
+        .iter()
+        .map(|t| match t {
+            crate::provider::InputType::Text => "text",
+            crate::provider::InputType::Image => "image",
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "id": entry.model.id,
+        "name": entry.model.name,
+        "api": entry.model.api,
+        "provider": entry.model.provider,
+        "baseUrl": entry.model.base_url,
+        "reasoning": entry.model.reasoning,
+        "input": input,
+        "contextWindow": entry.model.context_window,
+        "maxTokens": entry.model.max_tokens,
+        "cost": entry.model.cost,
+    })
+}
+
+fn extension_ui_options(payload: &Value) -> Vec<(String, Value)> {
+    payload
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    let label = option.get("label").and_then(Value::as_str)?;
+                    let value = option
+                        .get("value")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(label.to_string()));
+                    Some((label.to_string(), value))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
+    let title = request
+        .payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Extension prompt");
+    let message = request
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let placeholder = request
+        .payload
+        .get("placeholder")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    match request.method.as_str() {
+        "confirm" => {
+            let default = request.payload.get("default").and_then(Value::as_bool);
+            let default_hint = default
+                .map(|value| format!(" (default: {})", if value { "yes" } else { "no" }))
+                .unwrap_or_default();
+            format!("Extension confirm: {title}\n{message}{default_hint}")
+        }
+        "select" => {
+            let options = extension_ui_options(&request.payload);
+            let mut lines = vec![format!("Extension select: {title}")];
+            if !message.is_empty() {
+                lines.push(message.to_string());
+            }
+            for (idx, (label, _)) in options.iter().enumerate() {
+                lines.push(format!("  {}. {label}", idx + 1));
+            }
+            if let Some(default) = request.payload.get("default") {
+                lines.push(format!("Default: {default}"));
+            }
+            lines.join("\n")
+        }
+        "input" => {
+            let default = request
+                .payload
+                .get("default")
+                .cloned()
+                .unwrap_or(Value::Null);
+            format!("Extension input: {title}\n{message}\n{placeholder}\nDefault: {default}")
+        }
+        "editor" => {
+            let language = request
+                .payload
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or("text");
+            format!("Extension editor ({language}): {title}\n{message}")
+        }
+        _ => format!("Extension request: {title}\n{message}"),
+    }
+}
+
+fn parse_extension_ui_response(
+    request: &ExtensionUiRequest,
+    input: &str,
+) -> Result<ExtensionUiResponse, String> {
+    let trimmed = input.trim();
+    let cancelled = trimmed.eq_ignore_ascii_case("cancel");
+
+    match request.method.as_str() {
+        "confirm" => parse_confirm_response(request, trimmed, cancelled),
+        "select" => parse_select_response(request, trimmed, cancelled),
+        "input" | "editor" => Ok(parse_text_response(request, input, cancelled)),
+        _ => Err(format!(
+            "Unsupported extension UI method: {}",
+            request.method
+        )),
+    }
+}
+
+fn parse_confirm_response(
+    request: &ExtensionUiRequest,
+    input: &str,
+    cancelled: bool,
+) -> Result<ExtensionUiResponse, String> {
+    if cancelled {
+        return Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
+        });
+    }
+
+    let value = if input.is_empty() {
+        request
+            .payload
+            .get("default")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        match input.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" | "1" => true,
+            "n" | "no" | "false" | "0" => false,
+            _ => {
+                return Err("Enter yes/no (y/n) or 'cancel'".to_string());
+            }
+        }
+    };
+
+    Ok(ExtensionUiResponse {
+        id: request.id.clone(),
+        value: Some(json!(value)),
+        cancelled: false,
+    })
+}
+
+fn parse_select_response(
+    request: &ExtensionUiRequest,
+    input: &str,
+    cancelled: bool,
+) -> Result<ExtensionUiResponse, String> {
+    if cancelled {
+        return Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
+        });
+    }
+
+    let options = extension_ui_options(&request.payload);
+    if options.is_empty() {
+        return Err("No options provided for select".to_string());
+    }
+
+    if input.is_empty() {
+        if let Some(default) = request.payload.get("default") {
+            return Ok(ExtensionUiResponse {
+                id: request.id.clone(),
+                value: Some(default.clone()),
+                cancelled: false,
+            });
+        }
+        return Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
+        });
+    }
+
+    if let Ok(index) = input.parse::<usize>() {
+        if index > 0 && index <= options.len() {
+            let value = options[index - 1].1.clone();
+            return Ok(ExtensionUiResponse {
+                id: request.id.clone(),
+                value: Some(value),
+                cancelled: false,
+            });
+        }
+    }
+
+    for (label, value) in options {
+        if label.eq_ignore_ascii_case(input) {
+            return Ok(ExtensionUiResponse {
+                id: request.id.clone(),
+                value: Some(value),
+                cancelled: false,
+            });
+        }
+    }
+
+    Err("Invalid selection. Enter a number, label, or 'cancel'.".to_string())
+}
+
+fn parse_text_response(
+    request: &ExtensionUiRequest,
+    input: &str,
+    cancelled: bool,
+) -> ExtensionUiResponse {
+    if cancelled {
+        return ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
+        };
+    }
+
+    let value = if input.trim().is_empty() {
+        request
+            .payload
+            .get("default")
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::String(input.to_string())
+    };
+
+    ExtensionUiResponse {
+        id: request.id.clone(),
+        value: Some(value),
+        cancelled: false,
+    }
+}
+
 fn user_content_to_text(content: &UserContent) -> String {
     match content {
         UserContent::Text(text) => text.clone(),
@@ -2789,13 +3725,32 @@ pub async fn run_interactive(
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
+    runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PiMsg>();
+    let (event_tx, event_rx) = mpsc::channel::<PiMsg>(1024);
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
 
-    tokio::spawn(async move {
-        while let Some(msg) = event_rx.recv().await {
+    runtime_handle.spawn(async move {
+        let cx = Cx::for_request();
+        while let Ok(msg) = event_rx.recv(&cx).await {
             let _ = ui_tx.send(Message::new(msg));
+        }
+    });
+    let extensions = if resource_cli.no_extensions {
+        None
+    } else {
+        Some(ExtensionManager::new())
+    };
+
+    let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
+    if let Some(manager) = &extensions {
+        manager.set_ui_sender(extension_ui_tx);
+    }
+    let extension_event_tx = event_tx.clone();
+    runtime_handle.spawn(async move {
+        let cx = Cx::for_request();
+        while let Ok(request) = extension_ui_rx.recv(&cx).await {
+            let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
         }
     });
 
@@ -2811,7 +3766,9 @@ pub async fn run_interactive(
         available_models,
         pending_inputs,
         event_tx,
+        runtime_handle,
         save_enabled,
+        extensions,
     );
 
     // Run the TUI program

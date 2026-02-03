@@ -21,12 +21,14 @@ use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
 use crate::session_index::SessionIndex;
 use crate::tools::{ToolOutput, ToolRegistry, ToolUpdate};
+use asupersync::sync::Notify;
 use chrono::Utc;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::watch;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
 // Agent Configuration
@@ -129,26 +131,42 @@ pub enum AgentEvent {
 /// Handle to request an abort of an in-flight agent run.
 #[derive(Debug, Clone)]
 pub struct AbortHandle {
-    tx: watch::Sender<bool>,
+    inner: Arc<AbortSignalInner>,
 }
 
 /// Signal for observing abort requests.
 #[derive(Debug, Clone)]
 pub struct AbortSignal {
-    rx: watch::Receiver<bool>,
+    inner: Arc<AbortSignalInner>,
+}
+
+#[derive(Debug)]
+struct AbortSignalInner {
+    aborted: AtomicBool,
+    notify: Notify,
 }
 
 impl AbortHandle {
     /// Create a new abort handle + signal pair.
     #[must_use]
     pub fn new() -> (Self, AbortSignal) {
-        let (tx, rx) = watch::channel(false);
-        (Self { tx }, AbortSignal { rx })
+        let inner = Arc::new(AbortSignalInner {
+            aborted: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            AbortSignal { inner },
+        )
     }
 
     /// Trigger an abort.
     pub fn abort(&self) {
-        let _ = self.tx.send(true);
+        if !self.inner.aborted.swap(true, Ordering::SeqCst) {
+            self.inner.notify.notify_waiters();
+        }
     }
 }
 
@@ -156,18 +174,17 @@ impl AbortSignal {
     /// Check if an abort has already been requested.
     #[must_use]
     pub fn is_aborted(&self) -> bool {
-        *self.rx.borrow()
+        self.inner.aborted.load(Ordering::SeqCst)
     }
 
-    async fn wait(&mut self) {
-        if *self.rx.borrow() {
+    async fn wait(&self) {
+        if self.is_aborted() {
             return;
         }
+
         loop {
-            if self.rx.changed().await.is_err() {
-                return;
-            }
-            if *self.rx.borrow() {
+            self.inner.notify.notified().await;
+            if self.is_aborted() {
                 return;
             }
         }
@@ -534,7 +551,7 @@ impl Agent {
     async fn stream_assistant_response(
         &mut self,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-        mut abort: Option<AbortSignal>,
+        abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
         // Build context and stream completion
         let context = self.build_context();
@@ -547,9 +564,13 @@ impl Agent {
         let mut added_partial = false;
 
         loop {
-            let event_result = if let Some(signal) = abort.as_mut() {
-                tokio::select! {
-                    () = signal.wait() => {
+            let event_result = if let Some(signal) = abort.as_ref() {
+                let abort_fut = signal.wait().fuse();
+                let event_fut = stream.next().fuse();
+                futures::pin_mut!(abort_fut, event_fut);
+
+                match futures::future::select(abort_fut, event_fut).await {
+                    futures::future::Either::Left(((), _event_fut)) => {
                         let abort_message = self.build_abort_message(partial_message.take());
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(abort_message.clone()),
@@ -558,9 +579,13 @@ impl Agent {
                                 error: abort_message.clone(),
                             }),
                         });
-                        return Ok(self.finalize_assistant_message(abort_message, on_event, added_partial));
+                        return Ok(self.finalize_assistant_message(
+                            abort_message,
+                            on_event,
+                            added_partial,
+                        ));
                     }
-                    event = stream.next() => event,
+                    futures::future::Either::Right((event, _abort_fut)) => event,
                 }
             } else {
                 stream.next().await

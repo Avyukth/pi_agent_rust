@@ -8,6 +8,7 @@ use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -172,7 +173,7 @@ impl AuthStorage {
 
         for (provider, refresh_token) in refreshes {
             let refreshed = match provider.as_str() {
-                "anthropic" => refresh_anthropic_oauth_token(&refresh_token).await?,
+                "anthropic" => Box::pin(refresh_anthropic_oauth_token(&refresh_token)).await?,
                 _ => continue,
             };
             self.entries.insert(provider, refreshed);
@@ -209,25 +210,98 @@ pub struct OAuthStartInfo {
     pub instructions: Option<String>,
 }
 
+fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*b as char);
+            }
+            b' ' => out.push_str("%20"),
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+fn percent_decode_component(value: &str) -> Option<String> {
+    if !value.as_bytes().contains(&b'%') && !value.as_bytes().contains(&b'+') {
+        return Some(value.to_string());
+    }
+
+    let mut out = Vec::with_capacity(value.len());
+    let mut bytes = value.as_bytes().iter().copied();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let hi = bytes.next()?;
+                let lo = bytes.next()?;
+                let hex = [hi, lo];
+                let hex = std::str::from_utf8(&hex).ok()?;
+                let decoded = u8::from_str_radix(hex, 16).ok()?;
+                out.push(decoded);
+            }
+            other => out.push(other),
+        }
+    }
+
+    String::from_utf8(out).ok()
+}
+
+fn parse_query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|part| !part.trim().is_empty())
+        .filter_map(|part| {
+            let (k, v) = part.split_once('=').unwrap_or((part, ""));
+            let key = percent_decode_component(k.trim())?;
+            let value = percent_decode_component(v.trim())?;
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn build_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
+    let mut url = String::with_capacity(base.len() + 128);
+    url.push_str(base);
+    url.push('?');
+
+    for (idx, (k, v)) in params.iter().enumerate() {
+        if idx > 0 {
+            url.push('&');
+        }
+        url.push_str(&percent_encode_component(k));
+        url.push('=');
+        url.push_str(&percent_encode_component(v));
+    }
+
+    url
+}
+
 /// Start Anthropic OAuth by generating an authorization URL and PKCE verifier.
 pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
 
-    let mut url = reqwest::Url::parse(ANTHROPIC_OAUTH_AUTHORIZE_URL)
-        .map_err(|e| Error::auth(e.to_string()))?;
-    url.query_pairs_mut()
-        .append_pair("code", "true")
-        .append_pair("client_id", ANTHROPIC_OAUTH_CLIENT_ID)
-        .append_pair("response_type", "code")
-        .append_pair("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI)
-        .append_pair("scope", ANTHROPIC_OAUTH_SCOPES)
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &verifier);
+    let url = build_url_with_query(
+        ANTHROPIC_OAUTH_AUTHORIZE_URL,
+        &[
+            ("code", "true"),
+            ("client_id", ANTHROPIC_OAUTH_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI),
+            ("scope", ANTHROPIC_OAUTH_SCOPES),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("state", &verifier),
+        ],
+    );
 
     Ok(OAuthStartInfo {
         provider: "anthropic".to_string(),
-        url: url.to_string(),
+        url,
         verifier,
         instructions: Some(
             "Open the URL, complete login, then paste the callback URL or authorization code."
@@ -246,8 +320,8 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
 
     let state = state.unwrap_or_else(|| verifier.to_string());
 
-    let client = reqwest::Client::new();
-    let response = client
+    let client = crate::http::client::Client::new();
+    let request = client
         .post(ANTHROPIC_OAUTH_TOKEN_URL)
         .json(&serde_json::json!({
             "grant_type": "authorization_code",
@@ -256,22 +330,23 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
             "state": state,
             "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
             "code_verifier": verifier,
-        }))
-        .send()
+        }))?;
+
+    let response = Box::pin(request.send())
         .await
         .map_err(|e| Error::auth(format!("Token exchange failed: {e}")))?;
 
-    if !response.status().is_success() {
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+
+    if !(200..300).contains(&status) {
         return Err(Error::auth(format!("Token exchange failed: {text}")));
     }
 
-    let oauth_response = response
-        .json::<OAuthTokenResponse>()
-        .await
+    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
         .map_err(|e| Error::auth(format!("Invalid token response: {e}")))?;
 
     Ok(AuthCredential::OAuth {
@@ -282,31 +357,32 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
 }
 
 async fn refresh_anthropic_oauth_token(refresh_token: &str) -> Result<AuthCredential> {
-    let client = reqwest::Client::new();
-    let response = client
+    let client = crate::http::client::Client::new();
+    let request = client
         .post(ANTHROPIC_OAUTH_TOKEN_URL)
         .json(&serde_json::json!({
             "grant_type": "refresh_token",
             "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
             "refresh_token": refresh_token,
-        }))
-        .send()
+        }))?;
+
+    let response = Box::pin(request.send())
         .await
         .map_err(|e| Error::auth(format!("Anthropic token refresh failed: {e}")))?;
 
-    if !response.status().is_success() {
-        let text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+
+    if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
             "Anthropic token refresh failed: {text}"
         )));
     }
 
-    let oauth_response = response
-        .json::<OAuthTokenResponse>()
-        .await
+    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
         .map_err(|e| Error::auth(format!("Invalid refresh response: {e}")))?;
 
     Ok(AuthCredential::OAuth {
@@ -346,13 +422,15 @@ fn parse_oauth_code_input(input: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
 
-    if let Ok(url) = reqwest::Url::parse(value) {
-        let code = url
-            .query_pairs()
-            .find_map(|(k, v)| (k == "code").then_some(v.into_owned()));
-        let state = url
-            .query_pairs()
-            .find_map(|(k, v)| (k == "state").then_some(v.into_owned()));
+    if let Some((_, query)) = value.split_once('?') {
+        let query = query.split('#').next().unwrap_or(query);
+        let pairs = parse_query_pairs(query);
+        let code = pairs
+            .iter()
+            .find_map(|(k, v)| (k == "code").then(|| v.clone()));
+        let state = pairs
+            .iter()
+            .find_map(|(k, v)| (k == "state").then(|| v.clone()));
         return (code, state);
     }
 
@@ -427,13 +505,11 @@ mod tests {
     #[test]
     fn test_start_anthropic_oauth_url_contains_required_params() {
         let info = start_anthropic_oauth().expect("start");
-        let url = reqwest::Url::parse(&info.url).expect("parse url");
-        assert_eq!(
-            url.as_str().split('?').next().unwrap(),
-            ANTHROPIC_OAUTH_AUTHORIZE_URL
-        );
+        let (base, query) = info.url.split_once('?').expect("missing query");
+        assert_eq!(base, ANTHROPIC_OAUTH_AUTHORIZE_URL);
 
-        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        let params: std::collections::HashMap<_, _> =
+            parse_query_pairs(query).into_iter().collect();
         assert_eq!(
             params.get("client_id").map(String::as_str),
             Some(ANTHROPIC_OAUTH_CLIENT_ID)

@@ -122,21 +122,25 @@ fn run_cli_test_case(case: &TestCase) -> TestResult {
         .map(|values| {
             values
                 .iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .filter_map(|item| item.as_str().map(ToString::to_string))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    let mut argv = Vec::with_capacity(args.len() + 1);
-    argv.push("pi".to_string());
-    argv.extend(args);
+    let mut cli_args = Vec::with_capacity(args.len() + 1);
+    cli_args.push("pi".to_string());
+    cli_args.extend(args);
 
     let mut content = String::new();
     let mut details: Option<Value> = None;
     let mut parse_error: Option<String> = None;
 
-    match Cli::try_parse_from(argv) {
+    match Cli::try_parse_from(cli_args) {
         Ok(cli) => {
+            // Handle custom --version flag (since clap's is disabled)
+            if cli.version {
+                content = format!("pi {}", env!("CARGO_PKG_VERSION"));
+            }
             details = Some(cli_details(&cli));
         }
         Err(err) => match err.kind() {
@@ -223,22 +227,22 @@ fn cli_details(cli: &Cli) -> Value {
         "theme": cli.theme.clone(),
         "no_themes": cli.no_themes,
         "export": cli.export.clone(),
-        "list_models": list_models_value(&cli.list_models),
-        "command": command_value(&cli.command),
+        "list_models": list_models_value(cli.list_models.as_ref()),
+        "command": command_value(cli.command.as_ref()),
         "file_args": cli
             .file_args()
             .into_iter()
-            .map(|arg| arg.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>(),
         "message_args": cli
             .message_args()
             .into_iter()
-            .map(|arg| arg.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>(),
     })
 }
 
-fn list_models_value(list_models: &Option<Option<String>>) -> Value {
+fn list_models_value(list_models: Option<&Option<String>>) -> Value {
     match list_models {
         None => Value::Null,
         Some(None) => Value::String("all".to_string()),
@@ -246,7 +250,7 @@ fn list_models_value(list_models: &Option<Option<String>>) -> Value {
     }
 }
 
-fn command_value(command: &Option<Commands>) -> Value {
+fn command_value(command: Option<&Commands>) -> Value {
     match command {
         Some(Commands::Install { source, local }) => json!({
             "name": "install",

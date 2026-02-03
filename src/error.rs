@@ -48,10 +48,6 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] Box<serde_json::Error>),
 
-    /// HTTP errors
-    #[error("HTTP error: {0}")]
-    Http(#[from] Box<reqwest::Error>),
-
     /// SQLite errors
     #[error("SQLite error: {0}")]
     Sqlite(#[from] Box<sqlmodel_core::Error>),
@@ -119,15 +115,18 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<serde_json::Error> for Error {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(Box::new(value))
+impl From<asupersync::sync::LockError> for Error {
+    fn from(value: asupersync::sync::LockError) -> Self {
+        match value {
+            asupersync::sync::LockError::Cancelled => Self::Aborted,
+            asupersync::sync::LockError::Poisoned => Self::session(value.to_string()),
+        }
     }
 }
 
-impl From<reqwest::Error> for Error {
-    fn from(value: reqwest::Error) -> Self {
-        Self::Http(Box::new(value))
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(Box::new(value))
     }
 }
 

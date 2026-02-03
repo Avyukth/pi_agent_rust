@@ -4,11 +4,9 @@
 //! responses (e.g., SSE) for deterministic provider tests.
 
 use crate::error::{Error, Result};
-use crate::http::client::StreamingResponse;
-use crate::http::{Client, Method};
-use asupersync::Cx;
 use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -132,13 +130,9 @@ pub struct RecordedResponse {
 }
 
 impl RecordedResponse {
-    pub fn into_streaming_response(self) -> StreamingResponse {
-        let chunks = self
-            .body_chunks
-            .into_iter()
-            .map(String::into_bytes)
-            .collect();
-        StreamingResponse::from_parts(self.status, self.headers, chunks)
+    pub fn into_byte_stream(self) -> BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>>
+    {
+        stream::iter(self.body_chunks.into_iter().map(|chunk| Ok(chunk.into_bytes()))).boxed()
     }
 }
 
@@ -180,56 +174,42 @@ impl VcrRecorder {
         &self.cassette_path
     }
 
-    pub async fn request_streaming(&self, request: RecordedRequest) -> Result<RecordedResponse> {
-        match self.mode {
-            VcrMode::Playback => self.playback(&request),
-            VcrMode::Record => self.record_request(request).await,
-            VcrMode::Auto => {
-                if self.cassette_path.exists() {
-                    self.playback(&request)
-                } else {
-                    self.record_request(request).await
-                }
-            }
-        }
-    }
-
-    async fn record_request(&self, request: RecordedRequest) -> Result<RecordedResponse> {
-        let client = Client::new();
-        let response = self
-            .record_streaming_with(request.clone(), || async {
-                let mut builder = client.request(method_from_str(&request.method)?, &request.url);
-                for (name, value) in &request.headers {
-                    builder = builder.header(name.clone(), value.clone());
-                }
-                if let Some(body) = &request.body {
-                    builder = builder.json(body)?;
-                } else if let Some(body_text) = &request.body_text {
-                    builder = builder.body(body_text.clone());
-                }
-                let cx = Cx::for_request();
-                builder.send_streaming(&cx).await
-            })
-            .await?;
-
-        Ok(response)
-    }
-
-    pub async fn record_streaming_with<F, Fut>(
+    pub async fn request_streaming_with<F, Fut, S>(
         &self,
         request: RecordedRequest,
         send: F,
     ) -> Result<RecordedResponse>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<StreamingResponse>>,
+        Fut: std::future::Future<Output = Result<(u16, Vec<(String, String)>, S)>>,
+        S: futures::Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
     {
-        let response = send().await?;
-        let status = response.status().as_u16();
-        let headers = response.headers().to_vec();
+        match self.mode {
+            VcrMode::Playback => self.playback(&request),
+            VcrMode::Record => self.record_streaming_with(request, send).await,
+            VcrMode::Auto => {
+                if self.cassette_path.exists() {
+                    self.playback(&request)
+                } else {
+                    self.record_streaming_with(request, send).await
+                }
+            }
+        }
+    }
+
+    pub async fn record_streaming_with<F, Fut, S>(
+        &self,
+        request: RecordedRequest,
+        send: F,
+    ) -> Result<RecordedResponse>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(u16, Vec<(String, String)>, S)>>,
+        S: futures::Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+    {
+        let (status, headers, mut stream) = send().await?;
 
         let mut body_chunks = Vec::new();
-        let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Error::api(format!("HTTP stream read failed: {e}")))?;
             if chunk.is_empty() {
@@ -297,18 +277,6 @@ fn sanitize_test_name(value: &str) -> String {
         "vcr".to_string()
     } else {
         out
-    }
-}
-
-fn method_from_str(value: &str) -> Result<Method> {
-    match value.to_ascii_uppercase().as_str() {
-        "GET" => Ok(Method::Get),
-        "POST" => Ok(Method::Post),
-        "PUT" => Ok(Method::Put),
-        "PATCH" => Ok(Method::Patch),
-        "DELETE" => Ok(Method::Delete),
-        "HEAD" => Ok(Method::Head),
-        other => Err(Error::config(format!("Unsupported HTTP method: {other}"))),
     }
 }
 
@@ -533,10 +501,18 @@ mod tests {
                     VcrRecorder::new_with("record_playback", VcrMode::Record, &cassette_dir);
                 recorder
                     .record_streaming_with(request.clone(), || async {
-                        Ok(StreamingResponse::from_parts(
-                            200,
-                            vec![("content-type".to_string(), "text/event-stream".to_string())],
-                            vec![b"event: message\ndata: ok\n\n".to_vec()],
+                        let recorded = RecordedResponse {
+                            status: 200,
+                            headers: vec![(
+                                "content-type".to_string(),
+                                "text/event-stream".to_string(),
+                            )],
+                            body_chunks: vec!["event: message\ndata: ok\n\n".to_string()],
+                        };
+                        Ok((
+                            recorded.status,
+                            recorded.headers.clone(),
+                            recorded.into_byte_stream(),
                         ))
                     })
                     .await
@@ -553,7 +529,12 @@ mod tests {
             async move {
                 let recorder =
                     VcrRecorder::new_with("record_playback", VcrMode::Playback, &cassette_dir);
-                recorder.request_streaming(request).await.expect("playback")
+                recorder
+                    .request_streaming_with(request, || async {
+                        Err(Error::config("Unexpected record in playback mode"))
+                    })
+                    .await
+                    .expect("playback")
             }
         });
 

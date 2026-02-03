@@ -1,0 +1,29 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+  Assistant:
+
+    Assistant reply 9
+
+
+
+  You: User message 10
+
+  Assistant:
+
+    Assistant reply 10
+
+
+
+  You: User message 11
+  [82%] ↑/↓ PgUp/PgDn to scroll
+
+  [single-line] Enter to send
+    > Type your message... (Enter to send, Alt+Enter for multi-line, Esc to quit)
+  >
+  >
+
+  Tokens: 0 in / 0 out  |  Alt+Enter: multi-line  |  /help  |  Esc: quit

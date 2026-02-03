@@ -7,6 +7,7 @@
 //! `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}`
 
 use crate::error::{Error, Result};
+use crate::http::client::Client;
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, Usage, UserContent,
 };
@@ -15,7 +16,6 @@ use crate::sse::SseStream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -144,10 +144,12 @@ impl Provider for AzureOpenAIProvider {
 
         let request_body = self.build_request(context, options);
 
+        let endpoint_url = self.endpoint_url();
+
         // Build request with Azure-specific headers
         let mut request = self
             .client
-            .post(self.endpoint_url())
+            .post(&endpoint_url)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("api-key", &api_key); // Azure uses api-key header, not Authorization
@@ -156,28 +158,19 @@ impl Provider for AzureOpenAIProvider {
             request = request.header(key, value);
         }
 
-        let request = request.json(&request_body);
+        let request = request.json(&request_body)?;
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| Error::api(format!("HTTP request failed: {e}")))?;
+        let response = Box::pin(request.send()).await?;
         let status = response.status();
-        if !status.is_success() {
+        if !(200..300).contains(&status) {
             let body = response.text().await.unwrap_or_default();
             return Err(Error::api(format!(
                 "Azure OpenAI API error (HTTP {status}): {body}"
             )));
         }
 
-        let byte_stream = response.bytes_stream().map(|chunk| {
-            chunk
-                .map(|bytes| bytes.to_vec())
-                .map_err(std::io::Error::other)
-        });
-
         // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(Box::pin(byte_stream));
+        let event_source = SseStream::new(response.bytes_stream());
 
         // Create stream state
         let model = self.deployment.clone();
@@ -280,6 +273,14 @@ where
             self.partial.usage.total_tokens = usage.total_tokens;
         }
 
+        // Emit Start event on first chunk
+        if !self.started {
+            self.started = true;
+            return Ok(Some(StreamEvent::Start {
+                partial: self.partial.clone(),
+            }));
+        }
+
         // Process choices
         for choice in chunk.choices {
             // Handle finish reason
@@ -329,13 +330,7 @@ where
                 // Always save text first (before started check) to avoid losing content
                 self.current_text.push_str(&text);
 
-                if !self.started {
-                    self.started = true;
-                    return Ok(Some(StreamEvent::Start {
-                        partial: self.partial.clone(),
-                    }));
-                }
-
+                // Emit TextDelta for this content
                 return Ok(Some(StreamEvent::TextDelta {
                     content_index: 0,
                     delta: text,
@@ -744,18 +739,18 @@ mod tests {
             .build()
             .expect("runtime build");
         runtime.block_on(async move {
-            let bytes = events
-                .iter()
-                .map(|event| {
-                    let data = match event {
-                        Value::String(text) => text.clone(),
-                        _ => serde_json::to_string(event).expect("serialize event"),
-                    };
-                    format!("data: {data}\n\n").into_bytes()
-                })
-                .collect::<Vec<_>>();
-
-            let byte_stream = stream::iter(bytes.into_iter().map(Ok));
+            let byte_stream = stream::iter(
+                events
+                    .iter()
+                    .map(|event| {
+                        let data = match event {
+                            Value::String(text) => text.clone(),
+                            _ => serde_json::to_string(event).expect("serialize event"),
+                        };
+                        format!("data: {data}\n\n").into_bytes()
+                    })
+                    .map(Ok),
+            );
             let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
             let mut state = StreamState::new(
                 event_source,
@@ -814,14 +809,14 @@ mod tests {
                 content_index: None,
                 delta: None,
                 content: None,
-                reason: Some(reason_to_string(reason)),
+                reason: Some(reason_to_string(*reason)),
             },
             StreamEvent::Error { reason, .. } => EventSummary {
                 kind: "error".to_string(),
                 content_index: None,
                 delta: None,
                 content: None,
-                reason: Some(reason_to_string(reason)),
+                reason: Some(reason_to_string(*reason)),
             },
             StreamEvent::TextStart { content_index, .. } => EventSummary {
                 kind: "text_start".to_string(),
@@ -851,7 +846,7 @@ mod tests {
         }
     }
 
-    fn reason_to_string(reason: &StopReason) -> String {
+    fn reason_to_string(reason: StopReason) -> String {
         match reason {
             StopReason::Stop => "stop",
             StopReason::Length => "length",

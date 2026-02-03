@@ -7,7 +7,19 @@ This document summarizes the **frozen sample set** defined in `docs/extension-sa
 - **Source**: `pi-mono` at commit `df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5`
 - **Sample size**: 16 (min 12, max 20)
 - **Selection**: CONFORMANCE.md + EXTENSION_SAMPLING_MATRIX quotas satisfied, with explicit swaps noted in the manifest rationale.
-- **Checksums**: `sha256` fields are **null** pending fixture capture (see bd-2qd / bd-3rr).
+- **Checksums**: `checksum.sha256` is filled for every entry (see **Artifacts & Checksums**).
+
+## Artifacts & Checksums
+
+To make conformance reproducible offline, we vendor the extension sources for the sample set:
+
+- **Artifacts path**: `tests/ext_conformance/artifacts/<id>/`
+- **Provenance**: copied from `legacy_pi_mono_code/pi-mono` at commit `df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5` (MIT licensed).
+- **Checksum storage**: `docs/extension-sample.json` → `items[].checksum.sha256`
+- **Checksum definition**: content-only `sha256` of the artifact file tree, independent of platform file permissions/mtimes.
+  - Enumerate all regular files under `tests/ext_conformance/artifacts/<id>/` recursively.
+  - Sort by normalized relative path (POSIX `/` separators).
+  - Hash stream: `b\"file\\0\" + path + b\"\\0\" + bytes + b\"\\0\"` for each file.
 
 ## Coverage Summary
 
@@ -60,6 +72,6 @@ This document summarizes the **frozen sample set** defined in `docs/extension-sa
 
 ## Next Steps
 
-1. Fill `checksum.sha256` for each entry at the pinned commit.
-2. Generate fixture outputs for each extension (bd-2qd) and normalize paths/time/randomness (bd-1oz).
-3. Use this list as the canonical sample for conformance and benchmark runs.
+1. Define per-extension capture scenarios (bd-2qd) in `docs/extension-sample.json` (`scenario_suite`).
+2. Implement the legacy capture pipeline to run scenarios and record outputs (bd-3on), then normalize paths/time/randomness (bd-1oz).
+3. Use this list + artifacts as the canonical sample for conformance and benchmark runs.

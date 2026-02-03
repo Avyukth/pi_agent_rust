@@ -1,0 +1,13 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+  Welcome to Pi! Type a message to begin, or /help for commands.
+
+  ⣾  Running read ...
+
+  ⣾  Processing...
+
+  Tokens: 0 in / 0 out  |  Alt+Enter: multi-line  |  /help  |  Esc: quit

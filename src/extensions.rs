@@ -5,11 +5,19 @@
 
 use crate::agent::AgentEvent;
 use crate::error::{Error, Result};
+use crate::session::SessionMessage;
+use asupersync::Cx;
+use asupersync::channel::{mpsc, oneshot};
+use asupersync::time::{timeout, wall_now};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
+use std::time::Duration;
+use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 pub const LOG_SCHEMA_VERSION: &str = "pi.ext.log.v1";
@@ -196,7 +204,7 @@ pub struct ToolCallPayload {
     pub call_id: String,
     pub name: String,
     pub input: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
 }
 
@@ -212,9 +220,9 @@ pub struct HostCallPayload {
     pub call_id: String,
     pub name: String,
     pub input: Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
 }
 
@@ -230,7 +238,7 @@ pub struct SlashCommandPayload {
     pub name: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Value>,
 }
 
@@ -243,7 +251,7 @@ pub struct SlashResultPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventHookPayload {
     pub event: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
@@ -255,9 +263,9 @@ pub struct LogPayload {
     pub event: String,
     pub message: String,
     pub correlation: LogCorrelation,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<LogSource>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
@@ -265,34 +273,34 @@ pub struct LogPayload {
 pub struct LogCorrelation {
     pub extension_id: String,
     pub scenario_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slash_command_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_call_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogSource {
     pub component: LogComponent,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
 }
 
@@ -318,8 +326,86 @@ pub enum LogLevel {
 pub struct ErrorPayload {
     pub code: String,
     pub message: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+}
+
+// ============================================================================
+// Extension UI + Session Bridge
+// ============================================================================
+
+/// Extension UI request payload (host -> UI surface).
+#[derive(Debug, Clone)]
+pub struct ExtensionUiRequest {
+    pub id: String,
+    pub method: String,
+    pub payload: Value,
+    pub timeout_ms: Option<u64>,
+}
+
+impl ExtensionUiRequest {
+    pub fn new(id: impl Into<String>, method: impl Into<String>, payload: Value) -> Self {
+        Self {
+            id: id.into(),
+            method: method.into(),
+            payload,
+            timeout_ms: None,
+        }
+    }
+
+    pub fn expects_response(&self) -> bool {
+        matches!(
+            self.method.as_str(),
+            "select" | "confirm" | "input" | "editor"
+        )
+    }
+
+    pub fn effective_timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms.or_else(|| {
+            self.payload
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+        })
+    }
+
+    pub fn to_rpc_event(&self) -> Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "type".to_string(),
+            Value::String("extension_ui_request".to_string()),
+        );
+        map.insert("id".to_string(), Value::String(self.id.clone()));
+        map.insert("method".to_string(), Value::String(self.method.clone()));
+
+        match &self.payload {
+            Value::Object(obj) => {
+                for (key, value) in obj {
+                    map.insert(key.clone(), value.clone());
+                }
+            }
+            other => {
+                map.insert("payload".to_string(), other.clone());
+            }
+        }
+
+        Value::Object(map)
+    }
+}
+
+/// Extension UI response payload (UI surface -> host).
+#[derive(Debug, Clone)]
+pub struct ExtensionUiResponse {
+    pub id: String,
+    pub value: Option<Value>,
+    pub cancelled: bool,
+}
+
+/// Minimal session access for extensions (hostcalls).
+#[async_trait]
+pub trait ExtensionSession: Send + Sync {
+    async fn get_state(&self) -> Value;
+    async fn get_messages(&self) -> Vec<SessionMessage>;
+    async fn set_name(&self, name: String) -> Result<()>;
 }
 
 impl ExtensionMessage {
@@ -544,14 +630,23 @@ impl std::fmt::Display for ExtensionEventName {
 }
 
 /// Extension manager for handling loaded extensions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExtensionManager {
     inner: Arc<Mutex<ExtensionManagerInner>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ExtensionManagerInner {
     extensions: Vec<RegisterPayload>,
+    ui_sender: Option<mpsc::Sender<ExtensionUiRequest>>,
+    pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
+    session: Option<Arc<dyn ExtensionSession>>,
+}
+
+impl std::fmt::Debug for ExtensionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtensionManager").finish_non_exhaustive()
+    }
 }
 
 impl Default for ExtensionManager {
@@ -566,6 +661,121 @@ impl ExtensionManager {
         Self {
             inner: Arc::new(Mutex::new(ExtensionManagerInner::default())),
         }
+    }
+
+    pub fn set_ui_sender(&self, sender: mpsc::Sender<ExtensionUiRequest>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.ui_sender = Some(sender);
+    }
+
+    pub fn set_session(&self, session: Arc<dyn ExtensionSession>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.session = Some(session);
+    }
+
+    pub fn register(&self, payload: RegisterPayload) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.extensions.push(payload);
+    }
+
+    pub fn has_command(&self, name: &str) -> bool {
+        let needle = normalize_command(name);
+        let guard = self.inner.lock().unwrap();
+        guard
+            .extensions
+            .iter()
+            .flat_map(|ext| ext.slash_commands.iter())
+            .filter_map(extract_slash_command_name)
+            .any(|cmd| normalize_command(&cmd) == needle)
+    }
+
+    pub fn list_commands(&self) -> Vec<Value> {
+        let guard = self.inner.lock().unwrap();
+        let mut commands = Vec::new();
+
+        for ext in &guard.extensions {
+            for cmd in &ext.slash_commands {
+                let Some(name) = extract_slash_command_name(cmd) else {
+                    continue;
+                };
+                let description = cmd.get("description").and_then(Value::as_str);
+                commands.push(json!({
+                    "name": name,
+                    "description": description,
+                    "source": "extension",
+                }));
+            }
+        }
+
+        drop(guard);
+        commands
+    }
+
+    pub async fn request_ui(
+        &self,
+        mut request: ExtensionUiRequest,
+    ) -> Result<Option<ExtensionUiResponse>> {
+        let cx = Cx::for_request();
+        if request.id.trim().is_empty() {
+            request.id = Uuid::new_v4().to_string();
+        }
+
+        let (ui_sender, expects_response) = {
+            let guard = self.inner.lock().unwrap();
+            (guard.ui_sender.clone(), request.expects_response())
+        };
+
+        let Some(ui_sender) = ui_sender else {
+            return Err(Error::extension("Extension UI sender not configured"));
+        };
+
+        if !expects_response {
+            ui_sender
+                .send(&cx, request)
+                .await
+                .map_err(|_| Error::extension("Extension UI channel closed"))?;
+            return Ok(None);
+        }
+
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.inner.lock().unwrap();
+            guard.pending_ui.insert(request.id.clone(), tx);
+        }
+
+        if ui_sender.send(&cx, request.clone()).await.is_err() {
+            self.inner.lock().unwrap().pending_ui.remove(&request.id);
+            return Err(Error::extension("Extension UI channel closed"));
+        }
+
+        let response = if let Some(timeout_ms) = request.effective_timeout_ms() {
+            match timeout(wall_now(), Duration::from_millis(timeout_ms), rx.recv(&cx)).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(_)) => Err(Error::extension("Extension UI response dropped")),
+                Err(_) => Err(Error::extension("Extension UI request timed out")),
+            }
+        } else {
+            rx.recv(&cx)
+                .await
+                .map_err(|_| Error::extension("Extension UI response dropped"))
+        };
+
+        match response {
+            Ok(resp) => Ok(Some(resp)),
+            Err(err) => {
+                self.inner.lock().unwrap().pending_ui.remove(&request.id);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn respond_ui(&self, response: ExtensionUiResponse) -> bool {
+        let cx = Cx::for_request();
+        let tx = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.pending_ui.remove(&response.id)
+        };
+        tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
     }
 
     /// Dispatch an event to all registered extensions.
@@ -591,7 +801,7 @@ impl ExtensionManager {
 }
 
 /// Extract extension event information from an agent event.
-pub fn extension_event_from_agent(
+pub const fn extension_event_from_agent(
     event: &AgentEvent,
 ) -> Option<(ExtensionEventName, Option<Value>)> {
     match event {
@@ -601,9 +811,197 @@ pub fn extension_event_from_agent(
     }
 }
 
+fn extract_slash_command_name(value: &Value) -> Option<String> {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn normalize_command(name: &str) -> String {
+    name.trim_start_matches('/').trim().to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonschema::Validator;
+
+    fn compiled_extension_protocol_schema() -> Validator {
+        let schema_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/schema/extension_protocol.json");
+        let raw = std::fs::read_to_string(&schema_path).unwrap_or_else(|err| {
+            panic!(
+                "Failed to read extension protocol schema {}: {err}",
+                schema_path.display()
+            )
+        });
+        let schema: Value = serde_json::from_str(&raw).unwrap_or_else(|err| {
+            panic!(
+                "Failed to parse extension protocol schema {}: {err}",
+                schema_path.display()
+            )
+        });
+
+        jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to compile JSON schema {}: {err}",
+                    schema_path.display()
+                )
+            })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn sample_protocol_messages() -> Vec<(&'static str, ExtensionMessage)> {
+        vec![
+            (
+                "register",
+                ExtensionMessage {
+                    id: "msg-register".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::Register(RegisterPayload {
+                        name: "demo".to_string(),
+                        version: "0.1.0".to_string(),
+                        api_version: "1.0".to_string(),
+                        capabilities: vec!["read".to_string()],
+                        tools: Vec::new(),
+                        slash_commands: Vec::new(),
+                        event_hooks: Vec::new(),
+                    }),
+                },
+            ),
+            (
+                "tool_call",
+                ExtensionMessage {
+                    id: "msg-tool-call".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::ToolCall(ToolCallPayload {
+                        call_id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        input: json!({ "path": "README.md" }),
+                        context: None,
+                    }),
+                },
+            ),
+            (
+                "tool_result",
+                ExtensionMessage {
+                    id: "msg-tool-result".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::ToolResult(ToolResultPayload {
+                        call_id: "call-1".to_string(),
+                        output: json!({ "ok": true }),
+                        is_error: false,
+                    }),
+                },
+            ),
+            (
+                "slash_command",
+                ExtensionMessage {
+                    id: "msg-slash-command".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::SlashCommand(SlashCommandPayload {
+                        name: "/hello".to_string(),
+                        args: vec!["world".to_string()],
+                        input: None,
+                    }),
+                },
+            ),
+            (
+                "slash_result",
+                ExtensionMessage {
+                    id: "msg-slash-result".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::SlashResult(SlashResultPayload {
+                        output: json!({ "text": "ok" }),
+                        is_error: false,
+                    }),
+                },
+            ),
+            (
+                "event_hook",
+                ExtensionMessage {
+                    id: "msg-event-hook".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::EventHook(EventHookPayload {
+                        event: "agent_start".to_string(),
+                        data: Some(json!({ "note": "hello" })),
+                    }),
+                },
+            ),
+            (
+                "host_call",
+                ExtensionMessage {
+                    id: "msg-host-call".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::HostCall(HostCallPayload {
+                        call_id: "host-1".to_string(),
+                        name: "tool".to_string(),
+                        input: json!({ "name": "read", "input": { "path": "README.md" } }),
+                        timeout_ms: Some(2500),
+                        context: None,
+                    }),
+                },
+            ),
+            (
+                "host_result",
+                ExtensionMessage {
+                    id: "msg-host-result".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::HostResult(HostResultPayload {
+                        call_id: "host-1".to_string(),
+                        output: json!({ "content": [] }),
+                        is_error: false,
+                    }),
+                },
+            ),
+            (
+                "log",
+                ExtensionMessage {
+                    id: "msg-log".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::Log(Box::new(LogPayload {
+                        schema: LOG_SCHEMA_VERSION.to_string(),
+                        ts: "2026-02-03T03:01:02.123Z".to_string(),
+                        level: LogLevel::Info,
+                        event: "tool_call.start".to_string(),
+                        message: "tool call dispatched".to_string(),
+                        correlation: LogCorrelation {
+                            extension_id: "ext.demo".to_string(),
+                            scenario_id: "scn-001".to_string(),
+                            session_id: None,
+                            run_id: None,
+                            artifact_id: None,
+                            tool_call_id: None,
+                            slash_command_id: None,
+                            event_id: None,
+                            host_call_id: None,
+                            rpc_id: None,
+                            trace_id: None,
+                            span_id: None,
+                        },
+                        source: None,
+                        data: None,
+                    })),
+                },
+            ),
+            (
+                "error",
+                ExtensionMessage {
+                    id: "msg-error".to_string(),
+                    version: PROTOCOL_VERSION.to_string(),
+                    body: ExtensionBody::Error(ErrorPayload {
+                        code: "E_DEMO".to_string(),
+                        message: "Something went wrong".to_string(),
+                        details: Some(json!({ "hint": "check config" })),
+                    }),
+                },
+            ),
+        ]
+    }
 
     #[test]
     fn parse_register_message() {
@@ -690,5 +1088,114 @@ mod tests {
         "#;
         let msg = ExtensionMessage::parse_and_validate(json).unwrap();
         assert!(matches!(msg.body, ExtensionBody::Log(_)));
+    }
+
+    #[test]
+    fn extension_ui_rpc_event_format() {
+        let request = ExtensionUiRequest::new(
+            "req-1",
+            "notify",
+            json!({ "title": "Hello", "message": "World" }),
+        );
+        let event = request.to_rpc_event();
+        assert_eq!(event["type"], "extension_ui_request");
+        assert_eq!(event["id"], "req-1");
+        assert_eq!(event["method"], "notify");
+        assert_eq!(event["title"], "Hello");
+        assert_eq!(event["message"], "World");
+    }
+
+    #[test]
+    fn extension_ui_request_roundtrip() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let (ui_tx, ui_rx) = mpsc::channel(16);
+            manager.set_ui_sender(ui_tx);
+
+            let responder = manager.clone();
+            handle.spawn(async move {
+                let cx = Cx::for_request();
+                if let Ok(req) = ui_rx.recv(&cx).await {
+                    responder.respond_ui(ExtensionUiResponse {
+                        id: req.id,
+                        value: Some(json!(true)),
+                        cancelled: false,
+                    });
+                }
+            });
+
+            let request = ExtensionUiRequest::new("", "confirm", json!({ "title": "Confirm" }));
+            let response = manager.request_ui(request).await.unwrap();
+            assert_eq!(response.unwrap().value, Some(json!(true)));
+        });
+    }
+
+    #[test]
+    fn extension_protocol_schema_accepts_all_variants() {
+        let schema = compiled_extension_protocol_schema();
+        for (label, message) in sample_protocol_messages() {
+            let instance =
+                serde_json::to_value(&message).unwrap_or_else(|err| panic!("{label}: {err}"));
+
+            if !schema.is_valid(&instance) {
+                let errs = schema
+                    .iter_errors(&instance)
+                    .map(|err| err.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                panic!("{label}: schema validation failed:\n{errs}");
+            }
+
+            let json =
+                serde_json::to_string(&message).unwrap_or_else(|err| panic!("{label}: {err}"));
+            let parsed = ExtensionMessage::parse_and_validate(&json)
+                .unwrap_or_else(|err| panic!("{label}: parse_and_validate failed: {err}"));
+            let parsed_json =
+                serde_json::to_value(&parsed).unwrap_or_else(|err| panic!("{label}: {err}"));
+            assert_eq!(
+                instance, parsed_json,
+                "{label}: JSON changed after roundtrip"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_protocol_schema_rejects_missing_required_fields() {
+        let schema = compiled_extension_protocol_schema();
+
+        let (_, message) = sample_protocol_messages()
+            .into_iter()
+            .find(|(label, _)| *label == "register")
+            .expect("register sample");
+        let mut instance = serde_json::to_value(&message).expect("serialize");
+
+        // Missing "id"
+        instance
+            .as_object_mut()
+            .expect("object")
+            .remove("id")
+            .expect("id present");
+        assert!(
+            schema.validate(&instance).is_err(),
+            "schema should reject missing id"
+        );
+    }
+
+    #[test]
+    fn parse_and_validate_rejects_unknown_type() {
+        let json = r#"
+        {
+          "id": "msg-unknown",
+          "version": "1.0",
+          "type": "not_a_real_type",
+          "payload": { "x": 1 }
+        }
+        "#;
+        assert!(ExtensionMessage::parse_and_validate(json).is_err());
     }
 }

@@ -108,7 +108,7 @@ impl LogEntry {
         );
 
         for (key, value) in &self.context {
-            let _ = write!(output, "           {key} = {value}\n");
+            let _ = writeln!(output, "           {key} = {value}");
         }
 
         output
@@ -129,7 +129,7 @@ impl LogEntry {
         );
 
         for (key, value) in &self.context {
-            let _ = write!(output, "{DIM}           {key}{RESET} = {value}\n");
+            let _ = writeln!(output, "{DIM}           {key}{RESET} = {value}");
         }
 
         output
@@ -407,7 +407,7 @@ impl TestLogger {
     }
 }
 
-fn redact_context(context: &mut Vec<(String, String)>) {
+fn redact_context(context: &mut [(String, String)]) {
     for (key, value) in context.iter_mut() {
         if is_sensitive_key(key) {
             *value = REDACTED_VALUE.to_string();

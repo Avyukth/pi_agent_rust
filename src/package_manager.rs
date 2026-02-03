@@ -224,8 +224,7 @@ impl PackageManager {
             scope: PackageScope::Project,
         }));
         let package_sources = self.dedupe_packages(all_packages);
-        self.resolve_package_sources(&package_sources, &mut accumulator)
-            .await?;
+        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
 
         // 2) Local entries from settings (global and project)
         for resource_type in ResourceType::all() {
@@ -297,8 +296,7 @@ impl PackageManager {
             })
             .collect::<Vec<_>>();
 
-        self.resolve_package_sources(&package_sources, &mut accumulator)
-            .await?;
+        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
         Ok(accumulator.into_resolved_paths())
     }
 
@@ -804,7 +802,7 @@ impl PackageManager {
                         .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
 
                     let needs_install = !installed_path.exists()
-                        || self.npm_needs_update(&spec, pinned, &installed_path).await;
+                        || Box::pin(self.npm_needs_update(&spec, pinned, &installed_path)).await;
                     if needs_install {
                         self.install(source_str, entry.scope)?;
                     }
@@ -854,7 +852,7 @@ impl PackageManager {
             return pinned_version.is_some_and(|pv| pv != installed_version);
         }
 
-        get_latest_npm_version(installed_path, spec)
+        Box::pin(get_latest_npm_version(installed_path, spec))
             .await
             .is_ok_and(|latest| latest != installed_version)
     }
@@ -1776,8 +1774,8 @@ fn read_installed_npm_version(installed_path: &Path) -> Option<String> {
 async fn get_latest_npm_version(installed_path: &Path, spec: &str) -> Result<String> {
     let (name, _) = parse_npm_spec(spec);
     let url = format!("https://registry.npmjs.org/{name}/latest");
-    let client = reqwest::Client::new();
-    let response = client.get(url).send().await.map_err(|e| {
+    let client = crate::http::client::Client::new();
+    let response = Box::pin(client.get(&url).send()).await.map_err(|e| {
         Error::tool(
             "npm",
             format!(
@@ -1786,7 +1784,26 @@ async fn get_latest_npm_version(installed_path: &Path, spec: &str) -> Result<Str
             ),
         )
     })?;
-    let data: Value = response.json().await.map_err(|e| {
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        Error::tool(
+            "npm",
+            format!(
+                "Failed to read npm registry response for {}: {e}",
+                installed_path.display()
+            ),
+        )
+    })?;
+
+    if !(200..300).contains(&status) {
+        return Err(Error::tool(
+            "npm",
+            format!("npm registry error (HTTP {status}): {body}"),
+        ));
+    }
+
+    let data: Value = serde_json::from_str(&body).map_err(|e| {
         Error::tool(
             "npm",
             format!(

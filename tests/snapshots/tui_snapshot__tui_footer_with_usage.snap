@@ -1,0 +1,19 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+
+  Assistant:
+
+    Usage sample.
+
+
+
+  [single-line] Enter to send
+    > Type your message... (Enter to send, Alt+Enter for multi-line, Esc to quit)
+  >
+  >
+
+  Tokens: 120 in / 45 out ($0.0030)  |  Alt+Enter: multi-line  |  /help  |  Esc: quit

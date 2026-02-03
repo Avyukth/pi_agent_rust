@@ -3,7 +3,8 @@
 //! This module defines the provider trait and common types for interacting
 //! with different LLM APIs.
 
-use crate::model::{Message, StreamEvent, ThinkingLevel};
+pub use crate::model::StreamEvent;
+use crate::model::{Message, ThinkingLevel};
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};

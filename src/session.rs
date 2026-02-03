@@ -30,6 +30,7 @@ pub const SESSION_VERSION: u8 = 3;
 // ============================================================================
 
 /// A session manages conversation state and persistence.
+#[derive(Debug)]
 pub struct Session {
     /// Session header
     pub header: SessionHeader,
@@ -232,7 +233,7 @@ impl Session {
             });
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = asupersync::fs::read_to_string(&path).await?;
         let mut lines = content.lines();
 
         // Parse header (first line)
@@ -321,7 +322,7 @@ impl Session {
             let encoded_cwd = encode_cwd(&cwd);
             let project_session_dir = base_dir.join(&encoded_cwd);
 
-            tokio::fs::create_dir_all(&project_session_dir).await?;
+            asupersync::fs::create_dir_all(&project_session_dir).await?;
 
             let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
             let filename = format!("{}_{}.jsonl", timestamp, &self.header.id[..8]);
@@ -345,7 +346,7 @@ impl Session {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
-        tokio::fs::write(temp_file.path(), content).await?;
+        asupersync::fs::write(temp_file.path(), content).await?;
 
         temp_file
             .persist(path)
@@ -1701,8 +1702,12 @@ mod tests {
         assert!(info.leaves.contains(&id_b));
     }
 
-    #[tokio::test]
-    async fn test_session_jsonl_serialization() {
+    #[test]
+    fn test_session_jsonl_serialization() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
         let temp = tempfile::tempdir().unwrap();
         let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
         session.header.provider = Some("anthropic".to_string());
@@ -1724,10 +1729,10 @@ mod tests {
         session.append_model_change("anthropic".to_string(), "claude-test".to_string());
         session.append_thinking_level_change("high".to_string());
         session.append_compaction("summary".to_string(), user_id.clone(), 123, None, None);
-        session.append_branch_summary(user_id.clone(), "branch".to_string(), None, None);
+        session.append_branch_summary(user_id, "branch".to_string(), None, None);
         session.append_session_info(Some("my-session".to_string()));
 
-        session.save().await.unwrap();
+        runtime.block_on(async { session.save().await }).unwrap();
 
         let path = session.path.clone().unwrap();
         let contents = std::fs::read_to_string(path).unwrap();

@@ -124,14 +124,9 @@ pub enum PackageSource {
 impl Config {
     /// Load configuration from global and project settings.
     pub fn load() -> Result<Self> {
-        if let Ok(path) = std::env::var("PI_CONFIG_PATH") {
-            return Self::load_from_path(&PathBuf::from(path));
-        }
-        let global = Self::load_global()?;
-        let project = Self::load_project()?;
-
-        // Merge project settings over global
-        Ok(Self::merge(global, project))
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config_path = std::env::var_os("PI_CONFIG_PATH").map(PathBuf::from);
+        Self::load_with_roots(config_path.as_deref(), &Self::global_dir(), &cwd)
     }
 
     /// Get the global configuration directory.
@@ -186,7 +181,7 @@ impl Config {
     }
 
     /// Load settings from a specific path.
-    fn load_from_path(path: &PathBuf) -> Result<Self> {
+    fn load_from_path(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -194,6 +189,20 @@ impl Config {
         let content = std::fs::read_to_string(path)?;
         let config: Self = serde_json::from_str(&content).unwrap_or_default();
         Ok(config)
+    }
+
+    fn load_with_roots(
+        config_path: Option<&std::path::Path>,
+        global_dir: &std::path::Path,
+        cwd: &std::path::Path,
+    ) -> Result<Self> {
+        if let Some(path) = config_path {
+            return Self::load_from_path(path);
+        }
+
+        let global = Self::load_from_path(&global_dir.join("settings.json"))?;
+        let project = Self::load_from_path(&cwd.join(Self::project_dir()).join("settings.json"))?;
+        Ok(Self::merge(global, project))
     }
 
     /// Merge two configurations, with `other` taking precedence.
@@ -328,5 +337,106 @@ impl Config {
 
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use tempfile::TempDir;
+
+    fn write_file(path: &std::path::Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, contents).expect("write file");
+    }
+
+    #[test]
+    fn load_returns_defaults_when_missing() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert!(config.theme.is_none());
+        assert!(config.default_provider.is_none());
+        assert!(config.default_model.is_none());
+    }
+
+    #[test]
+    fn load_respects_pi_config_path_override() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "theme": "global", "default_provider": "anthropic" }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "theme": "project", "default_provider": "google" }"#,
+        );
+
+        let override_path = temp.path().join("override.json");
+        write_file(
+            &override_path,
+            r#"{ "theme": "override", "default_provider": "openai" }"#,
+        );
+
+        let config =
+            Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
+        assert_eq!(config.theme.as_deref(), Some("override"));
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn load_merges_project_over_global() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "default_provider": "anthropic", "default_model": "global", "theme": "global" }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "default_model": "project" }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.default_model.as_deref(), Some("project"));
+        assert_eq!(config.theme.as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn load_with_invalid_pi_config_path_json_falls_back_to_defaults() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+
+        let override_path = temp.path().join("override.json");
+        write_file(&override_path, "not json");
+
+        let config =
+            Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
+        assert!(config.theme.is_none());
+        assert!(config.default_provider.is_none());
+        assert!(config.default_model.is_none());
+    }
+
+    #[test]
+    fn load_with_missing_pi_config_path_file_falls_back_to_defaults() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+
+        let missing_path = temp.path().join("missing.json");
+        let config =
+            Config::load_with_roots(Some(&missing_path), &global_dir, &cwd).expect("load config");
+        assert!(config.theme.is_none());
+        assert!(config.default_provider.is_none());
+        assert!(config.default_model.is_none());
     }
 }
