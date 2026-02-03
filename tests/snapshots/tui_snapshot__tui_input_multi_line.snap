@@ -1,6 +1,6 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 203
+assertion_line: 205
 expression: view
 ---
   Pi (dummy/dummy-model)

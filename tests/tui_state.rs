@@ -35,6 +35,20 @@ fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
     .handle()
 }
 
+fn ensure_tui_test_env() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "pi_agent_rust_tui_state_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        // Keep interactive tests deterministic regardless of any user/global config on disk.
+        std::env::set_var("PI_TEST_MODE", "1");
+        std::env::set_var("PI_CODING_AGENT_DIR", root.to_string_lossy().to_string());
+    });
+}
+
 struct DummyProvider;
 
 #[async_trait::async_trait]
@@ -96,6 +110,7 @@ fn build_app_with_session(
     pending_inputs: Vec<PendingInput>,
     session: Session,
 ) -> PiApp {
+    ensure_tui_test_env();
     let config = Config::default();
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
