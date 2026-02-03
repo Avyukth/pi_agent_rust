@@ -19,7 +19,6 @@ use crate::model::{
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
-use crate::session_index::SessionIndex;
 use crate::tools::{ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::sync::Notify;
 use chrono::Utc;
@@ -1008,21 +1007,14 @@ struct ToolExecutionOutcome {
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Session,
-    session_index: Option<SessionIndex>,
     save_enabled: bool,
 }
 
 impl AgentSession {
-    pub fn new(agent: Agent, session: Session, save_enabled: bool) -> Self {
-        let session_index = if save_enabled {
-            Some(SessionIndex::new())
-        } else {
-            None
-        };
+    pub const fn new(agent: Agent, session: Session, save_enabled: bool) -> Self {
         Self {
             agent,
             session,
-            session_index,
             save_enabled,
         }
     }
@@ -1034,9 +1026,6 @@ impl AgentSession {
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
             self.session.save().await?;
-            if let Some(index) = &self.session_index {
-                index.index_session(&self.session)?;
-            }
         }
         Ok(())
     }
@@ -1046,9 +1035,6 @@ impl AgentSession {
             return Ok(());
         }
         self.session.save().await?;
-        if let Some(index) = &self.session_index {
-            index.index_session(&self.session)?;
-        }
         Ok(())
     }
 
@@ -1107,9 +1093,6 @@ impl AgentSession {
         }
         if self.save_enabled {
             self.session.save().await?;
-            if let Some(index) = &self.session_index {
-                index.index_session(&self.session)?;
-            }
         }
         Ok(())
     }

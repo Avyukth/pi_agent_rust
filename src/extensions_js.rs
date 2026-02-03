@@ -14,10 +14,13 @@ pub struct QuickJsRuntime {
     context: AsyncContext,
 }
 
+#[allow(clippy::future_not_send)]
 impl QuickJsRuntime {
     pub async fn new() -> Result<Self> {
-        let runtime = AsyncRuntime::new().map_err(map_js_error)?;
-        let context = AsyncContext::full(&runtime).await.map_err(map_js_error)?;
+        let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
+        let context = AsyncContext::full(&runtime)
+            .await
+            .map_err(|err| map_js_error(&err))?;
         let instance = Self { runtime, context };
         instance.install_pi_stub().await?;
         Ok(instance)
@@ -27,7 +30,7 @@ impl QuickJsRuntime {
         self.context
             .with(|ctx| ctx.eval::<(), _>(source))
             .await
-            .map_err(map_js_error)?;
+            .map_err(|err| map_js_error(&err))?;
         Ok(())
     }
 
@@ -35,7 +38,7 @@ impl QuickJsRuntime {
         self.context
             .with(|ctx| ctx.eval_file::<(), _>(path))
             .await
-            .map_err(map_js_error)?;
+            .map_err(|err| map_js_error(&err))?;
         Ok(())
     }
 
@@ -68,7 +71,7 @@ impl QuickJsRuntime {
                     "tool",
                     Func::from(
                         |ctx: Ctx<'_>, _name: String, _input: Value| -> rquickjs::Result<Value> {
-                            Err(throw_unimplemented(ctx, "pi.tool"))
+                            Err(throw_unimplemented(&ctx, "pi.tool"))
                         },
                     ),
                 )?;
@@ -76,21 +79,21 @@ impl QuickJsRuntime {
                     "exec",
                     Func::from(
                         |ctx: Ctx<'_>, _cmd: String, _args: Value| -> rquickjs::Result<Value> {
-                            Err(throw_unimplemented(ctx, "pi.exec"))
+                            Err(throw_unimplemented(&ctx, "pi.exec"))
                         },
                     ),
                 )?;
                 pi.set(
                     "http",
                     Func::from(|ctx: Ctx<'_>, _req: Value| -> rquickjs::Result<Value> {
-                        Err(throw_unimplemented(ctx, "pi.http"))
+                        Err(throw_unimplemented(&ctx, "pi.http"))
                     }),
                 )?;
                 pi.set(
                     "session",
                     Func::from(
                         |ctx: Ctx<'_>, _op: String, _args: Value| -> rquickjs::Result<Value> {
-                            Err(throw_unimplemented(ctx, "pi.session"))
+                            Err(throw_unimplemented(&ctx, "pi.session"))
                         },
                     ),
                 )?;
@@ -98,7 +101,7 @@ impl QuickJsRuntime {
                     "ui",
                     Func::from(
                         |ctx: Ctx<'_>, _op: String, _args: Value| -> rquickjs::Result<Value> {
-                            Err(throw_unimplemented(ctx, "pi.ui"))
+                            Err(throw_unimplemented(&ctx, "pi.ui"))
                         },
                     ),
                 )?;
@@ -106,7 +109,7 @@ impl QuickJsRuntime {
                     "events",
                     Func::from(
                         |ctx: Ctx<'_>, _op: String, _args: Value| -> rquickjs::Result<Value> {
-                            Err(throw_unimplemented(ctx, "pi.events"))
+                            Err(throw_unimplemented(&ctx, "pi.events"))
                         },
                     ),
                 )?;
@@ -115,19 +118,19 @@ impl QuickJsRuntime {
                 Ok(())
             })
             .await
-            .map_err(map_js_error)?;
+            .map_err(|err| map_js_error(&err))?;
         Ok(())
     }
 }
 
-fn throw_unimplemented(ctx: Ctx<'_>, name: &str) -> rquickjs::Error {
+fn throw_unimplemented(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
     let message = format!("{name} is not wired yet");
-    match message.into_js(&ctx) {
+    match message.into_js(ctx) {
         Ok(value) => ctx.throw(value),
         Err(err) => err,
     }
 }
 
-fn map_js_error(err: rquickjs::Error) -> Error {
+fn map_js_error(err: &rquickjs::Error) -> Error {
     Error::extension(format!("QuickJS: {err}"))
 }

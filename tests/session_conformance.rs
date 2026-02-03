@@ -9,6 +9,7 @@ use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, 
 use pi::session::{
     CustomEntry, EntryBase, Session, SessionEntry, SessionHeader, SessionMessage, encode_cwd,
 };
+use pi::session_index::SessionIndex;
 use serde_json::json;
 use std::future::Future;
 use std::path::Path;
@@ -134,9 +135,7 @@ fn open_missing_session_returns_session_not_found_error() {
             .log()
             .info("setup", "Attempting to open missing file");
 
-        let Err(err) = open_session(&missing).await else {
-            panic!("expected error");
-        };
+        let err = open_session(&missing).await.expect_err("expected error");
         assert!(
             matches!(err, Error::SessionNotFound { .. }),
             "Expected SessionNotFound, got: {err}"
@@ -151,9 +150,7 @@ fn open_empty_session_file_errors() {
         let path = harness.create_file("empty.jsonl", "");
         harness.record_artifact("empty.jsonl", &path);
 
-        let Err(err) = open_session(&path).await else {
-            panic!("expected error");
-        };
+        let err = open_session(&path).await.expect_err("expected error");
         assert!(
             matches!(err, Error::Session(_)),
             "Expected Session error, got: {err}"
@@ -199,6 +196,28 @@ fn save_creates_path_under_override_dir() {
             path.starts_with(&expected_prefix),
             "Expected session path {path:?} to start with {expected_prefix:?}"
         );
+    });
+}
+
+#[test]
+fn save_updates_session_index_for_override_dir() {
+    run_async_test(async {
+        let harness = TestHarness::new("save_updates_session_index_for_override_dir");
+        let base_dir = harness.temp_path("sessions");
+        let mut session = Session::create_with_dir(Some(base_dir.clone()));
+        session.append_message(make_user_message("Hello"));
+
+        session.save().await.expect("save session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        let indexed = index
+            .list_sessions(Some(&session.header.cwd))
+            .expect("list sessions")
+            .into_iter()
+            .any(|meta| meta.id == session.header.id);
+
+        harness.assert_log("Session saved and indexed");
+        assert!(indexed, "Expected session to be indexed after save()");
     });
 }
 

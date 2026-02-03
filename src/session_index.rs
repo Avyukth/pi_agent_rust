@@ -30,9 +30,15 @@ pub struct SessionIndex {
 
 impl SessionIndex {
     pub fn new() -> Self {
-        let db_path = Config::global_dir().join("session-index.sqlite");
-        let lock_path = Config::global_dir().join("session-index.lock");
-        Self { db_path, lock_path }
+        let root = Config::sessions_dir();
+        Self::for_sessions_root(&root)
+    }
+
+    pub fn for_sessions_root(root: &Path) -> Self {
+        Self {
+            db_path: root.join("session-index.sqlite"),
+            lock_path: root.join("session-index.lock"),
+        }
     }
 
     pub fn index_session(&self, session: &Session) -> Result<()> {
@@ -109,13 +115,13 @@ impl SessionIndex {
     }
 
     pub fn reindex_all(&self) -> Result<()> {
-        let sessions_root = Config::sessions_dir();
+        let sessions_root = self.sessions_root();
         if !sessions_root.exists() {
             return Ok(());
         }
 
         let mut metas = Vec::new();
-        for entry in walk_jsonl(&sessions_root) {
+        for entry in walk_jsonl(sessions_root) {
             let Ok(path) = entry else { continue };
             if let Ok(meta) = build_meta_from_file(&path) {
                 metas.push(meta);
@@ -183,6 +189,10 @@ impl SessionIndex {
             .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
 
         f(&conn)
+    }
+
+    fn sessions_root(&self) -> &Path {
+        self.db_path.parent().unwrap_or_else(|| Path::new("."))
     }
 }
 

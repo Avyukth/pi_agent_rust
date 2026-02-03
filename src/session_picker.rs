@@ -193,6 +193,7 @@ pub fn list_sessions_for_cwd() -> Vec<SessionMeta> {
 /// Run the session picker and return the selected session.
 pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
     let cwd = std::env::current_dir().ok()?;
+    let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
     let sessions = list_sessions_for_project(&cwd, override_dir);
 
     if sessions.is_empty() {
@@ -201,7 +202,9 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 
     if sessions.len() == 1 {
         // Only one session, just open it
-        return Session::open(&sessions[0].path).await.ok();
+        let mut session = Session::open(&sessions[0].path).await.ok()?;
+        session.session_dir = Some(base_dir);
+        return Some(session);
     }
 
     let picker = SessionPicker::new(sessions);
@@ -216,7 +219,9 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
             }
 
             if let Some(path) = picker.selected_path() {
-                Session::open(path).await.ok()
+                let mut session = Session::open(path).await.ok()?;
+                session.session_dir = Some(base_dir);
+                Some(session)
             } else {
                 None
             }
@@ -234,12 +239,10 @@ fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<Ses
 
     let mut sessions = Vec::new();
 
-    if override_dir.is_none() {
-        let index = SessionIndex::new();
-        let _ = index.reindex_all();
-        if let Ok(list) = index.list_sessions(Some(&cwd.display().to_string())) {
-            sessions = list;
-        }
+    let index = SessionIndex::for_sessions_root(&base_dir);
+    let _ = index.reindex_all();
+    if let Ok(list) = index.list_sessions(Some(&cwd.display().to_string())) {
+        sessions = list;
     }
 
     if sessions.is_empty() {

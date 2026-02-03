@@ -85,19 +85,14 @@ impl Session {
             return Ok(Self::create_with_dir(Some(base_dir)));
         }
 
-        let mut entries = if override_dir.is_none() {
-            let index = SessionIndex::new();
-            index
-                .list_sessions(Some(&cwd.display().to_string()))
-                .map(|list| {
-                    list.into_iter()
-                        .filter_map(SessionPickEntry::from_meta)
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mut entries: Vec<SessionPickEntry> = SessionIndex::for_sessions_root(&base_dir)
+            .list_sessions(Some(&cwd.display().to_string()))
+            .map(|list| {
+                list.into_iter()
+                    .filter_map(SessionPickEntry::from_meta)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         if entries.is_empty() {
             entries = scan_sessions_on_disk(&project_session_dir)?;
@@ -158,7 +153,9 @@ impl Session {
             match input.parse::<usize>() {
                 Ok(index) if index > 0 && index <= entries.len() => {
                     let selected = &entries[index - 1];
-                    return Self::open(selected.path.to_string_lossy().as_ref()).await;
+                    let mut session = Self::open(selected.path.to_string_lossy().as_ref()).await?;
+                    session.session_dir = Some(base_dir.clone());
+                    return Ok(session);
                 }
                 _ => {
                     console.render_warning("Invalid selection. Try again.");
@@ -287,7 +284,7 @@ impl Session {
         let project_session_dir = base_dir.join(&encoded_cwd);
 
         if !project_session_dir.exists() {
-            return Ok(Self::create());
+            return Ok(Self::create_with_dir(Some(base_dir)));
         }
 
         // Find the most recent session file
@@ -303,7 +300,9 @@ impl Session {
         });
 
         if let Some(entry) = entries.pop() {
-            Self::open(entry.path().to_string_lossy().as_ref()).await
+            let mut session = Self::open(entry.path().to_string_lossy().as_ref()).await?;
+            session.session_dir = Some(base_dir);
+            Ok(session)
         } else {
             Ok(Self::create_with_dir(Some(base_dir)))
         }
@@ -351,6 +350,14 @@ impl Session {
         temp_file
             .persist(path)
             .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+
+        let sessions_root = self
+            .session_dir
+            .clone()
+            .unwrap_or_else(Config::sessions_dir);
+        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session(self) {
+            tracing::warn!("Failed to update session index: {err}");
+        }
         Ok(())
     }
 

@@ -51,7 +51,6 @@ use crate::package_manager::PackageManager;
 use crate::providers;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage};
-use crate::session_index::SessionIndex;
 
 // ============================================================================
 // Slash Commands
@@ -397,8 +396,6 @@ impl ExtensionSession for InteractiveExtensionSession {
         guard.set_name(&name);
         if self.save_enabled {
             guard.save().await?;
-            let index = SessionIndex::new();
-            index.index_session(&guard)?;
         }
         Ok(())
     }
@@ -1253,24 +1250,15 @@ impl PiApp {
                 session_guard.append_model_message(message);
             }
             let mut save_error = None;
-            let mut index_error = None;
 
             if save_enabled {
                 if let Err(err) = session_guard.save().await {
                     save_error = Some(format!("Failed to save session: {err}"));
-                } else {
-                    let index = SessionIndex::new();
-                    if let Err(err) = index.index_session(&session_guard) {
-                        index_error = Some(format!("Failed to index session: {err}"));
-                    }
                 }
             }
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = event_tx.try_send(PiMsg::AgentError(err));
-            }
-            if let Some(err) = index_error {
                 let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
 
@@ -1483,24 +1471,15 @@ impl PiApp {
                 session_guard.append_model_message(message);
             }
             let mut save_error = None;
-            let mut index_error = None;
 
             if save_enabled {
                 if let Err(err) = session_guard.save().await {
                     save_error = Some(format!("Failed to save session: {err}"));
-                } else {
-                    let index = SessionIndex::new();
-                    if let Err(err) = index.index_session(&session_guard) {
-                        index_error = Some(format!("Failed to index session: {err}"));
-                    }
                 }
             }
             drop(session_guard);
 
             if let Some(err) = save_error {
-                let _ = event_tx.try_send(PiMsg::AgentError(err));
-            }
-            if let Some(err) = index_error {
                 let _ = event_tx.try_send(PiMsg::AgentError(err));
             }
 
@@ -1747,7 +1726,7 @@ impl PiApp {
                         }
                     };
 
-                    let Some(api_key) = entry.api_key.clone() else {
+                    let Some(provider_key) = entry.api_key.clone() else {
                         self.status_message =
                             Some(format!("No API key for provider {}", entry.model.provider));
                         return None;
@@ -1760,7 +1739,7 @@ impl PiApp {
                         };
                         agent_guard.set_provider(provider_impl);
                         let options = agent_guard.stream_options_mut();
-                        options.api_key = Some(api_key);
+                        options.api_key.replace(provider_key);
                         options.headers.clone_from(&entry.headers);
                         drop(agent_guard);
                     }
@@ -2549,9 +2528,6 @@ impl PiApp {
                         return;
                     }
 
-                    let index = SessionIndex::new();
-                    let _ = index.index_session(&new_session);
-
                     let messages_for_agent = new_session.to_messages_for_current_path();
                     {
                         let mut agent_guard = match agent.lock(&cx).await {
@@ -2702,7 +2678,7 @@ impl PiApp {
                         return;
                     };
 
-                    let (provider, api_key) = {
+                    let (provider, maybe_provider_key) = {
                         let agent_guard = match agent.lock(&cx).await {
                             Ok(guard) => guard,
                             Err(err) => {
@@ -2712,29 +2688,32 @@ impl PiApp {
                                 return;
                             }
                         };
-                        let api_key = agent_guard.stream_options().api_key.clone();
-                        (agent_guard.provider(), api_key)
+                        let key = agent_guard.stream_options().api_key.clone();
+                        (agent_guard.provider(), key)
                     };
 
-                    let Some(api_key) = api_key else {
+                    let Some(provider_key) = maybe_provider_key else {
                         let _ = event_tx.try_send(PiMsg::AgentError(
                             "Missing API key for compaction".to_string(),
                         ));
                         return;
                     };
 
-                    let result =
-                        match compact(prep, provider, &api_key, custom_instructions.as_deref())
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Compaction failed: {err}"
-                                )));
-                                return;
-                            }
-                        };
+                    let result = match compact(
+                        prep,
+                        provider,
+                        &provider_key,
+                        custom_instructions.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            let _ = event_tx
+                                .try_send(PiMsg::AgentError(format!("Compaction failed: {err}")));
+                            return;
+                        }
+                    };
 
                     let details_value = match compaction_details_to_value(&result.details) {
                         Ok(value) => value,
@@ -2769,12 +2748,6 @@ impl PiApp {
                                     "Failed to save session: {err}"
                                 )));
                                 return;
-                            }
-                            let index = SessionIndex::new();
-                            if let Err(err) = index.index_session(&guard) {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to index session: {err}"
-                                )));
                             }
                         }
                         let messages = guard.to_messages_for_current_path();
@@ -2909,12 +2882,6 @@ impl PiApp {
                 let _ =
                     event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
                 return;
-            }
-
-            let index = SessionIndex::new();
-            if let Err(err) = index.index_session(&session_guard) {
-                let _ =
-                    event_tx.try_send(PiMsg::AgentError(format!("Failed to index session: {err}")));
             }
             drop(session_guard);
         });
