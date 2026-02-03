@@ -12,21 +12,21 @@
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use chrono::{Datelike, Local};
 use clap::Parser;
 use glob::Pattern;
-use pi::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
+use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::auth::AuthStorage;
 use pi::cli;
 use pi::config::Config;
 use pi::model;
 use pi::model::{AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
+use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
 use pi::provider::{InputType, StreamOptions, ThinkingBudgets};
-use pi::providers::{anthropic::AnthropicProvider, openai::OpenAIProvider};
+use pi::providers;
 use pi::session::Session;
 use pi::tools::{ToolRegistry, process_file_arguments};
 use tracing_subscriber::EnvFilter;
@@ -55,14 +55,29 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
         return Ok(());
     }
 
-    let config = Config::load()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    if let Some(command) = cli.command.take() {
+        handle_subcommand(command, &cwd).await?;
+        return Ok(());
+    }
+
+    let config = Config::load()?;
     let auth = AuthStorage::load(Config::auth_path())?;
     let models_path = default_models_path(&Config::global_dir());
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
+    }
+
+    // Auto-install packages from settings on startup
+    let package_manager = PackageManager::new(cwd.clone());
+    if let Ok(installed) = package_manager.ensure_packages_installed() {
+        if cli.verbose && !installed.is_empty() {
+            for entry in &installed {
+                eprintln!("Auto-installed: {}", entry.source);
+            }
+        }
     }
 
     if let Some(pattern) = &cli.list_models {
@@ -138,7 +153,8 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     let api_key = resolve_api_key(&auth, &cli, &selection.model_entry)?;
 
     let system_prompt = build_system_prompt(&cli, &cwd, &enabled_tools);
-    let provider = create_provider(&selection.model_entry)?;
+    let provider =
+        providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
     let stream_options = build_stream_options(&config, api_key, &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
@@ -163,34 +179,171 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     }
 
     if is_interactive {
-        if !scoped_models.is_empty() && (cli.verbose || !config.quiet_startup.unwrap_or(false)) {
-            let model_list = scoped_models
-                .iter()
-                .map(|sm| {
-                    let suffix = sm
-                        .thinking_level
-                        .map(thinking_level_to_str)
-                        .map(|s| format!(":{s}"))
-                        .unwrap_or_default();
-                    format!("{}{}", sm.model.model.id, suffix)
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("Model scope: {model_list} (Ctrl+P to cycle)");
-        }
+        let model_scope = selection
+            .scoped_models
+            .iter()
+            .map(|sm| sm.model.clone())
+            .collect::<Vec<_>>();
+        let available_models = model_registry.get_available();
 
         return run_interactive_mode(
             agent_session,
             initial,
             messages,
             config.clone(),
-            selection.model_entry.model.id.clone(),
+            selection.model_entry.clone(),
+            model_scope,
+            available_models,
             !cli.no_session,
         )
         .await;
     }
 
     run_print_mode(&mut agent_session, &mode, initial, messages).await
+}
+
+async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
+    let manager = PackageManager::new(cwd.to_path_buf());
+    match command {
+        cli::Commands::Install { source, local } => {
+            handle_package_install(&manager, &source, local)?;
+        }
+        cli::Commands::Remove { source, local } => {
+            handle_package_remove(&manager, &source, local)?;
+        }
+        cli::Commands::Update { source } => {
+            handle_package_update(&manager, source)?;
+        }
+        cli::Commands::List => {
+            handle_package_list(&manager)?;
+        }
+        cli::Commands::Config => {
+            handle_config(cwd)?;
+        }
+    }
+
+    Ok(())
+}
+
+const fn scope_from_flag(local: bool) -> PackageScope {
+    if local {
+        PackageScope::Project
+    } else {
+        PackageScope::User
+    }
+}
+
+fn handle_package_install(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
+    let scope = scope_from_flag(local);
+    manager.install(source, scope)?;
+    manager.add_package_source(source, scope)?;
+    println!("Installed {source}");
+    Ok(())
+}
+
+fn handle_package_remove(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
+    let scope = scope_from_flag(local);
+    manager.remove(source, scope)?;
+    manager.remove_package_source(source, scope)?;
+    println!("Removed {source}");
+    Ok(())
+}
+
+fn handle_package_update(manager: &PackageManager, source: Option<String>) -> Result<()> {
+    let entries = manager.list_packages()?;
+
+    if let Some(source) = source {
+        let identity = manager.package_identity(&source);
+        for entry in entries {
+            if manager.package_identity(&entry.source) != identity {
+                continue;
+            }
+            manager.update_source(&entry.source, entry.scope)?;
+        }
+        println!("Updated {source}");
+        return Ok(());
+    }
+
+    for entry in entries {
+        manager.update_source(&entry.source, entry.scope)?;
+    }
+    println!("Updated packages");
+    Ok(())
+}
+
+fn handle_package_list(manager: &PackageManager) -> Result<()> {
+    let entries = manager.list_packages()?;
+
+    let mut user = Vec::new();
+    let mut project = Vec::new();
+    for entry in entries {
+        match entry.scope {
+            PackageScope::User => user.push(entry),
+            PackageScope::Project => project.push(entry),
+        }
+    }
+
+    if user.is_empty() && project.is_empty() {
+        println!("No packages installed.");
+        return Ok(());
+    }
+
+    if !user.is_empty() {
+        println!("User packages:");
+        for entry in &user {
+            print_package_entry(manager, entry)?;
+        }
+    }
+
+    if !project.is_empty() {
+        if !user.is_empty() {
+            println!();
+        }
+        println!("Project packages:");
+        for entry in &project {
+            print_package_entry(manager, entry)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
+    let display = if entry.filtered {
+        format!("{} (filtered)", entry.source)
+    } else {
+        entry.source.clone()
+    };
+    println!("  {display}");
+    if let Some(path) = manager.installed_path(&entry.source, entry.scope)? {
+        println!("    {}", path.display());
+    }
+    Ok(())
+}
+
+fn handle_config(cwd: &Path) -> Result<()> {
+    let _ = Config::load()?;
+    let config_path = std::env::var("PI_CONFIG_PATH")
+        .ok()
+        .map_or_else(|| Config::global_dir().join("settings.json"), PathBuf::from);
+    let project_path = cwd.join(Config::project_dir()).join("settings.json");
+
+    println!("Settings paths:");
+    println!("  Global:  {}", config_path.display());
+    println!("  Project: {}", project_path.display());
+    println!();
+    println!("Other paths:");
+    println!("  Auth:     {}", Config::auth_path().display());
+    println!("  Sessions: {}", Config::sessions_dir().display());
+    println!();
+    println!("Settings precedence:");
+    println!("  1) CLI flags");
+    println!("  2) Environment variables");
+    println!("  3) Project settings ({})", project_path.display());
+    println!("  4) Global settings ({})", config_path.display());
+    println!("  5) Built-in defaults");
+
+    Ok(())
 }
 
 fn print_version() {
@@ -365,14 +518,28 @@ async fn run_print_mode(
             }
         }
     };
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    let abort_listener = abort_handle.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        abort_listener.abort();
+    });
 
     if let Some(initial) = initial {
         let content = build_initial_content(&initial);
-        last_message = Some(session.run_with_content(content, event_handler).await?);
+        last_message = Some(
+            session
+                .run_with_content_with_abort(content, Some(abort_signal.clone()), event_handler)
+                .await?,
+        );
     }
 
     for message in messages {
-        last_message = Some(session.run_text(message, event_handler).await?);
+        last_message = Some(
+            session
+                .run_text_with_abort(message, Some(abort_signal.clone()), event_handler)
+                .await?,
+        );
     }
 
     let Some(last_message) = last_message else {
@@ -397,27 +564,39 @@ async fn run_print_mode(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive_mode(
-    mut session: AgentSession,
+    session: AgentSession,
     initial: Option<InitialMessage>,
     messages: Vec<String>,
     config: Config,
-    model: String,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
     save_enabled: bool,
 ) -> Result<()> {
-    let ignore_event = |_event: AgentEvent| {};
-
+    let mut pending = Vec::new();
     if let Some(initial) = initial {
-        let content = build_initial_content(&initial);
-        session.run_with_content(content, ignore_event).await?;
+        pending.push(pi::interactive::PendingInput::Content(
+            build_initial_content(&initial),
+        ));
     }
-
     for message in messages {
-        session.run_text(message, ignore_event).await?;
+        pending.push(pi::interactive::PendingInput::Text(message));
     }
 
     let AgentSession { agent, session, .. } = session;
-    pi::interactive::run_interactive(agent, session, config, model, save_enabled).await?;
+    pi::interactive::run_interactive(
+        agent,
+        session,
+        config,
+        model_entry,
+        model_scope,
+        available_models,
+        pending,
+        save_enabled,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1261,22 +1440,6 @@ fn build_stream_options(
     options
 }
 
-fn create_provider(entry: &ModelEntry) -> Result<Arc<dyn pi::provider::Provider>> {
-    match entry.model.provider.as_str() {
-        "anthropic" => Ok(Arc::new(
-            AnthropicProvider::new(entry.model.id.clone())
-                .with_base_url(entry.model.base_url.clone()),
-        )),
-        "openai" => {
-            let base_url = normalize_openai_base(&entry.model.base_url);
-            Ok(Arc::new(
-                OpenAIProvider::new(entry.model.id.clone()).with_base_url(base_url),
-            ))
-        }
-        other => Err(anyhow::anyhow!("Provider '{other}' not implemented")),
-    }
-}
-
 fn supports_xhigh(model_id: &str) -> bool {
     matches!(model_id, "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex")
 }
@@ -1323,17 +1486,4 @@ fn default_export_path(input: &Path) -> PathBuf {
 
 fn render_session_html(session: &Session) -> String {
     session.to_html()
-}
-
-fn normalize_openai_base(base_url: &str) -> String {
-    if base_url.ends_with("/chat/completions") {
-        return base_url.to_string();
-    }
-    if base_url.ends_with("/responses") {
-        return base_url.to_string();
-    }
-    if base_url.ends_with("/v1") {
-        return format!("{base_url}/chat/completions");
-    }
-    format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }

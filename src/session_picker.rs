@@ -2,12 +2,17 @@
 //!
 //! Provides an interactive list for choosing which session to resume.
 
+use std::cmp::Reverse;
 use std::fmt::Write;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
 use lipgloss::Style;
 
-use crate::session::Session;
+use crate::config::Config;
+use crate::session::{Session, SessionEntry, SessionHeader, encode_cwd};
 use crate::session_index::{SessionIndex, SessionMeta};
 
 /// Format a timestamp for display.
@@ -182,20 +187,13 @@ pub fn list_sessions_for_cwd() -> Vec<SessionMeta> {
     let Ok(cwd) = std::env::current_dir() else {
         return Vec::new();
     };
-
-    let index = SessionIndex::new();
-
-    // Try to reindex if needed (this is a no-op if already indexed)
-    let _ = index.reindex_all();
-
-    index
-        .list_sessions(Some(&cwd.display().to_string()))
-        .unwrap_or_default()
+    list_sessions_for_project(&cwd, None)
 }
 
 /// Run the session picker and return the selected session.
-pub async fn pick_session() -> Option<Session> {
-    let sessions = list_sessions_for_cwd();
+pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
+    let cwd = std::env::current_dir().ok()?;
+    let sessions = list_sessions_for_project(&cwd, override_dir);
 
     if sessions.is_empty() {
         return None;
@@ -225,6 +223,96 @@ pub async fn pick_session() -> Option<Session> {
         }
         Err(_) => None,
     }
+}
+
+fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
+    let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
+    let project_session_dir = base_dir.join(encode_cwd(cwd));
+    if !project_session_dir.exists() {
+        return Vec::new();
+    }
+
+    let mut sessions = Vec::new();
+
+    if override_dir.is_none() {
+        let index = SessionIndex::new();
+        let _ = index.reindex_all();
+        if let Ok(list) = index.list_sessions(Some(&cwd.display().to_string())) {
+            sessions = list;
+        }
+    }
+
+    if sessions.is_empty() {
+        sessions = scan_sessions_on_disk(&project_session_dir);
+    }
+
+    sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
+    sessions.truncate(50);
+    sessions
+}
+
+fn scan_sessions_on_disk(project_session_dir: &Path) -> Vec<SessionMeta> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(project_session_dir) else {
+        return out;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            if let Ok(meta) = build_meta_from_file(&path) {
+                out.push(meta);
+            }
+        }
+    }
+
+    out
+}
+
+fn build_meta_from_file(path: &Path) -> crate::error::Result<SessionMeta> {
+    let content = fs::read_to_string(path)?;
+    let mut lines = content.lines();
+    let header: SessionHeader = lines
+        .next()
+        .map(serde_json::from_str)
+        .transpose()?
+        .ok_or_else(|| crate::error::Error::session("Empty session file"))?;
+
+    let mut message_count = 0u64;
+    let mut name = None;
+    for line in lines {
+        if let Ok(entry) = serde_json::from_str::<SessionEntry>(line) {
+            match entry {
+                SessionEntry::Message(_) => message_count += 1,
+                SessionEntry::SessionInfo(info) => {
+                    if info.name.is_some() {
+                        name.clone_from(&info.name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let meta = fs::metadata(path)?;
+    let size_bytes = meta.len();
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let millis = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let last_modified_ms = i64::try_from(millis).unwrap_or(i64::MAX);
+
+    Ok(SessionMeta {
+        path: path.display().to_string(),
+        id: header.id,
+        cwd: header.cwd,
+        timestamp: header.timestamp,
+        message_count,
+        last_modified_ms,
+        size_bytes,
+        name,
+    })
 }
 
 #[cfg(test)]

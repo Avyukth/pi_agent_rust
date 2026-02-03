@@ -36,6 +36,10 @@ pub enum Error {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Extension errors
+    #[error("Extension error: {0}")]
+    Extension(String),
+
     /// IO errors
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -96,6 +100,11 @@ impl Error {
     /// Create a validation error.
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation(message.into())
+    }
+
+    /// Create an extension error.
+    pub fn extension(message: impl Into<String>) -> Self {
+        Self::Extension(message.into())
     }
 
     /// Create an API error.

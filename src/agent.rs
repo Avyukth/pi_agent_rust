@@ -15,7 +15,7 @@
 use crate::error::{Error, Result};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
-    ToolResultMessage, UserContent, UserMessage,
+    ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
@@ -25,6 +25,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde::Serialize;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 // ============================================================================
 // Agent Configuration
@@ -104,6 +105,54 @@ pub enum AgentEvent {
 // Agent
 // ============================================================================
 
+/// Handle to request an abort of an in-flight agent run.
+#[derive(Debug, Clone)]
+pub struct AbortHandle {
+    tx: watch::Sender<bool>,
+}
+
+/// Signal for observing abort requests.
+#[derive(Debug, Clone)]
+pub struct AbortSignal {
+    rx: watch::Receiver<bool>,
+}
+
+impl AbortHandle {
+    /// Create a new abort handle + signal pair.
+    #[must_use]
+    pub fn new() -> (Self, AbortSignal) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx }, AbortSignal { rx })
+    }
+
+    /// Trigger an abort.
+    pub fn abort(&self) {
+        let _ = self.tx.send(true);
+    }
+}
+
+impl AbortSignal {
+    /// Check if an abort has already been requested.
+    #[must_use]
+    pub fn is_aborted(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    async fn wait(&mut self) {
+        if *self.rx.borrow() {
+            return;
+        }
+        loop {
+            if self.rx.changed().await.is_err() {
+                return;
+            }
+            if *self.rx.borrow() {
+                return;
+            }
+        }
+    }
+}
+
 /// The agent runtime that orchestrates LLM calls and tool execution.
 pub struct Agent {
     /// The LLM provider.
@@ -151,6 +200,19 @@ impl Agent {
         self.messages = messages;
     }
 
+    /// Replace the provider implementation (used for model/provider switching).
+    pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+    }
+
+    pub const fn stream_options(&self) -> &StreamOptions {
+        &self.config.stream_options
+    }
+
+    pub const fn stream_options_mut(&mut self) -> &mut StreamOptions {
+        &mut self.config.stream_options
+    }
+
     /// Build tool definitions for the API.
     fn build_tool_defs(&self) -> Vec<ToolDef> {
         self.tools
@@ -181,6 +243,16 @@ impl Agent {
         user_input: impl Into<String>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_with_abort(user_input, None, on_event).await
+    }
+
+    /// Run the agent with a user message and abort support.
+    pub async fn run_with_abort(
+        &mut self,
+        user_input: impl Into<String>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         // Add user message
         let user_message = UserMessage {
             content: UserContent::Text(user_input.into()),
@@ -189,13 +261,24 @@ impl Agent {
         self.messages.push(Message::User(user_message));
 
         // Run the agent loop
-        self.run_loop(Arc::new(on_event)).await
+        self.run_loop(Arc::new(on_event), abort).await
     }
 
     /// Run the agent with structured content (text + images).
     pub async fn run_with_content(
         &mut self,
         content: Vec<ContentBlock>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_with_content_with_abort(content, None, on_event)
+            .await
+    }
+
+    /// Run the agent with structured content (text + images) and abort support.
+    pub async fn run_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         // Add user message
@@ -206,13 +289,47 @@ impl Agent {
         self.messages.push(Message::User(user_message));
 
         // Run the agent loop
-        self.run_loop(Arc::new(on_event)).await
+        self.run_loop(Arc::new(on_event), abort).await
+    }
+
+    fn build_abort_message(&self, partial: Option<AssistantMessage>) -> AssistantMessage {
+        let mut message = partial.unwrap_or_else(|| AssistantMessage {
+            content: Vec::new(),
+            api: self.provider.api().to_string(),
+            provider: self.provider.name().to_string(),
+            model: self.provider.model_id().to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Aborted,
+            error_message: Some("Aborted".to_string()),
+            timestamp: Utc::now().timestamp_millis(),
+        });
+        message.stop_reason = StopReason::Aborted;
+        message.error_message = Some("Aborted".to_string());
+        message.timestamp = Utc::now().timestamp_millis();
+        message
+    }
+
+    fn finalize_abort(
+        &mut self,
+        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        partial: Option<AssistantMessage>,
+    ) -> AssistantMessage {
+        let message = self.build_abort_message(partial);
+        self.messages.push(Message::Assistant(message.clone()));
+        on_event(AgentEvent::AssistantDone {
+            message: message.clone(),
+        });
+        on_event(AgentEvent::Done {
+            final_message: message.clone(),
+        });
+        message
     }
 
     /// The main agent loop.
     async fn run_loop(
         &mut self,
         on_event: Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
         let mut iterations = 0;
 
@@ -225,7 +342,15 @@ impl Agent {
                 )));
             }
 
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Ok(self.finalize_abort(&on_event, None));
+            }
+
             on_event(AgentEvent::RequestStart);
+
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                return Ok(self.finalize_abort(&on_event, None));
+            }
 
             // Build context and stream completion
             let context = self.build_context();
@@ -235,7 +360,9 @@ impl Agent {
                 .await?;
 
             // Process stream events
-            let assistant_message = self.process_stream(&mut stream, &on_event).await?;
+            let assistant_message = self
+                .process_stream(&mut stream, &on_event, abort.clone())
+                .await?;
 
             // Add assistant message to history
             self.messages
@@ -285,20 +412,39 @@ impl Agent {
         &self,
         stream: &mut std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        mut abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
         let mut final_message: Option<AssistantMessage> = None;
+        let mut last_partial: Option<AssistantMessage> = None;
 
-        while let Some(event_result) = stream.next().await {
+        loop {
+            let event_result = if let Some(signal) = abort.as_mut() {
+                tokio::select! {
+                    () = signal.wait() => {
+                        return Ok(self.build_abort_message(last_partial.take()));
+                    }
+                    event = stream.next() => event,
+                }
+            } else {
+                stream.next().await
+            };
+
+            let Some(event_result) = event_result else {
+                break;
+            };
             let event = event_result?;
 
             match event {
-                StreamEvent::TextDelta { delta, .. } => {
+                StreamEvent::TextDelta { delta, partial, .. } => {
+                    last_partial = Some(partial);
                     on_event(AgentEvent::TextDelta { text: delta });
                 }
-                StreamEvent::ThinkingDelta { delta, .. } => {
+                StreamEvent::ThinkingDelta { delta, partial, .. } => {
+                    last_partial = Some(partial);
                     on_event(AgentEvent::ThinkingDelta { text: delta });
                 }
                 StreamEvent::ToolCallStart { partial, .. } => {
+                    last_partial = Some(partial.clone());
                     // Find the tool call being started
                     if let Some(ContentBlock::ToolCall(tool_call)) = partial.content.last() {
                         on_event(AgentEvent::ToolCallStart {
@@ -306,6 +452,15 @@ impl Agent {
                             id: tool_call.id.clone(),
                         });
                     }
+                }
+                StreamEvent::Start { partial }
+                | StreamEvent::TextStart { partial, .. }
+                | StreamEvent::TextEnd { partial, .. }
+                | StreamEvent::ThinkingStart { partial, .. }
+                | StreamEvent::ThinkingEnd { partial, .. }
+                | StreamEvent::ToolCallDelta { partial, .. }
+                | StreamEvent::ToolCallEnd { partial, .. } => {
+                    last_partial = Some(partial);
                 }
                 StreamEvent::Done { message, .. } => {
                     final_message = Some(message);
@@ -318,10 +473,6 @@ impl Agent {
                         error: error_msg.clone(),
                     });
                     return Err(Error::api(error_msg));
-                }
-                _ => {
-                    // Other events (Start, TextStart, TextEnd, etc.) are handled
-                    // by the partial message accumulation in the provider
                 }
             }
         }
@@ -427,8 +578,17 @@ impl AgentSession {
         input: String,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_text_with_abort(input, None, on_event).await
+    }
+
+    pub async fn run_text_with_abort(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         let start_len = self.agent.messages().len();
-        let result = self.agent.run(input, on_event).await?;
+        let result = self.agent.run_with_abort(input, abort, on_event).await?;
         self.persist_new_messages(start_len).await?;
         Ok(result)
     }
@@ -438,8 +598,21 @@ impl AgentSession {
         content: Vec<ContentBlock>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_with_content_with_abort(content, None, on_event)
+            .await
+    }
+
+    pub async fn run_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         let start_len = self.agent.messages().len();
-        let result = self.agent.run_with_content(content, on_event).await?;
+        let result = self
+            .agent
+            .run_with_content_with_abort(content, abort, on_event)
+            .await?;
         self.persist_new_messages(start_len).await?;
         Ok(result)
     }

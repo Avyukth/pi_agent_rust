@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-03 (50+ tests pass, Azure provider complete, TUI multi-line/slash commands)
+> **Last Updated:** 2026-02-02 (89 tests pass, read tool line numbers, all providers complete)
 
 ## Status Legend
 
@@ -19,12 +19,12 @@
 | Category | Implemented | Partial | Missing | Out of Scope | Total |
 |----------|-------------|---------|---------|--------------|-------|
 | **Core Types** | 8 | 0 | 0 | 0 | 8 |
-| **Provider Layer** | 4 | 1 | 0 | 10+ | 15+ |
+| **Provider Layer** | 18 | 0 | 0 | 9 | 27 |
 | **Tools (7 total)** | 7 | 0 | 0 | 0 | 7 |
-| **Agent Runtime** | 1 | 1 | 0 | 0 | 2 |
+| **Agent Runtime** | 7 | 0 | 0 | 0 | 7 |
 | **Session Management** | 10 | 0 | 0 | 0 | 10 |
-| **CLI** | 7 | 1 | 0 | 2 | 10 |
-| **TUI** | 16 | 1 | 0 | 2 | 19 |
+| **CLI** | 9 | 0 | 0 | 1 | 10 |
+| **TUI** | 18 | 0 | 0 | 2 | 20 |
 | **Configuration** | 2 | 0 | 0 | 0 | 2 |
 | **Authentication** | 6 | 1 | 1 | 0 | 8 |
 
@@ -111,7 +111,7 @@
 | Truncation (head/tail) | ✅ | ✅ | - | - | ✅ | ✅ | ✅ |
 | Image support | ✅ | - | - | - | - | - | - |
 | Streaming updates | - | ✅ | - | - | - | - | - |
-| Line numbers | ❌ | - | - | - | ✅ | - | - |
+| Line numbers | ✅ | - | - | - | ✅ | - | - |
 | Fuzzy matching | - | - | ✅ | - | - | - | - |
 | Path resolution | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | ~ expansion | ✅ | - | ✅ | ✅ | ✅ | ✅ | ✅ |
@@ -137,7 +137,7 @@
 | Event callbacks | ✅ | `src/agent.rs` | - | 9 event types |
 | Stream processing | ✅ | `src/agent.rs` | - | Delta handling |
 | Context building | ✅ | `src/agent.rs` | - | System + history + tools |
-| Abort handling | 🔶 | - | - | Basic, needs SIGINT |
+| Abort handling | ✅ | `src/agent.rs`, `src/main.rs`, `src/interactive.rs` | - | Ctrl+C cancels in-flight requests |
 
 ---
 
@@ -163,7 +163,7 @@
 | Feature | Status | Rust Location | Tests | Notes |
 |---------|--------|---------------|-------|-------|
 | Argument parsing | ✅ | `src/cli.rs` | - | Clap derive |
-| Subcommands | 🔶 | `src/cli.rs` | - | Parsed, but handlers not implemented |
+| Subcommands | ✅ | `src/cli.rs`, `src/main.rs` | - | Install, Remove, Update, List, Config |
 | @file arguments | ✅ | `src/cli.rs` | - | File inclusion |
 | Message arguments | ✅ | `src/cli.rs` | - | Positional text |
 | Tool selection | ✅ | `src/cli.rs` | - | --tools flag |
@@ -171,7 +171,7 @@
 | Session export | ✅ | `src/main.rs` | - | HTML export |
 | Print mode | ✅ | `src/main.rs` | - | Single-shot mode |
 | RPC mode | ⬜ | `src/main.rs` | - | Out of scope for v1 |
-| Package management | ⬜ | - | - | Out of scope for v1 |
+| Package management | ✅ | `src/package_manager.rs`, `src/main.rs` | Unit | install/remove/update/list + settings updates + startup auto-install + resource resolution |
 
 ---
 
@@ -265,16 +265,17 @@
 | Provider (Gemini) | 4 | 0 | 0 | 4 |
 | Provider (Azure) | 4 | 0 | 0 | 4 |
 | SSE parser | 11 | 0 | 0 | 11 |
-| Tools | 5 | 20 | 67 | 92 |
+| Tools | 5 | 20 | 122 | 147 |
 | TUI (rich_rust) | 3 | 0 | 0 | 3 |
 | TUI (interactive) | 2 | 0 | 0 | 2 |
 | TUI (session picker) | 3 | 0 | 0 | 3 |
 | Session (branching) | 7 | 0 | 0 | 7 |
 | Agent | 2 | 0 | 0 | 2 |
 | Conformance infra | 6 | 0 | 0 | 6 |
-| **Total** | **50** | **20** | **67** | **137** |
+| Extensions | 2 | 0 | 0 | 2 |
+| **Total** | **56** | **20** | **122** | **198** |
 
-**All tests pass** (50 unit + 15 fixture wrappers + 20 integration)
+**All tests pass** (56 unit + 15 fixture wrappers + 20 integration)
 
 ---
 

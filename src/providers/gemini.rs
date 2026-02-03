@@ -122,6 +122,10 @@ impl Provider for GeminiProvider {
         "gemini"
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn stream(
         &self,
         context: &Context,
@@ -293,6 +297,9 @@ impl StreamState {
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
+                        // Always save text first (before started check) to avoid losing content
+                        self.current_text.push_str(&text);
+
                         // Emit start event on first content
                         if !self.started {
                             self.started = true;
@@ -301,7 +308,6 @@ impl StreamState {
                             }));
                         }
 
-                        self.current_text.push_str(&text);
                         return Ok(Some(StreamEvent::TextDelta {
                             content_index: 0,
                             delta: text,

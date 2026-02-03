@@ -118,6 +118,10 @@ impl Provider for AnthropicProvider {
         "anthropic-messages"
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn stream(
         &self,
         context: &Context,
@@ -138,10 +142,6 @@ impl Provider for AnthropicProvider {
             .header("Content-Type", "application/json")
             .header("X-API-Key", &api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION);
-
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
 
         // Add cache control header if needed
         if options.cache_retention != CacheRetention::None {

@@ -21,12 +21,15 @@ use lipgloss::Style;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::{AbortHandle, Agent, AgentEvent};
 use crate::config::Config;
-use crate::model::{ContentBlock, Usage, UserContent};
+use crate::model::{ContentBlock, StopReason, ThinkingLevel, Usage, UserContent};
+use crate::models::ModelEntry;
+use crate::providers;
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::session_index::SessionIndex;
 
@@ -75,8 +78,8 @@ impl SlashCommand {
         r"Available commands:
   /help, /h, /?      - Show this help message
   /clear, /cls       - Clear conversation history
-  /model, /m [name]  - Show or change the current model
-  /thinking, /t [level] - Set thinking level (none/low/medium/high)
+  /model, /m [id|provider/id] - Show or change the current model
+  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
   /exit, /quit, /q   - Exit Pi
@@ -94,6 +97,8 @@ Tips:
 pub enum PiMsg {
     /// Agent started processing.
     AgentStart,
+    /// Trigger processing of the next queued input (CLI startup messages).
+    RunPending,
     /// Text delta from assistant.
     TextDelta(String),
     /// Thinking delta from assistant.
@@ -114,7 +119,10 @@ pub enum PiMsg {
         is_error: bool,
     },
     /// Agent finished with final message.
-    AgentDone { usage: Option<Usage> },
+    AgentDone {
+        usage: Option<Usage>,
+        stop_reason: StopReason,
+    },
     /// Agent error.
     AgentError(String),
 }
@@ -139,6 +147,12 @@ pub enum InputMode {
     MultiLine,
 }
 
+#[derive(Debug, Clone)]
+pub enum PendingInput {
+    Text(String),
+    Content(Vec<ContentBlock>),
+}
+
 /// The main interactive TUI application model.
 #[derive(bubbletea::Model)]
 pub struct PiApp {
@@ -147,6 +161,7 @@ pub struct PiApp {
     input_history: Vec<String>,
     history_index: Option<usize>,
     input_mode: InputMode,
+    pending_inputs: VecDeque<PendingInput>,
 
     // Display state - viewport for scrollable conversation
     conversation_viewport: Viewport,
@@ -162,13 +177,18 @@ pub struct PiApp {
     current_response: String,
     current_thinking: String,
     current_tool: Option<String>,
+    pending_tool_output: Option<String>,
 
     // Session and config
     session: Arc<Mutex<Session>>,
     config: Config,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
     model: String,
     agent: Arc<Mutex<Agent>>,
     save_enabled: bool,
+    abort_handle: Option<AbortHandle>,
 
     // Token tracking
     total_usage: Usage,
@@ -198,11 +218,15 @@ pub enum MessageRole {
 
 impl PiApp {
     /// Create a new Pi application.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: Agent,
         session: Session,
         config: Config,
-        model: String,
+        model_entry: ModelEntry,
+        model_scope: Vec<ModelEntry>,
+        available_models: Vec<ModelEntry>,
+        pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::UnboundedSender<PiMsg>,
         save_enabled: bool,
     ) -> Self {
@@ -235,11 +259,18 @@ impl PiApp {
 
         let (messages, total_usage) = load_conversation_from_session(&session);
 
+        let model = format!(
+            "{}/{}",
+            model_entry.model.provider.as_str(),
+            model_entry.model.id.as_str()
+        );
+
         let mut app = Self {
             input,
             input_history: Vec::new(),
             history_index: None,
             input_mode: InputMode::SingleLine,
+            pending_inputs: VecDeque::from(pending_inputs),
             conversation_viewport,
             spinner,
             agent_state: AgentState::Idle,
@@ -249,14 +280,19 @@ impl PiApp {
             current_response: String::new(),
             current_thinking: String::new(),
             current_tool: None,
+            pending_tool_output: None,
             session: Arc::new(Mutex::new(session)),
             config,
+            model_entry,
+            model_scope,
+            available_models,
             model,
             agent: Arc::new(Mutex::new(agent)),
             total_usage,
             event_tx,
             status_message: None,
             save_enabled,
+            abort_handle: None,
         };
 
         app.scroll_to_bottom();
@@ -268,9 +304,14 @@ impl PiApp {
         // Start text input cursor blink and spinner
         let input_cmd = BubbleteaModel::init(&self.input);
         let spinner_cmd = BubbleteaModel::init(&self.spinner);
+        let pending_cmd = if self.pending_inputs.is_empty() {
+            None
+        } else {
+            Some(Cmd::new(|| Message::new(PiMsg::RunPending)))
+        };
 
         // Batch commands
-        batch(vec![input_cmd, spinner_cmd])
+        batch(vec![input_cmd, spinner_cmd, pending_cmd])
     }
 
     /// Handle messages (keyboard input, async events, etc.).
@@ -315,7 +356,16 @@ impl PiApp {
                     }
                     // In multi-line mode, let TextArea handle Enter (insert newline)
                 }
-                KeyType::CtrlC => return Some(quit()),
+                KeyType::CtrlC => {
+                    if self.agent_state != AgentState::Idle {
+                        if let Some(handle) = &self.abort_handle {
+                            handle.abort();
+                        }
+                        self.status_message = Some("Aborting request...".to_string());
+                        return None;
+                    }
+                    return Some(quit());
+                }
                 KeyType::Esc if self.agent_state == AgentState::Idle => {
                     if self.input_mode == InputMode::MultiLine {
                         // Exit multi-line mode
@@ -527,6 +577,9 @@ impl PiApp {
                 self.current_response.clear();
                 self.current_thinking.clear();
             }
+            PiMsg::RunPending => {
+                return self.run_next_pending();
+            }
             PiMsg::TextDelta(text) => {
                 self.current_response.push_str(&text);
             }
@@ -536,6 +589,7 @@ impl PiApp {
             PiMsg::ToolStart { name, .. } => {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
+                self.pending_tool_output = None;
             }
             PiMsg::ToolUpdate {
                 name,
@@ -544,19 +598,22 @@ impl PiApp {
                 ..
             } => {
                 if let Some(output) = format_tool_output(&content, details.as_ref()) {
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: format!("Tool {name} output:\n{output}"),
-                        thinking: None,
-                    });
-                    self.scroll_to_bottom();
+                    self.pending_tool_output = Some(format!("Tool {name} output:\n{output}"));
                 }
             }
             PiMsg::ToolEnd { .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
+                if let Some(output) = self.pending_tool_output.take() {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: output,
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                }
             }
-            PiMsg::AgentDone { usage } => {
+            PiMsg::AgentDone { usage, stop_reason } => {
                 // Finalize the response
                 if !self.current_response.is_empty() {
                     self.messages.push(ConversationMessage {
@@ -580,9 +637,18 @@ impl PiApp {
 
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.abort_handle = None;
+
+                if stop_reason == StopReason::Aborted {
+                    self.status_message = Some("Request aborted".to_string());
+                }
 
                 // Re-focus input
                 self.input.focus();
+
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
             PiMsg::AgentError(error) => {
                 self.messages.push(ConversationMessage {
@@ -592,9 +658,140 @@ impl PiApp {
                 });
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.abort_handle = None;
                 self.input.focus();
+
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
             }
         }
+        None
+    }
+
+    fn run_next_pending(&mut self) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            return None;
+        }
+        let next = self.pending_inputs.pop_front()?;
+        match next {
+            PendingInput::Text(text) => self.submit_message(&text),
+            PendingInput::Content(content) => self.submit_content(content),
+        }
+    }
+
+    fn submit_content(&mut self, content: Vec<ContentBlock>) -> Option<Cmd> {
+        if content.is_empty() {
+            return None;
+        }
+
+        let display = content_blocks_to_text(&content);
+        if !display.trim().is_empty() {
+            self.messages.push(ConversationMessage {
+                role: MessageRole::User,
+                content: display,
+                thinking: None,
+            });
+        }
+
+        // Clear input and reset to single-line mode
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.input.set_height(3);
+
+        // Start processing
+        self.agent_state = AgentState::Processing;
+
+        // Auto-scroll to bottom when new message is added
+        self.scroll_to_bottom();
+
+        let content_for_agent = content;
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let session = Arc::clone(&self.session);
+        let save_enabled = self.save_enabled;
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
+
+        tokio::spawn(async move {
+            let mut agent_guard = agent.lock().await;
+            let previous_len = agent_guard.messages().len();
+
+            let event_sender = event_tx.clone();
+            let result = agent_guard
+                .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
+                    let mapped = match event {
+                        AgentEvent::RequestStart => Some(PiMsg::AgentStart),
+                        AgentEvent::TextDelta { text } => Some(PiMsg::TextDelta(text)),
+                        AgentEvent::ThinkingDelta { text } => Some(PiMsg::ThinkingDelta(text)),
+                        AgentEvent::ToolExecuteStart { name, id } => {
+                            Some(PiMsg::ToolStart { name, tool_id: id })
+                        }
+                        AgentEvent::ToolExecuteEnd { name, id, is_error } => Some(PiMsg::ToolEnd {
+                            name,
+                            tool_id: id,
+                            is_error,
+                        }),
+                        AgentEvent::ToolUpdate {
+                            name,
+                            id,
+                            content,
+                            details,
+                        } => Some(PiMsg::ToolUpdate {
+                            name,
+                            tool_id: id,
+                            content,
+                            details,
+                        }),
+                        AgentEvent::Done { final_message } => Some(PiMsg::AgentDone {
+                            usage: Some(final_message.usage),
+                            stop_reason: final_message.stop_reason,
+                        }),
+                        AgentEvent::Error { error } => Some(PiMsg::AgentError(error)),
+                        _ => None,
+                    };
+
+                    if let Some(msg) = mapped {
+                        let _ = event_sender.send(msg);
+                    }
+                })
+                .await;
+
+            let new_messages: Vec<crate::model::Message> =
+                agent_guard.messages()[previous_len..].to_vec();
+            drop(agent_guard);
+
+            let mut session_guard = session.lock().await;
+            for message in new_messages {
+                session_guard.append_model_message(message);
+            }
+            let mut save_error = None;
+            let mut index_error = None;
+
+            if save_enabled {
+                if let Err(err) = session_guard.save().await {
+                    save_error = Some(format!("Failed to save session: {err}"));
+                } else {
+                    let index = SessionIndex::new();
+                    if let Err(err) = index.index_session(&session_guard) {
+                        index_error = Some(format!("Failed to index session: {err}"));
+                    }
+                }
+            }
+            drop(session_guard);
+
+            if let Some(err) = save_error {
+                let _ = event_tx.send(PiMsg::AgentError(err));
+            }
+            if let Some(err) = index_error {
+                let _ = event_tx.send(PiMsg::AgentError(err));
+            }
+
+            if let Err(err) = result {
+                let _ = event_tx.send(PiMsg::AgentError(err.to_string()));
+            }
+        });
+
         None
     }
 
@@ -616,6 +813,8 @@ impl PiApp {
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
+        let (abort_handle, abort_signal) = AbortHandle::new();
+        self.abort_handle = Some(abort_handle);
 
         // Add to history
         self.input_history.push(message_owned.clone());
@@ -646,7 +845,7 @@ impl PiApp {
 
             let event_sender = event_tx.clone();
             let result = agent_guard
-                .run(message_for_agent, move |event| {
+                .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
                     let mapped = match event {
                         AgentEvent::RequestStart => Some(PiMsg::AgentStart),
                         AgentEvent::TextDelta { text } => Some(PiMsg::TextDelta(text)),
@@ -672,6 +871,7 @@ impl PiApp {
                         }),
                         AgentEvent::Done { final_message } => Some(PiMsg::AgentDone {
                             usage: Some(final_message.usage),
+                            stop_reason: final_message.stop_reason,
                         }),
                         AgentEvent::Error { error } => Some(PiMsg::AgentError(error)),
                         _ => None,
@@ -754,6 +954,7 @@ impl PiApp {
     }
 
     /// Handle a slash command.
+    #[allow(clippy::too_many_lines)]
     fn handle_slash_command(&mut self, cmd: SlashCommand, args: &str) -> Option<Cmd> {
         // Clear input
         self.input.reset();
@@ -774,26 +975,112 @@ impl PiApp {
                 self.status_message = Some("Conversation cleared".to_string());
             }
             SlashCommand::Model => {
-                if args.is_empty() {
-                    self.status_message = Some(format!("Current model: {}", self.model));
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot change model while processing".to_string());
+                } else if args.is_empty() {
+                    self.status_message = Some(format!(
+                        "Current model: {}/{}",
+                        self.model_entry.model.provider, self.model_entry.model.id
+                    ));
                 } else {
-                    self.model = args.to_string();
-                    self.status_message = Some(format!("Model changed to: {args}"));
+                    let (provider, id) =
+                        parse_model_selector(args, &self.model_entry.model.provider);
+                    let entry = self
+                        .model_scope
+                        .iter()
+                        .chain(self.available_models.iter())
+                        .find(|m| m.model.provider == provider && m.model.id == id)
+                        .cloned();
+
+                    let Some(entry) = entry else {
+                        self.status_message = Some(format!("Unknown model: {args}"));
+                        return None;
+                    };
+
+                    let provider_impl = match providers::create_provider(&entry) {
+                        Ok(provider_impl) => provider_impl,
+                        Err(e) => {
+                            self.status_message = Some(format!("Model change failed: {e}"));
+                            return None;
+                        }
+                    };
+
+                    let Some(api_key) = entry.api_key.clone() else {
+                        self.status_message =
+                            Some(format!("No API key for provider {}", entry.model.provider));
+                        return None;
+                    };
+
+                    {
+                        let mut agent_guard = self.agent.blocking_lock();
+                        agent_guard.set_provider(provider_impl);
+                        let options = agent_guard.stream_options_mut();
+                        options.api_key = Some(api_key);
+                        options.headers.clone_from(&entry.headers);
+                        drop(agent_guard);
+                    }
+
+                    {
+                        let mut session_guard = self.session.blocking_lock();
+                        session_guard.header.provider = Some(entry.model.provider.clone());
+                        session_guard.header.model_id = Some(entry.model.id.clone());
+                        session_guard.append_model_change(
+                            entry.model.provider.clone(),
+                            entry.model.id.clone(),
+                        );
+                    }
+
+                    self.model_entry = entry;
+                    self.model = format!(
+                        "{}/{}",
+                        self.model_entry.model.provider, self.model_entry.model.id
+                    );
+                    self.status_message = Some(format!("Model changed to: {}", self.model));
+                    self.spawn_save_session();
                 }
             }
             SlashCommand::Thinking => {
-                let level_info = if args.is_empty() {
-                    "Thinking levels: none, low, medium, high"
-                } else {
-                    match args.to_lowercase().as_str() {
-                        "none" | "off" | "0" => "Thinking disabled",
-                        "low" | "1" => "Thinking level: low",
-                        "medium" | "med" | "2" => "Thinking level: medium",
-                        "high" | "3" => "Thinking level: high",
-                        _ => "Unknown thinking level. Use: none, low, medium, high",
-                    }
+                if self.agent_state != AgentState::Idle {
+                    self.status_message =
+                        Some("Cannot change thinking while processing".to_string());
+                    return None;
+                }
+
+                if args.is_empty() {
+                    let current = self
+                        .session
+                        .blocking_lock()
+                        .header
+                        .thinking_level
+                        .clone()
+                        .unwrap_or_else(|| "off".to_string());
+                    self.status_message = Some(format!("Current thinking level: {current}"));
+                    return None;
+                }
+
+                let Some(level) = parse_thinking_level(args) else {
+                    self.status_message = Some(
+                        "Unknown thinking level. Use: off/minimal/low/medium/high/xhigh"
+                            .to_string(),
+                    );
+                    return None;
                 };
-                self.status_message = Some(level_info.to_string());
+
+                {
+                    let mut agent_guard = self.agent.blocking_lock();
+                    agent_guard.stream_options_mut().thinking_level = Some(level);
+                }
+
+                {
+                    let mut session_guard = self.session.blocking_lock();
+                    let level_str = thinking_level_to_str(level).to_string();
+                    session_guard.header.thinking_level = Some(level_str.clone());
+                    session_guard.append_thinking_level_change(level_str);
+                }
+
+                self.status_message =
+                    Some(format!("Thinking level: {}", thinking_level_to_str(level)));
+                self.spawn_save_session();
             }
             SlashCommand::Exit => {
                 return Some(quit());
@@ -837,6 +1124,29 @@ impl PiApp {
         }
 
         None
+    }
+
+    fn spawn_save_session(&self) {
+        if !self.save_enabled {
+            return;
+        }
+
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let mut session_guard = session.lock().await;
+            if let Err(err) = session_guard.save().await {
+                let _ = event_tx.send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+                return;
+            }
+
+            let index = SessionIndex::new();
+            if let Err(err) = index.index_session(&session_guard) {
+                let _ = event_tx.send(PiMsg::AgentError(format!("Failed to index session: {err}")));
+            }
+            drop(session_guard);
+        });
     }
 
     /// Scroll the conversation viewport to the bottom.
@@ -1191,6 +1501,41 @@ fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn parse_model_selector(input: &str, default_provider: &str) -> (String, String) {
+    let trimmed = input.trim();
+    if let Some((provider, model)) = trimmed.split_once(':') {
+        return (provider.trim().to_string(), model.trim().to_string());
+    }
+    if let Some((provider, model)) = trimmed.split_once('/') {
+        return (provider.trim().to_string(), model.trim().to_string());
+    }
+    (default_provider.to_string(), trimmed.to_string())
+}
+
+fn parse_thinking_level(input: &str) -> Option<ThinkingLevel> {
+    let normalized = input.trim().to_lowercase();
+    match normalized.as_str() {
+        "off" | "none" | "0" => Some(ThinkingLevel::Off),
+        "minimal" | "min" => Some(ThinkingLevel::Minimal),
+        "low" | "1" => Some(ThinkingLevel::Low),
+        "medium" | "med" | "2" => Some(ThinkingLevel::Medium),
+        "high" | "3" => Some(ThinkingLevel::High),
+        "xhigh" | "4" => Some(ThinkingLevel::XHigh),
+        _ => None,
+    }
+}
+
+const fn thinking_level_to_str(level: ThinkingLevel) -> &'static str {
+    match level {
+        ThinkingLevel::Off => "off",
+        ThinkingLevel::Minimal => "minimal",
+        ThinkingLevel::Low => "low",
+        ThinkingLevel::Medium => "medium",
+        ThinkingLevel::High => "high",
+        ThinkingLevel::XHigh => "xhigh",
+    }
+}
+
 fn push_line(buffer: &mut String, line: &str) {
     if line.is_empty() {
         return;
@@ -1224,11 +1569,15 @@ fn truncate(s: &str, max_len: usize) -> String {
 }
 
 /// Run the interactive mode.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     agent: Agent,
     session: Session,
     config: Config,
-    model: String,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
+    pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
 ) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PiMsg>();
@@ -1240,7 +1589,17 @@ pub async fn run_interactive(
         }
     });
 
-    let app = PiApp::new(agent, session, config, model, event_tx, save_enabled);
+    let app = PiApp::new(
+        agent,
+        session,
+        config,
+        model_entry,
+        model_scope,
+        available_models,
+        pending_inputs,
+        event_tx,
+        save_enabled,
+    );
 
     // Run the TUI program
     Program::new(app)

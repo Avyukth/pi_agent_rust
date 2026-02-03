@@ -111,6 +111,10 @@ impl Provider for OpenAIProvider {
         "openai-completions"
     }
 
+    fn model_id(&self) -> &str {
+        &self.model
+    }
+
     async fn stream(
         &self,
         context: &Context,
@@ -276,20 +280,29 @@ impl StreamState {
 
         let delta = choice.delta;
 
-        // Emit start event on first content
-        if !self.started {
-            self.started = true;
-            return Some(StreamEvent::Start {
+        // Handle text content
+        if let Some(content) = delta.content {
+            // Always save text first (before started check) to avoid losing content
+            self.current_text.push_str(&content);
+
+            if !self.started {
+                self.started = true;
+                return Some(StreamEvent::Start {
+                    partial: self.partial.clone(),
+                });
+            }
+
+            return Some(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: content,
                 partial: self.partial.clone(),
             });
         }
 
-        // Handle text content
-        if let Some(content) = delta.content {
-            self.current_text.push_str(&content);
-            return Some(StreamEvent::TextDelta {
-                content_index: 0,
-                delta: content,
+        // Emit start event if we haven't yet (e.g., role-only first chunk)
+        if !self.started {
+            self.started = true;
+            return Some(StreamEvent::Start {
                 partial: self.partial.clone(),
             });
         }

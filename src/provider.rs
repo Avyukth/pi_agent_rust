@@ -23,6 +23,9 @@ pub trait Provider: Send + Sync {
     /// Get the API type.
     fn api(&self) -> &str;
 
+    /// Get the model identifier used by this provider.
+    fn model_id(&self) -> &str;
+
     /// Stream a completion.
     async fn stream(
         &self,

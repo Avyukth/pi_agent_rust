@@ -127,6 +127,10 @@ impl Provider for AzureOpenAIProvider {
         "azure-openai"
     }
 
+    fn model_id(&self) -> &str {
+        &self.deployment
+    }
+
     async fn stream(
         &self,
         context: &Context,
@@ -290,6 +294,9 @@ impl StreamState {
 
             // Handle text content
             if let Some(text) = choice.delta.content {
+                // Always save text first (before started check) to avoid losing content
+                self.current_text.push_str(&text);
+
                 if !self.started {
                     self.started = true;
                     return Ok(Some(StreamEvent::Start {
@@ -297,7 +304,6 @@ impl StreamState {
                     }));
                 }
 
-                self.current_text.push_str(&text);
                 return Ok(Some(StreamEvent::TextDelta {
                     content_index: 0,
                     delta: text,

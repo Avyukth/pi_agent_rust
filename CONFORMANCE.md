@@ -37,6 +37,7 @@ Location: `src/*.rs` inline `#[cfg(test)]` modules
 - Truncation algorithms
 - Path resolution
 - Provider message conversion
+- Package manager source parsing/identity + settings updates
 
 **Count:** 32+ tests
 

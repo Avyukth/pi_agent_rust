@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,6 +67,12 @@ impl Session {
 
     /// Resume a session by prompting the user to select from recent sessions.
     pub async fn resume_with_picker(override_dir: Option<&Path>, _config: &Config) -> Result<Self> {
+        if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if let Some(session) = crate::session_picker::pick_session(override_dir).await {
+                return Ok(session);
+            }
+        }
+
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);

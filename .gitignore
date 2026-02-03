@@ -1,2 +1,5 @@
 /target/
 a.out
+
+# bv (beads viewer) local config and caches
+.bv/

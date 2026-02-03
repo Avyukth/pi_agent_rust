@@ -964,6 +964,7 @@ impl Tool for ReadTool {
         }
 
         let text_content = String::from_utf8_lossy(&bytes).to_string();
+
         let all_lines: Vec<&str> = text_content.split('\n').collect();
         let total_file_lines = all_lines.len();
 
@@ -983,22 +984,33 @@ impl Tool for ReadTool {
             ));
         }
 
-        let (selected_content, user_limited_lines): (String, Option<usize>) =
-            input.limit.map_or_else(
-                || (all_lines[start_line..].join("\n"), None),
-                |limit| {
-                    let limit_usize = if limit > 0 {
-                        usize::try_from(limit).unwrap_or(0)
-                    } else {
-                        0
-                    };
-                    let end_line = start_line.saturating_add(limit_usize).min(all_lines.len());
-                    (
-                        all_lines[start_line..end_line].join("\n"),
-                        Some(end_line.saturating_sub(start_line)),
-                    )
-                },
-            );
+        // Determine end line based on user limit
+        let (end_line, user_limited_lines): (usize, Option<usize>) = input.limit.map_or_else(
+            || (all_lines.len(), None),
+            |limit| {
+                let limit_usize = if limit > 0 {
+                    usize::try_from(limit).unwrap_or(0)
+                } else {
+                    0
+                };
+                let end = start_line.saturating_add(limit_usize).min(all_lines.len());
+                (end, Some(end.saturating_sub(start_line)))
+            },
+        );
+
+        // Format lines with line numbers (cat -n style)
+        // Format: "     N→content" where N is right-aligned
+        let max_line_num = end_line;
+        let line_num_width = max_line_num.to_string().len().max(5);
+        let selected_content: String = all_lines[start_line..end_line]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let line_num = start_line + i + 1;
+                format!("{line_num:>line_num_width$}→{line}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
 

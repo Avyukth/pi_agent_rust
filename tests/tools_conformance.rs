@@ -25,7 +25,11 @@ mod read_tool {
             .expect("should succeed");
 
         let text = get_text_content(&result.content);
-        assert_eq!(text, "line1\nline2\nline3\nline4\nline5");
+        // Line numbers are right-aligned to 5 chars with arrow separator (cat -n style)
+        assert_eq!(
+            text,
+            "    1→line1\n    2→line2\n    3→line3\n    4→line4\n    5→line5"
+        );
         assert!(result.details.is_none());
     }
 
