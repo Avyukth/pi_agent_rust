@@ -42,6 +42,8 @@ use crate::session_index::SessionIndex;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    Login,
+    Logout,
     Clear,
     Model,
     Thinking,
@@ -62,6 +64,8 @@ impl SlashCommand {
 
         let command = match cmd.to_lowercase().as_str() {
             "/help" | "/h" | "/?" => Self::Help,
+            "/login" => Self::Login,
+            "/logout" => Self::Logout,
             "/clear" | "/cls" => Self::Clear,
             "/model" | "/m" => Self::Model,
             "/thinking" | "/think" | "/t" => Self::Thinking,
@@ -78,6 +82,8 @@ impl SlashCommand {
     pub const fn help_text() -> &'static str {
         r"Available commands:
   /help, /h, /?      - Show this help message
+  /login [provider]  - OAuth login (currently: anthropic)
+  /logout [provider] - Remove stored OAuth credentials
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Show or change the current model
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
@@ -127,6 +133,8 @@ pub enum PiMsg {
     },
     /// Agent error.
     AgentError(String),
+    /// Non-error system message.
+    System(String),
 }
 
 /// State of the agent processing.
@@ -201,6 +209,15 @@ pub struct PiApp {
 
     // Status message (for slash command feedback)
     status_message: Option<String>,
+
+    // OAuth login flow state (awaiting code paste)
+    pending_oauth: Option<PendingOAuth>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOAuth {
+    provider: String,
+    verifier: String,
 }
 
 /// A message in the conversation history.
@@ -298,6 +315,7 @@ impl PiApp {
             status_message: None,
             save_enabled,
             abort_handle: None,
+            pending_oauth: None,
         };
 
         app.scroll_to_bottom();
@@ -670,6 +688,21 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::System(message) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: message,
+                    thinking: None,
+                });
+                self.agent_state = AgentState::Idle;
+                self.current_tool = None;
+                self.abort_handle = None;
+                self.input.focus();
+
+                if !self.pending_inputs.is_empty() {
+                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
+                }
+            }
         }
         None
     }
@@ -807,6 +840,10 @@ impl PiApp {
             return None;
         }
 
+        if let Some(pending) = self.pending_oauth.take() {
+            return self.submit_oauth_code(message, pending);
+        }
+
         // Check for slash commands
         if let Some((cmd, args)) = SlashCommand::parse(message) {
             return self.handle_slash_command(cmd, args);
@@ -926,6 +963,59 @@ impl PiApp {
         None
     }
 
+    fn submit_oauth_code(&mut self, code_input: &str, pending: PendingOAuth) -> Option<Cmd> {
+        // Do not store OAuth codes in history or session.
+        self.input.reset();
+        self.input_mode = InputMode::SingleLine;
+        self.input.set_height(3);
+
+        self.agent_state = AgentState::Processing;
+        self.scroll_to_bottom();
+
+        let event_tx = self.event_tx.clone();
+        let provider = pending.provider.clone();
+        let verifier = pending.verifier.clone();
+        let code_input = code_input.to_string();
+
+        tokio::spawn(async move {
+            let auth_path = crate::config::Config::auth_path();
+            let mut auth = match crate::auth::AuthStorage::load(auth_path) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                    return;
+                }
+            };
+
+            let credential = match provider.as_str() {
+                "anthropic" => crate::auth::complete_anthropic_oauth(&code_input, &verifier).await,
+                _ => Err(crate::error::Error::auth(format!(
+                    "OAuth provider not supported: {provider}"
+                ))),
+            };
+
+            let credential = match credential {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                    return;
+                }
+            };
+
+            auth.set(provider.clone(), credential);
+            if let Err(e) = auth.save() {
+                let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                return;
+            }
+
+            let _ = event_tx.send(PiMsg::System(format!(
+                "OAuth login successful for {provider}. Credentials saved to auth.json."
+            )));
+        });
+
+        None
+    }
+
     /// Navigate to previous history entry.
     fn navigate_history_back(&mut self) {
         if self.input_history.is_empty() {
@@ -972,6 +1062,95 @@ impl PiApp {
                     thinking: None,
                 });
                 self.scroll_to_bottom();
+            }
+            SlashCommand::Login => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot login while processing".to_string());
+                    return None;
+                }
+
+                let provider = if args.is_empty() {
+                    self.model_entry.model.provider.clone()
+                } else {
+                    args.to_string()
+                };
+
+                if provider != "anthropic" {
+                    self.status_message = Some(format!(
+                        "OAuth login not supported for {provider} (supported: anthropic)"
+                    ));
+                    return None;
+                }
+
+                match crate::auth::start_anthropic_oauth() {
+                    Ok(info) => {
+                        let mut message = format!(
+                            "OAuth login: {}\n\nOpen this URL:\n{}\n",
+                            info.provider, info.url
+                        );
+                        if let Some(instructions) = info.instructions {
+                            message.push_str(&format!("\n{instructions}\n"));
+                        }
+                        message.push_str("\nPaste the callback URL or authorization code as your next message.");
+
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: message,
+                            thinking: None,
+                        });
+                        self.pending_oauth = Some(PendingOAuth {
+                            provider: info.provider,
+                            verifier: info.verifier,
+                        });
+                        self.status_message = Some("Awaiting OAuth code...".to_string());
+                        self.scroll_to_bottom();
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("OAuth login failed: {e}"));
+                    }
+                }
+            }
+            SlashCommand::Logout => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot logout while processing".to_string());
+                    return None;
+                }
+
+                let provider = if args.is_empty() {
+                    self.model_entry.model.provider.clone()
+                } else {
+                    args.to_string()
+                };
+
+                self.agent_state = AgentState::Processing;
+
+                let event_tx = self.event_tx.clone();
+                tokio::spawn(async move {
+                    let auth_path = crate::config::Config::auth_path();
+                    let mut auth = match crate::auth::AuthStorage::load(auth_path) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                            return;
+                        }
+                    };
+
+                    if !auth.remove(&provider) {
+                        let _ = event_tx.send(PiMsg::System(format!(
+                            "No stored credentials found for {provider}."
+                        )));
+                        return;
+                    }
+
+                    if let Err(e) = auth.save() {
+                        let _ = event_tx.send(PiMsg::AgentError(e.to_string()));
+                        return;
+                    }
+
+                    let _ = event_tx.send(PiMsg::System(format!(
+                        "Logged out of {provider}. Credentials removed from auth.json."
+                    )));
+                });
             }
             SlashCommand::Clear => {
                 self.messages.clear();
