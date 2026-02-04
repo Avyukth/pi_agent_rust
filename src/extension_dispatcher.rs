@@ -1701,6 +1701,124 @@ mod tests {
     }
 
     #[test]
+    fn dispatcher_extension_ui_set_status_includes_text_field() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    const ui = __pi_make_extension_ui(true);
+                    ui.setStatus("key", "hello");
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(TestUiHandler {
+                    captured: Arc::clone(&captured),
+                    response_value: Value::Null,
+                }),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            let seen = captured.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].method, "setStatus");
+            assert_eq!(
+                seen[0].payload.get("statusKey").and_then(Value::as_str),
+                Some("key")
+            );
+            assert_eq!(
+                seen[0].payload.get("statusText").and_then(Value::as_str),
+                Some("hello")
+            );
+            assert_eq!(
+                seen[0].payload.get("text").and_then(Value::as_str),
+                Some("hello")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_extension_ui_set_widget_includes_widget_lines_and_content() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    const ui = __pi_make_extension_ui(true);
+                    ui.setWidget("widget", ["a", "b"]);
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(TestUiHandler {
+                    captured: Arc::clone(&captured),
+                    response_value: Value::Null,
+                }),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            let seen = captured.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].method, "setWidget");
+            assert_eq!(
+                seen[0].payload.get("widgetKey").and_then(Value::as_str),
+                Some("widget")
+            );
+            assert_eq!(
+                seen[0].payload.get("content").and_then(Value::as_str),
+                Some("a\nb")
+            );
+            assert_eq!(
+                seen[0].payload.get("widgetLines").and_then(Value::as_array),
+                seen[0].payload.get("lines").and_then(Value::as_array)
+            );
+        });
+    }
+
+    #[test]
     fn dispatcher_events_hostcall_rejects_promise() {
         futures::executor::block_on(async {
             let runtime = Rc::new(
