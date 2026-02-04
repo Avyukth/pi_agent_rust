@@ -5832,7 +5832,7 @@ impl PiApp {
             let right = format!("{}/{}", b.model.provider, b.model.id);
             left.cmp(&right)
         });
-        candidates.dedup_by(model_entry_matches);
+        candidates.dedup_by(|left, right| model_entry_matches(left, right));
 
         if candidates.is_empty() {
             self.status_message = Some(if use_scope {

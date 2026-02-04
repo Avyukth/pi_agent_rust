@@ -1782,6 +1782,52 @@ pub trait ExtensionSession: Send + Sync {
     async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionDeliverAs {
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
+impl ExtensionDeliverAs {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        let value = value?.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match value {
+            "steer" => Some(Self::Steer),
+            "followUp" | "follow_up" | "follow-up" => Some(Self::FollowUp),
+            "nextTurn" | "next_turn" | "next-turn" => Some(Self::NextTurn),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSendMessage {
+    pub extension_id: Option<String>,
+    pub custom_type: String,
+    pub content: String,
+    pub display: bool,
+    pub details: Option<Value>,
+    pub deliver_as: Option<ExtensionDeliverAs>,
+    pub trigger_turn: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionSendUserMessage {
+    pub extension_id: Option<String>,
+    pub text: String,
+    pub deliver_as: Option<ExtensionDeliverAs>,
+}
+
+#[async_trait]
+pub trait ExtensionHostActions: Send + Sync {
+    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()>;
+    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()>;
+}
+
 impl ExtensionMessage {
     pub fn parse_and_validate(json: &str) -> Result<Self> {
         let msg: Self = serde_json::from_str(json)?;
@@ -3436,6 +3482,9 @@ struct ExtensionManagerInner {
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
+    cwd: Option<String>,
+    model_registry_values: HashMap<String, String>,
+    host_actions: Option<Arc<dyn ExtensionHostActions>>,
 }
 
 impl std::fmt::Debug for ExtensionManager {
@@ -3468,9 +3517,34 @@ impl ExtensionManager {
         guard.js_runtime = Some(runtime);
     }
 
+    pub fn set_cwd(&self, cwd: String) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.cwd = Some(cwd);
+    }
+
+    pub fn set_model_registry_values(&self, values: HashMap<String, String>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.model_registry_values = values;
+    }
+
+    pub fn set_host_actions(&self, actions: Arc<dyn ExtensionHostActions>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.host_actions = Some(actions);
+    }
+
     pub fn js_runtime(&self) -> Option<JsExtensionRuntimeHandle> {
         let guard = self.inner.lock().unwrap();
         guard.js_runtime.clone()
+    }
+
+    fn host_actions(&self) -> Option<Arc<dyn ExtensionHostActions>> {
+        let guard = self.inner.lock().unwrap();
+        guard.host_actions.clone()
+    }
+
+    pub fn active_tools(&self) -> Option<Vec<String>> {
+        let guard = self.inner.lock().unwrap();
+        guard.active_tools.clone()
     }
 
     pub async fn load_js_extensions(&self, specs: Vec<JsExtensionLoadSpec>) -> Result<()> {
