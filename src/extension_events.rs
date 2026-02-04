@@ -1,0 +1,234 @@
+//! Typed extension event definitions + dispatch helper.
+//!
+//! This module defines the JSON-serializable event payloads that can be sent to
+//! JavaScript extensions via the `dispatch_event` hook system.
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::error::{Error, Result};
+use crate::extensions::{EXTENSION_EVENT_TIMEOUT_MS, JsExtensionRuntimeHandle};
+use crate::model::{AssistantMessage, ContentBlock, ImageContent, Message, ToolResultMessage};
+
+/// Events that can be dispatched to extension handlers.
+///
+/// The serialized representation is tagged with `type` in `snake_case`, matching
+/// the string event name used by JS hooks (e.g. `"tool_call"`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionEvent {
+    /// Agent startup (once per session).
+    Startup {
+        version: String,
+        session_file: Option<String>,
+    },
+
+    /// Before first API call in a run.
+    AgentStart { session_id: String },
+
+    /// After agent loop ends.
+    AgentEnd {
+        session_id: String,
+        messages: Vec<Message>,
+        error: Option<String>,
+    },
+
+    /// Before provider.stream() call.
+    TurnStart {
+        session_id: String,
+        turn_index: usize,
+    },
+
+    /// After response processed.
+    TurnEnd {
+        session_id: String,
+        turn_index: usize,
+        message: AssistantMessage,
+        tool_results: Vec<ToolResultMessage>,
+    },
+
+    /// Before tool execution (can block).
+    ToolCall {
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+    },
+
+    /// After tool execution (can modify result).
+    ToolResult {
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+        content: Vec<ContentBlock>,
+        details: Option<Value>,
+        is_error: bool,
+    },
+
+    /// Before session switch (can cancel).
+    SessionBeforeSwitch {
+        current_session: Option<String>,
+        target_session: String,
+    },
+
+    /// Before session fork (can cancel).
+    SessionBeforeFork {
+        current_session: Option<String>,
+        fork_entry_id: String,
+    },
+
+    /// Before processing user input (can transform).
+    Input {
+        content: String,
+        attachments: Vec<ImageContent>,
+    },
+}
+
+impl ExtensionEvent {
+    /// Get the event name for dispatch.
+    #[must_use]
+    pub const fn event_name(&self) -> &'static str {
+        match self {
+            Self::Startup { .. } => "startup",
+            Self::AgentStart { .. } => "agent_start",
+            Self::AgentEnd { .. } => "agent_end",
+            Self::TurnStart { .. } => "turn_start",
+            Self::TurnEnd { .. } => "turn_end",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+            Self::SessionBeforeSwitch { .. } => "session_before_switch",
+            Self::SessionBeforeFork { .. } => "session_before_fork",
+            Self::Input { .. } => "input",
+        }
+    }
+}
+
+/// Result from a tool_call event handler.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallEventResult {
+    /// If true, block tool execution.
+    #[serde(default)]
+    pub block: bool,
+
+    /// Reason for blocking (shown to user).
+    pub reason: Option<String>,
+}
+
+/// Result from a tool_result event handler.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolResultEventResult {
+    /// Modified content (if None, use original).
+    pub content: Option<Vec<ContentBlock>>,
+
+    /// Modified details (if None, use original).
+    pub details: Option<Value>,
+}
+
+/// Result from an input event handler.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputEventResult {
+    /// Transformed content (if None, use original).
+    pub content: Option<String>,
+
+    /// If true, block processing.
+    #[serde(default)]
+    pub block: bool,
+
+    /// Reason for blocking.
+    pub reason: Option<String>,
+}
+
+fn json_to_value<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|err| Error::Json(Box::new(err)))
+}
+
+fn json_from_value<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|err| Error::Json(Box::new(err)))
+}
+
+/// Dispatches events to extension handlers.
+#[derive(Clone)]
+pub struct EventDispatcher {
+    runtime: JsExtensionRuntimeHandle,
+}
+
+impl EventDispatcher {
+    #[must_use]
+    pub const fn new(runtime: JsExtensionRuntimeHandle) -> Self {
+        Self { runtime }
+    }
+
+    /// Dispatch an event with an explicit context payload and timeout.
+    pub async fn dispatch_with_context<R: DeserializeOwned>(
+        &self,
+        event: ExtensionEvent,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Option<R>> {
+        let event_name = event.event_name().to_string();
+        let event_payload = json_to_value(&event)?;
+        let response = self
+            .runtime
+            .dispatch_event(event_name, event_payload, ctx_payload, timeout_ms)
+            .await?;
+
+        if response.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(json_from_value(response)?))
+        }
+    }
+
+    /// Dispatch an event with an empty context payload and default timeout.
+    pub async fn dispatch<R: DeserializeOwned>(&self, event: ExtensionEvent) -> Result<Option<R>> {
+        self.dispatch_with_context(
+            event,
+            Value::Object(serde_json::Map::new()),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    #[test]
+    fn event_name_matches_expected_strings() {
+        let event = ExtensionEvent::ToolCall {
+            tool_name: "read".to_string(),
+            tool_call_id: "call-1".to_string(),
+            input: Value::Null,
+        };
+        assert_eq!(event.event_name(), "tool_call");
+    }
+
+    #[test]
+    fn event_serializes_with_type_tag() {
+        let event = ExtensionEvent::Startup {
+            version: "0.1.0".to_string(),
+            session_file: None,
+        };
+        let value = serde_json::to_value(event).expect("serialize");
+        assert_eq!(value.get("type").and_then(Value::as_str), Some("startup"));
+    }
+
+    #[test]
+    fn result_types_deserialize_defaults() {
+        let result: ToolCallEventResult =
+            serde_json::from_value(json!({ "reason": "nope" })).expect("deserialize");
+        assert_eq!(
+            result,
+            ToolCallEventResult {
+                block: false,
+                reason: Some("nope".to_string())
+            }
+        );
+    }
+}
