@@ -206,10 +206,15 @@ where
                             }
                             // Incomplete UTF-8 sequence at the end
                             let valid_len = e.valid_up_to();
-                            // valid_up_to() guarantees this range is valid UTF-8
-                            let s = std::str::from_utf8(&buffer[..valid_len])
-                                .expect("valid_up_to guarantees valid UTF-8")
-                                .to_string();
+                            let s = match std::str::from_utf8(&buffer[..valid_len]) {
+                                Ok(s) => s.to_string(),
+                                Err(err) => {
+                                    return Poll::Ready(Some(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        err,
+                                    ))));
+                                }
+                            };
                             let remaining = buffer[valid_len..].to_vec();
                             (s, remaining)
                         }

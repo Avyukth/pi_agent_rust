@@ -19,7 +19,7 @@ use crate::model::{
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
-use crate::tools::{ToolOutput, ToolRegistry, ToolUpdate};
+use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::sync::Notify;
 use chrono::Utc;
 use futures::FutureExt;
@@ -368,6 +368,14 @@ impl Agent {
     ) {
         self.steering_fetcher = steering;
         self.follow_up_fetcher = follow_up;
+    }
+
+    /// Extend the tool registry with additional tools (e.g. extension-registered tools).
+    pub fn extend_tools<I>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = Box<dyn Tool>>,
+    {
+        self.tools.extend(tools);
     }
 
     /// Queue a steering message (delivered after tool completion).

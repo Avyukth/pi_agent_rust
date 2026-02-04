@@ -8,7 +8,8 @@ use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
 use crate::extensions_js::{
-    HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json, json_to_js,
+    ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json,
+    json_to_js,
 };
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
@@ -2820,9 +2821,20 @@ mod wasm_host {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::connectors::http::HttpConnectorConfig;
+        use crate::model::ContentBlock;
+        use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
         use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{sleep, wall_now};
+        use async_trait::async_trait;
         use serde_json::json;
+        use std::collections::BTreeMap;
         use std::future::Future;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
         use tempfile::tempdir;
 
         fn run_async<T, Fut>(future: Fut) -> T
@@ -2841,6 +2853,15 @@ mod wasm_host {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+            }
+        }
+
+        fn strict_policy(default_caps: &[&str], deny_caps: &[&str]) -> ExtensionPolicy {
+            ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: default_caps.iter().map(|cap| (*cap).to_string()).collect(),
+                deny_caps: deny_caps.iter().map(|cap| (*cap).to_string()).collect(),
             }
         }
 
@@ -2876,6 +2897,194 @@ mod wasm_host {
                 tools: Vec::new(),
                 slash_commands: Vec::new(),
                 event_hooks: Vec::new(),
+            }
+        }
+
+        fn registration_payload_with_write_scope() -> RegisterPayload {
+            let mut payload = registration_payload();
+            let CapabilityManifest { capabilities, .. } = payload
+                .capability_manifest
+                .get_or_insert_with(|| CapabilityManifest {
+                    schema: "pi.ext.cap.v1".to_string(),
+                    capabilities: Vec::new(),
+                });
+            capabilities.push(CapabilityRequirement {
+                capability: "write".to_string(),
+                methods: vec!["fs".to_string()],
+                scope: Some(CapabilityScope {
+                    paths: Some(vec![".".to_string()]),
+                    hosts: None,
+                    env: None,
+                }),
+            });
+            payload
+        }
+
+        #[derive(Debug, Clone)]
+        struct CapturedEvent {
+            level: tracing::Level,
+            fields: BTreeMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct CaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl CaptureLayer {
+            fn snapshot(&self) -> Vec<CapturedEvent> {
+                self.events
+                    .lock()
+                    .expect("events mutex")
+                    .iter()
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        struct FieldVisitor<'a> {
+            fields: &'a mut BTreeMap<String, String>,
+        }
+
+        impl tracing::field::Visit for FieldVisitor<'_> {
+            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.fields
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = BTreeMap::new();
+                let mut visitor = FieldVisitor {
+                    fields: &mut fields,
+                };
+                event.record(&mut visitor);
+                self.events
+                    .lock()
+                    .expect("events mutex")
+                    .push(CapturedEvent {
+                        level: *event.metadata().level(),
+                        fields,
+                    });
+            }
+        }
+
+        fn capture_tracing_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let capture = CaptureLayer::default();
+            let subscriber = tracing_subscriber::registry().with(capture.clone());
+            let result = tracing::subscriber::with_default(subscriber, f);
+            (result, capture.snapshot())
+        }
+
+        fn find_policy_decisions(events: &[CapturedEvent], call_id: &str) -> Vec<&CapturedEvent> {
+            events
+                .iter()
+                .filter(|event| {
+                    event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| value == "policy.decision")
+                        && event
+                            .fields
+                            .get("call_id")
+                            .is_some_and(|value| value == call_id)
+                })
+                .collect()
+        }
+
+        fn assert_policy_decision_logged(
+            events: &[CapturedEvent],
+            call_id: &str,
+            capability: &str,
+            decision: &str,
+        ) {
+            let matching = find_policy_decisions(events, call_id);
+            assert!(
+                !matching.is_empty(),
+                "expected policy.decision log for call_id={call_id}; got events: {events:#?}"
+            );
+            assert!(
+                matching.iter().any(|event| {
+                    event
+                        .fields
+                        .get("capability")
+                        .is_some_and(|value| value == capability)
+                        && event
+                            .fields
+                            .get("decision")
+                            .is_some_and(|value| value == decision)
+                        && event
+                            .fields
+                            .get("extension_id")
+                            .is_some_and(|value| value.contains("ext.test"))
+                }),
+                "expected policy.decision with capability={capability} decision={decision} extension_id=ext.test; got: {matching:#?}"
+            );
+        }
+
+        #[derive(Debug)]
+        struct SleepTool;
+
+        #[async_trait]
+        impl Tool for SleepTool {
+            fn name(&self) -> &str {
+                "sleep"
+            }
+
+            fn label(&self) -> &str {
+                "sleep"
+            }
+
+            fn description(&self) -> &str {
+                "sleep tool"
+            }
+
+            fn parameters(&self) -> Value {
+                json!({ "type": "object" })
+            }
+
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _input: Value,
+                _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            ) -> Result<ToolOutput> {
+                sleep(wall_now(), Duration::from_millis(200)).await;
+                Ok(ToolOutput {
+                    content: vec![],
+                    details: None,
+                    is_error: false,
+                })
             }
         }
 
@@ -2932,6 +3141,40 @@ mod wasm_host {
         }
 
         #[test]
+        fn wasm_host_env_denied_by_policy_even_when_allowlisted() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(ExtensionPolicy::default(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-env-policy-deny".to_string(),
+                capability: "env".to_string(),
+                method: "env".to_string(),
+                params: json!({ "name": "PI_TEST_ENV" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let ((outcome, _), events) = capture_tracing_events(|| {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                let outcome = run_async(async {
+                    host::Host::call(&mut state, "env".to_string(), json).await
+                });
+                (outcome, ())
+            });
+
+            let err_json = outcome.expect_err("env hostcall denied by policy");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+            assert_policy_decision_logged(&events, &call.call_id, "env", "Deny");
+        }
+
+        #[test]
         fn wasm_host_fs_respects_manifest_scopes() {
             let dir = tempdir().expect("tempdir");
             let cwd = dir.path().to_path_buf();
@@ -2977,6 +3220,202 @@ mod wasm_host {
             .expect_err("fs write denied");
             let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
             assert_eq!(err.code, HostCallErrorCode::Denied);
+        }
+
+        #[test]
+        fn wasm_host_fs_write_succeeds_with_write_scope_and_logs_policy() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd.clone()).expect("host state");
+            state
+                .apply_registration(&registration_payload_with_write_scope())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-fs-write-ok".to_string(),
+                capability: "write".to_string(),
+                method: "fs".to_string(),
+                params: json!({ "op": "write", "path": "out.txt", "encoding": "utf8", "data": "hi" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let ((out, _), events) = capture_tracing_events(|| {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                let out =
+                    run_async(async { host::Host::call(&mut state, "fs".to_string(), json).await })
+                        .expect("fs write ok");
+                (out, ())
+            });
+
+            let out: Value = serde_json::from_str(&out).expect("parse fs output");
+            assert_eq!(out.get("bytes_written").and_then(Value::as_u64), Some(2));
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("out.txt")).expect("read out.txt"),
+                "hi"
+            );
+            assert_policy_decision_logged(&events, &call.call_id, "write", "Allow");
+        }
+
+        #[test]
+        fn wasm_host_tool_call_times_out_and_returns_timeout_error() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state.tools = ToolRegistry::from_tools(vec![Box::new(SleepTool)]);
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-tool-timeout".to_string(),
+                capability: "tool".to_string(),
+                method: "tool".to_string(),
+                params: json!({ "name": "sleep", "input": {} }),
+                timeout_ms: Some(50),
+                cancel_token: None,
+                context: None,
+            };
+
+            let ((outcome, _), events) = capture_tracing_events(|| {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                let outcome = run_async(async {
+                    host::Host::call(&mut state, "tool".to_string(), json).await
+                });
+                (outcome, ())
+            });
+
+            let err_json = outcome.expect_err("tool hostcall timeout");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Timeout);
+            assert_policy_decision_logged(&events, &call.call_id, "tool", "Allow");
+        }
+
+        #[test]
+        fn wasm_host_exec_denied_by_default_policy_and_logs_decision() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(ExtensionPolicy::default(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-exec-deny".to_string(),
+                capability: "exec".to_string(),
+                method: "exec".to_string(),
+                params: json!({ "command": "echo hi" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let ((outcome, _), events) = capture_tracing_events(|| {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                let outcome = run_async(async {
+                    host::Host::call(&mut state, "exec".to_string(), json).await
+                });
+                (outcome, ())
+            });
+
+            let err_json = outcome.expect_err("exec denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+            assert_policy_decision_logged(&events, &call.call_id, "exec", "Deny");
+        }
+
+        #[test]
+        fn wasm_host_exec_succeeds_when_policy_allows() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-exec-ok".to_string(),
+                capability: "exec".to_string(),
+                method: "exec".to_string(),
+                params: json!({ "command": "echo hello" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let out_json = {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                run_async(async { host::Host::call(&mut state, "exec".to_string(), json).await })
+                    .expect("exec ok")
+            };
+
+            let output: ToolOutput = serde_json::from_str(&out_json).expect("parse tool output");
+            assert!(!output.is_error);
+            let text = output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("hello"));
+        }
+
+        #[test]
+        fn wasm_host_http_get_succeeds_against_local_server_when_configured() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            let addr = listener.local_addr().expect("local addr");
+
+            let join = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                let _ = stream.write_all(response);
+            });
+
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(strict_policy(&["http"], &[]), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+            state.http = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                allowlist: vec!["127.0.0.1".to_string()],
+                ..Default::default()
+            });
+
+            let url = format!("http://127.0.0.1:{}/", addr.port());
+            let call = HostCallPayload {
+                call_id: "call-http-ok".to_string(),
+                capability: "http".to_string(),
+                method: "http".to_string(),
+                params: json!({ "url": url, "method": "GET" }),
+                timeout_ms: Some(2000),
+                cancel_token: None,
+                context: None,
+            };
+
+            let out_json = {
+                let json = serde_json::to_string(&call).expect("serialize hostcall");
+                run_async(async { host::Host::call(&mut state, "http".to_string(), json).await })
+                    .expect("http ok")
+            };
+
+            let out: Value = serde_json::from_str(&out_json).expect("parse http output");
+            assert_eq!(out.get("status").and_then(Value::as_u64), Some(200));
+            assert_eq!(out.get("body").and_then(Value::as_str), Some("ok"));
+
+            join.join().expect("server thread join");
         }
     }
 }
@@ -3231,6 +3670,9 @@ enum JsRuntimeCommand {
         specs: Vec<JsExtensionLoadSpec>,
         reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
     },
+    GetRegisteredTools {
+        reply: oneshot::Sender<Result<Vec<ExtensionToolDef>>>,
+    },
     DispatchEvent {
         event_name: String,
         event_payload: Value,
@@ -3261,6 +3703,7 @@ pub struct JsExtensionRuntimeHandle {
 }
 
 impl JsExtensionRuntimeHandle {
+    #[allow(clippy::too_many_lines)]
     pub async fn start(
         config: PiJsRuntimeConfig,
         tools: Arc<ToolRegistry>,
@@ -3298,6 +3741,10 @@ impl JsExtensionRuntimeHandle {
                     match cmd {
                         JsRuntimeCommand::LoadExtensions { specs, reply } => {
                             let result = load_all_extensions(&js_runtime, &host, &specs).await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::GetRegisteredTools { reply } => {
+                            let result = js_runtime.get_registered_tools().await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::DispatchEvent {
@@ -3383,6 +3830,22 @@ impl JsExtensionRuntimeHandle {
                     specs,
                     reply: reply_tx,
                 },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::GetRegisteredTools { reply: reply_tx },
             )
             .await
             .map_err(|_| Error::extension("JS extension runtime channel closed"))?;

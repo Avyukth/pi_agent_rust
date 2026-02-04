@@ -5,9 +5,10 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::error::{Error, Result};
-use crate::extensions::JsExtensionRuntimeHandle;
+use crate::extensions::{ExtensionManager, JsExtensionRuntimeHandle};
 use crate::extensions_js::ExtensionToolDef;
 use crate::tools::{Tool, ToolOutput, ToolUpdate};
 
@@ -46,6 +47,42 @@ impl ExtensionToolWrapper {
         self.timeout_ms = timeout_ms.max(1);
         self
     }
+}
+
+/// Collect all registered extension tools and wrap them as Rust [`Tool`]s.
+///
+/// This is intended to be called after extensions are loaded/activated so the returned tool list
+/// can be injected into the agent [`crate::tools::ToolRegistry`].
+pub async fn collect_extension_tool_wrappers(
+    manager: &ExtensionManager,
+    ctx_payload: Value,
+) -> Result<Vec<Box<dyn Tool>>> {
+    let Some(runtime) = manager.js_runtime() else {
+        return Ok(Vec::new());
+    };
+
+    let mut defs = runtime.get_registered_tools().await?;
+    if let Some(active_tools) = manager.active_tools() {
+        let active = active_tools.into_iter().collect::<HashSet<_>>();
+        defs.retain(|def| active.contains(&def.name));
+    }
+
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut wrappers: Vec<Box<dyn Tool>> = Vec::new();
+    let mut seen = HashSet::new();
+    for def in defs {
+        if !seen.insert(def.name.clone()) {
+            tracing::warn!(tool = %def.name, "Duplicate extension tool name; ignoring");
+            continue;
+        }
+
+        wrappers.push(Box::new(
+            ExtensionToolWrapper::new(def, runtime.clone()).with_ctx_payload(ctx_payload.clone()),
+        ));
+    }
+
+    Ok(wrappers)
 }
 
 #[async_trait]
@@ -97,12 +134,21 @@ impl Tool for ExtensionToolWrapper {
 mod tests {
     use super::*;
 
+    use crate::agent::{Agent, AgentConfig, AgentEvent, AgentSession};
     use crate::extensions::{ExtensionManager, JsExtensionLoadSpec};
     use crate::extensions_js::PiJsRuntimeConfig;
-    use crate::model::ContentBlock;
+    use crate::model::{
+        AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
+        Usage,
+    };
+    use crate::provider::{Context, Provider, StreamOptions};
+    use crate::session::Session;
     use crate::tools::ToolRegistry;
     use asupersync::runtime::RuntimeBuilder;
+    use async_trait::async_trait;
+    use futures::Stream;
     use serde_json::json;
+    use std::pin::Pin;
     use std::sync::Arc;
 
     #[test]
@@ -158,15 +204,14 @@ mod tests {
                 .await
                 .expect("load js extensions");
 
-            let def = ExtensionToolDef {
-                name: "hello_tool".to_string(),
-                label: "hello_tool".to_string(),
-                description: "test tool".to_string(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": { "name": { "type": "string" } }
-                }),
-            };
+            let tool_defs = js_runtime
+                .get_registered_tools()
+                .await
+                .expect("get registered tools");
+            let def = tool_defs
+                .into_iter()
+                .find(|tool| tool.name == "hello_tool")
+                .expect("hello_tool registered");
 
             let wrapper = ExtensionToolWrapper::new(def, js_runtime).with_ctx_payload(json!({
                 "cwd": temp_dir.path().display().to_string()
@@ -197,6 +242,174 @@ mod tests {
                 details.get("cwd").and_then(Value::as_str),
                 Some(cwd.as_str())
             );
+        });
+    }
+
+    #[derive(Debug)]
+    struct ToolCallingProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ToolCallingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            fn assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
+                AssistantMessage {
+                    content,
+                    api: "test-api".to_string(),
+                    provider: "test-provider".to_string(),
+                    model: "test-model".to_string(),
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 0,
+                }
+            }
+
+            let tool_def_present = context.tools.iter().any(|tool| tool.name == "hello_tool");
+            let tool_result = context.messages.iter().find_map(|message| match message {
+                Message::ToolResult(result) if result.tool_name == "hello_tool" => Some(result),
+                _ => None,
+            });
+
+            if let Some(result) = tool_result {
+                match result.content.as_slice() {
+                    [ContentBlock::Text(text)] => assert_eq!(text.text, "hello pi"),
+                    other => panic!("Expected single text content block, got: {other:?}"),
+                }
+
+                let events = vec![
+                    Ok(StreamEvent::Start {
+                        partial: assistant_message(Vec::new()),
+                    }),
+                    Ok(StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message: assistant_message(vec![ContentBlock::Text(TextContent::new(
+                            "done",
+                        ))]),
+                    }),
+                ];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
+
+            assert!(
+                tool_def_present,
+                "Expected extension tool to be present in provider tool defs"
+            );
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "hello_tool".to_string(),
+                arguments: json!({ "name": "pi" }),
+                thought_signature: None,
+            };
+
+            let events = vec![
+                Ok(StreamEvent::Start {
+                    partial: assistant_message(Vec::new()),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: assistant_message(vec![ContentBlock::ToolCall(tool_call)]),
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn agent_executes_extension_tool_registered_via_js() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "hello_tool",
+                    label: "hello_tool",
+                    description: "test tool",
+                    parameters: { type: "object", properties: { name: { type: "string" } } },
+                    execute: async (_callId, input, _onUpdate, _abort, _ctx) => {
+                      const who = input && input.name ? String(input.name) : "world";
+                      return {
+                        content: [{ type: "text", text: `hello ${who}` }],
+                        details: { from: "extension" },
+                        isError: false
+                      };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let manager = ExtensionManager::new();
+            let tools_for_runtime = Arc::new(ToolRegistry::new(&[], temp_dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: temp_dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools_for_runtime),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load js extensions");
+
+            let wrappers = collect_extension_tool_wrappers(
+                &manager,
+                json!({ "cwd": temp_dir.path().display().to_string() }),
+            )
+            .await
+            .expect("collect wrappers");
+            assert_eq!(wrappers.len(), 1);
+
+            let provider = Arc::new(ToolCallingProvider);
+            let tools = ToolRegistry::new(&[], temp_dir.path(), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.extend_tools(wrappers);
+
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+            let message = agent_session
+                .run_text("hi".to_string(), |_event: AgentEvent| {})
+                .await
+                .expect("run_text");
+
+            match message.content.as_slice() {
+                [ContentBlock::Text(text)] => assert_eq!(text.text, "done"),
+                other => panic!("Expected single text content block, got: {other:?}"),
+            }
         });
     }
 }

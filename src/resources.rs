@@ -1263,7 +1263,8 @@ pub fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<Res
     let mut diagnostics = Vec::new();
 
     for theme in themes {
-        if let Some(existing) = seen.get(&theme.name) {
+        let key = theme.name.to_ascii_lowercase();
+        if let Some(existing) = seen.get(&key) {
             diagnostics.push(ResourceDiagnostic {
                 kind: DiagnosticKind::Collision,
                 message: format!("theme \"{}\" collision", theme.name),
@@ -1277,11 +1278,15 @@ pub fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<Res
             });
             continue;
         }
-        seen.insert(theme.name.clone(), theme);
+        seen.insert(key, theme);
     }
 
     let mut themes: Vec<ThemeResource> = seen.into_values().collect();
-    themes.sort_by(|a, b| a.name.cmp(&b.name));
+    themes.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+    });
     (themes, diagnostics)
 }
 
@@ -1684,5 +1689,32 @@ mod tests {
                 .count();
             assert_eq!(matches, 1);
         });
+    }
+
+    #[test]
+    fn test_dedupe_themes_is_case_insensitive() {
+        let (themes, diagnostics) = dedupe_themes(vec![
+            ThemeResource {
+                name: "Dark".to_string(),
+                theme: Theme::default(),
+                source: "test:first".to_string(),
+                file_path: PathBuf::from("/tmp/Dark.ini"),
+            },
+            ThemeResource {
+                name: "dark".to_string(),
+                theme: Theme::default(),
+                source: "test:second".to_string(),
+                file_path: PathBuf::from("/tmp/dark.ini"),
+            },
+        ]);
+
+        assert_eq!(themes.len(), 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::Collision);
+        assert!(
+            diagnostics[0].message.contains("theme"),
+            "unexpected diagnostic: {:?}",
+            diagnostics[0]
+        );
     }
 }

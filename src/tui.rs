@@ -427,15 +427,8 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
     }
 
     if in_code_block {
-        // Unterminated fence; fall back to treating it as plain markdown.
-        text_buf.push_str("```");
-        if let Some(language) = code_language {
-            if !language.is_empty() {
-                text_buf.push_str(&language);
-            }
-        }
-        text_buf.push('\n');
-        text_buf.push_str(&code_buf);
+        // Unterminated fence; fall back to treating the entire input as plain markdown.
+        return vec![MarkdownChunk::Text(markdown.to_string())];
     }
 
     if !text_buf.is_empty() {
@@ -443,6 +436,27 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
     }
 
     chunks
+}
+
+fn has_multiple_non_none_styles(segments: &[Segment<'_>]) -> bool {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for segment in segments {
+        let Some(style) = &segment.style else {
+            continue;
+        };
+        if segment.text.as_ref().trim().is_empty() {
+            continue;
+        }
+
+        seen.insert(style.clone());
+        if seen.len() > 1 {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn render_markdown_with_syntax(markdown: &str, width: usize) -> Vec<Segment<'static>> {
@@ -476,20 +490,40 @@ fn render_markdown_with_syntax(markdown: &str, width: usize) -> Vec<Segment<'sta
                 }
 
                 let language = language.unwrap_or_else(|| "text".to_string());
-                let syntax = Syntax::new(code.as_str(), language);
-                let fallback_syntax = Syntax::new(code.as_str(), "text");
-                let rendered = syntax
-                    .render(Some(width))
-                    .or_else(|_| fallback_syntax.render(Some(width)));
+                let require_variation = matches!(language.as_str(), "typescript" | "ts" | "tsx");
+                let mut candidates: Vec<&str> = Vec::new();
+                match language.as_str() {
+                    // syntect's built-in set doesn't always include TypeScript; prefer `ts` if
+                    // available, otherwise fall back to JavaScript highlighting.
+                    "typescript" | "ts" | "tsx" => candidates.extend(["ts", "javascript"]),
+                    _ => candidates.push(language.as_str()),
+                }
+                candidates.push("text");
 
-                match rendered {
-                    Ok(items) => segments.extend(items.into_iter().map(Segment::into_owned)),
-                    Err(_) => segments.extend(
+                let mut rendered_items: Option<Vec<Segment<'static>>> = None;
+                for candidate in candidates {
+                    let syntax = Syntax::new(code.as_str(), candidate);
+                    if let Ok(items) = syntax.render(Some(width)) {
+                        if require_variation
+                            && candidate != "text"
+                            && !has_multiple_non_none_styles(&items)
+                        {
+                            continue;
+                        }
+                        rendered_items = Some(items.into_iter().map(Segment::into_owned).collect());
+                        break;
+                    }
+                }
+
+                if let Some(items) = rendered_items {
+                    segments.extend(items);
+                } else {
+                    segments.extend(
                         Markdown::new(format!("```\n{code}```\n"))
                             .render(width)
                             .into_iter()
                             .map(Segment::into_owned),
-                    ),
+                    );
                 }
             }
         }
@@ -572,6 +606,31 @@ mod tests {
 
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+
+    fn capture_markdown_segments(markdown: &str) -> Vec<Segment<'static>> {
+        let console = PiConsole::with_color();
+        console.console.begin_capture();
+        console.render_markdown(markdown);
+        console.console.end_capture()
+    }
+
+    fn segments_text(segments: &[Segment<'static>]) -> String {
+        segments.iter().map(|s| s.text.as_ref()).collect()
+    }
+
+    fn unique_style_debug_for_tokens(
+        segments: &[Segment<'static>],
+        tokens: &[&str],
+    ) -> HashSet<String> {
+        segments
+            .iter()
+            .filter(|segment| {
+                let text = segment.text.as_ref();
+                tokens.iter().any(|token| text.contains(token))
+            })
+            .map(|segment| format!("{:?}", segment.style))
+            .collect()
+    }
 
     #[derive(Clone)]
     struct SharedBufferWriter {
@@ -670,18 +729,176 @@ mod tests {
         console.render_markdown("```rust\nfn main() {\n    println!(\"hi\");\n}\n```");
         let segments = console.console.end_capture();
 
-        let code_styles = segments
-            .iter()
-            .filter(|segment| {
-                let text = segment.text.as_ref();
-                text.contains("fn") || text.contains("println")
-            })
-            .map(|segment| format!("{:?}", segment.style))
-            .collect::<HashSet<_>>();
+        let code_styles = unique_style_debug_for_tokens(&segments, &["fn", "println"]);
 
         assert!(
             code_styles.len() > 1,
             "expected multiple token styles from syntax highlighting, got {code_styles:?}"
+        );
+    }
+
+    #[test]
+    fn parse_fenced_code_language_extracts_first_tag() {
+        assert_eq!(parse_fenced_code_language("rust"), Some("rust".to_string()));
+        assert_eq!(
+            parse_fenced_code_language(" RuSt "),
+            Some("rust".to_string())
+        );
+        assert_eq!(
+            parse_fenced_code_language("rust,ignore"),
+            Some("rust".to_string())
+        );
+        assert_eq!(parse_fenced_code_language(""), None);
+        assert_eq!(parse_fenced_code_language("   "), None);
+    }
+
+    #[test]
+    fn split_markdown_fenced_code_blocks_splits_text_and_code() {
+        let input = "Intro\n\n```rust\nfn main() {}\n```\n\nTail\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(matches!(chunks[0], MarkdownChunk::Text(_)));
+        assert!(
+            matches!(
+                &chunks[1],
+                MarkdownChunk::CodeBlock { language, code }
+                    if language.as_deref() == Some("rust") && code.contains("fn main")
+            ),
+            "expected rust code block, got {chunks:?}"
+        );
+        assert!(matches!(chunks[2], MarkdownChunk::Text(_)));
+    }
+
+    #[test]
+    fn split_markdown_fenced_code_blocks_unterminated_fence_falls_back_to_text() {
+        let input = "Intro\n\n```rust\nfn main() {}\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "expected a single Text chunk, got {chunks:?}"
+        );
+        let MarkdownChunk::Text(text) = &chunks[0] else {
+            panic!("expected text fallback, got {chunks:?}");
+        };
+        assert!(text.contains("```rust"));
+        assert!(text.contains("fn main"));
+    }
+
+    #[test]
+    fn render_markdown_strips_inline_markers_and_renders_headings_lists_links() {
+        let segments = capture_markdown_segments(
+            r"
+# H1
+## H2
+### H3
+#### H4
+##### H5
+###### H6
+
+This is **bold**, *italic*, ~~strike~~, `code`, and [link](https://example.com).
+
+- Bullet 1
+1. Numbered 1
+
+Nested: **bold and *italic*** and ~~**strike bold**~~.
+",
+        );
+
+        let captured = segments_text(&segments);
+        for needle in [
+            "H1",
+            "H2",
+            "H3",
+            "H4",
+            "H5",
+            "H6",
+            "bold",
+            "italic",
+            "strike",
+            "code",
+            "link",
+            "Bullet 1",
+            "Numbered 1",
+            "Nested",
+        ] {
+            assert!(
+                captured.contains(needle),
+                "expected output to contain {needle:?}, got: {captured:?}"
+            );
+        }
+
+        assert!(
+            !captured.contains("**"),
+            "expected bold markers to be stripped, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("~~"),
+            "expected strikethrough markers to be stripped, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains('`'),
+            "expected inline code markers to be stripped, got: {captured:?}"
+        );
+        assert!(
+            !captured.contains("]("),
+            "expected link markers to be stripped, got: {captured:?}"
+        );
+
+        assert!(
+            segments.iter().any(|s| s.style.is_some()),
+            "expected styled segments, got: {segments:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_code_fences_highlight_multiple_languages_and_fallback_unknown() {
+        let segments = capture_markdown_segments(
+            r#"
+```rust
+fn main() { println!("hi"); }
+```
+
+```python
+def foo():
+    print("hi")
+```
+
+```javascript
+function foo() { console.log("hi"); }
+```
+
+```typescript
+interface Foo { x: number }
+const foo: Foo = { x: 1 };
+const greeting = "hi";
+```
+
+```notalanguage
+some_code_here();
+```
+"#,
+        );
+
+        for (language, tokens) in [
+            ("rust", vec!["fn", "println", "\"hi\""]),
+            ("python", vec!["def", "print", "\"hi\""]),
+            ("javascript", vec!["function", "console", "\"hi\""]),
+            ("typescript", vec!["interface", "const", "\"hi\""]),
+        ] {
+            let styles = unique_style_debug_for_tokens(&segments, &tokens);
+            assert!(
+                styles.len() > 1,
+                "expected multiple styles for {language} tokens {tokens:?}, got {styles:?}"
+            );
+        }
+
+        let captured = segments_text(&segments);
+        assert!(
+            captured.contains("some_code_here"),
+            "expected unknown language fence to still render code, got: {captured:?}"
         );
     }
 }

@@ -184,7 +184,7 @@ impl Clock for WallClock {
         use std::time::{SystemTime, UNIX_EPOCH};
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("time before epoch")
+            .unwrap_or_default()
             .as_millis();
         u64::try_from(millis).unwrap_or(u64::MAX)
     }
