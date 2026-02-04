@@ -978,4 +978,27 @@ mod tests {
             ("~".to_string(), "notes.txt".to_string())
         );
     }
+
+    #[test]
+    fn fuzzy_match_prefers_prefix_and_shorter() {
+        let (prefix_short, score_short) = fuzzy_match_score("help", "he").expect("match help");
+        let (prefix_long, score_long) = fuzzy_match_score("hello", "he").expect("match hello");
+        assert!(prefix_short && prefix_long);
+        assert!(score_short > score_long);
+    }
+
+    #[test]
+    fn fuzzy_match_accepts_subsequence() {
+        let (is_prefix, score) = fuzzy_match_score("autocomplete", "acmp").expect("subsequence");
+        assert!(!is_prefix);
+        assert!(score > 0);
+    }
+
+    #[test]
+    fn suggest_replaces_only_current_token() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let resp = provider.suggest("foo /he bar", "foo /he".len());
+        assert_eq!(resp.replace, 4..7);
+    }
 }

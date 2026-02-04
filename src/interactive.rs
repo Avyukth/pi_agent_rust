@@ -7901,3 +7901,47 @@ fn normalize_raw_terminal_newlines(input: String) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bash_command_distinguishes_exclusion() {
+        let (command, exclude) = parse_bash_command("! ls -la").expect("bang command");
+        assert_eq!(command, "ls -la");
+        assert!(!exclude);
+
+        let (command, exclude) = parse_bash_command("!! ls -la").expect("double bang command");
+        assert_eq!(command, "ls -la");
+        assert!(exclude);
+    }
+
+    #[cfg(all(feature = "clipboard", feature = "image-resize"))]
+    #[test]
+    fn paste_image_from_clipboard_writes_temp_png() {
+        use arboard::ImageData;
+        use std::borrow::Cow;
+
+        let Ok(mut clipboard) = ArboardClipboard::new() else {
+            return;
+        };
+
+        let image = ImageData {
+            width: 1,
+            height: 1,
+            bytes: Cow::Owned(vec![255, 0, 0, 255]),
+        };
+
+        if clipboard.set_image(image).is_err() {
+            return;
+        }
+
+        let Some(path) = PiApp::paste_image_from_clipboard() else {
+            return;
+        };
+
+        assert!(path.exists());
+        assert_eq!(path.extension().and_then(|s| s.to_str()), Some("png"));
+    }
+}
