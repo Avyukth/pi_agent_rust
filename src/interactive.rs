@@ -2386,11 +2386,7 @@ fn parse_extension_ui_response(
                         .get("value")
                         .cloned()
                         .or_else(|| chosen.get("label").cloned())
-                        .or_else(|| {
-                            chosen
-                                .as_str()
-                                .map(|s| Value::String(s.to_string()))
-                        });
+                        .or_else(|| chosen.as_str().map(|s| Value::String(s.to_string())));
                     return Ok(ExtensionUiResponse {
                         id: request.id.clone(),
                         value,
