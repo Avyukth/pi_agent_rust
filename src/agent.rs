@@ -1354,7 +1354,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, expected),
-            other => assert!(false, "expected user text message, got {other:?}"),
+            other => panic!("expected user text message, got {other:?}"),
         }
     }
 
