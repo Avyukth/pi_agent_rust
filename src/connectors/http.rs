@@ -527,10 +527,7 @@ mod tests {
     use std::future::Future;
     use std::net::TcpListener;
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex};
     use std::thread;
-    use tracing_subscriber::Layer as _;
-    use tracing_subscriber::layer::SubscriberExt as _;
 
     fn run_async<T, Fut>(future: Fut) -> T
     where
@@ -879,71 +876,21 @@ mod tests {
         let _ = join.join();
     }
 
-    #[derive(Clone)]
-    struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
-
-    struct SharedBufGuard(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for SharedBufGuard {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBufWriter {
-        type Writer = SharedBufGuard;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedBufGuard(Arc::clone(&self.0))
-        }
+    #[test]
+    fn http_connector_redact_url_for_log_strips_sensitive_parts() {
+        let redacted = HttpConnector::redact_url_for_log(
+            "http://user:pass@denied.example/test?token=supersecret#frag",
+        );
+        assert!(redacted.contains("http://denied.example/test"));
+        assert!(!redacted.contains("token=supersecret"));
+        assert!(!redacted.contains("#frag"));
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("pass"));
     }
 
     #[test]
-    fn http_connector_logs_redacts_query_parameters() {
-        let connector = HttpConnector::new(HttpConnectorConfig {
-            require_tls: false,
-            allowlist: vec!["allowed.example".to_string()],
-            ..Default::default()
-        });
-
-        let call = HostCallPayload {
-            call_id: "call-1".to_string(),
-            capability: "http".to_string(),
-            method: "http".to_string(),
-            params: json!({
-                "url": "http://denied.example/test?token=supersecret#frag",
-                "method": "GET",
-            }),
-            timeout_ms: None,
-            cancel_token: None,
-            context: None,
-        };
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let writer = SharedBufWriter(Arc::clone(&buffer));
-        let subscriber = tracing_subscriber::registry().with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .with_target(false)
-                .with_ansi(false)
-                .without_time()
-                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
-        );
-
-        let result = tracing::subscriber::with_default(subscriber, || {
-            futures::executor::block_on(async move { connector.dispatch(&call).await.unwrap() })
-        });
-
-        assert!(result.is_error);
-
-        let logs = String::from_utf8(buffer.lock().unwrap().clone()).expect("utf8 logs");
-        assert!(logs.contains("HTTP connector: policy denied"));
-        assert!(!logs.contains("token=supersecret"));
-        assert!(!logs.contains("#frag"));
+    fn http_connector_redact_url_for_log_falls_back_for_invalid_urls() {
+        let redacted = HttpConnector::redact_url_for_log("not a url?token=supersecret#frag");
+        assert_eq!(redacted, "not a url");
     }
 }
