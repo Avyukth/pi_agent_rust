@@ -1,7 +1,9 @@
-//! Message types and content blocks.
+//! Message types, content blocks, and streaming events.
 //!
-//! This module defines the core data structures for LLM communication,
-//! including messages, content blocks, usage tracking, and streaming events.
+//! These types are the shared “wire format” used across the project:
+//! - Providers stream [`StreamEvent`] values that incrementally build an assistant reply.
+//! - Sessions persist [`Message`] values as JSON (see [`crate::session`]).
+//! - Tools return [`ContentBlock`] output that can be rendered in the TUI and replayed to providers.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,9 +15,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Message {
+    /// Message authored by the user.
     User(UserMessage),
+    /// Message authored by the assistant/model.
     Assistant(AssistantMessage),
+    /// Tool result produced by the host after executing a tool call.
     ToolResult(ToolResultMessage),
+    /// Host/extension-defined message type.
     Custom(CustomMessage),
 }
 
@@ -31,7 +37,9 @@ pub struct UserMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UserContent {
+    /// Plain text content (common for interactive input).
     Text(String),
+    /// Structured content blocks (e.g. text + images).
     Blocks(Vec<ContentBlock>),
 }
 
@@ -85,10 +93,15 @@ pub struct CustomMessage {
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
     #[default]
+    /// The provider signaled a normal stop (end of message).
     Stop,
+    /// The provider hit a token limit.
     Length,
+    /// The provider requested tool execution.
     ToolUse,
+    /// The stream terminated due to an error.
     Error,
+    /// The request was aborted locally.
     Aborted,
 }
 
@@ -100,9 +113,13 @@ pub enum StopReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ContentBlock {
+    /// Plain text content.
     Text(TextContent),
+    /// Provider “thinking” / reasoning (if enabled).
     Thinking(ThinkingContent),
+    /// An inline image (base64 + MIME type).
     Image(ImageContent),
+    /// A request to call a tool with JSON arguments.
     ToolCall(ToolCall),
 }
 
@@ -184,6 +201,10 @@ pub struct Cost {
 // ============================================================================
 
 /// Streaming event from a provider.
+///
+/// Provider implementations emit this enum while decoding SSE/HTTP streams. Most variants carry a
+/// `partial` [`AssistantMessage`] snapshot so the caller can update UI state without having to
+/// re-implement incremental assembly.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Start {
