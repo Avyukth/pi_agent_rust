@@ -878,11 +878,10 @@ mod tests {
 
     #[test]
     fn http_connector_redact_url_for_log_strips_sensitive_parts() {
-        let redacted = HttpConnector::redact_url_for_log(
-            "http://user:pass@denied.example/test?token=supersecret#frag",
-        );
+        let redacted =
+            HttpConnector::redact_url_for_log("http://user:pass@denied.example/test?q=hello#frag");
         assert!(redacted.contains("http://denied.example/test"));
-        assert!(!redacted.contains("token=supersecret"));
+        assert!(!redacted.contains("q=hello"));
         assert!(!redacted.contains("#frag"));
         assert!(!redacted.contains("user"));
         assert!(!redacted.contains("pass"));
@@ -890,7 +889,7 @@ mod tests {
 
     #[test]
     fn http_connector_redact_url_for_log_falls_back_for_invalid_urls() {
-        let redacted = HttpConnector::redact_url_for_log("not a url?token=supersecret#frag");
+        let redacted = HttpConnector::redact_url_for_log("not a url?q=hello#frag");
         assert_eq!(redacted, "not a url");
     }
 }
