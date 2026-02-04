@@ -7,6 +7,8 @@ use std::io::{self, IsTerminal, Write};
 
 use rich_rust::Theme;
 use rich_rust::prelude::*;
+use rich_rust::renderables::Markdown;
+use rich_rust::segment::Segment;
 
 /// Pi's console wrapper providing styled terminal output.
 pub struct PiConsole {
@@ -74,6 +76,33 @@ impl PiConsole {
     /// Print a newline.
     pub fn newline(&self) {
         println!();
+    }
+
+    /// Render Markdown (TTY → styled output; non-TTY → raw Markdown).
+    pub fn render_markdown(&self, markdown: &str) {
+        if self.is_tty {
+            let md = Markdown::new(markdown);
+            let mut segments = md.render(self.width());
+            let mut ends_with_newline = false;
+            for segment in segments.iter().rev() {
+                let text = segment.text.as_ref();
+                if text.is_empty() {
+                    continue;
+                }
+                ends_with_newline = text.ends_with('\n');
+                break;
+            }
+            if !ends_with_newline {
+                segments.push(Segment::plain("\n"));
+            }
+            self.console.print_segments(&segments);
+        } else {
+            print!("{markdown}");
+            if !markdown.ends_with('\n') {
+                println!();
+            }
+            let _ = io::stdout().flush();
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -414,5 +443,19 @@ mod tests {
     fn test_console_creation() {
         let console = PiConsole::with_color();
         assert!(console.width() > 0);
+    }
+
+    #[test]
+    fn render_markdown_produces_styled_segments() {
+        let console = PiConsole::with_color();
+
+        console.console.begin_capture();
+        console.render_markdown("# Title\n\nThis is **bold**.\n\n- Item 1\n- Item 2");
+        let segments = console.console.end_capture();
+
+        let captured: String = segments.iter().map(|s| s.text.as_ref()).collect();
+        assert!(captured.contains("Title"));
+        assert!(captured.contains("bold"));
+        assert!(segments.iter().any(|s| s.style.is_some()));
     }
 }
