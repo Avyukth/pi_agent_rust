@@ -123,9 +123,13 @@ pub struct Cli {
     pub no_prompt_templates: bool,
 
     // === Themes ===
-    /// Load theme file/directory (can use multiple times)
-    #[arg(long, action = clap::ArgAction::Append)]
-    pub theme: Vec<String>,
+    /// Select active theme (built-in name, discovered theme name, or theme JSON path)
+    #[arg(long)]
+    pub theme: Option<String>,
+
+    /// Add theme file/directory to discovery (can use multiple times)
+    #[arg(long = "theme-path", action = clap::ArgAction::Append)]
+    pub theme_path: Vec<String>,
 
     /// Disable theme discovery
     #[arg(long)]
@@ -172,6 +176,8 @@ mod tests {
             "--prompt-template",
             "prompt.md",
             "--theme",
+            "dark",
+            "--theme-path",
             "dark.ini",
             "--no-themes",
         ]);
@@ -181,7 +187,8 @@ mod tests {
         assert_eq!(cli.extension, vec!["ext1".to_string()]);
         assert_eq!(cli.skill, vec!["skill.md".to_string()]);
         assert_eq!(cli.prompt_template, vec!["prompt.md".to_string()]);
-        assert_eq!(cli.theme, vec!["dark.ini".to_string()]);
+        assert_eq!(cli.theme.as_deref(), Some("dark"));
+        assert_eq!(cli.theme_path, vec!["dark.ini".to_string()]);
         assert!(cli.no_themes);
     }
 

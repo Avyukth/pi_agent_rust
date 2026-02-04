@@ -86,33 +86,63 @@ impl Theme {
     ///
     /// - If `config.theme` is unset/empty, defaults to [`Theme::dark`].
     /// - If set to `dark`, `light`, or `solarized`, uses built-in defaults.
-    /// - Otherwise, attempts to load a theme JSON by name, falling back to dark on error.
+    /// - Otherwise, attempts to resolve a theme spec:
+    ///   - discovered theme name (from user/project theme dirs)
+    ///   - theme JSON file path (absolute or cwd-relative, supports `~/...`)
+    ///
+    /// Falls back to dark on error.
     #[must_use]
     pub fn resolve(config: &Config, cwd: &Path) -> Self {
-        let Some(name) = config.theme.as_deref() else {
+        let Some(spec) = config.theme.as_deref() else {
             return Self::dark();
         };
-        let name = name.trim();
-        if name.is_empty() {
+        let spec = spec.trim();
+        if spec.is_empty() {
             return Self::dark();
-        }
-        if name.eq_ignore_ascii_case("dark") {
-            return Self::dark();
-        }
-        if name.eq_ignore_ascii_case("light") {
-            return Self::light();
-        }
-        if name.eq_ignore_ascii_case("solarized") {
-            return Self::solarized();
         }
 
-        match Self::load_by_name(name, cwd) {
+        match Self::resolve_spec(spec, cwd) {
             Ok(theme) => theme,
             Err(err) => {
-                tracing::warn!("Failed to load theme '{name}': {err}");
+                tracing::warn!("Failed to load theme '{spec}': {err}");
                 Self::dark()
             }
         }
+    }
+
+    /// Resolve a theme spec into a theme.
+    ///
+    /// Supported specs:
+    /// - Built-ins: `dark`, `light`, `solarized`
+    /// - Theme name: resolves via [`Self::load_by_name`]
+    /// - File path: resolves via [`Self::load`] (absolute or cwd-relative, supports `~/...`)
+    pub fn resolve_spec(spec: &str, cwd: &Path) -> Result<Self> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err(Error::validation("Theme spec is empty"));
+        }
+        if spec.eq_ignore_ascii_case("dark") {
+            return Ok(Self::dark());
+        }
+        if spec.eq_ignore_ascii_case("light") {
+            return Ok(Self::light());
+        }
+        if spec.eq_ignore_ascii_case("solarized") {
+            return Ok(Self::solarized());
+        }
+
+        if looks_like_theme_path(spec) {
+            let path = resolve_theme_path(spec, cwd);
+            if !path.exists() {
+                return Err(Error::config(format!(
+                    "Theme file not found: {}",
+                    path.display()
+                )));
+            }
+            return Self::load(&path);
+        }
+
+        Self::load_by_name(spec, cwd)
     }
 
     #[must_use]
@@ -391,6 +421,45 @@ fn glob_json(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+fn looks_like_theme_path(spec: &str) -> bool {
+    let spec = spec.trim();
+    if spec.starts_with('~') {
+        return true;
+    }
+    if Path::new(spec)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        return true;
+    }
+    spec.contains('/') || spec.contains('\\')
+}
+
+fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
+    let trimmed = spec.trim();
+
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return dirs::home_dir()
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(rest);
+    }
+    if trimmed.starts_with('~') {
+        return dirs::home_dir()
+            .unwrap_or_else(|| cwd.to_path_buf())
+            .join(trimmed.trim_start_matches('~'));
+    }
+
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim();
     let hex = value.strip_prefix('#')?;
@@ -521,5 +590,61 @@ mod tests {
         Theme::solarized()
             .validate()
             .expect("solarized theme valid");
+    }
+
+    #[test]
+    fn resolve_spec_supports_builtins() {
+        let cwd = Path::new(".");
+        assert_eq!(Theme::resolve_spec("dark", cwd).unwrap().name, "dark");
+        assert_eq!(Theme::resolve_spec("light", cwd).unwrap().name, "light");
+        assert_eq!(
+            Theme::resolve_spec("solarized", cwd).unwrap().name,
+            "solarized"
+        );
+    }
+
+    #[test]
+    fn resolve_spec_loads_from_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("custom.json");
+        let json = serde_json::json!({
+            "name": "custom",
+            "version": "1.0",
+            "colors": {
+                "foreground": "#ffffff",
+                "background": "#000000",
+                "accent": "#123456",
+                "success": "#00ff00",
+                "warning": "#ffcc00",
+                "error": "#ff0000",
+                "muted": "#888888"
+            },
+            "syntax": {
+                "keyword": "#111111",
+                "string": "#222222",
+                "number": "#333333",
+                "comment": "#444444",
+                "function": "#555555"
+            },
+            "ui": {
+                "border": "#666666",
+                "selection": "#777777",
+                "cursor": "#888888"
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let theme = Theme::resolve_spec(path.to_str().unwrap(), dir.path()).expect("resolve spec");
+        assert_eq!(theme.name, "custom");
+    }
+
+    #[test]
+    fn resolve_spec_errors_on_missing_path() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let err = Theme::resolve_spec("does-not-exist.json", cwd.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Config(_)),
+            "expected config error, got {err:?}"
+        );
     }
 }

@@ -90,7 +90,12 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         return Ok(());
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    if let Some(theme_spec) = cli.theme.as_deref() {
+        // Validate the theme early so we error instead of silently falling back to the default.
+        pi::theme::Theme::resolve_spec(theme_spec, &cwd).map_err(anyhow::Error::new)?;
+        config.theme = Some(theme_spec.to_string());
+    }
     spawn_session_index_maintenance();
     let package_manager = PackageManager::new(cwd.clone());
     let resource_cli = ResourceCliOptions {
@@ -101,7 +106,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         skill_paths: cli.skill.clone(),
         prompt_paths: cli.prompt_template.clone(),
         extension_paths: cli.extension.clone(),
-        theme_paths: cli.theme.clone(),
+        theme_paths: cli.theme_path.clone(),
     };
     let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli).await
     {

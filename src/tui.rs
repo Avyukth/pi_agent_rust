@@ -7,7 +7,7 @@ use std::io::{self, IsTerminal, Write};
 
 use rich_rust::Theme;
 use rich_rust::prelude::*;
-use rich_rust::renderables::Markdown;
+use rich_rust::renderables::{Markdown, Syntax};
 use rich_rust::segment::Segment;
 
 /// Pi's console wrapper providing styled terminal output.
@@ -85,8 +85,7 @@ impl PiConsole {
     /// Render Markdown (TTY → styled output; non-TTY → raw Markdown).
     pub fn render_markdown(&self, markdown: &str) {
         if self.is_tty {
-            let md = Markdown::new(markdown);
-            let mut segments = md.render(self.width());
+            let mut segments = render_markdown_with_syntax(markdown, self.width());
             let mut ends_with_newline = false;
             for segment in segments.iter().rev() {
                 let text = segment.text.as_ref();
@@ -352,6 +351,153 @@ impl Clone for PiConsole {
     }
 }
 
+#[derive(Debug, Clone)]
+enum MarkdownChunk {
+    Text(String),
+    CodeBlock {
+        language: Option<String>,
+        code: String,
+    },
+}
+
+fn parse_fenced_code_language(info: &str) -> Option<String> {
+    let language_tag = info
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if language_tag.is_empty() {
+        None
+    } else {
+        Some(language_tag.to_ascii_lowercase())
+    }
+}
+
+fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
+    let mut chunks = Vec::new();
+
+    let mut text_buf = String::new();
+    let mut code_buf = String::new();
+    let mut in_code_block = false;
+    let mut fence_len = 0usize;
+    let mut code_language: Option<String> = None;
+
+    for line in markdown.split_inclusive('\n') {
+        let trimmed_start = line.trim_start();
+        let trimmed_line = trimmed_start.trim_end_matches(['\r', '\n']);
+
+        let backtick_count = trimmed_line.chars().take_while(|ch| *ch == '`').count();
+        let is_fence = backtick_count >= 3 && trimmed_line.starts_with("```");
+
+        if !in_code_block {
+            if is_fence {
+                if !text_buf.is_empty() {
+                    chunks.push(MarkdownChunk::Text(std::mem::take(&mut text_buf)));
+                }
+
+                fence_len = backtick_count;
+                let info = trimmed_line.get(fence_len..).unwrap_or_default();
+                code_language = parse_fenced_code_language(info);
+                in_code_block = true;
+                code_buf.clear();
+                continue;
+            }
+
+            text_buf.push_str(line);
+            continue;
+        }
+
+        if is_fence
+            && backtick_count >= fence_len
+            && trimmed_line[backtick_count..].trim().is_empty()
+        {
+            chunks.push(MarkdownChunk::CodeBlock {
+                language: code_language.take(),
+                code: std::mem::take(&mut code_buf),
+            });
+            in_code_block = false;
+            fence_len = 0;
+            continue;
+        }
+
+        code_buf.push_str(line);
+    }
+
+    if in_code_block {
+        // Unterminated fence; fall back to treating it as plain markdown.
+        text_buf.push_str("```");
+        if let Some(language) = code_language {
+            if !language.is_empty() {
+                text_buf.push_str(&language);
+            }
+        }
+        text_buf.push('\n');
+        text_buf.push_str(&code_buf);
+    }
+
+    if !text_buf.is_empty() {
+        chunks.push(MarkdownChunk::Text(text_buf));
+    }
+
+    chunks
+}
+
+fn render_markdown_with_syntax(markdown: &str, width: usize) -> Vec<Segment<'static>> {
+    if !markdown.contains("```") {
+        return Markdown::new(markdown)
+            .render(width)
+            .into_iter()
+            .map(Segment::into_owned)
+            .collect();
+    }
+
+    let chunks = split_markdown_fenced_code_blocks(markdown);
+    let mut segments: Vec<Segment<'static>> = Vec::new();
+
+    for chunk in chunks {
+        match chunk {
+            MarkdownChunk::Text(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                segments.extend(
+                    Markdown::new(text)
+                        .render(width)
+                        .into_iter()
+                        .map(Segment::into_owned),
+                );
+            }
+            MarkdownChunk::CodeBlock { language, mut code } => {
+                if !code.ends_with('\n') {
+                    code.push('\n');
+                }
+
+                let language = language.unwrap_or_else(|| "text".to_string());
+                let syntax = Syntax::new(code.as_str(), language);
+                let fallback_syntax = Syntax::new(code.as_str(), "text");
+                let rendered = syntax
+                    .render(Some(width))
+                    .or_else(|_| fallback_syntax.render(Some(width)));
+
+                match rendered {
+                    Ok(items) => segments.extend(items.into_iter().map(Segment::into_owned)),
+                    Err(_) => segments.extend(
+                        Markdown::new(format!("```\n{code}```\n"))
+                            .render(width)
+                            .into_iter()
+                            .map(Segment::into_owned),
+                    ),
+                }
+            }
+        }
+    }
+
+    segments
+}
+
 /// Strip rich markup tags from text.
 fn strip_markup(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
@@ -424,6 +570,7 @@ impl SpinnerStyle {
 mod tests {
     use super::*;
 
+    use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -513,5 +660,28 @@ mod tests {
         assert!(captured.contains("Title"));
         assert!(captured.contains("bold"));
         assert!(segments.iter().any(|s| s.style.is_some()));
+    }
+
+    #[test]
+    fn render_markdown_code_fence_uses_syntax_highlighting_when_language_present() {
+        let console = PiConsole::with_color();
+
+        console.console.begin_capture();
+        console.render_markdown("```rust\nfn main() {\n    println!(\"hi\");\n}\n```");
+        let segments = console.console.end_capture();
+
+        let code_styles = segments
+            .iter()
+            .filter(|segment| {
+                let text = segment.text.as_ref();
+                text.contains("fn") || text.contains("println")
+            })
+            .map(|segment| format!("{:?}", segment.style))
+            .collect::<HashSet<_>>();
+
+        assert!(
+            code_styles.len() > 1,
+            "expected multiple token styles from syntax highlighting, got {code_styles:?}"
+        );
     }
 }
