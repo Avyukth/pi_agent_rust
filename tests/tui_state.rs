@@ -3,6 +3,7 @@
 mod common;
 
 use asupersync::channel::mpsc;
+use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, QuitMsg};
 use common::TestHarness;
 use futures::stream;
@@ -20,9 +21,7 @@ use pi::model::{
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::resources::{ResourceCliOptions, ResourceLoader};
-use pi::session::Session;
-use pi::session::SessionMessage;
-use pi::session::encode_cwd;
+use pi::session::{Session, SessionEntry, SessionMessage, encode_cwd};
 use pi::tools::ToolRegistry;
 use regex::Regex;
 use serde_json::json;
@@ -148,6 +147,8 @@ fn build_app_with_session_and_config(
     let model_scope = vec![model_entry.clone()];
     let available_models = vec![model_entry.clone()];
     let (event_tx, _event_rx) = mpsc::channel(1024);
+    let (messages, usage) = conversation_from_session(&session);
+    let session = Arc::new(Mutex::new(session));
 
     let mut app = PiApp::new(
         agent,
@@ -165,6 +166,8 @@ fn build_app_with_session_and_config(
         false,
         None,
         Some(KeyBindings::new()),
+        messages,
+        usage,
     );
     app.set_terminal_size(80, 24);
     app
@@ -196,6 +199,8 @@ fn build_app_with_session_and_events_and_extension(
     let model_scope = vec![model_entry.clone()];
     let available_models = vec![model_entry.clone()];
     let (event_tx, event_rx) = mpsc::channel(1024);
+    let (messages, usage) = conversation_from_session(&session);
+    let session = Arc::new(Mutex::new(session));
 
     let manager = ExtensionManager::new();
     let ext_entry_path = harness.create_file("extensions/ext.mjs", extension_source.as_bytes());
@@ -242,6 +247,8 @@ fn build_app_with_session_and_events_and_extension(
         false,
         Some(manager),
         Some(KeyBindings::new()),
+        messages,
+        usage,
     );
     app.set_terminal_size(80, 24);
     (app, event_rx)
@@ -272,6 +279,8 @@ fn build_app_with_models(
         theme_paths: Vec::new(),
     };
     let (event_tx, _event_rx) = mpsc::channel(1024);
+    let (messages, usage) = conversation_from_session(&session);
+    let session = Arc::new(Mutex::new(session));
 
     let mut app = PiApp::new(
         agent,
@@ -289,6 +298,8 @@ fn build_app_with_models(
         false,
         None,
         Some(keybindings),
+        messages,
+        usage,
     );
     app.set_terminal_size(80, 24);
     app
@@ -340,6 +351,8 @@ fn build_app_with_session_and_events_and_config(
     let model_scope = vec![model_entry.clone()];
     let available_models = vec![model_entry.clone()];
     let (event_tx, event_rx) = mpsc::channel(1024);
+    let (messages, usage) = conversation_from_session(&session);
+    let session = Arc::new(Mutex::new(session));
 
     let mut app = PiApp::new(
         agent,
@@ -357,6 +370,8 @@ fn build_app_with_session_and_events_and_config(
         false,
         None,
         Some(KeyBindings::new()),
+        messages,
+        usage,
     );
     app.set_terminal_size(80, 24);
     (app, event_rx)
@@ -364,6 +379,138 @@ fn build_app_with_session_and_events_and_config(
 
 fn build_app(harness: &TestHarness, pending_inputs: Vec<PendingInput>) -> PiApp {
     build_app_with_session(harness, pending_inputs, Session::in_memory())
+}
+
+fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Usage) {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+
+    for entry in session.entries_for_current_path() {
+        let SessionEntry::Message(message_entry) = entry else {
+            continue;
+        };
+
+        match &message_entry.message {
+            SessionMessage::User { content, .. } => {
+                messages.push(ConversationMessage {
+                    role: MessageRole::User,
+                    content: user_content_to_text(content),
+                    thinking: None,
+                });
+            }
+            SessionMessage::Assistant { message } => {
+                let (text, thinking) = assistant_content_to_text(&message.content);
+                add_usage(&mut usage, &message.usage);
+                messages.push(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    content: text,
+                    thinking,
+                });
+            }
+            SessionMessage::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => {
+                let prefix = if *is_error {
+                    "Tool error"
+                } else {
+                    "Tool result"
+                };
+                let text = content_blocks_to_text(content);
+                messages.push(ConversationMessage {
+                    role: MessageRole::Tool,
+                    content: format!("{prefix} ({tool_name}): {text}"),
+                    thinking: None,
+                });
+            }
+            SessionMessage::Custom {
+                content, display, ..
+            } => {
+                if *display {
+                    messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: content.clone(),
+                        thinking: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (messages, usage)
+}
+
+fn user_content_to_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+    }
+}
+
+fn assistant_content_to_text(content: &[ContentBlock]) -> (String, Option<String>) {
+    let mut text = String::new();
+    let mut thinking = String::new();
+
+    for block in content {
+        match block {
+            ContentBlock::Text(t) => text.push_str(&t.text),
+            ContentBlock::Thinking(t) => thinking.push_str(&t.thinking),
+            _ => {}
+        }
+    }
+
+    let thinking = if thinking.trim().is_empty() {
+        None
+    } else {
+        Some(thinking)
+    };
+
+    (text, thinking)
+}
+
+fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
+    let mut output = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
+            ContentBlock::Image(image) => {
+                push_line(&mut output, &format!("[image: {}]", image.mime_type));
+            }
+            ContentBlock::Thinking(thinking_block) => {
+                push_line(&mut output, &thinking_block.thinking);
+            }
+            ContentBlock::ToolCall(call) => {
+                push_line(&mut output, &format!("[tool call: {}]", call.name));
+            }
+        }
+    }
+    output
+}
+
+fn push_line(out: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(line);
+}
+
+fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input = total.input.saturating_add(delta.input);
+    total.output = total.output.saturating_add(delta.output);
+    total.cache_read = total.cache_read.saturating_add(delta.cache_read);
+    total.cache_write = total.cache_write.saturating_add(delta.cache_write);
+    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
+    total.cost.input += delta.cost.input;
+    total.cost.output += delta.cost.output;
+    total.cost.cache_read += delta.cost.cache_read;
+    total.cost.cache_write += delta.cost.cache_write;
+    total.cost.total += delta.cost.total;
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -507,11 +654,14 @@ struct StepOutcome {
     delta: ViewDelta,
 }
 
+const SINGLE_LINE_HINT: &str = "Enter: send  Shift+Enter: newline  Alt+Enter: multi-line";
+const MULTI_LINE_HINT: &str = "Alt+Enter: send  Enter: newline  Esc: single-line";
+
 fn log_initial_state(harness: &TestHarness, app: &PiApp) {
     let view = normalize_view(&BubbleteaModel::view(app));
-    let mode = if view.contains("[multi-line]") {
+    let mode = if view.contains(MULTI_LINE_HINT) {
         "multi"
-    } else if view.contains("[single-line]") {
+    } else if view.contains(SINGLE_LINE_HINT) {
         "single"
     } else if view.contains("Processing...") {
         "processing"
@@ -790,9 +940,9 @@ fn tui_state_escape_exits_multiline_instead_of_quit() {
     log_initial_state(&harness, &app);
 
     let step = press_alt_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[multi-line]");
+    assert_after_contains(&harness, &step, MULTI_LINE_HINT);
     let step = press_esc(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[single-line]");
+    assert_after_contains(&harness, &step, SINGLE_LINE_HINT);
 }
 
 #[test]
@@ -924,7 +1074,7 @@ fn tui_state_shift_enter_inserts_newline_and_enters_multiline_mode() {
 
     type_text(&harness, &mut app, "line1");
     let step = press_shift_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[multi-line]");
+    assert_after_contains(&harness, &step, MULTI_LINE_HINT);
     assert_after_not_contains(&harness, &step, "Processing...");
 }
 
@@ -954,7 +1104,7 @@ fn tui_state_alt_enter_enables_multiline_mode() {
     log_initial_state(&harness, &app);
 
     let step = press_alt_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[multi-line]");
+    assert_after_contains(&harness, &step, MULTI_LINE_HINT);
 }
 
 #[test]
@@ -978,7 +1128,7 @@ fn tui_state_enter_in_multiline_mode_inserts_newline_not_submit() {
     press_alt_enter(&harness, &mut app);
     type_text(&harness, &mut app, "line1");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[multi-line]");
+    assert_after_contains(&harness, &step, MULTI_LINE_HINT);
     assert_after_not_contains(&harness, &step, "Processing...");
 }
 
@@ -1568,7 +1718,7 @@ fn tui_state_agent_error_adds_system_error_message_and_returns_idle() {
         PiMsg::AgentError("boom".to_string()),
     );
     assert_after_contains(&harness, &step, "Error: boom");
-    assert_after_contains(&harness, &step, "[single-line]");
+    assert_after_contains(&harness, &step, SINGLE_LINE_HINT);
 }
 
 #[test]
@@ -1993,13 +2143,13 @@ fn tui_state_slash_settings_opens_selector_and_restores_editor() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Settings");
     assert_after_contains(&harness, &step, "Summary");
-    assert_after_not_contains(&harness, &step, "[single-line]");
+    assert_after_not_contains(&harness, &step, SINGLE_LINE_HINT);
 
     // Navigate and confirm selection (scaffold: returns to editor).
     press_down(&harness, &mut app);
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Selected setting: Theme");
-    assert_after_contains(&harness, &step, "[single-line]");
+    assert_after_contains(&harness, &step, SINGLE_LINE_HINT);
 
     // Reopen and toggle a delivery mode (should persist to .pi/settings.json).
     type_text(&harness, &mut app, "/settings");
@@ -2020,7 +2170,7 @@ fn tui_state_slash_settings_opens_selector_and_restores_editor() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "↑/↓/j/k: navigate");
     let step = press_esc(&harness, &mut app);
-    assert_after_contains(&harness, &step, "[single-line]");
+    assert_after_contains(&harness, &step, SINGLE_LINE_HINT);
     assert_after_not_contains(&harness, &step, "↑/↓/j/k: navigate");
 }
 
