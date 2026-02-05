@@ -2360,7 +2360,7 @@ impl Tool for GrepTool {
 
                 if match_count >= effective_limit {
                     match_limit_reached = true;
-                    break; // Guard drop will kill the process
+                    break; // We'll terminate ripgrep once we have enough matches.
                 }
             }
 
@@ -2387,10 +2387,23 @@ impl Tool for GrepTool {
         }
 
         let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        let status = guard
-            .wait()
-            .map_err(|e| Error::tool("grep", e.to_string()))?;
-        let code = status.code().unwrap_or(0);
+        let code = if match_limit_reached {
+            // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
+            // `kill()` also waits, ensuring the stdout reader threads can exit promptly.
+            let _ = guard
+                .kill()
+                .map_err(|e| Error::tool("grep", format!("Failed to terminate ripgrep: {e}")))?;
+            // Drop any buffered stdout/stderr lines that were queued before termination.
+            while stdout_rx.try_recv().is_ok() {}
+            while stderr_rx.try_recv().is_ok() {}
+            0
+        } else {
+            guard
+                .wait()
+                .map_err(|e| Error::tool("grep", e.to_string()))?
+                .code()
+                .unwrap_or(0)
+        };
 
         if !match_limit_reached && code != 0 && code != 1 {
             let msg = if stderr_text.is_empty() {
