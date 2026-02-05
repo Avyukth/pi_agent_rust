@@ -7248,4 +7248,87 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn pijs_node_events_module_provides_event_emitter() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            // Use dynamic import() since eval() runs as a script, not a module
+            runtime
+                .eval(
+                    r"
+                    globalThis.results = [];
+                    globalThis.testDone = false;
+
+                    import('node:events').then(({ EventEmitter }) => {
+                        const emitter = new EventEmitter();
+
+                        emitter.on('data', (val) => globalThis.results.push('data:' + val));
+                        emitter.once('done', () => globalThis.results.push('done'));
+
+                        emitter.emit('data', 1);
+                        emitter.emit('data', 2);
+                        emitter.emit('done');
+                        emitter.emit('done'); // should not fire again
+
+                        globalThis.listenerCount = emitter.listenerCount('data');
+                        globalThis.eventNames = emitter.eventNames();
+                        globalThis.testDone = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval EventEmitter test");
+
+            assert_eq!(
+                get_global_json(&runtime, "testDone").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "results").await,
+                serde_json::json!(["data:1", "data:2", "done"])
+            );
+            assert_eq!(
+                get_global_json(&runtime, "listenerCount").await,
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "eventNames").await,
+                serde_json::json!(["data"])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_bare_module_aliases_resolve_correctly() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            // Test that bare "events" alias resolves to "node:events"
+            runtime
+                .eval(
+                    r"
+                    globalThis.bare_events_ok = false;
+                    import('events').then((mod) => {
+                        const e = new mod.default();
+                        globalThis.bare_events_ok = typeof e.on === 'function';
+                    });
+                    ",
+                )
+                .await
+                .expect("eval bare events import");
+
+            assert_eq!(
+                get_global_json(&runtime, "bare_events_ok").await,
+                serde_json::json!(true)
+            );
+        });
+    }
 }

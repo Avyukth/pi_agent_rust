@@ -1,3 +1,4 @@
+#![cfg(feature = "ext-conformance")]
 //! Differential extension conformance tests: compare TS oracle (Bun + jiti)
 //! output against Rust `QuickJS` runtime output for the SAME extension source.
 //!

@@ -1,3 +1,4 @@
+#![cfg(feature = "ext-conformance")]
 //! Auto-generated conformance tests for all extensions in the validated manifest (bd-15jg).
 //!
 //! Each extension in `tests/ext_conformance/VALIDATED_MANIFEST.json` gets its own `#[test]`
