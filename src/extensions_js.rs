@@ -1038,6 +1038,11 @@ impl JsModuleResolver for PiJsResolver {
             "readline" => "node:readline",
             "url" => "node:url",
             "net" => "node:net",
+            "events" => "node:events",
+            "buffer" => "node:buffer",
+            "assert" => "node:assert",
+            "stream" => "node:stream",
+            "module" => "node:module",
             other => other,
         };
 
@@ -1293,6 +1298,11 @@ export const Type = {
   },
   Optional: (schema) => ({ __pi_optional: true, schema }),
   Literal: (value, opts = {}) => ({ const: value, ...opts }),
+  Any: (opts = {}) => ({ ...opts }),
+  Union: (schemas, opts = {}) => ({ anyOf: schemas, ...opts }),
+  Enum: (values, opts = {}) => ({ enum: values, ...opts }),
+  Null: (opts = {}) => ({ type: "null", ...opts }),
+  Unknown: (opts = {}) => ({ ...opts }),
 };
 export default { Type };
 "#
@@ -1530,7 +1540,27 @@ export function fuzzyFilter(query, items, _opts = {}) {
   });
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter };
+// Cancellable loader widget - shows loading state with optional cancel
+export class CancellableLoader {
+  constructor(message = 'Loading...', opts = {}) {
+    this.message = String(message ?? 'Loading...');
+    this.cancelled = false;
+    this.onCancel = opts.onCancel ?? null;
+  }
+
+  cancel() {
+    this.cancelled = true;
+    if (typeof this.onCancel === 'function') {
+      this.onCancel();
+    }
+  }
+
+  render() {
+    return this.cancelled ? [] : [this.message];
+  }
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
 "#
         .trim()
         .to_string(),
@@ -1837,6 +1867,44 @@ export async function compact(_preparation, _model, _apiKey, _customInstructions
   };
 }
 
+/// Stub: AssistantMessageComponent for rendering assistant messages
+export class AssistantMessageComponent {
+  constructor(message, editable = false) {
+    this.message = message;
+    this.editable = editable;
+  }
+
+  render() {
+    return [];
+  }
+}
+
+// Stub: ToolExecutionComponent for rendering tool executions
+export class ToolExecutionComponent {
+  constructor(toolName, args, opts = {}, result, ui) {
+    this.toolName = toolName;
+    this.args = args;
+    this.opts = opts;
+    this.result = result;
+    this.ui = ui;
+  }
+
+  render() {
+    return [];
+  }
+}
+
+// Stub: UserMessageComponent for rendering user messages
+export class UserMessageComponent {
+  constructor(text) {
+    this.text = text;
+  }
+
+  render() {
+    return [];
+  }
+}
+
 export default {
   VERSION,
   DEFAULT_MAX_LINES,
@@ -1861,6 +1929,9 @@ export default {
   getAgentDir,
   keyHint,
   compact,
+  AssistantMessageComponent,
+  ToolExecutionComponent,
+  UserMessageComponent,
 };
 "#
         .trim()
@@ -2010,20 +2081,6 @@ export const sep = "/";
 export const delimiter = ":";
 
 export default { join, dirname, resolve, basename, relative, sep, delimiter };
-"#
-        .trim()
-        .to_string(),
-    );
-
-    modules.insert(
-        "node:url".to_string(),
-        r#"
-export function fileURLToPath(url) {
-  const s = String(url ?? "");
-  if (s.startsWith("file://")) return s.slice("file://".length);
-  return s;
-}
-export default { fileURLToPath };
 "#
         .trim()
         .to_string(),
@@ -2245,7 +2302,34 @@ export function randomUUID() {
   const r = Math.random().toString(16).slice(2);
   return `00000000-0000-4000-8000-${r.padEnd(12, "0").slice(0, 12)}`;
 }
-export default { randomUUID };
+
+// Simple hash implementation (NOT cryptographically secure - for testing only)
+export function createHash(algorithm) {
+  let data = '';
+  return {
+    update(input) {
+      data += String(input ?? '');
+      return this;
+    },
+    digest(encoding) {
+      // Simple non-crypto hash using djb2 algorithm
+      let hash = 5381;
+      for (let i = 0; i < data.length; i++) {
+        hash = ((hash << 5) + hash) + data.charCodeAt(i);
+        hash = hash >>> 0; // Convert to unsigned 32-bit
+      }
+      // Convert to hex string
+      const hex = hash.toString(16).padStart(8, '0');
+      // Repeat to approximate SHA-1/SHA-256 length
+      if (encoding === 'hex') {
+        return (hex + hex + hex + hex + hex).slice(0, algorithm === 'sha256' ? 64 : 40);
+      }
+      return hex;
+    },
+  };
+}
+
+export default { randomUUID, createHash };
 "#
         .trim()
         .to_string(),
@@ -2348,6 +2432,214 @@ export class Server {
 
 export default { createConnection, createServer, connect, Socket, Server };
 "
+        .trim()
+        .to_string(),
+    );
+
+    // ── node:events ──────────────────────────────────────────────────
+    modules.insert(
+        "node:events".to_string(),
+        r"
+class EventEmitter {
+  constructor() {
+    this._events = Object.create(null);
+    this._maxListeners = 10;
+  }
+
+  on(event, listener) {
+    if (!this._events[event]) this._events[event] = [];
+    this._events[event].push(listener);
+    return this;
+  }
+
+  addListener(event, listener) { return this.on(event, listener); }
+
+  once(event, listener) {
+    const wrapper = (...args) => {
+      this.removeListener(event, wrapper);
+      listener.apply(this, args);
+    };
+    wrapper._original = listener;
+    return this.on(event, wrapper);
+  }
+
+  off(event, listener) { return this.removeListener(event, listener); }
+
+  removeListener(event, listener) {
+    const list = this._events[event];
+    if (!list) return this;
+    this._events[event] = list.filter(
+      fn => fn !== listener && fn._original !== listener
+    );
+    if (this._events[event].length === 0) delete this._events[event];
+    return this;
+  }
+
+  removeAllListeners(event) {
+    if (event === undefined) {
+      this._events = Object.create(null);
+    } else {
+      delete this._events[event];
+    }
+    return this;
+  }
+
+  emit(event, ...args) {
+    const list = this._events[event];
+    if (!list || list.length === 0) return false;
+    for (const fn of list.slice()) {
+      try { fn.apply(this, args); } catch (e) {
+        if (event !== 'error') this.emit('error', e);
+      }
+    }
+    return true;
+  }
+
+  listeners(event) {
+    const list = this._events[event];
+    if (!list) return [];
+    return list.map(fn => fn._original || fn);
+  }
+
+  listenerCount(event) {
+    const list = this._events[event];
+    return list ? list.length : 0;
+  }
+
+  eventNames() { return Object.keys(this._events); }
+
+  setMaxListeners(n) { this._maxListeners = n; return this; }
+  getMaxListeners() { return this._maxListeners; }
+
+  prependListener(event, listener) {
+    if (!this._events[event]) this._events[event] = [];
+    this._events[event].unshift(listener);
+    return this;
+  }
+
+  prependOnceListener(event, listener) {
+    const wrapper = (...args) => {
+      this.removeListener(event, wrapper);
+      listener.apply(this, args);
+    };
+    wrapper._original = listener;
+    return this.prependListener(event, wrapper);
+  }
+
+  rawListeners(event) {
+    return this._events[event] ? this._events[event].slice() : [];
+  }
+}
+
+EventEmitter.EventEmitter = EventEmitter;
+EventEmitter.defaultMaxListeners = 10;
+
+export { EventEmitter };
+export default EventEmitter;
+"
+        .trim()
+        .to_string(),
+    );
+
+    // ── node:buffer ──────────────────────────────────────────────────
+    modules.insert(
+        "node:buffer".to_string(),
+        r"
+// Re-export the globalThis.Buffer if available, otherwise provide a stub.
+const _Buffer = typeof globalThis.Buffer !== 'undefined'
+  ? globalThis.Buffer
+  : class Buffer extends Uint8Array {
+      static from(input) { return new TextEncoder().encode(String(input)); }
+      static alloc(size) { return new Uint8Array(size); }
+      static isBuffer(obj) { return obj instanceof Uint8Array; }
+      toString(encoding) {
+        if (encoding === 'base64') return globalThis.btoa(String.fromCharCode(...this));
+        return new TextDecoder().decode(this);
+      }
+    };
+
+export const Buffer = _Buffer;
+export default { Buffer: _Buffer };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // ── node:assert ──────────────────────────────────────────────────
+    modules.insert(
+        "node:assert".to_string(),
+        r"
+function assert(value, message) {
+  if (!value) throw new Error(message || 'Assertion failed');
+}
+assert.ok = assert;
+assert.equal = (a, b, msg) => { if (a != b) throw new Error(msg || `${a} != ${b}`); };
+assert.strictEqual = (a, b, msg) => { if (a !== b) throw new Error(msg || `${a} !== ${b}`); };
+assert.notEqual = (a, b, msg) => { if (a == b) throw new Error(msg || `${a} == ${b}`); };
+assert.notStrictEqual = (a, b, msg) => { if (a === b) throw new Error(msg || `${a} === ${b}`); };
+assert.deepEqual = assert.deepStrictEqual = (a, b, msg) => {
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(msg || 'Deep equality failed');
+};
+assert.throws = (fn, _expected, msg) => {
+  let threw = false;
+  try { fn(); } catch (_) { threw = true; }
+  if (!threw) throw new Error(msg || 'Expected function to throw');
+};
+assert.doesNotThrow = (fn, _expected, msg) => {
+  try { fn(); } catch (e) { throw new Error(msg || `Got unwanted exception: ${e}`); }
+};
+assert.fail = (msg) => { throw new Error(msg || 'assert.fail()'); };
+
+export default assert;
+export { assert };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // ── node:stream ──────────────────────────────────────────────────
+    modules.insert(
+        "node:stream".to_string(),
+        r#"
+import EventEmitter from "node:events";
+
+class Stream extends EventEmitter {}
+
+class Readable extends Stream {
+  constructor(opts) { super(); this._readableState = { flowing: null }; }
+  read(_size) { return null; }
+  pipe(dest) { return dest; }
+  unpipe(_dest) { return this; }
+  resume() { return this; }
+  pause() { return this; }
+  destroy() { this.emit('close'); return this; }
+}
+
+class Writable extends Stream {
+  constructor(opts) { super(); this._writableState = {}; }
+  write(_chunk, _encoding, _cb) { return true; }
+  end(_chunk, _encoding, _cb) { this.emit('finish'); return this; }
+  destroy() { this.emit('close'); return this; }
+}
+
+class Duplex extends Readable {
+  constructor(opts) { super(opts); }
+  write(_chunk, _encoding, _cb) { return true; }
+  end(_chunk, _encoding, _cb) { this.emit('finish'); return this; }
+}
+
+class Transform extends Duplex {
+  constructor(opts) { super(opts); }
+  _transform(_chunk, _encoding, callback) { callback(); }
+}
+
+class PassThrough extends Transform {
+  _transform(chunk, _encoding, callback) { callback(null, chunk); }
+}
+
+export { Stream, Readable, Writable, Duplex, Transform, PassThrough };
+export default { Stream, Readable, Writable, Duplex, Transform, PassThrough };
+"#
         .trim()
         .to_string(),
     );
@@ -3286,6 +3578,44 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
+                // __pi_console_output_native(level, message) — routes JS console output
+                // through the Rust tracing infrastructure so extensions get a working
+                // `console` global.
+                global.set(
+                    "__pi_console_output_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>,
+                              level: String,
+                              message: String|
+                              -> rquickjs::Result<()> {
+                            match level.as_str() {
+                                "error" => tracing::error!(
+                                    target: "pijs.console",
+                                    "{message}"
+                                ),
+                                "warn" => tracing::warn!(
+                                    target: "pijs.console",
+                                    "{message}"
+                                ),
+                                "debug" => tracing::debug!(
+                                    target: "pijs.console",
+                                    "{message}"
+                                ),
+                                "trace" => tracing::trace!(
+                                    target: "pijs.console",
+                                    "{message}"
+                                ),
+                                // "log" and "info" both map to info
+                                _ => tracing::info!(
+                                    target: "pijs.console",
+                                    "{message}"
+                                ),
+                            }
+                            Ok(())
+                        },
+                    ),
+                )?;
+
                 // Install the JS bridge that creates Promises and wraps the native functions
                 match ctx.eval::<(), _>(PI_BRIDGE_JS) {
                     Ok(()) => {}
@@ -3344,6 +3674,160 @@ fn random_bytes(len: usize) -> Vec<u8> {
 /// This code creates the `pi` global object with Promise-returning methods.
 /// Each method wraps a native Rust function (`__pi_*_native`) that returns a call_id.
 const PI_BRIDGE_JS: &str = r"
+// ============================================================================
+// Console global — must come first so all other bridge code can use it.
+// ============================================================================
+if (typeof globalThis.console === 'undefined') {
+    const __fmt = (...args) => args.map(a => {
+        if (a === null) return 'null';
+        if (a === undefined) return 'undefined';
+        if (typeof a === 'object') {
+            try { return JSON.stringify(a); } catch (_) { return String(a); }
+        }
+        return String(a);
+    }).join(' ');
+
+    globalThis.console = {
+        log:   (...args) => { __pi_console_output_native('log', __fmt(...args)); },
+        info:  (...args) => { __pi_console_output_native('info', __fmt(...args)); },
+        warn:  (...args) => { __pi_console_output_native('warn', __fmt(...args)); },
+        error: (...args) => { __pi_console_output_native('error', __fmt(...args)); },
+        debug: (...args) => { __pi_console_output_native('debug', __fmt(...args)); },
+        trace: (...args) => { __pi_console_output_native('trace', __fmt(...args)); },
+        dir:   (...args) => { __pi_console_output_native('log', __fmt(...args)); },
+        time:  ()        => {},
+        timeEnd: ()      => {},
+        timeLog: ()      => {},
+        assert: (cond, ...args) => {
+            if (!cond) __pi_console_output_native('error', 'Assertion failed: ' + __fmt(...args));
+        },
+        count:    () => {},
+        countReset: () => {},
+        group:    () => {},
+        groupEnd: () => {},
+        table:    (...args) => { __pi_console_output_native('log', __fmt(...args)); },
+        clear:    () => {},
+    };
+}
+
+// ============================================================================
+// Intl polyfill — minimal stubs for extensions that use Intl APIs.
+// QuickJS does not ship with Intl support; these cover the most common uses.
+// ============================================================================
+if (typeof globalThis.Intl === 'undefined') {
+    const __intlPad = (n, w) => String(n).padStart(w || 2, '0');
+
+    class NumberFormat {
+        constructor(locale, opts) {
+            this._locale = locale || 'en-US';
+            this._opts = opts || {};
+        }
+        format(n) {
+            const o = this._opts;
+            if (o.style === 'currency') {
+                const c = o.currency || 'USD';
+                const v = Number(n).toFixed(o.maximumFractionDigits ?? 2);
+                return c + ' ' + v;
+            }
+            if (o.notation === 'compact') {
+                const abs = Math.abs(n);
+                if (abs >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+                if (abs >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+                if (abs >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+                return String(n);
+            }
+            if (o.style === 'percent') return (Number(n) * 100).toFixed(0) + '%';
+            return String(n);
+        }
+        resolvedOptions() { return { ...this._opts, locale: this._locale }; }
+    }
+
+    const __months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    class DateTimeFormat {
+        constructor(locale, opts) {
+            this._locale = locale || 'en-US';
+            this._opts = opts || {};
+        }
+        format(d) {
+            const dt = d instanceof Date ? d : new Date(d ?? Date.now());
+            const o = this._opts;
+            const parts = [];
+            if (o.month === 'short') parts.push(__months[dt.getMonth()]);
+            else if (o.month === 'numeric' || o.month === '2-digit') parts.push(__intlPad(dt.getMonth() + 1));
+            if (o.day === 'numeric' || o.day === '2-digit') parts.push(String(dt.getDate()));
+            if (o.year === 'numeric') parts.push(String(dt.getFullYear()));
+            if (parts.length === 0) {
+                return __intlPad(dt.getMonth()+1) + '/' + __intlPad(dt.getDate()) + '/' + dt.getFullYear();
+            }
+            if (o.hour !== undefined) {
+                parts.push(__intlPad(dt.getHours()) + ':' + __intlPad(dt.getMinutes()));
+            }
+            return parts.join(' ');
+        }
+        resolvedOptions() { return { ...this._opts, locale: this._locale, timeZone: 'UTC' }; }
+    }
+
+    class Collator {
+        constructor(locale, opts) {
+            this._locale = locale || 'en';
+            this._opts = opts || {};
+        }
+        compare(a, b) {
+            const sa = String(a ?? '');
+            const sb = String(b ?? '');
+            if (this._opts.sensitivity === 'base') {
+                return sa.toLowerCase().localeCompare(sb.toLowerCase());
+            }
+            return sa.localeCompare(sb);
+        }
+        resolvedOptions() { return { ...this._opts, locale: this._locale }; }
+    }
+
+    class Segmenter {
+        constructor(locale, opts) {
+            this._locale = locale || 'en';
+            this._opts = opts || {};
+        }
+        segment(str) {
+            const s = String(str ?? '');
+            const segments = [];
+            // Approximate grapheme segmentation: split by codepoints
+            for (const ch of s) {
+                segments.push({ segment: ch, index: segments.length, input: s });
+            }
+            segments[Symbol.iterator] = function*() { for (const seg of segments) yield seg; };
+            return segments;
+        }
+    }
+
+    class RelativeTimeFormat {
+        constructor(locale, opts) {
+            this._locale = locale || 'en';
+            this._opts = opts || {};
+        }
+        format(value, unit) {
+            const v = Number(value);
+            const u = String(unit);
+            const abs = Math.abs(v);
+            const plural = abs !== 1 ? 's' : '';
+            if (this._opts.numeric === 'auto') {
+                if (v === -1 && u === 'day') return 'yesterday';
+                if (v === 1 && u === 'day') return 'tomorrow';
+            }
+            if (v < 0) return abs + ' ' + u + plural + ' ago';
+            return 'in ' + abs + ' ' + u + plural;
+        }
+    }
+
+    globalThis.Intl = {
+        NumberFormat,
+        DateTimeFormat,
+        Collator,
+        Segmenter,
+        RelativeTimeFormat,
+    };
+}
+
 // Pending hostcalls: call_id -> { resolve, reject }
 const __pi_pending_hostcalls = new Map();
 
@@ -4935,6 +5419,59 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
     };
 }
 
+// Intl polyfill - minimal implementation for string comparison
+if (typeof globalThis.Intl === 'undefined') {
+    class Collator {
+        constructor(_locales, options = {}) {
+            this.sensitivity = options.sensitivity || 'variant';
+        }
+
+        compare(a, b) {
+            const strA = String(a ?? '');
+            const strB = String(b ?? '');
+
+            if (this.sensitivity === 'base' || this.sensitivity === 'accent') {
+                // Case-insensitive comparison
+                const lowerA = strA.toLowerCase();
+                const lowerB = strB.toLowerCase();
+                if (lowerA < lowerB) return -1;
+                if (lowerA > lowerB) return 1;
+                return 0;
+            }
+
+            // Default: case-sensitive comparison
+            if (strA < strB) return -1;
+            if (strA > strB) return 1;
+            return 0;
+        }
+    }
+
+    class NumberFormat {
+        constructor(_locales, _options = {}) {}
+
+        format(value) {
+            return String(value ?? '');
+        }
+    }
+
+    class DateTimeFormat {
+        constructor(_locales, _options = {}) {}
+
+        format(date) {
+            if (date instanceof Date) {
+                return date.toISOString();
+            }
+            return String(date ?? '');
+        }
+    }
+
+    globalThis.Intl = {
+        Collator,
+        NumberFormat,
+        DateTimeFormat,
+    };
+}
+
 if (typeof globalThis.process === 'undefined') {
     const platform =
         __pi_env_get_native('PI_PLATFORM') ||
@@ -5005,6 +5542,40 @@ if (typeof globalThis.clearTimeout !== 'function') {
         try {
             __pi_clear_timeout_native(timer_id);
         } catch (_) {}
+    };
+}
+
+// setInterval polyfill using setTimeout
+const __pi_intervals = new Map();
+let __pi_interval_id = 0;
+
+if (typeof globalThis.setInterval !== 'function') {
+    globalThis.setInterval = (callback, delay, ...args) => {
+        const ms = Math.max(0, Number(delay || 0));
+        const id = ++__pi_interval_id;
+        const run = () => {
+            if (!__pi_intervals.has(id)) return;
+            try {
+                callback(...args);
+            } catch (e) {
+                console.error('setInterval callback error:', e);
+            }
+            if (__pi_intervals.has(id)) {
+                __pi_intervals.set(id, globalThis.setTimeout(run, ms));
+            }
+        };
+        __pi_intervals.set(id, globalThis.setTimeout(run, ms));
+        return id;
+    };
+}
+
+if (typeof globalThis.clearInterval !== 'function') {
+    globalThis.clearInterval = (id) => {
+        const timerId = __pi_intervals.get(id);
+        if (timerId !== undefined) {
+            globalThis.clearTimeout(timerId);
+            __pi_intervals.delete(id);
+        }
     };
 }
 
@@ -6581,6 +7152,99 @@ mod tests {
             assert_eq!(
                 req.payload,
                 serde_json::json!({ "event": "custom_event", "data": { "a": 1 } })
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_console_global_is_defined_and_callable() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            // Verify console global exists and all standard methods are functions
+            runtime
+                .eval(
+                    r"
+                    globalThis.console_exists = typeof globalThis.console === 'object';
+                    globalThis.has_log   = typeof console.log   === 'function';
+                    globalThis.has_warn  = typeof console.warn  === 'function';
+                    globalThis.has_error = typeof console.error === 'function';
+                    globalThis.has_info  = typeof console.info  === 'function';
+                    globalThis.has_debug = typeof console.debug === 'function';
+                    globalThis.has_trace = typeof console.trace === 'function';
+                    globalThis.has_dir   = typeof console.dir   === 'function';
+                    globalThis.has_assert = typeof console.assert === 'function';
+                    globalThis.has_table = typeof console.table === 'function';
+
+                    // Call each method to ensure they don't throw
+                    console.log('test log', 42, { key: 'value' });
+                    console.warn('test warn');
+                    console.error('test error');
+                    console.info('test info');
+                    console.debug('test debug');
+                    console.trace('test trace');
+                    console.dir({ a: 1 });
+                    console.assert(true, 'should not appear');
+                    console.assert(false, 'assertion failed message');
+                    console.table([1, 2, 3]);
+                    console.time();
+                    console.timeEnd();
+                    console.group();
+                    console.groupEnd();
+                    console.clear();
+
+                    globalThis.calls_succeeded = true;
+                    ",
+                )
+                .await
+                .expect("eval console tests");
+
+            assert_eq!(
+                get_global_json(&runtime, "console_exists").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_log").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_warn").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_error").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_info").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_debug").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_trace").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_dir").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_assert").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "has_table").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "calls_succeeded").await,
+                serde_json::json!(true)
             );
         });
     }
