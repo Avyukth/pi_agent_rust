@@ -1442,9 +1442,14 @@ mod extensions_integration_tests {
                 .expect("execute tool");
 
             assert!(!output.is_error);
-            match output.content.as_slice() {
-                [ContentBlock::Text(text)] => assert_eq!(text.text, "hello pi"),
-                other => panic!("Expected single text content block, got {other:?}"),
+            if let [ContentBlock::Text(text)] = output.content.as_slice() {
+                assert_eq!(text.text, "hello pi");
+            } else {
+                assert!(
+                    false,
+                    "Expected single text content block, got {:?}",
+                    output.content
+                );
             }
 
             let details = output.details.expect("details present");
@@ -1703,7 +1708,7 @@ mod turn_event_tests {
                     assert!(matches!(message, Message::Assistant(_)));
                     assert!(tool_results.is_empty());
                 }
-                other => panic!("Expected TurnEnd event, got {other:?}"),
+                other => assert!(false, "Expected TurnEnd event, got {other:?}"),
             }
         });
     }
@@ -1870,12 +1875,14 @@ mod tests {
     }
 
     fn assert_user_text(message: &Message, expected: &str) {
-        match message {
-            Message::User(UserMessage {
-                content: UserContent::Text(text),
-                ..
-            }) => assert_eq!(text, expected),
-            other => panic!("expected user text message, got {other:?}"),
+        if let Message::User(UserMessage {
+            content: UserContent::Text(text),
+            ..
+        }) = message
+        {
+            assert_eq!(text, expected);
+        } else {
+            assert!(false, "expected user text message, got {message:?}");
         }
     }
 

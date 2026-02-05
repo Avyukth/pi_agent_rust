@@ -827,11 +827,11 @@ impl PiApp {
 
     fn insert_file_ref_path(&mut self, path: &Path) {
         let display = path_for_display(path, &self.cwd);
-        let mut token = format_file_ref(&display);
-        if !token.ends_with(' ') {
-            token.push(' ');
+        let mut insert_text = format_file_ref(&display);
+        if !insert_text.ends_with(' ') {
+            insert_text.push(' ');
         }
-        self.input.insert_string(&token);
+        self.input.insert_string(&insert_text);
     }
 
     fn paste_image_from_clipboard() -> Option<PathBuf> {

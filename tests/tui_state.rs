@@ -2676,7 +2676,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
             PiMsg::SetEditorText(_) => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
-                panic!("Unexpected fork error: {err}");
+                assert!(false, "Unexpected fork error: {err}");
             }
             _ => {}
         }
