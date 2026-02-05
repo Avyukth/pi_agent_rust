@@ -421,7 +421,10 @@ fn glob_json(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn looks_like_theme_path(spec: &str) -> bool {
+/// Returns true if the theme spec looks like a file path rather than a theme name.
+/// Path-like specs: start with ~, have .json extension, or contain / or \.
+#[must_use]
+pub fn looks_like_theme_path(spec: &str) -> bool {
     let spec = spec.trim();
     if spec.starts_with('~') {
         return true;

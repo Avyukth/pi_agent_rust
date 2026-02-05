@@ -80,12 +80,20 @@ fn print_error_with_hints(err: &anyhow::Error) {
 
 #[allow(clippy::too_many_lines)]
 async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    // Early-validate theme file paths so invalid paths error before --version.
+    // Named themes (without .json, /, ~) are validated later after resource loading.
+    if let Some(theme_spec) = cli.theme.as_deref() {
+        if pi::theme::looks_like_theme_path(theme_spec) {
+            pi::theme::Theme::resolve_spec(theme_spec, &cwd).map_err(anyhow::Error::new)?;
+        }
+    }
+
     if cli.version {
         print_version();
         return Ok(());
     }
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if let Some(command) = cli.command.take() {
         handle_subcommand(command, &cwd).await?;
@@ -94,8 +102,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let mut config = Config::load()?;
     if let Some(theme_spec) = cli.theme.as_deref() {
-        // Validate the theme early so we error instead of silently falling back to the default.
-        pi::theme::Theme::resolve_spec(theme_spec, &cwd).map_err(anyhow::Error::new)?;
+        // Theme already validated above
         config.theme = Some(theme_spec.to_string());
     }
     spawn_session_index_maintenance();
