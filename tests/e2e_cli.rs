@@ -461,6 +461,172 @@ fn count_jsonl_files(path: &Path) -> usize {
     count
 }
 
+#[cfg(unix)]
+fn sh_escape(value: &str) -> String {
+    // POSIX shell escape using single quotes.
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg(unix)]
+struct TmuxInstance {
+    socket_name: String,
+    session_name: String,
+}
+
+#[cfg(unix)]
+impl TmuxInstance {
+    fn tmux_available() -> bool {
+        Command::new("tmux")
+            .arg("-V")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    fn new(harness: &TestHarness) -> Self {
+        let pid = std::process::id();
+        let seed = harness.deterministic_seed();
+        Self {
+            socket_name: format!("pi-e2e-{pid}-{seed:x}"),
+            session_name: format!("pi-e2e-{pid}-{seed:x}"),
+        }
+    }
+
+    fn tmux_base(&self) -> Command {
+        let mut command = Command::new("tmux");
+        command
+            .arg("-L")
+            .arg(&self.socket_name)
+            .arg("-f")
+            .arg("/dev/null");
+        command
+    }
+
+    fn tmux_output(&self, args: &[&str]) -> std::process::Output {
+        self.tmux_base()
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("tmux output")
+    }
+
+    fn run_checked(&self, args: &[&str], label: &str) -> std::process::Output {
+        let output = self.tmux_output(args);
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("tmux {label} failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+        }
+        output
+    }
+
+    fn start_session(&self, workdir: &Path, script_path: &Path) {
+        let workdir_str = workdir.display().to_string();
+        let script_str = script_path.display().to_string();
+        self.run_checked(
+            &[
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-s",
+                &self.session_name,
+                "-c",
+                &workdir_str,
+                &script_str,
+            ],
+            "new-session",
+        );
+    }
+
+    fn target_pane(&self) -> String {
+        format!("{}:0.0", self.session_name)
+    }
+
+    fn send_literal(&self, text: &str) {
+        let target = self.target_pane();
+        self.run_checked(&["send-keys", "-t", &target, "-l", text], "send-keys -l");
+    }
+
+    fn send_key(&self, key: &str) {
+        let target = self.target_pane();
+        self.run_checked(&["send-keys", "-t", &target, key], "send-keys");
+    }
+
+    fn capture_pane(&self) -> String {
+        let target = self.target_pane();
+        // Capture some scrollback so long outputs (like `/help`) include their header.
+        let output = self.run_checked(
+            &["capture-pane", "-t", &target, "-p", "-S", "-2000"],
+            "capture-pane",
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    fn wait_for_pane_contains(&self, needle: &str, timeout: Duration) -> String {
+        let start = Instant::now();
+        loop {
+            let pane = self.capture_pane();
+            if pane.contains(needle) {
+                return pane;
+            }
+            if start.elapsed() > timeout {
+                return pane;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_pane_contains_any(&self, needles: &[&str], timeout: Duration) -> String {
+        assert!(!needles.is_empty(), "needles must not be empty");
+        let start = Instant::now();
+        loop {
+            let pane = self.capture_pane();
+            if needles.iter().any(|needle| pane.contains(needle)) {
+                return pane;
+            }
+            if start.elapsed() > timeout {
+                return pane;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn session_exists(&self) -> bool {
+        self.tmux_base()
+            .args(["has-session", "-t", &self.session_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn kill_server(&self) {
+        let _ = self.tmux_base().args(["kill-server"]).status();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TmuxInstance {
+    fn drop(&mut self) {
+        self.kill_server();
+    }
+}
+
 #[test]
 fn e2e_cli_extension_compat_ledger_logged_when_enabled() {
     let mut harness = CliTestHarness::new("e2e_cli_extension_compat_ledger_logged_when_enabled");
@@ -961,4 +1127,178 @@ fn e2e_cli_version_is_fast_enough_for_test_env() {
     // Avoid hard <100ms assertions in CI; we only enforce that the CLI isn't hanging.
     harness.harness.assert_log("assert duration < 5s (sanity)");
     assert!(result.duration < Duration::from_secs(5));
+}
+
+#[test]
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn e2e_interactive_smoke_tmux() {
+    let mut harness = CliTestHarness::new("e2e_interactive_smoke_tmux");
+    let logger = harness.harness.log();
+
+    if !TmuxInstance::tmux_available() {
+        logger.warn(
+            "tmux",
+            "Skipping interactive smoke test: tmux not available",
+        );
+        return;
+    }
+
+    // Used in src/interactive.rs for rendering behavior (and in src/app.rs for prompt determinism).
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+
+    // Force deterministic behavior (no resource discovery variability).
+    harness
+        .env
+        .insert("RUST_LOG".to_string(), "info".to_string());
+
+    let tmux = TmuxInstance::new(&harness.harness);
+
+    let script_path = harness.harness.temp_path("run-interactive-smoke.sh");
+    let mut script = String::new();
+    script.push_str("#!/usr/bin/env sh\n");
+    script.push_str("set -eu\n");
+    for (key, value) in &harness.env {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&sh_escape(value));
+        script.push('\n');
+    }
+
+    // Avoid first-time setup prompts by providing an explicit model + API key.
+    let args = [
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-4o-mini",
+        "--api-key",
+        "test-openai-key",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--system-prompt",
+        "pi e2e interactive smoke test",
+    ];
+
+    script.push_str("exec ");
+    script.push_str(&sh_escape(harness.binary_path.to_string_lossy().as_ref()));
+    for arg in &args {
+        script.push(' ');
+        script.push_str(&sh_escape(arg));
+    }
+    script.push('\n');
+
+    fs::write(&script_path, &script).expect("write interactive script");
+
+    let mut perms = fs::metadata(&script_path)
+        .expect("stat interactive script")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).expect("chmod interactive script");
+
+    harness.harness.record_artifact("tmux-run.sh", &script_path);
+
+    logger.info_ctx("tmux", "Starting tmux session", |ctx| {
+        ctx.push(("socket".into(), tmux.socket_name.clone()));
+        ctx.push(("session".into(), tmux.session_name.clone()));
+    });
+
+    tmux.start_session(harness.harness.temp_dir(), &script_path);
+
+    let pane = tmux.wait_for_pane_contains("Welcome to Pi!", Duration::from_secs(20));
+    assert!(
+        pane.contains("Welcome to Pi!"),
+        "Expected Pi to start and render welcome message; got:\n{pane}"
+    );
+    let pane_start_path = harness.harness.temp_path("tmux-pane.start.txt");
+    fs::write(&pane_start_path, &pane).expect("write pane start");
+    harness
+        .harness
+        .record_artifact("tmux-pane.start.txt", &pane_start_path);
+
+    tmux.send_literal("/help");
+    tmux.send_key("Enter");
+
+    let help_markers = [
+        "Available commands:",
+        "/logout [provider]",
+        "/clear, /cls",
+        "/model, /m",
+        "Tips:",
+    ];
+    let pane = tmux.wait_for_pane_contains_any(&help_markers, Duration::from_secs(20));
+    assert!(
+        help_markers.iter().any(|marker| pane.contains(marker)),
+        "Expected /help output; got:\n{pane}"
+    );
+    let pane_help_path = harness.harness.temp_path("tmux-pane.help.txt");
+    fs::write(&pane_help_path, &pane).expect("write pane help");
+    harness
+        .harness
+        .record_artifact("tmux-pane.help.txt", &pane_help_path);
+
+    tmux.send_literal("/exit");
+    tmux.send_key("Enter");
+
+    let start = Instant::now();
+    while tmux.session_exists() {
+        if start.elapsed() > Duration::from_secs(5) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if tmux.session_exists() {
+        logger.warn(
+            "tmux",
+            "/exit did not terminate; sending Ctrl+C double-tap fallback",
+        );
+        tmux.send_key("C-c");
+        std::thread::sleep(Duration::from_millis(100));
+        tmux.send_key("C-c");
+        let start = Instant::now();
+        while tmux.session_exists() {
+            if start.elapsed() > Duration::from_secs(5) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let pane = tmux.capture_pane();
+    let pane_exit_path = harness.harness.temp_path("tmux-pane.exit.txt");
+    fs::write(&pane_exit_path, &pane).expect("write pane exit");
+    harness
+        .harness
+        .record_artifact("tmux-pane.exit.txt", &pane_exit_path);
+
+    assert!(
+        !tmux.session_exists(),
+        "tmux session did not exit cleanly within timeout; final pane:\n{pane}"
+    );
+
+    let log_path = harness.harness.temp_path("interactive-smoke-log.jsonl");
+    harness
+        .harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl log");
+    harness
+        .harness
+        .record_artifact("interactive-smoke-log.jsonl", &log_path);
+
+    let artifact_index = harness
+        .harness
+        .temp_path("interactive-smoke-artifacts.jsonl");
+    harness
+        .harness
+        .write_artifact_index_jsonl(&artifact_index)
+        .expect("write artifact index");
+    harness
+        .harness
+        .record_artifact("interactive-smoke-artifacts.jsonl", &artifact_index);
 }
