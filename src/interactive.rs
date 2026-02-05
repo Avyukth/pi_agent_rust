@@ -52,7 +52,7 @@ use crate::extensions::{
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
+    AssistantMessageEvent, ContentBlock, ImageContent, Message as ModelMessage,
     StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
