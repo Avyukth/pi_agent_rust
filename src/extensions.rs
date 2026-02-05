@@ -7,7 +7,6 @@ use crate::agent::AgentEvent;
 use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
-use crate::extension_dispatcher::{ExtensionDispatcher, ExtensionUiHandler};
 use crate::extension_events::{ToolCallEventResult, ToolResultEventResult};
 use crate::extensions_js::{
     ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json,
@@ -19,6 +18,8 @@ use crate::tools::ToolRegistry;
 use asupersync::Cx;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
+#[cfg(feature = "wasm-host")]
+use asupersync::sync::Mutex as AsyncMutex;
 use asupersync::time::{sleep, timeout, wall_now};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -2047,7 +2048,7 @@ mod wasm_host {
     pub struct HostState {
         pub policy: ExtensionPolicy,
         pub cwd: PathBuf,
-        pub tools: crate::tools::ToolRegistry,
+        pub tools: Arc<crate::tools::ToolRegistry>,
         pub http: HttpConnector,
         pub fs: FsConnector,
         pub env_allowlist: BTreeSet<String>,
@@ -2056,11 +2057,19 @@ mod wasm_host {
 
     impl HostState {
         pub fn new(policy: ExtensionPolicy, cwd: PathBuf) -> Result<Self> {
-            let tools = crate::tools::ToolRegistry::new(
+            let tools = Arc::new(crate::tools::ToolRegistry::new(
                 &["read", "bash", "edit", "write", "grep", "find", "ls"],
                 &cwd,
                 None,
-            );
+            ));
+            Self::new_with_tools(policy, cwd, tools)
+        }
+
+        pub fn new_with_tools(
+            policy: ExtensionPolicy,
+            cwd: PathBuf,
+            tools: Arc<crate::tools::ToolRegistry>,
+        ) -> Result<Self> {
             let scopes = FsScopes::for_cwd(&cwd)?;
             let fs = FsConnector::new(&cwd, policy.clone(), scopes)?;
             Ok(Self {
@@ -3270,7 +3279,7 @@ mod wasm_host {
             let cwd = dir.path().to_path_buf();
 
             let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
-            state.tools = ToolRegistry::from_tools(vec![Box::new(SleepTool)]);
+            state.tools = Arc::new(ToolRegistry::from_tools(vec![Box::new(SleepTool)]));
             state
                 .apply_registration(&registration_payload())
                 .expect("apply registration");
@@ -3473,6 +3482,20 @@ impl WasmExtensionHost {
         )
         .await
     }
+
+    pub async fn instantiate_with(
+        &self,
+        extension: &WasmExtension,
+        tools: Arc<ToolRegistry>,
+        _manager: Option<ExtensionManager>,
+    ) -> Result<wasm_host::Instance> {
+        wasm_host::Instance::instantiate(
+            &self.engine,
+            &extension.path,
+            wasm_host::HostState::new_with_tools(self.policy.clone(), self.cwd.clone(), tools)?,
+        )
+        .await
+    }
 }
 
 // ============================================================================
@@ -3553,6 +3576,345 @@ impl std::fmt::Display for ExtensionEventName {
         };
         write!(f, "{name}")
     }
+}
+
+// ============================================================================
+// Extension Manifest + Load Specs
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionRuntime {
+    Js,
+    Wasm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionManifest {
+    pub schema: String,
+    pub extension_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub api_version: String,
+    pub runtime: ExtensionRuntime,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_manifest: Option<CapabilityManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl ExtensionManifest {
+    fn normalize(
+        mut self,
+        package_name: Option<String>,
+        package_version: Option<String>,
+    ) -> Result<Self> {
+        if self.name.trim().is_empty() {
+            if let Some(name) = package_name {
+                self.name = name;
+            }
+        }
+
+        if self.version.trim().is_empty() {
+            if let Some(version) = package_version {
+                self.version = version;
+            }
+        }
+
+        if self.api_version.trim().is_empty() {
+            self.api_version = PROTOCOL_VERSION.to_string();
+        }
+
+        validate_extension_manifest(&self)?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionManifestSource {
+    pub manifest: ExtensionManifest,
+    pub manifest_json: String,
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+}
+
+impl ExtensionManifestSource {
+    pub fn entry_path(&self) -> PathBuf {
+        self.root.join(self.manifest.entrypoint.trim())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExtensionLoadSpec {
+    Js(JsExtensionLoadSpec),
+    #[cfg(feature = "wasm-host")]
+    Wasm(WasmExtensionLoadSpec),
+}
+
+#[cfg(feature = "wasm-host")]
+#[derive(Debug, Clone)]
+pub struct WasmExtensionLoadSpec {
+    pub manifest: ExtensionManifest,
+    pub manifest_json: String,
+    pub root: PathBuf,
+    pub entry_path: PathBuf,
+}
+
+fn extension_id_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z0-9][a-z0-9._-]{0,63}$").expect("regex"))
+}
+
+fn validate_extension_manifest(manifest: &ExtensionManifest) -> Result<()> {
+    if manifest.schema != "pi.ext.manifest.v1" {
+        return Err(Error::validation(format!(
+            "Unsupported extension manifest schema: {}",
+            manifest.schema
+        )));
+    }
+
+    let extension_id = manifest.extension_id.trim();
+    if extension_id.is_empty() {
+        return Err(Error::validation(
+            "Extension manifest extension_id is empty",
+        ));
+    }
+    if !extension_id_regex().is_match(extension_id) {
+        return Err(Error::validation(format!(
+            "Invalid extension_id '{extension_id}'"
+        )));
+    }
+
+    if manifest.name.trim().is_empty() {
+        return Err(Error::validation("Extension manifest name is empty"));
+    }
+    if manifest.version.trim().is_empty() {
+        return Err(Error::validation("Extension manifest version is empty"));
+    }
+    if manifest.api_version.trim().is_empty() {
+        return Err(Error::validation("Extension manifest api_version is empty"));
+    }
+    if manifest.entrypoint.trim().is_empty() {
+        return Err(Error::validation("Extension manifest entrypoint is empty"));
+    }
+
+    if let Some(capability_manifest) = &manifest.capability_manifest {
+        if capability_manifest.schema != "pi.ext.cap.v1" {
+            return Err(Error::validation(format!(
+                "Unsupported capability manifest schema: {}",
+                capability_manifest.schema
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn read_package_json_meta(root: &Path) -> Option<(Option<String>, Option<String>, Option<Value>)> {
+    let package_json = root.join("package.json");
+    if !package_json.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(package_json).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    let name = json.get("name").and_then(Value::as_str).map(str::to_string);
+    let version = json
+        .get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let pi = json.get("pi").cloned();
+    Some((name, version, pi))
+}
+
+fn parse_extension_manifest_value(
+    value: Value,
+    package_name: Option<String>,
+    package_version: Option<String>,
+) -> Result<ExtensionManifest> {
+    let manifest: ExtensionManifest = serde_json::from_value(value)
+        .map_err(|err| Error::validation(format!("Invalid extension manifest: {err}")))?;
+    manifest.normalize(package_name, package_version)
+}
+
+pub fn load_extension_manifest(root: &Path) -> Result<Option<ExtensionManifestSource>> {
+    let (package_name, package_version, package_pi) =
+        read_package_json_meta(root).unwrap_or((None, None, None));
+
+    let extension_json = root.join("extension.json");
+    if extension_json.exists() {
+        let raw = fs::read_to_string(&extension_json).map_err(|err| {
+            Error::validation(format!(
+                "Failed to read extension manifest {}: {err}",
+                extension_json.display()
+            ))
+        })?;
+        let value: Value = serde_json::from_str(&raw).map_err(|err| {
+            Error::validation(format!(
+                "Failed to parse extension manifest {}: {err}",
+                extension_json.display()
+            ))
+        })?;
+        let manifest = parse_extension_manifest_value(value, package_name, package_version)?;
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|err| Error::validation(format!("Serialize manifest: {err}")))?;
+        return Ok(Some(ExtensionManifestSource {
+            manifest,
+            manifest_json,
+            root: root.to_path_buf(),
+            manifest_path: extension_json,
+        }));
+    }
+
+    if let Some(pi) = package_pi {
+        if pi.get("schema").and_then(Value::as_str) == Some("pi.ext.manifest.v1") {
+            let manifest = parse_extension_manifest_value(pi, package_name, package_version)?;
+            let manifest_json = serde_json::to_string(&manifest)
+                .map_err(|err| Error::validation(format!("Serialize manifest: {err}")))?;
+            let manifest_path = root.join("package.json");
+            return Ok(Some(ExtensionManifestSource {
+                manifest,
+                manifest_json,
+                root: root.to_path_buf(),
+                manifest_path,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_extension_index(root: &Path) -> Option<PathBuf> {
+    let index_ts = root.join("index.ts");
+    if index_ts.exists() {
+        return Some(index_ts);
+    }
+    let index_js = root.join("index.js");
+    if index_js.exists() {
+        return Some(index_js);
+    }
+    None
+}
+
+impl ExtensionManifestSource {
+    fn to_load_spec(&self) -> Result<ExtensionLoadSpec> {
+        let entry_path = self.entry_path();
+        if !entry_path.exists() {
+            return Err(Error::validation(format!(
+                "Extension entrypoint not found: {}",
+                entry_path.display()
+            )));
+        }
+
+        match self.manifest.runtime {
+            ExtensionRuntime::Js => Ok(ExtensionLoadSpec::Js(JsExtensionLoadSpec::from_manifest(
+                &self.manifest,
+                &self.root,
+            )?)),
+            ExtensionRuntime::Wasm => {
+                #[cfg(feature = "wasm-host")]
+                {
+                    Ok(ExtensionLoadSpec::Wasm(WasmExtensionLoadSpec {
+                        manifest: self.manifest.clone(),
+                        manifest_json: self.manifest_json.clone(),
+                        root: self.root.clone(),
+                        entry_path,
+                    }))
+                }
+                #[cfg(not(feature = "wasm-host"))]
+                {
+                    Err(Error::validation(
+                        "WASM extensions require the `wasm-host` feature".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+pub fn resolve_extension_load_spec(entry: &Path) -> Result<ExtensionLoadSpec> {
+    if entry.is_dir() {
+        if let Some(source) = load_extension_manifest(entry)? {
+            return source.to_load_spec();
+        }
+        if let Some(index) = resolve_extension_index(entry) {
+            return Ok(ExtensionLoadSpec::Js(JsExtensionLoadSpec::from_entry_path(
+                index,
+            )?));
+        }
+        return Err(Error::validation(format!(
+            "Extension directory has no manifest or entrypoint: {}",
+            entry.display()
+        )));
+    }
+
+    if entry.is_file() {
+        if entry
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s == "extension.json")
+        {
+            let root = entry.parent().unwrap_or(entry);
+            if let Some(source) = load_extension_manifest(root)? {
+                return source.to_load_spec();
+            }
+        }
+
+        if let Some(ext) = entry.extension().and_then(|s| s.to_str()) {
+            match ext {
+                "wasm" => {
+                    #[cfg(feature = "wasm-host")]
+                    {
+                        if let Some(source) =
+                            load_extension_manifest(entry.parent().unwrap_or(entry))?
+                        {
+                            let spec = source.to_load_spec()?;
+                            if let ExtensionLoadSpec::Wasm(wasm_spec) = spec {
+                                if wasm_spec.entry_path != entry {
+                                    return Err(Error::validation(format!(
+                                        "WASM entrypoint mismatch: manifest entrypoint is {}, but got {}",
+                                        wasm_spec.entry_path.display(),
+                                        entry.display()
+                                    )));
+                                }
+                                return Ok(ExtensionLoadSpec::Wasm(wasm_spec));
+                            }
+                            return Err(Error::validation(format!(
+                                "Extension manifest runtime is not wasm for {}",
+                                entry.display()
+                            )));
+                        }
+                        return Err(Error::validation(format!(
+                            "WASM extension requires extension.json or package.json#pi manifest: {}",
+                            entry.display()
+                        )));
+                    }
+                    #[cfg(not(feature = "wasm-host"))]
+                    {
+                        return Err(Error::validation(
+                            "WASM extensions require the `wasm-host` feature".to_string(),
+                        ));
+                    }
+                }
+                "js" | "ts" | "mjs" | "cjs" => {
+                    return Ok(ExtensionLoadSpec::Js(JsExtensionLoadSpec::from_entry_path(
+                        entry,
+                    )?));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Err(Error::validation(format!(
+        "Unsupported extension entry: {}",
+        entry.display()
+    )))
 }
 
 // ============================================================================
@@ -3644,6 +4006,34 @@ impl JsExtensionLoadSpec {
             api_version: PROTOCOL_VERSION.to_string(),
         })
     }
+
+    pub fn from_manifest(manifest: &ExtensionManifest, root: &Path) -> Result<Self> {
+        let entry_path = root.join(manifest.entrypoint.trim());
+        if !entry_path.exists() {
+            return Err(Error::validation(format!(
+                "Extension entry does not exist: {}",
+                entry_path.display()
+            )));
+        }
+
+        let entry_path = entry_path
+            .canonicalize()
+            .unwrap_or_else(|_| entry_path.clone());
+
+        if manifest.extension_id.trim().is_empty() {
+            return Err(Error::validation(
+                "Extension manifest extension_id is empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            extension_id: manifest.extension_id.clone(),
+            entry_path,
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            api_version: manifest.api_version.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3665,6 +4055,123 @@ struct JsExtensionSnapshot {
     event_hooks: Vec<String>,
     #[serde(default)]
     active_tools: Option<Vec<String>>,
+}
+
+#[cfg(feature = "wasm-host")]
+#[derive(Clone)]
+pub struct WasmExtensionHandle {
+    instance: Arc<AsyncMutex<wasm_host::Instance>>,
+    registration: RegisterPayload,
+    tool_defs: Vec<ExtensionToolDef>,
+}
+
+#[cfg(feature = "wasm-host")]
+impl WasmExtensionHandle {
+    fn new(instance: wasm_host::Instance, registration: RegisterPayload) -> Self {
+        let tool_defs = parse_extension_tool_defs(&registration.tools);
+        Self {
+            instance: Arc::new(AsyncMutex::new(instance)),
+            registration,
+            tool_defs,
+        }
+    }
+
+    pub fn tool_defs(&self) -> &[ExtensionToolDef] {
+        &self.tool_defs
+    }
+
+    pub fn event_hooks(&self) -> &[String] {
+        &self.registration.event_hooks
+    }
+
+    pub fn registration(&self) -> &RegisterPayload {
+        &self.registration
+    }
+
+    pub async fn handle_tool(&self, name: &str, input: &Value) -> Result<String> {
+        let input_json = serde_json::to_string(input)
+            .map_err(|err| Error::extension(format!("Serialize tool input: {err}")))?;
+        let cx = Cx::for_request();
+        let mut instance = self
+            .instance
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
+        instance.handle_tool(name, &input_json).await
+    }
+
+    pub async fn handle_slash(
+        &self,
+        command: &str,
+        args: &[String],
+        input: &Value,
+    ) -> Result<String> {
+        let input_json = serde_json::to_string(input)
+            .map_err(|err| Error::extension(format!("Serialize slash input: {err}")))?;
+        let cx = Cx::for_request();
+        let mut instance = self
+            .instance
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
+        instance.handle_slash(command, args, &input_json).await
+    }
+
+    pub async fn handle_event_value(
+        &self,
+        event: &Value,
+        timeout_ms: u64,
+    ) -> Result<Option<Value>> {
+        let event_json = serde_json::to_string(event)
+            .map_err(|err| Error::extension(format!("Serialize event: {err}")))?;
+        let cx = Cx::for_request();
+        let fut = async {
+            let mut instance = self
+                .instance
+                .lock(&cx)
+                .await
+                .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
+            instance.handle_event(&event_json).await
+        };
+
+        let response_json = if timeout_ms > 0 {
+            match timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut)).await {
+                Ok(value) => value?,
+                Err(_) => {
+                    return Err(Error::extension(format!(
+                        "WASM event timed out after {timeout_ms}ms"
+                    )));
+                }
+            }
+        } else {
+            fut.await?
+        };
+
+        if response_json.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let value: Value = serde_json::from_str(&response_json)
+            .map_err(|err| Error::extension(format!("Parse event response: {err}")))?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
+}
+
+fn parse_extension_tool_defs(tools: &[Value]) -> Vec<ExtensionToolDef> {
+    let mut defs = Vec::new();
+    for value in tools {
+        match serde_json::from_value::<ExtensionToolDef>(value.clone()) {
+            Ok(def) => defs.push(def),
+            Err(err) => {
+                tracing::warn!(error = %err, "Invalid extension tool definition; ignoring");
+            }
+        }
+    }
+    defs
 }
 
 #[derive(Clone)]
@@ -4996,6 +5503,8 @@ pub struct ExtensionManager {
 struct ExtensionManagerInner {
     extensions: Vec<RegisterPayload>,
     js_runtime: Option<JsExtensionRuntimeHandle>,
+    #[cfg(feature = "wasm-host")]
+    wasm_extensions: Vec<WasmExtensionHandle>,
     ui_sender: Option<mpsc::Sender<ExtensionUiRequest>>,
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
@@ -5139,6 +5648,50 @@ impl ExtensionManager {
         Ok(())
     }
 
+    #[cfg(feature = "wasm-host")]
+    pub async fn load_wasm_extensions(
+        &self,
+        host: &WasmExtensionHost,
+        specs: Vec<WasmExtensionLoadSpec>,
+        tools: Arc<ToolRegistry>,
+    ) -> Result<()> {
+        let mut wasm_handles = Vec::new();
+        let mut registrations = Vec::new();
+
+        for spec in specs {
+            let extension = host.load_from_path(&spec.entry_path)?;
+            let mut instance = host
+                .instantiate_with(&extension, Arc::clone(&tools), Some(self.clone()))
+                .await?;
+
+            let registration_json = instance.init(&spec.manifest_json).await?;
+            let mut registration: RegisterPayload = serde_json::from_str(&registration_json)
+                .map_err(|err| {
+                    Error::extension(format!(
+                        "WASM init returned invalid registration payload: {err}"
+                    ))
+                })?;
+            if registration.capability_manifest.is_none() {
+                registration.capability_manifest = spec.manifest.capability_manifest.clone();
+            }
+            validate_register(&registration)?;
+
+            wasm_handles.push(WasmExtensionHandle::new(instance, registration.clone()));
+            registrations.push(registration);
+        }
+
+        let mut guard = self.inner.lock().unwrap();
+        guard.extensions.extend(registrations);
+        guard.wasm_extensions.extend(wasm_handles);
+        Ok(())
+    }
+
+    #[cfg(feature = "wasm-host")]
+    pub fn wasm_extensions(&self) -> Vec<WasmExtensionHandle> {
+        let guard = self.inner.lock().unwrap();
+        guard.wasm_extensions.clone()
+    }
+
     pub fn set_session(&self, session: Arc<dyn ExtensionSession>) {
         let mut guard = self.inner.lock().unwrap();
         guard.session = Some(session);
@@ -5259,6 +5812,8 @@ impl ExtensionManager {
         tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
     }
 
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     async fn dispatch_event_value(
         &self,
         event: ExtensionEventName,
@@ -5266,17 +5821,14 @@ impl ExtensionManager {
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
         let event_name = event.to_string();
-        let Some(runtime) = self.js_runtime() else {
-            return Ok(None);
-        };
-
-        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
+        let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook) = {
             let guard = self.inner.lock().unwrap();
             let has_hook = guard
                 .extensions
                 .iter()
                 .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
             (
+                guard.js_runtime.clone(),
                 guard.ui_sender.is_some(),
                 guard.session.clone(),
                 guard.cwd.clone(),
@@ -5285,7 +5837,28 @@ impl ExtensionManager {
             )
         };
 
-        if !has_hook {
+        #[cfg(feature = "wasm-host")]
+        let (wasm_extensions, has_hook_wasm) = {
+            let guard = self.inner.lock().unwrap();
+            let has_hook_wasm = guard
+                .wasm_extensions
+                .iter()
+                .any(|ext| ext.event_hooks().iter().any(|hook| hook == &event_name));
+            (guard.wasm_extensions.clone(), has_hook_wasm)
+        };
+
+        let has_any_hook = {
+            #[cfg(feature = "wasm-host")]
+            {
+                has_hook || has_hook_wasm
+            }
+            #[cfg(not(feature = "wasm-host"))]
+            {
+                has_hook
+            }
+        };
+
+        if !has_any_hook {
             return Ok(None);
         }
 
@@ -5327,11 +5900,61 @@ impl ExtensionManager {
             Some(other) => json!({ "type": event_name, "data": other }),
         };
 
-        let response = runtime
-            .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
-            .await?;
+        let ctx_payload = Value::Object(ctx);
 
-        Ok(Some(response))
+        let mut response = None;
+        if let Some(runtime) = runtime {
+            if has_hook {
+                let js_response = runtime
+                    .dispatch_event(
+                        event_name.clone(),
+                        event_payload.clone(),
+                        ctx_payload.clone(),
+                        timeout_ms,
+                    )
+                    .await?;
+                response = Some(js_response);
+            }
+        }
+
+        #[cfg(feature = "wasm-host")]
+        if has_hook_wasm {
+            let mut wasm_payload = event_payload;
+            if let Value::Object(map) = &mut wasm_payload {
+                map.insert("ctx".to_string(), ctx_payload);
+            }
+            if let Some(value) = Self::dispatch_wasm_event_value(
+                &wasm_extensions,
+                &event_name,
+                &wasm_payload,
+                timeout_ms,
+            )
+            .await?
+            {
+                response = Some(value);
+            }
+        }
+
+        Ok(response)
+    }
+
+    #[cfg(feature = "wasm-host")]
+    async fn dispatch_wasm_event_value(
+        extensions: &[WasmExtensionHandle],
+        event_name: &str,
+        event_payload: &Value,
+        timeout_ms: u64,
+    ) -> Result<Option<Value>> {
+        let mut response = None;
+        for ext in extensions {
+            if !ext.event_hooks().iter().any(|hook| hook == event_name) {
+                continue;
+            }
+            if let Some(value) = ext.handle_event_value(event_payload, timeout_ms).await? {
+                response = Some(value);
+            }
+        }
+        Ok(response)
     }
 
     /// Dispatch an event to all registered extensions.
