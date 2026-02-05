@@ -668,18 +668,13 @@ pub async fn run(
                     continue;
                 };
 
-                let api_key = resolve_model_api_key(&options.auth, &entry).ok_or_else(|| {
-                    Error::auth(format!(
+                let Some(key) = resolve_model_key(&options.auth, &entry) else {
+                    let err = Error::auth(format!(
                         "No API key for {}/{}",
                         entry.model.provider, entry.model.id
-                    ))
-                });
-                let api_key = match api_key {
-                    Ok(key) => key,
-                    Err(err) => {
-                        let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
-                        continue;
-                    }
+                    ));
+                    let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
+                    continue;
                 };
 
                 {
@@ -687,10 +682,10 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    guard
-                        .agent
-                        .set_provider(providers::create_provider(&entry)?);
-                    guard.agent.stream_options_mut().api_key = Some(api_key);
+                    let provider_impl =
+                        providers::create_provider(&entry, guard.extensions.as_ref())?;
+                    guard.agent.set_provider(provider_impl);
+                    let _ = guard.agent.stream_options_mut().api_key.replace(key);
                     guard
                         .agent
                         .stream_options_mut()
@@ -1098,7 +1093,7 @@ pub async fn run(
                             .collect::<Vec<_>>()
                     };
 
-                    let api_key = guard
+                    let key = guard
                         .agent
                         .stream_options()
                         .api_key
@@ -1121,7 +1116,7 @@ pub async fn run(
 
                     is_compacting.store(true, Ordering::SeqCst);
                     let result =
-                        compact(prep, provider, api_key, custom_instructions.as_deref()).await?;
+                        compact(prep, provider, key, custom_instructions.as_deref()).await?;
                     is_compacting.store(false, Ordering::SeqCst);
                     let details_value = compaction_details_to_value(&result.details)?;
 
@@ -1878,12 +1873,12 @@ async fn maybe_auto_compact(
     })));
     is_compacting.store(true, Ordering::SeqCst);
 
-    let (provider, api_key) = {
+    let (provider, key) = {
         let Ok(guard) = session.lock(&cx).await else {
             is_compacting.store(false, Ordering::SeqCst);
             return;
         };
-        let Some(api_key) = guard.agent.stream_options().api_key.clone() else {
+        let Some(key) = guard.agent.stream_options().api_key.clone() else {
             is_compacting.store(false, Ordering::SeqCst);
             let _ = out_tx.send(event(&json!({
                 "type": "auto_compaction_end",
@@ -1894,10 +1889,10 @@ async fn maybe_auto_compact(
             })));
             return;
         };
-        (guard.agent.provider(), api_key)
+        (guard.agent.provider(), key)
     };
 
-    let result = compact(prep, provider, &api_key, None).await;
+    let result = compact(prep, provider, &key, None).await;
     is_compacting.store(false, Ordering::SeqCst);
 
     match result {
@@ -2404,7 +2399,7 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     Ok(images)
 }
 
-fn resolve_model_api_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
+fn resolve_model_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
     auth.resolve_api_key(&entry.model.provider, None)
         .or_else(|| entry.api_key.clone())
 }
@@ -2660,16 +2655,16 @@ async fn cycle_model_for_rpc(
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
 
     let next_entry = candidates[next_index].clone();
-    let provider_impl = crate::providers::create_provider(&next_entry)?;
+    let provider_impl = crate::providers::create_provider(&next_entry, guard.extensions.as_ref())?;
     guard.agent.set_provider(provider_impl);
 
-    let api_key = resolve_model_api_key(&options.auth, &next_entry).ok_or_else(|| {
+    let key = resolve_model_key(&options.auth, &next_entry).ok_or_else(|| {
         Error::auth(format!(
             "No API key for {}/{}",
             next_entry.model.provider, next_entry.model.id
         ))
     })?;
-    guard.agent.stream_options_mut().api_key = Some(api_key);
+    let _ = guard.agent.stream_options_mut().api_key.replace(key);
     guard
         .agent
         .stream_options_mut()

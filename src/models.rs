@@ -117,10 +117,7 @@ impl ModelRegistry {
     /// Find a model by ID alone (ignoring provider), useful for extension models
     /// where the provider name may be custom.
     pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
-        self.models
-            .iter()
-            .find(|m| m.model.id == id)
-            .cloned()
+        self.models.iter().find(|m| m.model.id == id).cloned()
     }
 
     /// Merge extension-provided model entries into the registry.
@@ -143,6 +140,7 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
 
     let anthropic_key = auth.resolve_api_key("anthropic", None);
     for (id, name, reasoning) in [
+        ("claude-sonnet-4-20250514", "Claude Sonnet 4", true),
         ("claude-sonnet-4-5", "Claude Sonnet 4.5", true),
         ("claude-opus-4-5", "Claude Opus 4.5", true),
         ("claude-haiku-4-5", "Claude Haiku 4.5", false),

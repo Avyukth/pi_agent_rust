@@ -5,7 +5,6 @@
 
 use std::io::{self, IsTerminal, Write};
 
-use rich_rust::Theme;
 use rich_rust::prelude::*;
 use rich_rust::renderables::{Markdown, Syntax};
 use rich_rust::segment::Segment;
@@ -22,14 +21,10 @@ impl PiConsole {
         Self::new_with_theme(None)
     }
 
-    /// Create a new Pi console with an optional rich_rust theme.
-    pub fn new_with_theme(theme: Option<Theme>) -> Self {
+    /// Create a new Pi console with an optional theme.
+    pub fn new_with_theme(_theme: Option<crate::theme::Theme>) -> Self {
         let is_tty = io::stdout().is_terminal();
-        let mut builder = Console::builder().markup(is_tty).emoji(is_tty);
-        if let Some(theme) = theme {
-            builder = builder.theme(theme);
-        }
-        let console = builder.build();
+        let console = Console::builder().markup(is_tty).emoji(is_tty).build();
 
         Self { console, is_tty }
     }
@@ -805,7 +800,8 @@ mod tests {
             "expected a single Text chunk, got {chunks:?}"
         );
         let MarkdownChunk::Text(text) = &chunks[0] else {
-            panic!("expected text fallback, got {chunks:?}");
+            assert!(false, "expected text fallback, got {chunks:?}");
+            return;
         };
         assert!(text.contains("```rust"));
         assert!(text.contains("fn main"));

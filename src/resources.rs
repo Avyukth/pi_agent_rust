@@ -6,9 +6,9 @@
 //! - Package-based resource discovery
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
-use rich_rust::Theme;
+use crate::theme::Theme;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -359,7 +359,16 @@ impl ResourceLoader {
 
         let path = Path::new(trimmed);
         if path.exists() {
-            if let Ok(theme) = Theme::read(path, true) {
+            let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            let theme = match ext {
+                "json" => Theme::load(path),
+                "ini" | "theme" => load_legacy_ini_theme(path),
+                _ => Err(Error::config(format!(
+                    "Unsupported theme format: {}",
+                    path.display()
+                ))),
+            };
+            if let Ok(theme) = theme {
                 return Some(theme);
             }
         }
@@ -1186,7 +1195,7 @@ fn load_themes_from_dir(
 fn is_theme_file(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
-        Some("ini" | "theme")
+        Some("json" | "ini" | "theme")
     )
 }
 
@@ -1202,7 +1211,14 @@ fn load_theme_from_file(
         .unwrap_or("theme")
         .to_string();
 
-    match Theme::read(path, true) {
+    let ext = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let theme = match ext {
+        "json" => Theme::load(path),
+        "ini" | "theme" => load_legacy_ini_theme(path),
+        _ => return None,
+    };
+
+    match theme {
         Ok(theme) => Some(ThemeResource {
             name,
             theme,
@@ -1222,6 +1238,37 @@ fn load_theme_from_file(
             None
         }
     }
+}
+
+fn load_legacy_ini_theme(path: &Path) -> Result<Theme> {
+    let content = fs::read_to_string(path)?;
+    let mut theme = Theme::dark();
+    if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+        theme.name = name.to_string();
+    }
+
+    let mut first_color = None;
+    for token in content.split_whitespace() {
+        let Some(raw) = token.strip_prefix('#') else {
+            continue;
+        };
+        let trimmed = raw.trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+        if trimmed.len() != 6 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::config(format!(
+                "Invalid color '{token}' in theme file {}",
+                path.display()
+            )));
+        }
+        if first_color.is_none() {
+            first_color = Some(format!("#{trimmed}"));
+        }
+    }
+
+    if let Some(accent) = first_color {
+        theme.colors.accent = accent;
+    }
+
+    Ok(theme)
 }
 
 fn build_path_source_label(path: &Path) -> String {
@@ -1705,13 +1752,13 @@ mod tests {
         let (themes, diagnostics) = dedupe_themes(vec![
             ThemeResource {
                 name: "Dark".to_string(),
-                theme: Theme::default(),
+                theme: Theme::dark(),
                 source: "test:first".to_string(),
                 file_path: PathBuf::from("/tmp/Dark.ini"),
             },
             ThemeResource {
                 name: "dark".to_string(),
-                theme: Theme::default(),
+                theme: Theme::dark(),
                 source: "test:second".to_string(),
                 file_path: PathBuf::from("/tmp/dark.ini"),
             },

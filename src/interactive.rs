@@ -3509,7 +3509,9 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             self.queue_custom_message(message.deliver_as, custom_message.clone())?;
             if let ModelMessage::Custom(custom) = &custom_message {
                 if custom.display {
-                    let _ = self.event_tx.try_send(PiMsg::SystemNote(custom.content.clone()));
+                    let _ = self
+                        .event_tx
+                        .try_send(PiMsg::SystemNote(custom.content.clone()));
                 }
             }
             return Ok(());
@@ -3526,14 +3528,19 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
 
         if let ModelMessage::Custom(custom) = &custom_message {
             if custom.display {
-                let _ = self.event_tx.try_send(PiMsg::SystemNote(custom.content.clone()));
+                let _ = self
+                    .event_tx
+                    .try_send(PiMsg::SystemNote(custom.content.clone()));
             }
         }
 
         Ok(())
     }
 
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> crate::error::Result<()> {
+    async fn send_user_message(
+        &self,
+        message: ExtensionSendUserMessage,
+    ) -> crate::error::Result<()> {
         let is_streaming = self.extension_streaming.load(Ordering::SeqCst);
         if is_streaming {
             let deliver_as = message.deliver_as.unwrap_or(ExtensionDeliverAs::Steer);
@@ -3542,7 +3549,9 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             };
             match deliver_as {
                 ExtensionDeliverAs::FollowUp => queue.push_follow_up(message.text),
-                ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => queue.push_steering(message.text),
+                ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => {
+                    queue.push_steering(message.text);
+                }
             }
             return Ok(());
         }
@@ -4163,6 +4172,23 @@ impl ExtensionSession for InteractiveExtensionSession {
             return None;
         };
         guard.header.thinking_level.clone()
+    }
+
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+    ) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.add_label(&target_id, label);
+        if self.save_enabled {
+            guard.save().await?;
+        }
+        Ok(())
     }
 }
 
@@ -5897,7 +5923,8 @@ impl PiApp {
         };
 
         let Some(runtime) = manager.js_runtime() else {
-            self.status_message = Some("Extension shortcut not available (runtime not enabled)".to_string());
+            self.status_message =
+                Some("Extension shortcut not available (runtime not enabled)".to_string());
             return None;
         };
 
@@ -7042,7 +7069,7 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next) {
+        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
             Ok(provider_impl) => provider_impl,
             Err(err) => {
                 self.status_message = Some(err.to_string());
@@ -7642,13 +7669,14 @@ impl PiApp {
                     return None;
                 }
 
-                let provider_impl = match providers::create_provider(&next) {
-                    Ok(provider_impl) => provider_impl,
-                    Err(err) => {
-                        self.status_message = Some(err.to_string());
-                        return None;
-                    }
-                };
+                let provider_impl =
+                    match providers::create_provider(&next, self.extensions.as_ref()) {
+                        Ok(provider_impl) => provider_impl,
+                        Err(err) => {
+                            self.status_message = Some(err.to_string());
+                            return None;
+                        }
+                    };
 
                 let Ok(mut agent_guard) = self.agent.try_lock() else {
                     self.status_message = Some("Agent busy; try again".to_string());
