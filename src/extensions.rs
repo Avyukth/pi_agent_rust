@@ -4289,6 +4289,8 @@ struct JsExtensionSnapshot {
     #[serde(default)]
     slash_commands: Vec<Value>,
     #[serde(default)]
+    shortcuts: Vec<Value>,
+    #[serde(default)]
     providers: Vec<Value>,
     #[serde(default)]
     event_hooks: Vec<String>,
