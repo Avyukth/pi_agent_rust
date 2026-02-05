@@ -4670,7 +4670,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("echo", ["hello", "world"], {})
+                    pi.exec("/bin/echo", ["hello", "world"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -4722,7 +4722,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("echo")
+                    pi.exec("/bin/echo")
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -4823,7 +4823,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("sh", ["-c", "echo OUT && echo ERR >&2"], {})
+                    pi.exec("/bin/sh", ["-c", "echo OUT && echo ERR >&2"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -4875,7 +4875,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("sh", ["-c", "exit 42"], {})
+                    pi.exec("/bin/sh", ["-c", "exit 42"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -6129,6 +6129,62 @@ mod tests {
                 )
                 .await
                 .expect("verify event names list");
+        });
+    }
+
+    #[test]
+    fn dispatcher_events_emit_no_handlers_still_resolves() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Emit an event that has no registered handlers
+            runtime
+                .eval(
+                    r#"
+                    globalThis.emitResult = null;
+
+                    __pi_begin_extension("ext.lonely", { name: "ext.lonely" });
+                    pi.events("emit", { event: "unheard_event", data: { msg: "nobody listens" } })
+                      .then((r) => { globalThis.emitResult = r; })
+                      .catch((e) => { globalThis.emitResult = { error: e.message || String(e) }; });
+                    __pi_end_extension();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.emitResult) throw new Error("emit not resolved");
+                    // Should resolve even with no handlers (dispatched: true, handler_count: 0)
+                    if (globalThis.emitResult.error) {
+                        throw new Error("emit errored: " + globalThis.emitResult.error);
+                    }
+                    if (globalThis.emitResult.dispatched !== true) {
+                        throw new Error("emit not dispatched: " + JSON.stringify(globalThis.emitResult));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify emit with no handlers");
         });
     }
 
