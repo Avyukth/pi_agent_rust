@@ -101,11 +101,13 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         return Ok(());
     }
 
+    eprintln!("[dbg] loading config...");
     let mut config = Config::load()?;
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
     }
+    eprintln!("[dbg] config loaded, spawning session index maintenance...");
     spawn_session_index_maintenance();
     let package_manager = PackageManager::new(cwd.clone());
     let resource_cli = ResourceCliOptions {
@@ -118,14 +120,19 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         extension_paths: cli.extension.clone(),
         theme_paths: cli.theme_path.clone(),
     };
+    eprintln!("[dbg] calling ResourceLoader::load...");
     let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli).await
     {
-        Ok(resources) => resources,
+        Ok(resources) => {
+            eprintln!("[dbg] resources loaded OK");
+            resources
+        }
         Err(err) => {
             eprintln!("Warning: Failed to load skills/prompts: {err}");
             ResourceLoader::empty(config.enable_skill_commands())
         }
     };
+    eprintln!("[dbg] calling AuthStorage::load_async...");
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
     let global_dir = Config::global_dir();

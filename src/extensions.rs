@@ -6402,11 +6402,13 @@ impl ExtensionManager {
                     .get("reasoning")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                #[allow(clippy::cast_possible_truncation)]
                 let context_window = model_spec
                     .get("contextWindow")
                     .or_else(|| model_spec.get("context_window"))
                     .and_then(Value::as_u64)
                     .unwrap_or(128_000) as u32;
+                #[allow(clippy::cast_possible_truncation)]
                 let max_tokens = model_spec
                     .get("maxTokens")
                     .or_else(|| model_spec.get("max_tokens"))
@@ -6416,17 +6418,19 @@ impl ExtensionManager {
                 let input = model_spec
                     .get("input")
                     .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(Value::as_str)
-                            .filter_map(|s| match s {
-                                "text" => Some(InputType::Text),
-                                "image" => Some(InputType::Image),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_else(|| vec![InputType::Text]);
+                    .map_or_else(
+                        || vec![InputType::Text],
+                        |arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .filter_map(|s| match s {
+                                    "text" => Some(InputType::Text),
+                                    "image" => Some(InputType::Image),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                        },
+                    );
 
                 entries.push(crate::models::ModelEntry {
                     model: Model {
@@ -6454,6 +6458,7 @@ impl ExtensionManager {
                 });
             }
         }
+        drop(guard);
         entries
     }
 

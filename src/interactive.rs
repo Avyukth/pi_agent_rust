@@ -5249,6 +5249,12 @@ impl PiApp {
             PiMsg::RunPending => {
                 return self.run_next_pending();
             }
+            PiMsg::EnqueuePendingInput(input) => {
+                self.pending_inputs.push_back(input);
+                if self.agent_state == AgentState::Idle {
+                    return self.run_next_pending();
+                }
+            }
             PiMsg::UiShutdown => {
                 // Internal signal for shutting down the async→UI bridge; should not normally reach
                 // the UI event loop, but handle it defensively.
@@ -5394,6 +5400,14 @@ impl PiApp {
                 if !self.pending_inputs.is_empty() {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
+            }
+            PiMsg::SystemNote(message) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: message,
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
             }
             PiMsg::BashResult {
                 display,

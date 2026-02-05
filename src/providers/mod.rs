@@ -59,7 +59,7 @@ pub fn create_provider(entry: &ModelEntry) -> Result<Arc<dyn Provider>> {
         )),
         _ => Err(Error::provider(
             &entry.model.provider,
-            &format!(
+            format!(
                 "Provider not implemented (api: {})",
                 entry.model.api
             ),
