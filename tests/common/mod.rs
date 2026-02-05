@@ -9,6 +9,8 @@ use std::future::Future;
 
 pub mod harness;
 pub mod logging;
+#[cfg(unix)]
+pub mod tmux;
 
 #[allow(unused_imports)]
 pub use harness::TestHarness;
