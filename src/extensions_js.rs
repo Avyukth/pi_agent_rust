@@ -2715,14 +2715,14 @@ export default { Stream, Readable, Writable, Duplex, Transform, PassThrough };
     // node:string_decoder — often imported by stream consumers
     modules.insert(
         "node:string_decoder".to_string(),
-        r#"
+        r"
 export class StringDecoder {
   constructor(encoding) { this.encoding = encoding || 'utf8'; }
   write(buf) { return typeof buf === 'string' ? buf : String(buf ?? ''); }
   end(buf) { return buf ? this.write(buf) : ''; }
 }
 export default { StringDecoder };
-"#
+"
         .trim()
         .to_string(),
     );
@@ -2730,7 +2730,7 @@ export default { StringDecoder };
     // node:querystring — URL query string encoding/decoding
     modules.insert(
         "node:querystring".to_string(),
-        r#"
+        r"
 export function parse(qs, sep, eq) {
   const s = String(qs ?? '');
   const sepStr = sep || '&';
@@ -2764,7 +2764,7 @@ export const encode = stringify;
 export function escape(str) { return encodeURIComponent(str); }
 export function unescape(str) { return decodeURIComponent(str); }
 export default { parse, stringify, decode, encode, escape, unescape };
-"#
+"
         .trim()
         .to_string(),
     );
@@ -2772,7 +2772,7 @@ export default { parse, stringify, decode, encode, escape, unescape };
     // node:process — re-exports globalThis.process
     modules.insert(
         "node:process".to_string(),
-        r#"
+        r"
 const p = globalThis.process || {};
 export const env = p.env || {};
 export const argv = p.argv || [];
@@ -2793,7 +2793,7 @@ export const kill = p.kill || (() => {});
 export const on = p.on || (() => {});
 export const off = p.off || (() => {});
 export default p;
-"#
+"
         .trim()
         .to_string(),
     );
