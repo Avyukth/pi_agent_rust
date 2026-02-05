@@ -3989,11 +3989,6 @@ impl PiApp {
         conversation_viewport.mouse_wheel_enabled = true;
         conversation_viewport.mouse_wheel_delta = 3;
 
-        let (messages, total_usage) = {
-            let guard = session.try_lock().expect("session lock unavailable during PiApp init");
-            load_conversation_from_session(&guard)
-        };
-
         let model = format!(
             "{}/{}",
             model_entry.model.provider.as_str(),
@@ -4083,7 +4078,7 @@ impl PiApp {
             tools_expanded: true,
             current_tool: None,
             pending_tool_output: None,
-            session: Arc::new(Mutex::new(session)),
+            session,
             config,
             theme,
             styles,

@@ -790,7 +790,12 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let Some(entry) = current_model_entry(&guard.session, &options) else {
+                    let entry = {
+                        let inner_session = guard.session.lock(&cx).await
+                            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                        current_model_entry(&inner_session, &options).cloned()
+                    };
+                    let Some(entry) = entry else {
                         let _ =
                             out_tx.send(response_ok(id, "cycle_thinking_level", Some(Value::Null)));
                         continue;
@@ -801,7 +806,7 @@ pub async fn run(
                         continue;
                     }
 
-                    let levels = available_thinking_levels(entry);
+                    let levels = available_thinking_levels(&entry);
                     let current = guard
                         .agent
                         .stream_options()

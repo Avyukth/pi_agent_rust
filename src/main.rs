@@ -11,11 +11,13 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
+use asupersync::sync::Mutex;
 use clap::Parser;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
@@ -279,13 +281,22 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     };
 
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let session_arc = Arc::new(Mutex::new(session));
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
-        session,
+        session_arc,
         !cli.no_session,
     );
 
-    let history = agent_session.session.to_messages_for_current_path();
+    let history = {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let session = agent_session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        session.to_messages_for_current_path()
+    };
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
     }
@@ -850,7 +861,13 @@ async fn run_print_mode(
     }
 
     if mode == "json" {
-        println!("{}", serde_json::to_string(&session.session.header)?);
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let session = session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        println!("{}", serde_json::to_string(&session.header)?);
     }
 
     let mut last_message: Option<AssistantMessage> = None;

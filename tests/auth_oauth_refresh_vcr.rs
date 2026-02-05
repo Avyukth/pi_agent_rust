@@ -55,7 +55,7 @@ fn write_redacted_snapshot(harness: &TestHarness, src: &Path, name: &str) -> (Pa
 }
 
 fn oauth_entry(value: &Value, provider: &str) -> &serde_json::Map<String, Value> {
-    let Some(Value::Object(map)) = value.as_object() else {
+    let Some(map) = value.as_object() else {
         panic!("expected auth.json root object");
     };
     let Some(Value::Object(entry)) = map.get(provider) else {
@@ -243,4 +243,3 @@ fn auth_oauth_refresh_network_failure_vcr() {
         .await;
     });
 }
-
