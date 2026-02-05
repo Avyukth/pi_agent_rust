@@ -1970,7 +1970,32 @@ export function resolve(...parts) {
   return out.replace(/\/+/g, "/");
 }
 
-export default { join, dirname, resolve };
+export function basename(p, ext) {
+  const s = String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+  const idx = s.lastIndexOf("/");
+  const name = idx === -1 ? s : s.slice(idx + 1);
+  if (ext && name.endsWith(ext)) {
+    return name.slice(0, -ext.length);
+  }
+  return name;
+}
+
+export function relative(from, to) {
+  const fromParts = String(from ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
+  const toParts = String(to ?? "").replace(/\\/g, "/").split("/").filter(Boolean);
+
+  let common = 0;
+  while (common < fromParts.length && common < toParts.length && fromParts[common] === toParts[common]) {
+    common++;
+  }
+
+  const up = fromParts.length - common;
+  const downs = toParts.slice(common);
+  const result = [...Array(up).fill(".."), ...downs];
+  return result.join("/") || ".";
+}
+
+export default { join, dirname, resolve, basename, relative };
 "#
         .trim()
         .to_string(),
@@ -2220,6 +2245,77 @@ export const promises = {
 };
 
 export default { createInterface, promises };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:url".to_string(),
+        r"
+export function fileURLToPath(url) {
+  const u = String(url ?? '');
+  if (u.startsWith('file://')) {
+    return u.slice(7);
+  }
+  return u;
+}
+export function pathToFileURL(path) {
+  return new URL('file://' + String(path ?? ''));
+}
+export class URL {
+  constructor(input, base) {
+    const u = String(input ?? '');
+    this.href = u;
+    this.protocol = u.split(':')[0] + ':';
+    this.pathname = u.replace(/^[^:]+:\/\/[^\/]+/, '') || '/';
+    this.hostname = (u.match(/^[^:]+:\/\/([^\/]+)/) || [])[1] || '';
+    this.host = this.hostname;
+    this.origin = this.protocol + '//' + this.hostname;
+  }
+  toString() { return this.href; }
+}
+export const URLSearchParams = globalThis.URLSearchParams || class URLSearchParams {
+  constructor() { this._params = new Map(); }
+  get(key) { return this._params.get(key); }
+  set(key, val) { this._params.set(key, val); }
+};
+export default { fileURLToPath, pathToFileURL, URL, URLSearchParams };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:net".to_string(),
+        r"
+// Stub net module - socket operations are not available in PiJS
+
+export function createConnection(_opts, _callback) {
+  throw new Error('node:net.createConnection is not available in PiJS');
+}
+
+export function createServer(_opts, _callback) {
+  throw new Error('node:net.createServer is not available in PiJS');
+}
+
+export function connect(_opts, _callback) {
+  throw new Error('node:net.connect is not available in PiJS');
+}
+
+export class Socket {
+  constructor() {
+    throw new Error('node:net.Socket is not available in PiJS');
+  }
+}
+
+export class Server {
+  constructor() {
+    throw new Error('node:net.Server is not available in PiJS');
+  }
+}
+
+export default { createConnection, createServer, connect, Socket, Server };
 "
         .trim()
         .to_string(),
