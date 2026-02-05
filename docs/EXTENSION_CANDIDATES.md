@@ -204,10 +204,119 @@ from repo names/descriptions and should be validated in follow‑up.
 }
 ```
 
+```json
+{
+  "executed_at": "2026-02-05T19:25:07Z",
+  "queries": [
+    {
+      "query": "topic:claude-code",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 30,
+      "top_results": [
+        {"repo": "affaan-m/everything-claude-code", "stars": 40494, "forks": 5015, "updated_at": "2026-02-05T19:24:48Z", "license": "mit", "url": "https://github.com/affaan-m/everything-claude-code"},
+        {"repo": "CherryHQ/cherry-studio", "stars": 39337, "forks": 3618, "updated_at": "2026-02-05T18:26:57Z", "license": "agpl-3.0", "url": "https://github.com/CherryHQ/cherry-studio"},
+        {"repo": "ComposioHQ/awesome-claude-skills", "stars": 30683, "forks": 2930, "updated_at": "2026-02-05T19:23:24Z", "license": "", "url": "https://github.com/ComposioHQ/awesome-claude-skills"},
+        {"repo": "code-yeongyu/oh-my-opencode", "stars": 28473, "forks": 2092, "updated_at": "2026-02-05T19:18:45Z", "license": "other", "url": "https://github.com/code-yeongyu/oh-my-opencode"},
+        {"repo": "nextlevelbuilder/ui-ux-pro-max-skill", "stars": 28146, "forks": 2828, "updated_at": "2026-02-05T19:23:14Z", "license": "mit", "url": "https://github.com/nextlevelbuilder/ui-ux-pro-max-skill"},
+        {"repo": "wshobson/agents", "stars": 27858, "forks": 3070, "updated_at": "2026-02-05T18:57:40Z", "license": "mit", "url": "https://github.com/wshobson/agents"},
+        {"repo": "thedotmack/claude-mem", "stars": 23578, "forks": 1565, "updated_at": "2026-02-05T19:24:25Z", "license": "other", "url": "https://github.com/thedotmack/claude-mem"},
+        {"repo": "hesreallyhim/awesome-claude-code", "stars": 22907, "forks": 1319, "updated_at": "2026-02-05T18:31:40Z", "license": "other", "url": "https://github.com/hesreallyhim/awesome-claude-code"},
+        {"repo": "winfunc/opcode", "stars": 20418, "forks": 1590, "updated_at": "2026-02-05T17:22:01Z", "license": "agpl-3.0", "url": "https://github.com/winfunc/opcode"},
+        {"repo": "oraios/serena", "stars": 19750, "forks": 1332, "updated_at": "2026-02-05T19:12:54Z", "license": "mit", "url": "https://github.com/oraios/serena"}
+      ]
+    },
+    {
+      "query": "topic:claude-code-plugin",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 30,
+      "top_results": [
+        {"repo": "wshobson/agents", "stars": 27858, "forks": 3070, "updated_at": "2026-02-05T18:57:40Z", "license": "mit", "url": "https://github.com/wshobson/agents"},
+        {"repo": "thedotmack/claude-mem", "stars": 23578, "forks": 1565, "updated_at": "2026-02-05T19:24:25Z", "license": "other", "url": "https://github.com/thedotmack/claude-mem"},
+        {"repo": "timescale/pg-aiguide", "stars": 1501, "forks": 77, "updated_at": "2026-02-05T09:38:11Z", "license": "apache-2.0", "url": "https://github.com/timescale/pg-aiguide"},
+        {"repo": "kenryu42/claude-code-safety-net", "stars": 972, "forks": 42, "updated_at": "2026-02-05T17:01:06Z", "license": "mit", "url": "https://github.com/kenryu42/claude-code-safety-net"},
+        {"repo": "gmickel/gmickel-claude-marketplace", "stars": 501, "forks": 33, "updated_at": "2026-02-05T11:25:26Z", "license": "mit", "url": "https://github.com/gmickel/gmickel-claude-marketplace"},
+        {"repo": "zscole/adversarial-spec", "stars": 473, "forks": 41, "updated_at": "2026-02-03T22:23:19Z", "license": "mit", "url": "https://github.com/zscole/adversarial-spec"},
+        {"repo": "ccplugins/awesome-claude-code-plugins", "stars": 440, "forks": 65, "updated_at": "2026-02-05T10:00:36Z", "license": "apache-2.0", "url": "https://github.com/ccplugins/awesome-claude-code-plugins"},
+        {"repo": "fcakyon/claude-codex-settings", "stars": 401, "forks": 39, "updated_at": "2026-02-05T16:00:46Z", "license": "apache-2.0", "url": "https://github.com/fcakyon/claude-codex-settings"},
+        {"repo": "keskinonur/claude-code-ios-dev-guide", "stars": 293, "forks": 34, "updated_at": "2026-02-05T15:20:39Z", "license": "", "url": "https://github.com/keskinonur/claude-code-ios-dev-guide"},
+        {"repo": "jarrodwatts/claude-stt", "stars": 290, "forks": 27, "updated_at": "2026-02-05T17:36:16Z", "license": "mit", "url": "https://github.com/jarrodwatts/claude-stt"}
+      ]
+    },
+    {
+      "query": "topic:claude-code-plugins",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 30,
+      "top_results": [
+        {"repo": "wshobson/agents", "stars": 27858, "forks": 3070, "updated_at": "2026-02-05T18:57:40Z", "license": "mit", "url": "https://github.com/wshobson/agents"},
+        {"repo": "timescale/pg-aiguide", "stars": 1501, "forks": 77, "updated_at": "2026-02-05T09:38:11Z", "license": "apache-2.0", "url": "https://github.com/timescale/pg-aiguide"},
+        {"repo": "jeremylongshore/claude-code-plugins-plus-skills", "stars": 1288, "forks": 156, "updated_at": "2026-02-05T19:09:00Z", "license": "other", "url": "https://github.com/jeremylongshore/claude-code-plugins-plus-skills"},
+        {"repo": "malob/nix-config", "stars": 450, "forks": 35, "updated_at": "2026-02-04T19:39:30Z", "license": "mit", "url": "https://github.com/malob/nix-config"},
+        {"repo": "quemsah/awesome-claude-plugins", "stars": 89, "forks": 4, "updated_at": "2026-02-05T08:39:03Z", "license": "", "url": "https://github.com/quemsah/awesome-claude-plugins"},
+        {"repo": "NikiforovAll/claude-code-rules", "stars": 80, "forks": 13, "updated_at": "2026-02-02T08:26:17Z", "license": "apache-2.0", "url": "https://github.com/NikiforovAll/claude-code-rules"},
+        {"repo": "PCIRCLE-AI/claude-code-buddy", "stars": 56, "forks": 12, "updated_at": "2026-02-05T16:35:48Z", "license": "agpl-3.0", "url": "https://github.com/PCIRCLE-AI/claude-code-buddy"},
+        {"repo": "wakatime/claude-code-wakatime", "stars": 48, "forks": 11, "updated_at": "2026-02-02T03:33:00Z", "license": "bsd-3-clause", "url": "https://github.com/wakatime/claude-code-wakatime"},
+        {"repo": "secondsky/claude-skills", "stars": 42, "forks": 1, "updated_at": "2026-02-05T14:30:30Z", "license": "", "url": "https://github.com/secondsky/claude-skills"},
+        {"repo": "Securiteru/codex-openai-proxy", "stars": 66, "forks": 5, "updated_at": "2026-02-03T18:49:10Z", "license": "mit", "url": "https://github.com/Securiteru/codex-openai-proxy"}
+      ]
+    },
+    {
+      "query": "\"claude code\" extension",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 30,
+      "top_results": [
+        {"repo": "Securiteru/codex-openai-proxy", "stars": 66, "forks": 5, "updated_at": "2026-02-03T18:49:10Z", "license": "mit", "url": "https://github.com/Securiteru/codex-openai-proxy"},
+        {"repo": "ntanner-ctrl/claude-bootstrap", "stars": 54, "forks": 5, "updated_at": "2026-02-01T06:24:48Z", "license": "", "url": "https://github.com/ntanner-ctrl/claude-bootstrap"},
+        {"repo": "jimmy927/claude-code-extension-patcher", "stars": 15, "forks": 4, "updated_at": "2025-12-15T23:30:59Z", "license": "", "url": "https://github.com/jimmy927/claude-code-extension-patcher"},
+        {"repo": "ruimgbarros/data-journalism-marketplace", "stars": 14, "forks": 0, "updated_at": "2026-01-29T22:50:20Z", "license": "mit", "url": "https://github.com/ruimgbarros/data-journalism-marketplace"},
+        {"repo": "aegntic/cldcde", "stars": 9, "forks": 0, "updated_at": "2026-01-29T16:46:33Z", "license": "mit", "url": "https://github.com/aegntic/cldcde"},
+        {"repo": "yuji0809/cc-recommender", "stars": 8, "forks": 0, "updated_at": "2026-02-04T12:44:59Z", "license": "mit", "url": "https://github.com/yuji0809/cc-recommender"},
+        {"repo": "0x1NotMe/claude-workspace-tools", "stars": 8, "forks": 2, "updated_at": "2026-01-17T18:10:59Z", "license": "", "url": "https://github.com/0x1NotMe/claude-workspace-tools"},
+        {"repo": "zpaper-com/ClaudeKit", "stars": 6, "forks": 4, "updated_at": "2025-12-21T04:21:06Z", "license": "", "url": "https://github.com/zpaper-com/ClaudeKit"},
+        {"repo": "walidboulanouar/ay-claude-templates", "stars": 5, "forks": 1, "updated_at": "2026-02-02T14:06:57Z", "license": "mit", "url": "https://github.com/walidboulanouar/ay-claude-templates"},
+        {"repo": "Autopsias/slashagents", "stars": 4, "forks": 2, "updated_at": "2026-01-16T20:42:36Z", "license": "mit", "url": "https://github.com/Autopsias/slashagents"}
+      ]
+    },
+    {
+      "query": "\"claude-code\" extension",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 30,
+      "top_results": [
+        {"repo": "Securiteru/codex-openai-proxy", "stars": 66, "forks": 5, "updated_at": "2026-02-03T18:49:10Z", "license": "mit", "url": "https://github.com/Securiteru/codex-openai-proxy"},
+        {"repo": "ntanner-ctrl/claude-bootstrap", "stars": 54, "forks": 5, "updated_at": "2026-02-01T06:24:48Z", "license": "", "url": "https://github.com/ntanner-ctrl/claude-bootstrap"},
+        {"repo": "jimmy927/claude-code-extension-patcher", "stars": 15, "forks": 4, "updated_at": "2025-12-15T23:30:59Z", "license": "", "url": "https://github.com/jimmy927/claude-code-extension-patcher"},
+        {"repo": "ruimgbarros/data-journalism-marketplace", "stars": 14, "forks": 0, "updated_at": "2026-01-29T22:50:20Z", "license": "mit", "url": "https://github.com/ruimgbarros/data-journalism-marketplace"},
+        {"repo": "aegntic/cldcde", "stars": 9, "forks": 0, "updated_at": "2026-01-29T16:46:33Z", "license": "mit", "url": "https://github.com/aegntic/cldcde"},
+        {"repo": "yuji0809/cc-recommender", "stars": 8, "forks": 0, "updated_at": "2026-02-04T12:44:59Z", "license": "mit", "url": "https://github.com/yuji0809/cc-recommender"},
+        {"repo": "0x1NotMe/claude-workspace-tools", "stars": 8, "forks": 2, "updated_at": "2026-01-17T18:10:59Z", "license": "", "url": "https://github.com/0x1NotMe/claude-workspace-tools"},
+        {"repo": "zpaper-com/ClaudeKit", "stars": 6, "forks": 4, "updated_at": "2025-12-21T04:21:06Z", "license": "", "url": "https://github.com/zpaper-com/ClaudeKit"},
+        {"repo": "walidboulanouar/ay-claude-templates", "stars": 5, "forks": 1, "updated_at": "2026-02-02T14:06:57Z", "license": "mit", "url": "https://github.com/walidboulanouar/ay-claude-templates"},
+        {"repo": "Autopsias/slashagents", "stars": 4, "forks": 2, "updated_at": "2026-01-16T20:42:36Z", "license": "mit", "url": "https://github.com/Autopsias/slashagents"}
+      ]
+    },
+    {
+      "query": "\"claude\" \"mcp\" extension",
+      "executed_at": "2026-02-05T19:25:07Z",
+      "limit": 30,
+      "result_count": 2,
+      "top_results": [
+        {"repo": "k3d3/firefox_mcpbridge", "stars": 4, "forks": 0, "updated_at": "2025-08-31T14:44:29Z", "license": "", "url": "https://github.com/k3d3/firefox_mcpbridge"},
+        {"repo": "k3d3/mcpbridge", "stars": 2, "forks": 1, "updated_at": "2025-08-25T05:18:42Z", "license": "", "url": "https://github.com/k3d3/mcpbridge"}
+      ]
+    }
+  ]
+}
+```
+
 Follow‑ups:
 - Resolve `NOASSERTION`/`NONE` license entries via LICENSE files or SPDX metadata.
 - Expand coverage to other high‑signal topic pages (e.g., `claude-code-mcp`, `claude-code-hooks`).
 - Several broad‑net queries returned zero results; plan to expand with code search + curated lists to reach target coverage.
+- `topic:claude-code*` queries are noisy (many non‑Pi repos); requires code‑signature validation (bd‑3l39) before acceptance.
 
 ---
 
