@@ -271,16 +271,16 @@ Summary (times in ms):
 
 | Scenario | Mean ± σ | Min / Max | per_call_us | calls/sec |
 |----------|----------|-----------|-------------|-----------|
-| pijs_workload_200x1 | 19.83 ± 1.74 | 17.89 / 24.13 | 51 | 19,535 |
-| pijs_workload_200x10 | 110.72 ± 1.56 | 108.41 / 112.81 | 50 | 19,828 |
+| pijs_workload_200x1 | 16.96 ± 0.98 | 15.78 / 19.00 | 44 | 22,716 |
+| pijs_workload_200x10 | 97.09 ± 4.27 | 93.08 / 105.57 | 43 | 22,883 |
 
 JSONL logs (hyperfine + workload):
 
 ```jsonl
-{"tool":"hyperfine","scenario":"pijs_workload_200x1","command":"target/release/pijs_workload --iterations 200 --tool-calls 1","mean_ms":19.83,"stddev_ms":1.74,"min_ms":17.89,"max_ms":24.13}
-{"tool":"hyperfine","scenario":"pijs_workload_200x10","command":"target/release/pijs_workload --iterations 200 --tool-calls 10","mean_ms":110.72,"stddev_ms":1.56,"min_ms":108.41,"max_ms":112.81}
-{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":1,"total_calls":200,"elapsed_ms":10,"per_call_us":51,"calls_per_sec":19535}
-{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":100,"per_call_us":50,"calls_per_sec":19828}
+{"tool":"hyperfine","scenario":"pijs_workload_200x1","command":"target/release/pijs_workload --iterations 200 --tool-calls 1","mean_ms":16.96,"stddev_ms":0.98,"min_ms":15.78,"max_ms":19.00}
+{"tool":"hyperfine","scenario":"pijs_workload_200x10","command":"target/release/pijs_workload --iterations 200 --tool-calls 10","mean_ms":97.09,"stddev_ms":4.27,"min_ms":93.08,"max_ms":105.57}
+{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":1,"total_calls":200,"elapsed_ms":8,"per_call_us":44,"calls_per_sec":22716}
+{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":87,"per_call_us":43,"calls_per_sec":22883}
 ```
 
 Raw artifacts (local):
