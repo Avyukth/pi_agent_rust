@@ -307,7 +307,7 @@ fn run_ts_oracle(extension_path: &Path) -> Value {
 }
 
 fn run_ts_oracle_result(extension_path: &Path) -> Result<Value, String> {
-    let settings = deterministic_settings();
+    let settings = deterministic_settings_for(extension_path);
     ensure_deterministic_dirs(&settings);
     let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
         Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
@@ -329,6 +329,9 @@ fn run_ts_oracle_result(extension_path: &Path) -> Result<Value, String> {
         .arg(extension_path)
         .arg(&settings.cwd)
         .current_dir(pi_mono_root())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env("NODE_PATH", node_path.as_ref())
         .env("PI_DETERMINISTIC_TIME_MS", &settings.time_ms)
         .env("PI_DETERMINISTIC_TIME_STEP_MS", &settings.time_step_ms)
@@ -339,7 +342,44 @@ fn run_ts_oracle_result(extension_path: &Path) -> Result<Value, String> {
     } else {
         cmd.env("PI_DETERMINISTIC_RANDOM_SEED", &settings.random_seed);
     }
-    let output = cmd.output().expect("failed to execute TS oracle harness");
+
+    let timeout = ts_oracle_timeout();
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn TS oracle harness: {err}"))?;
+    let start = Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|err| format!("failed to capture TS oracle output: {err}"))?;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": format!("timeout after {}s", timeout.as_secs()),
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            }));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "TS oracle wait error for {}: {err}",
+                    extension_path.display()
+                ));
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to capture TS oracle output: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -368,7 +408,7 @@ fn run_ts_oracle_result(extension_path: &Path) -> Result<Value, String> {
 }
 
 fn run_ts_harness_result(extension_path: &Path) -> Result<Value, String> {
-    let settings = deterministic_settings();
+    let settings = deterministic_settings_for(extension_path);
     ensure_deterministic_dirs(&settings);
     let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
         Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
@@ -391,6 +431,9 @@ fn run_ts_harness_result(extension_path: &Path) -> Result<Value, String> {
         .arg(ts_default_mock_spec())
         .arg(&settings.cwd)
         .current_dir(pi_mono_root())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .env("NODE_PATH", node_path.as_ref())
         .env("PI_DETERMINISTIC_TIME_MS", &settings.time_ms)
         .env("PI_DETERMINISTIC_TIME_STEP_MS", &settings.time_step_ms)
@@ -402,9 +445,43 @@ fn run_ts_harness_result(extension_path: &Path) -> Result<Value, String> {
         cmd.env("PI_DETERMINISTIC_RANDOM_SEED", &settings.random_seed);
     }
 
-    let output = cmd
-        .output()
-        .map_err(|err| format!("failed to execute TS harness: {err}"))?;
+    let timeout = ts_oracle_timeout();
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn TS harness: {err}"))?;
+    let start = Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .map_err(|err| format!("failed to capture TS harness output: {err}"))?;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": format!("timeout after {}s", timeout.as_secs()),
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            }));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "TS harness wait error for {}: {err}",
+                    extension_path.display()
+                ));
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to capture TS harness output: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
