@@ -916,13 +916,13 @@ mod tests {
                 entries: HashMap::new(),
             };
             // Insert an expired anthropic OAuth credential.
-            let initial_access_token = next_token();
-            let initial_refresh_token = next_token();
+            let initial_access = next_token();
+            let initial_refresh = next_token();
             auth.entries.insert(
                 "anthropic".to_string(),
                 AuthCredential::OAuth {
-                    access_token: initial_access_token.clone(),
-                    refresh_token: initial_refresh_token,
+                    access_token: initial_access.clone(),
+                    refresh_token: initial_refresh,
                     expires: 0, // expired
                 },
             );
@@ -942,7 +942,7 @@ mod tests {
                 matches!(
                     auth.entries.get("anthropic"),
                     Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token == &initial_access_token
+                        if access_token == &initial_access
                 ),
                 "expected OAuth credential"
             );
@@ -1072,7 +1072,9 @@ mod tests {
                 assert_eq!(refresh_token, &expected_refresh_token);
                 assert_eq!(*expires, 9_999_999_999_000);
             }
-            other => panic!("expected OAuth credential, got: {other:?}"),
+            other @ AuthCredential::ApiKey { .. } => {
+                unreachable!("expected OAuth credential, got: {other:?}");
+            }
         }
     }
 

@@ -154,12 +154,56 @@ fn load_extension_with_mocks(harness: &common::TestHarness, source: &str) -> Ext
     }
 }
 
+fn write_jsonl_artifacts(harness: &common::TestHarness, test_name: &str) {
+    let log_path = harness.temp_path(format!("{test_name}.log.jsonl"));
+    harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl log");
+    assert!(log_path.exists(), "jsonl log should exist");
+    harness.record_artifact(format!("{test_name}.log.jsonl"), &log_path);
+
+    let normalized_log_path = harness.temp_path(format!("{test_name}.log.normalized.jsonl"));
+    harness
+        .write_jsonl_logs_normalized(&normalized_log_path)
+        .expect("write normalized jsonl log");
+    assert!(
+        normalized_log_path.exists(),
+        "normalized jsonl log should exist"
+    );
+    harness.record_artifact(
+        format!("{test_name}.log.normalized.jsonl"),
+        &normalized_log_path,
+    );
+
+    let artifacts_path = harness.temp_path(format!("{test_name}.artifacts.jsonl"));
+    harness
+        .write_artifact_index_jsonl(&artifacts_path)
+        .expect("write artifact index jsonl");
+    assert!(artifacts_path.exists(), "artifact index should exist");
+    harness.record_artifact(format!("{test_name}.artifacts.jsonl"), &artifacts_path);
+
+    let normalized_artifacts_path =
+        harness.temp_path(format!("{test_name}.artifacts.normalized.jsonl"));
+    harness
+        .write_artifact_index_jsonl_normalized(&normalized_artifacts_path)
+        .expect("write normalized artifact index jsonl");
+    assert!(
+        normalized_artifacts_path.exists(),
+        "normalized artifact index should exist"
+    );
+    harness.record_artifact(
+        format!("{test_name}.artifacts.normalized.jsonl"),
+        &normalized_artifacts_path,
+    );
+}
+
 // ─── Message Injection Tests ────────────────────────────────────────────────
 
 /// Extension calls `pi.sendMessage()` via a command handler.
 #[test]
 fn e2e_send_message_via_command() {
-    let harness = common::TestHarness::new("e2e_send_message_via_command");
+    let test_name = "e2e_send_message_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -204,12 +248,14 @@ export default function init(pi) {
         Some("success")
     );
     drop(messages);
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 /// Extension calls `pi.sendMessage()` missing customType - should fail.
 #[test]
 fn e2e_send_message_missing_custom_type() {
-    let harness = common::TestHarness::new("e2e_send_message_missing_custom_type");
+    let test_name = "e2e_send_message_missing_custom_type";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -240,12 +286,14 @@ export default function init(pi) {
         "no message should be sent without customType"
     );
     drop(messages);
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 /// Extension sends a user message.
 #[test]
 fn e2e_send_user_message_via_command() {
-    let harness = common::TestHarness::new("e2e_send_user_message_via_command");
+    let test_name = "e2e_send_user_message_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -274,6 +322,7 @@ export default function init(pi) {
     assert_eq!(user_msgs.len(), 1);
     assert_eq!(user_msgs[0].text, "Please review the changes");
     drop(user_msgs);
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 // ─── Tool Management Tests ──────────────────────────────────────────────────
@@ -281,7 +330,8 @@ export default function init(pi) {
 /// Extension queries and modifies active tools.
 #[test]
 fn e2e_tool_management_via_command() {
-    let harness = common::TestHarness::new("e2e_tool_management_via_command");
+    let test_name = "e2e_tool_management_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -319,6 +369,7 @@ export default function init(pi) {
     // Verify the manager state reflects the change
     let active = setup.manager.active_tools();
     assert_eq!(active, Some(vec!["read".to_string(), "edit".to_string()]));
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 // ─── Model Control Tests ────────────────────────────────────────────────────
@@ -326,7 +377,8 @@ export default function init(pi) {
 /// Extension changes model and thinking level.
 #[test]
 fn e2e_model_control_via_command() {
-    let harness = common::TestHarness::new("e2e_model_control_via_command");
+    let test_name = "e2e_model_control_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -373,6 +425,7 @@ export default function init(pi) {
 
     let thinking = setup.session.thinking_level.lock().unwrap().clone();
     assert_eq!(thinking.as_deref(), Some("high"));
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 // ─── Session Metadata Tests ─────────────────────────────────────────────────
@@ -380,7 +433,8 @@ export default function init(pi) {
 /// Extension sets and reads session name.
 #[test]
 fn e2e_session_name_via_command() {
-    let harness = common::TestHarness::new("e2e_session_name_via_command");
+    let test_name = "e2e_session_name_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -405,12 +459,14 @@ export default function init(pi) {
 
     let name = setup.session.name.lock().unwrap().clone();
     assert_eq!(name.as_deref(), Some("My Feature Work"));
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 /// Extension sets a label on an entry.
 #[test]
 fn e2e_session_set_label_via_command() {
-    let harness = common::TestHarness::new("e2e_session_set_label_via_command");
+    let test_name = "e2e_session_set_label_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -439,12 +495,14 @@ export default function init(pi) {
     assert_eq!(labels.len(), 1);
     assert_eq!(labels[0].0, "entry-99");
     assert_eq!(labels[0].1.as_deref(), Some("important"));
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 /// Extension appends a custom entry to the session.
 #[test]
 fn e2e_append_entry_via_command() {
-    let harness = common::TestHarness::new("e2e_append_entry_via_command");
+    let test_name = "e2e_append_entry_via_command";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -480,6 +538,7 @@ export default function init(pi) {
             .and_then(Value::as_str),
         Some("https://example.com")
     );
+    write_jsonl_artifacts(&harness, test_name);
 }
 
 // ─── Combined Lifecycle Test ────────────────────────────────────────────────
@@ -487,7 +546,8 @@ export default function init(pi) {
 /// Extension that exercises multiple APIs in a single flow.
 #[test]
 fn e2e_combined_message_session_lifecycle() {
-    let harness = common::TestHarness::new("e2e_combined_message_session_lifecycle");
+    let test_name = "e2e_combined_message_session_lifecycle";
+    let harness = common::TestHarness::new(test_name);
     let setup = load_extension_with_mocks(
         &harness,
         r#"
@@ -572,4 +632,5 @@ export default function init(pi) {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].0, "checkpoint");
     drop(entries);
+    write_jsonl_artifacts(&harness, test_name);
 }

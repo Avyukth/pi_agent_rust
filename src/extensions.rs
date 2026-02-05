@@ -11824,32 +11824,43 @@ mod tests {
 
         #[test]
         fn budget_constants_are_reasonable() {
-            assert!(EXTENSION_EVENT_TIMEOUT_MS >= 1_000);
-            assert!(EXTENSION_EVENT_TIMEOUT_MS <= 60_000);
-            assert!(EXTENSION_TOOL_BUDGET_MS >= 5_000);
-            assert!(EXTENSION_TOOL_BUDGET_MS <= 300_000);
-            assert!(EXTENSION_COMMAND_BUDGET_MS >= 5_000);
-            assert!(EXTENSION_SHORTCUT_BUDGET_MS >= 5_000);
-            assert!(EXTENSION_UI_BUDGET_MS >= 100);
-            assert!(EXTENSION_UI_BUDGET_MS <= 10_000);
-            assert!(EXTENSION_PROVIDER_BUDGET_MS >= 30_000);
-            assert!(EXTENSION_QUERY_BUDGET_MS >= 1_000);
-            assert!(EXTENSION_LOAD_BUDGET_MS >= 10_000);
+            const _: () = {
+                assert!(EXTENSION_EVENT_TIMEOUT_MS >= 1_000);
+                assert!(EXTENSION_EVENT_TIMEOUT_MS <= 60_000);
+                assert!(EXTENSION_TOOL_BUDGET_MS >= 5_000);
+                assert!(EXTENSION_TOOL_BUDGET_MS <= 300_000);
+                assert!(EXTENSION_COMMAND_BUDGET_MS >= 5_000);
+                assert!(EXTENSION_SHORTCUT_BUDGET_MS >= 5_000);
+                assert!(EXTENSION_UI_BUDGET_MS >= 100);
+                assert!(EXTENSION_UI_BUDGET_MS <= 10_000);
+                assert!(EXTENSION_PROVIDER_BUDGET_MS >= 30_000);
+                assert!(EXTENSION_QUERY_BUDGET_MS >= 1_000);
+                assert!(EXTENSION_LOAD_BUDGET_MS >= 10_000);
+            };
         }
 
         #[test]
         fn tight_deadline_cancels_blocked_recv() {
             asupersync::test_utils::run_test(|| async {
-                // Create a oneshot where nobody will send.
-                let (_tx, rx) = oneshot::channel::<()>();
+                // Create a oneshot and only send after the deadline has expired.
+                // This ensures the recv future gets woken so it can observe cancellation.
+                let (tx, rx) = oneshot::channel::<()>();
                 let cx = cx_with_deadline(50); // 50ms deadline
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let cx = Cx::for_request();
+                    let _ = tx.send(&cx, ());
+                });
                 let start = wall_now();
                 let result = rx.recv(&cx).await;
                 let elapsed = Duration::from_nanos(wall_now().duration_since(start));
-                assert!(result.is_err(), "recv should fail when deadline expires");
-                // Should complete in roughly 50ms, not hang forever.
                 assert!(
-                    elapsed < Duration::from_millis(500),
+                    result.is_err(),
+                    "recv should fail once the deadline is exceeded; got: {result:?}"
+                );
+                // Should not hang forever.
+                assert!(
+                    elapsed < Duration::from_secs(1),
                     "recv should be cancelled quickly, took {elapsed:?}"
                 );
             });

@@ -2,16 +2,17 @@
 //!
 //! Covers provider HTTP error codes (401/403/429/529), malformed SSE scenarios,
 //! tool execution edge cases not in `tools_conformance`, and the error hints taxonomy.
-//! All tests are deterministic and offline (`MockHttpServer` or temp dirs).
+//! All tests are deterministic and offline (VCR cassettes or temp dirs).
 
 mod common;
 
 use common::TestHarness;
-use common::harness::MockHttpResponse;
 use futures::StreamExt;
 use pi::error::Error;
+use pi::http::client::Client;
 use pi::model::{Message, UserContent, UserMessage};
 use pi::provider::{Context, Provider, StreamOptions};
+use pi::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder};
 use serde_json::json;
 
 // ============================================================================
@@ -48,7 +49,122 @@ fn get_text_content(content: &[pi::model::ContentBlock]) -> String {
 }
 
 // ============================================================================
-// Provider HTTP Error Codes (MockHttpServer)
+// VCR Cassette Helpers
+// ============================================================================
+
+/// Build a VCR-backed HTTP client with a single pre-built cassette interaction.
+/// Returns (Client, `TempDir`) — caller must keep `TempDir` alive for the test duration.
+fn vcr_client(
+    test_name: &str,
+    url: &str,
+    request_body: serde_json::Value,
+    status: u16,
+    response_headers: Vec<(String, String)>,
+    response_chunks: Vec<String>,
+) -> (Client, tempfile::TempDir) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: test_name.to_string(),
+        recorded_at: "2026-02-05T00:00:00.000Z".to_string(),
+        interactions: vec![Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: url.to_string(),
+                headers: Vec::new(),
+                body: Some(request_body),
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status,
+                headers: response_headers,
+                body_chunks: response_chunks,
+            },
+        }],
+    };
+    let serialized = serde_json::to_string_pretty(&cassette).expect("serialize cassette");
+    std::fs::write(temp.path().join(format!("{test_name}.json")), serialized)
+        .expect("write cassette");
+    let recorder = VcrRecorder::new_with(test_name, VcrMode::Playback, temp.path());
+    let client = Client::new().with_vcr(recorder);
+    (client, temp)
+}
+
+fn anthropic_body(prompt: &str) -> serde_json::Value {
+    json!({
+        "max_tokens": 8192,
+        "messages": [{"content": [{"text": prompt, "type": "text"}], "role": "user"}],
+        "model": "claude-test",
+        "stream": true,
+    })
+}
+
+fn openai_body(prompt: &str) -> serde_json::Value {
+    json!({
+        "max_tokens": 4096,
+        "messages": [{"content": prompt, "role": "user"}],
+        "model": "gpt-test",
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    })
+}
+
+fn gemini_url(model: &str, api_key: &str) -> String {
+    format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+    )
+}
+
+fn gemini_body(prompt: &str) -> serde_json::Value {
+    json!({
+        "contents": [{"parts": [{"text": prompt}], "role": "user"}],
+        "generationConfig": {"candidateCount": 1, "maxOutputTokens": 8192},
+    })
+}
+
+fn azure_url(deployment: &str) -> String {
+    format!(
+        "https://fake.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version=2024-02-15-preview"
+    )
+}
+
+fn azure_body(prompt: &str) -> serde_json::Value {
+    json!({
+        "max_tokens": 4096,
+        "messages": [{"content": prompt, "role": "user"}],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    })
+}
+
+fn json_headers() -> Vec<(String, String)> {
+    vec![("Content-Type".to_string(), "application/json".to_string())]
+}
+
+fn json_with_retry_headers(retry_after: &str) -> Vec<(String, String)> {
+    vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("retry-after".to_string(), retry_after.to_string()),
+    ]
+}
+
+fn text_headers() -> Vec<(String, String)> {
+    vec![("Content-Type".to_string(), "text/plain".to_string())]
+}
+
+fn text_with_retry_headers(retry_after: &str) -> Vec<(String, String)> {
+    vec![
+        ("Content-Type".to_string(), "text/plain".to_string()),
+        ("retry-after".to_string(), retry_after.to_string()),
+    ]
+}
+
+fn sse_headers() -> Vec<(String, String)> {
+    vec![("Content-Type".to_string(), "text/event-stream".to_string())]
+}
+
+// ============================================================================
+// Provider HTTP Error Codes (VCR)
 // ============================================================================
 
 mod provider_http_errors {
@@ -58,17 +174,22 @@ mod provider_http_errors {
 
     #[test]
     fn anthropic_http_401_reports_auth_error() {
-        let harness = TestHarness::new("anthropic_http_401");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "type": "error",
             "error": { "type": "authentication_error", "message": "invalid x-api-key" }
         });
-        server.add_route("POST", "/v1/messages", MockHttpResponse::json(401, &body));
-
+        let (client, _dir) = vcr_client(
+            "anthropic_http_401",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            401,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_http_401");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("bad-key"))
                 .await
@@ -82,17 +203,22 @@ mod provider_http_errors {
 
     #[test]
     fn anthropic_http_403_reports_forbidden() {
-        let harness = TestHarness::new("anthropic_http_403");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "type": "error",
             "error": { "type": "forbidden", "message": "access denied to model" }
         });
-        server.add_route("POST", "/v1/messages", MockHttpResponse::json(403, &body));
-
+        let (client, _dir) = vcr_client(
+            "anthropic_http_403",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            403,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_http_403");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
@@ -106,28 +232,22 @@ mod provider_http_errors {
 
     #[test]
     fn anthropic_http_429_reports_rate_limit() {
-        let harness = TestHarness::new("anthropic_http_429");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "type": "error",
             "error": { "type": "rate_limit_error", "message": "rate limited" }
         });
-        server.add_route(
-            "POST",
-            "/v1/messages",
-            MockHttpResponse {
-                status: 429,
-                headers: vec![
-                    ("Content-Type".to_string(), "application/json".to_string()),
-                    ("retry-after".to_string(), "5".to_string()),
-                ],
-                body: serde_json::to_vec(&body).unwrap_or_default(),
-            },
+        let (client, _dir) = vcr_client(
+            "anthropic_http_429",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            429,
+            json_with_retry_headers("5"),
+            vec![serde_json::to_string(&body).unwrap()],
         );
-
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_http_429");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
@@ -141,17 +261,22 @@ mod provider_http_errors {
 
     #[test]
     fn anthropic_http_529_reports_overloaded() {
-        let harness = TestHarness::new("anthropic_http_529");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "type": "error",
             "error": { "type": "overloaded_error", "message": "overloaded" }
         });
-        server.add_route("POST", "/v1/messages", MockHttpResponse::json(529, &body));
-
+        let (client, _dir) = vcr_client(
+            "anthropic_http_529",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            529,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_http_529");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
@@ -167,20 +292,21 @@ mod provider_http_errors {
 
     #[test]
     fn openai_http_401_reports_auth_error() {
-        let harness = TestHarness::new("openai_http_401");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "error": { "message": "Incorrect API key", "type": "invalid_request_error" }
         });
-        server.add_route(
-            "POST",
-            "/v1/chat/completions",
-            MockHttpResponse::json(401, &body),
+        let (client, _dir) = vcr_client(
+            "openai_http_401",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            401,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
         );
-
         common::run_async(async move {
-            let provider = pi::providers::openai::OpenAIProvider::new("gpt-test")
-                .with_base_url(format!("{}/v1/chat/completions", server.base_url()));
+            let harness = TestHarness::new("openai_http_401");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("bad-key"))
                 .await
@@ -194,27 +320,21 @@ mod provider_http_errors {
 
     #[test]
     fn openai_http_429_reports_rate_limit() {
-        let harness = TestHarness::new("openai_http_429");
-        let server = harness.start_mock_http_server();
         let body = json!({
             "error": { "message": "Rate limit exceeded", "type": "rate_limit_error" }
         });
-        server.add_route(
-            "POST",
-            "/v1/chat/completions",
-            MockHttpResponse {
-                status: 429,
-                headers: vec![
-                    ("Content-Type".to_string(), "application/json".to_string()),
-                    ("retry-after".to_string(), "10".to_string()),
-                ],
-                body: serde_json::to_vec(&body).unwrap_or_default(),
-            },
+        let (client, _dir) = vcr_client(
+            "openai_http_429",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            429,
+            json_with_retry_headers("10"),
+            vec![serde_json::to_string(&body).unwrap()],
         );
-
         common::run_async(async move {
-            let provider = pi::providers::openai::OpenAIProvider::new("gpt-test")
-                .with_base_url(format!("{}/v1/chat/completions", server.base_url()));
+            let harness = TestHarness::new("openai_http_429");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
@@ -230,23 +350,21 @@ mod provider_http_errors {
 
     #[test]
     fn gemini_http_401_reports_auth_error() {
-        let harness = TestHarness::new("gemini_http_401");
-        let server = harness.start_mock_http_server();
-
-        let model = "gemini-test";
-        let api_key = "bad-key";
-        let path = format!("/models/{model}:streamGenerateContent?alt=sse&key={api_key}");
-        server.add_route(
-            "POST",
-            &path,
-            MockHttpResponse::text(401, "API key not valid"),
+        let url = gemini_url("gemini-test", "bad-key");
+        let (client, _dir) = vcr_client(
+            "gemini_http_401",
+            &url,
+            gemini_body("test"),
+            401,
+            text_headers(),
+            vec!["API key not valid".to_string()],
         );
-
         common::run_async(async move {
+            let harness = TestHarness::new("gemini_http_401");
             let provider =
-                pi::providers::gemini::GeminiProvider::new(model).with_base_url(server.base_url());
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
             let err = provider
-                .stream(&context_for("test"), &options_with_key(api_key))
+                .stream(&context_for("test"), &options_with_key("bad-key"))
                 .await
                 .err()
                 .expect("expected error");
@@ -258,23 +376,21 @@ mod provider_http_errors {
 
     #[test]
     fn gemini_http_429_reports_rate_limit() {
-        let harness = TestHarness::new("gemini_http_429");
-        let server = harness.start_mock_http_server();
-
-        let model = "gemini-test";
-        let api_key = "test-key";
-        let path = format!("/models/{model}:streamGenerateContent?alt=sse&key={api_key}");
-        server.add_route(
-            "POST",
-            &path,
-            MockHttpResponse::text(429, "Resource exhausted"),
+        let url = gemini_url("gemini-test", "test-key");
+        let (client, _dir) = vcr_client(
+            "gemini_http_429",
+            &url,
+            gemini_body("test"),
+            429,
+            text_headers(),
+            vec!["Resource exhausted".to_string()],
         );
-
         common::run_async(async move {
+            let harness = TestHarness::new("gemini_http_429");
             let provider =
-                pi::providers::gemini::GeminiProvider::new(model).with_base_url(server.base_url());
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
             let err = provider
-                .stream(&context_for("test"), &options_with_key(api_key))
+                .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
                 .err()
                 .expect("expected error");
@@ -288,18 +404,19 @@ mod provider_http_errors {
 
     #[test]
     fn azure_http_401_reports_auth_error() {
-        let harness = TestHarness::new("azure_http_401");
-        let server = harness.start_mock_http_server();
-
-        let deployment = "gpt-test";
-        let api_version = "2024-02-15-preview";
-        let path =
-            format!("/openai/deployments/{deployment}/chat/completions?api-version={api_version}");
-        server.add_route("POST", &path, MockHttpResponse::text(401, "Unauthorized"));
-
+        let endpoint = azure_url("gpt-test");
+        let (client, _dir) = vcr_client(
+            "azure_http_401",
+            &endpoint,
+            azure_body("test"),
+            401,
+            text_headers(),
+            vec!["Unauthorized".to_string()],
+        );
         common::run_async(async move {
-            let endpoint = format!("{}{path}", server.base_url());
-            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", deployment)
+            let harness = TestHarness::new("azure_http_401");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
                 .with_endpoint_url(endpoint);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("bad-key"))
@@ -314,29 +431,19 @@ mod provider_http_errors {
 
     #[test]
     fn azure_http_429_reports_rate_limit() {
-        let harness = TestHarness::new("azure_http_429");
-        let server = harness.start_mock_http_server();
-
-        let deployment = "gpt-test";
-        let api_version = "2024-02-15-preview";
-        let path =
-            format!("/openai/deployments/{deployment}/chat/completions?api-version={api_version}");
-        server.add_route(
-            "POST",
-            &path,
-            MockHttpResponse {
-                status: 429,
-                headers: vec![
-                    ("Content-Type".to_string(), "text/plain".to_string()),
-                    ("retry-after".to_string(), "30".to_string()),
-                ],
-                body: b"Too many requests".to_vec(),
-            },
+        let endpoint = azure_url("gpt-test");
+        let (client, _dir) = vcr_client(
+            "azure_http_429",
+            &endpoint,
+            azure_body("test"),
+            429,
+            text_with_retry_headers("30"),
+            vec!["Too many requests".to_string()],
         );
-
         common::run_async(async move {
-            let endpoint = format!("{}{path}", server.base_url());
-            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", deployment)
+            let harness = TestHarness::new("azure_http_429");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
                 .with_endpoint_url(endpoint);
             let err = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
@@ -351,7 +458,7 @@ mod provider_http_errors {
 }
 
 // ============================================================================
-// Malformed SSE / Response Tests
+// Malformed SSE / Response Tests (VCR)
 // ============================================================================
 
 mod malformed_responses {
@@ -359,21 +466,18 @@ mod malformed_responses {
 
     #[test]
     fn anthropic_invalid_json_in_sse_fails_stream() {
-        let harness = TestHarness::new("anthropic_invalid_json_sse");
-        let server = harness.start_mock_http_server();
-        server.add_route(
-            "POST",
-            "/v1/messages",
-            MockHttpResponse {
-                status: 200,
-                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-                body: b"event: message_start\ndata: {not json}\n\n".to_vec(),
-            },
+        let (client, _dir) = vcr_client(
+            "anthropic_invalid_json_sse",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            200,
+            sse_headers(),
+            vec!["event: message_start\ndata: {not json}\n\n".to_string()],
         );
-
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_invalid_json_sse");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let mut stream = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
@@ -393,32 +497,27 @@ mod malformed_responses {
 
     #[test]
     fn anthropic_empty_body_200_reports_error() {
-        let harness = TestHarness::new("anthropic_empty_body_200");
-        let server = harness.start_mock_http_server();
-        server.add_route(
-            "POST",
-            "/v1/messages",
-            MockHttpResponse {
-                status: 200,
-                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-                body: Vec::new(),
-            },
+        let (client, _dir) = vcr_client(
+            "anthropic_empty_body_200",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            200,
+            sse_headers(),
+            Vec::new(),
         );
-
         common::run_async(async move {
-            let provider = pi::providers::anthropic::AnthropicProvider::new("claude-test")
-                .with_base_url(format!("{}/v1/messages", server.base_url()));
+            let harness = TestHarness::new("anthropic_empty_body_200");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
             let result = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await;
 
-            // Either the stream creation fails or the stream yields no items / an error
             match result {
                 Err(err) => {
                     harness.log().info("verify", err.to_string());
                 }
                 Ok(mut stream) => {
-                    // Stream opened, but should produce no meaningful events or an error
                     let mut event_count = 0;
                     while let Some(item) = stream.next().await {
                         event_count += 1;
@@ -439,27 +538,21 @@ mod malformed_responses {
 
     #[test]
     fn gemini_invalid_json_in_sse_fails_stream() {
-        let harness = TestHarness::new("gemini_invalid_json_sse");
-        let server = harness.start_mock_http_server();
-
-        let model = "gemini-test";
-        let api_key = "test-key";
-        let path = format!("/models/{model}:streamGenerateContent?alt=sse&key={api_key}");
-        server.add_route(
-            "POST",
-            &path,
-            MockHttpResponse {
-                status: 200,
-                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-                body: b"data: {broken json\n\n".to_vec(),
-            },
+        let url = gemini_url("gemini-test", "test-key");
+        let (client, _dir) = vcr_client(
+            "gemini_invalid_json_sse",
+            &url,
+            gemini_body("test"),
+            200,
+            sse_headers(),
+            vec!["data: {broken json\n\n".to_string()],
         );
-
         common::run_async(async move {
+            let harness = TestHarness::new("gemini_invalid_json_sse");
             let provider =
-                pi::providers::gemini::GeminiProvider::new(model).with_base_url(server.base_url());
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
             let mut stream = provider
-                .stream(&context_for("test"), &options_with_key(api_key))
+                .stream(&context_for("test"), &options_with_key("test-key"))
                 .await
                 .expect("stream should open");
 
@@ -477,31 +570,27 @@ mod malformed_responses {
 
     #[test]
     fn openai_non_json_200_body_is_handled() {
-        let harness = TestHarness::new("openai_non_json_200");
-        let server = harness.start_mock_http_server();
-        server.add_route(
-            "POST",
-            "/v1/chat/completions",
-            MockHttpResponse::text(200, "<html>Not an API</html>"),
+        let (client, _dir) = vcr_client(
+            "openai_non_json_200",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            200,
+            text_headers(),
+            vec!["<html>Not an API</html>".to_string()],
         );
-
         common::run_async(async move {
-            let provider = pi::providers::openai::OpenAIProvider::new("gpt-test")
-                .with_base_url(format!("{}/v1/chat/completions", server.base_url()));
+            let harness = TestHarness::new("openai_non_json_200");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
             let result = provider
                 .stream(&context_for("test"), &options_with_key("test-key"))
                 .await;
 
             match result {
                 Err(err) => {
-                    // Immediate error is fine
                     harness.log().info("verify", err.to_string());
                 }
                 Ok(mut stream) => {
-                    // Provider may open the stream and then either:
-                    // (a) yield an error event, or
-                    // (b) yield no events (empty stream terminates cleanly)
-                    // Both are acceptable handling of malformed responses.
                     let mut event_count = 0;
                     let mut found_error = false;
                     while let Some(item) = stream.next().await {
@@ -518,7 +607,6 @@ mod malformed_responses {
                             ctx.push(("event_count".into(), event_count.to_string()));
                             ctx.push(("found_error".into(), found_error.to_string()));
                         });
-                    // Either an error in stream or no meaningful events is correct
                     assert!(
                         found_error || event_count == 0,
                         "expected error or empty stream, got {event_count} events"
@@ -549,8 +637,6 @@ mod tool_errors {
             let result = tool.execute("test-id", input, None).await;
             match result {
                 Ok(output) => {
-                    // bash returns exit code 127 for command not found; tool may return
-                    // it as a successful ToolOutput with is_error or non-zero exit code.
                     let text = get_text_content(&output.content);
                     harness
                         .log()
@@ -558,7 +644,6 @@ mod tool_errors {
                             ctx.push(("text".into(), text.clone()));
                             ctx.push(("is_error".into(), output.is_error.to_string()));
                         });
-                    // Should indicate failure somehow
                     assert!(
                         output.is_error || text.contains("not found") || text.contains("127"),
                         "expected not-found indication, got: {text}"
@@ -584,7 +669,6 @@ mod tool_errors {
             let input = json!({ "command": "" });
 
             let result = tool.execute("test-id", input, None).await;
-            // Empty command should error or produce empty output
             harness
                 .log()
                 .info_ctx("verify", "empty command result", |ctx| {
@@ -632,7 +716,6 @@ mod tool_errors {
             });
 
             let result = tool.execute("test-id", input, None).await;
-            // WriteTool may create parent dirs or error; verify behavior is consistent
             harness
                 .log()
                 .info_ctx("verify", "write to nonexistent parent", |ctx| {
@@ -662,7 +745,6 @@ mod tool_errors {
                     harness.log().info("verify", &msg);
                 }
                 Ok(output) => {
-                    // grep might return is_error=true instead of Err
                     let text = get_text_content(&output.content);
                     harness
                         .log()
@@ -689,7 +771,6 @@ mod tool_errors {
             });
 
             let result = tool.execute("test-id", input, None).await;
-            // Empty old text is either an error or a degenerate match
             harness
                 .log()
                 .info_ctx("verify", "empty old text result", |ctx| {

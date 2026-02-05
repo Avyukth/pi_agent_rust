@@ -3421,7 +3421,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.tool("edit", { path: "target.txt", old_text: "old text", new_text: "new text" })
+                    pi.tool("edit", { path: "target.txt", oldText: "old text", newText: "new text" })
                         .then((r) => { globalThis.result = r; });
                 "#,
                 )
@@ -3954,7 +3954,7 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap();
+            let reqs = captured.lock().unwrap().clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "spinner");
             assert_eq!(reqs[0].payload["text"], "Loading...");
@@ -4008,7 +4008,7 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap();
+            let reqs = captured.lock().unwrap().clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "progress");
             assert_eq!(reqs[0].payload["current"], 50);
@@ -4063,7 +4063,7 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap();
+            let reqs = captured.lock().unwrap().clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "notification");
             assert_eq!(reqs[0].payload["message"], "Task complete!");
@@ -4169,11 +4169,15 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap();
-            assert_eq!(reqs.len(), 2);
-            let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
-            assert!(methods.contains(&"set_status"));
-            assert!(methods.contains(&"set_widget"));
+            let methods = {
+                let reqs = captured.lock().unwrap();
+                assert_eq!(reqs.len(), 2);
+                let methods = reqs.iter().map(|r| r.method.clone()).collect::<Vec<_>>();
+                drop(reqs);
+                methods
+            };
+            assert!(methods.iter().any(|method| method == "set_status"));
+            assert!(methods.iter().any(|method| method == "set_widget"));
         });
     }
 

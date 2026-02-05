@@ -295,7 +295,9 @@ fn complete_extension_oauth_exchanges_code_for_tokens() {
                 let now = chrono::Utc::now().timestamp_millis();
                 assert!(expires > now, "token should not be immediately expired");
             }
-            _ => panic!("expected OAuth credential"),
+            other @ AuthCredential::ApiKey { .. } => {
+                unreachable!("expected OAuth credential, got: {other:?}");
+            }
         }
 
         // Verify the request body was sent correctly.
@@ -417,7 +419,9 @@ fn complete_extension_oauth_parses_url_callback_input() {
             AuthCredential::OAuth { access_token, .. } => {
                 assert_eq!(access_token, "from-url");
             }
-            _ => panic!("expected OAuth credential"),
+            other @ AuthCredential::ApiKey { .. } => {
+                unreachable!("expected OAuth credential, got: {other:?}");
+            }
         }
 
         let reqs = server.requests();

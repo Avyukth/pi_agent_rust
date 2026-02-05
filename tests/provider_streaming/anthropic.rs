@@ -161,7 +161,7 @@ fn generate_error_fixture(
             Message::User(u) => {
                 let text = match &u.content {
                     UserContent::Text(t) => t.clone(),
-                    _ => String::new(),
+                    UserContent::Blocks(_) => String::new(),
                 };
                 json!({"role": "user", "content": [{"type": "text", "text": text}]})
             }
@@ -232,17 +232,12 @@ fn generate_error_fixture(
         }],
     };
 
-    let serialized = serde_json::to_string_pretty(&cassette)
-        .unwrap_or_else(|err| panic!("Failed to serialize error fixture: {err}"));
+    let serialized =
+        serde_json::to_string_pretty(&cassette).expect("Failed to serialize error fixture");
     if let Some(parent) = cassette_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(cassette_path, &serialized).unwrap_or_else(|err| {
-        panic!(
-            "Failed to write error fixture {}: {err}",
-            cassette_path.display()
-        )
-    });
+    std::fs::write(cassette_path, &serialized).expect("Failed to write error fixture");
     harness.log().info(
         "fixture",
         format!(
@@ -269,14 +264,12 @@ async fn run_scenario(scenario: Scenario) {
     // Error scenarios use pre-built fixture cassettes rather than mock HTTP servers.
     // Errors (4xx, 5xx, 529) cannot be triggered on demand from real API endpoints, so we
     // generate deterministic fixture cassettes that the VCR replays in playback mode.
-    let effective_mode = if let Some(expectation) = error_expectation.as_ref() {
+    let effective_mode = error_expectation.as_ref().map_or(mode, |expectation| {
         if !cassette_path.exists() {
             generate_error_fixture(&cassette_path, &scenario, expectation, &harness);
         }
         VcrMode::Playback
-    } else {
-        mode
-    };
+    });
 
     let cassette_exists = cassette_path.exists();
     if effective_mode == VcrMode::Playback && !cassette_exists {
