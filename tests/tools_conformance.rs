@@ -1367,7 +1367,7 @@ mod e2e_grep {
             let tool = pi::tools::GrepTool::new(harness.temp_dir());
             let input = serde_json::json!({
                 "pattern": "match_here",
-                "include": "*.rs"
+                "glob": "*.rs"
             });
 
             let result = tool.execute("grep-003", input.clone(), None).await;

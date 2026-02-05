@@ -1040,19 +1040,21 @@ fn e2e_tui_tool_call_read() {
                 ctx.push(("lines".into(), lines.len().to_string()));
             });
 
-        // Check for tool_use and tool_result in the session
-        let has_tool_use = content.contains("tool_use");
-        let has_tool_result = content.contains("tool_result");
+        // Check for toolCall and toolResult in the session JSONL.
+        // ContentBlock uses serde rename_all = "camelCase" (ToolCall → "toolCall").
+        // SessionMessage uses serde tag = "role" rename_all = "camelCase" (ToolResult → "toolResult").
+        let has_tool_call = content.contains("toolCall");
+        let has_tool_result = content.contains("toolResult");
         session
             .harness
             .log()
             .info_ctx("verify", "Session content check", |ctx| {
-                ctx.push(("has_tool_use".into(), has_tool_use.to_string()));
+                ctx.push(("has_tool_call".into(), has_tool_call.to_string()));
                 ctx.push(("has_tool_result".into(), has_tool_result.to_string()));
             });
 
-        assert!(has_tool_use, "Expected tool_use in session JSONL");
-        assert!(has_tool_result, "Expected tool_result in session JSONL");
+        assert!(has_tool_call, "Expected toolCall in session JSONL");
+        assert!(has_tool_result, "Expected toolResult in session JSONL");
     } else {
         session
             .harness

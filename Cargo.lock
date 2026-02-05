@@ -306,7 +306,8 @@ dependencies = [
 [[package]]
 name = "asupersync"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807#393d13e134ba5908f03fde1e5cbc24e62de8f807"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45551c816d1bb377e94e2633e48e6ab3cedfba821fa1d0eee52f1f2164b17db8"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -5170,9 +5171,9 @@ checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
 
 [[package]]
 name = "sqlmodel-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807)",
+ "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "regex",
  "serde",
  "serde_json",
@@ -5181,9 +5182,9 @@ dependencies = [
 
 [[package]]
 name = "sqlmodel-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
- "asupersync 0.1.0 (git+https://github.com/Dicklesworthstone/asupersync?rev=393d13e134ba5908f03fde1e5cbc24e62de8f807)",
+ "asupersync 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde",
  "serde_json",
  "sqlmodel-core",
