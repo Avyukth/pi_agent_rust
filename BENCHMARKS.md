@@ -257,10 +257,41 @@ hyperfine --warmup 3 --runs 10 'target/release/pi --version'
 scripts/bench_extension_workloads.sh
 ```
 
+#### Baseline Captures (2026-02-05)
+
+Commands:
+
+```bash
+hyperfine --warmup 3 --runs 10 'target/release/pijs_workload --iterations 200 --tool-calls 1'
+hyperfine --warmup 3 --runs 10 'target/release/pijs_workload --iterations 200 --tool-calls 10'
+```
+
+Summary (times in ms):
+
+| Scenario | Mean ± σ | Min / Max | per_call_us | calls/sec |
+|----------|----------|-----------|-------------|-----------|
+| pijs_workload_200x1 | 15.57 ± 0.69 | 14.44 / 16.32 | 42 | 23,312 |
+| pijs_workload_200x10 | 87.38 ± 2.93 | 84.05 / 93.07 | 42 | 23,302 |
+
+JSONL logs (hyperfine + workload):
+
+```jsonl
+{"tool":"hyperfine","scenario":"pijs_workload_200x1","command":"target/release/pijs_workload --iterations 200 --tool-calls 1","mean_ms":15.57,"stddev_ms":0.69,"min_ms":14.44,"max_ms":16.32}
+{"tool":"hyperfine","scenario":"pijs_workload_200x10","command":"target/release/pijs_workload --iterations 200 --tool-calls 10","mean_ms":87.38,"stddev_ms":2.93,"min_ms":84.05,"max_ms":93.07}
+{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":1,"total_calls":200,"elapsed_ms":8,"per_call_us":42,"calls_per_sec":23312}
+{"tool":"pijs_workload","scenario":"tool_call_roundtrip","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":85,"per_call_us":42,"calls_per_sec":23302}
+```
+
+Raw artifacts (local):
+- `target/perf/hyperfine_pijs_workload_200x1.json`
+- `target/perf/hyperfine_pijs_workload_200x10.json`
+- `target/perf/pijs_workload.jsonl`
+
 #### 2) Profile
 
 - CPU hotspots: `cargo flamegraph --bench extensions` (requires `cargo install flamegraph`).
 - Allocations: `heaptrack cargo bench --bench extensions` (Linux).
+- Note (2026-02-05): `cargo flamegraph --bench extensions -- ext_js_runtime` failed on this host due to `perf_event_paranoid=4` (no perf access). Retry on a machine with perf permissions or CAP_PERFMON.
 
 #### 3) Prove (No “silent regressions”)
 
