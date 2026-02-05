@@ -577,7 +577,12 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    session_stats(&guard.session)
+                    let inner_session = guard
+                        .session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                    session_stats(&inner_session)
                 };
                 let _ = out_tx.send(response_ok(id, "get_session_stats", Some(data)));
             }
@@ -588,8 +593,12 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    guard
+                    let inner_session = guard
                         .session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                    inner_session
                         .entries_for_current_path()
                         .iter()
                         .filter_map(|entry| match entry {
@@ -757,8 +766,12 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let level = current_model_entry(&guard.session, &options)
-                        .map_or(level, |entry| clamp_thinking_level(level, entry));
+                    let level = {
+                        let inner_session = guard.session.lock(&cx).await
+                            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                        current_model_entry(&inner_session, &options)
+                            .map_or(level, |entry| clamp_thinking_level(level, entry))
+                    };
                     if let Err(err) = apply_thinking_level(&mut guard, level).await {
                         let _ = out_tx.send(response_error_with_hints(
                             id.clone(),

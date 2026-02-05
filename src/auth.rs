@@ -210,6 +210,18 @@ impl AuthStorage {
     /// This keeps startup behavior predictable: models that rely on OAuth credentials remain
     /// available after restart without requiring the user to re-login.
     pub async fn refresh_expired_oauth_tokens(&mut self) -> Result<()> {
+        let client = crate::http::client::Client::new();
+        self.refresh_expired_oauth_tokens_with_client(&client).await
+    }
+
+    /// Refresh any expired OAuth tokens using the provided HTTP client.
+    ///
+    /// This is primarily intended for tests and deterministic harnesses (e.g. VCR playback),
+    /// but is also useful for callers that want to supply a custom HTTP implementation.
+    pub async fn refresh_expired_oauth_tokens_with_client(
+        &mut self,
+        client: &crate::http::client::Client,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut refreshes = Vec::new();
 
@@ -228,7 +240,9 @@ impl AuthStorage {
 
         for (provider, refresh_token) in refreshes {
             let refreshed = match provider.as_str() {
-                "anthropic" => Box::pin(refresh_anthropic_oauth_token(&refresh_token)).await?,
+                "anthropic" => {
+                    Box::pin(refresh_anthropic_oauth_token(client, &refresh_token)).await?
+                }
                 _ => continue,
             };
             self.entries.insert(provider, refreshed);
@@ -411,8 +425,10 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
     })
 }
 
-async fn refresh_anthropic_oauth_token(refresh_token: &str) -> Result<AuthCredential> {
-    let client = crate::http::client::Client::new();
+async fn refresh_anthropic_oauth_token(
+    client: &crate::http::client::Client,
+    refresh_token: &str,
+) -> Result<AuthCredential> {
     let request = client
         .post(ANTHROPIC_OAUTH_TOKEN_URL)
         .json(&serde_json::json!({
