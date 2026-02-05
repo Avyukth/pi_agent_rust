@@ -2239,7 +2239,7 @@ impl Tool for GrepTool {
         if !rg_available() {
             return Err(Error::tool(
                 "grep",
-                "ripgrep (rg) is not available and could not be downloaded".to_string(),
+                "ripgrep (rg) is not available (please install ripgrep)".to_string(),
             ));
         }
 
@@ -2596,7 +2596,7 @@ impl Tool for FindTool {
         let fd_cmd = find_fd_binary().ok_or_else(|| {
             Error::tool(
                 "find",
-                "fd is not available and could not be downloaded".to_string(),
+                "fd is not available (please install fd-find or fd)".to_string(),
             )
         })?;
 
