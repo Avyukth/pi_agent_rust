@@ -3510,6 +3510,8 @@ pub enum ExtensionEventName {
     ToolExecutionEnd,
     /// Tool call (pre-exec; can block).
     ToolCall,
+    /// Tool result (post-exec; can modify).
+    ToolResult,
     /// Session before switch.
     SessionBeforeSwitch,
     /// Session switched.
@@ -3540,6 +3542,7 @@ impl std::fmt::Display for ExtensionEventName {
             Self::ToolExecutionUpdate => "tool_execution_update",
             Self::ToolExecutionEnd => "tool_execution_end",
             Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
             Self::SessionBeforeSwitch => "session_before_switch",
             Self::SessionSwitch => "session_switch",
             Self::SessionBeforeFork => "session_before_fork",
@@ -5437,19 +5440,15 @@ impl ExtensionManager {
         });
 
         let response = runtime
-            .dispatch_event(
-                event_name,
-                event_payload,
-                Value::Object(ctx),
-                timeout_ms,
-            )
+            .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
             .await?;
 
         if response.is_null() {
             Ok(None)
         } else {
             Ok(Some(
-                serde_json::from_value(response).map_err(|err| Error::extension(err.to_string()))?,
+                serde_json::from_value(response)
+                    .map_err(|err| Error::extension(err.to_string()))?,
             ))
         }
     }

@@ -15,8 +15,7 @@
 use crate::error::{Error, Result};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, JsExtensionLoadSpec,
-    JsExtensionRuntimeHandle,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
@@ -1155,48 +1154,32 @@ impl Agent {
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
     ) -> (ToolOutput, bool) {
         if let Some(extensions) = self.extensions.clone() {
-            let response = extensions
-                .dispatch_event_with_response(
-                    ExtensionEventName::ToolCall,
-                    Some(serde_json::json!({
-                        "toolName": tool_call.name.clone(),
-                        "toolCallId": tool_call.id.clone(),
-                        "input": tool_call.arguments.clone(),
-                    })),
-                    EXTENSION_EVENT_TIMEOUT_MS,
-                )
-                .await;
+            match extensions
+                .dispatch_tool_call(tool_call, EXTENSION_EVENT_TIMEOUT_MS)
+                .await
+            {
+                Ok(Some(result)) if result.block => {
+                    let reason = result
+                        .reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|reason| !reason.is_empty());
+                    let message = reason.map_or_else(
+                        || "Tool execution was blocked by an extension".to_string(),
+                        |reason| format!("Tool execution blocked: {reason}"),
+                    );
 
-            match response {
-                Ok(Some(value)) => {
-                    let blocked = value
-                        .get("block")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    if blocked {
-                        let reason = value
-                            .get("reason")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::trim)
-                            .filter(|reason| !reason.is_empty())
-                            .unwrap_or("Tool execution was blocked by an extension");
-
-                        return (
-                            ToolOutput {
-                                content: vec![ContentBlock::Text(TextContent::new(format!(
-                                    "Tool execution blocked: {reason}"
-                                )))],
-                                details: None,
-                                is_error: true,
-                            },
-                            true,
-                        );
-                    }
+                    return (
+                        ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(message))],
+                            details: None,
+                            is_error: true,
+                        },
+                        true,
+                    );
                 }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!("tool_call extension hook failed (fail-open): {err}");
-                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("tool_call extension hook failed (fail-open): {err}"),
             }
         }
 
@@ -1608,13 +1591,14 @@ mod extensions_integration_tests {
             assert!(output.is_error);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
 
+            assert_eq!(output.details, None);
             assert!(
                 matches!(output.content.as_slice(), [ContentBlock::Text(_)]),
                 "Expected text output, got {:?}",
                 output.content
             );
             if let [ContentBlock::Text(text)] = output.content.as_slice() {
-                assert!(text.text.contains("blocked"));
+                assert_eq!(text.text, "Tool execution blocked: blocked in test");
             }
         });
     }
@@ -1684,9 +1668,9 @@ mod extensions_integration_tests {
             let entry_path = temp_dir.path().join("ext.mjs");
             std::fs::write(
                 &entry_path,
-                r#"
+                r"
                 export default function init(_pi) {}
-                "#,
+                ",
             )
             .expect("write extension entry");
 
@@ -1824,10 +1808,19 @@ mod extensions_integration_tests {
 
             assert!(is_error);
             assert!(output.is_error);
+            assert_eq!(output.details, None);
             assert!(
                 !temp_dir.path().join("blocked.txt").exists(),
                 "expected bash command not to run when blocked"
             );
+            assert!(
+                matches!(output.content.as_slice(), [ContentBlock::Text(_)]),
+                "Expected text output, got {:?}",
+                output.content
+            );
+            if let [ContentBlock::Text(text)] = output.content.as_slice() {
+                assert_eq!(text.text, "Tool execution blocked: blocked bash in test");
+            }
         });
     }
 }
