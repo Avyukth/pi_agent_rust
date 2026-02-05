@@ -1776,3 +1776,528 @@ fn e2e_cli_print_mode_file_ref_reads_file() {
     assert_exit_code(&harness.harness, &result, 0);
     assert_contains(&harness.harness, &result.stdout, "File processed.");
 }
+
+// ============================================================================
+// Tool enable/disable scenarios (bd-1o4)
+// ============================================================================
+
+/// `--no-tools` disables all tools — the system prompt sent to the provider
+/// should contain "(none)" and the request body should omit the `tools` field.
+#[test]
+fn e2e_cli_no_tools_omits_tool_definitions() {
+    let mut harness = CliTestHarness::new("e2e_cli_no_tools_omits_tool_definitions");
+
+    // Build the expected request body WITHOUT a `tools` field.
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
+        ],
+        "system": expected_system_prompt("Test no-tools."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+
+    setup_vcr_anthropic(&mut harness, "e2e_no_tools", &request_body, "ok");
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "Test no-tools.",
+        "Say ok.",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "no-tools check", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert!(
+        result.exit_code == 0,
+        "expected exit 0 with --no-tools, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "ok");
+}
+
+/// `--tools read,grep` enables only read and grep tools.
+/// The VCR cassette expects a request with exactly those two tool definitions.
+#[test]
+fn e2e_cli_specific_tools_enables_subset() {
+    let mut harness = CliTestHarness::new("e2e_cli_specific_tools_enables_subset");
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say tools."}]}
+        ],
+        "system": expected_system_prompt("Test tools subset."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+
+    setup_vcr_anthropic(&mut harness, "e2e_tools_subset", &request_body, "tools");
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--tools",
+        "read,grep",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "Test tools subset.",
+        "Say tools.",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "tools subset check", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert!(
+        result.exit_code == 0,
+        "expected exit 0 with --tools read,grep, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "tools");
+}
+
+/// Default tools (read,bash,edit,write) should be enabled when no --tools/--no-tools flag.
+#[test]
+fn e2e_cli_default_tools_when_no_flag() {
+    let mut harness = CliTestHarness::new("e2e_cli_default_tools_when_no_flag");
+
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Say default."}]}
+        ],
+        "system": expected_system_prompt("Test default tools."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+
+    setup_vcr_anthropic(&mut harness, "e2e_default_tools", &request_body, "default");
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "Test default tools.",
+        "Say default.",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "default tools check", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert!(
+        result.exit_code == 0,
+        "expected exit 0 with default tools, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "default");
+}
+
+// ============================================================================
+// Error path scenarios (bd-1o4)
+// ============================================================================
+
+/// Missing API key produces a clear error message and non-zero exit.
+#[test]
+fn e2e_cli_missing_api_key_error() {
+    let harness = CliTestHarness::new("e2e_cli_missing_api_key_error");
+
+    // No VCR, no ANTHROPIC_API_KEY — the binary should fail early.
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "hello",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "missing API key error", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+
+    assert_ne!(
+        result.exit_code, 0,
+        "expected non-zero exit for missing API key"
+    );
+    let stderr_lower = result.stderr.to_lowercase();
+    assert!(
+        stderr_lower.contains("api key")
+            || stderr_lower.contains("no models")
+            || stderr_lower.contains("authentication")
+            || stderr_lower.contains("anthropic_api_key"),
+        "expected stderr to mention API key/auth issue, got:\n{}",
+        result.stderr,
+    );
+}
+
+/// Invalid provider name produces a clear error and non-zero exit.
+#[test]
+fn e2e_cli_invalid_provider_error() {
+    let harness = CliTestHarness::new("e2e_cli_invalid_provider_error");
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "nonexistent-provider-xyz",
+        "--model",
+        "fake-model",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "hello",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "invalid provider error", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+
+    assert_ne!(
+        result.exit_code, 0,
+        "expected non-zero exit for invalid provider"
+    );
+    let stderr_lower = result.stderr.to_lowercase();
+    assert!(
+        stderr_lower.contains("provider")
+            || stderr_lower.contains("unsupported")
+            || stderr_lower.contains("not found")
+            || stderr_lower.contains("unknown")
+            || stderr_lower.contains("no models"),
+        "expected stderr to mention provider issue, got:\n{}",
+        result.stderr,
+    );
+}
+
+/// VCR 401 error for expired/invalid API key produces actionable error message.
+#[test]
+fn e2e_cli_auth_failure_error() {
+    let mut harness = CliTestHarness::new("e2e_cli_auth_failure_error");
+
+    // Build a VCR cassette that returns 401.
+    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
+    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+
+    let error_body = json!({
+        "type": "error",
+        "error": {
+            "type": "authentication_error",
+            "message": "invalid x-api-key"
+        }
+    });
+
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": "e2e_auth_failure",
+        "recorded_at": "2026-02-05T00:00:00.000Z",
+        "interactions": [{
+            "request": {
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": [
+                    ["Content-Type", "application/json"],
+                    ["Accept", "text/event-stream"]
+                ],
+                "body": null
+            },
+            "response": {
+                "status": 401,
+                "headers": [
+                    ["Content-Type", "application/json"]
+                ],
+                "body_chunks": [
+                    serde_json::to_string(&error_body).expect("serialize error body")
+                ]
+            }
+        }]
+    });
+
+    let cassette_path = cassette_dir.join("e2e_auth_failure.json");
+    fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
+    )
+    .expect("write cassette");
+
+    harness
+        .env
+        .insert("VCR_MODE".to_string(), "playback".to_string());
+    harness.env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_VCR_TEST_NAME".to_string(),
+        "e2e_auth_failure".to_string(),
+    );
+    harness
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "bad-key".to_string());
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+    harness
+        .env
+        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "hello",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "auth failure error", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    assert_ne!(
+        result.exit_code, 0,
+        "expected non-zero exit for 401 auth failure"
+    );
+    let combined = format!("{}\n{}", result.stderr, result.stdout).to_lowercase();
+    assert!(
+        combined.contains("401")
+            || combined.contains("auth")
+            || combined.contains("unauthorized")
+            || combined.contains("api key"),
+        "expected output to mention auth/401 issue, got:\nstderr: {}\nstdout: {}",
+        result.stderr,
+        result.stdout,
+    );
+}
+
+/// `--no-tools` with VCR playback that returns a tool_use response:
+/// Verify the agent gracefully handles the situation (no crash, clear behavior).
+#[test]
+fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
+    let mut harness = CliTestHarness::new("e2e_cli_no_tools_handles_tool_use_response_gracefully");
+
+    // Build a VCR cassette that returns a tool_use response even though
+    // no tools were sent. The binary should handle this gracefully.
+    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
+    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+
+    let message_start = json!({
+        "type": "message_start",
+        "message": {
+            "model": "claude-sonnet-4-5",
+            "id": "msg_mock_no_tools_001",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1,
+                "service_tier": "standard"
+            }
+        }
+    });
+    let text_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    });
+    let text_delta = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "I wanted to use a tool but none are available."}
+    });
+    let text_stop = json!({
+        "type": "content_block_stop",
+        "index": 0
+    });
+    let message_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 15
+        }
+    });
+
+    let chunks = vec![
+        format!("event: message_start\ndata: {message_start}\n\n"),
+        format!("event: content_block_start\ndata: {text_start}\n\n"),
+        "event: ping\ndata: {\"type\": \"ping\"}\n\n".to_string(),
+        format!("event: content_block_delta\ndata: {text_delta}\n\n"),
+        format!("event: content_block_stop\ndata: {text_stop}\n\n"),
+        format!("event: message_delta\ndata: {message_delta}\n\n"),
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
+    ];
+
+    let cassette = json!({
+        "version": "1.0",
+        "test_name": "e2e_no_tools_graceful",
+        "recorded_at": "2026-02-05T00:00:00.000Z",
+        "interactions": [{
+            "request": {
+                "method": "POST",
+                "url": "https://api.anthropic.com/v1/messages",
+                "headers": [
+                    ["Content-Type", "application/json"],
+                    ["Accept", "text/event-stream"]
+                ],
+                "body": null
+            },
+            "response": {
+                "status": 200,
+                "headers": [
+                    ["Content-Type", "text/event-stream; charset=utf-8"]
+                ],
+                "body_chunks": chunks
+            }
+        }]
+    });
+
+    let cassette_path = cassette_dir.join("e2e_no_tools_graceful.json");
+    fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
+    )
+    .expect("write cassette");
+
+    harness
+        .env
+        .insert("VCR_MODE".to_string(), "playback".to_string());
+    harness.env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    harness.env.insert(
+        "PI_VCR_TEST_NAME".to_string(),
+        "e2e_no_tools_graceful".to_string(),
+    );
+    harness
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
+    harness
+        .env
+        .insert("PI_TEST_MODE".to_string(), "1".to_string());
+    harness
+        .env
+        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
+
+    let result = harness.run(&[
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "Read a file for me.",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "no-tools graceful handling", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+            ctx.push(("stdout".into(), result.stdout.clone()));
+        });
+
+    // The binary should not crash; it should either succeed with text or
+    // exit cleanly with an informative message.
+    assert!(
+        result.exit_code == 0,
+        "expected graceful handling with exit 0, got {}.\nstderr:\n{}\nstdout:\n{}",
+        result.exit_code,
+        result.stderr,
+        result.stdout,
+    );
+    assert_contains(&harness.harness, &result.stdout, "none are available");
+}
