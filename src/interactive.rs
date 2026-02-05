@@ -47,12 +47,13 @@ use crate::autocomplete::{
 use crate::config::{Config, SettingsScope};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionSession,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
+    ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
     ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent,
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, ImageContent, Message as ModelMessage,
+    AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
     StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
