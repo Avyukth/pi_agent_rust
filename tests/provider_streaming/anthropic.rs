@@ -218,35 +218,32 @@ async fn run_scenario(scenario: Scenario) {
     let recorder = VcrRecorder::new_with(scenario.name, mode, &cassette_dir);
     let client = Client::new().with_vcr(recorder);
     let mut provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
-    #[allow(clippy::option_if_let_else)] // closure would capture `provider` by move
-    let _mock_server = if is_recording {
-        if let Some(expectation) = error_expectation.as_ref() {
-            let server = harness.start_mock_http_server();
-            let body = json!({
-                "type": "error",
-                "error": {
-                    "type": "test_error",
-                    "message": format!("Synthetic HTTP {} for VCR recording.", expectation.status),
-                }
-            });
-            let response = if expectation.status == 429 {
-                MockHttpResponse {
-                    status: expectation.status,
-                    headers: vec![
-                        ("Content-Type".to_string(), "application/json".to_string()),
-                        ("retry-after".to_string(), "1".to_string()),
-                    ],
-                    body: serde_json::to_vec(&body).unwrap_or_default(),
-                }
-            } else {
-                MockHttpResponse::json(expectation.status, &body)
-            };
-            server.add_route("POST", "/v1/messages", response);
-            provider = provider.with_base_url(format!("{}/v1/messages", server.base_url()));
-            Some(server)
+    let _mock_server = if let (true, Some(expectation)) =
+        (is_recording, error_expectation.as_ref())
+    {
+        let server = harness.start_mock_http_server();
+        let body = json!({
+            "type": "error",
+            "error": {
+                "type": "test_error",
+                "message": format!("Synthetic HTTP {} for VCR recording.", expectation.status),
+            }
+        });
+        let response = if expectation.status == 429 {
+            MockHttpResponse {
+                status: expectation.status,
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("retry-after".to_string(), "1".to_string()),
+                ],
+                body: serde_json::to_vec(&body).unwrap_or_default(),
+            }
         } else {
-            None
-        }
+            MockHttpResponse::json(expectation.status, &body)
+        };
+        server.add_route("POST", "/v1/messages", response);
+        provider = provider.with_base_url(format!("{}/v1/messages", server.base_url()));
+        Some(server)
     } else {
         None
     };
