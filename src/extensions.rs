@@ -6759,14 +6759,11 @@ impl ExtensionManager {
     /// ensures individual operations don't outlast the overall budget.
     fn effective_timeout(&self, operation_timeout_ms: u64) -> u64 {
         let budget = self.budget();
-        match budget.deadline {
-            Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(wall_now());
-                let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
-                operation_timeout_ms.min(remaining_ms)
-            }
-            None => operation_timeout_ms,
-        }
+        budget.deadline.map_or(operation_timeout_ms, |deadline| {
+            let now = wall_now();
+            let remaining_ms = deadline.as_millis().saturating_sub(now.as_millis());
+            operation_timeout_ms.min(remaining_ms)
+        })
     }
 
     /// Shut down the extension runtime with a cleanup budget.
@@ -7079,6 +7076,7 @@ impl ExtensionManager {
         args: &str,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
         let runtime = self
             .js_runtime()
             .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
@@ -7406,6 +7404,7 @@ impl ExtensionManager {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
         let runtime = self
             .js_runtime()
             .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
@@ -10015,6 +10014,152 @@ mod tests {
         });
     }
 
+    #[test]
+    fn register_provider_oauth_config_extracted() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-oauth",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "oauth-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.oauth-llm.com/v1",
+                    "oauth": {
+                        "authUrl": "https://auth.oauth-llm.com/authorize",
+                        "tokenUrl": "https://auth.oauth-llm.com/token",
+                        "clientId": "client-abc",
+                        "scopes": ["read", "write", "admin"],
+                        "redirectUri": "http://localhost:9999/callback"
+                    },
+                    "models": [
+                        { "id": "oauth-model-1", "name": "OAuth Model" }
+                    ]
+                }),
+            )
+            .await;
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            let oauth = entry
+                .oauth_config
+                .as_ref()
+                .expect("oauth_config should be present");
+            assert_eq!(oauth.auth_url, "https://auth.oauth-llm.com/authorize");
+            assert_eq!(oauth.token_url, "https://auth.oauth-llm.com/token");
+            assert_eq!(oauth.client_id, "client-abc");
+            assert_eq!(oauth.scopes, vec!["read", "write", "admin"]);
+            assert_eq!(
+                oauth.redirect_uri.as_deref(),
+                Some("http://localhost:9999/callback")
+            );
+        });
+    }
+
+    #[test]
+    fn register_provider_without_oauth_config_has_none() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-no-oauth",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "plain-llm",
+                    "api": "anthropic-messages",
+                    "baseUrl": "https://api.plain-llm.com/v1",
+                    "models": [
+                        { "id": "plain-model", "name": "Plain Model" }
+                    ]
+                }),
+            )
+            .await;
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].oauth_config.is_none());
+        });
+    }
+
+    #[test]
+    fn register_provider_oauth_missing_required_fields_ignored() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-bad-oauth",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "bad-oauth-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.bad.com/v1",
+                    "oauth": {
+                        "authUrl": "https://auth.bad.com/authorize",
+                        "tokenUrl": "https://auth.bad.com/token"
+                    },
+                    "models": [
+                        { "id": "bad-model", "name": "Bad Model" }
+                    ]
+                }),
+            )
+            .await;
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            assert!(entries[0].oauth_config.is_none());
+        });
+    }
+
+    #[test]
+    fn register_provider_oauth_no_redirect_uri() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-no-redirect",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "no-redirect-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.nr.com/v1",
+                    "oauth": {
+                        "authUrl": "https://auth.nr.com/authorize",
+                        "tokenUrl": "https://auth.nr.com/token",
+                        "clientId": "client-nr"
+                    },
+                    "models": [
+                        { "id": "nr-model", "name": "NR Model" }
+                    ]
+                }),
+            )
+            .await;
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            let oauth = entries[0]
+                .oauth_config
+                .as_ref()
+                .expect("oauth should be present");
+            assert_eq!(oauth.client_id, "client-nr");
+            assert!(oauth.redirect_uri.is_none());
+            assert!(oauth.scopes.is_empty());
+        });
+    }
+
     // --- registerShortcut tests ---
 
     #[test]
@@ -11362,6 +11507,52 @@ mod tests {
     }
 
     #[test]
+    fn effective_timeout_no_budget_returns_operation_timeout() {
+        let manager = ExtensionManager::new();
+        assert_eq!(manager.effective_timeout(5_000), 5_000);
+        assert_eq!(manager.effective_timeout(30_000), 30_000);
+    }
+
+    #[test]
+    fn effective_timeout_with_tight_budget_caps_timeout() {
+        // Set a budget that expires 2 seconds from now.
+        let budget = Budget {
+            deadline: Some(wall_now() + Duration::from_secs(2)),
+            ..Budget::INFINITE
+        };
+        let manager = ExtensionManager::with_budget(budget);
+        // A 30s operation timeout should be capped to ~2s.
+        let effective = manager.effective_timeout(30_000);
+        assert!(effective <= 2_100, "expected <=2100ms, got {effective}");
+        assert!(effective >= 1_000, "expected >=1000ms, got {effective}");
+    }
+
+    #[test]
+    fn effective_timeout_with_expired_budget_returns_zero() {
+        // Set a budget with a deadline in the past.
+        let budget = Budget {
+            deadline: Some(wall_now()),
+            ..Budget::INFINITE
+        };
+        let manager = ExtensionManager::with_budget(budget);
+        // Should return 0 (or close to it) since the deadline has passed.
+        let effective = manager.effective_timeout(30_000);
+        assert!(effective <= 1, "expected ~0ms, got {effective}");
+    }
+
+    #[test]
+    fn effective_timeout_takes_min_of_budget_and_operation() {
+        // Budget with a far-off deadline (60s) — operation timeout (5s) wins.
+        let budget = Budget {
+            deadline: Some(wall_now() + Duration::from_secs(60)),
+            ..Budget::INFINITE
+        };
+        let manager = ExtensionManager::with_budget(budget);
+        let effective = manager.effective_timeout(5_000);
+        assert_eq!(effective, 5_000);
+    }
+
+    #[test]
     fn extension_manager_shutdown_without_runtime_is_noop() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
@@ -11604,7 +11795,7 @@ mod tests {
 
     mod budget_tests {
         use super::*;
-        use asupersync::sync::oneshot;
+        use asupersync::channel::oneshot;
 
         #[test]
         fn cx_with_deadline_has_finite_budget() {
@@ -11619,9 +11810,13 @@ mod tests {
                 let deadline = budget.deadline.unwrap();
                 let expected = before + Duration::from_millis(500);
                 // Deadline should be within 100ms of expected (accounting for wall clock drift).
+                let delta_ns = if deadline >= expected {
+                    deadline.duration_since(expected)
+                } else {
+                    expected.duration_since(deadline)
+                };
                 assert!(
-                    deadline >= expected - Duration::from_millis(100)
-                        && deadline <= expected + Duration::from_millis(100),
+                    u128::from(delta_ns) <= Duration::from_millis(100).as_nanos(),
                     "deadline {deadline:?} should be ~500ms after {before:?}"
                 );
             });
@@ -11650,7 +11845,7 @@ mod tests {
                 let cx = cx_with_deadline(50); // 50ms deadline
                 let start = wall_now();
                 let result = rx.recv(&cx).await;
-                let elapsed = wall_now() - start;
+                let elapsed = Duration::from_nanos(wall_now().duration_since(start));
                 assert!(result.is_err(), "recv should fail when deadline expires");
                 // Should complete in roughly 50ms, not hang forever.
                 assert!(
