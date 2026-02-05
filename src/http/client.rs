@@ -168,7 +168,10 @@ impl<'a> RequestBuilder<'a> {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
-            let sleep_fut = sleep(wall_now(), duration).fuse();
+            let now = asupersync::Cx::current()
+                .and_then(|cx| cx.timer_driver())
+                .map_or_else(wall_now, |timer| timer.now());
+            let sleep_fut = sleep(now, duration).fuse();
             let send_fut = send_fut.fuse();
             futures::pin_mut!(sleep_fut, send_fut);
 

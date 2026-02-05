@@ -16,6 +16,8 @@ use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -50,8 +52,82 @@ fn manifest_path() -> PathBuf {
     project_root().join("tests/ext_conformance/VALIDATED_MANIFEST.json")
 }
 
+fn determinism_extension_path() -> PathBuf {
+    project_root().join("tests/fixtures/determinism_extension.ts")
+}
+
 const fn bun_path() -> &'static str {
     "/home/ubuntu/.bun/bin/bun"
+}
+
+const DEFAULT_DETERMINISTIC_TIME_MS: &str = "1700000000000";
+const DEFAULT_DETERMINISTIC_TIME_STEP_MS: &str = "1";
+const DEFAULT_DETERMINISTIC_RANDOM_SEED: &str = "1337";
+const DEFAULT_DETERMINISTIC_CWD: &str = "/tmp/ext-conformance-test";
+const DEFAULT_DETERMINISTIC_HOME: &str = "/tmp/ext-conformance-home";
+
+struct DeterministicSettings {
+    time_ms: String,
+    time_step_ms: String,
+    random_seed: String,
+    random_value: Option<String>,
+    cwd: String,
+    home: String,
+}
+
+fn env_or_default(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .filter(|val| !val.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn deterministic_settings() -> DeterministicSettings {
+    let random_env = std::env::var("PI_DETERMINISTIC_RANDOM")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
+    let seed_env = std::env::var("PI_DETERMINISTIC_RANDOM_SEED")
+        .ok()
+        .filter(|val| !val.trim().is_empty());
+    let random_value = if random_env.is_some() {
+        random_env
+    } else if seed_env.is_some() {
+        None
+    } else {
+        Some("0.5".to_string())
+    };
+    DeterministicSettings {
+        time_ms: env_or_default("PI_DETERMINISTIC_TIME_MS", DEFAULT_DETERMINISTIC_TIME_MS),
+        time_step_ms: env_or_default(
+            "PI_DETERMINISTIC_TIME_STEP_MS",
+            DEFAULT_DETERMINISTIC_TIME_STEP_MS,
+        ),
+        random_seed: env_or_default(
+            "PI_DETERMINISTIC_RANDOM_SEED",
+            DEFAULT_DETERMINISTIC_RANDOM_SEED,
+        ),
+        random_value,
+        cwd: env_or_default("PI_DETERMINISTIC_CWD", DEFAULT_DETERMINISTIC_CWD),
+        home: env_or_default("PI_DETERMINISTIC_HOME", DEFAULT_DETERMINISTIC_HOME),
+    }
+}
+
+fn ensure_deterministic_dirs(settings: &DeterministicSettings) {
+    let _ = fs::create_dir_all(&settings.cwd);
+    let _ = fs::create_dir_all(&settings.home);
+}
+
+fn deterministic_random_label(settings: &DeterministicSettings) -> String {
+    if let Some(value) = settings.random_value.as_deref() {
+        if let Ok(parsed) = value.parse::<f64>() {
+            return format!("{parsed:.6}");
+        }
+        return value.to_string();
+    }
+    let seed: u32 = settings.random_seed.parse().unwrap_or(0);
+    let next = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+    let rand = f64::from(next) / 4_294_967_296.0;
+    format!("{rand:.6}")
 }
 
 fn ts_oracle_node_path() -> &'static Path {
@@ -93,50 +169,92 @@ fn ts_oracle_node_path() -> &'static Path {
     })
 }
 
+/// Get extensions filtered by source tier.
+fn extensions_by_tier(tier: &str) -> Vec<(String, String)> {
+    let data =
+        std::fs::read_to_string(manifest_path()).expect("Failed to read VALIDATED_MANIFEST.json");
+    let json: Value = serde_json::from_str(&data).expect("Failed to parse VALIDATED_MANIFEST.json");
+    let extensions = json["extensions"]
+        .as_array()
+        .expect("manifest.extensions should be an array");
+
+    let mut out = Vec::new();
+    for entry in extensions {
+        if entry["source_tier"].as_str() != Some(tier) {
+            continue;
+        }
+        let entry_path = entry["entry_path"]
+            .as_str()
+            .expect("missing entry_path in manifest entry");
+        let path = Path::new(entry_path);
+        let mut components = path.components();
+        let Some(root) = components.next() else {
+            continue;
+        };
+        let extension_dir = root.as_os_str().to_string_lossy().to_string();
+        let remaining = components.as_path().to_string_lossy().to_string();
+        let entry_file = if remaining.is_empty() {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(entry_path)
+                .to_string()
+        } else {
+            remaining
+        };
+        out.push((extension_dir, entry_file));
+    }
+    out
+}
+
 fn official_extensions() -> &'static Vec<(String, String)> {
     static OFFICIAL: OnceLock<Vec<(String, String)>> = OnceLock::new();
-    OFFICIAL.get_or_init(|| {
-        let data = std::fs::read_to_string(manifest_path())
-            .expect("Failed to read VALIDATED_MANIFEST.json");
-        let json: Value =
-            serde_json::from_str(&data).expect("Failed to parse VALIDATED_MANIFEST.json");
-        let extensions = json["extensions"]
-            .as_array()
-            .expect("manifest.extensions should be an array");
+    OFFICIAL.get_or_init(|| extensions_by_tier("official-pi-mono"))
+}
 
-        let mut out = Vec::new();
-        for entry in extensions {
-            if entry["source_tier"].as_str() != Some("official-pi-mono") {
-                continue;
-            }
-            let entry_path = entry["entry_path"]
-                .as_str()
-                .expect("missing entry_path in official manifest entry");
-            let path = Path::new(entry_path);
-            let mut components = path.components();
-            let Some(root) = components.next() else {
-                continue;
-            };
-            let extension_dir = root.as_os_str().to_string_lossy().to_string();
-            let remaining = components.as_path().to_string_lossy().to_string();
-            let entry_file = if remaining.is_empty() {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or(entry_path)
-                    .to_string()
-            } else {
-                remaining
-            };
-            out.push((extension_dir, entry_file));
-        }
-        out
-    })
+#[allow(dead_code)]
+fn community_extensions() -> &'static Vec<(String, String)> {
+    static COMMUNITY: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    COMMUNITY.get_or_init(|| extensions_by_tier("community"))
+}
+
+#[allow(dead_code)]
+fn npm_extensions() -> &'static Vec<(String, String)> {
+    static NPM: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    NPM.get_or_init(|| extensions_by_tier("npm-registry"))
+}
+
+#[allow(dead_code)]
+fn thirdparty_extensions() -> &'static Vec<(String, String)> {
+    static THIRDPARTY: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    THIRDPARTY.get_or_init(|| extensions_by_tier("third-party-github"))
+}
+
+#[test]
+fn validated_manifest_has_all_tiers() {
+    assert!(
+        !official_extensions().is_empty(),
+        "expected official-pi-mono extensions in validated manifest"
+    );
+    assert!(
+        !community_extensions().is_empty(),
+        "expected community extensions in validated manifest"
+    );
+    assert!(
+        !npm_extensions().is_empty(),
+        "expected npm-registry extensions in validated manifest"
+    );
+    assert!(
+        !thirdparty_extensions().is_empty(),
+        "expected third-party-github extensions in validated manifest"
+    );
 }
 
 // ─── TS oracle runner ────────────────────────────────────────────────────────
 
 /// Run the TS oracle harness on an extension and parse the JSON output.
 fn run_ts_oracle(extension_path: &Path) -> Value {
+    let settings = deterministic_settings();
+    ensure_deterministic_dirs(&settings);
     let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
         Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
             "{}:{}:{}",
@@ -151,15 +269,23 @@ fn run_ts_oracle(extension_path: &Path) -> Value {
         )),
     };
 
-    let output = Command::new(bun_path())
-        .arg("run")
+    let mut cmd = Command::new(bun_path());
+    cmd.arg("run")
         .arg(ts_oracle_script())
         .arg(extension_path)
-        .arg("/tmp")
+        .arg(&settings.cwd)
         .current_dir(pi_mono_root())
         .env("NODE_PATH", node_path.as_ref())
-        .output()
-        .expect("failed to execute TS oracle harness");
+        .env("PI_DETERMINISTIC_TIME_MS", &settings.time_ms)
+        .env("PI_DETERMINISTIC_TIME_STEP_MS", &settings.time_step_ms)
+        .env("PI_DETERMINISTIC_CWD", &settings.cwd)
+        .env("PI_DETERMINISTIC_HOME", &settings.home);
+    if let Some(random_value) = settings.random_value.as_deref() {
+        cmd.env("PI_DETERMINISTIC_RANDOM", random_value);
+    } else {
+        cmd.env("PI_DETERMINISTIC_RANDOM_SEED", &settings.random_seed);
+    }
+    let output = cmd.output().expect("failed to execute TS oracle harness");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -184,18 +310,38 @@ fn run_ts_oracle(extension_path: &Path) -> Value {
 /// registration snapshot in a format comparable to the TS oracle output.
 /// Returns `Err(message)` if the extension fails to load.
 fn load_rust_snapshot(extension_path: &Path) -> Result<Value, String> {
-    let cwd = extension_path
-        .parent()
-        .unwrap_or_else(|| Path::new("/tmp"))
-        .to_path_buf();
+    let settings = deterministic_settings();
+    ensure_deterministic_dirs(&settings);
+    let cwd = PathBuf::from(&settings.cwd);
 
     let spec = JsExtensionLoadSpec::from_entry_path(extension_path)
         .map_err(|e| format!("load spec: {e}"))?;
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let mut env = HashMap::new();
+    env.insert(
+        "PI_DETERMINISTIC_TIME_MS".to_string(),
+        settings.time_ms.clone(),
+    );
+    env.insert(
+        "PI_DETERMINISTIC_TIME_STEP_MS".to_string(),
+        settings.time_step_ms.clone(),
+    );
+    env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
+    env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
+    env.insert("HOME".to_string(), settings.home.clone());
+    if let Some(random_value) = settings.random_value {
+        env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
+    } else {
+        env.insert(
+            "PI_DETERMINISTIC_RANDOM_SEED".to_string(),
+            settings.random_seed.clone(),
+        );
+    }
     let js_config = PiJsRuntimeConfig {
-        cwd: cwd.display().to_string(),
+        cwd: settings.cwd.clone(),
+        env,
         ..Default::default()
     };
 
@@ -587,24 +733,44 @@ fn run_differential_test(extension_name: &str, entry_file: &str) {
 }
 
 /// Strict differential test that treats TS oracle failures as errors and returns a summary.
+/// Retries once on TS oracle timeout (flaky under load).
 fn run_differential_test_strict(extension_name: &str, entry_file: &str) -> Result<(), String> {
     let ext_path = artifacts_dir().join(extension_name).join(entry_file);
     if !ext_path.exists() {
         return Err(format!("extension file not found: {}", ext_path.display()));
     }
 
-    let ts_result = run_ts_oracle(&ext_path);
-    let ts_success = ts_result
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !ts_success {
-        let err = ts_result
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        return Err(format!("ts_oracle_failed: {err}"));
-    }
+    // Run TS oracle with one retry on timeout
+    let ts_result = {
+        let first_try = run_ts_oracle(&ext_path);
+        let first_success = first_try
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if first_success {
+            first_try
+        } else {
+            let err = first_try
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if err.contains("timeout") {
+                eprintln!("[{extension_name}] TS oracle timed out, retrying...");
+                let retry = run_ts_oracle(&ext_path);
+                let retry_success = retry
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if retry_success {
+                    retry
+                } else {
+                    return Err(format!("ts_oracle_failed (after retry): {err}"));
+                }
+            } else {
+                return Err(format!("ts_oracle_failed: {err}"));
+            }
+        }
+    };
 
     let rust_snapshot =
         load_rust_snapshot(&ext_path).map_err(|err| format!("rust_runtime_failed: {err}"))?;
@@ -619,7 +785,6 @@ fn run_differential_test_strict(extension_name: &str, entry_file: &str) -> Resul
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "bd-150s: official manifest diff run is not yet expected to pass; run manually with --ignored"]
 fn diff_official_manifest() {
     let filter = std::env::var("PI_OFFICIAL_FILTER").ok();
     let max = std::env::var("PI_OFFICIAL_MAX")
@@ -749,4 +914,125 @@ fn diff_status_line() {
 #[test]
 fn diff_custom_provider_anthropic() {
     run_differential_test("custom-provider-anthropic", "index.ts");
+}
+
+#[test]
+fn diff_deterministic_globals() {
+    let settings = deterministic_settings();
+    ensure_deterministic_dirs(&settings);
+    let ext_path = determinism_extension_path();
+    let ts_result = run_ts_oracle(&ext_path);
+    let ts_success = ts_result
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    assert!(ts_success, "ts oracle failed: {ts_result:?}");
+
+    let rust_snapshot = load_rust_snapshot(&ext_path).unwrap_or_else(|err| unreachable!("{err}"));
+    let diffs = diff_snapshots(&ts_result, &rust_snapshot);
+    assert!(diffs.is_empty(), "diffs: {}", diffs.join("; "));
+
+    let tools = ts_result
+        .pointer("/extension/tools")
+        .and_then(Value::as_array)
+        .expect("ts oracle tools");
+    assert_eq!(tools.len(), 1);
+    let tool = &tools[0];
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let rand_label = deterministic_random_label(&settings);
+    let expected_name = format!("determinism-{}-{}", settings.time_ms, rand_label);
+    let expected_desc = format!(
+        "now={} rand={} cwd={} home={}",
+        settings.time_ms, rand_label, settings.cwd, settings.home
+    );
+    assert_eq!(name, expected_name);
+    assert_eq!(description, expected_desc);
+}
+
+/// Run differential conformance tests on community extensions (58 extensions from pi-mono).
+/// Use `PI_COMMUNITY_FILTER` env var to filter by name substring.
+/// Use `PI_COMMUNITY_MAX` env var to limit the number of extensions to test.
+#[test]
+#[ignore = "bd-2ru2: community extensions not yet expected to pass; run manually with --ignored"]
+fn diff_community_manifest() {
+    let filter = std::env::var("PI_COMMUNITY_FILTER").ok();
+    let max = std::env::var("PI_COMMUNITY_MAX")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok());
+
+    let selected: Vec<(String, String)> = community_extensions()
+        .iter()
+        .filter(|(dir, entry)| {
+            let name = format!("{dir}/{entry}");
+            filter.as_ref().is_none_or(|needle| name.contains(needle))
+        })
+        .take(max.unwrap_or(usize::MAX))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "[diff_community_manifest] Starting (selected={} filter={:?} max={:?})",
+        selected.len(),
+        filter,
+        max
+    );
+
+    let mut failures = Vec::new();
+    let mut passes: u32 = 0;
+    for (idx, (extension_dir, entry_file)) in selected.iter().enumerate() {
+        let name = format!("{extension_dir}/{entry_file}");
+        eprintln!(
+            "[diff_community_manifest] {}/{}: {name}",
+            idx + 1,
+            selected.len()
+        );
+        let start = std::time::Instant::now();
+        match run_differential_test_strict(extension_dir, entry_file) {
+            Ok(()) => passes += 1,
+            Err(err) => failures.push(format!("{name}: {err}")),
+        }
+        eprintln!(
+            "[diff_community_manifest] {}/{}: done in {:?}",
+            idx + 1,
+            selected.len(),
+            start.elapsed()
+        );
+    }
+
+    eprintln!(
+        "[diff_community_manifest] Results: {} passed, {} failed out of {} total",
+        passes,
+        failures.len(),
+        selected.len()
+    );
+
+    // For community extensions, we track failures but don't assert yet
+    // as many may fail due to missing features or extension bugs
+    if !failures.is_empty() {
+        eprintln!(
+            "Community conformance failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    // Target: 90%+ pass rate for community extensions
+    let total = u32::try_from(selected.len()).unwrap_or(u32::MAX);
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        f64::from(passes) / f64::from(total) * 100.0
+    };
+    eprintln!("[diff_community_manifest] Pass rate: {pass_rate:.1}%");
+
+    assert!(
+        failures.is_empty(),
+        "Community conformance failures ({}):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }
