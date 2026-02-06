@@ -45,15 +45,25 @@ fn main() {
 }
 
 fn main_impl() -> Result<()> {
-    // Initialize logging
+    // Parse CLI arguments
+    let cli = cli::Cli::parse();
+
+    // Early-validate theme file paths so invalid paths error before --version.
+    // Named themes (without .json, /, ~) are validated later after resource loading.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+
+    if cli.version {
+        print_version();
+        return Ok(());
+    }
+
+    // Initialize logging (skip for ultra-fast paths like --version)
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
         .with_writer(io::stderr)
         .init();
-
-    // Parse CLI arguments
-    let cli = cli::Cli::parse();
 
     // Run the application
     let reactor = create_reactor()?;
@@ -79,22 +89,18 @@ fn print_error_with_hints(err: &anyhow::Error) {
     eprintln!("{err}");
 }
 
+fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> {
+    if let Some(theme_spec) = theme_spec {
+        if pi::theme::looks_like_theme_path(theme_spec) {
+            pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    // Early-validate theme file paths so invalid paths error before --version.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
-    if let Some(theme_spec) = cli.theme.as_deref() {
-        if pi::theme::looks_like_theme_path(theme_spec) {
-            pi::theme::Theme::resolve_spec(theme_spec, &cwd).map_err(anyhow::Error::new)?;
-        }
-    }
-
-    if cli.version {
-        print_version();
-        return Ok(());
-    }
 
     if let Some(command) = cli.command.take() {
         handle_subcommand(command, &cwd).await?;
