@@ -188,7 +188,7 @@ impl PermissionStore {
     }
 
     /// List all persisted decisions grouped by extension.
-    pub fn list(&self) -> &HashMap<String, HashMap<String, PersistedDecision>> {
+    pub const fn list(&self) -> &HashMap<String, HashMap<String, PersistedDecision>> {
         &self.decisions
     }
 
@@ -203,7 +203,7 @@ impl PermissionStore {
             .map(|(ext_id, by_cap)| {
                 let filtered: HashMap<String, bool> = by_cap
                     .iter()
-                    .filter(|(_, dec)| dec.expires_at.as_ref().map_or(true, |exp| now <= *exp))
+                    .filter(|(_, dec)| dec.expires_at.as_ref().is_none_or(|exp| now <= *exp))
                     .map(|(cap, dec)| (cap.clone(), dec.allow))
                     .collect();
                 (ext_id.clone(), filtered)
@@ -289,7 +289,7 @@ fn now_iso8601() -> String {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Algorithm from Howard Hinnant's `chrono`-compatible date library.
     let z = days + 719_468;
     let era = z / 146_097;
