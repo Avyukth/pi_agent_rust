@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn for_request_with_budget_creates_valid_context() {
-        let budget = Budget::new(100);
+        let budget = Budget::new().with_poll_quota(100);
         let cx = AgentCx::for_request_with_budget(budget);
         let _ = cx.cx();
     }

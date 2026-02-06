@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn parse_npm_registry_response_no_dist_tags() {
-        let json = r#"{}"#;
+        let json = "{}";
         let meta = parse_npm_registry_response(json).unwrap();
         assert_eq!(meta.latest_version, None);
         assert_eq!(meta.last_publish, None);
