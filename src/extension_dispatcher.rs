@@ -171,7 +171,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         let cwd = options
             .get("cwd")
             .and_then(serde_json::Value::as_str)
-            .map(ToString::to_string);
+            .map_or_else(|| self.cwd.clone(), PathBuf::from);
         let timeout_ms = options
             .get("timeout")
             .and_then(serde_json::Value::as_u64)
@@ -195,11 +195,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .args(&args)
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-
-                if let Some(cwd) = cwd.as_ref() {
-                    command.current_dir(cwd);
-                }
+                    .stderr(Stdio::piped())
+                    .current_dir(&cwd);
 
                 let mut child = command.spawn().map_err(|err| err.to_string())?;
                 let pid = child.id();

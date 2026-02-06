@@ -77,6 +77,13 @@ jobs:
         env:
           PI_BENCH_BINARY: target/release/pi
 
+      - name: Generate PiJS workload perf data (JSONL)
+        run: |
+          set -euxo pipefail
+          mkdir -p target/perf
+          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/pijs_workload.jsonl
+          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/pijs_workload.jsonl
+
       - name: Generate benchmark summary
         run: |
           echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
@@ -103,7 +110,11 @@ jobs:
             done
           fi
 
+      - name: Perf budget gate
+        run: cargo test --test perf_budgets -- --nocapture
+
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ github.sha }}

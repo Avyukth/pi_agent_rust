@@ -173,6 +173,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
   benchmark:
@@ -181,30 +182,33 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release binary (for system benchmarks)
+      - name: Build release binary
         run: cargo build --release
 
-      - name: Run benchmarks
+      - name: Check binary size budget
         run: |
-          # Run all benchmarks, save results
-          cargo bench -- --noplot --save-baseline current
-
-          # Check binary size budget
           SIZE_MB=$(stat --printf="%s" target/release/pi | awk '{printf "%.2f", $1/1024/1024}')
           echo "Binary size: ${SIZE_MB}MB"
           if (( $(echo "$SIZE_MB > 20" | bc -l) )); then
             echo "::error::Binary size ${SIZE_MB}MB exceeds 20MB budget"
             exit 1
           fi
+
+      - name: Run benchmarks
+        run: |
+          cargo bench --bench tools -- --noplot
+          cargo bench --bench extensions -- --noplot
+          cargo bench --bench system -- --noplot
+
+      - name: Generate PiJS workload perf data (JSONL)
+        run: |
+          set -euxo pipefail
+          mkdir -p target/perf
+          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/pijs_workload.jsonl
+          cargo run --release --bin pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/pijs_workload.jsonl
+
+      - name: Perf budget gate
+        run: cargo test --test perf_budgets -- --nocapture
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
