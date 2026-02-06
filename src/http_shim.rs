@@ -138,9 +138,9 @@ class ClientRequest extends EventEmitter {
     if (this._timeoutMs) request.timeout = this._timeoutMs;
 
     // Use pi.http() hostcall if available
-    if (typeof globalThis.__pi_bridge === 'object' && typeof globalThis.__pi_bridge.http === 'function') {
+    if (typeof globalThis.pi === 'object' && typeof globalThis.pi.http === 'function') {
       try {
-        const promise = globalThis.__pi_bridge.http(request);
+        const promise = globalThis.pi.http(request);
         if (promise && typeof promise.then === 'function') {
           promise.then(
             (result) => this._handleResponse(result),
