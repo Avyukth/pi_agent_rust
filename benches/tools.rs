@@ -9,8 +9,10 @@
 //! - `sse_parse_100_events`: <100μs
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use futures::StreamExt as _;
 use std::fmt::Write as _;
 use std::hint::black_box;
+use std::time::Duration;
 
 // ============================================================================
 // Test Data Builders
@@ -37,6 +39,10 @@ fn build_sse_data(event_count: usize) -> String {
     }
     s.push_str("data: [DONE]\n\n");
     s
+}
+
+fn chunk_bytes(input: &[u8], chunk_size: usize) -> Vec<Vec<u8>> {
+    input.chunks(chunk_size).map(<[u8]>::to_vec).collect()
 }
 
 // ============================================================================
@@ -114,6 +120,43 @@ fn bench_sse_parsing(c: &mut Criterion) {
 }
 
 // ============================================================================
+// SSE Streaming Benchmarks (SseStream)
+// ============================================================================
+
+fn bench_sse_stream(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sse_stream");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(5));
+
+    let event_count = 1000;
+    let data = build_sse_data(event_count);
+    let data_bytes = data.as_bytes();
+
+    for chunk_size in [64usize, 1024, 4096] {
+        let chunks = chunk_bytes(data_bytes, chunk_size);
+
+        group.throughput(Throughput::Elements(event_count as u64));
+        group.bench_function(BenchmarkId::new("parse", chunk_size), |b| {
+            b.iter(|| {
+                let stream = futures::stream::iter(chunks.iter().cloned().map(Ok));
+                let mut sse = pi::sse::SseStream::new(stream);
+                let parsed = futures::executor::block_on(async move {
+                    let mut count = 0usize;
+                    while let Some(event) = sse.next().await {
+                        let _event = event.expect("ok");
+                        count += 1;
+                    }
+                    count
+                });
+                black_box(parsed);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Groups
 // ============================================================================
 
@@ -122,5 +165,6 @@ criterion_group!(
     bench_truncate_head,
     bench_truncate_tail,
     bench_sse_parsing,
+    bench_sse_stream,
 );
 criterion_main!(benches);

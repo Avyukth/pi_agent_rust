@@ -1298,6 +1298,7 @@ pub(crate) async fn run_bash_command(
 
     let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
     let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
 
     let mut timed_out = false;
     let mut exit_code: Option<i32> = None;
@@ -3110,6 +3111,9 @@ fn concat_chunks(chunks: &VecDeque<Vec<u8>>) -> Vec<u8> {
 
 struct BashOutputState {
     total_bytes: usize,
+    line_count: usize,
+    start_time: std::time::Instant,
+    timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
     temp_file: Option<asupersync::fs::File>,
     chunks: VecDeque<Vec<u8>>,
@@ -3118,9 +3122,12 @@ struct BashOutputState {
 }
 
 impl BashOutputState {
-    const fn new(max_chunks_bytes: usize) -> Self {
+    fn new(max_chunks_bytes: usize) -> Self {
         Self {
             total_bytes: 0,
+            line_count: 0,
+            start_time: std::time::Instant::now(),
+            timeout_ms: None,
             temp_file_path: None,
             temp_file: None,
             chunks: VecDeque::new(),
@@ -3136,6 +3143,9 @@ async fn process_bash_chunk(
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
 ) -> Result<()> {
     state.total_bytes = state.total_bytes.saturating_add(chunk.len());
+    state.line_count = state
+        .line_count
+        .saturating_add(memchr::memchr_iter(b'\n', chunk).count());
 
     if state.total_bytes > DEFAULT_MAX_BYTES && state.temp_file.is_none() {
         let id_full = Uuid::new_v4().simple().to_string();
@@ -3185,15 +3195,23 @@ async fn process_bash_chunk(
             );
         }
 
-        let details = if details_map.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(details_map))
-        };
+        // Emit progress metrics for TUI display.
+        let elapsed_ms = state.start_time.elapsed().as_millis();
+        let mut progress = serde_json::Map::new();
+        progress.insert("elapsedMs".to_string(), serde_json::json!(elapsed_ms));
+        progress.insert("lineCount".to_string(), serde_json::json!(state.line_count));
+        progress.insert(
+            "byteCount".to_string(),
+            serde_json::json!(state.total_bytes),
+        );
+        if let Some(timeout) = state.timeout_ms {
+            progress.insert("timeoutMs".to_string(), serde_json::json!(timeout));
+        }
+        details_map.insert("progress".to_string(), serde_json::Value::Object(progress));
 
         callback(ToolUpdate {
             content: vec![ContentBlock::Text(TextContent::new(truncation.content))],
-            details,
+            details: Some(serde_json::Value::Object(details_map)),
         });
     }
 
