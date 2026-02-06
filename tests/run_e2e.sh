@@ -234,16 +234,31 @@ for provider in "${TARGET_PROVIDERS[@]}"; do
 
   if [[ -f "$results_file" ]]; then
     status="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .status' "$results_file" | tail -n 1)"
-    elapsed_ms="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .elapsed_ms' "$results_file" | tail -n 1)"
+    elapsed_ms="$(jq -r --arg provider "$provider" '
+      select(.provider == $provider)
+      | (.elapsedMs // .elapsed_ms)
+    ' "$results_file" | tail -n 1)"
     input_tokens="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .usage.input' "$results_file" | tail -n 1)"
     output_tokens="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .usage.output' "$results_file" | tail -n 1)"
-    total_tokens="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .usage.total_tokens' "$results_file" | tail -n 1)"
+    total_tokens="$(jq -r --arg provider "$provider" '
+      select(.provider == $provider)
+      | (.usage.totalTokens // .usage.total_tokens)
+    ' "$results_file" | tail -n 1)"
   fi
 
   if [[ -f "$costs_file" ]]; then
-    estimated_cost="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .estimated_cost_usd // "n/a"' "$costs_file" | tail -n 1)"
-    total_cost="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .total_cost_usd // "n/a"' "$costs_file" | tail -n 1)"
-    cost_source="$(jq -r --arg provider "$provider" 'select(.provider == $provider) | .cost_source // "n/a"' "$costs_file" | tail -n 1)"
+    estimated_cost="$(jq -r --arg provider "$provider" '
+      select(.provider == $provider)
+      | (.estimatedCostUsd // .estimated_cost_usd // "n/a")
+    ' "$costs_file" | tail -n 1)"
+    total_cost="$(jq -r --arg provider "$provider" '
+      select(.provider == $provider)
+      | (.totalCostUsd // .total_cost_usd // "n/a")
+    ' "$costs_file" | tail -n 1)"
+    cost_source="$(jq -r --arg provider "$provider" '
+      select(.provider == $provider)
+      | (.costSource // .cost_source // "n/a")
+    ' "$costs_file" | tail -n 1)"
   fi
 
   verdict="FAIL"

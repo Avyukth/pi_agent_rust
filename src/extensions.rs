@@ -2269,22 +2269,35 @@ mod wasm_host {
         fn hostcall_outcome_to_result(
             outcome: HostcallOutcome,
         ) -> std::result::Result<String, String> {
-            match outcome {
-                HostcallOutcome::Success(value) => serde_json::to_string(&value).map_err(|err| {
-                    Self::host_error_json(
-                        HostCallErrorCode::Internal,
-                        format!("Failed to serialize hostcall output: {err}"),
-                        None,
-                        None,
-                    )
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => serde_json::json!({
+                    "sequence": sequence,
+                    "chunk": chunk,
+                    "isFinal": is_final,
                 }),
-                HostcallOutcome::Error { code, message } => Err(Self::host_error_json(
-                    Self::hostcall_outcome_code(&code),
-                    message,
+                HostcallOutcome::Error { code, message } => {
+                    return Err(Self::host_error_json(
+                        Self::hostcall_outcome_code(&code),
+                        message,
+                        None,
+                        None,
+                    ));
+                }
+            };
+
+            serde_json::to_string(&value).map_err(|err| {
+                Self::host_error_json(
+                    HostCallErrorCode::Internal,
+                    format!("Failed to serialize hostcall output: {err}"),
                     None,
                     None,
-                )),
-            }
+                )
+            })
         }
 
         async fn resolve_policy_decision(
@@ -9691,6 +9704,9 @@ mod tests {
                     );
                 }
                 other @ HostcallOutcome::Success(_) => {
+                    panic!("expected denied outcome for capability={capability}, got {other:?}");
+                }
+                other @ HostcallOutcome::StreamChunk { .. } => {
                     panic!("expected denied outcome for capability={capability}, got {other:?}");
                 }
             }

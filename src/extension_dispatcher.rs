@@ -6495,26 +6495,26 @@ mod tests {
                     Vec::new()
                 }
                 async fn set_name(&self, _name: String) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
                 async fn append_message(&self, _message: SessionMessage) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
                 async fn append_custom_entry(
                     &self,
                     _custom_type: String,
                     _data: Option<Value>,
                 ) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
                 async fn set_model(&self, _provider: String, _model_id: String) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
                 async fn get_model(&self) -> (Option<String>, Option<String>) {
                     (None, None)
                 }
                 async fn set_thinking_level(&self, _level: String) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
                 async fn get_thinking_level(&self) -> Option<String> {
                     None
@@ -6524,7 +6524,7 @@ mod tests {
                     _target_id: String,
                     _label: Option<String>,
                 ) -> Result<()> {
-                    Err(crate::error::PiError::Io(std::io::Error::other("disk full")))
+                    Err(crate::error::Error::from(std::io::Error::other("disk full")))
                 }
             }
 
