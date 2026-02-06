@@ -1109,11 +1109,7 @@ conformance_test!(
     ext_community_prateekmedia_checkpoint,
     "community/prateekmedia-checkpoint"
 );
-conformance_test!(
-    ext_community_prateekmedia_lsp,
-    "community/prateekmedia-lsp",
-    ignore
-);
+conformance_test!(ext_community_prateekmedia_lsp, "community/prateekmedia-lsp",);
 conformance_test!(
     ext_community_prateekmedia_permission,
     "community/prateekmedia-permission"
@@ -1149,9 +1145,9 @@ conformance_test!(
     "npm/aliou-pi-guardrails",
     ignore
 );
-conformance_test!(ext_npm_aliou_pi_linkup, "npm/aliou-pi-linkup", ignore);
+conformance_test!(ext_npm_aliou_pi_linkup, "npm/aliou-pi-linkup");
 conformance_test!(ext_npm_aliou_pi_processes, "npm/aliou-pi-processes", ignore);
-conformance_test!(ext_npm_aliou_pi_synthetic, "npm/aliou-pi-synthetic", ignore);
+conformance_test!(ext_npm_aliou_pi_synthetic, "npm/aliou-pi-synthetic");
 conformance_test!(ext_npm_aliou_pi_toolchain, "npm/aliou-pi-toolchain", ignore);
 conformance_test!(
     ext_npm_benvargas_pi_synthetic_provider,
@@ -1172,7 +1168,7 @@ conformance_test!(
     ignore
 );
 conformance_test!(ext_npm_juanibiapina_pi_gob, "npm/juanibiapina-pi-gob");
-conformance_test!(ext_npm_lsp_pi, "npm/lsp-pi", ignore);
+conformance_test!(ext_npm_lsp_pi, "npm/lsp-pi");
 conformance_test!(
     ext_npm_marckrenn_pi_sub_bar,
     "npm/marckrenn-pi-sub-bar",
@@ -1185,8 +1181,8 @@ conformance_test!(
 );
 conformance_test!(ext_npm_permission_pi, "npm/permission-pi");
 conformance_test!(ext_npm_pi_agentic_compaction, "npm/pi-agentic-compaction");
-conformance_test!(ext_npm_pi_amplike, "npm/pi-amplike", ignore);
-conformance_test!(ext_npm_pi_bash_confirm, "npm/pi-bash-confirm", ignore);
+conformance_test!(ext_npm_pi_amplike, "npm/pi-amplike");
+conformance_test!(ext_npm_pi_bash_confirm, "npm/pi-bash-confirm");
 conformance_test!(ext_npm_pi_brave_search, "npm/pi-brave-search", ignore);
 conformance_test!(ext_npm_pi_mermaid, "npm/pi-mermaid", ignore);
 conformance_test!(ext_npm_pi_messenger, "npm/pi-messenger");
@@ -1206,7 +1202,7 @@ conformance_test!(ext_npm_pi_watch, "npm/pi-watch", ignore);
 conformance_test!(ext_npm_pi_web_access, "npm/pi-web-access", ignore);
 conformance_test!(ext_npm_ralph_loop_pi, "npm/ralph-loop-pi");
 conformance_test!(ext_npm_repeat_pi, "npm/repeat-pi");
-conformance_test!(ext_npm_vaayne_agent_kit, "npm/vaayne-agent-kit", ignore);
+conformance_test!(ext_npm_vaayne_agent_kit, "npm/vaayne-agent-kit");
 conformance_test!(ext_npm_vaayne_pi_mcp, "npm/vaayne-pi-mcp");
 conformance_test!(ext_npm_vaayne_pi_subagent, "npm/vaayne-pi-subagent");
 conformance_test!(
@@ -1223,17 +1219,14 @@ conformance_test!(ext_subagent, "subagent");
 conformance_test!(
     ext_third_party_aliou_pi_extensions,
     "third-party/aliou-pi-extensions",
-    ignore
 );
 conformance_test!(
     ext_third_party_ben_vargas_pi_packages,
     "third-party/ben-vargas-pi-packages",
-    ignore
 );
 conformance_test!(
     ext_third_party_charles_cooper_pi_extensions,
     "third-party/charles-cooper-pi-extensions",
-    ignore
 );
 conformance_test!(
     ext_third_party_cv_pi_ssh_remote,
@@ -1255,12 +1248,10 @@ conformance_test!(
 conformance_test!(
     ext_third_party_openclaw_openclaw,
     "third-party/openclaw-openclaw",
-    ignore
 );
 conformance_test!(
     ext_third_party_pasky_pi_amplike,
     "third-party/pasky-pi-amplike",
-    ignore
 );
 conformance_test!(
     ext_third_party_qualisero_pi_agent_scip,
@@ -1274,7 +1265,6 @@ conformance_test!(
 conformance_test!(
     ext_third_party_w_winter_dot314,
     "third-party/w-winter-dot314",
-    ignore
 );
 conformance_test!(
     ext_third_party_zenobi_us_pi_dcp,
@@ -1299,7 +1289,6 @@ conformance_test!(
 conformance_test!(
     ext_agents_mikeastock_extensions,
     "agents-mikeastock/extensions",
-    ignore
 );
 conformance_test!(
     ext_community_mitsuhiko_control,
