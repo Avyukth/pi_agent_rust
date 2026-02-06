@@ -19,7 +19,7 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::extension_event_from_agent;
+use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -287,6 +287,38 @@ pub async fn run(
             Some(Arc::new(steering_fetcher)),
             Some(Arc::new(follow_fetcher)),
         );
+    }
+
+    // Set up extension UI channel for RPC mode.
+    // When extensions request UI (capability prompts, etc.), we emit them as
+    // JSON notifications so the RPC client can respond programmatically.
+    let rpc_extension_manager = {
+        let cx_ui = cx.clone();
+        let guard = session
+            .lock(&cx_ui)
+            .await
+            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        guard
+            .extensions
+            .as_ref()
+            .map(crate::extensions::ExtensionRegion::manager)
+            .cloned()
+    };
+
+    if let Some(ref manager) = rpc_extension_manager {
+        let (extension_ui_tx, extension_ui_rx) =
+            asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
+        manager.set_ui_sender(extension_ui_tx);
+
+        let out_tx_ui = out_tx.clone();
+        options.runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            while let Ok(request) = extension_ui_rx.recv(&cx).await {
+                // Emit the UI request as a JSON-RPC notification to the client.
+                let rpc_event = request.to_rpc_event();
+                let _ = out_tx_ui.send(event(&rpc_event));
+            }
+        });
     }
 
     while let Ok(line) = in_rx.recv(&cx).await {
@@ -1316,7 +1348,41 @@ pub async fn run(
             }
 
             "extension_ui_response" => {
-                let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
+                if let Some(ref manager) = rpc_extension_manager {
+                    let request_id = parsed
+                        .get("requestId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+
+                    if request_id.is_empty() {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "extension_ui_response",
+                            "Missing requestId field",
+                        ));
+                    } else {
+                        let value = parsed.get("value").cloned();
+                        let cancelled = parsed
+                            .get("cancelled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+
+                        let response = ExtensionUiResponse {
+                            id: request_id,
+                            value,
+                            cancelled,
+                        };
+                        let resolved = manager.respond_ui(response);
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "extension_ui_response",
+                            Some(json!({ "resolved": resolved })),
+                        ));
+                    }
+                } else {
+                    let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
+                }
             }
 
             _ => {

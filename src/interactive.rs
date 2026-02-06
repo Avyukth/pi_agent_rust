@@ -713,11 +713,17 @@ impl PiApp {
             chrome += 2;
         }
 
+        // Capability prompt overlay: ~8 lines (title, ext name, desc, blank, buttons, timer, help, blank).
+        if self.capability_prompt.is_some() {
+            chrome += 8;
+        }
+
         // Input area vs processing spinner.
         let show_input = self.agent_state == AgentState::Idle
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
-            && self.theme_picker.is_none();
+            && self.theme_picker.is_none()
+            && self.capability_prompt.is_none();
 
         if show_input {
             // render_input: "\n  header\n" (2 rows) + input.height() rows.
@@ -1658,6 +1664,71 @@ impl PiApp {
 
         output
     }
+
+    fn render_capability_prompt(&self, prompt: &CapabilityPromptOverlay) -> String {
+        let mut output = String::new();
+
+        // Title line.
+        let _ = writeln!(
+            output,
+            "\n  {}",
+            self.styles.title.render("Extension Permission Request")
+        );
+
+        // Extension and capability info.
+        let _ = writeln!(
+            output,
+            "  {} requests {}",
+            self.styles.accent_bold.render(&prompt.extension_id),
+            self.styles.warning_bold.render(&prompt.capability),
+        );
+
+        // Description.
+        if !prompt.description.is_empty() {
+            let _ = writeln!(
+                output,
+                "\n  {}",
+                self.styles.muted.render(&prompt.description),
+            );
+        }
+
+        // Button row.
+        output.push('\n');
+        output.push_str("  ");
+        for (idx, action) in CapabilityAction::ALL.iter().enumerate() {
+            let label = action.label();
+            let rendered = if idx == prompt.focused {
+                self.styles.selection.render(&format!("[{label}]"))
+            } else {
+                self.styles.muted.render(&format!(" {label} "))
+            };
+            output.push_str(&rendered);
+            output.push_str("  ");
+        }
+        output.push('\n');
+
+        // Auto-deny timer.
+        if let Some(secs) = prompt.auto_deny_secs {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles
+                    .muted_italic
+                    .render(&format!("Auto-deny in {secs}s")),
+            );
+        }
+
+        // Help text.
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted_italic
+                .render("←/→/Tab: navigate  Enter: confirm  Esc: deny"),
+        );
+
+        output
+    }
 }
 
 const fn bool_label(value: bool) -> &'static str {
@@ -2494,20 +2565,20 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
 
         match &message_entry.message {
             SessionMessage::User { content, .. } => {
-                messages.push(ConversationMessage {
-                    role: MessageRole::User,
-                    content: user_content_to_text(content),
-                    thinking: None,
-                });
+                messages.push(ConversationMessage::new(
+                    MessageRole::User,
+                    user_content_to_text(content),
+                    None,
+                ));
             }
             SessionMessage::Assistant { message } => {
                 let (text, thinking) = assistant_content_to_text(&message.content);
                 add_usage(&mut usage, &message.usage);
-                messages.push(ConversationMessage {
-                    role: MessageRole::Assistant,
-                    content: text,
+                messages.push(ConversationMessage::new(
+                    MessageRole::Assistant,
+                    text,
                     thinking,
-                });
+                ));
             }
             SessionMessage::ToolResult {
                 tool_name,
@@ -2536,11 +2607,9 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
                 } else {
                     "Tool result"
                 };
-                messages.push(ConversationMessage {
-                    role: MessageRole::Tool,
-                    content: format!("{prefix} ({tool_name}): {text}"),
-                    thinking: None,
-                });
+                messages.push(ConversationMessage::tool(format!(
+                    "{prefix} ({tool_name}): {text}"
+                )));
             }
             SessionMessage::BashExecution {
                 command,
@@ -2556,21 +2625,17 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
                 {
                     text.push_str("\n\n[Output excluded from model context]");
                 }
-                messages.push(ConversationMessage {
-                    role: MessageRole::Tool,
-                    content: text,
-                    thinking: None,
-                });
+                messages.push(ConversationMessage::tool(text));
             }
             SessionMessage::Custom {
                 content, display, ..
             } => {
                 if *display {
-                    messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: content.clone(),
-                        thinking: None,
-                    });
+                    messages.push(ConversationMessage::new(
+                        MessageRole::System,
+                        content.clone(),
+                        None,
+                    ));
                 }
             }
             _ => {}
@@ -3540,6 +3605,98 @@ pub enum AgentState {
     ToolRunning,
 }
 
+/// Progress metrics emitted by long-running tools (e.g. bash).
+#[derive(Debug, Clone)]
+struct ToolProgress {
+    started_at: std::time::Instant,
+    elapsed_ms: u128,
+    line_count: usize,
+    byte_count: usize,
+    timeout_ms: Option<u64>,
+}
+
+impl ToolProgress {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            elapsed_ms: 0,
+            line_count: 0,
+            byte_count: 0,
+            timeout_ms: None,
+        }
+    }
+
+    /// Update from a `details.progress` JSON object emitted by tool callbacks.
+    fn update_from_details(&mut self, details: Option<&serde_json::Value>) {
+        // Always update elapsed from wall clock as fallback.
+        self.elapsed_ms = self.started_at.elapsed().as_millis();
+
+        let Some(details) = details else {
+            return;
+        };
+        if let Some(progress) = details.get("progress") {
+            if let Some(v) = progress
+                .get("elapsedMs")
+                .and_then(serde_json::Value::as_u64)
+            {
+                self.elapsed_ms = u128::from(v);
+            }
+            if let Some(v) = progress
+                .get("lineCount")
+                .and_then(serde_json::Value::as_u64)
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                let count = v as usize;
+                self.line_count = count;
+            }
+            if let Some(v) = progress
+                .get("byteCount")
+                .and_then(serde_json::Value::as_u64)
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                let count = v as usize;
+                self.byte_count = count;
+            }
+            if let Some(v) = progress
+                .get("timeoutMs")
+                .and_then(serde_json::Value::as_u64)
+            {
+                self.timeout_ms = Some(v);
+            }
+        }
+    }
+
+    /// Format a compact status string like `"Running bash · 3s · 42 lines"`.
+    fn format_display(&self, tool_name: &str) -> String {
+        let secs = self.elapsed_ms / 1000;
+        let mut parts = vec![format!("Running {tool_name}"), format!("{secs}s")];
+        if self.line_count > 0 {
+            parts.push(format!("{} lines", format_count(self.line_count)));
+        } else if self.byte_count > 0 {
+            parts.push(format!("{} bytes", format_count(self.byte_count)));
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            let timeout_s = timeout_ms / 1000;
+            if timeout_s > 0 {
+                parts.push(format!("timeout {timeout_s}s"));
+            }
+        }
+        parts.join(" \u{2022} ")
+    }
+}
+
+/// Format a count with K/M suffix for compact display.
+#[allow(clippy::cast_precision_loss)]
+fn format_count(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Input mode for the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
@@ -3901,6 +4058,7 @@ pub struct PiApp {
     thinking_visible: bool,
     tools_expanded: bool,
     current_tool: Option<String>,
+    tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
 
     // Session and config
@@ -3966,6 +4124,9 @@ pub struct PiApp {
 
     // Tree navigation UI state (for /tree command)
     tree_ui: Option<TreeUiState>,
+
+    // Capability prompt overlay (extension permission request)
+    capability_prompt: Option<CapabilityPromptOverlay>,
 }
 
 /// Autocomplete dropdown state.
@@ -4183,6 +4344,116 @@ impl SettingsUiState {
         } else {
             self.selected - self.max_visible + 1
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capability prompt overlay
+// ---------------------------------------------------------------------------
+
+/// User action choices for a capability prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityAction {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+    DenyAlways,
+}
+
+impl CapabilityAction {
+    const ALL: [Self; 4] = [
+        Self::AllowOnce,
+        Self::AllowAlways,
+        Self::Deny,
+        Self::DenyAlways,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "Allow Once",
+            Self::AllowAlways => "Allow Always",
+            Self::Deny => "Deny",
+            Self::DenyAlways => "Deny Always",
+        }
+    }
+
+    const fn is_allow(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowAlways)
+    }
+
+    const fn is_persistent(self) -> bool {
+        matches!(self, Self::AllowAlways | Self::DenyAlways)
+    }
+}
+
+/// Modal overlay for extension capability prompts.
+#[derive(Debug)]
+struct CapabilityPromptOverlay {
+    /// The underlying UI request (used to send response).
+    request: ExtensionUiRequest,
+    /// Extension that requested the capability.
+    extension_id: String,
+    /// Capability being requested (e.g. "exec", "http").
+    capability: String,
+    /// Human-readable description of what the capability does.
+    description: String,
+    /// Which button is focused.
+    focused: usize,
+    /// Auto-deny countdown (remaining seconds).  `None` = no timer.
+    auto_deny_secs: Option<u32>,
+}
+
+impl CapabilityPromptOverlay {
+    fn from_request(request: ExtensionUiRequest) -> Self {
+        let extension_id = request
+            .payload
+            .get("extension_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_string();
+        let capability = request
+            .payload
+            .get("capability")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let description = request
+            .payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Self {
+            request,
+            extension_id,
+            capability,
+            description,
+            focused: 0,
+            auto_deny_secs: Some(30),
+        }
+    }
+
+    const fn focus_next(&mut self) {
+        self.focused = (self.focused + 1) % CapabilityAction::ALL.len();
+    }
+
+    fn focus_prev(&mut self) {
+        self.focused = self
+            .focused
+            .checked_sub(1)
+            .unwrap_or(CapabilityAction::ALL.len() - 1);
+    }
+
+    const fn selected_action(&self) -> CapabilityAction {
+        CapabilityAction::ALL[self.focused]
+    }
+
+    /// Returns `true` if this is a capability-specific confirm prompt (not a
+    /// generic extension confirm).
+    fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
+        request.method == "confirm"
+            && request.payload.get("capability").is_some()
+            && request.payload.get("extension_id").is_some()
     }
 }
 
@@ -4476,12 +4747,42 @@ impl ExtensionSession for InteractiveExtensionSession {
     }
 }
 
+/// Tool output line count above which blocks auto-collapse.
+const TOOL_AUTO_COLLAPSE_THRESHOLD: usize = 20;
+/// Number of preview lines to show when a tool block is collapsed.
+const TOOL_COLLAPSE_PREVIEW_LINES: usize = 5;
+
 /// A message in the conversation history.
 #[derive(Debug, Clone)]
 pub struct ConversationMessage {
     pub role: MessageRole,
     pub content: String,
     pub thinking: Option<String>,
+    /// Per-message collapse state for tool outputs.
+    pub collapsed: bool,
+}
+
+impl ConversationMessage {
+    /// Create a non-tool message (never collapsed).
+    const fn new(role: MessageRole, content: String, thinking: Option<String>) -> Self {
+        Self {
+            role,
+            content,
+            thinking,
+            collapsed: false,
+        }
+    }
+
+    /// Create a tool output message with auto-collapse for large outputs.
+    fn tool(content: String) -> Self {
+        let line_count = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
+        Self {
+            role: MessageRole::Tool,
+            content,
+            thinking: None,
+            collapsed: line_count > TOOL_AUTO_COLLAPSE_THRESHOLD,
+        }
+    }
 }
 
 /// Role of a message.
@@ -4648,6 +4949,7 @@ impl PiApp {
             thinking_visible,
             tools_expanded: true,
             current_tool: None,
+            tool_progress: None,
             pending_tool_output: None,
             session,
             config,
@@ -4684,6 +4986,7 @@ impl PiApp {
             settings_ui: None,
             theme_picker: None,
             tree_ui: None,
+            capability_prompt: None,
         };
 
         if let Some(manager) = app.extensions.clone() {
@@ -4764,6 +5067,11 @@ impl PiApp {
             // /tree modal captures all input while active.
             if self.tree_ui.is_some() {
                 return self.handle_tree_ui_key(key);
+            }
+
+            // Capability prompt modal captures all input while active.
+            if self.capability_prompt.is_some() {
+                return self.handle_capability_prompt_key(key);
             }
 
             // Theme picker modal captures all input while active.
@@ -4861,6 +5169,7 @@ impl PiApp {
                                         role: MessageRole::System,
                                         content: self.format_settings_summary(),
                                         thinking: None,
+                                        collapsed: false,
                                     });
                                     self.scroll_to_bottom();
                                     self.status_message =
@@ -5079,6 +5388,7 @@ impl PiApp {
     }
 
     /// Render the view.
+    #[allow(clippy::too_many_lines)]
     fn view(&self) -> String {
         let mut output = String::new();
 
@@ -5132,11 +5442,31 @@ impl PiApp {
 
         // Tool status
         if let Some(tool) = &self.current_tool {
+            let progress_str = self.tool_progress.as_ref().map_or_else(String::new, |p| {
+                let secs = p.elapsed_ms / 1000;
+                if secs < 1 {
+                    return String::new();
+                }
+                let mut parts = vec![format!("{secs}s")];
+                if p.line_count > 0 {
+                    parts.push(format!("{} lines", format_count(p.line_count)));
+                } else if p.byte_count > 0 {
+                    parts.push(format!("{} bytes", format_count(p.byte_count)));
+                }
+                if let Some(timeout_ms) = p.timeout_ms {
+                    let timeout_s = timeout_ms / 1000;
+                    if timeout_s > 0 {
+                        parts.push(format!("timeout {timeout_s}s"));
+                    }
+                }
+                format!(" ({})", parts.join(" \u{2022} "))
+            });
             let _ = write!(
                 output,
-                "\n  {} {} ...\n",
+                "\n  {} {}{} ...\n",
                 self.spinner.view(),
-                self.styles.warning_bold.render(&format!("Running {tool}"))
+                self.styles.warning_bold.render(&format!("Running {tool}")),
+                self.styles.muted.render(&progress_str),
             );
         }
 
@@ -5161,11 +5491,17 @@ impl PiApp {
             output.push_str(&self.render_theme_picker(picker));
         }
 
+        // Capability prompt overlay (if open)
+        if let Some(ref prompt) = self.capability_prompt {
+            output.push_str(&self.render_capability_prompt(prompt));
+        }
+
         // Input area (only when idle and no overlay open)
         if self.agent_state == AgentState::Idle
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
             && self.theme_picker.is_none()
+            && self.capability_prompt.is_none()
         {
             output.push_str(&self.render_input());
 
@@ -5194,6 +5530,55 @@ impl PiApp {
         // scrolls in the alternate-screen buffer.
         let output = clamp_to_terminal_height(output, self.term_height);
         normalize_raw_terminal_newlines(output)
+    }
+
+    fn handle_capability_prompt_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
+        let prompt = self.capability_prompt.as_mut()?;
+
+        match key.key_type {
+            // Navigate between buttons.
+            KeyType::Right | KeyType::Tab => prompt.focus_next(),
+            KeyType::Left => prompt.focus_prev(),
+            KeyType::Runes if key.runes == ['l'] => prompt.focus_next(),
+            KeyType::Runes if key.runes == ['h'] => prompt.focus_prev(),
+
+            // Confirm selection.
+            KeyType::Enter => {
+                let action = prompt.selected_action();
+                let response = ExtensionUiResponse {
+                    id: prompt.request.id.clone(),
+                    value: Some(Value::Bool(action.is_allow())),
+                    cancelled: false,
+                };
+                // Record persistent decisions for "Always" choices.
+                if action.is_persistent() {
+                    if let Ok(mut store) = crate::permissions::PermissionStore::open_default() {
+                        let _ = store.record(
+                            &prompt.extension_id,
+                            &prompt.capability,
+                            action.is_allow(),
+                        );
+                    }
+                }
+                self.capability_prompt = None;
+                self.send_extension_ui_response(response);
+            }
+
+            // Escape = deny once.
+            KeyType::Esc => {
+                let response = ExtensionUiResponse {
+                    id: prompt.request.id.clone(),
+                    value: Some(Value::Bool(false)),
+                    cancelled: true,
+                };
+                self.capability_prompt = None;
+                self.send_extension_ui_response(response);
+            }
+
+            _ => {}
+        }
+
+        None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5711,6 +6096,7 @@ impl PiApp {
     }
 
     /// Build the conversation content string for the viewport.
+    #[allow(clippy::too_many_lines)]
     fn build_conversation_content(&self) -> String {
         let mut output = String::new();
 
@@ -5755,14 +6141,47 @@ impl PiApp {
                     }
                 }
                 MessageRole::Tool => {
-                    if self.tools_expanded {
+                    // Per-message collapse: global toggle overrides, then per-message.
+                    let show_expanded = self.tools_expanded && !msg.collapsed;
+                    if show_expanded {
                         let rendered = render_tool_message(&msg.content, &self.styles);
                         let _ = write!(output, "\n  {rendered}\n");
                     } else {
                         let header = msg.content.lines().next().unwrap_or("Tool output");
-                        let collapsed = format!("{} (collapsed)", header.trim_end());
-                        let rendered = self.styles.muted_italic.render(&collapsed);
-                        let _ = write!(output, "\n  {rendered}\n");
+                        let line_count =
+                            memchr::memchr_iter(b'\n', msg.content.as_bytes()).count() + 1;
+                        let summary = format!(
+                            "\u{25b6} {} ({line_count} lines, collapsed)",
+                            header.trim_end()
+                        );
+                        let _ = write!(
+                            output,
+                            "\n  {}\n",
+                            self.styles.muted_italic.render(&summary)
+                        );
+                        // Show preview when per-message collapsed (not global).
+                        if self.tools_expanded && msg.collapsed {
+                            for (i, line) in msg.content.lines().skip(1).enumerate() {
+                                if i >= TOOL_COLLAPSE_PREVIEW_LINES {
+                                    let remaining = line_count
+                                        .saturating_sub(1)
+                                        .saturating_sub(TOOL_COLLAPSE_PREVIEW_LINES);
+                                    let _ = writeln!(
+                                        output,
+                                        "  {}",
+                                        self.styles
+                                            .muted
+                                            .render(&format!("  ... {remaining} more lines"))
+                                    );
+                                    break;
+                                }
+                                let _ = writeln!(
+                                    output,
+                                    "  {}",
+                                    self.styles.muted.render(&format!("  {line}"))
+                                );
+                            }
+                        }
                     }
                 }
                 MessageRole::System => {
@@ -5834,6 +6253,7 @@ impl PiApp {
             PiMsg::ToolStart { name, .. } => {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
+                self.tool_progress = Some(ToolProgress::new());
                 self.pending_tool_output = None;
             }
             PiMsg::ToolUpdate {
@@ -5842,6 +6262,14 @@ impl PiApp {
                 details,
                 ..
             } => {
+                // Update progress metrics from details if present.
+                if let Some(ref mut progress) = self.tool_progress {
+                    progress.update_from_details(details.as_ref());
+                } else {
+                    let mut progress = ToolProgress::new();
+                    progress.update_from_details(details.as_ref());
+                    self.tool_progress = Some(progress);
+                }
                 if let Some(output) = format_tool_output(
                     &content,
                     details.as_ref(),
@@ -5853,12 +6281,9 @@ impl PiApp {
             PiMsg::ToolEnd { .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
+                self.tool_progress = None;
                 if let Some(output) = self.pending_tool_output.take() {
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::Tool,
-                        content: output,
-                        thinking: None,
-                    });
+                    self.messages.push(ConversationMessage::tool(output));
                     self.scroll_to_bottom();
                 }
             }
@@ -5870,15 +6295,15 @@ impl PiApp {
                 // Finalize the response
                 let had_response = !self.current_response.is_empty();
                 if had_response {
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::Assistant,
-                        content: std::mem::take(&mut self.current_response),
-                        thinking: if self.current_thinking.is_empty() {
+                    self.messages.push(ConversationMessage::new(
+                        MessageRole::Assistant,
+                        std::mem::take(&mut self.current_response),
+                        if self.current_thinking.is_empty() {
                             None
                         } else {
                             Some(std::mem::take(&mut self.current_thinking))
                         },
-                    });
+                    ));
                 }
 
                 // Update usage
@@ -5905,6 +6330,7 @@ impl PiApp {
                             role: MessageRole::System,
                             content: format!("Error: {message}"),
                             thinking: None,
+                            collapsed: false,
                         });
                     }
                 }
@@ -5928,6 +6354,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
@@ -5956,6 +6383,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: message,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
@@ -5972,6 +6400,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: message,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
             }
@@ -5992,6 +6421,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: display,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
                 self.input.focus();
@@ -6043,6 +6473,7 @@ impl PiApp {
                         role: MessageRole::System,
                         content: message,
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_bottom();
                 }
@@ -6063,6 +6494,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: display,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
                 self.input.focus();
@@ -6076,6 +6508,11 @@ impl PiApp {
     }
 
     fn handle_extension_ui_request(&mut self, request: ExtensionUiRequest) -> Option<Cmd> {
+        // Capability-specific prompts get a dedicated modal overlay.
+        if CapabilityPromptOverlay::is_capability_prompt(&request) {
+            self.capability_prompt = Some(CapabilityPromptOverlay::from_request(request));
+            return None;
+        }
         if request.expects_response() {
             self.extension_ui_queue.push_back(request);
             self.advance_extension_ui_queue();
@@ -6109,6 +6546,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: format!("Extension notify ({level}): {title} {message}"),
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
             }
@@ -6169,6 +6607,7 @@ impl PiApp {
                         role: MessageRole::System,
                         content: format!("Extension widget ({widget_key}):\n{content}"),
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_bottom();
                 }
@@ -6208,6 +6647,7 @@ impl PiApp {
                 role: MessageRole::System,
                 content: prompt,
                 thinking: None,
+                collapsed: false,
             });
             self.scroll_to_bottom();
             self.input.focus();
@@ -6461,6 +6901,7 @@ impl PiApp {
                 role: MessageRole::User,
                 content: display_owned.clone(),
                 thinking: None,
+                collapsed: false,
             });
         }
 
@@ -6854,6 +7295,7 @@ impl PiApp {
             role: MessageRole::User,
             content: message_for_agent.clone(),
             thinking: None,
+            collapsed: false,
         });
         let displayed_message = message_for_agent.clone();
 
@@ -7778,6 +8220,16 @@ impl PiApp {
             }
             AppAction::ExpandTools => {
                 self.tools_expanded = !self.tools_expanded;
+                // When expanding globally, also reset per-message collapse for
+                // all tools so they show expanded. When collapsing globally,
+                // the global flag is enough (render checks both).
+                if self.tools_expanded {
+                    for msg in &mut self.messages {
+                        if msg.role == MessageRole::Tool {
+                            msg.collapsed = false;
+                        }
+                    }
+                }
                 let content = self.build_conversation_content();
                 self.conversation_viewport.set_content(&content);
                 self.status_message = Some(if self.tools_expanded {
@@ -7857,6 +8309,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: SlashCommand::help_text().to_string(),
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_last_match("Available commands:");
                 None
@@ -7914,6 +8367,7 @@ impl PiApp {
                             role: MessageRole::System,
                             content: message,
                             thinking: None,
+                            collapsed: false,
                         });
                         self.scroll_to_bottom();
                         self.pending_oauth = Some(PendingOAuth {
@@ -8060,6 +8514,7 @@ impl PiApp {
                             "Ambiguous model pattern \"{pattern}\". Matches:\n{preview}\n\nUse /model provider/id for an exact match."
                         ),
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_bottom();
                     return None;
@@ -8185,6 +8640,7 @@ impl PiApp {
                         role: MessageRole::System,
                         content: self.format_scoped_models_status(),
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_last_match("Scoped models");
                     return None;
@@ -8255,6 +8711,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: self.format_input_history(),
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_last_match("Input history");
                 None
@@ -8296,6 +8753,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: format!("Exported HTML: {}", output_path.display()),
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
                 self.status_message = Some(format!("Exported: {}", output_path.display()));
@@ -8312,6 +8770,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: info,
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
                 None
@@ -8334,6 +8793,7 @@ impl PiApp {
                         role: MessageRole::System,
                         content: self.format_themes_list(),
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_last_match("Available themes:");
                     return None;
@@ -8624,6 +9084,7 @@ impl PiApp {
                     role: MessageRole::System,
                     content: self.format_hotkeys(),
                     thinking: None,
+                    collapsed: false,
                 });
                 self.scroll_to_bottom();
                 None
@@ -8636,6 +9097,7 @@ impl PiApp {
                             role: MessageRole::System,
                             content,
                             thinking: None,
+                            collapsed: false,
                         });
                         self.scroll_to_last_match("# ");
                     }
@@ -8698,6 +9160,7 @@ impl PiApp {
                         role: MessageRole::System,
                         content: format!("Forkable user messages (use /fork <id|index>):\n{list}"),
                         thinking: None,
+                        collapsed: false,
                     });
                     self.scroll_to_bottom();
                     return None;
@@ -9401,6 +9864,100 @@ mod tests {
         // term_height=2 → max 1 newline → "a\nb"
         let clamped = clamp_to_terminal_height("a\nb\n".to_string(), 2);
         assert_eq!(clamped, "a\nb");
+    }
+
+    #[test]
+    fn format_count_suffixes() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1.0K");
+        assert_eq!(format_count(1_500), "1.5K");
+        assert_eq!(format_count(42_000), "42.0K");
+        assert_eq!(format_count(1_000_000), "1.0M");
+        assert_eq!(format_count(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn tool_progress_format_display() {
+        let mut p = ToolProgress::new();
+        p.elapsed_ms = 5_000;
+        p.line_count = 42;
+        let display = p.format_display("bash");
+        assert!(display.contains("Running bash"));
+        assert!(display.contains("5s"));
+        assert!(display.contains("42 lines"));
+
+        // With byte count instead of lines
+        p.line_count = 0;
+        p.byte_count = 1_500;
+        let display = p.format_display("grep");
+        assert!(display.contains("Running grep"));
+        assert!(display.contains("1.5K bytes"));
+        assert!(!display.contains("lines"));
+
+        // With timeout
+        p.timeout_ms = Some(120_000);
+        let display = p.format_display("bash");
+        assert!(display.contains("timeout 120s"));
+    }
+
+    #[test]
+    fn tool_progress_update_from_details() {
+        let mut p = ToolProgress::new();
+        let details = json!({
+            "progress": {
+                "elapsedMs": 3000,
+                "lineCount": 100,
+                "byteCount": 5000,
+                "timeoutMs": 60000
+            }
+        });
+        p.update_from_details(Some(&details));
+        assert_eq!(p.elapsed_ms, 3000);
+        assert_eq!(p.line_count, 100);
+        assert_eq!(p.byte_count, 5000);
+        assert_eq!(p.timeout_ms, Some(60000));
+    }
+
+    #[test]
+    fn tool_progress_update_from_no_details() {
+        let mut p = ToolProgress::new();
+        // Sleep a tiny bit so elapsed > 0
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        p.update_from_details(None);
+        assert!(p.elapsed_ms >= 5);
+        assert_eq!(p.line_count, 0);
+    }
+
+    #[test]
+    fn tool_message_auto_collapse_threshold() {
+        // Small output: not collapsed.
+        let small = ConversationMessage::tool("Tool bash:\nline1\nline2".to_string());
+        assert!(!small.collapsed);
+        assert_eq!(small.role, MessageRole::Tool);
+
+        // Exactly at threshold: not collapsed (20 lines = threshold).
+        let lines: String = (1..=TOOL_AUTO_COLLAPSE_THRESHOLD)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let at_threshold = ConversationMessage::tool(lines);
+        assert!(!at_threshold.collapsed);
+
+        // Over threshold: auto-collapsed.
+        let lines: String = (1..=TOOL_AUTO_COLLAPSE_THRESHOLD + 1)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let over_threshold = ConversationMessage::tool(lines);
+        assert!(over_threshold.collapsed);
+    }
+
+    #[test]
+    fn non_tool_message_never_collapsed() {
+        let msg =
+            ConversationMessage::new(MessageRole::User, "a very long message\n".repeat(100), None);
+        assert!(!msg.collapsed);
     }
 
     #[test]
