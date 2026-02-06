@@ -5059,7 +5059,9 @@ impl ExtensionSession for InteractiveExtensionSession {
         data: Option<Value>,
     ) -> crate::error::Result<()> {
         if custom_type.trim().is_empty() {
-            return Err(crate::error::Error::session("customType must not be empty"));
+            return Err(crate::error::Error::validation(
+                "customType must not be empty",
+            ));
         }
         let cx = Cx::for_request();
         let mut guard =
@@ -5128,7 +5130,7 @@ impl ExtensionSession for InteractiveExtensionSession {
                 crate::error::Error::session(format!("session lock failed: {err}"))
             })?;
         if guard.add_label(&target_id, label).is_none() {
-            return Err(crate::error::Error::session(format!(
+            return Err(crate::error::Error::validation(format!(
                 "target entry '{target_id}' not found in session"
             )));
         }
@@ -11425,7 +11427,7 @@ mod tests {
     fn tool_content_blocks_thinking() {
         let blocks = vec![ContentBlock::Thinking(crate::model::ThinkingContent {
             thinking: "reasoning here".to_string(),
-            signature: None,
+            thinking_signature: None,
         })];
         let result = tool_content_blocks_to_text(&blocks, false);
         assert_eq!(result, "reasoning here");
@@ -11433,10 +11435,11 @@ mod tests {
 
     #[test]
     fn tool_content_blocks_tool_call() {
-        let blocks = vec![ContentBlock::ToolCall(crate::model::ToolCallContent {
+        let blocks = vec![ContentBlock::ToolCall(crate::model::ToolCall {
             id: "tc-1".to_string(),
             name: "bash".to_string(),
             arguments: json!({"command": "ls"}),
+            thought_signature: None,
         })];
         let result = tool_content_blocks_to_text(&blocks, false);
         assert!(result.contains("[tool call: bash]"));
@@ -11511,7 +11514,10 @@ mod tests {
         // Within /a: warning (rank 0) comes before collision (rank 1)
         let warn_pos = text.find("a-message").unwrap();
         let coll_pos = text.find("z-message").unwrap();
-        assert!(warn_pos < coll_pos, "Warning should appear before collision for same path");
+        assert!(
+            warn_pos < coll_pos,
+            "Warning should appear before collision for same path"
+        );
     }
 
     #[test]
@@ -11558,12 +11564,13 @@ mod tests {
             ContentBlock::Text(TextContent::new("text")),
             ContentBlock::Thinking(crate::model::ThinkingContent {
                 thinking: "think".to_string(),
-                signature: None,
+                thinking_signature: None,
             }),
-            ContentBlock::ToolCall(crate::model::ToolCallContent {
+            ContentBlock::ToolCall(crate::model::ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
                 arguments: json!({}),
+                thought_signature: None,
             }),
         ];
         let result = content_blocks_to_text(&blocks);
@@ -11585,7 +11592,7 @@ mod tests {
             ContentBlock::Image(img.clone()),
             ContentBlock::Thinking(crate::model::ThinkingContent {
                 thinking: "ignored".to_string(),
-                signature: None,
+                thinking_signature: None,
             }),
         ];
         let (text, images) = split_content_blocks_for_input(&blocks);
@@ -11653,7 +11660,6 @@ mod tests {
             ("/login", SlashCommand::Login),
             ("/logout", SlashCommand::Logout),
             ("/settings", SlashCommand::Settings),
-            ("/s", SlashCommand::Settings),
             ("/history", SlashCommand::History),
             ("/export", SlashCommand::Export),
             ("/session", SlashCommand::Session),

@@ -169,7 +169,7 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         if custom_type.trim().is_empty() {
-            return Err(Error::session("customType must not be empty"));
+            return Err(Error::validation("customType must not be empty"));
         }
         session.append_custom_entry(custom_type, data);
         if session.path.is_some() {
@@ -235,7 +235,7 @@ impl ExtensionSession for SessionHandle {
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         if session.add_label(&target_id, label).is_none() {
-            return Err(Error::session(format!(
+            return Err(Error::validation(format!(
                 "target entry '{target_id}' not found in session"
             )));
         }
@@ -2380,7 +2380,7 @@ fn generate_entry_id(existing: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{StopReason, Usage};
+    use crate::model::{Cost, StopReason, Usage};
     use asupersync::runtime::RuntimeBuilder;
     use std::future::Future;
 
@@ -3955,8 +3955,8 @@ mod tests {
             .map(str::to_string)
             .collect();
         // Corrupt all entry lines (keep header at index 0)
-        for i in 1..lines.len() {
-            lines[i] = format!("GARBAGE_{i}");
+        for (i, line) in lines.iter_mut().enumerate().skip(1) {
+            *line = format!("GARBAGE_{i}");
         }
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
 
@@ -4007,7 +4007,7 @@ mod tests {
                 if let SessionMessage::User { content, .. } = &msg.message {
                     match content {
                         UserContent::Text(t) => assert_eq!(t, unicode_texts[i]),
-                        _ => panic!("expected Text content at index {i}"),
+                        UserContent::Blocks(_) => panic!("expected Text content at index {i}"),
                     }
                 }
             }
@@ -4027,13 +4027,13 @@ mod tests {
         let id_c = session.append_message(make_test_message("kept C"));
 
         // First compaction: keep from C
-        session.append_compaction("Summary 1".to_string(), id_c.clone(), 1000, None, None);
+        session.append_compaction("Summary 1".to_string(), id_c, 1000, None, None);
 
         let _id_d = session.append_message(make_test_message("new D"));
         let id_e = session.append_message(make_test_message("new E"));
 
         // Second compaction: keep from E
-        session.append_compaction("Summary 2".to_string(), id_e.clone(), 2000, None, None);
+        session.append_compaction("Summary 2".to_string(), id_e, 2000, None, None);
 
         let id_f = session.append_message(make_test_message("newest F"));
 
@@ -4046,7 +4046,7 @@ mod tests {
             .filter_map(|m| match m {
                 Message::User(u) => match &u.content {
                     UserContent::Text(t) => Some(t.clone()),
-                    _ => None,
+                    UserContent::Blocks(_) => None,
                 },
                 _ => None,
             })
@@ -4207,7 +4207,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 total_tokens: 150,
-                cost: Default::default(),
+                cost: Cost::default(),
             },
             stop_reason: StopReason::ToolUse,
             error_message: None,

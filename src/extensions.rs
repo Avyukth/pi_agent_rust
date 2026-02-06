@@ -7368,7 +7368,7 @@ async fn dispatch_hostcall_session(
             let message_value = payload.get("message").cloned().unwrap_or(payload);
             match serde_json::from_value(message_value) {
                 Ok(message) => session.append_message(message).await.map(|()| Value::Null),
-                Err(err) => Err(Error::extension(format!("Parse message: {err}"))),
+                Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
             }
         }
         "append_entry" | "appendentry" => {
@@ -7410,15 +7410,18 @@ async fn dispatch_hostcall_session(
                 .await
                 .map(|()| Value::Null)
         }
-        _ => Err(Error::extension(format!("Unknown session op: {op}"))),
+        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
     };
 
     match result {
         Ok(value) => HostcallOutcome::Success(value),
-        Err(err) => HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: err.to_string(),
-        },
+        Err(err) => {
+            let code = err.hostcall_error_code().to_string();
+            HostcallOutcome::Error {
+                code,
+                message: err.to_string(),
+            }
+        }
     }
 }
 

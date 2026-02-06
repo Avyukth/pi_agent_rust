@@ -108,6 +108,27 @@ impl Error {
         Self::Api(message.into())
     }
 
+    /// Map this error to a hostcall taxonomy code.
+    ///
+    /// The hostcall ABI requires every error to be one of:
+    /// `timeout`, `denied`, `io`, `invalid_request`, or `internal`.
+    pub fn hostcall_error_code(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "invalid_request",
+            Self::Io(_) => "io",
+            Self::Json(_) => "internal",
+            Self::Session(_) | Self::SessionNotFound { .. } => "io",
+            Self::Sqlite(_) => "io",
+            Self::Auth(_) => "denied",
+            Self::Aborted => "timeout",
+            Self::Extension(_)
+            | Self::Config(_)
+            | Self::Provider { .. }
+            | Self::Tool { .. }
+            | Self::Api(_) => "internal",
+        }
+    }
+
     /// Map internal errors to a stable, user-facing hint taxonomy.
     #[must_use]
     pub fn hints(&self) -> ErrorHints {
@@ -527,5 +548,428 @@ impl From<serde_json::Error> for Error {
 impl From<sqlmodel_core::Error> for Error {
     fn from(value: sqlmodel_core::Error) -> Self {
         Self::Sqlite(Box::new(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── Constructor tests ──────────────────────────────────────────────
+
+    #[test]
+    fn error_config_constructor() {
+        let err = Error::config("bad config");
+        assert!(matches!(err, Error::Config(ref msg) if msg == "bad config"));
+    }
+
+    #[test]
+    fn error_session_constructor() {
+        let err = Error::session("session corrupted");
+        assert!(matches!(err, Error::Session(ref msg) if msg == "session corrupted"));
+    }
+
+    #[test]
+    fn error_provider_constructor() {
+        let err = Error::provider("anthropic", "timeout");
+        assert!(matches!(err, Error::Provider { ref provider, ref message }
+            if provider == "anthropic" && message == "timeout"));
+    }
+
+    #[test]
+    fn error_auth_constructor() {
+        let err = Error::auth("missing key");
+        assert!(matches!(err, Error::Auth(ref msg) if msg == "missing key"));
+    }
+
+    #[test]
+    fn error_tool_constructor() {
+        let err = Error::tool("bash", "exit code 1");
+        assert!(matches!(err, Error::Tool { ref tool, ref message }
+            if tool == "bash" && message == "exit code 1"));
+    }
+
+    #[test]
+    fn error_validation_constructor() {
+        let err = Error::validation("field required");
+        assert!(matches!(err, Error::Validation(ref msg) if msg == "field required"));
+    }
+
+    #[test]
+    fn error_extension_constructor() {
+        let err = Error::extension("manifest invalid");
+        assert!(matches!(err, Error::Extension(ref msg) if msg == "manifest invalid"));
+    }
+
+    #[test]
+    fn error_api_constructor() {
+        let err = Error::api("404 not found");
+        assert!(matches!(err, Error::Api(ref msg) if msg == "404 not found"));
+    }
+
+    // ─── Display message tests ──────────────────────────────────────────
+
+    #[test]
+    fn error_config_display() {
+        let err = Error::config("missing settings.json");
+        let msg = err.to_string();
+        assert!(msg.contains("Configuration error"));
+        assert!(msg.contains("missing settings.json"));
+    }
+
+    #[test]
+    fn error_session_display() {
+        let err = Error::session("tree corrupted");
+        let msg = err.to_string();
+        assert!(msg.contains("Session error"));
+        assert!(msg.contains("tree corrupted"));
+    }
+
+    #[test]
+    fn error_session_not_found_display() {
+        let err = Error::SessionNotFound {
+            path: "/home/user/.pi/sessions/abc.jsonl".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Session not found"));
+        assert!(msg.contains("/home/user/.pi/sessions/abc.jsonl"));
+    }
+
+    #[test]
+    fn error_provider_display() {
+        let err = Error::provider("openai", "429 too many requests");
+        let msg = err.to_string();
+        assert!(msg.contains("Provider error"));
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("429 too many requests"));
+    }
+
+    #[test]
+    fn error_auth_display() {
+        let err = Error::auth("API key expired");
+        let msg = err.to_string();
+        assert!(msg.contains("Authentication error"));
+        assert!(msg.contains("API key expired"));
+    }
+
+    #[test]
+    fn error_tool_display() {
+        let err = Error::tool("read", "file not found: /tmp/x.txt");
+        let msg = err.to_string();
+        assert!(msg.contains("Tool error"));
+        assert!(msg.contains("read"));
+        assert!(msg.contains("file not found: /tmp/x.txt"));
+    }
+
+    #[test]
+    fn error_validation_display() {
+        let err = Error::validation("temperature must be 0-2");
+        let msg = err.to_string();
+        assert!(msg.contains("Validation error"));
+        assert!(msg.contains("temperature must be 0-2"));
+    }
+
+    #[test]
+    fn error_extension_display() {
+        let err = Error::extension("manifest parse failed");
+        let msg = err.to_string();
+        assert!(msg.contains("Extension error"));
+        assert!(msg.contains("manifest parse failed"));
+    }
+
+    #[test]
+    fn error_aborted_display() {
+        let err = Error::Aborted;
+        let msg = err.to_string();
+        assert!(msg.contains("Operation aborted"));
+    }
+
+    #[test]
+    fn error_api_display() {
+        let err = Error::api("GitHub API error 403");
+        let msg = err.to_string();
+        assert!(msg.contains("API error"));
+        assert!(msg.contains("GitHub API error 403"));
+    }
+
+    #[test]
+    fn error_io_display() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let err = Error::from(io_err);
+        let msg = err.to_string();
+        assert!(msg.contains("IO error"));
+    }
+
+    #[test]
+    fn error_json_display() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err = Error::from(json_err);
+        let msg = err.to_string();
+        assert!(msg.contains("JSON error"));
+    }
+
+    // ─── From impls ─────────────────────────────────────────────────────
+
+    #[test]
+    fn error_from_io_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let err: Error = io_err.into();
+        assert!(matches!(err, Error::Io(_)));
+    }
+
+    #[test]
+    fn error_from_serde_json_error() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{invalid").unwrap_err();
+        let err: Error = json_err.into();
+        assert!(matches!(err, Error::Json(_)));
+    }
+
+    // ─── Hints method tests (error.rs hints) ────────────────────────────
+
+    #[test]
+    fn hints_config_json_parse_error() {
+        let err = Error::config("JSON parse error in settings.json");
+        let h = err.hints();
+        assert!(h.summary.contains("not valid JSON"));
+        assert!(h.hints.iter().any(|s| s.contains("JSON formatting")));
+    }
+
+    #[test]
+    fn hints_config_missing_file() {
+        let err = Error::config("config file not found: ~/.pi/settings");
+        let h = err.hints();
+        assert!(h.summary.contains("missing"));
+    }
+
+    #[test]
+    fn hints_config_generic() {
+        let err = Error::config("unknown config issue");
+        let h = err.hints();
+        assert!(h.summary.contains("Configuration error"));
+    }
+
+    #[test]
+    fn hints_session_empty() {
+        let err = Error::session("empty session file");
+        let h = err.hints();
+        assert!(h.summary.contains("empty") || h.summary.contains("corrupted"));
+    }
+
+    #[test]
+    fn hints_session_read_failure() {
+        let err = Error::session("failed to read session directory");
+        let h = err.hints();
+        assert!(h.summary.contains("Failed to read"));
+    }
+
+    #[test]
+    fn hints_session_not_found() {
+        let err = Error::SessionNotFound {
+            path: "/tmp/session.jsonl".to_string(),
+        };
+        let h = err.hints();
+        assert!(h.summary.contains("not found"));
+        assert!(
+            h.context
+                .iter()
+                .any(|(k, v)| k == "path" && v.contains("/tmp/session.jsonl"))
+        );
+    }
+
+    #[test]
+    fn hints_provider_401() {
+        let err = Error::provider("anthropic", "HTTP 401 unauthorized");
+        let h = err.hints();
+        assert!(h.summary.contains("authentication failed"));
+        assert!(h.hints.iter().any(|s| s.contains("ANTHROPIC_API_KEY")));
+    }
+
+    #[test]
+    fn hints_provider_403() {
+        let err = Error::provider("openai", "403 forbidden");
+        let h = err.hints();
+        assert!(h.summary.contains("forbidden"));
+    }
+
+    #[test]
+    fn hints_provider_429() {
+        let err = Error::provider("anthropic", "429 rate limit");
+        let h = err.hints();
+        assert!(h.summary.contains("rate limited"));
+    }
+
+    #[test]
+    fn hints_provider_529() {
+        let err = Error::provider("anthropic", "529 overloaded");
+        let h = err.hints();
+        assert!(h.summary.contains("overloaded"));
+    }
+
+    #[test]
+    fn hints_provider_timeout() {
+        let err = Error::provider("openai", "request timed out");
+        let h = err.hints();
+        assert!(h.summary.contains("timed out"));
+    }
+
+    #[test]
+    fn hints_provider_400() {
+        let err = Error::provider("gemini", "400 bad request");
+        let h = err.hints();
+        assert!(h.summary.contains("rejected"));
+    }
+
+    #[test]
+    fn hints_provider_500() {
+        let err = Error::provider("cohere", "500 internal server error");
+        let h = err.hints();
+        assert!(h.summary.contains("server error"));
+    }
+
+    #[test]
+    fn hints_provider_generic() {
+        let err = Error::provider("custom", "unknown issue");
+        let h = err.hints();
+        assert!(h.summary.contains("failed"));
+        assert!(h.context.iter().any(|(k, _)| k == "provider"));
+    }
+
+    #[test]
+    fn hints_provider_key_hint_openai() {
+        let err = Error::provider("openai", "401 invalid api key");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("OPENAI_API_KEY")));
+    }
+
+    #[test]
+    fn hints_provider_key_hint_gemini() {
+        let err = Error::provider("gemini", "401 api key invalid");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("GOOGLE_API_KEY")));
+    }
+
+    #[test]
+    fn hints_provider_key_hint_azure() {
+        let err = Error::provider("azure_openai", "401 unauthorized");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("AZURE_OPENAI_API_KEY")));
+    }
+
+    #[test]
+    fn hints_provider_key_hint_unknown() {
+        let err = Error::provider("my-proxy", "401 unauthorized");
+        let h = err.hints();
+        assert!(h.hints.iter().any(|s| s.contains("my-proxy")));
+    }
+
+    #[test]
+    fn hints_auth_authorization_code() {
+        let err = Error::auth("missing authorization code");
+        let h = err.hints();
+        assert!(h.summary.contains("OAuth"));
+    }
+
+    #[test]
+    fn hints_auth_token_exchange() {
+        let err = Error::auth("token exchange failed");
+        let h = err.hints();
+        assert!(h.summary.contains("token exchange"));
+    }
+
+    #[test]
+    fn hints_auth_generic() {
+        let err = Error::auth("unknown auth issue");
+        let h = err.hints();
+        assert!(h.summary.contains("Authentication error"));
+    }
+
+    #[test]
+    fn hints_tool_not_found() {
+        let err = Error::tool("bash", "command not found: xyz");
+        let h = err.hints();
+        assert!(h.summary.contains("not found"));
+    }
+
+    #[test]
+    fn hints_tool_generic() {
+        let err = Error::tool("read", "unexpected error");
+        let h = err.hints();
+        assert!(h.summary.contains("execution failed"));
+    }
+
+    #[test]
+    fn hints_validation() {
+        let err = Error::validation("invalid input");
+        let h = err.hints();
+        assert!(h.summary.contains("Validation"));
+    }
+
+    #[test]
+    fn hints_extension() {
+        let err = Error::extension("load error");
+        let h = err.hints();
+        assert!(h.summary.contains("Extension"));
+    }
+
+    #[test]
+    fn hints_io_not_found() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let err = Error::from(io_err);
+        let h = err.hints();
+        assert!(h.summary.contains("not found"));
+    }
+
+    #[test]
+    fn hints_io_permission_denied() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let err = Error::from(io_err);
+        let h = err.hints();
+        assert!(h.summary.contains("Permission denied"));
+    }
+
+    #[test]
+    fn hints_io_timed_out() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let err = Error::from(io_err);
+        let h = err.hints();
+        assert!(h.summary.contains("timed out"));
+    }
+
+    #[test]
+    fn hints_io_connection_refused() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let err = Error::from(io_err);
+        let h = err.hints();
+        assert!(h.summary.contains("Connection refused"));
+    }
+
+    #[test]
+    fn hints_io_generic() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "something");
+        let err = Error::from(io_err);
+        let h = err.hints();
+        assert!(h.summary.contains("I/O error"));
+    }
+
+    #[test]
+    fn hints_json() {
+        let json_err = serde_json::from_str::<serde_json::Value>("broken").unwrap_err();
+        let err = Error::from(json_err);
+        let h = err.hints();
+        assert!(h.summary.contains("JSON"));
+    }
+
+    #[test]
+    fn hints_aborted() {
+        let err = Error::Aborted;
+        let h = err.hints();
+        assert!(h.summary.contains("aborted"));
+    }
+
+    #[test]
+    fn hints_api() {
+        let err = Error::api("connection reset");
+        let h = err.hints();
+        assert!(h.summary.contains("API"));
     }
 }
