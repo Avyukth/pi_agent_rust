@@ -2475,6 +2475,63 @@ mod render_tool_message_tests {
             "Expected truncation marker, got: {rendered}"
         );
     }
+
+    #[test]
+    fn no_diff_renders_only_muted_text() {
+        let styles = Theme::dark().tui_styles();
+        let input = "Tool read:\nfile contents here";
+        let rendered = render_tool_message(input, &styles);
+        assert!(rendered.contains(&styles.muted.render("Tool read:")));
+        assert!(rendered.contains(&styles.muted.render("file contents here")));
+        assert!(!rendered.contains("Diff:"));
+        assert!(!rendered.contains("@@"));
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        let styles = Theme::dark().tui_styles();
+        let rendered = render_tool_message("", &styles);
+        assert!(rendered.is_empty() || rendered == styles.muted.render(""));
+    }
+
+    #[test]
+    fn unpaired_minus_line_no_word_diff() {
+        let styles = Theme::dark().tui_styles();
+        // Single - line with no following + should render in error_bold without word diff
+        let input = "output\nDiff:\n- 1 removed line\n 2 context";
+        let rendered = render_tool_message(input, &styles);
+        assert!(rendered.contains(&styles.error_bold.render("- 1 removed line")));
+        assert!(rendered.contains(&styles.muted.render(" 2 context")));
+    }
+
+    #[test]
+    fn unpaired_plus_line_renders_success() {
+        let styles = Theme::dark().tui_styles();
+        // Standalone + line (no preceding -) should render in success_bold
+        let input = "output\nDiff:\n+ 1 added line";
+        let rendered = render_tool_message(input, &styles);
+        assert!(rendered.contains(&styles.success_bold.render("+ 1 added line")));
+    }
+
+    #[test]
+    fn context_only_diff_no_color() {
+        let styles = Theme::dark().tui_styles();
+        let input = "output\nDiff:\n 1 unchanged line\n 2 also unchanged";
+        let rendered = render_tool_message(input, &styles);
+        assert!(rendered.contains(&styles.muted.render(" 1 unchanged line")));
+        assert!(rendered.contains(&styles.muted.render(" 2 also unchanged")));
+    }
+
+    #[test]
+    fn word_diff_fallback_when_content_empty() {
+        let styles = Theme::dark().tui_styles();
+        // Prefix-only lines: split_diff_prefix returns ("- 1 ", "") for "- 1 "
+        // render_word_diff_pair should fall back to simple coloring
+        let input = "output\nDiff:\n-\n+";
+        let rendered = render_tool_message(input, &styles);
+        assert!(rendered.contains(&styles.error_bold.render("-")));
+        assert!(rendered.contains(&styles.success_bold.render("+")));
+    }
 }
 
 fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> String {
@@ -10684,5 +10741,645 @@ mod tests {
         let manager = crate::extensions::ExtensionManager::new();
         let entries = extension_commands_for_catalog(&manager);
         assert!(entries.is_empty());
+    }
+
+    // --- strip_wrapping_quotes tests ---
+
+    #[test]
+    fn strip_wrapping_quotes_double() {
+        assert_eq!(strip_wrapping_quotes("\"hello\""), "hello");
+    }
+
+    #[test]
+    fn strip_wrapping_quotes_single() {
+        assert_eq!(strip_wrapping_quotes("'hello'"), "hello");
+    }
+
+    #[test]
+    fn strip_wrapping_quotes_mismatched() {
+        assert_eq!(strip_wrapping_quotes("\"hello'"), "\"hello'");
+    }
+
+    #[test]
+    fn strip_wrapping_quotes_no_quotes() {
+        assert_eq!(strip_wrapping_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_wrapping_quotes_empty() {
+        assert_eq!(strip_wrapping_quotes(""), "");
+    }
+
+    #[test]
+    fn strip_wrapping_quotes_single_char() {
+        assert_eq!(strip_wrapping_quotes("\""), "\"");
+    }
+
+    // --- looks_like_windows_path tests ---
+
+    #[test]
+    fn windows_path_drive_letter() {
+        assert!(looks_like_windows_path("C:\\Users\\foo"));
+        assert!(looks_like_windows_path("D:file.txt"));
+    }
+
+    #[test]
+    fn windows_path_unc() {
+        assert!(looks_like_windows_path("\\\\server\\share"));
+    }
+
+    #[test]
+    fn unix_path_not_windows() {
+        assert!(!looks_like_windows_path("/home/user/file"));
+        assert!(!looks_like_windows_path("relative/path"));
+    }
+
+    // --- unescape_dragged_path tests ---
+
+    #[test]
+    fn unescape_dragged_path_backslash_space() {
+        assert_eq!(unescape_dragged_path("my\\ file.txt"), "my file.txt");
+    }
+
+    #[test]
+    fn unescape_dragged_path_backslash_parens() {
+        assert_eq!(unescape_dragged_path("file\\(1\\).txt"), "file(1).txt");
+    }
+
+    #[test]
+    fn unescape_dragged_path_windows_preserved() {
+        assert_eq!(unescape_dragged_path("C:\\Users\\foo"), "C:\\Users\\foo");
+    }
+
+    #[test]
+    fn unescape_dragged_path_no_escapes() {
+        assert_eq!(unescape_dragged_path("simple.txt"), "simple.txt");
+    }
+
+    // --- file_url_to_path tests ---
+
+    #[test]
+    fn file_url_to_path_valid() {
+        let result = file_url_to_path("file:///tmp/test.txt");
+        assert_eq!(result, Some(std::path::PathBuf::from("/tmp/test.txt")));
+    }
+
+    #[test]
+    fn file_url_to_path_not_file_url() {
+        assert!(file_url_to_path("https://example.com").is_none());
+        assert!(file_url_to_path("/tmp/test.txt").is_none());
+    }
+
+    // --- format_file_ref tests ---
+
+    #[test]
+    fn format_file_ref_simple() {
+        assert_eq!(format_file_ref("src/main.rs"), "@src/main.rs");
+    }
+
+    #[test]
+    fn format_file_ref_with_spaces() {
+        assert_eq!(format_file_ref("my file.rs"), "@\"my file.rs\"");
+    }
+
+    #[test]
+    fn format_file_ref_with_double_quotes_in_path() {
+        assert_eq!(format_file_ref("my \"file\".rs"), "@'my \"file\".rs'");
+    }
+
+    #[test]
+    fn format_file_ref_with_both_quotes() {
+        assert_eq!(
+            format_file_ref("it's a \"file\" name.rs"),
+            "@\"it's a \\\"file\\\" name.rs\""
+        );
+    }
+
+    // --- split_trailing_punct tests ---
+
+    #[test]
+    fn split_trailing_punct_period() {
+        assert_eq!(split_trailing_punct("file.rs."), ("file.rs", "."));
+    }
+
+    #[test]
+    fn split_trailing_punct_comma() {
+        assert_eq!(split_trailing_punct("word,"), ("word", ","));
+    }
+
+    #[test]
+    fn split_trailing_punct_no_trailing() {
+        assert_eq!(split_trailing_punct("word"), ("word", ""));
+    }
+
+    #[test]
+    fn split_trailing_punct_all_punct() {
+        assert_eq!(split_trailing_punct("!?"), ("", "!?"));
+    }
+
+    #[test]
+    fn split_trailing_punct_empty() {
+        assert_eq!(split_trailing_punct(""), ("", ""));
+    }
+
+    // --- is_file_ref_boundary tests ---
+
+    #[test]
+    fn file_ref_boundary_at_start() {
+        assert!(is_file_ref_boundary("@file", 0));
+    }
+
+    #[test]
+    fn file_ref_boundary_after_space() {
+        assert!(is_file_ref_boundary("see @file", 4));
+    }
+
+    #[test]
+    fn file_ref_boundary_after_paren() {
+        assert!(is_file_ref_boundary("(@file)", 1));
+    }
+
+    #[test]
+    fn file_ref_boundary_mid_word() {
+        assert!(!is_file_ref_boundary("foo@bar", 3));
+    }
+
+    // --- truncate tests ---
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_exact_fit() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_adds_ellipsis() {
+        assert_eq!(truncate("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn truncate_zero() {
+        assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_very_small_max() {
+        assert_eq!(truncate("hello", 1), ".");
+        assert_eq!(truncate("hello", 2), "..");
+        assert_eq!(truncate("hello", 3), "...");
+    }
+
+    // --- strip_thinking_level_suffix tests ---
+
+    #[test]
+    fn strip_thinking_suffix_present() {
+        assert_eq!(
+            strip_thinking_level_suffix("claude-opus:high"),
+            "claude-opus"
+        );
+        assert_eq!(strip_thinking_level_suffix("model:off"), "model");
+        assert_eq!(strip_thinking_level_suffix("m:xhigh"), "m");
+    }
+
+    #[test]
+    fn strip_thinking_suffix_absent() {
+        assert_eq!(strip_thinking_level_suffix("claude-opus"), "claude-opus");
+    }
+
+    #[test]
+    fn strip_thinking_suffix_unknown_level() {
+        assert_eq!(strip_thinking_level_suffix("claude:turbo"), "claude:turbo");
+    }
+
+    // --- parse_scoped_model_patterns tests ---
+
+    #[test]
+    fn parse_model_patterns_comma_separated() {
+        assert_eq!(
+            parse_scoped_model_patterns("gpt-4*,claude*"),
+            vec!["gpt-4*", "claude*"]
+        );
+    }
+
+    #[test]
+    fn parse_model_patterns_space_separated() {
+        assert_eq!(
+            parse_scoped_model_patterns("gpt-4o claude-opus"),
+            vec!["gpt-4o", "claude-opus"]
+        );
+    }
+
+    #[test]
+    fn parse_model_patterns_mixed() {
+        assert_eq!(parse_scoped_model_patterns("a, b c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_model_patterns_empty() {
+        assert!(parse_scoped_model_patterns("").is_empty());
+        assert!(parse_scoped_model_patterns("  ").is_empty());
+    }
+
+    // --- queued_message_preview tests ---
+
+    #[test]
+    fn queued_preview_short() {
+        assert_eq!(queued_message_preview("hello", 10), "hello");
+    }
+
+    #[test]
+    fn queued_preview_truncated() {
+        assert_eq!(queued_message_preview("hello world!", 8), "hello...");
+    }
+
+    #[test]
+    fn queued_preview_multiline() {
+        assert_eq!(queued_message_preview("\n\nhello\nworld", 20), "hello");
+    }
+
+    #[test]
+    fn queued_preview_empty() {
+        assert_eq!(queued_message_preview("", 10), "(empty)");
+        assert_eq!(queued_message_preview("  \n  \n  ", 10), "(empty)");
+    }
+
+    // --- parse_gist_url_and_id tests ---
+
+    #[test]
+    fn parse_gist_url_valid() {
+        let output = "Created gist https://gist.github.com/user/abc123def456";
+        let result = parse_gist_url_and_id(output);
+        assert_eq!(
+            result,
+            Some((
+                "https://gist.github.com/user/abc123def456".to_string(),
+                "abc123def456".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_gist_url_no_gist() {
+        assert!(parse_gist_url_and_id("no url here").is_none());
+    }
+
+    #[test]
+    fn parse_gist_url_wrong_host() {
+        assert!(parse_gist_url_and_id("https://github.com/user/repo").is_none());
+    }
+
+    // --- parse_queue_mode tests ---
+
+    #[test]
+    fn parse_queue_mode_all() {
+        assert!(matches!(parse_queue_mode(Some("all")), QueueMode::All));
+    }
+
+    #[test]
+    fn parse_queue_mode_default() {
+        assert!(matches!(parse_queue_mode(None), QueueMode::OneAtATime));
+        assert!(matches!(
+            parse_queue_mode(Some("anything")),
+            QueueMode::OneAtATime
+        ));
+    }
+
+    // --- push_line tests ---
+
+    #[test]
+    fn push_line_to_empty() {
+        let mut s = String::new();
+        push_line(&mut s, "hello");
+        assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn push_line_appends_with_newline() {
+        let mut s = "hello".to_string();
+        push_line(&mut s, "world");
+        assert_eq!(s, "hello\nworld");
+    }
+
+    #[test]
+    fn push_line_skips_empty() {
+        let mut s = "hello".to_string();
+        push_line(&mut s, "");
+        assert_eq!(s, "hello");
+    }
+
+    // --- parse_bash_command additional edge cases ---
+
+    #[test]
+    fn parse_bash_command_empty_bang() {
+        assert!(parse_bash_command("!").is_none());
+        assert!(parse_bash_command("!!").is_none());
+        assert!(parse_bash_command("!  ").is_none());
+    }
+
+    #[test]
+    fn parse_bash_command_no_bang() {
+        assert!(parse_bash_command("ls -la").is_none());
+        assert!(parse_bash_command("").is_none());
+    }
+
+    #[test]
+    fn parse_bash_command_leading_whitespace() {
+        let (cmd, exclude) = parse_bash_command("  ! echo hi").expect("should parse");
+        assert_eq!(cmd, "echo hi");
+        assert!(!exclude);
+    }
+
+    // --- pretty_json tests ---
+
+    #[test]
+    fn pretty_json_formats_object() {
+        let val = json!({"a": 1});
+        let out = pretty_json(&val);
+        assert!(out.contains("\"a\": 1"));
+        assert!(out.contains('\n'));
+    }
+
+    #[test]
+    fn pretty_json_formats_null() {
+        assert_eq!(pretty_json(&json!(null)), "null");
+    }
+
+    // --- SlashCommand::parse tests ---
+
+    #[test]
+    fn slash_command_parse_known_commands() {
+        assert!(matches!(
+            SlashCommand::parse("/help"),
+            Some((SlashCommand::Help, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/h"),
+            Some((SlashCommand::Help, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/?"),
+            Some((SlashCommand::Help, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/exit"),
+            Some((SlashCommand::Exit, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/quit"),
+            Some((SlashCommand::Exit, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/q"),
+            Some((SlashCommand::Exit, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/clear"),
+            Some((SlashCommand::Clear, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/cls"),
+            Some((SlashCommand::Clear, ""))
+        ));
+    }
+
+    #[test]
+    fn slash_command_parse_with_args() {
+        let (cmd, args) = SlashCommand::parse("/model claude-opus").unwrap();
+        assert!(matches!(cmd, SlashCommand::Model));
+        assert_eq!(args, "claude-opus");
+
+        let (cmd, args) = SlashCommand::parse("/name my session").unwrap();
+        assert!(matches!(cmd, SlashCommand::Name));
+        assert_eq!(args, "my session");
+    }
+
+    #[test]
+    fn slash_command_parse_case_insensitive() {
+        assert!(SlashCommand::parse("/HELP").is_some());
+        assert!(SlashCommand::parse("/Model").is_some());
+        assert!(SlashCommand::parse("/EXIT").is_some());
+    }
+
+    #[test]
+    fn slash_command_parse_unknown() {
+        assert!(SlashCommand::parse("/deploy").is_none());
+        assert!(SlashCommand::parse("/unknown").is_none());
+    }
+
+    #[test]
+    fn slash_command_parse_no_slash() {
+        assert!(SlashCommand::parse("help").is_none());
+        assert!(SlashCommand::parse("model gpt-4").is_none());
+    }
+
+    #[test]
+    fn slash_command_parse_aliases() {
+        assert!(matches!(
+            SlashCommand::parse("/m"),
+            Some((SlashCommand::Model, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/t"),
+            Some((SlashCommand::Thinking, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/think"),
+            Some((SlashCommand::Thinking, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/r"),
+            Some((SlashCommand::Resume, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/cp"),
+            Some((SlashCommand::Copy, ""))
+        ));
+        assert!(matches!(
+            SlashCommand::parse("/info"),
+            Some((SlashCommand::Session, ""))
+        ));
+    }
+
+    // --- format_tool_output tests ---
+
+    #[test]
+    fn format_tool_output_text_only() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("tool result"))];
+        let result = format_tool_output(&blocks, None, false);
+        assert_eq!(result.as_deref(), Some("tool result"));
+    }
+
+    #[test]
+    fn format_tool_output_with_diff_details() {
+        let blocks = vec![ContentBlock::Text(TextContent::new(
+            "Successfully replaced text in foo.rs.",
+        ))];
+        let details = json!({ "diff": "- 1 old\n+ 1 new" });
+        let result = format_tool_output(&blocks, Some(&details), false).unwrap();
+        assert!(result.contains("Diff:"));
+        assert!(result.contains("- 1 old"));
+        assert!(result.contains("+ 1 new"));
+    }
+
+    #[test]
+    fn format_tool_output_empty_returns_none() {
+        let blocks: Vec<ContentBlock> = vec![];
+        assert!(format_tool_output(&blocks, None, false).is_none());
+    }
+
+    #[test]
+    fn format_tool_output_empty_text_with_details_shows_json() {
+        let blocks: Vec<ContentBlock> = vec![];
+        let details = json!({"key": "value"});
+        let result = format_tool_output(&blocks, Some(&details), false).unwrap();
+        assert!(result.contains("key"));
+        assert!(result.contains("value"));
+    }
+
+    #[test]
+    fn format_tool_output_empty_diff_in_details() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("Success"))];
+        let details = json!({ "diff": "  " }); // whitespace-only diff
+        let result = format_tool_output(&blocks, Some(&details), false).unwrap();
+        // Should NOT contain Diff: header since diff is effectively empty
+        assert!(!result.contains("Diff:"));
+        assert!(result.contains("Success"));
+    }
+
+    // --- path_for_display tests ---
+
+    #[test]
+    fn path_for_display_within_cwd() {
+        let cwd = Path::new("/home/user/project");
+        let path = Path::new("/home/user/project/src/main.rs");
+        assert_eq!(path_for_display(path, cwd), "src/main.rs");
+    }
+
+    #[test]
+    fn path_for_display_outside_cwd() {
+        let cwd = Path::new("/home/user/project");
+        let path = Path::new("/tmp/file.txt");
+        assert_eq!(path_for_display(path, cwd), "/tmp/file.txt");
+    }
+
+    #[test]
+    fn path_for_display_same_as_cwd() {
+        let cwd = Path::new("/home/user");
+        let path = Path::new("/home/user");
+        assert_eq!(path_for_display(path, cwd), "");
+    }
+
+    // --- assistant_content_to_text tests ---
+
+    #[test]
+    fn assistant_text_only() {
+        let blocks = vec![ContentBlock::Text(TextContent::new("Hello"))];
+        let (text, thinking) = assistant_content_to_text(&blocks);
+        assert_eq!(text, "Hello");
+        assert!(thinking.is_none());
+    }
+
+    #[test]
+    fn assistant_text_with_thinking() {
+        let blocks = vec![
+            ContentBlock::Thinking(crate::model::ThinkingContent {
+                thinking: "Let me reason...".to_string(),
+                thinking_signature: None,
+            }),
+            ContentBlock::Text(TextContent::new("response")),
+        ];
+        let (text, thinking) = assistant_content_to_text(&blocks);
+        assert_eq!(text, "response");
+        assert_eq!(thinking.as_deref(), Some("Let me reason..."));
+    }
+
+    #[test]
+    fn assistant_empty_thinking_is_none() {
+        let blocks = vec![
+            ContentBlock::Thinking(crate::model::ThinkingContent {
+                thinking: "  ".to_string(),
+                thinking_signature: None,
+            }),
+            ContentBlock::Text(TextContent::new("response")),
+        ];
+        let (_, thinking) = assistant_content_to_text(&blocks);
+        assert!(
+            thinking.is_none(),
+            "whitespace-only thinking should be None"
+        );
+    }
+
+    // --- ConversationMessage tests ---
+
+    #[test]
+    fn conversation_message_tool_role() {
+        let msg = ConversationMessage::tool("Tool read:\nfile contents".to_string());
+        assert_eq!(msg.role, MessageRole::Tool);
+        assert!(msg.content.contains("file contents"));
+    }
+
+    #[test]
+    fn conversation_message_new_user_not_collapsed() {
+        let msg = ConversationMessage::new(MessageRole::User, "question".to_string(), None);
+        assert_eq!(msg.role, MessageRole::User);
+        assert!(!msg.collapsed);
+    }
+
+    #[test]
+    fn conversation_message_with_thinking() {
+        let msg = ConversationMessage::new(
+            MessageRole::Assistant,
+            "response".to_string(),
+            Some("I'm thinking...".to_string()),
+        );
+        assert_eq!(msg.thinking.as_deref(), Some("I'm thinking..."));
+    }
+
+    // --- extension UI prompt/response ---
+
+    #[test]
+    fn extension_ui_confirm_prompt_format() {
+        let request = ExtensionUiRequest::new("req-1", "confirm", json!({ "title": "Proceed?" }));
+        let prompt = format_extension_ui_prompt(&request);
+        assert!(prompt.contains("Proceed?"));
+    }
+
+    #[test]
+    fn extension_ui_confirm_yes() {
+        let request = ExtensionUiRequest::new("req-1", "confirm", json!({ "title": "Proceed?" }));
+        let response = parse_extension_ui_response(&request, "yes").unwrap();
+        assert_eq!(response.value, Some(json!(true)));
+    }
+
+    #[test]
+    fn extension_ui_confirm_no() {
+        let request = ExtensionUiRequest::new("req-1", "confirm", json!({ "title": "Proceed?" }));
+        let response = parse_extension_ui_response(&request, "no").unwrap();
+        assert_eq!(response.value, Some(json!(false)));
+    }
+
+    #[test]
+    fn extension_ui_input_response() {
+        let request = ExtensionUiRequest::new("req-1", "input", json!({ "title": "Enter name:" }));
+        let response = parse_extension_ui_response(&request, "Alice").unwrap();
+        assert_eq!(response.value, Some(json!("Alice")));
+    }
+
+    #[test]
+    fn extension_ui_select_by_label_text() {
+        let request = ExtensionUiRequest::new(
+            "req-1",
+            "select",
+            json!({
+                "title": "Pick",
+                "options": ["alpha", "beta", "gamma"],
+            }),
+        );
+        let response = parse_extension_ui_response(&request, "beta").unwrap();
+        assert_eq!(response.value, Some(json!("beta")));
     }
 }

@@ -187,17 +187,30 @@ impl AuthStorage {
 
     /// Resolve API key with precedence.
     pub fn resolve_api_key(&self, provider: &str, override_key: Option<&str>) -> Option<String> {
+        self.resolve_api_key_with_env_lookup(provider, override_key, |var| std::env::var(var).ok())
+    }
+
+    fn resolve_api_key_with_env_lookup<F>(
+        &self,
+        provider: &str,
+        override_key: Option<&str>,
+        mut env_lookup: F,
+    ) -> Option<String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
         if let Some(key) = override_key {
             return Some(key.to_string());
         }
 
-        if let Some(key) = self.api_key(provider) {
+        if let Some(key) = env_keys_for_provider(provider)
+            .iter()
+            .find_map(|var| env_lookup(var).filter(|value| !value.is_empty()))
+        {
             return Some(key);
         }
 
-        env_keys_for_provider(provider)
-            .iter()
-            .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
+        self.api_key(provider)
     }
 
     /// Refresh any expired OAuth tokens that this binary knows how to refresh.
@@ -347,6 +360,16 @@ fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
     }
 }
 
+fn redact_known_secrets(text: &str, secrets: &[&str]) -> String {
+    let mut redacted = text.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            redacted = redacted.replace(secret, "[REDACTED]");
+        }
+    }
+    redacted
+}
+
 #[derive(Debug, Clone)]
 pub struct OAuthStartInfo {
     pub provider: String,
@@ -486,9 +509,12 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
 
     if !(200..300).contains(&status) {
-        return Err(Error::auth(format!("Token exchange failed: {text}")));
+        return Err(Error::auth(format!(
+            "Token exchange failed: {redacted_text}"
+        )));
     }
 
     let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
@@ -522,10 +548,11 @@ async fn refresh_anthropic_oauth_token(
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[refresh_token]);
 
     if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
-            "Anthropic token refresh failed: {text}"
+            "Anthropic token refresh failed: {redacted_text}"
         )));
     }
 
@@ -613,9 +640,12 @@ pub async fn complete_extension_oauth(
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
 
     if !(200..300).contains(&status) {
-        return Err(Error::auth(format!("Token exchange failed: {text}")));
+        return Err(Error::auth(format!(
+            "Token exchange failed: {redacted_text}"
+        )));
     }
 
     let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
@@ -649,10 +679,11 @@ async fn refresh_extension_oauth_token(
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[refresh_token]);
 
     if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
-            "Extension OAuth token refresh failed: {text}"
+            "Extension OAuth token refresh failed: {redacted_text}"
         )));
     }
 
@@ -776,11 +807,127 @@ pub fn load_default_auth(path: &Path) -> Result<AuthStorage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
 
     fn next_token() -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_string()
+    }
+
+    fn spawn_json_server(status_code: u16, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = body.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut chunk = [0_u8; 4096];
+            let _ = socket.read(&mut chunk);
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        format!("http://{addr}/token")
+    }
+
+    #[test]
+    fn test_auth_storage_load_missing_file_starts_empty() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("missing-auth.json");
+        assert!(!auth_path.exists());
+
+        let loaded = AuthStorage::load(auth_path.clone()).expect("load");
+        assert!(loaded.entries.is_empty());
+        assert_eq!(loaded.path, auth_path);
+    }
+
+    #[test]
+    fn test_auth_storage_api_key_round_trip() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        {
+            let mut auth = AuthStorage {
+                path: auth_path.clone(),
+                entries: HashMap::new(),
+            };
+            auth.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "stored-openai-key".to_string(),
+                },
+            );
+            auth.save().expect("save");
+        }
+
+        let loaded = AuthStorage::load(auth_path).expect("load");
+        assert_eq!(
+            loaded.api_key("openai").as_deref(),
+            Some("stored-openai-key")
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_precedence_override_env_stored() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-openai-key".to_string(),
+            },
+        );
+
+        let env_value = "env-openai-key".to_string();
+
+        let override_resolved =
+            auth.resolve_api_key_with_env_lookup("openai", Some("override-key"), |_| {
+                Some(env_value.clone())
+            });
+        assert_eq!(override_resolved.as_deref(), Some("override-key"));
+
+        let env_resolved =
+            auth.resolve_api_key_with_env_lookup("openai", None, |_| Some(env_value.clone()));
+        assert_eq!(env_resolved.as_deref(), Some("env-openai-key"));
+
+        let stored_resolved = auth.resolve_api_key_with_env_lookup("openai", None, |_| None);
+        assert_eq!(stored_resolved.as_deref(), Some("stored-openai-key"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_returns_none_when_unconfigured() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+
+        let resolved = auth.resolve_api_key_with_env_lookup("openai", None, |_| None);
+        assert!(resolved.is_none());
     }
 
     #[test]
@@ -1076,6 +1223,103 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_expired_extension_oauth_tokens_updates_and_persists() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let auth_path = dir.path().join("auth.json");
+            let mut auth = AuthStorage {
+                path: auth_path.clone(),
+                entries: HashMap::new(),
+            };
+            auth.entries.insert(
+                "my-ext".to_string(),
+                AuthCredential::OAuth {
+                    access_token: "old-access".to_string(),
+                    refresh_token: "old-refresh".to_string(),
+                    expires: 0,
+                },
+            );
+
+            let token_url = spawn_json_server(
+                200,
+                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
+            );
+            let mut config = sample_oauth_config();
+            config.token_url = token_url;
+
+            let mut extension_configs = HashMap::new();
+            extension_configs.insert("my-ext".to_string(), config);
+
+            let client = crate::http::client::Client::new();
+            auth.refresh_expired_extension_oauth_tokens(&client, &extension_configs)
+                .await
+                .expect("refresh");
+
+            let now = chrono::Utc::now().timestamp_millis();
+            match auth.entries.get("my-ext").expect("credential updated") {
+                AuthCredential::OAuth {
+                    access_token,
+                    refresh_token,
+                    expires,
+                } => {
+                    assert_eq!(access_token, "new-access");
+                    assert_eq!(refresh_token, "new-refresh");
+                    assert!(*expires > now);
+                }
+                other @ AuthCredential::ApiKey { .. } => {
+                    unreachable!("expected oauth credential, got: {other:?}");
+                }
+            }
+
+            let reloaded = AuthStorage::load(auth_path).expect("reload");
+            match reloaded.get("my-ext").expect("persisted credential") {
+                AuthCredential::OAuth {
+                    access_token,
+                    refresh_token,
+                    ..
+                } => {
+                    assert_eq!(access_token, "new-access");
+                    assert_eq!(refresh_token, "new-refresh");
+                }
+                other @ AuthCredential::ApiKey { .. } => {
+                    unreachable!("expected oauth credential, got: {other:?}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_refresh_extension_oauth_token_redacts_secret_in_error() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let refresh_secret = "secret-refresh-token-123";
+            let token_url = spawn_json_server(
+                401,
+                &format!(r#"{{"error":"invalid_grant","echo":"{refresh_secret}"}}"#),
+            );
+
+            let mut config = sample_oauth_config();
+            config.token_url = token_url;
+
+            let client = crate::http::client::Client::new();
+            let err = refresh_extension_oauth_token(&client, &config, refresh_secret)
+                .await
+                .expect_err("expected refresh failure");
+            let err_text = err.to_string();
+
+            assert!(
+                err_text.contains("[REDACTED]"),
+                "expected redacted marker in error: {err_text}"
+            );
+            assert!(
+                !err_text.contains(refresh_secret),
+                "refresh token leaked in error: {err_text}"
+            );
+        });
+    }
+
+    #[test]
     fn test_oauth_token_storage_round_trip() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
@@ -1236,5 +1480,649 @@ mod tests {
         assert!(info.url.contains("client%20with%20spaces"));
         assert!(info.url.contains("scope%26dangerous"));
         assert!(info.url.contains("call%20back"));
+    }
+
+    // ── AuthStorage creation (additional edge cases) ─────────────────
+
+    #[test]
+    fn test_auth_storage_load_valid_api_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let content = r#"{"anthropic":{"type":"api_key","key":"sk-test-abc"}}"#;
+        fs::write(&auth_path, content).expect("write");
+
+        let auth = AuthStorage::load(auth_path).expect("load");
+        assert!(auth.entries.contains_key("anthropic"));
+        match auth.get("anthropic").expect("credential") {
+            AuthCredential::ApiKey { key } => assert_eq!(key, "sk-test-abc"),
+            other => panic!("expected ApiKey, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_auth_storage_load_corrupted_json_returns_empty() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        fs::write(&auth_path, "not valid json {{").expect("write");
+
+        let auth = AuthStorage::load(auth_path).expect("load");
+        // Corrupted JSON falls through to `unwrap_or_default()`.
+        assert!(auth.entries.is_empty());
+    }
+
+    #[test]
+    fn test_auth_storage_load_empty_file_returns_empty() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        fs::write(&auth_path, "").expect("write");
+
+        let auth = AuthStorage::load(auth_path).expect("load");
+        assert!(auth.entries.is_empty());
+    }
+
+    // ── resolve_api_key edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_resolve_api_key_empty_override_still_wins() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        // Empty string override still counts as explicit.
+        let resolved = auth.resolve_api_key_with_env_lookup("anthropic", Some(""), |_| None);
+        assert_eq!(resolved.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_beats_stored() {
+        // The new precedence is: override > env > stored.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        let resolved =
+            auth.resolve_api_key_with_env_lookup("openai", None, |_| Some("env-key".to_string()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("env-key"),
+            "env should beat stored"
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_empty_env_falls_through_to_stored() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-key".to_string(),
+            },
+        );
+
+        // Empty env var is filtered out, falls through to stored.
+        let resolved =
+            auth.resolve_api_key_with_env_lookup("openai", None, |_| Some(String::new()));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("stored-key"),
+            "empty env should fall through to stored"
+        );
+    }
+
+    // ── API key storage and persistence ───────────────────────────────
+
+    #[test]
+    fn test_api_key_store_and_retrieve() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "sk-openai-test".to_string(),
+            },
+        );
+
+        assert_eq!(auth.api_key("openai").as_deref(), Some("sk-openai-test"));
+    }
+
+    #[test]
+    fn test_multiple_providers_stored_and_retrieved() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "sk-ant".to_string(),
+            },
+        );
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "sk-oai".to_string(),
+            },
+        );
+        let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        auth.set(
+            "google",
+            AuthCredential::OAuth {
+                access_token: "goog-token".to_string(),
+                refresh_token: "goog-refresh".to_string(),
+                expires: far_future,
+            },
+        );
+        auth.save().expect("save");
+
+        // Reload and verify all three.
+        let loaded = AuthStorage::load(auth_path).expect("load");
+        assert_eq!(loaded.api_key("anthropic").as_deref(), Some("sk-ant"));
+        assert_eq!(loaded.api_key("openai").as_deref(), Some("sk-oai"));
+        assert_eq!(loaded.api_key("google").as_deref(), Some("goog-token"));
+        assert_eq!(loaded.entries.len(), 3);
+    }
+
+    #[test]
+    fn test_save_creates_parent_directories() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("nested").join("dirs").join("auth.json");
+
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "nested-key".to_string(),
+            },
+        );
+        auth.save().expect("save should create parents");
+        assert!(auth_path.exists());
+
+        let loaded = AuthStorage::load(auth_path).expect("load");
+        assert_eq!(loaded.api_key("anthropic").as_deref(), Some("nested-key"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_sets_600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "secret".to_string(),
+            },
+        );
+        auth.save().expect("save");
+
+        let metadata = fs::metadata(&auth_path).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "auth.json should be owner-only read/write");
+    }
+
+    // ── Missing key handling ──────────────────────────────────────────
+
+    #[test]
+    fn test_api_key_returns_none_for_missing_provider() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        assert!(auth.api_key("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_returns_none_for_missing_provider() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        assert!(auth.get("nonexistent").is_none());
+    }
+
+    // ── env_keys_for_provider coverage ────────────────────────────────
+
+    #[test]
+    fn test_env_keys_all_built_in_providers() {
+        let providers = [
+            ("anthropic", "ANTHROPIC_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("google", "GOOGLE_API_KEY"),
+            ("google-vertex", "GOOGLE_CLOUD_API_KEY"),
+            ("amazon-bedrock", "AWS_ACCESS_KEY_ID"),
+            ("azure-openai", "AZURE_OPENAI_API_KEY"),
+            ("github-copilot", "GITHUB_COPILOT_API_KEY"),
+            ("xai", "XAI_API_KEY"),
+            ("groq", "GROQ_API_KEY"),
+            ("deepinfra", "DEEPINFRA_API_KEY"),
+            ("cerebras", "CEREBRAS_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("mistral", "MISTRAL_API_KEY"),
+            ("cohere", "COHERE_API_KEY"),
+            ("perplexity", "PERPLEXITY_API_KEY"),
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("fireworks", "FIREWORKS_API_KEY"),
+        ];
+        for (provider, expected_key) in providers {
+            let keys = env_keys_for_provider(provider);
+            assert!(!keys.is_empty(), "expected env key for {provider}");
+            assert_eq!(
+                keys[0], expected_key,
+                "wrong primary env key for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_keys_togetherai_has_two_variants() {
+        let keys = env_keys_for_provider("togetherai");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], "TOGETHER_API_KEY");
+        assert_eq!(keys[1], "TOGETHER_AI_API_KEY");
+    }
+
+    #[test]
+    fn test_env_keys_moonshotai_aliases() {
+        for alias in &["moonshotai", "moonshot", "kimi"] {
+            let keys = env_keys_for_provider(alias);
+            assert_eq!(
+                keys,
+                &["MOONSHOT_API_KEY"],
+                "alias {alias} should map to MOONSHOT_API_KEY"
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_keys_alibaba_aliases() {
+        for alias in &["alibaba", "dashscope", "qwen"] {
+            let keys = env_keys_for_provider(alias);
+            assert_eq!(
+                keys,
+                &["DASHSCOPE_API_KEY"],
+                "alias {alias} should map to DASHSCOPE_API_KEY"
+            );
+        }
+    }
+
+    // ── Percent encoding / decoding ───────────────────────────────────
+
+    #[test]
+    fn test_percent_encode_ascii_passthrough() {
+        assert_eq!(percent_encode_component("hello"), "hello");
+        assert_eq!(
+            percent_encode_component("ABCDEFxyz0189-._~"),
+            "ABCDEFxyz0189-._~"
+        );
+    }
+
+    #[test]
+    fn test_percent_encode_spaces_and_special() {
+        assert_eq!(percent_encode_component("hello world"), "hello%20world");
+        assert_eq!(percent_encode_component("a&b=c"), "a%26b%3Dc");
+        assert_eq!(percent_encode_component("100%"), "100%25");
+    }
+
+    #[test]
+    fn test_percent_decode_passthrough() {
+        assert_eq!(percent_decode_component("hello").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn test_percent_decode_encoded() {
+        assert_eq!(
+            percent_decode_component("hello%20world").as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(
+            percent_decode_component("a%26b%3Dc").as_deref(),
+            Some("a&b=c")
+        );
+    }
+
+    #[test]
+    fn test_percent_decode_plus_as_space() {
+        assert_eq!(
+            percent_decode_component("hello+world").as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn test_percent_decode_invalid_hex_returns_none() {
+        assert!(percent_decode_component("hello%ZZ").is_none());
+        assert!(percent_decode_component("trailing%2").is_none());
+        assert!(percent_decode_component("trailing%").is_none());
+    }
+
+    #[test]
+    fn test_percent_encode_decode_roundtrip() {
+        let inputs = ["hello world", "a=1&b=2", "special: 100% /path?q=v#frag"];
+        for input in inputs {
+            let encoded = percent_encode_component(input);
+            let decoded = percent_decode_component(&encoded).expect("decode");
+            assert_eq!(decoded, input, "roundtrip failed for: {input}");
+        }
+    }
+
+    // ── parse_query_pairs ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_query_pairs_basic() {
+        let pairs = parse_query_pairs("code=abc&state=def");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0], ("code".to_string(), "abc".to_string()));
+        assert_eq!(pairs[1], ("state".to_string(), "def".to_string()));
+    }
+
+    #[test]
+    fn test_parse_query_pairs_empty_value() {
+        let pairs = parse_query_pairs("key=");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("key".to_string(), String::new()));
+    }
+
+    #[test]
+    fn test_parse_query_pairs_no_value() {
+        let pairs = parse_query_pairs("key");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0], ("key".to_string(), String::new()));
+    }
+
+    #[test]
+    fn test_parse_query_pairs_empty_string() {
+        let pairs = parse_query_pairs("");
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_pairs_encoded_values() {
+        let pairs = parse_query_pairs("scope=read%20write&redirect=http%3A%2F%2Fexample.com");
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].1, "read write");
+        assert_eq!(pairs[1].1, "http://example.com");
+    }
+
+    // ── build_url_with_query ──────────────────────────────────────────
+
+    #[test]
+    fn test_build_url_basic() {
+        let url = build_url_with_query(
+            "https://example.com/auth",
+            &[("key", "val"), ("foo", "bar")],
+        );
+        assert_eq!(url, "https://example.com/auth?key=val&foo=bar");
+    }
+
+    #[test]
+    fn test_build_url_encodes_special_chars() {
+        let url =
+            build_url_with_query("https://example.com", &[("q", "hello world"), ("x", "a&b")]);
+        assert!(url.contains("q=hello%20world"));
+        assert!(url.contains("x=a%26b"));
+    }
+
+    #[test]
+    fn test_build_url_no_params() {
+        let url = build_url_with_query("https://example.com", &[]);
+        assert_eq!(url, "https://example.com?");
+    }
+
+    // ── parse_oauth_code_input edge cases ─────────────────────────────
+
+    #[test]
+    fn test_parse_oauth_code_input_empty() {
+        let (code, state) = parse_oauth_code_input("");
+        assert!(code.is_none());
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_whitespace_only() {
+        let (code, state) = parse_oauth_code_input("   ");
+        assert!(code.is_none());
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_url_strips_fragment() {
+        let (code, state) =
+            parse_oauth_code_input("https://example.com/callback?code=abc&state=def#fragment");
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert_eq!(state.as_deref(), Some("def"));
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_url_code_only() {
+        let (code, state) = parse_oauth_code_input("https://example.com/callback?code=abc");
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_hash_empty_state() {
+        let (code, state) = parse_oauth_code_input("abc#");
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_hash_empty_code() {
+        let (code, state) = parse_oauth_code_input("#state-only");
+        assert!(code.is_none());
+        assert_eq!(state.as_deref(), Some("state-only"));
+    }
+
+    // ── oauth_expires_at_ms ───────────────────────────────────────────
+
+    #[test]
+    fn test_oauth_expires_at_ms_subtracts_safety_margin() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let expires_in = 3600; // 1 hour
+        let result = oauth_expires_at_ms(expires_in);
+
+        // Should be ~55 minutes from now (3600s - 5min safety margin).
+        let expected_approx = now_ms + 3600 * 1000 - 5 * 60 * 1000;
+        let diff = (result - expected_approx).unsigned_abs();
+        assert!(diff < 1000, "expected ~{expected_approx}ms, got {result}ms");
+    }
+
+    #[test]
+    fn test_oauth_expires_at_ms_zero_expires_in() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let result = oauth_expires_at_ms(0);
+
+        // Should be 5 minutes before now (0s - 5min safety margin).
+        let expected_approx = now_ms - 5 * 60 * 1000;
+        let diff = (result - expected_approx).unsigned_abs();
+        assert!(diff < 1000, "expected ~{expected_approx}ms, got {result}ms");
+    }
+
+    // ── Overwrite semantics ───────────────────────────────────────────
+
+    #[test]
+    fn test_set_overwrites_existing_credential() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "first-key".to_string(),
+            },
+        );
+        assert_eq!(auth.api_key("anthropic").as_deref(), Some("first-key"));
+
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "second-key".to_string(),
+            },
+        );
+        assert_eq!(auth.api_key("anthropic").as_deref(), Some("second-key"));
+        assert_eq!(auth.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_save_then_overwrite_persists_latest() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        // Save first version.
+        {
+            let mut auth = AuthStorage {
+                path: auth_path.clone(),
+                entries: HashMap::new(),
+            };
+            auth.set(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "old-key".to_string(),
+                },
+            );
+            auth.save().expect("save");
+        }
+
+        // Overwrite.
+        {
+            let mut auth = AuthStorage::load(auth_path.clone()).expect("load");
+            auth.set(
+                "anthropic",
+                AuthCredential::ApiKey {
+                    key: "new-key".to_string(),
+                },
+            );
+            auth.save().expect("save");
+        }
+
+        // Verify.
+        let loaded = AuthStorage::load(auth_path).expect("load");
+        assert_eq!(loaded.api_key("anthropic").as_deref(), Some("new-key"));
+    }
+
+    // ── load_default_auth convenience ─────────────────────────────────
+
+    #[test]
+    fn test_load_default_auth_works_like_load() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "test-key".to_string(),
+            },
+        );
+        auth.save().expect("save");
+
+        let loaded = load_default_auth(&auth_path).expect("load_default_auth");
+        assert_eq!(loaded.api_key("anthropic").as_deref(), Some("test-key"));
+    }
+
+    // ── redact_known_secrets ─────────────────────────────────────────
+
+    #[test]
+    fn test_redact_known_secrets_replaces_secrets() {
+        let text = r#"{"token":"secret123","other":"hello secret123 world"}"#;
+        let redacted = redact_known_secrets(text, &["secret123"]);
+        assert!(!redacted.contains("secret123"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_known_secrets_ignores_empty_secrets() {
+        let text = "nothing to redact here";
+        let redacted = redact_known_secrets(text, &["", "   "]);
+        // Empty secret should be skipped; only non-empty "   " gets replaced if present.
+        assert_eq!(redacted, text);
+    }
+
+    #[test]
+    fn test_redact_known_secrets_multiple_secrets() {
+        let text = "token=aaa refresh=bbb echo=aaa";
+        let redacted = redact_known_secrets(text, &["aaa", "bbb"]);
+        assert!(!redacted.contains("aaa"));
+        assert!(!redacted.contains("bbb"));
+        assert_eq!(
+            redacted,
+            "token=[REDACTED] refresh=[REDACTED] echo=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_known_secrets_no_match() {
+        let text = "safe text with no secrets";
+        let redacted = redact_known_secrets(text, &["not-present"]);
+        assert_eq!(redacted, text);
+    }
+
+    // ── PKCE determinism ──────────────────────────────────────────────
+
+    #[test]
+    fn test_generate_pkce_unique_each_call() {
+        let (v1, c1) = generate_pkce();
+        let (v2, c2) = generate_pkce();
+        assert_ne!(v1, v2, "verifiers should differ");
+        assert_ne!(c1, c2, "challenges should differ");
+    }
+
+    #[test]
+    fn test_generate_pkce_challenge_is_sha256_of_verifier() {
+        let (verifier, challenge) = generate_pkce();
+        let expected_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        assert_eq!(challenge, expected_challenge);
     }
 }

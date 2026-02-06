@@ -3851,4 +3851,410 @@ mod tests {
         let session = Session::in_memory();
         assert!(session.get_entry("nonexistent").is_none());
     }
+
+    // ======================================================================
+    // Branching round-trip (save with branches, reload, verify)
+    // ======================================================================
+
+    #[test]
+    fn test_branching_round_trip_preserves_tree_structure() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        // Create: A -> B -> C, then branch from A: A -> D
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let id_c = session.append_message(make_test_message("C"));
+
+        session.create_branch_from(&id_a);
+        let id_d = session.append_message(make_test_message("D"));
+
+        // Verify pre-save state
+        let leaves = session.list_leaves();
+        assert_eq!(leaves.len(), 2);
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        // Verify tree structure survived round-trip
+        assert_eq!(loaded.entries.len(), 4);
+        let loaded_leaves = loaded.list_leaves();
+        assert_eq!(loaded_leaves.len(), 2);
+        assert!(loaded_leaves.contains(&id_c));
+        assert!(loaded_leaves.contains(&id_d));
+
+        // Verify parent linking
+        let path_to_c = loaded.get_path_to_entry(&id_c);
+        assert_eq!(path_to_c, vec![id_a.as_str(), id_b.as_str(), id_c.as_str()]);
+
+        let path_to_d = loaded.get_path_to_entry(&id_d);
+        assert_eq!(path_to_d, vec![id_a.as_str(), id_d.as_str()]);
+    }
+
+    // ======================================================================
+    // Session directory resolution from CWD
+    // ======================================================================
+
+    #[test]
+    fn test_encode_cwd_strips_leading_separators() {
+        let path = std::path::Path::new("/home/user/my-project");
+        let encoded = encode_cwd(path);
+        assert_eq!(encoded, "--home-user-my-project--");
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn test_encode_cwd_handles_deeply_nested_path() {
+        let path = std::path::Path::new("/a/b/c/d/e/f");
+        let encoded = encode_cwd(path);
+        assert_eq!(encoded, "--a-b-c-d-e-f--");
+    }
+
+    #[test]
+    fn test_save_creates_project_session_dir_from_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("test"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        // The saved path should be inside a CWD-encoded subdirectory
+        let parent = path.parent().unwrap();
+        let dir_name = parent.file_name().unwrap().to_string_lossy();
+        assert!(
+            dir_name.starts_with("--"),
+            "session dir should start with --"
+        );
+        assert!(dir_name.ends_with("--"), "session dir should end with --");
+
+        // The file should have .jsonl extension
+        assert_eq!(path.extension().unwrap(), "jsonl");
+    }
+
+    // ======================================================================
+    // All entries corrupted (only header valid)
+    // ======================================================================
+
+    #[test]
+    fn test_all_entries_corrupted_produces_empty_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("A"));
+        session.append_message(make_test_message("B"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Corrupt all entry lines (keep header at index 0)
+        for i in 1..lines.len() {
+            lines[i] = format!("GARBAGE_{i}");
+        }
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(diagnostics.skipped_entries.len(), 2);
+        assert!(loaded.entries.is_empty());
+        assert!(loaded.leaf_id.is_none());
+        // Header should still be valid
+        assert_eq!(loaded.header.id, session.header.id);
+    }
+
+    // ======================================================================
+    // Unicode and special character content
+    // ======================================================================
+
+    #[test]
+    fn test_unicode_content_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        let unicode_texts = [
+            "Hello \u{1F600} World",    // emoji
+            "\u{4F60}\u{597D}",         // Chinese
+            "\u{0410}\u{0411}\u{0412}", // Cyrillic
+            "caf\u{00E9}",              // accented
+            "tab\there\nnewline",       // control chars
+            "\"quoted\" and \\escaped", // JSON special chars
+        ];
+
+        for text in &unicode_texts {
+            session.append_message(make_test_message(text));
+        }
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), unicode_texts.len());
+
+        for (i, entry) in loaded.entries.iter().enumerate() {
+            if let SessionEntry::Message(msg) = entry {
+                if let SessionMessage::User { content, .. } = &msg.message {
+                    match content {
+                        UserContent::Text(t) => assert_eq!(t, unicode_texts[i]),
+                        _ => panic!("expected Text content at index {i}"),
+                    }
+                }
+            }
+        }
+    }
+
+    // ======================================================================
+    // Multiple compactions
+    // ======================================================================
+
+    #[test]
+    fn test_multiple_compactions_latest_wins() {
+        let mut session = Session::in_memory();
+
+        let _id_a = session.append_message(make_test_message("old A"));
+        let _id_b = session.append_message(make_test_message("old B"));
+        let id_c = session.append_message(make_test_message("kept C"));
+
+        // First compaction: keep from C
+        session.append_compaction("Summary 1".to_string(), id_c.clone(), 1000, None, None);
+
+        let _id_d = session.append_message(make_test_message("new D"));
+        let id_e = session.append_message(make_test_message("new E"));
+
+        // Second compaction: keep from E
+        session.append_compaction("Summary 2".to_string(), id_e.clone(), 2000, None, None);
+
+        let id_f = session.append_message(make_test_message("newest F"));
+
+        session.navigate_to(&id_f);
+        let messages = session.to_messages_for_current_path();
+
+        // Old messages A, B should definitely not appear
+        let all_text: String = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => match &u.content {
+                    UserContent::Text(t) => Some(t.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(!all_text.contains("old A"), "A should be compacted away");
+        assert!(!all_text.contains("old B"), "B should be compacted away");
+    }
+
+    // ======================================================================
+    // Session with only metadata entries (no messages)
+    // ======================================================================
+
+    #[test]
+    fn test_session_with_only_metadata_entries() {
+        let mut session = Session::in_memory();
+
+        session.append_model_change("anthropic".to_string(), "claude-opus".to_string());
+        session.append_thinking_level_change("high".to_string());
+        session.set_name("metadata-only");
+
+        // to_messages should return empty (no actual messages)
+        let messages = session.to_messages();
+        assert!(messages.is_empty());
+
+        // entries_for_current_path should still return the metadata entries
+        let entries = session.entries_for_current_path();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn test_metadata_only_session_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        session.append_model_change("openai".to_string(), "gpt-4o".to_string());
+        session.append_thinking_level_change("medium".to_string());
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(
+            loaded
+                .entries
+                .iter()
+                .any(|e| matches!(e, SessionEntry::ModelChange(_)))
+        );
+        assert!(
+            loaded
+                .entries
+                .iter()
+                .any(|e| matches!(e, SessionEntry::ThinkingLevelChange(_)))
+        );
+    }
+
+    // ======================================================================
+    // Session name round-trip persistence
+    // ======================================================================
+
+    #[test]
+    fn test_session_name_survives_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        session.append_message(make_test_message("Hello"));
+        session.set_name("my-important-session");
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.get_name().as_deref(), Some("my-important-session"));
+    }
+
+    // ======================================================================
+    // Trailing newline / whitespace in JSONL
+    // ======================================================================
+
+    #[test]
+    fn test_trailing_whitespace_in_jsonl_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("test"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        // Append extra blank lines at the end
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents.push_str("\n\n\n");
+        std::fs::write(&path, contents).unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), 1);
+    }
+
+    // ======================================================================
+    // Branching after compaction
+    // ======================================================================
+
+    #[test]
+    fn test_branching_after_compaction() {
+        let mut session = Session::in_memory();
+
+        let _id_a = session.append_message(make_test_message("old A"));
+        let id_b = session.append_message(make_test_message("kept B"));
+
+        session.append_compaction("Compacted".to_string(), id_b.clone(), 500, None, None);
+
+        let id_c = session.append_message(make_test_message("C after compaction"));
+
+        // Branch from B (the compaction keep-point)
+        session.create_branch_from(&id_b);
+        let id_d = session.append_message(make_test_message("D branch after compaction"));
+
+        let leaves = session.list_leaves();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains(&id_c));
+        assert!(leaves.contains(&id_d));
+    }
+
+    // ======================================================================
+    // Assistant message with tool calls round-trip
+    // ======================================================================
+
+    #[test]
+    fn test_assistant_with_tool_calls_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        session.append_message(make_test_message("read my file"));
+
+        let assistant = AssistantMessage {
+            content: vec![
+                ContentBlock::Text(TextContent::new("Let me read that for you.")),
+                ContentBlock::ToolCall(crate::model::ToolCall {
+                    id: "call_abc".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({"path": "src/main.rs"}),
+                    thought_signature: None,
+                }),
+            ],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            usage: Usage {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 150,
+                cost: Default::default(),
+            },
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: 12345,
+        };
+        session.append_message(SessionMessage::Assistant { message: assistant });
+
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call_abc".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("fn main() {}"))],
+            details: Some(serde_json::json!({"lines": 1, "truncated": false})),
+            is_error: false,
+            timestamp: Some(12346),
+        });
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), 3);
+
+        // Verify tool call content survived
+        let has_tool_call = loaded.entries.iter().any(|e| {
+            if let SessionEntry::Message(msg) = e {
+                if let SessionMessage::Assistant { message } = &msg.message {
+                    return message
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::ToolCall(tc) if tc.id == "call_abc"));
+                }
+            }
+            false
+        });
+        assert!(has_tool_call, "tool call should survive round-trip");
+
+        // Verify tool result details survived
+        let has_details = loaded.entries.iter().any(|e| {
+            if let SessionEntry::Message(msg) = e {
+                if let SessionMessage::ToolResult { details, .. } = &msg.message {
+                    return details.is_some();
+                }
+            }
+            false
+        });
+        assert!(has_details, "tool result details should survive round-trip");
+    }
 }
