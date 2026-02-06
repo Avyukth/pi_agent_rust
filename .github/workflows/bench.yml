@@ -26,34 +26,6 @@ jobs:
         with:
           path: pi_agent_rust
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
       - name: Install system deps (bc, fd, rg) [linux]
         run: |
           set -euxo pipefail
@@ -147,34 +119,6 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
       - uses: actions/checkout@v4
         with:
           ref: main
