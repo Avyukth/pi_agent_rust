@@ -1897,6 +1897,46 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn log_tool_scenario_setup(
+    harness: &CliTestHarness,
+    scenario: &str,
+    expected_tools: &[&str],
+    system_prompt: &str,
+) {
+    let effective_tools = if expected_tools.is_empty() {
+        "(none)".to_string()
+    } else {
+        expected_tools.join(",")
+    };
+
+    let vcr_mode = harness
+        .env
+        .get("VCR_MODE")
+        .cloned()
+        .unwrap_or_else(|| "unset".to_string());
+    let cassette_name = harness
+        .env
+        .get("PI_VCR_TEST_NAME")
+        .cloned()
+        .unwrap_or_else(|| "unset".to_string());
+    let cassette_path = harness.env.get("VCR_CASSETTE_DIR").map_or_else(
+        || "unset".to_string(),
+        |dir| format!("{dir}/{cassette_name}.json"),
+    );
+    let prompt_excerpt: String = system_prompt.chars().take(96).collect();
+
+    harness
+        .harness
+        .log()
+        .info_ctx("setup", format!("tool scenario: {scenario}"), |ctx| {
+            ctx.push(("effective_tools".into(), effective_tools.clone()));
+            ctx.push(("system_prompt_excerpt".into(), prompt_excerpt.clone()));
+            ctx.push(("vcr_mode".into(), vcr_mode.clone()));
+            ctx.push(("cassette_name".into(), cassette_name.clone()));
+            ctx.push(("cassette_path".into(), cassette_path.clone()));
+        });
+}
+
 #[test]
 fn e2e_cli_print_mode_vcr_roundtrip() {
     let mut harness = CliTestHarness::new("e2e_cli_print_mode_vcr_roundtrip");
@@ -2095,6 +2135,7 @@ fn e2e_cli_print_mode_file_ref_reads_file() {
 #[test]
 fn e2e_cli_no_tools_omits_tool_definitions() {
     let mut harness = CliTestHarness::new("e2e_cli_no_tools_omits_tool_definitions");
+    let system_prompt = "Test no-tools.";
 
     // Build the expected request body WITHOUT a `tools` field.
     let request_body = json!({
@@ -2102,12 +2143,13 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
         ],
-        "system": expected_system_prompt("Test no-tools."),
+        "system": expected_system_prompt(system_prompt),
         "max_tokens": 8192,
         "stream": true
     });
 
     setup_vcr_anthropic(&mut harness, "e2e_no_tools", &request_body, "ok");
+    log_tool_scenario_setup(&harness, "no-tools", &[], system_prompt);
 
     let result = harness.run(&[
         "-p",
@@ -2123,7 +2165,7 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
         "--thinking",
         "off",
         "--system-prompt",
-        "Test no-tools.",
+        system_prompt,
         "Say ok.",
     ]);
 
@@ -2151,19 +2193,22 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
 #[test]
 fn e2e_cli_specific_tools_enables_subset() {
     let mut harness = CliTestHarness::new("e2e_cli_specific_tools_enables_subset");
+    let system_prompt = "Test tools subset.";
+    let expected_tools = ["read", "grep"];
 
     let request_body = json!({
         "model": "claude-sonnet-4-5",
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Say tools."}]}
         ],
-        "system": expected_system_prompt("Test tools subset."),
-        "tools": expected_anthropic_tools(&["read", "grep"]),
+        "system": expected_system_prompt(system_prompt),
+        "tools": expected_anthropic_tools(&expected_tools),
         "max_tokens": 8192,
         "stream": true
     });
 
     setup_vcr_anthropic(&mut harness, "e2e_tools_subset", &request_body, "tools");
+    log_tool_scenario_setup(&harness, "tools-subset", &expected_tools, system_prompt);
 
     let result = harness.run(&[
         "-p",
@@ -2180,7 +2225,7 @@ fn e2e_cli_specific_tools_enables_subset() {
         "--thinking",
         "off",
         "--system-prompt",
-        "Test tools subset.",
+        system_prompt,
         "Say tools.",
     ]);
 
@@ -2207,19 +2252,22 @@ fn e2e_cli_specific_tools_enables_subset() {
 #[test]
 fn e2e_cli_default_tools_when_no_flag() {
     let mut harness = CliTestHarness::new("e2e_cli_default_tools_when_no_flag");
+    let system_prompt = "Test default tools.";
+    let expected_tools = ["read", "bash", "edit", "write"];
 
     let request_body = json!({
         "model": "claude-sonnet-4-5",
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Say default."}]}
         ],
-        "system": expected_system_prompt("Test default tools."),
-        "tools": expected_anthropic_tools(&["read", "bash", "edit", "write"]),
+        "system": expected_system_prompt(system_prompt),
+        "tools": expected_anthropic_tools(&expected_tools),
         "max_tokens": 8192,
         "stream": true
     });
 
     setup_vcr_anthropic(&mut harness, "e2e_default_tools", &request_body, "default");
+    log_tool_scenario_setup(&harness, "default-tools", &expected_tools, system_prompt);
 
     let result = harness.run(&[
         "-p",
@@ -2234,7 +2282,7 @@ fn e2e_cli_default_tools_when_no_flag() {
         "--thinking",
         "off",
         "--system-prompt",
-        "Test default tools.",
+        system_prompt,
         "Say default.",
     ]);
 
@@ -2344,6 +2392,78 @@ fn e2e_cli_invalid_provider_error() {
             || stderr_lower.contains("no models"),
         "expected stderr to mention provider issue, got:\n{}",
         result.stderr,
+    );
+}
+
+/// Invalid model name produces a clear model-selection error and non-zero exit.
+#[test]
+fn e2e_cli_invalid_model_error() {
+    let harness = CliTestHarness::new("e2e_cli_invalid_model_error");
+
+    let result = harness.run(&[
+        "-p",
+        "--model",
+        "not-a-real-model",
+        "--no-tools",
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "hello",
+    ]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "invalid model error", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+
+    assert_ne!(
+        result.exit_code, 0,
+        "expected non-zero exit for invalid model"
+    );
+    let stderr_lower = result.stderr.to_lowercase();
+    assert!(
+        stderr_lower.contains("model")
+            && (stderr_lower.contains("not found")
+                || stderr_lower.contains("unknown")
+                || stderr_lower.contains("available")),
+        "expected stderr to mention invalid model selection, got:\n{}",
+        result.stderr,
+    );
+}
+
+/// RPC mode rejects @file arguments with a clear, actionable error.
+#[test]
+fn e2e_cli_rpc_mode_rejects_file_arguments() {
+    let harness = CliTestHarness::new("e2e_cli_rpc_mode_rejects_file_arguments");
+    let file_path = harness.harness.temp_path("rpc-input.txt");
+    fs::write(&file_path, "rpc mode file arg").expect("write rpc input");
+    let file_arg = format!("@{}", file_path.display());
+
+    let result = harness.run(&["--mode", "rpc", &file_arg]);
+
+    harness
+        .harness
+        .log()
+        .info_ctx("verify", "rpc mode @file restriction", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr".into(), result.stderr.clone()));
+        });
+
+    assert_ne!(
+        result.exit_code, 0,
+        "expected non-zero exit for RPC mode @file argument"
+    );
+    let combined = format!("{}\n{}", result.stderr, result.stdout).to_lowercase();
+    assert!(
+        combined.contains("rpc mode")
+            && (combined.contains("@file") || combined.contains("file arguments")),
+        "expected RPC mode @file restriction error, got:\nstderr: {}\nstdout: {}",
+        result.stderr,
+        result.stdout,
     );
 }
 

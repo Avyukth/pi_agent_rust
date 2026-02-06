@@ -1,23 +1,32 @@
 {
   "$schema": "pi.ext.candidate_pool.v1",
-  "generated_at": "2026-02-06T12:12:26.732773Z",
+  "generated_at": "2026-02-06T20:48:08Z",
   "source_inputs": {
     "artifact_provenance": "docs/extension-artifact-provenance.json",
     "artifact_root": "tests/ext_conformance/artifacts",
     "extra_npm_packages": [
-      "pi-mcp-adapter",
-      "pi-interactive-shell",
-      "pi-powerline-footer",
-      "pi-acp",
-      "pi-package-test",
-      "shitty-extensions",
-      "pi-extensions",
+      "@oh-my-pi/anthropic-websearch",
+      "@oh-my-pi/basics",
+      "@oh-my-pi/exa",
+      "@oh-my-pi/lsp",
+      "@oh-my-pi/pi-git-tool",
+      "@oh-my-pi/subagents",
+      "@qualisero/pi-agent-scip",
+      "@tmustier/pi-arcade",
       "@verioussmith/pi-openrouter",
       "agentsbox",
-      "mitsupi"
+      "mitsupi",
+      "pi-acp",
+      "pi-extensions",
+      "pi-interactive-shell",
+      "pi-interview",
+      "pi-mcp-adapter",
+      "pi-package-test",
+      "pi-powerline-footer",
+      "shitty-extensions"
     ]
   },
-  "total_candidates": 215,
+  "total_candidates": 224,
   "items": [
     {
       "id": "agents-mikeastock/extensions",
@@ -2434,6 +2443,162 @@
       "description": "TypeScript implementation of DDSketch, a distributed quantile sketch algorithm "
     },
     {
+      "id": "npm/oh-my-pi-anthropic-websearch",
+      "name": "@oh-my-pi/anthropic-websearch",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/anthropic-websearch",
+        "version": "1.3.3710",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/anthropic-websearch"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-01T17:38:32.457Z",
+      "version": "1.3.3710",
+      "description": "Anthropic Claude web search tool for pi",
+      "popularity": {
+        "npm_downloads_weekly": 15,
+        "npm_downloads_monthly": 276
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
+      "id": "npm/oh-my-pi-basics",
+      "name": "@oh-my-pi/basics",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/basics",
+        "version": "1.3.3710",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/basics"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-01T17:38:35.653Z",
+      "version": "1.3.3710",
+      "description": "Essential tools for pi: rg (ripgrep), glob (fd), notebook_edit, and git status hook",
+      "popularity": {
+        "npm_downloads_weekly": 5,
+        "npm_downloads_monthly": 54
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
+      "id": "npm/oh-my-pi-exa",
+      "name": "@oh-my-pi/exa",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/exa",
+        "version": "1.3.3710",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/exa"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-01T17:38:38.884Z",
+      "version": "1.3.3710",
+      "description": "Exa AI web search and websets tools for pi",
+      "popularity": {
+        "npm_downloads_weekly": 19,
+        "npm_downloads_monthly": 273
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
+      "id": "npm/oh-my-pi-lsp",
+      "name": "@oh-my-pi/lsp",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/lsp",
+        "version": "1.3.3710",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/lsp"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-01T17:38:45.374Z",
+      "version": "1.3.3710",
+      "description": "LSP (Language Server Protocol) tool for Pi - provides code intelligence, diagnostics, refactoring, and more",
+      "popularity": {
+        "npm_downloads_weekly": 11,
+        "npm_downloads_monthly": 136
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
+      "id": "npm/oh-my-pi-pi-git-tool",
+      "name": "@oh-my-pi/pi-git-tool",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/pi-git-tool",
+        "version": "6.8.5",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/pi-git-tool"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-21T07:01:22.657Z",
+      "version": "6.8.5",
+      "description": "Structured Git tool with safety guards and typed output",
+      "popularity": {
+        "npm_downloads_weekly": 165,
+        "npm_downloads_monthly": 7557
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
+      "id": "npm/oh-my-pi-subagents",
+      "name": "@oh-my-pi/subagents",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@oh-my-pi/subagents",
+        "version": "1.3.3710",
+        "url": "https://www.npmjs.com/package/@oh-my-pi/subagents"
+      },
+      "repository_url": "git+https://github.com/can1357/oh-my-pi.git",
+      "published_at": "2026-01-01T17:38:54.833Z",
+      "version": "1.3.3710",
+      "description": "Task delegation system with specialized subagents (task, planner, explore, reviewer, browser)",
+      "popularity": {
+        "npm_downloads_weekly": 12,
+        "npm_downloads_monthly": 195
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
       "id": "npm/permission-pi",
       "name": "permission-pi",
       "source_tier": "npm-registry",
@@ -2768,6 +2933,32 @@
         "community/nicobailon-interactive-shell"
       ],
       "notes": null
+    },
+    {
+      "id": "npm/pi-interview",
+      "name": "pi-interview",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-interview",
+        "version": "0.4.5",
+        "url": "https://www.npmjs.com/package/pi-interview"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-interview-tool.git",
+      "published_at": "2026-02-02T00:39:34.441Z",
+      "version": "0.4.5",
+      "description": "Interactive interview form extension for pi coding agent",
+      "popularity": {
+        "npm_downloads_weekly": 175,
+        "npm_downloads_monthly": 868
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
     },
     {
       "id": "npm/pi-mcp-adapter",
@@ -3558,6 +3749,32 @@
       "description": "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding, and local video analysis for Pi coding agent"
     },
     {
+      "id": "npm/qualisero-pi-agent-scip",
+      "name": "@qualisero/pi-agent-scip",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "Apache-2.0",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@qualisero/pi-agent-scip",
+        "version": "0.3.0",
+        "url": "https://www.npmjs.com/package/@qualisero/pi-agent-scip"
+      },
+      "repository_url": "git+https://github.com/qualisero/pi-agent-scip.git",
+      "published_at": "2026-01-10T16:33:35.497Z",
+      "version": "0.3.0",
+      "description": "SCIP code intelligence tools for pi-coding-agent (Python, TypeScript/JavaScript)",
+      "popularity": {
+        "npm_downloads_weekly": 17,
+        "npm_downloads_monthly": 196
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
+    },
+    {
       "id": "npm/ralph-loop-pi",
       "name": "ralph-loop-pi",
       "source_tier": "npm-registry",
@@ -3640,6 +3857,32 @@
       },
       "aliases": [],
       "notes": null
+    },
+    {
+      "id": "npm/tmustier-pi-arcade",
+      "name": "@tmustier/pi-arcade",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@tmustier/pi-arcade",
+        "version": "0.1.5",
+        "url": "https://www.npmjs.com/package/@tmustier/pi-arcade"
+      },
+      "repository_url": "git+https://github.com/tmustier/pi-extensions.git",
+      "published_at": "2026-02-03T01:23:10.942Z",
+      "version": "0.1.5",
+      "description": "Arcade minigames for the Pi coding agent.",
+      "popularity": {
+        "npm_downloads_weekly": 141,
+        "npm_downloads_monthly": 578
+      },
+      "aliases": [],
+      "notes": "Added by bd-2p71 npm query sweep on 2026-02-06; pending ExtensionAPI signature validation."
     },
     {
       "id": "npm/token-rate-pi",

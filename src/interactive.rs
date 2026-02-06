@@ -1813,14 +1813,19 @@ fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
         let Ok(url) = Url::parse(candidate_url) else {
             continue;
         };
-        if url.host_str()? != "gist.github.com" {
+        let Some(host) = url.host_str() else {
+            continue;
+        };
+        if host != "gist.github.com" {
             continue;
         }
-        let gist_id = url.path_segments()?.next_back()?.to_string();
+        let Some(gist_id) = url.path_segments().and_then(|mut seg| seg.next_back()) else {
+            continue;
+        };
         if gist_id.is_empty() {
             continue;
         }
-        return Some((candidate_url.to_string(), gist_id));
+        return Some((candidate_url.to_string(), gist_id.to_string()));
     }
     None
 }
@@ -11027,6 +11032,19 @@ mod tests {
     #[test]
     fn parse_gist_url_wrong_host() {
         assert!(parse_gist_url_and_id("https://github.com/user/repo").is_none());
+    }
+
+    #[test]
+    fn parse_gist_url_with_quotes_and_trailing_punctuation() {
+        let output = "Created gist: 'https://gist.github.com/testuser/abc123def456', done.";
+        let result = parse_gist_url_and_id(output);
+        assert_eq!(
+            result,
+            Some((
+                "https://gist.github.com/testuser/abc123def456".to_string(),
+                "abc123def456".to_string()
+            ))
+        );
     }
 
     // --- parse_queue_mode tests ---

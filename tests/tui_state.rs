@@ -2775,6 +2775,102 @@ fn tui_state_slash_share_reports_error_when_gh_missing() {
 
 #[test]
 #[cfg(unix)]
+fn tui_state_slash_share_reports_error_when_gh_not_authenticated() {
+    let harness = TestHarness::new("tui_state_slash_share_reports_error_when_gh_not_authenticated");
+
+    let gh_path = harness.temp_path("gh");
+    let script = "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  echo \"You are not logged into any GitHub hosts\" >&2\n  exit 1\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n";
+    fs::write(&gh_path, script).expect("write fake gh");
+    make_executable(&gh_path);
+
+    let config = Config {
+        gh_path: Some(gh_path.display().to_string()),
+        ..Default::default()
+    };
+    let (mut app, event_rx) = build_app_with_session_and_events_and_config(
+        &harness,
+        Vec::new(),
+        Session::in_memory(),
+        config,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/share");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Sharing session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
+    });
+    let error = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::AgentError(_)))
+        .expect("expected AgentError for unauthenticated gh");
+    let step = apply_pi(&harness, &mut app, "PiMsg::AgentError", error);
+    assert_after_contains(&harness, &step, "`gh` is not authenticated.");
+    assert_after_contains(&harness, &step, "Run `gh auth login` and retry.");
+}
+
+#[test]
+#[cfg(unix)]
+fn tui_state_slash_share_reports_parse_error_and_cleans_temp_file() {
+    let harness =
+        TestHarness::new("tui_state_slash_share_reports_parse_error_and_cleans_temp_file");
+
+    let record_path = harness.temp_path("gh_record_path.txt");
+    let gh_path = harness.temp_path("gh");
+    let script = format!(
+        "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  exit 0\nfi\n\nif [ \"$1\" = \"gist\" ] && [ \"$2\" = \"create\" ]; then\n  file=\"\"\n  for arg in \"$@\"; do\n    file=\"$arg\"\n  done\n  printf '%s' \"$file\" > \"{record_path}\"\n  echo \"created gist but no url\"\n  exit 0\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n",
+        record_path = record_path.display(),
+    );
+    fs::write(&gh_path, script).expect("write fake gh");
+    make_executable(&gh_path);
+
+    let config = Config {
+        gh_path: Some(gh_path.display().to_string()),
+        ..Default::default()
+    };
+    let (mut app, event_rx) = build_app_with_session_and_events_and_config(
+        &harness,
+        Vec::new(),
+        Session::in_memory(),
+        config,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/share");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Sharing session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
+    });
+    let error = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::AgentError(_)))
+        .expect("expected AgentError for gist parse failure");
+    let step = apply_pi(&harness, &mut app, "PiMsg::AgentError", error);
+    assert_after_contains(
+        &harness,
+        &step,
+        "Failed to parse gist URL from `gh gist create` output.",
+    );
+
+    let recorded = fs::read_to_string(&record_path).expect("read record path");
+    let shared_path = std::path::Path::new(recorded.trim());
+    let start = Instant::now();
+    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !shared_path.exists(),
+        "expected temp HTML file to be cleaned up on parse failure (still exists at {})",
+        shared_path.display()
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
     let harness = TestHarness::new(
         "tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file",

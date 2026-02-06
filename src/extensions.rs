@@ -6103,6 +6103,107 @@ pub async fn dispatch_host_call_shared(
     outcome_to_host_result(&call_id, &outcome)
 }
 
+// ============================================================================
+// Protocol Adapter: ExtensionMessage host_call -> host_result (bd-1uy.1.2)
+// ============================================================================
+
+/// Handle an incoming [`ExtensionMessage`] of type `host_call` by dispatching
+/// through the shared hostcall ABI and returning `host_result` messages.
+///
+/// This is a thin wrapper around [`dispatch_host_call_shared`] with no bespoke
+/// policy, timeout, or logging logic.
+///
+/// Returns a `Vec<ExtensionMessage>` for streaming-readiness: the initial
+/// implementation always returns exactly one message.
+///
+/// If the message is not a `host_call`, or fails validation, a single
+/// `host_result` with `invalid_request` is returned (never panics).
+#[allow(clippy::future_not_send)]
+pub async fn handle_extension_message(
+    ctx: &HostCallContext<'_>,
+    msg: ExtensionMessage,
+) -> Vec<ExtensionMessage> {
+    // Validate the incoming message.
+    if let Err(err) = msg.validate() {
+        let call_id = match &msg.body {
+            ExtensionBody::HostCall(payload) => payload.call_id.clone(),
+            _ => String::new(),
+        };
+        return vec![make_host_result_message(
+            &call_id,
+            HostResultPayload {
+                call_id: call_id.clone(),
+                output: json!({}),
+                is_error: true,
+                error: Some(HostCallError {
+                    code: HostCallErrorCode::InvalidRequest,
+                    message: format!("Message validation failed: {err}"),
+                    details: None,
+                    retryable: None,
+                }),
+                chunk: None,
+            },
+        )];
+    }
+
+    // Extract the `HostCallPayload`.
+    let payload = match msg.body {
+        ExtensionBody::HostCall(payload) => payload,
+        other => {
+            let type_name = extension_body_type_name(&other);
+            return vec![make_host_result_message(
+                "",
+                HostResultPayload {
+                    call_id: String::new(),
+                    output: json!({}),
+                    is_error: true,
+                    error: Some(HostCallError {
+                        code: HostCallErrorCode::InvalidRequest,
+                        message: format!(
+                            "handle_extension_message expects host_call, got {type_name}"
+                        ),
+                        details: None,
+                        retryable: None,
+                    }),
+                    chunk: None,
+                },
+            )];
+        }
+    };
+
+    let call_id = payload.call_id.clone();
+
+    // Dispatch through the shared ABI surface.
+    let result = dispatch_host_call_shared(ctx, payload).await;
+
+    vec![make_host_result_message(&call_id, result)]
+}
+
+/// Build an [`ExtensionMessage`] wrapping a [`HostResultPayload`].
+fn make_host_result_message(call_id: &str, result: HostResultPayload) -> ExtensionMessage {
+    ExtensionMessage {
+        id: format!("host_result:{call_id}"),
+        version: PROTOCOL_VERSION.to_string(),
+        body: ExtensionBody::HostResult(result),
+    }
+}
+
+/// Return the serde tag name for an [`ExtensionBody`] variant.
+const fn extension_body_type_name(body: &ExtensionBody) -> &'static str {
+    match body {
+        ExtensionBody::Register(_) => "register",
+        ExtensionBody::ToolCall(_) => "tool_call",
+        ExtensionBody::ToolResult(_) => "tool_result",
+        ExtensionBody::SlashCommand(_) => "slash_command",
+        ExtensionBody::SlashResult(_) => "slash_result",
+        ExtensionBody::EventHook(_) => "event_hook",
+        ExtensionBody::HostCall(_) => "host_call",
+        ExtensionBody::HostResult(_) => "host_result",
+        ExtensionBody::Log(_) => "log",
+        ExtensionBody::Error(_) => "error",
+    }
+}
+
 /// Resolve a policy `Prompt` decision using the extension manager cache + UI.
 #[allow(clippy::future_not_send)]
 async fn resolve_shared_policy_prompt(
@@ -14832,6 +14933,217 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // bd-1uy.1.2: Protocol adapter (handle_extension_message) tests
+    // ========================================================================
+
+    fn make_host_call_msg(call_id: &str, method: &str, capability: &str, params: Value) -> ExtensionMessage {
+        ExtensionMessage {
+            id: format!("msg-{call_id}"),
+            version: PROTOCOL_VERSION.to_string(),
+            body: ExtensionBody::HostCall(HostCallPayload {
+                call_id: call_id.to_string(),
+                capability: capability.to_string(),
+                method: method.to_string(),
+                params,
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            }),
+        }
+    }
+
+    /// Round-trip: host_call -> adapter -> host_result validates.
+    #[test]
+    fn protocol_adapter_host_call_roundtrip_validates() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let msg = make_host_call_msg(
+            "call-roundtrip",
+            "tool",
+            "tool",
+            json!({ "name": "nonexistent_tool", "input": {} }),
+        );
+
+        let responses = run_async(async { handle_extension_message(&ctx, msg).await });
+        assert_eq!(responses.len(), 1);
+
+        let response = &responses[0];
+        // Response id should follow the deterministic format.
+        assert_eq!(response.id, "host_result:call-roundtrip");
+        assert_eq!(response.version, PROTOCOL_VERSION);
+
+        // Validate the response message.
+        response.validate().expect("response must be schema-valid");
+
+        // The body should be HostResult.
+        let result = match &response.body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+        };
+
+        // call_id must be preserved.
+        assert_eq!(result.call_id, "call-roundtrip");
+        // Unknown tool -> error.
+        assert!(result.is_error);
+        let err = result.error.as_ref().expect("error payload");
+        assert_eq!(err.code, HostCallErrorCode::InvalidRequest);
+    }
+
+    /// Protocol adapter: capability mismatch -> invalid_request.
+    #[test]
+    fn protocol_adapter_capability_mismatch_returns_invalid_request() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        // Claim capability "exec" but method is "tool" with name "read" (requires "read").
+        let msg = make_host_call_msg(
+            "call-mismatch",
+            "tool",
+            "exec",
+            json!({ "name": "read", "input": {} }),
+        );
+
+        let responses = run_async(async { handle_extension_message(&ctx, msg).await });
+        assert_eq!(responses.len(), 1);
+
+        let result = match &responses[0].body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+        };
+
+        assert!(result.is_error);
+        let err = result.error.as_ref().expect("error payload");
+        assert_eq!(err.code, HostCallErrorCode::InvalidRequest);
+        assert!(
+            err.message.contains("mismatch"),
+            "expected mismatch in message: {}",
+            err.message
+        );
+    }
+
+    /// Protocol adapter: denied-by-policy -> denied.
+    #[test]
+    fn protocol_adapter_denied_by_policy() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = deny_all_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let msg = make_host_call_msg(
+            "call-deny",
+            "tool",
+            "read",
+            json!({ "name": "read", "input": { "path": "/etc/passwd" } }),
+        );
+
+        let responses = run_async(async { handle_extension_message(&ctx, msg).await });
+        assert_eq!(responses.len(), 1);
+
+        let result = match &responses[0].body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+        };
+
+        assert!(result.is_error);
+        let err = result.error.as_ref().expect("error payload");
+        assert_eq!(err.code, HostCallErrorCode::Denied);
+    }
+
+    /// Protocol adapter: wrong message type -> invalid_request error.
+    #[test]
+    fn protocol_adapter_wrong_message_type_returns_error() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        // Send an error message instead of host_call.
+        let msg = ExtensionMessage {
+            id: "msg-wrong".to_string(),
+            version: PROTOCOL_VERSION.to_string(),
+            body: ExtensionBody::Error(ErrorPayload {
+                code: "test_error".to_string(),
+                message: "this is not a host_call".to_string(),
+                details: None,
+            }),
+        };
+
+        let responses = run_async(async { handle_extension_message(&ctx, msg).await });
+        assert_eq!(responses.len(), 1);
+
+        let result = match &responses[0].body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+        };
+
+        assert!(result.is_error);
+        let err = result.error.as_ref().expect("error payload");
+        assert_eq!(err.code, HostCallErrorCode::InvalidRequest);
+        assert!(
+            err.message.contains("expects host_call"),
+            "error should mention expected type: {}",
+            err.message
+        );
+    }
+
+    /// Protocol adapter: successful tool execution roundtrip.
+    #[test]
+    fn protocol_adapter_tool_success_roundtrip() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+
+        // Write a file we can read.
+        std::fs::write(cwd.join("hello.txt"), "world").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], cwd, None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = HostCallContext {
+            runtime_name: "protocol",
+            extension_id: Some("ext.test"),
+            tools: &tools,
+            http: &http,
+            manager: None,
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let msg = make_host_call_msg(
+            "call-read-ok",
+            "tool",
+            "read",
+            json!({ "name": "read", "input": { "path": cwd.join("hello.txt").to_str().unwrap() } }),
+        );
+
+        let responses = run_async(async { handle_extension_message(&ctx, msg).await });
+        assert_eq!(responses.len(), 1);
+
+        let response = &responses[0];
+        response.validate().expect("response must validate");
+
+        let result = match &response.body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+        };
+
+        assert_eq!(result.call_id, "call-read-ok");
+        assert!(!result.is_error, "read should succeed: {:?}", result.error);
+        // Output should contain the file content.
+        let output_str = serde_json::to_string(&result.output).expect("serialize");
+        assert!(output_str.contains("world"), "output should contain file content: {output_str}");
     }
 
     #[test]

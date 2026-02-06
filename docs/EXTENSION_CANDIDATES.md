@@ -38,6 +38,38 @@ This is a **source-first, unfiltered** candidate inventory for extension samplin
 
 ---
 
+## npm Registry Sweep (bd-2p71) — Incremental Pass (2026-02-06)
+
+Executed npm registry search queries (`size=100` each):
+- `buildwithpi`
+- `pi-coding-agent`
+- `"pi agent" extension`
+- `pi extensionapi`
+- `@mariozechner/pi-coding-agent`
+- `pi-extension`
+- `pi-agent-extension`
+- `@oh-my-pi`
+
+Pass summary:
+- 700 raw search rows captured across 8 queries.
+- 341 unique package names observed.
+- 37 high-signal Pi-scoped/package-name candidates identified after filtering.
+- 9 new npm candidates added to `docs/extension-candidate-pool.json` in this pass.
+
+Newly added npm candidates:
+
+| Package | Latest | Weekly Downloads | Monthly Downloads | Repository |
+|---|---:|---:|---:|---|
+| `@oh-my-pi/anthropic-websearch` | `1.3.3710` | 15 | 276 | https://github.com/can1357/oh-my-pi.git |
+| `@oh-my-pi/basics` | `1.3.3710` | 5 | 54 | https://github.com/can1357/oh-my-pi.git |
+| `@oh-my-pi/exa` | `1.3.3710` | 19 | 273 | https://github.com/can1357/oh-my-pi.git |
+| `@oh-my-pi/lsp` | `1.3.3710` | 11 | 136 | https://github.com/can1357/oh-my-pi.git |
+| `@oh-my-pi/pi-git-tool` | `6.8.5` | 165 | 7557 | https://github.com/can1357/oh-my-pi.git |
+| `@oh-my-pi/subagents` | `1.3.3710` | 12 | 195 | https://github.com/can1357/oh-my-pi.git |
+| `@tmustier/pi-arcade` | `0.1.5` | 141 | 578 | https://github.com/tmustier/pi-extensions.git |
+| `@qualisero/pi-agent-scip` | `0.3.0` | 17 | 196 | https://github.com/qualisero/pi-agent-scip.git |
+| `pi-interview` | `0.4.5` | 175 | 868 | https://github.com/nicobailon/pi-interview-tool.git |
+
 ## GitHub / Community Sweep (bd‑3jxt) — Initial Pass (2026‑02‑05)
 
 This is a **high‑signal, non‑exhaustive** snapshot of extension ecosystems discovered via

@@ -1480,6 +1480,123 @@ fn transpile_typescript_module(source: &str, name: &str) -> std::result::Result<
     })
 }
 
+/// Build the `node:os` virtual module with real system values injected at init
+/// time. Values are captured once and cached in the JS module source, so no
+/// per-call hostcalls are needed.
+fn build_node_os_module() -> String {
+    // Map Rust target constants to Node.js conventions.
+    let node_platform = match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other, // "linux", "freebsd", etc.
+    };
+    let node_arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "ia32",
+        "arm" => "arm",
+        other => other,
+    };
+    let node_type = match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "Darwin",
+        "windows" => "Windows_NT",
+        other => other,
+    };
+    let tmpdir = std::env::temp_dir().display().to_string();
+    let homedir = std::env::var("HOME").unwrap_or_else(|_| "/home/unknown".to_string());
+    let hostname = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "localhost".to_string());
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let eol = if cfg!(windows) { "\\r\\n" } else { "\\n" };
+    let dev_null = if cfg!(windows) {
+        "\\\\\\\\.\\\\NUL"
+    } else {
+        "/dev/null"
+    };
+    #[cfg(unix)]
+    let (uid, gid, username, shell) = {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        (uid, gid, username, shell)
+    };
+    #[cfg(not(unix))]
+    let (uid, gid, username, shell) = (0u32, 0u32, "unknown".to_string(), "".to_string());
+
+    // Build CPU array entries. We use generic model names since QuickJS
+    // doesn't need real CPU model strings — extensions only care about count.
+    let cpu_entry =
+        r#"{ model: "cpu", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }"#;
+    let cpus_array = std::iter::repeat(cpu_entry)
+        .take(num_cpus)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        r#"
+const _platform = "{node_platform}";
+const _arch = "{node_arch}";
+const _type = "{node_type}";
+const _tmpdir = "{tmpdir}";
+const _homedir = "{homedir}";
+const _hostname = "{hostname}";
+const _eol = "{eol}";
+const _devNull = "{dev_null}";
+const _uid = {uid};
+const _gid = {gid};
+const _username = "{username}";
+const _shell = "{shell}";
+const _cpus = [{cpus_array}];
+
+export function homedir() {{
+  const env_home =
+    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
+      ? globalThis.pi.env.get("HOME")
+      : undefined;
+  return env_home || _homedir;
+}}
+export function tmpdir() {{ return _tmpdir; }}
+export function hostname() {{ return _hostname; }}
+export function platform() {{ return _platform; }}
+export function arch() {{ return _arch; }}
+export function type() {{ return _type; }}
+export function release() {{ return "6.0.0"; }}
+export function cpus() {{ return _cpus; }}
+export function totalmem() {{ return 8 * 1024 * 1024 * 1024; }}
+export function freemem() {{ return 4 * 1024 * 1024 * 1024; }}
+export function uptime() {{ return Math.floor(Date.now() / 1000); }}
+export function loadavg() {{ return [0.0, 0.0, 0.0]; }}
+export function networkInterfaces() {{ return {{}}; }}
+export function userInfo(_options) {{
+  return {{
+    uid: _uid,
+    gid: _gid,
+    username: _username,
+    homedir: homedir(),
+    shell: _shell,
+  }};
+}}
+export function endianness() {{ return "LE"; }}
+export const EOL = _eol;
+export const devNull = _devNull;
+export const constants = {{
+  signals: {{}},
+  errno: {{}},
+  priority: {{ PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 }},
+}};
+export default {{ homedir, tmpdir, hostname, platform, arch, type, release, cpus, totalmem, freemem, uptime, loadavg, networkInterfaces, userInfo, endianness, EOL, devNull, constants }};
+"#
+    )
+    .trim()
+    .to_string()
+}
+
 #[allow(clippy::too_many_lines)]
 fn default_virtual_modules() -> HashMap<String, String> {
     let mut modules = HashMap::new();
@@ -2725,77 +2842,7 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
         .to_string(),
     );
 
-    modules.insert(
-        "node:os".to_string(),
-        r#"
-export function homedir() {
-  const home =
-    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
-      : undefined;
-  return home || "/home/unknown";
-}
-export function tmpdir() {
-  return "/tmp";
-}
-export function hostname() {
-  return "pi-host";
-}
-export function platform() {
-  return "linux";
-}
-export function arch() {
-  return "x64";
-}
-export function type() {
-  return "Linux";
-}
-export function release() {
-  return "6.0.0";
-}
-export function cpus() {
-  return [{ model: "PiJS Virtual CPU", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }];
-}
-export function totalmem() {
-  return 8 * 1024 * 1024 * 1024;
-}
-export function freemem() {
-  return 4 * 1024 * 1024 * 1024;
-}
-export function uptime() {
-  return Math.floor(Date.now() / 1000);
-}
-export function loadavg() {
-  return [0.0, 0.0, 0.0];
-}
-export function networkInterfaces() {
-  return {};
-}
-export function userInfo(_options) {
-  const home = homedir();
-  return {
-    uid: 1000,
-    gid: 1000,
-    username: "pi",
-    homedir: home,
-    shell: "/bin/sh",
-  };
-}
-export function endianness() {
-  return "LE";
-}
-export const EOL = "\n";
-export const devNull = "/dev/null";
-export const constants = {
-  signals: {},
-  errno: {},
-  priority: { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 },
-};
-export default { homedir, tmpdir, hostname, platform, arch, type, release, cpus, totalmem, freemem, uptime, loadavg, networkInterfaces, userInfo, endianness, EOL, devNull, constants };
-"#
-        .trim()
-        .to_string(),
-    );
+    modules.insert("node:os".to_string(), build_node_os_module());
 
     modules.insert(
         "node:child_process".to_string(),

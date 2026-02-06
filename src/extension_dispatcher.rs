@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::connectors::{Connector, http::HttpConnector};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
 use crate::extensions::{
     ExtensionBody, ExtensionMessage, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse,
@@ -84,6 +84,21 @@ fn protocol_error_code(code: &str) -> HostCallErrorCode {
         "io" | "tool_error" => HostCallErrorCode::Io,
         "invalid_request" => HostCallErrorCode::InvalidRequest,
         _ => HostCallErrorCode::Internal,
+    }
+}
+
+fn classify_ui_hostcall_error(err: &Error) -> &'static str {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") || lower.contains("cancel") {
+        "timeout"
+    } else if lower.contains("not configured")
+        || lower.contains("channel closed")
+        || lower.contains("response dropped")
+    {
+        "denied"
+    } else {
+        err.hostcall_error_code()
     }
 }
 
@@ -892,6 +907,14 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     #[allow(clippy::future_not_send)]
     async fn dispatch_ui(&self, call_id: &str, op: &str, payload: Value) -> HostcallOutcome {
+        let op = op.trim();
+        if op.is_empty() {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: "host_call ui requires non-empty op".to_string(),
+            };
+        }
+
         let request = ExtensionUiRequest {
             id: call_id.to_string(),
             method: op.to_string(),
@@ -903,7 +926,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             Ok(Some(response)) => HostcallOutcome::Success(ui_response_value_for_op(op, &response)),
             Ok(None) => HostcallOutcome::Success(Value::Null),
             Err(err) => HostcallOutcome::Error {
-                code: "io".to_string(),
+                code: classify_ui_hostcall_error(&err).to_string(),
                 message: err.to_string(),
             },
         }
@@ -7204,6 +7227,96 @@ mod tests {
                     _ => panic!("alias pair ({snake}, {camel}) should both succeed"),
                 }
             }
+        });
+    }
+
+    #[test]
+    fn ui_dispatch_taxonomy_missing_op_is_invalid_request() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            let outcome = dispatcher
+                .dispatch_ui("ui-1", "   ", serde_json::json!({}))
+                .await;
+            assert!(
+                matches!(outcome, HostcallOutcome::Error { code, .. } if code == "invalid_request")
+            );
+        });
+    }
+
+    #[test]
+    fn ui_dispatch_taxonomy_timeout_error_maps_to_timeout() {
+        futures::executor::block_on(async {
+            struct TimeoutUiHandler;
+
+            #[async_trait]
+            impl ExtensionUiHandler for TimeoutUiHandler {
+                async fn request_ui(
+                    &self,
+                    _request: ExtensionUiRequest,
+                ) -> Result<Option<ExtensionUiResponse>> {
+                    Err(Error::extension("Extension UI request timed out"))
+                }
+            }
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(TimeoutUiHandler),
+                PathBuf::from("."),
+            );
+
+            let outcome = dispatcher
+                .dispatch_ui("ui-2", "confirm", serde_json::json!({}))
+                .await;
+            assert!(matches!(outcome, HostcallOutcome::Error { code, .. } if code == "timeout"));
+        });
+    }
+
+    #[test]
+    fn ui_dispatch_taxonomy_unconfigured_maps_to_denied() {
+        futures::executor::block_on(async {
+            struct MissingUiHandler;
+
+            #[async_trait]
+            impl ExtensionUiHandler for MissingUiHandler {
+                async fn request_ui(
+                    &self,
+                    _request: ExtensionUiRequest,
+                ) -> Result<Option<ExtensionUiResponse>> {
+                    Err(Error::extension("Extension UI sender not configured"))
+                }
+            }
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(MissingUiHandler),
+                PathBuf::from("."),
+            );
+
+            let outcome = dispatcher
+                .dispatch_ui("ui-3", "confirm", serde_json::json!({}))
+                .await;
+            assert!(matches!(outcome, HostcallOutcome::Error { code, .. } if code == "denied"));
         });
     }
 

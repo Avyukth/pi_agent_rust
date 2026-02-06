@@ -7,23 +7,32 @@ mod common;
 
 use asupersync::runtime::RuntimeBuilder;
 use async_trait::async_trait;
+use clap::Parser;
 use common::TestHarness;
+#[cfg(unix)]
+use common::tmux::{TmuxInstance, sh_escape};
 use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
+use pi::cli::Cli;
 use pi::compaction::ResolvedCompactionSettings;
+use pi::config::Config;
 use pi::error::{Error, Result};
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
     UserContent,
 };
 use pi::provider::{Context, Provider, StreamOptions};
-use pi::session::{Session, SessionEntry, SessionMessage};
+use pi::session::{Session, SessionEntry, SessionMessage, encode_cwd};
 use pi::tools::ToolRegistry;
 use serde_json::json;
+use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 struct PlannedStep {
@@ -147,6 +156,174 @@ const fn tool_names() -> [&'static str; 7] {
     ["read", "write", "edit", "bash", "grep", "find", "ls"]
 }
 
+const DEFAULT_CLI_TIMEOUT_SECS: u64 = 120;
+
+#[derive(Debug)]
+struct CliResult {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+    duration: Duration,
+}
+
+fn cli_binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_pi"))
+}
+
+fn isolated_cli_env(harness: &TestHarness) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    let env_root = harness.temp_path("pi-env");
+    let _ = std::fs::create_dir_all(&env_root);
+
+    env.insert(
+        "PI_CODING_AGENT_DIR".to_string(),
+        env_root.join("agent").display().to_string(),
+    );
+    env.insert(
+        "PI_CONFIG_PATH".to_string(),
+        env_root.join("settings.json").display().to_string(),
+    );
+    env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        env_root.join("sessions").display().to_string(),
+    );
+    env.insert(
+        "PI_PACKAGE_DIR".to_string(),
+        env_root.join("packages").display().to_string(),
+    );
+    env.insert("PI_TEST_MODE".to_string(), "1".to_string());
+
+    env
+}
+
+fn run_cli(
+    harness: &TestHarness,
+    env: &BTreeMap<String, String>,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> CliResult {
+    harness
+        .log()
+        .info("action", format!("Running CLI: {}", args.join(" ")));
+    harness.log().info_ctx("action", "CLI env", |ctx| {
+        for (key, value) in env {
+            ctx.push((key.clone(), value.clone()));
+        }
+    });
+
+    let mut command = Command::new(cli_binary_path());
+    command
+        .args(args)
+        .envs(env.clone())
+        .current_dir(harness.temp_dir())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+
+    let start = Instant::now();
+    let mut child = command.spawn().expect("run pi");
+    let mut child_stdout = child.stdout.take().expect("child stdout piped");
+    let mut child_stderr = child.stderr.take().expect("child stderr piped");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut child_stdout, &mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut child_stderr, &mut buf);
+        buf
+    });
+
+    if let Some(input) = stdin {
+        if let Some(mut child_stdin) = child.stdin.take() {
+            child_stdin.write_all(input).expect("write stdin");
+        }
+    }
+
+    let timeout = Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS);
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => panic!("try_wait failed: {err}"),
+        }
+
+        if start.elapsed() > timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().expect("wait child after kill");
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let duration = start.elapsed();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let mut stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    let exit_code = if timed_out {
+        stderr = format!("ERROR: timed out after {timeout:?}\n{stderr}");
+        -1
+    } else {
+        status.code().unwrap_or(-1)
+    };
+
+    harness.log().info_ctx("result", "CLI completed", |ctx| {
+        ctx.push(("exit_code".into(), exit_code.to_string()));
+        ctx.push(("duration_ms".into(), duration.as_millis().to_string()));
+        ctx.push(("stdout_len".into(), stdout.len().to_string()));
+        ctx.push(("stderr_len".into(), stderr.len().to_string()));
+    });
+
+    CliResult {
+        exit_code,
+        stdout,
+        stderr,
+        duration,
+    }
+}
+
+fn assert_contains(harness: &TestHarness, haystack: &str, needle: &str) {
+    harness.assert_log(format!("assert contains: {needle}").as_str());
+    assert!(
+        haystack.contains(needle),
+        "expected output to contain '{needle}'"
+    );
+}
+
+fn write_minimal_session(path: &Path, cwd: &Path, session_id: &str, message: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create session parent dir");
+    }
+
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": "2026-02-06T00:00:00.000Z",
+        "cwd": cwd.display().to_string(),
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-4-5"
+    });
+    let user_entry = json!({
+        "type": "message",
+        "id": "entry-user-1",
+        "timestamp": "2026-02-06T00:00:01.000Z",
+        "message": {
+            "role": "user",
+            "content": message
+        }
+    });
+    std::fs::write(path, format!("{header}\n{user_entry}\n")).expect("write minimal session");
+}
+
 fn make_agent_session(
     cwd: &Path,
     provider: Arc<dyn Provider>,
@@ -181,6 +358,22 @@ fn write_jsonl_artifacts(harness: &TestHarness, test_name: &str) {
     harness.record_artifact(
         format!("{test_name}.log.normalized.jsonl"),
         &normalized_log_path,
+    );
+
+    let artifacts_path = harness.temp_path(format!("{test_name}.artifacts.jsonl"));
+    harness
+        .write_artifact_index_jsonl(&artifacts_path)
+        .expect("write artifact index");
+    harness.record_artifact(format!("{test_name}.artifacts.jsonl"), &artifacts_path);
+
+    let normalized_artifacts_path =
+        harness.temp_path(format!("{test_name}.artifacts.normalized.jsonl"));
+    harness
+        .write_artifact_index_jsonl_normalized(&normalized_artifacts_path)
+        .expect("write normalized artifact index");
+    harness.record_artifact(
+        format!("{test_name}.artifacts.normalized.jsonl"),
+        &normalized_artifacts_path,
     );
 }
 
@@ -509,5 +702,365 @@ fn multi_turn_persistence() {
             "expected persisted tool result entries"
         );
     });
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn cli_export_html_integrity_from_session_file() {
+    let test_name = "e2e_cli_export_html_integrity_from_session_file";
+    let harness = TestHarness::new(test_name);
+
+    let session_id = "session-export-123";
+    let session_message = "Export integrity message";
+    let session_path = harness.temp_path("fixtures/export-session.jsonl");
+    write_minimal_session(
+        &session_path,
+        harness.temp_dir(),
+        session_id,
+        session_message,
+    );
+    harness.record_artifact("export-session.jsonl", &session_path);
+
+    let export_path = harness.temp_path("export/session.html");
+    let session_arg = session_path.to_string_lossy().to_string();
+    let export_arg = export_path.to_string_lossy().to_string();
+
+    let env = isolated_cli_env(&harness);
+    let result = run_cli(
+        &harness,
+        &env,
+        &["--export", &session_arg, &export_arg],
+        None,
+    );
+    assert_eq!(
+        result.exit_code, 0,
+        "export command failed\nstderr:\n{}\nstdout:\n{}",
+        result.stderr, result.stdout
+    );
+    assert_contains(&harness, &result.stdout, "Exported to:");
+    assert!(export_path.exists(), "expected export file at {export_arg}");
+    harness.record_artifact("export.html", &export_path);
+
+    let html = std::fs::read_to_string(&export_path).expect("read export html");
+    assert_contains(&harness, &html, session_id);
+    assert_contains(&harness, &html, session_message);
+
+    let header_line = std::fs::read_to_string(&session_path)
+        .expect("read session file")
+        .lines()
+        .next()
+        .expect("session header line")
+        .to_string();
+    let header: serde_json::Value = serde_json::from_str(&header_line).expect("parse header");
+    harness
+        .log()
+        .info_ctx("verify", "export session metadata", |ctx| {
+            ctx.push(("session_path".into(), session_path.display().to_string()));
+            ctx.push((
+                "session_size".into(),
+                std::fs::metadata(&session_path)
+                    .expect("session metadata")
+                    .len()
+                    .to_string(),
+            ));
+            ctx.push(("export_path".into(), export_path.display().to_string()));
+            ctx.push((
+                "export_size".into(),
+                std::fs::metadata(&export_path)
+                    .expect("export metadata")
+                    .len()
+                    .to_string(),
+            ));
+            ctx.push((
+                "session_id".into(),
+                header["id"].as_str().unwrap_or_default().to_string(),
+            ));
+            ctx.push((
+                "provider".into(),
+                header["provider"].as_str().unwrap_or_default().to_string(),
+            ));
+            ctx.push((
+                "model_id".into(),
+                header["modelId"].as_str().unwrap_or_default().to_string(),
+            ));
+            ctx.push((
+                "duration_ms".into(),
+                result.duration.as_millis().to_string(),
+            ));
+        });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn session_dir_override_and_env_sessions_path() {
+    let test_name = "e2e_session_dir_override_and_env_sessions_path";
+    let harness = TestHarness::new(test_name);
+
+    let env_sessions = harness.temp_path("env-sessions");
+    std::fs::create_dir_all(&env_sessions).expect("create env sessions dir");
+    let mut env = isolated_cli_env(&harness);
+    env.insert(
+        "PI_SESSIONS_DIR".to_string(),
+        env_sessions.display().to_string(),
+    );
+
+    let config_result = run_cli(&harness, &env, &["config"], None);
+    assert_eq!(
+        config_result.exit_code, 0,
+        "config command failed\nstderr:\n{}\nstdout:\n{}",
+        config_result.stderr, config_result.stdout
+    );
+    assert_contains(
+        &harness,
+        &config_result.stdout,
+        env_sessions.display().to_string().as_str(),
+    );
+
+    run_async_test(async {
+        let cli_sessions = harness.temp_path("cli-session-dir");
+        let cli_session_arg = cli_sessions.to_string_lossy().to_string();
+        let cli = Cli::parse_from(["pi", "--session-dir", cli_session_arg.as_str()]);
+        let mut session = Session::new(&cli, &Config::default())
+            .await
+            .expect("session new with --session-dir");
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("session-dir override message".to_string()),
+            timestamp: Some(0),
+        });
+        session
+            .save()
+            .await
+            .expect("save session with --session-dir");
+
+        let path = session.path.clone().expect("session path");
+        assert!(
+            path.starts_with(&cli_sessions),
+            "expected session path under --session-dir. path={}, root={}",
+            path.display(),
+            cli_sessions.display()
+        );
+        harness.record_artifact("session-dir-override.jsonl", &path);
+        harness
+            .log()
+            .info_ctx("verify", "session-dir override metadata", |ctx| {
+                ctx.push(("session_path".into(), path.display().to_string()));
+                ctx.push((
+                    "session_size".into(),
+                    std::fs::metadata(&path)
+                        .expect("session metadata")
+                        .len()
+                        .to_string(),
+                ));
+            });
+    });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[test]
+fn explicit_session_flag_loads_requested_session() {
+    let test_name = "e2e_explicit_session_flag_loads_requested_session";
+    let harness = TestHarness::new(test_name);
+
+    run_async_test(async {
+        let expected_id = "session-explicit-999";
+        let expected_message = "explicit session payload";
+        let session_path = harness.temp_path("explicit/session.jsonl");
+        write_minimal_session(
+            &session_path,
+            harness.temp_dir(),
+            expected_id,
+            expected_message,
+        );
+        harness.record_artifact("explicit-session.jsonl", &session_path);
+
+        let session_arg = session_path.to_string_lossy().to_string();
+        let cli = Cli::parse_from(["pi", "--session", session_arg.as_str()]);
+        let loaded = Session::new(&cli, &Config::default())
+            .await
+            .expect("load explicit session");
+
+        assert_eq!(loaded.header.id, expected_id);
+        let contains_user_message = loaded
+            .to_messages_for_current_path()
+            .iter()
+            .any(|message| matches!(
+                message,
+                Message::User(user) if matches!(&user.content, UserContent::Text(text) if text == expected_message)
+            ));
+        assert!(
+            contains_user_message,
+            "explicitly loaded session missing expected user message"
+        );
+    });
+
+    write_jsonl_artifacts(&harness, test_name);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_continue_tmux_loads_existing_session() {
+    let test_name = "e2e_cli_continue_tmux_loads_existing_session";
+    let harness = TestHarness::new(test_name);
+
+    if !TmuxInstance::tmux_available() {
+        harness.log().warn("tmux", "Skipping: tmux not available");
+        return;
+    }
+
+    let mut env = isolated_cli_env(&harness);
+    env.insert("VCR_MODE".to_string(), "playback".to_string());
+    let cassette_dir = harness.temp_path("vcr-cassettes");
+    std::fs::create_dir_all(&cassette_dir).expect("create cassette dir");
+    env.insert(
+        "VCR_CASSETTE_DIR".to_string(),
+        cassette_dir.display().to_string(),
+    );
+    env.insert(
+        "PI_VCR_TEST_NAME".to_string(),
+        "e2e_continue_session".to_string(),
+    );
+    env.insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
+
+    let cassette_path = cassette_dir.join("e2e_continue_session.json");
+    std::fs::write(
+        &cassette_path,
+        serde_json::to_string_pretty(&json!({
+            "version": "1.0",
+            "test_name": "e2e_continue_session",
+            "recorded_at": "2026-02-06T00:00:00.000Z",
+            "interactions": []
+        }))
+        .expect("serialize cassette"),
+    )
+    .expect("write cassette");
+    harness.record_artifact("continue-cassette.json", &cassette_path);
+
+    let sessions_dir = PathBuf::from(env.get("PI_SESSIONS_DIR").expect("PI_SESSIONS_DIR"));
+    let project_sessions = sessions_dir.join(encode_cwd(harness.temp_dir()));
+    std::fs::create_dir_all(&project_sessions).expect("create project sessions dir");
+    let session_file = project_sessions.join("2026-02-06T00-00-00.000Z_continue.jsonl");
+    let session_id = "continue-session-123";
+    let session_message = "Continue session baseline";
+    write_minimal_session(
+        &session_file,
+        harness.temp_dir(),
+        session_id,
+        session_message,
+    );
+    harness.record_artifact("continue-source-session.jsonl", &session_file);
+
+    let tmux = TmuxInstance::new(&harness);
+    let script_path = harness.temp_path("continue-session.sh");
+    let mut script = String::new();
+    script.push_str("#!/usr/bin/env sh\nset -eu\n");
+    for (key, value) in &env {
+        script.push_str("export ");
+        script.push_str(key);
+        script.push('=');
+        script.push_str(&sh_escape(value));
+        script.push('\n');
+    }
+    script.push_str("exec ");
+    script.push_str(&sh_escape(cli_binary_path().to_string_lossy().as_ref()));
+    for arg in [
+        "-c",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-vcr-key",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+    ] {
+        script.push(' ');
+        script.push_str(&sh_escape(arg));
+    }
+    script.push('\n');
+
+    std::fs::write(&script_path, script).expect("write continue script");
+    let mut perms = std::fs::metadata(&script_path)
+        .expect("script metadata")
+        .permissions();
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o755);
+    }
+    std::fs::set_permissions(&script_path, perms).expect("chmod script");
+    harness.record_artifact("continue-script.sh", &script_path);
+
+    tmux.start_session(harness.temp_dir(), &script_path);
+    let pane = tmux.wait_for_pane_contains_any(
+        &["Continuing session", "Welcome to Pi!", "Pi ("],
+        Duration::from_secs(20),
+    );
+    assert!(
+        pane.contains("Continuing session")
+            || pane.contains("Welcome to Pi!")
+            || pane.contains("Pi ("),
+        "expected continue startup text, got:\n{pane}"
+    );
+
+    tmux.send_literal("/exit");
+    tmux.send_key("Enter");
+    let start = Instant::now();
+    while tmux.session_exists() {
+        if start.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if tmux.session_exists() {
+        tmux.try_send_key("C-d");
+    }
+
+    let final_pane = if tmux.session_exists() {
+        tmux.capture_pane()
+    } else {
+        pane
+    };
+    let pane_path = harness.temp_path("continue-pane.txt");
+    std::fs::write(&pane_path, &final_pane).expect("write pane artifact");
+    harness.record_artifact("continue-pane.txt", &pane_path);
+
+    assert!(
+        session_file.exists(),
+        "continued session file should still exist"
+    );
+    let persisted = std::fs::read_to_string(&session_file).expect("read continued session");
+    assert_contains(&harness, &persisted, session_id);
+    assert_contains(&harness, &persisted, session_message);
+
+    harness
+        .log()
+        .info_ctx("verify", "continue lifecycle metadata", |ctx| {
+            ctx.push(("session_path".into(), session_file.display().to_string()));
+            ctx.push((
+                "session_size".into(),
+                std::fs::metadata(&session_file)
+                    .expect("session metadata")
+                    .len()
+                    .to_string(),
+            ));
+            ctx.push((
+                "vcr_mode".into(),
+                env.get("VCR_MODE").cloned().unwrap_or_default(),
+            ));
+            ctx.push((
+                "cassette_name".into(),
+                env.get("PI_VCR_TEST_NAME").cloned().unwrap_or_default(),
+            ));
+            ctx.push(("cassette_path".into(), cassette_path.display().to_string()));
+        });
+
     write_jsonl_artifacts(&harness, test_name);
 }

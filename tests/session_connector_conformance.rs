@@ -104,10 +104,7 @@ fn set_name_empty_string_clears_name() {
             .set_name("Before".to_string())
             .await
             .expect("set initial name");
-        handle
-            .set_name(String::new())
-            .await
-            .expect("clear name");
+        handle.set_name(String::new()).await.expect("clear name");
 
         let state = handle.get_state().await;
         // Empty string sets the name to empty, which may appear as "" or null.
@@ -256,10 +253,7 @@ fn append_custom_entry_succeeds_with_valid_type() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
         handle
-            .append_custom_entry(
-                "annotation".to_string(),
-                Some(json!({ "note": "test" })),
-            )
+            .append_custom_entry("annotation".to_string(), Some(json!({ "note": "test" })))
             .await
             .expect("append_custom_entry should succeed");
     });
@@ -285,9 +279,7 @@ fn append_custom_entry_rejects_empty_type() {
 fn append_custom_entry_rejects_whitespace_only_type() {
     asupersync::test_utils::run_test(|| async {
         let handle = session_handle();
-        let result = handle
-            .append_custom_entry("   ".to_string(), None)
-            .await;
+        let result = handle.append_custom_entry("   ".to_string(), None).await;
         assert!(result.is_err(), "whitespace-only customType should fail");
     });
 }
@@ -338,11 +330,7 @@ fn fresh_session_returns_empty_collections() {
 
 /// Helper: dispatch a session hostcall through the `ExtensionManager`.
 /// Returns (success, code) where code is the taxonomy error code on failure.
-async fn dispatch_via_manager(
-    mgr: &ExtensionManager,
-    op: &str,
-    payload: Value,
-) -> (bool, String) {
+async fn dispatch_via_manager(mgr: &ExtensionManager, op: &str, payload: Value) -> (bool, String) {
     // Access the dispatch function through the manager's public API.
     // Since dispatch_hostcall_session is private, we test taxonomy via
     // the ExtensionManager + session_handle path indirectly.
@@ -357,10 +345,7 @@ async fn dispatch_via_manager(
         "get_state" | "getstate" => Ok(session.get_state().await),
         "get_name" | "getname" => {
             let state = session.get_state().await;
-            Ok(state
-                .get("sessionName")
-                .cloned()
-                .unwrap_or(Value::Null))
+            Ok(state.get("sessionName").cloned().unwrap_or(Value::Null))
         }
         "set_name" | "setname" => {
             let name = payload
@@ -424,7 +409,10 @@ async fn dispatch_via_manager(
                 .get("label")
                 .and_then(Value::as_str)
                 .map(String::from);
-            session.set_label(target_id, label).await.map(|()| Value::Null)
+            session
+                .set_label(target_id, label)
+                .await
+                .map(|()| Value::Null)
         }
         "append_custom_entry" | "append_entry" | "appendentry" => {
             let custom_type = payload
@@ -479,8 +467,16 @@ fn dispatch_taxonomy_validation_errors_return_invalid_request() {
 
         // Missing required fields should return "invalid_request".
         let invalid_cases = [
-            ("set_model", json!({"provider": "anthropic"}), "missing modelId"),
-            ("set_model", json!({"modelId": "gpt-4o"}), "missing provider"),
+            (
+                "set_model",
+                json!({"provider": "anthropic"}),
+                "missing modelId",
+            ),
+            (
+                "set_model",
+                json!({"modelId": "gpt-4o"}),
+                "missing provider",
+            ),
             (
                 "set_model",
                 json!({"provider": "", "modelId": ""}),
@@ -492,10 +488,7 @@ fn dispatch_taxonomy_validation_errors_return_invalid_request() {
 
         for (op, payload, desc) in &invalid_cases {
             let (ok, code) = dispatch_via_manager(&mgr, op, payload.clone()).await;
-            assert!(
-                !ok,
-                "{desc}: op={op} should fail"
-            );
+            assert!(!ok, "{desc}: op={op} should fail");
             assert_eq!(
                 code, "invalid_request",
                 "{desc}: op={op} expected 'invalid_request', got '{code}'"
@@ -542,8 +535,7 @@ fn dispatch_taxonomy_unknown_op_returns_invalid_request() {
     asupersync::test_utils::run_test(|| async {
         let (mgr, _handle) = manager_with_session();
 
-        let (ok, code) =
-            dispatch_via_manager(&mgr, "totally_bogus_op", json!({})).await;
+        let (ok, code) = dispatch_via_manager(&mgr, "totally_bogus_op", json!({})).await;
         assert!(!ok, "unknown op should fail");
         assert_eq!(
             code, "invalid_request",

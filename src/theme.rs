@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn resolve_defaults_to_dark_when_theme_is_empty() {
         let cfg = Config {
-            theme: Some("".to_string()),
+            theme: Some(String::new()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn validate_rejects_empty_name() {
         let mut theme = Theme::dark();
-        theme.name = "".to_string();
+        theme.name = String::new();
         assert!(theme.validate().is_err());
     }
 

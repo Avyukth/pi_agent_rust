@@ -965,7 +965,10 @@ mod tests {
         fs::write(root.join("not_session.txt"), "").expect("write");
 
         let paths = walk_sessions(&root);
-        let ok_paths: Vec<_> = paths.into_iter().filter_map(|r| r.ok()).collect();
+        let ok_paths: Vec<_> = paths
+            .into_iter()
+            .filter_map(std::result::Result::ok)
+            .collect();
         assert_eq!(ok_paths.len(), 2);
         assert!(ok_paths.iter().any(|p| p.ends_with("a.jsonl")));
         assert!(ok_paths.iter().any(|p| p.ends_with("b.jsonl")));
