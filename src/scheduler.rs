@@ -1026,4 +1026,171 @@ mod tests {
             assert_eq!(a, b, "trace mismatch for seed={seed}");
         }
     }
+
+    // ── Seq Display format ──────────────────────────────────────────
+
+    #[test]
+    fn seq_display_format() {
+        assert_eq!(format!("{}", Seq::zero()), "seq:0");
+        assert_eq!(format!("{}", Seq::zero().next()), "seq:1");
+    }
+
+    // ── has_pending / macrotask_count / timer_count ──────────────────
+
+    #[test]
+    fn empty_scheduler_has_no_pending() {
+        let sched = Scheduler::with_clock(DeterministicClock::new(0));
+        assert!(!sched.has_pending());
+        assert_eq!(sched.macrotask_count(), 0);
+        assert_eq!(sched.timer_count(), 0);
+    }
+
+    #[test]
+    fn has_pending_with_timer_only() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        sched.set_timeout(100);
+        assert!(sched.has_pending());
+        assert_eq!(sched.macrotask_count(), 0);
+        assert_eq!(sched.timer_count(), 1);
+    }
+
+    #[test]
+    fn has_pending_with_macrotask_only() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        sched.enqueue_event("e".to_string(), serde_json::json!({}));
+        assert!(sched.has_pending());
+        assert_eq!(sched.macrotask_count(), 1);
+        assert_eq!(sched.timer_count(), 0);
+    }
+
+    // ── WallClock ────────────────────────────────────────────────────
+
+    #[test]
+    fn wall_clock_returns_positive_ms() {
+        let clock = WallClock;
+        let now = clock.now_ms();
+        assert!(now > 0, "WallClock should return a positive timestamp");
+    }
+
+    // ── clear_timeout edge cases ─────────────────────────────────────
+
+    #[test]
+    fn clear_timeout_nonexistent_returns_true() {
+        // Inserting a new ID into the cancel set always returns true
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        assert!(sched.clear_timeout(999));
+    }
+
+    #[test]
+    fn clear_timeout_double_cancel_returns_false() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        let t = sched.set_timeout(100);
+        assert!(sched.clear_timeout(t));
+        // Second cancel - already in set
+        assert!(!sched.clear_timeout(t));
+    }
+
+    // ── time_until_next_timer ────────────────────────────────────────
+
+    #[test]
+    fn time_until_next_timer_none_when_empty() {
+        let sched = Scheduler::with_clock(DeterministicClock::new(0));
+        assert!(sched.time_until_next_timer().is_none());
+    }
+
+    #[test]
+    fn time_until_next_timer_saturates_at_zero() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        sched.set_timeout(50);
+        sched.clock.advance(100); // Past the deadline
+        assert_eq!(sched.time_until_next_timer(), Some(0));
+    }
+
+    // ── HostcallOutcome::Error path ──────────────────────────────────
+
+    #[test]
+    fn hostcall_error_outcome() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        sched.enqueue_hostcall_complete(
+            "err-call".to_string(),
+            HostcallOutcome::Error {
+                code: "E_TIMEOUT".to_string(),
+                message: "Request timed out".to_string(),
+            },
+        );
+
+        let task = sched.tick().unwrap();
+        match task.kind {
+            MacrotaskKind::HostcallComplete { call_id, outcome } => {
+                assert_eq!(call_id, "err-call");
+                match outcome {
+                    HostcallOutcome::Error { code, message } => {
+                        assert_eq!(code, "E_TIMEOUT");
+                        assert_eq!(message, "Request timed out");
+                    }
+                    other => unreachable!("Expected error, got {other:?}"),
+                }
+            }
+            other => unreachable!("Expected HostcallComplete, got {other:?}"),
+        }
+    }
+
+    // ── timer_count decreases after tick ─────────────────────────────
+
+    #[test]
+    fn timer_count_decreases_after_fire() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        sched.set_timeout(50);
+        sched.set_timeout(100);
+        assert_eq!(sched.timer_count(), 2);
+
+        sched.clock.advance(75);
+        let _task = sched.tick(); // Fires first timer
+        assert_eq!(sched.timer_count(), 1);
+    }
+
+    // ── empty tick returns None ──────────────────────────────────────
+
+    #[test]
+    fn empty_scheduler_tick_returns_none() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        assert!(sched.tick().is_none());
+    }
+
+    // ── default constructor ──────────────────────────────────────────
+
+    #[test]
+    fn default_scheduler_starts_with_seq_zero() {
+        let sched = Scheduler::new();
+        assert_eq!(sched.current_seq(), Seq::zero());
+    }
+
+    // ── Arc<Clock> impl ──────────────────────────────────────────────
+
+    #[test]
+    fn arc_clock_delegation() {
+        let clock = Arc::new(DeterministicClock::new(42));
+        assert_eq!(Clock::now_ms(&clock), 42);
+        clock.advance(10);
+        assert_eq!(Clock::now_ms(&clock), 52);
+    }
+
+    // ── TimerEntry equality ──────────────────────────────────────────
+
+    #[test]
+    fn timer_entry_equality_ignores_timer_id() {
+        let a = TimerEntry::new(1, 100, Seq(5));
+        let b = TimerEntry::new(2, 100, Seq(5));
+        // PartialEq compares (deadline_ms, seq), not timer_id
+        assert_eq!(a, b);
+    }
+
+    // ── Macrotask PartialEq uses seq only ────────────────────────────
+
+    #[test]
+    fn macrotask_equality_uses_seq_only() {
+        let a = Macrotask::new(Seq(1), MacrotaskKind::TimerFired { timer_id: 1 });
+        let b = Macrotask::new(Seq(1), MacrotaskKind::TimerFired { timer_id: 2 });
+        assert_eq!(a, b); // Same seq → equal
+    }
 }

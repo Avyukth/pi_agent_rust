@@ -329,9 +329,42 @@ mod tests {
     }
 
     #[test]
+    fn jpeg_dimensions() {
+        // Minimal SOI + SOF0 segment with width=100, height=50.
+        let data = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0 marker
+            0x00, 0x11, // segment length
+            0x08, // precision
+            0x00, 0x32, // height
+            0x00, 0x64, // width
+            0x03, // component count
+            0x01, 0x11, 0x00, // Y
+            0x02, 0x11, 0x00, // Cb
+            0x03, 0x11, 0x00, // Cr
+        ];
+
+        let dims = image_dimensions(&data);
+        assert_eq!(dims, Some((100, 50)));
+    }
+
+    #[test]
     fn unknown_format_returns_none() {
         let data = b"definitely not an image";
         assert_eq!(image_dimensions(data), None);
+    }
+
+    #[test]
+    fn render_inline_returns_placeholder_for_invalid_base64() {
+        let result = render_inline("%%%not-base64%%%", "image/png", 80);
+        assert_eq!(result, "[image: image/png]");
+    }
+
+    #[test]
+    fn render_inline_with_unknown_image_bytes_omits_dimensions() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"not-an-image");
+        let result = render_inline(&b64, "image/webp", 80);
+        assert_eq!(result, "[image: image/webp]");
     }
 
     #[test]
@@ -350,5 +383,105 @@ mod tests {
         let p1 = detect_protocol();
         let p2 = detect_protocol();
         assert_eq!(p1, p2);
+    }
+
+    // ── image_dimensions edge cases ──────────────────────────────────
+
+    #[test]
+    fn image_dimensions_empty_data() {
+        assert_eq!(image_dimensions(&[]), None);
+    }
+
+    #[test]
+    fn image_dimensions_truncated_png_header() {
+        // PNG signature but not enough data for dimensions
+        let data = b"\x89PNG\r\n\x1A\n\x00\x00";
+        assert_eq!(image_dimensions(data), None);
+    }
+
+    #[test]
+    fn image_dimensions_truncated_gif_header() {
+        let data = b"GIF89a\x01";
+        assert_eq!(image_dimensions(data), None);
+    }
+
+    #[test]
+    fn image_dimensions_jpeg_truncated_sof() {
+        // SOI marker but SOF data cut short
+        let data = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x05];
+        assert_eq!(image_dimensions(&data), None);
+    }
+
+    #[test]
+    fn image_dimensions_jpeg_no_sof_marker() {
+        // SOI followed by non-FF byte (invalid)
+        let data = vec![0xFF, 0xD8, 0x00, 0x00];
+        assert_eq!(image_dimensions(&data), None);
+    }
+
+    #[test]
+    fn image_dimensions_gif87a() {
+        let mut data = vec![0u8; 16];
+        data[..6].copy_from_slice(b"GIF87a");
+        data[6..8].copy_from_slice(&128u16.to_le_bytes());
+        data[8..10].copy_from_slice(&64u16.to_le_bytes());
+        assert_eq!(image_dimensions(&data), Some((128, 64)));
+    }
+
+    // ── placeholder edge cases ───────────────────────────────────────
+
+    #[test]
+    fn placeholder_width_only() {
+        let result = placeholder("image/png", Some(100), None);
+        assert_eq!(result, "[image: image/png]");
+    }
+
+    #[test]
+    fn placeholder_height_only() {
+        let result = placeholder("image/png", None, Some(200));
+        assert_eq!(result, "[image: image/png]");
+    }
+
+    // ── kitty with empty data ────────────────────────────────────────
+
+    #[test]
+    fn kitty_empty_data_produces_empty_output() {
+        let result = encode_kitty(&[], 40);
+        // Empty bytes → empty base64 → no chunks → empty output
+        assert!(result.is_empty());
+    }
+
+    // ── iterm2 with empty data ───────────────────────────────────────
+
+    #[test]
+    fn iterm2_empty_data() {
+        let result = encode_iterm2(&[], 40);
+        assert!(result.contains("size=0"));
+        assert!(result.contains("width=40"));
+    }
+
+    // ── render_inline with valid PNG ─────────────────────────────────
+
+    #[test]
+    fn render_inline_with_valid_png_includes_dimensions() {
+        let mut png_data = vec![0u8; 32];
+        png_data[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
+        png_data[8..12].copy_from_slice(&13u32.to_be_bytes());
+        png_data[12..16].copy_from_slice(b"IHDR");
+        png_data[16..20].copy_from_slice(&200u32.to_be_bytes());
+        png_data[20..24].copy_from_slice(&150u32.to_be_bytes());
+
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_data);
+        let result = render_inline(&b64, "image/png", 80);
+        assert_eq!(result, "[image: image/png, 200x150]");
+    }
+
+    // ── ImageProtocol enum ──────────────────────────────────────────
+
+    #[test]
+    fn image_protocol_equality() {
+        assert_eq!(ImageProtocol::Kitty, ImageProtocol::Kitty);
+        assert_ne!(ImageProtocol::Kitty, ImageProtocol::Iterm2);
+        assert_ne!(ImageProtocol::Iterm2, ImageProtocol::Unsupported);
     }
 }
