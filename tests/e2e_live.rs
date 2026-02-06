@@ -1349,9 +1349,9 @@ mod cross_provider {
                     )
                 });
                 let done_has_text = events.iter().any(|e| match e {
-                    StreamEvent::Done { message, .. } => message.content.iter().any(|c| {
-                        matches!(c, pi::model::ContentBlock::Text(tc) if !tc.text.is_empty())
-                    }),
+                    StreamEvent::Done { message, .. } => message.content.iter().any(
+                        |c| matches!(c, pi::model::ContentBlock::Text(tc) if !tc.text.is_empty()),
+                    ),
                     _ => false,
                 });
                 let has_content = has_delta_content || done_has_text;

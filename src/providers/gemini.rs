@@ -301,14 +301,7 @@ where
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
-                        if !self.started {
-                            self.started = true;
-                            return Ok(Some(StreamEvent::Start {
-                                partial: self.partial.clone(),
-                            }));
-                        }
-
-                        // Find the last text block to append to, or create new
+                        // Always accumulate text into partial first
                         let last_is_text =
                             matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
                         if !last_is_text {
@@ -322,6 +315,13 @@ where
                             self.partial.content.get_mut(content_index)
                         {
                             t.text.push_str(&text);
+                        }
+
+                        if !self.started {
+                            self.started = true;
+                            return Ok(Some(StreamEvent::Start {
+                                partial: self.partial.clone(),
+                            }));
                         }
 
                         return Ok(Some(StreamEvent::TextDelta {
