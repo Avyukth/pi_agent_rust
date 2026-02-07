@@ -349,3 +349,84 @@ A refresh is complete when ALL of the following are true:
 | Artifact provenance | Source tracking + licenses | `docs/extension-artifact-provenance.json` |
 | EXTENSIONS.md | Architecture doc with coverage tables | `EXTENSIONS.md` |
 | README.md | User-facing extension status | `README.md` |
+
+---
+
+## Refresh Cadence and Triggers
+
+### Scheduled cadence
+
+**Quarterly refresh** (recommended): run the full pipeline once per quarter.
+This balances freshness against engineering cost. The extension ecosystem
+does not change fast enough to justify monthly runs.
+
+Suggested schedule:
+- Q1 (January): post-holiday ecosystem catch-up
+- Q2 (April): mid-year sweep
+- Q3 (July): pre-conference season
+- Q4 (October): year-end stabilization
+
+### Trigger events (unscheduled refresh)
+
+Run an immediate refresh when any of these occur:
+
+| Trigger | Scope | Rationale |
+|---|---|---|
+| **Pi upstream major release** | Full refresh | New APIs may break or enable extensions |
+| **QuickJS runtime upgrade** | Conformance only | Engine changes may affect shim behavior |
+| **New Node API shim added** | Conformance only | Previously-failing extensions may now pass |
+| **Security incident** | Targeted (affected extensions) | Must verify no malicious payload in corpus |
+| **Extension ecosystem event** | Discovery + validation | Large batch of new community extensions |
+| **Regression detected in CI** | Targeted investigation | Budget failure or conformance drop |
+
+### Emergency refresh criteria
+
+An emergency (same-day) refresh is warranted when:
+- A previously-passing official extension now fails (T1/T2 regression)
+- A security vulnerability is found in a corpus extension
+- The overall pass rate drops below 80% (regression threshold)
+
+### Ownership
+
+The engineer who triggers a refresh owns it through completion. They must:
+1. Follow this checklist end-to-end
+2. Not skip the exit criteria
+3. Document any deviations in the commit message
+
+For scheduled refreshes, assign ownership at least 1 week before the target
+date to allow time for discovery sweeps.
+
+---
+
+## Extension Proposal Intake
+
+Between refresh cycles, new extension candidates should be tracked
+systematically rather than added ad-hoc.
+
+### Proposal template
+
+When proposing a new extension for the corpus, record:
+
+```
+Extension: <name>
+Source: <URL or package reference>
+Source tier: <official / community / npm / third-party>
+Reason: <why add this — unique API surface, popular, covers gap in coverage>
+Evidence: <link to repo, npm page, or usage data>
+Priority: <high = covers uncovered capability / low = incremental>
+```
+
+### Triage rules
+
+- **High priority**: covers a capability or interaction tag not well-represented
+  in the current corpus (check `docs/extension-catalog.json` for gaps).
+- **Medium priority**: popular extension or from a new source tier.
+- **Low priority**: similar to existing extensions in behavior/capability.
+- **Reject**: duplicate, abandoned (no commits in 12+ months), or uses
+  forbidden APIs (see EXTENSIONS.md §2A.4).
+
+### Moving proposals into a refresh
+
+During the next scheduled refresh (Phase 1), review all pending proposals
+and include high/medium priority ones in the discovery sweep. Low priority
+proposals carry over to the following cycle unless the corpus has capacity.
