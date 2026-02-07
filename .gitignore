@@ -20,6 +20,7 @@ tests/ext_conformance/reports/*
 !tests/ext_conformance/reports/CONFORMANCE_REPORT.md
 !tests/ext_conformance/reports/conformance_baseline.json
 !tests/ext_conformance/reports/conformance_summary.json
+!tests/ext_conformance/reports/COMPATIBILITY_SUMMARY.md
 
 # sqlite WAL/SHM artifacts
 *.sqlite3-wal
