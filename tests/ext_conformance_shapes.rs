@@ -41,10 +41,7 @@ fn deterministic_env() -> HashMap<String, String> {
         "PI_DETERMINISTIC_HOME".to_string(),
         "/tmp/ext-shape-test-home".to_string(),
     );
-    env.insert(
-        "HOME".to_string(),
-        "/tmp/ext-shape-test-home".to_string(),
-    );
+    env.insert("HOME".to_string(), "/tmp/ext-shape-test-home".to_string());
     env.insert("PI_DETERMINISTIC_RANDOM".to_string(), "0.5".to_string());
     env
 }
@@ -52,7 +49,14 @@ fn deterministic_env() -> HashMap<String, String> {
 /// Load an extension and return manager + runtime + registration snapshot.
 fn load_and_snapshot(
     fixture_path: &Path,
-) -> Result<(ExtensionManager, JsExtensionRuntimeHandle, RegistrationSnapshot), String> {
+) -> Result<
+    (
+        ExtensionManager,
+        JsExtensionRuntimeHandle,
+        RegistrationSnapshot,
+    ),
+    String,
+> {
     let spec = JsExtensionLoadSpec::from_entry_path(fixture_path)
         .map_err(|e| format!("load spec: {e}"))?;
 
@@ -115,7 +119,8 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
 
     // Phase 1: Load
     let load_start = Instant::now();
-    let mut load_event = ShapeEvent::new(&correlation_id, fixture_name, shape, LifecyclePhase::Load);
+    let mut load_event =
+        ShapeEvent::new(&correlation_id, fixture_name, shape, LifecyclePhase::Load);
 
     let load_result = load_and_snapshot(&fixture_path);
     load_event.duration_ms = load_start.elapsed().as_millis() as u64;
@@ -150,8 +155,12 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
 
     // Phase 2: Verify registrations
     let verify_start = Instant::now();
-    let mut verify_event =
-        ShapeEvent::new(&correlation_id, fixture_name, shape, LifecyclePhase::VerifyRegistrations);
+    let mut verify_event = ShapeEvent::new(
+        &correlation_id,
+        fixture_name,
+        shape,
+        LifecyclePhase::VerifyRegistrations,
+    );
 
     let reg_failures = verify_registrations(shape, &snapshot);
     verify_event.duration_ms = verify_start.elapsed().as_millis() as u64;
@@ -160,7 +169,7 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
         verify_event.status = ShapeEventStatus::Ok;
     } else {
         verify_event.status = ShapeEventStatus::Fail;
-        verify_event.failures = reg_failures.clone();
+        verify_event.failures.clone_from(&reg_failures);
         all_failures.extend(reg_failures);
     }
     events.push(verify_event);
@@ -209,17 +218,11 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
         }
         ShapeInvocation::CommandExec { command_name, args } => {
             let result = common::run_async({
-                let runtime = runtime.clone();
                 let command_name = command_name.clone();
                 let args = args.clone();
                 async move {
                     runtime
-                        .execute_command(
-                            command_name,
-                            args,
-                            serde_json::json!({}),
-                            20_000,
-                        )
+                        .execute_command(command_name, args, serde_json::json!({}), 20_000)
                         .await
                         .map_err(|e| format!("execute_command: {e}"))
                 }
@@ -244,17 +247,11 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
             payload,
         } => {
             let result = common::run_async({
-                let runtime = runtime.clone();
                 let event_name = event_name.clone();
                 let payload = payload.clone();
                 async move {
                     runtime
-                        .dispatch_event(
-                            event_name,
-                            payload,
-                            serde_json::json!({}),
-                            20_000,
-                        )
+                        .dispatch_event(event_name, payload, serde_json::json!({}), 20_000)
                         .await
                         .map_err(|e| format!("dispatch_event: {e}"))
                 }
@@ -286,32 +283,27 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
 
     // Phase 4: Shutdown
     let shutdown_start = Instant::now();
-    let mut shutdown_event =
-        ShapeEvent::new(&correlation_id, fixture_name, shape, LifecyclePhase::Shutdown);
+    let mut shutdown_event = ShapeEvent::new(
+        &correlation_id,
+        fixture_name,
+        shape,
+        LifecyclePhase::Shutdown,
+    );
 
-    let shutdown_ok = common::run_async({
-        let manager = manager.clone();
-        async move {
-            manager
-                .shutdown(std::time::Duration::from_secs(5))
-                .await
-        }
-    });
+    let shutdown_ok =
+        common::run_async(async move { manager.shutdown(std::time::Duration::from_secs(5)).await });
 
     shutdown_event.duration_ms = shutdown_start.elapsed().as_millis() as u64;
-    match shutdown_ok {
-        true => {
-            shutdown_event.status = ShapeEventStatus::Ok;
-        }
-        false => {
-            shutdown_event.status = ShapeEventStatus::Fail;
-            let failure = ShapeFailure::new(
-                FailureClass::ShutdownError,
-                "Shutdown did not complete within budget",
-            );
-            shutdown_event.failures.push(failure.clone());
-            all_failures.push(failure);
-        }
+    if shutdown_ok {
+        shutdown_event.status = ShapeEventStatus::Ok;
+    } else {
+        shutdown_event.status = ShapeEventStatus::Fail;
+        let failure = ShapeFailure::new(
+            FailureClass::ShutdownError,
+            "Shutdown did not complete within budget",
+        );
+        shutdown_event.failures.push(failure.clone());
+        all_failures.push(failure);
     }
     events.push(shutdown_event);
 
@@ -342,7 +334,10 @@ fn shape_harness_tool_loads_and_registers() {
     // via registerTool (which goes to tool registry, not slash_commands).
     // The harness verifies the load completed without error.
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_tool"
     );
 }
@@ -355,7 +350,10 @@ fn shape_harness_command_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_command"
     );
 }
@@ -368,7 +366,10 @@ fn shape_harness_provider_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_provider"
     );
 }
@@ -381,7 +382,10 @@ fn shape_harness_event_hook_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_event"
     );
 }
@@ -394,12 +398,19 @@ fn shape_harness_general_loads() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_resources"
     );
     // General extensions should pass registration verification (no required registrations)
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::VerifyRegistrations && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::VerifyRegistrations
+                && e.status == ShapeEventStatus::Ok),
         "Registration verification should pass for General shape"
     );
 }
@@ -412,12 +423,19 @@ fn shape_harness_configuration_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_configuration"
     );
     // Configuration should pass registration (flags or shortcuts present)
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::VerifyRegistrations && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::VerifyRegistrations
+                && e.status == ShapeEventStatus::Ok),
         "Registration verification should pass for Configuration shape"
     );
 }
@@ -430,7 +448,10 @@ fn shape_harness_ui_component_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_ui_component"
     );
 }
@@ -443,12 +464,19 @@ fn shape_harness_multi_loads_and_registers() {
         eprintln!("  {}", event.to_jsonl());
     }
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Ok),
         "Load phase should succeed for minimal_multi"
     );
     // Multi should verify that 2+ registration types are present
     assert!(
-        result.events.iter().any(|e| e.phase == LifecyclePhase::VerifyRegistrations && e.status == ShapeEventStatus::Ok),
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::VerifyRegistrations
+                && e.status == ShapeEventStatus::Ok),
         "Registration verification should pass for Multi shape (tool + event_hook)"
     );
 }
@@ -478,10 +506,7 @@ fn shape_harness_batch_summary() {
     eprintln!("{md}");
 
     // All 8 shapes should be represented
-    assert_eq!(
-        summary.total, 8,
-        "Should have 8 results (one per shape)"
-    );
+    assert_eq!(summary.total, 8, "Should have 8 results (one per shape)");
     // Print per-result summary
     for result in &results {
         eprintln!("{}", result.summary_line());
@@ -502,7 +527,10 @@ fn shape_harness_emits_valid_jsonl() {
 
         // Must have required fields
         assert!(parsed.get("timestamp").is_some(), "Missing timestamp");
-        assert!(parsed.get("correlation_id").is_some(), "Missing correlation_id");
+        assert!(
+            parsed.get("correlation_id").is_some(),
+            "Missing correlation_id"
+        );
         assert!(parsed.get("extension_id").is_some(), "Missing extension_id");
         assert!(parsed.get("shape").is_some(), "Missing shape");
         assert!(parsed.get("phase").is_some(), "Missing phase");
@@ -527,16 +555,17 @@ fn shape_harness_nonexistent_fixture_reports_load_error() {
     let shape = ExtensionShape::Tool;
 
     let load_start = Instant::now();
-    let mut load_event = ShapeEvent::new(correlation_id, "nonexistent", shape, LifecyclePhase::Load);
+    let mut load_event =
+        ShapeEvent::new(correlation_id, "nonexistent", shape, LifecyclePhase::Load);
 
     let result = load_and_snapshot(&fixture_path);
-    load_event.duration_ms = load_start.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        load_event.duration_ms = load_start.elapsed().as_millis() as u64;
+    }
 
     assert!(result.is_err(), "Should fail on nonexistent fixture");
-    let err = match result {
-        Err(e) => e,
-        Ok(_) => unreachable!(),
-    };
+    let Err(err) = result else { unreachable!() };
 
     let failure = ShapeFailure::new(FailureClass::LoadError, &err);
     assert_eq!(failure.class, FailureClass::LoadError);
@@ -545,4 +574,153 @@ fn shape_harness_nonexistent_fixture_reports_load_error() {
     // The display format should include the class
     let display = failure.to_string();
     assert!(display.contains("load_error"), "Display: {display}");
+}
+
+// ─── Negative tests (bd-icjb) ────────────────────────────────────────────────
+
+#[test]
+fn negative_syntax_error_fails_cleanly() {
+    let result = run_shape_test(ExtensionShape::Tool, "negative_syntax_error");
+    eprintln!("{}", result.summary_line());
+    assert!(!result.passed, "Syntax error fixture should not pass");
+    assert!(
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Fail),
+        "Load phase should fail for syntax error"
+    );
+    // Error message should be useful
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|f| f.class == FailureClass::LoadError),
+        "Should have LoadError failure class"
+    );
+}
+
+#[test]
+fn negative_no_export_default_fails_cleanly() {
+    let result = run_shape_test(ExtensionShape::Tool, "negative_no_export");
+    eprintln!("{}", result.summary_line());
+    // Missing export default should fail at load or produce empty registrations
+    // Either way, tool shape verification should fail
+    let has_failure = !result.passed
+        || result
+            .events
+            .iter()
+            .any(|e| e.status == ShapeEventStatus::Fail);
+    assert!(
+        has_failure,
+        "No export default should produce a failure somewhere in the lifecycle"
+    );
+}
+
+#[test]
+fn negative_throw_on_load_fails_cleanly() {
+    let result = run_shape_test(ExtensionShape::Tool, "negative_throw_on_load");
+    eprintln!("{}", result.summary_line());
+    assert!(
+        !result.passed,
+        "Extension that throws on load should not pass"
+    );
+    assert!(
+        result
+            .events
+            .iter()
+            .any(|e| e.phase == LifecyclePhase::Load && e.status == ShapeEventStatus::Fail),
+        "Load phase should fail when extension throws"
+    );
+    // Error message should contain the thrown message
+    let load_err = result
+        .failures
+        .iter()
+        .find(|f| f.class == FailureClass::LoadError)
+        .map_or("", |f| f.message.as_str());
+    assert!(
+        load_err.contains("intentionally crashes"),
+        "Error should contain the thrown message, got: {load_err}"
+    );
+}
+
+#[test]
+fn negative_invalid_tool_schema_reports_missing_name() {
+    let result = run_shape_test(ExtensionShape::Tool, "negative_invalid_tool_schema");
+    eprintln!("{}", result.summary_line());
+    // Extension should load (the call may or may not throw), but verification
+    // should detect the missing tool name or the registration error
+    let has_load_or_verify_failure = result.events.iter().any(|e| {
+        (e.phase == LifecyclePhase::Load || e.phase == LifecyclePhase::VerifyRegistrations)
+            && e.status == ShapeEventStatus::Fail
+    });
+    assert!(
+        has_load_or_verify_failure,
+        "Invalid tool schema should fail at load or verification"
+    );
+}
+
+#[test]
+fn negative_wrong_export_type_fails_cleanly() {
+    let result = run_shape_test(ExtensionShape::General, "negative_wrong_type");
+    eprintln!("{}", result.summary_line());
+    // Exporting a string instead of a function should fail at load
+    let has_failure = result
+        .events
+        .iter()
+        .any(|e| e.status == ShapeEventStatus::Fail);
+    assert!(has_failure, "Exporting wrong type should produce a failure");
+}
+
+#[test]
+fn negative_missing_handler_registers_but_invocation_fails() {
+    let result = run_shape_test(ExtensionShape::Tool, "negative_missing_handler");
+    eprintln!("{}", result.summary_line());
+    for event in &result.events {
+        eprintln!("  {}", event.to_jsonl());
+    }
+    // If tool registers without handler, invocation should fail
+    // (or registration itself might fail)
+    let has_failure = result
+        .events
+        .iter()
+        .any(|e| e.status == ShapeEventStatus::Fail);
+    assert!(
+        has_failure,
+        "Tool without execute handler should fail at registration or invocation"
+    );
+}
+
+#[test]
+fn negative_tests_do_not_crash_host() {
+    // Run all negative fixtures in sequence to verify none crash the host process
+    let negatives = [
+        ("negative_syntax_error", ExtensionShape::Tool),
+        ("negative_no_export", ExtensionShape::Tool),
+        ("negative_throw_on_load", ExtensionShape::Tool),
+        ("negative_invalid_tool_schema", ExtensionShape::Tool),
+        ("negative_missing_handler", ExtensionShape::Tool),
+        ("negative_wrong_type", ExtensionShape::General),
+    ];
+
+    let mut pass_count = 0;
+    let mut fail_count = 0;
+    for (fixture, shape) in &negatives {
+        let result = run_shape_test(*shape, fixture);
+        if result.passed {
+            pass_count += 1;
+        } else {
+            fail_count += 1;
+        }
+        eprintln!("{}", result.summary_line());
+    }
+
+    eprintln!(
+        "\nNegative test summary: {fail_count} correctly failed, {pass_count} unexpectedly passed"
+    );
+    // At least 4 of 6 should fail (syntax error, throw, invalid schema, wrong type)
+    assert!(
+        fail_count >= 4,
+        "Expected at least 4 negative tests to fail, got {fail_count}"
+    );
 }

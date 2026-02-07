@@ -597,29 +597,25 @@ impl ShapeInvocation {
                     arguments: Value::Object(serde_json::Map::new()),
                 }
             }),
-            ExtensionShape::Command => {
-                snapshot
-                    .slash_commands
-                    .first()
-                    .map_or(Self::NoOp, |cmd| {
-                        let name = cmd
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        Self::CommandExec {
-                            command_name: name,
-                            args: String::new(),
-                        }
-                    })
-            }
+            ExtensionShape::Command => snapshot.slash_commands.first().map_or(Self::NoOp, |cmd| {
+                let name = cmd
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                Self::CommandExec {
+                    command_name: name,
+                    args: String::new(),
+                }
+            }),
             ExtensionShape::EventHook => {
-                snapshot.event_hooks.first().map_or(Self::NoOp, |event| {
-                    Self::EventDispatch {
+                snapshot
+                    .event_hooks
+                    .first()
+                    .map_or(Self::NoOp, |event| Self::EventDispatch {
                         event_name: event.clone(),
                         payload: Value::Object(serde_json::Map::new()),
-                    }
-                })
+                    })
             }
             ExtensionShape::Provider => Self::ProviderCheck,
             ExtensionShape::UiComponent => Self::UiComponentCheck,
@@ -642,13 +638,12 @@ impl ShapeInvocation {
             || {
                 snapshot.slash_commands.first().map_or_else(
                     || {
-                        snapshot
-                            .event_hooks
-                            .first()
-                            .map_or(Self::NoOp, |event| Self::EventDispatch {
+                        snapshot.event_hooks.first().map_or(Self::NoOp, |event| {
+                            Self::EventDispatch {
                                 event_name: event.clone(),
                                 payload: Value::Object(serde_json::Map::new()),
-                            })
+                            }
+                        })
                     },
                     |cmd| Self::CommandExec {
                         command_name: name_from_value(cmd),

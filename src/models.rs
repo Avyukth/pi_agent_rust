@@ -954,4 +954,513 @@ mod tests {
         );
         assert_eq!(acme.model.input, vec![InputType::Text, InputType::Image]);
     }
+
+    // ─── supports_xhigh ──────────────────────────────────────────────
+
+    fn make_model_entry(id: &str, reasoning: bool) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-responses".to_string(),
+                provider: "test".to_string(),
+                base_url: "https://example.com".to_string(),
+                reasoning,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8192,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    #[test]
+    fn supports_xhigh_for_known_models() {
+        assert!(make_model_entry("gpt-5.1-codex-max", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.2", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.2-codex", true).supports_xhigh());
+    }
+
+    #[test]
+    fn supports_xhigh_false_for_other_models() {
+        assert!(!make_model_entry("gpt-4o", true).supports_xhigh());
+        assert!(!make_model_entry("claude-sonnet-4-20250514", true).supports_xhigh());
+        assert!(!make_model_entry("gemini-2.5-pro", true).supports_xhigh());
+    }
+
+    // ─── clamp_thinking_level ────────────────────────────────────────
+
+    #[test]
+    fn clamp_non_reasoning_always_off() {
+        use crate::model::ThinkingLevel;
+        let entry = make_model_entry("gpt-4o-mini", false);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::Off
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::Off
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+    }
+
+    #[test]
+    fn clamp_xhigh_downgraded_without_support() {
+        use crate::model::ThinkingLevel;
+        let entry = make_model_entry("claude-sonnet-4-20250514", true);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::High,
+        );
+    }
+
+    #[test]
+    fn clamp_xhigh_preserved_with_support() {
+        use crate::model::ThinkingLevel;
+        let entry = make_model_entry("gpt-5.2", true);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::XHigh,
+        );
+    }
+
+    #[test]
+    fn clamp_passthrough_for_regular_levels() {
+        use crate::model::ThinkingLevel;
+        let entry = make_model_entry("claude-sonnet-4-20250514", true);
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::High
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Medium),
+            ThinkingLevel::Medium
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Low),
+            ThinkingLevel::Low
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Minimal),
+            ThinkingLevel::Minimal
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Off),
+            ThinkingLevel::Off
+        );
+    }
+
+    // ─── ad_hoc_provider_defaults ────────────────────────────────────
+
+    #[test]
+    fn ad_hoc_known_providers() {
+        let providers = [
+            "anthropic",
+            "openai",
+            "google",
+            "cohere",
+            "groq",
+            "deepinfra",
+            "cerebras",
+            "openrouter",
+            "mistral",
+            "deepseek",
+            "fireworks",
+            "togetherai",
+            "perplexity",
+            "xai",
+        ];
+        for provider in providers {
+            assert!(
+                ad_hoc_provider_defaults(provider).is_some(),
+                "expected defaults for '{provider}'"
+            );
+        }
+    }
+
+    #[test]
+    fn ad_hoc_alibaba_aliases() {
+        for alias in ["alibaba", "dashscope", "qwen"] {
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+            assert!(defaults.base_url.contains("dashscope"));
+        }
+    }
+
+    #[test]
+    fn ad_hoc_moonshot_aliases() {
+        for alias in ["moonshotai", "moonshot", "kimi"] {
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+            assert!(defaults.base_url.contains("moonshot"));
+        }
+    }
+
+    #[test]
+    fn ad_hoc_unknown_returns_none() {
+        assert!(ad_hoc_provider_defaults("unknown-provider").is_none());
+        assert!(ad_hoc_provider_defaults("").is_none());
+    }
+
+    #[test]
+    fn ad_hoc_anthropic_uses_messages_api() {
+        let defaults = ad_hoc_provider_defaults("anthropic").unwrap();
+        assert_eq!(defaults.api, "anthropic-messages");
+        assert_eq!(defaults.base_url, "https://api.anthropic.com/v1/messages");
+        assert!(defaults.reasoning);
+    }
+
+    #[test]
+    fn ad_hoc_openai_uses_responses_api() {
+        let defaults = ad_hoc_provider_defaults("openai").unwrap();
+        assert_eq!(defaults.api, "openai-responses");
+    }
+
+    #[test]
+    fn ad_hoc_groq_uses_completions_api() {
+        let defaults = ad_hoc_provider_defaults("groq").unwrap();
+        assert_eq!(defaults.api, "openai-completions");
+        assert!(defaults.base_url.contains("groq.com"));
+    }
+
+    // ─── ad_hoc_model_entry ──────────────────────────────────────────
+
+    #[test]
+    fn ad_hoc_model_entry_creates_valid_entry() {
+        let entry = ad_hoc_model_entry("groq", "llama-3-70b").unwrap();
+        assert_eq!(entry.model.id, "llama-3-70b");
+        assert_eq!(entry.model.name, "llama-3-70b");
+        assert_eq!(entry.model.provider, "groq");
+        assert_eq!(entry.model.api, "openai-completions");
+        assert!(entry.model.base_url.contains("groq.com"));
+        assert!(entry.auth_header); // openai-compatible → auth_header = true
+        assert!(entry.api_key.is_none()); // no auth lookup
+    }
+
+    #[test]
+    fn ad_hoc_model_entry_anthropic_no_auth_header() {
+        let entry = ad_hoc_model_entry("anthropic", "claude-custom").unwrap();
+        assert!(!entry.auth_header); // anthropic uses x-api-key, not Authorization
+    }
+
+    #[test]
+    fn ad_hoc_model_entry_unknown_returns_none() {
+        assert!(ad_hoc_model_entry("nonexistent", "model").is_none());
+    }
+
+    // ─── merge_headers ───────────────────────────────────────────────
+
+    #[test]
+    fn merge_headers_combines_both() {
+        let base = HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]);
+        let overrides = HashMap::from([
+            ("b".to_string(), "override".to_string()),
+            ("c".to_string(), "3".to_string()),
+        ]);
+        let merged = merge_headers(&base, overrides);
+        assert_eq!(merged.get("a").unwrap(), "1");
+        assert_eq!(merged.get("b").unwrap(), "override");
+        assert_eq!(merged.get("c").unwrap(), "3");
+    }
+
+    #[test]
+    fn merge_headers_empty_base() {
+        let merged = merge_headers(
+            &HashMap::new(),
+            HashMap::from([("x".to_string(), "y".to_string())]),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged.get("x").unwrap(), "y");
+    }
+
+    #[test]
+    fn merge_headers_empty_overrides() {
+        let base = HashMap::from([("x".to_string(), "y".to_string())]);
+        let merged = merge_headers(&base, HashMap::new());
+        assert_eq!(merged, base);
+    }
+
+    // ─── resolve_value ───────────────────────────────────────────────
+
+    #[test]
+    fn resolve_value_plain_literal() {
+        assert_eq!(resolve_value("my-key").as_deref(), Some("my-key"));
+    }
+
+    #[test]
+    fn resolve_value_empty_returns_none() {
+        assert!(resolve_value("").is_none());
+    }
+
+    #[test]
+    fn resolve_value_env_empty_var_name_returns_none() {
+        assert!(resolve_value("env:").is_none());
+    }
+
+    #[test]
+    fn resolve_value_file_empty_path_returns_none() {
+        assert!(resolve_value("file:").is_none());
+    }
+
+    #[test]
+    fn resolve_value_file_missing_returns_none() {
+        assert!(resolve_value("file:/nonexistent/path/key.txt").is_none());
+    }
+
+    #[test]
+    fn resolve_value_shell_echo() {
+        let result = resolve_value("!echo hello");
+        assert_eq!(result.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn resolve_value_shell_failing_command() {
+        assert!(resolve_value("!false").is_none());
+    }
+
+    // ─── resolve_headers ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_headers_none_returns_empty() {
+        assert!(resolve_headers(None).is_empty());
+    }
+
+    #[test]
+    fn resolve_headers_resolves_literal_values() {
+        let mut headers = HashMap::new();
+        headers.insert("x-key".to_string(), "literal-value".to_string());
+        let resolved = resolve_headers(Some(&headers));
+        assert_eq!(resolved.get("x-key").unwrap(), "literal-value");
+    }
+
+    // ─── ModelRegistry ───────────────────────────────────────────────
+
+    #[test]
+    fn model_registry_get_available_filters_by_api_key() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+        let available = registry.get_available();
+        assert!(!available.is_empty());
+        for entry in &available {
+            assert!(
+                entry.api_key.is_some(),
+                "all available models should have api_key"
+            );
+        }
+    }
+
+    #[test]
+    fn model_registry_error_none_for_valid_load() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+        assert!(registry.error().is_none());
+    }
+
+    #[test]
+    fn model_registry_error_on_invalid_json() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(&models_path, "not valid json").expect("write bad json");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert!(registry.error().is_some());
+    }
+
+    #[test]
+    fn model_registry_load_missing_models_json_is_fine() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let registry = ModelRegistry::load(&auth, Some(dir.path().join("nonexistent.json")));
+        assert!(registry.error().is_none());
+    }
+
+    // ─── default_models_path ─────────────────────────────────────────
+
+    #[test]
+    fn default_models_path_joins_correctly() {
+        let path = default_models_path(Path::new("/home/user/.pi"));
+        assert_eq!(path, PathBuf::from("/home/user/.pi/models.json"));
+    }
+
+    // ─── ModelsConfig deserialization ────────────────────────────────
+
+    #[test]
+    fn models_config_deserialize_camel_case() {
+        let json = r#"{
+            "providers": {
+                "acme": {
+                    "baseUrl": "https://acme.com/v1",
+                    "apiKey": "env:ACME_KEY",
+                    "authHeader": true,
+                    "models": [{
+                        "id": "acme-1",
+                        "contextWindow": 32000,
+                        "maxTokens": 2048
+                    }]
+                }
+            }
+        }"#;
+        let config: ModelsConfig = serde_json::from_str(json).expect("parse");
+        let acme = config.providers.get("acme").expect("acme provider");
+        assert_eq!(acme.base_url.as_deref(), Some("https://acme.com/v1"));
+        assert_eq!(acme.auth_header, Some(true));
+        let model = &acme.models.as_ref().unwrap()[0];
+        assert_eq!(model.context_window, Some(32000));
+        assert_eq!(model.max_tokens, Some(2048));
+    }
+
+    #[test]
+    fn models_config_empty_providers_ok() {
+        let json = r#"{"providers": {}}"#;
+        let config: ModelsConfig = serde_json::from_str(json).expect("parse");
+        assert!(config.providers.is_empty());
+    }
+
+    #[test]
+    fn compat_config_deserialize() {
+        let json = r#"{
+            "supportsStore": true,
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": false,
+            "maxTokensField": "max_completion_tokens"
+        }"#;
+        let compat: CompatConfig = serde_json::from_str(json).expect("parse");
+        assert_eq!(compat.supports_store, Some(true));
+        assert_eq!(compat.supports_developer_role, Some(false));
+        assert_eq!(compat.supports_reasoning_effort, Some(true));
+        assert_eq!(compat.supports_usage_in_streaming, Some(false));
+        assert_eq!(
+            compat.max_tokens_field.as_deref(),
+            Some("max_completion_tokens")
+        );
+    }
+
+    // ─── apply_custom_models: provider replaces built-ins ────────────
+
+    #[test]
+    fn apply_custom_models_replaces_built_in_when_models_specified() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = built_in_models(&auth);
+        let anthropic_before = models
+            .iter()
+            .filter(|m| m.model.provider == "anthropic")
+            .count();
+        assert!(anthropic_before > 0);
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://proxy.example/v1".to_string()),
+                    api: Some("anthropic-messages".to_string()),
+                    models: Some(vec![ModelConfig {
+                        id: "custom-claude".to_string(),
+                        name: Some("Custom Claude".to_string()),
+                        ..ModelConfig::default()
+                    }]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        // Built-in anthropic models should be replaced
+        let anthropic_after: Vec<_> = models
+            .iter()
+            .filter(|m| m.model.provider == "anthropic")
+            .collect();
+        assert_eq!(anthropic_after.len(), 1);
+        assert_eq!(anthropic_after[0].model.id, "custom-claude");
+    }
+
+    // ─── OAuthConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn oauth_config_fields() {
+        let config = OAuthConfig {
+            auth_url: "https://auth.example.com/authorize".to_string(),
+            token_url: "https://auth.example.com/token".to_string(),
+            client_id: "client-123".to_string(),
+            scopes: vec!["read".to_string(), "write".to_string()],
+            redirect_uri: Some("http://localhost:8080/callback".to_string()),
+        };
+        assert_eq!(config.client_id, "client-123");
+        assert_eq!(config.scopes.len(), 2);
+        assert!(config.redirect_uri.is_some());
+    }
+
+    // ─── Built-in model properties ───────────────────────────────────
+
+    #[test]
+    fn built_in_anthropic_models_use_correct_api() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+        for m in models.iter().filter(|m| m.model.provider == "anthropic") {
+            assert_eq!(m.model.api, "anthropic-messages");
+            assert!(!m.auth_header, "anthropic uses x-api-key, not auth header");
+            assert_eq!(m.model.context_window, 200_000);
+        }
+    }
+
+    #[test]
+    fn built_in_openai_models_use_auth_header() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+        for m in models.iter().filter(|m| m.model.provider == "openai") {
+            assert!(m.auth_header, "openai uses Authorization header");
+            assert_eq!(m.model.api, "openai-responses");
+        }
+    }
+
+    #[test]
+    fn built_in_google_models_no_auth_header() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+        for m in models.iter().filter(|m| m.model.provider == "google") {
+            assert!(!m.auth_header, "google uses api key in URL, not header");
+            assert_eq!(m.model.api, "google-generative-ai");
+        }
+    }
+
+    #[test]
+    fn built_in_reasoning_models_marked_correctly() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth);
+        // Haiku models are non-reasoning
+        for m in models.iter().filter(|m| m.model.id.contains("haiku")) {
+            assert!(
+                !m.model.reasoning || m.model.id.contains("3-5-haiku"),
+                "haiku 3.5 is non-reasoning, but {}: reasoning={}",
+                m.model.id,
+                m.model.reasoning
+            );
+        }
+        // Opus/Sonnet models are reasoning
+        for m in models
+            .iter()
+            .filter(|m| m.model.id.contains("opus") || m.model.id.contains("sonnet"))
+        {
+            assert!(m.model.reasoning, "{} should be reasoning", m.model.id);
+        }
+    }
 }
