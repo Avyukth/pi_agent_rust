@@ -430,3 +430,94 @@ Priority: <high = covers uncovered capability / low = incremental>
 During the next scheduled refresh (Phase 1), review all pending proposals
 and include high/medium priority ones in the discovery sweep. Low priority
 proposals carry over to the following cycle unless the corpus has capacity.
+
+---
+
+## Automation Hooks
+
+### CI conformance gate
+
+Add to `.github/workflows/ci.yml` (or equivalent) to catch regressions on
+every PR:
+
+```yaml
+# Extension conformance (PR subset)
+- name: Extension conformance check
+  run: |
+    cargo test --test ext_conformance_generated --features ext-conformance \
+      -- --test-threads=1 -q
+  env:
+    PI_TEST_MODE: "1"
+```
+
+This runs all 223 conformance tests. On a fast CI runner it takes ~2 minutes
+(debug build). For faster feedback, run only Tier 1+2 tests:
+
+```bash
+cargo test --test ext_conformance_generated "tier_[12]_" \
+  --features ext-conformance -- -q
+```
+
+### CI performance budget gate
+
+```yaml
+# Extension performance budgets
+- name: Extension perf budget check
+  run: |
+    PI_BENCH_MODE=pr cargo test --test ext_bench_harness \
+      --features ext-conformance -- --nocapture
+    cargo test --test perf_budgets --features ext-conformance -- -q
+```
+
+### Staleness detection
+
+The conformance baseline records `generated_at` timestamps. A simple
+staleness check:
+
+```bash
+#!/bin/bash
+# check_extension_staleness.sh
+BASELINE="tests/ext_conformance/reports/conformance_baseline.json"
+GENERATED=$(jq -r '.generated_at' "$BASELINE")
+DAYS_OLD=$(( ($(date +%s) - $(date -d "$GENERATED" +%s)) / 86400 ))
+
+if [ "$DAYS_OLD" -gt 90 ]; then
+  echo "WARNING: Extension conformance baseline is ${DAYS_OLD} days old."
+  echo "Consider running a refresh (see docs/EXTENSION_REFRESH_CHECKLIST.md)."
+  exit 1
+fi
+echo "Extension baseline is ${DAYS_OLD} days old (within 90-day window)."
+```
+
+Run this in CI on a weekly schedule to get early warning when the corpus
+is approaching staleness.
+
+### On-demand refresh
+
+To trigger a refresh outside the scheduled cadence:
+
+```bash
+# 1. Run conformance to see current state
+cargo test --test ext_conformance_generated conformance_full_report \
+  --features ext-conformance -- --nocapture
+
+# 2. Run benchmarks
+PI_BENCH_MODE=nightly PI_BENCH_MAX=200 PI_BENCH_ITERATIONS=10 \
+  cargo test --test ext_bench_harness --features ext-conformance -- --nocapture
+
+# 3. Follow the full checklist from Phase 1
+# See docs/EXTENSION_REFRESH_CHECKLIST.md
+```
+
+### Regression alerts
+
+When CI detects a conformance or budget failure, the responsible engineer
+should:
+
+1. Check `tests/ext_conformance/reports/conformance_events.jsonl` for the
+   failing extension(s).
+2. Determine if the failure is a code change (our regression) or a test
+   infrastructure issue.
+3. If our regression: fix the code, re-run conformance, verify pass.
+4. If test infrastructure: update the manifest or fixture, document the
+   change in the commit message.
