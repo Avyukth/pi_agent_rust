@@ -154,7 +154,12 @@ pub fn classify_registrations(registrations: &[String]) -> ExtensionCategory {
 
 /// Build inclusion rationale from tier, score, and registrations.
 #[must_use]
-pub fn build_rationale(tier: &str, score: u32, category: &ExtensionCategory, source_tier: &str) -> String {
+pub fn build_rationale(
+    tier: &str,
+    score: u32,
+    category: &ExtensionCategory,
+    source_tier: &str,
+) -> String {
     let tier_reason = match tier {
         "tier-0" => "Official pi-mono baseline; must-pass conformance target",
         "tier-1" => format!("High score ({score}/100); passes all gates").leak(),
@@ -225,10 +230,7 @@ mod tests {
 
     #[test]
     fn classify_empty() {
-        assert_eq!(
-            classify_registrations(&[]),
-            ExtensionCategory::General
-        );
+        assert_eq!(classify_registrations(&[]), ExtensionCategory::General);
     }
 
     #[test]

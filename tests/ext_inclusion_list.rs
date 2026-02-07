@@ -178,13 +178,19 @@ struct ExclusionNote {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 fn categorize_extension(capabilities: &[String]) -> String {
-    if capabilities.iter().any(|c| c == "registerProvider" || c == "streamSimple") {
+    if capabilities
+        .iter()
+        .any(|c| c == "registerProvider" || c == "streamSimple")
+    {
         return "provider".to_string();
     }
     if capabilities.iter().any(|c| c == "registerTool") {
         return "tool".to_string();
     }
-    if capabilities.iter().any(|c| c == "ui_header" || c == "ui_overlay") {
+    if capabilities
+        .iter()
+        .any(|c| c == "ui_header" || c == "ui_overlay")
+    {
         return "ui".to_string();
     }
     if capabilities.iter().any(|c| c == "event_hook") {
@@ -255,9 +261,7 @@ fn rationale_for(source_tier: &str, license: &str, score: Option<f64>) -> String
             "Third-party GitHub extension ({license} license{score_note}); \
              exercises diverse coding patterns"
         ),
-        _ => format!(
-            "{source_tier} extension ({license} license{score_note})"
-        ),
+        _ => format!("{source_tier} extension ({license} license{score_note})"),
     }
 }
 
@@ -296,17 +300,11 @@ fn generate_inclusion_list() {
         .map(|e| (e.id.clone(), e))
         .collect();
 
-    let tiered_map: BTreeMap<String, &TieredItem> = tiered
-        .items
-        .iter()
-        .map(|e| (e.id.clone(), e))
-        .collect();
+    let tiered_map: BTreeMap<String, &TieredItem> =
+        tiered.items.iter().map(|e| (e.id.clone(), e)).collect();
 
-    let risk_map: BTreeMap<String, &RiskArtifact> = risk
-        .artifacts
-        .iter()
-        .map(|e| (e.id.clone(), e))
-        .collect();
+    let risk_map: BTreeMap<String, &RiskArtifact> =
+        risk.artifacts.iter().map(|e| (e.id.clone(), e)).collect();
 
     let mut tier1 = Vec::new();
     let mut tier1_review = Vec::new();
@@ -318,11 +316,7 @@ fn generate_inclusion_list() {
 
     // Process all 208 vendored artifacts
     for item in &provenance.items {
-        let license = item
-            .license
-            .as_deref()
-            .unwrap_or("UNKNOWN")
-            .to_string();
+        let license = item.license.as_deref().unwrap_or("UNKNOWN").to_string();
         let is_clear = license != "UNKNOWN" && !license.is_empty();
 
         let source_tier_str = SourceTier::from_directory(&item.directory);
@@ -361,9 +355,7 @@ fn generate_inclusion_list() {
             .and_then(|t| t.score.as_ref())
             .map(|s| s.final_total);
 
-        let name = tiered_map
-            .get(&item.id)
-            .and_then(|t| t.name.clone());
+        let name = tiered_map.get(&item.id).and_then(|t| t.name.clone());
 
         let risk_level = risk_map
             .get(&item.id)
@@ -405,10 +397,7 @@ fn generate_inclusion_list() {
         }
 
         let tier = item.tier.as_deref().unwrap_or("excluded");
-        let score = item
-            .score
-            .as_ref()
-            .map_or(0.0, |s| s.final_total);
+        let score = item.score.as_ref().map_or(0.0, |s| s.final_total);
 
         if tier == "tier-2" || (tier != "excluded" && score >= 50.0) {
             tier2.push(InclusionEntry {
@@ -486,8 +475,7 @@ fn generate_inclusion_list() {
     };
 
     // Write output
-    let json =
-        serde_json::to_string_pretty(&inclusion_list).expect("serialize inclusion list");
+    let json = serde_json::to_string_pretty(&inclusion_list).expect("serialize inclusion list");
     let output_path = repo_root.join("docs/extension-inclusion-list.json");
     fs::write(&output_path, &json).expect("write inclusion list");
 

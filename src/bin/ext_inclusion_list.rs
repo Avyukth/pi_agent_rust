@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 use pi::extension_inclusion::{
-    ExclusionNote, InclusionEntry, InclusionList, InclusionStats, VersionPin,
-    build_rationale, classify_registrations,
+    ExclusionNote, InclusionEntry, InclusionList, InclusionStats, VersionPin, build_rationale,
+    classify_registrations,
 };
 use pi::extension_license::ScreeningReport;
 use pi::extension_popularity::{CandidateItem, CandidatePool, CandidateSource};
@@ -60,10 +60,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Load tiered corpus.
-    let tiered_text = fs::read_to_string(&args.tiered_corpus)
-        .with_context(|| format!("reading tiered corpus from {}", args.tiered_corpus.display()))?;
-    let tiered: ScoringReport = serde_json::from_str(&tiered_text)
-        .with_context(|| format!("parsing tiered corpus from {}", args.tiered_corpus.display()))?;
+    let tiered_text = fs::read_to_string(&args.tiered_corpus).with_context(|| {
+        format!(
+            "reading tiered corpus from {}",
+            args.tiered_corpus.display()
+        )
+    })?;
+    let tiered: ScoringReport = serde_json::from_str(&tiered_text).with_context(|| {
+        format!(
+            "parsing tiered corpus from {}",
+            args.tiered_corpus.display()
+        )
+    })?;
 
     // Load candidate pool.
     let pool_map: HashMap<String, CandidateItem> = args
@@ -135,11 +143,9 @@ fn main() -> Result<()> {
     let mut pinned_checksum = 0_usize;
 
     for item in &tiered.items {
-        let pool_item = pool_map.get(&item.id).or_else(|| {
-            item.name
-                .as_deref()
-                .and_then(|name| pool_map.get(name))
-        });
+        let pool_item = pool_map
+            .get(&item.id)
+            .or_else(|| item.name.as_deref().and_then(|name| pool_map.get(name)));
 
         let registrations = validation_map
             .get(&item.id)
@@ -189,7 +195,8 @@ fn main() -> Result<()> {
             VersionPin::Checksum => pinned_checksum += 1,
         }
 
-        let rationale = build_rationale(&item.tier, item.score.final_total, &category, &source_tier);
+        let rationale =
+            build_rationale(&item.tier, item.score.final_total, &category, &source_tier);
 
         let entry = InclusionEntry {
             id: item.id.clone(),
