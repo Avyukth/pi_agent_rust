@@ -12,6 +12,7 @@
 #![allow(clippy::needless_pass_by_value)]
 
 use crate::agent::{AbortHandle, AgentEvent, AgentSession, QueueMode};
+use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
@@ -30,7 +31,6 @@ use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
-use asupersync::Cx;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
@@ -246,7 +246,7 @@ pub async fn run(
     in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    let cx = Cx::for_request();
+    let cx = AgentCx::for_request();
     let session = Arc::new(Mutex::new(session));
     let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
     let is_streaming = Arc::new(AtomicBool::new(false));
@@ -324,7 +324,7 @@ pub async fn run(
         let manager_ui = (*manager).clone();
         let runtime_handle_ui = options.runtime_handle.clone();
         options.runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
+            let cx = AgentCx::for_request();
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
                 if request.expects_response() {
                     let emit_now = {
@@ -460,7 +460,7 @@ pub async fn run(
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
+                    let cx = AgentCx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -523,7 +523,7 @@ pub async fn run(
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
+                    let cx = AgentCx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -586,7 +586,7 @@ pub async fn run(
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
                 runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
+                    let cx = AgentCx::for_request();
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -1089,7 +1089,7 @@ pub async fn run(
                 let runtime_handle = options.runtime_handle.clone();
 
                 runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
+                    let cx = AgentCx::for_request();
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let result = run_bash_rpc(&cwd, &command, abort_rx).await;
 
@@ -1498,7 +1498,7 @@ async fn run_prompt_with_retry(
     options: RpcOptions,
     message: String,
     images: Vec<ImageContent>,
-    cx: Cx,
+    cx: AgentCx,
 ) {
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
@@ -1754,10 +1754,10 @@ fn rpc_emit_extension_ui_request(
 
     runtime_handle.spawn(async move {
         sleep(wall_now(), Duration::from_millis(fire_ms)).await;
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
 
         let next = {
-            let Ok(mut guard) = ui_state_timeout.lock(&cx).await else {
+            let Ok(mut guard) = ui_state_timeout.lock(cx.cx()).await else {
                 return;
             };
 
@@ -2281,7 +2281,7 @@ mod retry_tests {
                 options,
                 "hello".to_string(),
                 Vec::new(),
-                Cx::for_request(),
+                AgentCx::for_request(),
             )
             .await;
 
@@ -2330,13 +2330,13 @@ async fn maybe_auto_compact(
     is_compacting: Arc<AtomicBool>,
     out_tx: std::sync::mpsc::Sender<String>,
 ) {
-    let cx = Cx::for_request();
+    let cx = AgentCx::for_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
-        let Ok(guard) = session.lock(&cx).await else {
+        let Ok(guard) = session.lock(cx.cx()).await else {
             return;
         };
         let (path_entries, context_window) = {
-            let Ok(mut inner_session) = guard.session.lock(&cx).await else {
+            let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
                 return;
             };
             inner_session.ensure_entry_ids();
@@ -2375,7 +2375,7 @@ async fn maybe_auto_compact(
     is_compacting.store(true, Ordering::SeqCst);
 
     let (provider, key) = {
-        let Ok(guard) = session.lock(&cx).await else {
+        let Ok(guard) = session.lock(cx.cx()).await else {
             is_compacting.store(false, Ordering::SeqCst);
             return;
         };
@@ -2412,11 +2412,11 @@ async fn maybe_auto_compact(
                 }
             };
 
-            let Ok(mut guard) = session.lock(&cx).await else {
+            let Ok(mut guard) = session.lock(cx.cx()).await else {
                 return;
             };
             let messages = {
-                let Ok(mut inner_session) = guard.session.lock(&cx).await else {
+                let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
                     return;
                 };
                 inner_session.append_compaction(
@@ -2925,11 +2925,11 @@ async fn apply_thinking_level(
     guard: &mut AgentSession,
     level: crate::model::ThinkingLevel,
 ) -> Result<()> {
-    let cx = Cx::for_request();
+    let cx = AgentCx::for_request();
     {
         let mut inner_session = guard
             .session
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         inner_session.header.thinking_level = Some(level.to_string());
@@ -2940,11 +2940,11 @@ async fn apply_thinking_level(
 }
 
 async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
-    let cx = Cx::for_request();
+    let cx = AgentCx::for_request();
     {
         let mut inner_session = guard
             .session
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         inner_session.header.provider = Some(entry.model.provider.clone());
@@ -2957,7 +2957,7 @@ async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Res
 async fn fork_session(
     guard: &mut AgentSession,
     entry_id: &str,
-    cx: &Cx,
+    cx: &AgentCx,
 ) -> Result<(Option<String>, bool)> {
     let mut inner_session = guard
         .session
@@ -3107,11 +3107,11 @@ async fn cycle_model_for_rpc(
         return Ok(None);
     }
 
-    let cx = Cx::for_request();
+    let cx = AgentCx::for_request();
     let (current_provider, current_model_id) = {
         let inner_session = guard
             .session
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         (

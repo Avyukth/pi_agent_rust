@@ -1,0 +1,22 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+
+  Assistant:
+  Thinking: Reasoning now visible.
+
+    Answer after toggle.
+
+
+
+  Thinking shown
+
+  Enter: send  Shift+Enter: newline  Alt+Enter: multi-line  [thinking: off]
+  │ > Type a message... (/help, /exit)
+  │ >
+  │ >
+
+  Tokens: 0 in / 0 out  |  /help  |  Ctrl+C: quit

@@ -1098,12 +1098,48 @@ impl PiApp {
             })
             .unwrap_or_default();
 
+        let model_key = self.header_binding_hint(AppAction::SelectModel, "ctrl+l");
+        let next_model_key = self.header_binding_hint(AppAction::CycleModelForward, "ctrl+p");
+        let prev_model_key =
+            self.header_binding_hint(AppAction::CycleModelBackward, "ctrl+shift+p");
+        let tools_key = self.header_binding_hint(AppAction::ExpandTools, "ctrl+o");
+        let thinking_key = self.header_binding_hint(AppAction::ToggleThinking, "ctrl+t");
+        let max_width = self.term_width.saturating_sub(2);
+
+        let hints_line = truncate(
+            &format!(
+                "{model_key}: model  {next_model_key}: next  {prev_model_key}: prev  \
+                 {tools_key}: tools  {thinking_key}: thinking"
+            ),
+            max_width,
+        );
+
+        let resources_line = truncate(
+            &format!(
+                "resources: {} skills, {} prompts, {} themes, {} extensions",
+                self.resources.skills().len(),
+                self.resources.prompts().len(),
+                self.resources.themes().len(),
+                self.resources.extensions().len()
+            ),
+            max_width,
+        );
+
         format!(
-            "  {} {}{}\n",
+            "  {} {}{}\n  {}\n  {}\n",
             self.styles.title.render("Pi"),
             self.styles.muted.render(&model_label),
             self.styles.accent.render(&branch_indicator),
+            self.styles.muted.render(&hints_line),
+            self.styles.muted.render(&resources_line),
         )
+    }
+
+    fn header_binding_hint(&self, action: AppAction, fallback: &str) -> String {
+        self.keybindings
+            .get_bindings(action)
+            .first()
+            .map_or_else(|| fallback.to_string(), std::string::ToString::to_string)
     }
 
     fn render_input(&self) -> String {
@@ -5843,9 +5879,13 @@ impl PiApp {
         // Update viewport content (we can't mutate self in view, so we render with current offset)
         // The viewport will be updated in update() when new messages arrive
         let viewport_content = if conversation_content.is_empty() {
-            self.styles
-                .muted_italic
-                .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
+            if self.config.quiet_startup.unwrap_or(false) {
+                String::new()
+            } else {
+                self.styles
+                    .muted_italic
+                    .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
+            }
         } else {
             conversation_content
         };

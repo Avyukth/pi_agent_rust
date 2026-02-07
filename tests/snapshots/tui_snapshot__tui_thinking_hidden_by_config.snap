@@ -1,0 +1,19 @@
+---
+source: tests/tui_snapshot.rs
+expression: view
+---
+  Pi (dummy/dummy-model)
+
+
+  Assistant:
+
+    Answer text.
+
+
+
+  Enter: send  Shift+Enter: newline  Alt+Enter: multi-line  [thinking: off]
+  │ > Type a message... (/help, /exit)
+  │ >
+  │ >
+
+  Tokens: 0 in / 0 out  |  /help  |  Ctrl+C: quit

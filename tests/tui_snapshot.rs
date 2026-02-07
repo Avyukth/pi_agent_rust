@@ -93,7 +93,10 @@ fn dummy_model_entry() -> ModelEntry {
 }
 
 fn build_app(harness: &TestHarness) -> PiApp {
-    let config = Config::default();
+    build_app_with_config(harness, Config::default())
+}
+
+fn build_app_with_config(harness: &TestHarness, config: Config) -> PiApp {
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
@@ -233,6 +236,26 @@ fn system_msg(text: &str) -> ConversationMessage {
     ConversationMessage {
         role: MessageRole::System,
         content: text.to_string(),
+        thinking: None,
+        collapsed: false,
+    }
+}
+
+/// Tool message with auto-collapse for large outputs (mirrors `ConversationMessage::tool`).
+fn tool_msg(content: &str) -> ConversationMessage {
+    let line_count = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
+    ConversationMessage {
+        role: MessageRole::Tool,
+        content: content.to_string(),
+        thinking: None,
+        collapsed: line_count > 20, // TOOL_AUTO_COLLAPSE_THRESHOLD
+    }
+}
+
+fn tool_msg_small(content: &str) -> ConversationMessage {
+    ConversationMessage {
+        role: MessageRole::Tool,
+        content: content.to_string(),
         thinking: None,
         collapsed: false,
     }
@@ -552,4 +575,251 @@ fn tui_snapshot_wrapped_message() {
         ("size".to_string(), "50x20".to_string()),
     ];
     snapshot(&harness, "tui_wrapped_message", &app, &context);
+}
+
+// =========================================================================
+// Header + Tool/Thinking collapse toggle snapshot tests (bd-w4dn)
+// =========================================================================
+
+#[test]
+fn tui_snapshot_thinking_hidden_by_config() {
+    let harness = TestHarness::new("tui_snapshot_thinking_hidden_by_config");
+    let config = Config {
+        hide_thinking_block: Some(true),
+        ..Config::default()
+    };
+    let mut app = build_app_with_config(&harness, config);
+    set_conversation(
+        &mut app,
+        vec![assistant_msg(
+            "Answer text.",
+            Some("Internal reasoning that should be hidden."),
+        )],
+        Usage::default(),
+        None,
+    );
+    let context = vec![
+        (
+            "scenario".to_string(),
+            "thinking-hidden-by-config".to_string(),
+        ),
+        ("hide_thinking_block".to_string(), "true".to_string()),
+    ];
+    snapshot(&harness, "tui_thinking_hidden_by_config", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_thinking_toggled_visible() {
+    let harness = TestHarness::new("tui_snapshot_thinking_toggled_visible");
+    let config = Config {
+        hide_thinking_block: Some(true),
+        ..Config::default()
+    };
+    let mut app = build_app_with_config(&harness, config);
+    set_conversation(
+        &mut app,
+        vec![assistant_msg(
+            "Answer after toggle.",
+            Some("Reasoning now visible."),
+        )],
+        Usage::default(),
+        None,
+    );
+    // Toggle thinking visible via Ctrl+T
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlT));
+    let context = vec![
+        (
+            "scenario".to_string(),
+            "thinking-toggled-visible".to_string(),
+        ),
+        ("initial_hidden".to_string(), "true".to_string()),
+        ("toggled".to_string(), "true".to_string()),
+    ];
+    snapshot(&harness, "tui_thinking_toggled_visible", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_thinking_toggle_status_messages() {
+    let harness = TestHarness::new("tui_snapshot_thinking_toggle_status_messages");
+    let mut app = build_app(&harness);
+    set_conversation(
+        &mut app,
+        vec![assistant_msg("Text.", Some("Thinking."))],
+        Usage::default(),
+        None,
+    );
+    // Toggle thinking off (default is visible) -> "Thinking hidden"
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlT));
+    let context = vec![("scenario".to_string(), "thinking-hidden-status".to_string())];
+    snapshot(&harness, "tui_thinking_hidden_status", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_tool_output_auto_collapsed() {
+    let harness = TestHarness::new("tui_snapshot_tool_output_auto_collapsed");
+    let mut app = build_app(&harness);
+    // Generate 30 lines of tool output (exceeds TOOL_AUTO_COLLAPSE_THRESHOLD of 20)
+    let large_output: String = (1..=30)
+        .map(|i| format!("Tool read output:\nline {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    set_conversation(
+        &mut app,
+        vec![
+            user_msg("Read the file."),
+            tool_msg(&large_output),
+            assistant_msg("Done.", None),
+        ],
+        Usage::default(),
+        None,
+    );
+    let context = vec![
+        ("scenario".to_string(), "tool-auto-collapsed".to_string()),
+        ("tool_lines".to_string(), "30+".to_string()),
+    ];
+    snapshot(&harness, "tui_tool_auto_collapsed", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_tool_output_small_not_collapsed() {
+    let harness = TestHarness::new("tui_snapshot_tool_output_small_not_collapsed");
+    let mut app = build_app(&harness);
+    set_conversation(
+        &mut app,
+        vec![
+            user_msg("Read the file."),
+            tool_msg_small("Tool read output:\nfile contents here"),
+            assistant_msg("Done.", None),
+        ],
+        Usage::default(),
+        None,
+    );
+    let context = vec![
+        (
+            "scenario".to_string(),
+            "tool-small-not-collapsed".to_string(),
+        ),
+        ("tool_lines".to_string(), "2".to_string()),
+    ];
+    snapshot(&harness, "tui_tool_small_not_collapsed", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_tool_expand_toggle() {
+    let harness = TestHarness::new("tui_snapshot_tool_expand_toggle");
+    let mut app = build_app(&harness);
+    set_conversation(
+        &mut app,
+        vec![
+            user_msg("Read the file."),
+            tool_msg_small("Tool read output:\nshort output here"),
+            assistant_msg("Done.", None),
+        ],
+        Usage::default(),
+        None,
+    );
+    // Toggle tools collapsed via Ctrl+O
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    let context = vec![(
+        "scenario".to_string(),
+        "tool-collapsed-by-toggle".to_string(),
+    )];
+    snapshot(&harness, "tui_tool_collapsed_by_toggle", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_tool_expand_toggle_reexpand() {
+    let harness = TestHarness::new("tui_snapshot_tool_expand_toggle_reexpand");
+    let mut app = build_app(&harness);
+    set_conversation(
+        &mut app,
+        vec![
+            user_msg("Read the file."),
+            tool_msg_small("Tool read output:\nshort output here"),
+            assistant_msg("Done.", None),
+        ],
+        Usage::default(),
+        None,
+    );
+    // Collapse then re-expand
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    let context = vec![("scenario".to_string(), "tool-reexpanded".to_string())];
+    snapshot(&harness, "tui_tool_reexpanded", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_tool_expand_status_message() {
+    let harness = TestHarness::new("tui_snapshot_tool_expand_status_message");
+    let mut app = build_app(&harness);
+    set_conversation(
+        &mut app,
+        vec![tool_msg_small("Tool output:\ndata")],
+        Usage::default(),
+        None,
+    );
+    // Toggle collapse -> shows "Tool output collapsed"
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    let context = vec![("scenario".to_string(), "tool-collapse-status".to_string())];
+    snapshot(&harness, "tui_tool_collapse_status", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_header_quiet_startup_setting() {
+    let harness = TestHarness::new("tui_snapshot_header_quiet_startup_setting");
+    let config = Config {
+        quiet_startup: Some(true),
+        ..Config::default()
+    };
+    let app = build_app_with_config(&harness, config);
+    let context = vec![
+        ("scenario".to_string(), "quiet-startup".to_string()),
+        ("quiet_startup".to_string(), "true".to_string()),
+    ];
+    snapshot(&harness, "tui_header_quiet_startup", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_header_collapse_changelog_setting() {
+    let harness = TestHarness::new("tui_snapshot_header_collapse_changelog_setting");
+    let config = Config {
+        collapse_changelog: Some(true),
+        ..Config::default()
+    };
+    let app = build_app_with_config(&harness, config);
+    let context = vec![
+        ("scenario".to_string(), "collapse-changelog".to_string()),
+        ("collapse_changelog".to_string(), "true".to_string()),
+    ];
+    snapshot(&harness, "tui_header_collapse_changelog", &app, &context);
+}
+
+#[test]
+fn tui_snapshot_mixed_tool_and_thinking_toggles() {
+    let harness = TestHarness::new("tui_snapshot_mixed_tool_and_thinking_toggles");
+    let mut app = build_app(&harness);
+    let large_output: String = (1..=25)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    set_conversation(
+        &mut app,
+        vec![
+            user_msg("Analyze this."),
+            tool_msg(&format!("Tool grep output:\n{large_output}")),
+            assistant_msg("Analysis complete.", Some("Deep reasoning about the code.")),
+        ],
+        Usage::default(),
+        None,
+    );
+    // Hide thinking (Ctrl+T) and expand tools (Ctrl+O twice to collapse then expand)
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlT));
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    send_key(&mut app, KeyMsg::from_type(KeyType::CtrlO));
+    let context = vec![
+        ("scenario".to_string(), "mixed-toggles".to_string()),
+        ("thinking".to_string(), "hidden".to_string()),
+        ("tools".to_string(), "expanded".to_string()),
+    ];
+    snapshot(&harness, "tui_mixed_toggles", &app, &context);
 }
