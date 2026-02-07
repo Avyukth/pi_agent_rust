@@ -1,0 +1,128 @@
+{
+  "schema": "pi.ext.conformance_baseline.v1",
+  "generated_at": "2026-02-07T05:49:39Z",
+  "git_ref": "37046d3c",
+  "manifest_count": 223,
+  "tested": 223,
+  "passed": 187,
+  "failed": 36,
+  "pass_rate_pct": 83.86,
+  "by_tier": {
+    "1": { "pass": 38, "fail": 0, "total": 38, "rate_pct": 100.0 },
+    "2": { "pass": 85, "fail": 2, "total": 87, "rate_pct": 97.7 },
+    "3": { "pass": 60, "fail": 30, "total": 90, "rate_pct": 66.7 },
+    "4": { "pass": 2, "fail": 1, "total": 3, "rate_pct": 66.7 },
+    "5": { "pass": 2, "fail": 3, "total": 5, "rate_pct": 40.0 }
+  },
+  "by_source": {
+    "official-pi-mono": { "pass": 60, "fail": 1, "total": 61, "rate_pct": 98.4, "note": "1 failure is base_fixtures (test fixture, not real extension)" },
+    "community": { "pass": 52, "fail": 6, "total": 58, "rate_pct": 89.7 },
+    "npm-registry": { "pass": 48, "fail": 27, "total": 75, "rate_pct": 64.0 },
+    "third-party-github": { "pass": 16, "fail": 7, "total": 23, "rate_pct": 69.6 },
+    "agents": { "pass": 0, "fail": 1, "total": 1, "rate_pct": 0.0 }
+  },
+  "coverage": {
+    "all_manifest_extensions_tested": true,
+    "untested_extensions": [],
+    "per_extension_test_exists": true,
+    "conformance_test_macro_count": 223,
+    "test_function": "conformance_full_report (runs all 223 extensions)"
+  },
+  "failure_classification": {
+    "manifest_registration_mismatch": {
+      "count": 22,
+      "description": "Extension loads but registers different commands/tools than manifest expects. Usually caused by manifest referencing a different version or the extension conditionally registering based on environment.",
+      "extensions": [
+        "agents-mikeastock/extensions",
+        "community/prateekmedia-lsp",
+        "npm/aliou-pi-linkup",
+        "npm/aliou-pi-synthetic",
+        "npm/lsp-pi",
+        "npm/marckrenn-pi-sub-bar",
+        "npm/mitsupi",
+        "npm/pi-amplike",
+        "npm/pi-bash-confirm",
+        "npm/pi-extensions",
+        "npm/pi-package-test",
+        "npm/shitty-extensions",
+        "npm/tmustier-pi-arcade",
+        "npm/vaayne-agent-kit",
+        "third-party/aliou-pi-extensions",
+        "third-party/ben-vargas-pi-packages",
+        "third-party/charles-cooper-pi-extensions",
+        "third-party/kcosr-pi-extensions",
+        "third-party/marckrenn-pi-sub",
+        "third-party/openclaw-openclaw",
+        "third-party/pasky-pi-amplike",
+        "third-party/w-winter-dot314"
+      ]
+    },
+    "missing_npm_package": {
+      "count": 5,
+      "description": "Extension requires an npm package not available as a virtual module stub in QuickJS.",
+      "extensions": [
+        "npm/pi-search-agent",
+        "npm/pi-wakatime",
+        "npm/pi-web-access",
+        "npm/qualisero-pi-agent-scip",
+        "third-party/qualisero-pi-agent-scip"
+      ],
+      "missing_packages": ["openai", "adm-zip", "linkedom", "@sourcegraph/scip-typescript"]
+    },
+    "multi_file_dependency": {
+      "count": 4,
+      "description": "Extension uses relative imports to sibling/parent directories that are not bundled in the single-file artifact.",
+      "extensions": [
+        "community/qualisero-background-notify",
+        "community/qualisero-pi-agent-scip",
+        "community/qualisero-safe-git",
+        "npm/aliou-pi-processes"
+      ],
+      "missing_specifiers": ["../../shared", "./dist/extension.js", "../components/processes-component"]
+    },
+    "runtime_error": {
+      "count": 4,
+      "description": "Extension loads but crashes during initialization due to missing data, broken API usage, or file system dependencies.",
+      "extensions": [
+        "community/nicobailon-interview-tool",
+        "npm/aliou-pi-guardrails",
+        "npm/aliou-pi-toolchain",
+        "npm/marckrenn-pi-sub-core"
+      ],
+      "error_types": ["ENOENT (missing file)", "not a function", "cannot read property of undefined"]
+    },
+    "test_fixture": {
+      "count": 1,
+      "description": "Not a real extension; test-only fixture included in manifest for infrastructure testing.",
+      "extensions": ["base_fixtures"]
+    }
+  },
+  "actionable_improvements": [
+    {
+      "category": "manifest_registration_mismatch",
+      "action": "Audit manifests for 22 extensions where expected registrations don't match actual. Either update manifests to match actual behavior or investigate why extensions skip registration.",
+      "impact": "Would improve pass rate from 83.9% to 93.7% if all are manifest issues"
+    },
+    {
+      "category": "missing_npm_package",
+      "action": "Add virtual module stubs for openai, adm-zip, linkedom, @sourcegraph/scip-typescript",
+      "impact": "Would fix 5 extensions"
+    },
+    {
+      "category": "multi_file_dependency",
+      "action": "Bundle multi-file extensions or add relative path resolution support",
+      "impact": "Would fix 4 extensions"
+    },
+    {
+      "category": "runtime_error",
+      "action": "Investigate 4 extensions with runtime errors; some may need environment setup or API fixes",
+      "impact": "Would fix 4 extensions"
+    }
+  ],
+  "regression_thresholds": {
+    "tier1_pass_rate_min_pct": 100.0,
+    "tier2_pass_rate_min_pct": 95.0,
+    "overall_pass_rate_min_pct": 80.0,
+    "max_new_failures": 3
+  }
+}
