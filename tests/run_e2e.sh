@@ -215,7 +215,7 @@ for provider in "${TARGET_PROVIDERS[@]}"; do
       [[ -f "$cassette_path" ]] || continue
       cp "$cassette_path" "${cassette_dir}/$(basename "$cassette_path")"
     done < <(jq -r '
-      select(.schema == "pi.test.log.v1" and .type == "log")
+      select((.schema == "pi.test.log.v1" or .schema == "pi.test.log.v2") and .type == "log")
       | .context.vcr_path // empty
     ' "$test_log")
   fi

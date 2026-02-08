@@ -1,37 +1,58 @@
 {
-  "schema": "pi.ext.conformance_baseline.v1",
-  "generated_at": "2026-02-07T05:49:39Z",
-  "git_ref": "37046d3c",
-  "manifest_count": 223,
-  "tested": 223,
-  "passed": 187,
-  "failed": 36,
-  "pass_rate_pct": 83.86,
-  "by_tier": {
-    "1": { "pass": 38, "fail": 0, "total": 38, "rate_pct": 100.0 },
-    "2": { "pass": 85, "fail": 2, "total": 87, "rate_pct": 97.7 },
-    "3": { "pass": 60, "fail": 30, "total": 90, "rate_pct": 66.7 },
-    "4": { "pass": 2, "fail": 1, "total": 3, "rate_pct": 66.7 },
-    "5": { "pass": 2, "fail": 3, "total": 5, "rate_pct": 40.0 }
+  "schema": "pi.ext.conformance_baseline.v2",
+  "generated_at": "2026-02-07T23:31:53Z",
+  "git_ref": "33465815",
+  "extension_conformance": {
+    "manifest_count": 223,
+    "tested": 223,
+    "passed": 187,
+    "failed": 36,
+    "pass_rate_pct": 83.9,
+    "by_tier": {
+      "1": { "pass": 38, "fail": 0, "total": 38, "rate_pct": 100.0 },
+      "2": { "pass": 85, "fail": 2, "total": 87, "rate_pct": 97.7 },
+      "3": { "pass": 60, "fail": 30, "total": 90, "rate_pct": 66.7 },
+      "4": { "pass": 2, "fail": 1, "total": 3, "rate_pct": 66.7 },
+      "5": { "pass": 2, "fail": 3, "total": 5, "rate_pct": 40.0 }
+    },
+    "by_source": {
+      "official-pi-mono": { "pass": 60, "fail": 1, "total": 61, "rate_pct": 98.4, "note": "1 failure is base_fixtures (test fixture)" },
+      "community": { "pass": 52, "fail": 6, "total": 58, "rate_pct": 89.7 },
+      "npm-registry": { "pass": 48, "fail": 27, "total": 75, "rate_pct": 64.0 },
+      "third-party-github": { "pass": 16, "fail": 7, "total": 23, "rate_pct": 69.6 },
+      "agents": { "pass": 0, "fail": 1, "total": 1, "rate_pct": 0.0 }
+    }
   },
-  "by_source": {
-    "official-pi-mono": { "pass": 60, "fail": 1, "total": 61, "rate_pct": 98.4, "note": "1 failure is base_fixtures (test fixture, not real extension)" },
-    "community": { "pass": 52, "fail": 6, "total": 58, "rate_pct": 89.7 },
-    "npm-registry": { "pass": 48, "fail": 27, "total": 75, "rate_pct": 64.0 },
-    "third-party-github": { "pass": 16, "fail": 7, "total": 23, "rate_pct": 69.6 },
-    "agents": { "pass": 0, "fail": 1, "total": 1, "rate_pct": 0.0 }
-  },
-  "coverage": {
-    "all_manifest_extensions_tested": true,
-    "untested_extensions": [],
-    "per_extension_test_exists": true,
-    "conformance_test_macro_count": 223,
-    "test_function": "conformance_full_report (runs all 223 extensions)"
+  "scenario_conformance": {
+    "total": 25,
+    "passed": 22,
+    "failed": 3,
+    "pass_rate_pct": 88.0,
+    "failures": [
+      {
+        "id": "scn-antigravity-image-gen-002",
+        "extension": "antigravity-image-gen",
+        "cause": "vcr_stub_gap",
+        "detail": "Synthetic HTTP stub doesn't produce parseable SSE image data"
+      },
+      {
+        "id": "scn-status-line-001",
+        "extension": "status-line",
+        "cause": "mock_gap",
+        "detail": "UI status updates not captured in multi-step event lifecycle"
+      },
+      {
+        "id": "scn-git-checkpoint-001",
+        "extension": "git-checkpoint",
+        "cause": "mock_gap",
+        "detail": "UI notify + exec mock not firing in multi-step restore flow"
+      }
+    ]
   },
   "failure_classification": {
-    "manifest_registration_mismatch": {
+    "manifest_mismatch": {
       "count": 22,
-      "description": "Extension loads but registers different commands/tools than manifest expects. Usually caused by manifest referencing a different version or the extension conditionally registering based on environment.",
+      "description": "Extension loads but registers different commands/tools than manifest expects.",
       "extensions": [
         "agents-mikeastock/extensions",
         "community/prateekmedia-lsp",
@@ -59,7 +80,7 @@
     },
     "missing_npm_package": {
       "count": 5,
-      "description": "Extension requires an npm package not available as a virtual module stub in QuickJS.",
+      "description": "Extension requires an npm package not available as a virtual module stub.",
       "extensions": [
         "npm/pi-search-agent",
         "npm/pi-wakatime",
@@ -71,37 +92,45 @@
     },
     "multi_file_dependency": {
       "count": 4,
-      "description": "Extension uses relative imports to sibling/parent directories that are not bundled in the single-file artifact.",
+      "description": "Extension uses relative imports to unbundled sibling/parent modules.",
       "extensions": [
         "community/qualisero-background-notify",
         "community/qualisero-pi-agent-scip",
         "community/qualisero-safe-git",
         "npm/aliou-pi-processes"
-      ],
-      "missing_specifiers": ["../../shared", "./dist/extension.js", "../components/processes-component"]
+      ]
     },
     "runtime_error": {
       "count": 4,
-      "description": "Extension loads but crashes during initialization due to missing data, broken API usage, or file system dependencies.",
+      "description": "Extension crashes during initialization (missing data, broken API, FS dependency).",
       "extensions": [
         "community/nicobailon-interview-tool",
         "npm/aliou-pi-guardrails",
         "npm/aliou-pi-toolchain",
         "npm/marckrenn-pi-sub-core"
-      ],
-      "error_types": ["ENOENT (missing file)", "not a function", "cannot read property of undefined"]
+      ]
     },
     "test_fixture": {
       "count": 1,
-      "description": "Not a real extension; test-only fixture included in manifest for infrastructure testing.",
+      "description": "Not a real extension; test-only fixture in manifest.",
       "extensions": ["base_fixtures"]
+    },
+    "mock_gap": {
+      "count": 2,
+      "description": "Scenario mock infrastructure doesn't fully support the extension's hostcall pattern.",
+      "scenarios": ["scn-status-line-001", "scn-git-checkpoint-001"]
+    },
+    "vcr_stub_gap": {
+      "count": 1,
+      "description": "VCR/stub HTTP mock doesn't produce valid response for extension parser.",
+      "scenarios": ["scn-antigravity-image-gen-002"]
     }
   },
   "actionable_improvements": [
     {
-      "category": "manifest_registration_mismatch",
-      "action": "Audit manifests for 22 extensions where expected registrations don't match actual. Either update manifests to match actual behavior or investigate why extensions skip registration.",
-      "impact": "Would improve pass rate from 83.9% to 93.7% if all are manifest issues"
+      "category": "manifest_mismatch",
+      "action": "Audit manifests for 22 extensions where expected registrations don't match actual.",
+      "impact": "Would improve ext pass rate from 83.9% to 93.7%"
     },
     {
       "category": "missing_npm_package",
@@ -110,19 +139,38 @@
     },
     {
       "category": "multi_file_dependency",
-      "action": "Bundle multi-file extensions or add relative path resolution support",
+      "action": "Bundle multi-file extensions or add relative path resolution",
       "impact": "Would fix 4 extensions"
     },
     {
       "category": "runtime_error",
-      "action": "Investigate 4 extensions with runtime errors; some may need environment setup or API fixes",
+      "action": "Investigate 4 extensions with runtime errors",
       "impact": "Would fix 4 extensions"
+    },
+    {
+      "category": "mock_gap",
+      "action": "Enhance MockSpecInterceptor UI status capture and exec log wiring for multi-step scenarios",
+      "impact": "Would fix 2 scenario failures (status-line, git-checkpoint)"
+    },
+    {
+      "category": "vcr_stub_gap",
+      "action": "Improve synthetic HTTP response for antigravity-image-gen SSE stream",
+      "impact": "Would fix 1 scenario failure"
     }
   ],
   "regression_thresholds": {
     "tier1_pass_rate_min_pct": 100.0,
     "tier2_pass_rate_min_pct": 95.0,
     "overall_pass_rate_min_pct": 80.0,
+    "scenario_pass_rate_min_pct": 85.0,
     "max_new_failures": 3
+  },
+  "inventory_ref": "tests/ext_conformance/reports/inventory.json",
+  "report_refs": {
+    "extension_report": "tests/ext_conformance/reports/conformance/conformance_report.json",
+    "extension_events": "tests/ext_conformance/reports/conformance/conformance_events.jsonl",
+    "scenario_report": "tests/ext_conformance/reports/scenario_conformance.json",
+    "scenario_events": "tests/ext_conformance/reports/scenario_conformance.jsonl",
+    "triage": "tests/ext_conformance/reports/smoke_triage.json"
   }
 }
