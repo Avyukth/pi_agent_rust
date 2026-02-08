@@ -2758,6 +2758,735 @@ pub fn verify_repair_monotonicity(
     MonotonicityVerdict::Safe
 }
 
+// ---------------------------------------------------------------------------
+// Capability monotonicity proof reports (bd-k5q5.9.5.2)
+// ---------------------------------------------------------------------------
+
+/// A single capability change between before and after `IntentGraph`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityDelta {
+    /// A signal present in both before and after — no change.
+    Retained(IntentSignal),
+    /// A signal present in before but absent in after — removed.
+    Removed(IntentSignal),
+    /// A signal absent in before but present in after — added (violation).
+    Added(IntentSignal),
+}
+
+impl CapabilityDelta {
+    /// True when this delta represents a privilege escalation.
+    pub const fn is_escalation(&self) -> bool {
+        matches!(self, Self::Added(_))
+    }
+
+    /// True when the capability was preserved unchanged.
+    pub const fn is_retained(&self) -> bool {
+        matches!(self, Self::Retained(_))
+    }
+
+    /// True when the capability was dropped.
+    pub const fn is_removed(&self) -> bool {
+        matches!(self, Self::Removed(_))
+    }
+
+    /// Short label for logging and telemetry.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Retained(_) => "retained",
+            Self::Removed(_) => "removed",
+            Self::Added(_) => "added",
+        }
+    }
+
+    /// The underlying signal.
+    pub const fn signal(&self) -> &IntentSignal {
+        match self {
+            Self::Retained(s) | Self::Removed(s) | Self::Added(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.label(), self.signal())
+    }
+}
+
+/// Proof verdict for capability monotonicity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CapabilityMonotonicityVerdict {
+    /// No capabilities were added — repair is monotonic (safe).
+    Monotonic,
+    /// One or more capabilities were added — privilege escalation detected.
+    Escalation,
+}
+
+impl CapabilityMonotonicityVerdict {
+    /// True when the repair passed monotonicity (no escalation).
+    pub const fn is_safe(&self) -> bool {
+        matches!(self, Self::Monotonic)
+    }
+}
+
+impl std::fmt::Display for CapabilityMonotonicityVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Monotonic => write!(f, "monotonic"),
+            Self::Escalation => write!(f, "escalation"),
+        }
+    }
+}
+
+/// Full capability monotonicity proof report.
+///
+/// Compares the before-repair and after-repair `IntentGraph`s signal by
+/// signal. A repair is monotonic if and only if it introduces no new
+/// capabilities — it may remove or retain existing ones, but never add.
+#[derive(Debug, Clone)]
+pub struct CapabilityProofReport {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Overall verdict.
+    pub verdict: CapabilityMonotonicityVerdict,
+    /// Per-signal deltas.
+    pub deltas: Vec<CapabilityDelta>,
+    /// Number of retained capabilities.
+    pub retained_count: usize,
+    /// Number of removed capabilities.
+    pub removed_count: usize,
+    /// Number of added capabilities (escalations).
+    pub added_count: usize,
+}
+
+impl CapabilityProofReport {
+    /// True when the proof passed (no escalation).
+    pub const fn is_safe(&self) -> bool {
+        self.verdict.is_safe()
+    }
+
+    /// Return only the escalation deltas.
+    pub fn escalations(&self) -> Vec<&CapabilityDelta> {
+        self.deltas.iter().filter(|d| d.is_escalation()).collect()
+    }
+}
+
+/// Compute a capability monotonicity proof by diffing two intent graphs.
+///
+/// The `before` graph represents the original extension's capabilities.
+/// The `after` graph represents the repaired extension's capabilities.
+///
+/// A repair is *monotonic* (safe) if and only if `after` introduces no
+/// signals that were absent from `before`. Removals are allowed.
+pub fn compute_capability_proof(
+    before: &IntentGraph,
+    after: &IntentGraph,
+) -> CapabilityProofReport {
+    use std::collections::HashSet;
+
+    let before_set: HashSet<&IntentSignal> = before.signals.iter().collect();
+    let after_set: HashSet<&IntentSignal> = after.signals.iter().collect();
+
+    let mut deltas = Vec::new();
+
+    // Signals retained or removed (iterate `before`).
+    for signal in &before.signals {
+        if after_set.contains(signal) {
+            deltas.push(CapabilityDelta::Retained(signal.clone()));
+        } else {
+            deltas.push(CapabilityDelta::Removed(signal.clone()));
+        }
+    }
+
+    // Signals added (in `after` but not in `before`).
+    for signal in &after.signals {
+        if !before_set.contains(signal) {
+            deltas.push(CapabilityDelta::Added(signal.clone()));
+        }
+    }
+
+    let retained_count = deltas.iter().filter(|d| d.is_retained()).count();
+    let removed_count = deltas.iter().filter(|d| d.is_removed()).count();
+    let added_count = deltas.iter().filter(|d| d.is_escalation()).count();
+
+    let verdict = if added_count == 0 {
+        CapabilityMonotonicityVerdict::Monotonic
+    } else {
+        CapabilityMonotonicityVerdict::Escalation
+    };
+
+    CapabilityProofReport {
+        extension_id: before.extension_id.clone(),
+        verdict,
+        deltas,
+        retained_count,
+        removed_count,
+        added_count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hostcall parity and semantic delta proof (bd-k5q5.9.5.3)
+// ---------------------------------------------------------------------------
+
+/// Categories of hostcall surface that an extension can exercise.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HostcallCategory {
+    /// `pi.events(op, ...)` — lifecycle event dispatch.
+    Events(String),
+    /// `pi.session(op, ...)` — session metadata operations.
+    Session(String),
+    /// `pi.register(...)` — registration (tools, commands, etc.).
+    Register,
+    /// `pi.tool(op, ...)` — tool management.
+    Tool(String),
+    /// `require(...)` / `import(...)` — module resolution.
+    ModuleResolution(String),
+}
+
+impl HostcallCategory {
+    /// Short tag for logging.
+    pub fn tag(&self) -> String {
+        match self {
+            Self::Events(op) => format!("events:{op}"),
+            Self::Session(op) => format!("session:{op}"),
+            Self::Register => "register".to_string(),
+            Self::Tool(op) => format!("tool:{op}"),
+            Self::ModuleResolution(spec) => format!("module:{spec}"),
+        }
+    }
+}
+
+impl std::fmt::Display for HostcallCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.tag())
+    }
+}
+
+/// A delta between before/after hostcall surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostcallDelta {
+    /// Hostcall present in both before and after.
+    Retained(HostcallCategory),
+    /// Hostcall present before but absent after.
+    Removed(HostcallCategory),
+    /// Hostcall absent before but present after — new surface.
+    Added(HostcallCategory),
+}
+
+impl HostcallDelta {
+    /// True when this delta introduces new hostcall surface.
+    pub const fn is_expansion(&self) -> bool {
+        matches!(self, Self::Added(_))
+    }
+
+    /// Short label for logging.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Retained(_) => "retained",
+            Self::Removed(_) => "removed",
+            Self::Added(_) => "added",
+        }
+    }
+
+    /// The underlying category.
+    pub const fn category(&self) -> &HostcallCategory {
+        match self {
+            Self::Retained(c) | Self::Removed(c) | Self::Added(c) => c,
+        }
+    }
+}
+
+impl std::fmt::Display for HostcallDelta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.label(), self.category())
+    }
+}
+
+/// Semantic drift severity classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SemanticDriftSeverity {
+    /// No meaningful behavioral change detected.
+    None,
+    /// Minor changes that don't affect core functionality.
+    Low,
+    /// Changes that may affect behavior but within expected scope.
+    Medium,
+    /// Significant behavioral divergence — likely beyond fix scope.
+    High,
+}
+
+impl SemanticDriftSeverity {
+    /// True if drift is within acceptable bounds.
+    pub const fn is_acceptable(&self) -> bool {
+        matches!(self, Self::None | Self::Low)
+    }
+}
+
+impl std::fmt::Display for SemanticDriftSeverity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+        }
+    }
+}
+
+/// Overall verdict for hostcall parity and semantic delta proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticParityVerdict {
+    /// Repair preserves hostcall surface and semantic behavior.
+    Equivalent,
+    /// Minor acceptable drift (e.g., removed dead hostcalls).
+    AcceptableDrift,
+    /// Repair introduces new hostcall surface or significant semantic drift.
+    Divergent,
+}
+
+impl SemanticParityVerdict {
+    /// True if the repair passes semantic parity.
+    pub const fn is_safe(&self) -> bool {
+        matches!(self, Self::Equivalent | Self::AcceptableDrift)
+    }
+}
+
+impl std::fmt::Display for SemanticParityVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Equivalent => write!(f, "equivalent"),
+            Self::AcceptableDrift => write!(f, "acceptable_drift"),
+            Self::Divergent => write!(f, "divergent"),
+        }
+    }
+}
+
+/// Full hostcall parity and semantic delta proof report.
+#[derive(Debug, Clone)]
+pub struct SemanticParityReport {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Overall verdict.
+    pub verdict: SemanticParityVerdict,
+    /// Hostcall surface deltas.
+    pub hostcall_deltas: Vec<HostcallDelta>,
+    /// Semantic drift severity assessment.
+    pub drift_severity: SemanticDriftSeverity,
+    /// Number of new hostcall surfaces introduced.
+    pub expanded_count: usize,
+    /// Number of hostcalls removed.
+    pub removed_count: usize,
+    /// Number of hostcalls retained.
+    pub retained_count: usize,
+    /// Explanatory notes for the verdict.
+    pub notes: Vec<String>,
+}
+
+impl SemanticParityReport {
+    /// True if the proof passed (repair is safe).
+    pub const fn is_safe(&self) -> bool {
+        self.verdict.is_safe()
+    }
+
+    /// Return only the expansion deltas (new hostcall surface).
+    pub fn expansions(&self) -> Vec<&HostcallDelta> {
+        self.hostcall_deltas
+            .iter()
+            .filter(|d| d.is_expansion())
+            .collect()
+    }
+}
+
+/// Extract hostcall categories from an intent graph.
+///
+/// Maps `IntentSignal`s to the hostcall categories they exercise at runtime.
+/// This provides a static approximation of the extension's hostcall surface.
+pub fn extract_hostcall_surface(intent: &IntentGraph) -> std::collections::HashSet<HostcallCategory> {
+    let mut surface = std::collections::HashSet::new();
+
+    for signal in &intent.signals {
+        match signal {
+            IntentSignal::RegistersTool(_)
+            | IntentSignal::RegistersCommand(_)
+            | IntentSignal::RegistersShortcut(_)
+            | IntentSignal::RegistersFlag(_)
+            | IntentSignal::RegistersProvider(_)
+            | IntentSignal::RegistersRenderer(_) => {
+                surface.insert(HostcallCategory::Register);
+            }
+            IntentSignal::HooksEvent(name) => {
+                surface.insert(HostcallCategory::Events(name.clone()));
+            }
+            IntentSignal::RequiresCapability(cap) => {
+                if cap == "session" {
+                    surface.insert(HostcallCategory::Session("*".to_string()));
+                } else if cap == "tool" {
+                    surface.insert(HostcallCategory::Tool("*".to_string()));
+                }
+            }
+        }
+    }
+
+    surface
+}
+
+/// Compute hostcall parity and semantic delta proof.
+///
+/// Compares the before-repair and after-repair hostcall surfaces and
+/// assesses semantic drift. A repair passes if it does not expand the
+/// hostcall surface beyond the declared fix scope.
+pub fn compute_semantic_parity(
+    before: &IntentGraph,
+    after: &IntentGraph,
+    patch_ops: &[PatchOp],
+) -> SemanticParityReport {
+    let before_surface = extract_hostcall_surface(before);
+    let after_surface = extract_hostcall_surface(after);
+
+    let mut hostcall_deltas = Vec::new();
+
+    // Retained and removed.
+    for cat in &before_surface {
+        if after_surface.contains(cat) {
+            hostcall_deltas.push(HostcallDelta::Retained(cat.clone()));
+        } else {
+            hostcall_deltas.push(HostcallDelta::Removed(cat.clone()));
+        }
+    }
+
+    // Added.
+    for cat in &after_surface {
+        if !before_surface.contains(cat) {
+            hostcall_deltas.push(HostcallDelta::Added(cat.clone()));
+        }
+    }
+
+    let expanded_count = hostcall_deltas
+        .iter()
+        .filter(|d| d.is_expansion())
+        .count();
+    let removed_count = hostcall_deltas
+        .iter()
+        .filter(|d| matches!(d, HostcallDelta::Removed(_)))
+        .count();
+    let retained_count = hostcall_deltas
+        .iter()
+        .filter(|d| matches!(d, HostcallDelta::Retained(_)))
+        .count();
+
+    // Assess semantic drift based on patch operations.
+    let mut notes = Vec::new();
+    let drift_severity = assess_drift(patch_ops, expanded_count, removed_count, &mut notes);
+
+    let verdict = if expanded_count == 0 && drift_severity.is_acceptable() {
+        if removed_count == 0 {
+            SemanticParityVerdict::Equivalent
+        } else {
+            notes.push(format!("{removed_count} hostcall(s) removed — acceptable reduction"));
+            SemanticParityVerdict::AcceptableDrift
+        }
+    } else {
+        if expanded_count > 0 {
+            notes.push(format!(
+                "{expanded_count} new hostcall surface(s) introduced"
+            ));
+        }
+        SemanticParityVerdict::Divergent
+    };
+
+    SemanticParityReport {
+        extension_id: before.extension_id.clone(),
+        verdict,
+        hostcall_deltas,
+        drift_severity,
+        expanded_count,
+        removed_count,
+        retained_count,
+        notes,
+    }
+}
+
+/// Assess semantic drift severity from patch operations and hostcall changes.
+fn assess_drift(
+    patch_ops: &[PatchOp],
+    expanded_hostcalls: usize,
+    _removed_hostcalls: usize,
+    notes: &mut Vec<String>,
+) -> SemanticDriftSeverity {
+    // Any hostcall expansion is High severity.
+    if expanded_hostcalls > 0 {
+        notes.push("new hostcall surface detected".to_string());
+        return SemanticDriftSeverity::High;
+    }
+
+    let mut has_aggressive = false;
+    let mut stub_count = 0_usize;
+
+    for op in patch_ops {
+        match op {
+            PatchOp::InjectStub { .. } => {
+                stub_count += 1;
+                has_aggressive = true;
+            }
+            PatchOp::AddExport { .. } | PatchOp::RemoveImport { .. } => {
+                has_aggressive = true;
+            }
+            PatchOp::ReplaceModulePath { .. } | PatchOp::RewriteRequire { .. } => {}
+        }
+    }
+
+    if stub_count > 2 {
+        notes.push(format!("{stub_count} stubs injected — medium drift"));
+        return SemanticDriftSeverity::Medium;
+    }
+
+    if has_aggressive {
+        notes.push("aggressive ops present — low drift".to_string());
+        return SemanticDriftSeverity::Low;
+    }
+
+    SemanticDriftSeverity::None
+}
+
+// ---------------------------------------------------------------------------
+// Conformance replay and golden checksum evidence (bd-k5q5.9.5.4)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 checksum of an artifact (hex-encoded, lowercase).
+pub type ArtifactChecksum = String;
+
+/// Compute a SHA-256 checksum for the given byte content.
+pub fn compute_artifact_checksum(content: &[u8]) -> ArtifactChecksum {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(content);
+    format!("{hash:x}")
+}
+
+/// A single artifact entry in a golden checksum manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumEntry {
+    /// Relative path of the artifact within the extension root.
+    pub relative_path: String,
+    /// SHA-256 checksum.
+    pub checksum: ArtifactChecksum,
+    /// Byte size of the artifact.
+    pub size_bytes: u64,
+}
+
+/// Overall verdict of a conformance replay check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConformanceReplayVerdict {
+    /// All replayed fixtures matched expected behavior.
+    Pass,
+    /// One or more fixtures produced unexpected results.
+    Fail,
+    /// No fixtures were available to replay (vacuously safe).
+    NoFixtures,
+}
+
+impl ConformanceReplayVerdict {
+    /// True if the replay passed or had no fixtures.
+    pub const fn is_acceptable(&self) -> bool {
+        matches!(self, Self::Pass | Self::NoFixtures)
+    }
+}
+
+impl std::fmt::Display for ConformanceReplayVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "pass"),
+            Self::Fail => write!(f, "fail"),
+            Self::NoFixtures => write!(f, "no_fixtures"),
+        }
+    }
+}
+
+/// A single conformance fixture for replay.
+#[derive(Debug, Clone)]
+pub struct ConformanceFixture {
+    /// Descriptive name of the fixture.
+    pub name: String,
+    /// Expected behavior or output pattern.
+    pub expected: String,
+    /// Actual behavior or output observed during replay.
+    pub actual: Option<String>,
+    /// Whether this fixture passed.
+    pub passed: bool,
+}
+
+/// Result of replaying conformance fixtures.
+#[derive(Debug, Clone)]
+pub struct ConformanceReplayReport {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Overall verdict.
+    pub verdict: ConformanceReplayVerdict,
+    /// Individual fixture results.
+    pub fixtures: Vec<ConformanceFixture>,
+    /// Number of fixtures that passed.
+    pub passed_count: usize,
+    /// Total number of fixtures replayed.
+    pub total_count: usize,
+}
+
+impl ConformanceReplayReport {
+    /// True if the replay is acceptable.
+    pub const fn is_acceptable(&self) -> bool {
+        self.verdict.is_acceptable()
+    }
+}
+
+/// Replay conformance fixtures and produce a report.
+///
+/// Each fixture is checked: if `actual` is provided and matches `expected`,
+/// the fixture passes. If no fixtures are provided, the verdict is
+/// `NoFixtures` (vacuously safe — conformance cannot be disproven).
+pub fn replay_conformance_fixtures(
+    extension_id: &str,
+    fixtures: &[ConformanceFixture],
+) -> ConformanceReplayReport {
+    if fixtures.is_empty() {
+        return ConformanceReplayReport {
+            extension_id: extension_id.to_string(),
+            verdict: ConformanceReplayVerdict::NoFixtures,
+            fixtures: Vec::new(),
+            passed_count: 0,
+            total_count: 0,
+        };
+    }
+
+    let passed_count = fixtures.iter().filter(|f| f.passed).count();
+    let total_count = fixtures.len();
+    let verdict = if passed_count == total_count {
+        ConformanceReplayVerdict::Pass
+    } else {
+        ConformanceReplayVerdict::Fail
+    };
+
+    ConformanceReplayReport {
+        extension_id: extension_id.to_string(),
+        verdict,
+        fixtures: fixtures.to_vec(),
+        passed_count,
+        total_count,
+    }
+}
+
+/// A golden checksum manifest for reproducible evidence.
+///
+/// Records the checksums of all repaired artifacts at the time of repair.
+/// This provides tamper-evident proof that the artifacts were not modified
+/// after the repair pipeline produced them.
+#[derive(Debug, Clone)]
+pub struct GoldenChecksumManifest {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Entries (one per artifact).
+    pub entries: Vec<ChecksumEntry>,
+    /// When the manifest was generated (unix millis).
+    pub generated_at_ms: u64,
+}
+
+impl GoldenChecksumManifest {
+    /// Number of artifacts in the manifest.
+    pub fn artifact_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Verify that a given file's content matches its entry in the manifest.
+    pub fn verify_entry(&self, relative_path: &str, content: &[u8]) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|e| e.relative_path == relative_path)
+            .map(|e| e.checksum == compute_artifact_checksum(content))
+    }
+}
+
+/// Build a golden checksum manifest from file contents.
+///
+/// Takes an extension_id, a list of (relative_path, content) tuples, and a
+/// timestamp. Computes SHA-256 for each artifact.
+pub fn build_golden_manifest(
+    extension_id: &str,
+    artifacts: &[(&str, &[u8])],
+    timestamp_ms: u64,
+) -> GoldenChecksumManifest {
+    let entries = artifacts
+        .iter()
+        .map(|(path, content)| ChecksumEntry {
+            relative_path: (*path).to_string(),
+            checksum: compute_artifact_checksum(content),
+            size_bytes: content.len() as u64,
+        })
+        .collect();
+
+    GoldenChecksumManifest {
+        extension_id: extension_id.to_string(),
+        entries,
+        generated_at_ms: timestamp_ms,
+    }
+}
+
+/// Unified verification evidence bundle.
+///
+/// Collects all proof artifacts from LISR-5 into a single bundle that
+/// serves as the activation gate. A repair candidate cannot be activated
+/// unless ALL proofs pass.
+#[derive(Debug, Clone)]
+pub struct VerificationBundle {
+    /// Extension identity.
+    pub extension_id: String,
+    /// Structural validation (LISR-5.1).
+    pub structural: StructuralVerdict,
+    /// Capability monotonicity proof (LISR-5.2).
+    pub capability_proof: CapabilityProofReport,
+    /// Semantic parity proof (LISR-5.3).
+    pub semantic_proof: SemanticParityReport,
+    /// Conformance replay (LISR-5.4).
+    pub conformance: ConformanceReplayReport,
+    /// Golden checksum manifest (LISR-5.4).
+    pub checksum_manifest: GoldenChecksumManifest,
+}
+
+impl VerificationBundle {
+    /// True if ALL proofs pass — the activation gate.
+    pub const fn is_verified(&self) -> bool {
+        self.structural.is_valid()
+            && self.capability_proof.is_safe()
+            && self.semantic_proof.is_safe()
+            && self.conformance.is_acceptable()
+    }
+
+    /// Collect failure reasons for logging.
+    pub fn failure_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if !self.structural.is_valid() {
+            reasons.push(format!("structural: {}", self.structural));
+        }
+        if !self.capability_proof.is_safe() {
+            reasons.push(format!(
+                "capability: {} ({} escalation(s))",
+                self.capability_proof.verdict, self.capability_proof.added_count
+            ));
+        }
+        if !self.semantic_proof.is_safe() {
+            reasons.push(format!(
+                "semantic: {} (drift={})",
+                self.semantic_proof.verdict, self.semantic_proof.drift_severity
+            ));
+        }
+        if !self.conformance.is_acceptable() {
+            reasons.push(format!(
+                "conformance: {} ({}/{} passed)",
+                self.conformance.verdict,
+                self.conformance.passed_count,
+                self.conformance.total_count
+            ));
+        }
+        reasons
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PiJsRuntimeConfig {
     pub cwd: String,

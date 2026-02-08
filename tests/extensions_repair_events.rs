@@ -14,13 +14,18 @@ mod common;
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::{
     allowed_op_tags_for_mode, apply_proposal, build_approval_request,
-    check_approval_requirement, compute_confidence, compute_gating_verdict, detect_conflict,
-    resolve_conflicts, select_best_candidate, tolerant_parse, validate_proposal,
-    validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement, ConfidenceReport,
-    ConflictKind, ExtensionRepairEvent, GatingDecision, IntentGraph, IntentSignal,
+    build_golden_manifest, check_approval_requirement, compute_artifact_checksum,
+    compute_capability_proof, compute_confidence, compute_gating_verdict,
+    compute_semantic_parity, detect_conflict, extract_hostcall_surface,
+    replay_conformance_fixtures, resolve_conflicts, select_best_candidate, tolerant_parse,
+    validate_proposal, validate_repaired_artifact, AmbiguitySignal, ApprovalRequirement,
+    CapabilityDelta, CapabilityMonotonicityVerdict, ConformanceFixture,
+    ConformanceReplayVerdict, ConfidenceReport, ConflictKind, ExtensionRepairEvent,
+    GatingDecision, HostcallCategory, HostcallDelta, IntentGraph, IntentSignal,
     MonotonicityVerdict, PatchOp, PatchProposal, PiJsRuntimeConfig, PiJsTickStats,
-    ProposalValidationError, RepairMode, RepairPattern, RepairRisk, StructuralVerdict,
-    TolerantParseResult, REPAIR_REGISTRY_VERSION, REPAIR_RULES,
+    ProposalValidationError, RepairMode, RepairPattern, RepairRisk, SemanticDriftSeverity,
+    SemanticParityVerdict, StructuralVerdict, TolerantParseResult, VerificationBundle,
+    REPAIR_REGISTRY_VERSION, REPAIR_RULES,
 };
 use pi::tools::ToolRegistry;
 use std::sync::Arc;
@@ -2051,3 +2056,703 @@ fn approval_requirement_display() {
 }
 
 use std::path::Path;
+
+// ─── Capability monotonicity proof tests (bd-k5q5.9.5.2) ───────────────────
+
+fn graph_with_signals(id: &str, signals: Vec<IntentSignal>) -> IntentGraph {
+    IntentGraph {
+        extension_id: id.to_string(),
+        signals,
+    }
+}
+
+#[test]
+fn cap_proof_identical_is_monotonic() {
+    let before = graph_with_signals(
+        "ext-a",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::HooksEvent("on_message".to_string()),
+        ],
+    );
+    let after = before.clone();
+    let report = compute_capability_proof(&before, &after);
+    assert!(report.is_safe());
+    assert_eq!(report.verdict, CapabilityMonotonicityVerdict::Monotonic);
+    assert_eq!(report.retained_count, 2);
+    assert_eq!(report.removed_count, 0);
+    assert_eq!(report.added_count, 0);
+}
+
+#[test]
+fn cap_proof_removed_is_monotonic() {
+    let before = graph_with_signals(
+        "ext-b",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::RegistersCommand("run".to_string()),
+            IntentSignal::HooksEvent("on_message".to_string()),
+        ],
+    );
+    let after = graph_with_signals(
+        "ext-b",
+        vec![IntentSignal::RegistersTool("search".to_string())],
+    );
+    let report = compute_capability_proof(&before, &after);
+    assert!(report.is_safe());
+    assert_eq!(report.retained_count, 1);
+    assert_eq!(report.removed_count, 2);
+    assert_eq!(report.added_count, 0);
+}
+
+#[test]
+fn cap_proof_added_is_escalation() {
+    let before = graph_with_signals(
+        "ext-c",
+        vec![IntentSignal::RegistersTool("search".to_string())],
+    );
+    let after = graph_with_signals(
+        "ext-c",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::RegistersProvider("evil-llm".to_string()),
+        ],
+    );
+    let report = compute_capability_proof(&before, &after);
+    assert!(!report.is_safe());
+    assert_eq!(report.verdict, CapabilityMonotonicityVerdict::Escalation);
+    assert_eq!(report.added_count, 1);
+    let escalations = report.escalations();
+    assert_eq!(escalations.len(), 1);
+    assert_eq!(
+        escalations[0].signal(),
+        &IntentSignal::RegistersProvider("evil-llm".to_string())
+    );
+}
+
+#[test]
+fn cap_proof_empty_to_empty_is_monotonic() {
+    let before = graph_with_signals("ext-d", vec![]);
+    let after = graph_with_signals("ext-d", vec![]);
+    let report = compute_capability_proof(&before, &after);
+    assert!(report.is_safe());
+    assert_eq!(report.retained_count, 0);
+    assert_eq!(report.removed_count, 0);
+    assert_eq!(report.added_count, 0);
+}
+
+#[test]
+fn cap_proof_empty_to_nonempty_is_escalation() {
+    let before = graph_with_signals("ext-e", vec![]);
+    let after = graph_with_signals(
+        "ext-e",
+        vec![IntentSignal::RegistersTool("new-tool".to_string())],
+    );
+    let report = compute_capability_proof(&before, &after);
+    assert!(!report.is_safe());
+    assert_eq!(report.added_count, 1);
+}
+
+#[test]
+fn cap_proof_nonempty_to_empty_is_monotonic() {
+    let before = graph_with_signals(
+        "ext-f",
+        vec![
+            IntentSignal::RegistersTool("a".to_string()),
+            IntentSignal::RegistersFlag("b".to_string()),
+        ],
+    );
+    let after = graph_with_signals("ext-f", vec![]);
+    let report = compute_capability_proof(&before, &after);
+    assert!(report.is_safe());
+    assert_eq!(report.removed_count, 2);
+}
+
+#[test]
+fn cap_proof_mixed_add_remove_is_escalation() {
+    let before = graph_with_signals(
+        "ext-g",
+        vec![
+            IntentSignal::RegistersTool("old-tool".to_string()),
+            IntentSignal::HooksEvent("on_start".to_string()),
+        ],
+    );
+    let after = graph_with_signals(
+        "ext-g",
+        vec![
+            IntentSignal::HooksEvent("on_start".to_string()),
+            IntentSignal::RegistersCommand("new-cmd".to_string()),
+        ],
+    );
+    let report = compute_capability_proof(&before, &after);
+    assert!(!report.is_safe());
+    assert_eq!(report.retained_count, 1);
+    assert_eq!(report.removed_count, 1);
+    assert_eq!(report.added_count, 1);
+}
+
+#[test]
+fn cap_proof_delta_display() {
+    let retained = CapabilityDelta::Retained(IntentSignal::RegistersTool("x".to_string()));
+    assert_eq!(retained.to_string(), "retained: tool:x");
+    let removed = CapabilityDelta::Removed(IntentSignal::HooksEvent("y".to_string()));
+    assert_eq!(removed.to_string(), "removed: event_hook:y");
+    let added = CapabilityDelta::Added(IntentSignal::RegistersFlag("z".to_string()));
+    assert_eq!(added.to_string(), "added: flag:z");
+}
+
+#[test]
+fn cap_proof_delta_is_methods() {
+    let r = CapabilityDelta::Retained(IntentSignal::RegistersTool("a".to_string()));
+    assert!(r.is_retained());
+    assert!(!r.is_removed());
+    assert!(!r.is_escalation());
+
+    let d = CapabilityDelta::Removed(IntentSignal::RegistersTool("b".to_string()));
+    assert!(d.is_removed());
+    assert!(!d.is_retained());
+
+    let a = CapabilityDelta::Added(IntentSignal::RegistersTool("c".to_string()));
+    assert!(a.is_escalation());
+    assert!(!a.is_retained());
+}
+
+#[test]
+fn cap_proof_verdict_display() {
+    assert_eq!(CapabilityMonotonicityVerdict::Monotonic.to_string(), "monotonic");
+    assert_eq!(CapabilityMonotonicityVerdict::Escalation.to_string(), "escalation");
+}
+
+#[test]
+fn cap_proof_preserves_extension_id() {
+    let before = graph_with_signals("my-extension-123", vec![]);
+    let after = graph_with_signals("my-extension-123", vec![]);
+    let report = compute_capability_proof(&before, &after);
+    assert_eq!(report.extension_id, "my-extension-123");
+}
+
+// ─── Hostcall parity and semantic delta proof tests (bd-k5q5.9.5.3) ────────
+
+#[test]
+fn hostcall_surface_from_tool_registration() {
+    let graph = graph_with_signals(
+        "ext-h",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::RegistersCommand("run".to_string()),
+        ],
+    );
+    let surface = extract_hostcall_surface(&graph);
+    assert!(surface.contains(&HostcallCategory::Register));
+    assert_eq!(surface.len(), 1); // Both map to Register
+}
+
+#[test]
+fn hostcall_surface_from_events() {
+    let graph = graph_with_signals(
+        "ext-i",
+        vec![IntentSignal::HooksEvent("on_message".to_string())],
+    );
+    let surface = extract_hostcall_surface(&graph);
+    assert!(surface.contains(&HostcallCategory::Events("on_message".to_string())));
+}
+
+#[test]
+fn hostcall_surface_from_session_capability() {
+    let graph = graph_with_signals(
+        "ext-j",
+        vec![IntentSignal::RequiresCapability("session".to_string())],
+    );
+    let surface = extract_hostcall_surface(&graph);
+    assert!(surface.contains(&HostcallCategory::Session("*".to_string())));
+}
+
+#[test]
+fn hostcall_surface_from_tool_capability() {
+    let graph = graph_with_signals(
+        "ext-k",
+        vec![IntentSignal::RequiresCapability("tool".to_string())],
+    );
+    let surface = extract_hostcall_surface(&graph);
+    assert!(surface.contains(&HostcallCategory::Tool("*".to_string())));
+}
+
+#[test]
+fn hostcall_category_display() {
+    assert_eq!(
+        HostcallCategory::Events("on_start".to_string()).to_string(),
+        "events:on_start"
+    );
+    assert_eq!(HostcallCategory::Register.to_string(), "register");
+    assert_eq!(
+        HostcallCategory::Session("*".to_string()).to_string(),
+        "session:*"
+    );
+    assert_eq!(
+        HostcallCategory::ModuleResolution("./foo".to_string()).to_string(),
+        "module:./foo"
+    );
+}
+
+#[test]
+fn semantic_parity_equivalent_no_changes() {
+    let before = graph_with_signals(
+        "ext-l",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::HooksEvent("on_message".to_string()),
+        ],
+    );
+    let after = before.clone();
+    let report = compute_semantic_parity(&before, &after, &[]);
+    assert!(report.is_safe());
+    assert_eq!(report.verdict, SemanticParityVerdict::Equivalent);
+    assert_eq!(report.expanded_count, 0);
+    assert_eq!(report.drift_severity, SemanticDriftSeverity::None);
+}
+
+#[test]
+fn semantic_parity_acceptable_drift_on_removal() {
+    let before = graph_with_signals(
+        "ext-m",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::HooksEvent("on_message".to_string()),
+        ],
+    );
+    let after = graph_with_signals(
+        "ext-m",
+        vec![IntentSignal::RegistersTool("search".to_string())],
+    );
+    let ops = [PatchOp::ReplaceModulePath {
+        from: "./dist/index.js".to_string(),
+        to: "./src/index.ts".to_string(),
+    }];
+    let report = compute_semantic_parity(&before, &after, &ops);
+    assert!(report.is_safe());
+    assert_eq!(report.verdict, SemanticParityVerdict::AcceptableDrift);
+}
+
+#[test]
+fn semantic_parity_divergent_on_expansion() {
+    let before = graph_with_signals(
+        "ext-n",
+        vec![IntentSignal::RegistersTool("search".to_string())],
+    );
+    let after = graph_with_signals(
+        "ext-n",
+        vec![
+            IntentSignal::RegistersTool("search".to_string()),
+            IntentSignal::HooksEvent("on_start".to_string()),
+        ],
+    );
+    let report = compute_semantic_parity(&before, &after, &[]);
+    assert!(!report.is_safe());
+    assert_eq!(report.verdict, SemanticParityVerdict::Divergent);
+    assert_eq!(report.expanded_count, 1);
+}
+
+#[test]
+fn semantic_parity_low_drift_with_aggressive_ops() {
+    let before = graph_with_signals(
+        "ext-o",
+        vec![IntentSignal::RegistersTool("t".to_string())],
+    );
+    let after = before.clone();
+    let ops = [PatchOp::AddExport {
+        module_path: "./a.ts".to_string(),
+        export_name: "foo".to_string(),
+        export_value: "42".to_string(),
+    }];
+    let report = compute_semantic_parity(&before, &after, &ops);
+    assert!(report.is_safe());
+    assert_eq!(report.drift_severity, SemanticDriftSeverity::Low);
+}
+
+#[test]
+fn semantic_parity_medium_drift_with_many_stubs() {
+    let before = graph_with_signals(
+        "ext-p",
+        vec![IntentSignal::RegistersTool("t".to_string())],
+    );
+    let after = before.clone();
+    let ops = [
+        PatchOp::InjectStub {
+            virtual_path: "stub1".to_string(),
+            source: String::new(),
+        },
+        PatchOp::InjectStub {
+            virtual_path: "stub2".to_string(),
+            source: String::new(),
+        },
+        PatchOp::InjectStub {
+            virtual_path: "stub3".to_string(),
+            source: String::new(),
+        },
+    ];
+    let report = compute_semantic_parity(&before, &after, &ops);
+    // Medium drift is NOT safe — it triggers Divergent verdict.
+    assert!(!report.is_safe());
+    assert_eq!(report.verdict, SemanticParityVerdict::Divergent);
+    assert_eq!(report.drift_severity, SemanticDriftSeverity::Medium);
+}
+
+#[test]
+fn semantic_parity_high_drift_with_expansion() {
+    let before = graph_with_signals("ext-q", vec![]);
+    let after = graph_with_signals(
+        "ext-q",
+        vec![IntentSignal::RequiresCapability("session".to_string())],
+    );
+    let report = compute_semantic_parity(&before, &after, &[]);
+    assert!(!report.is_safe());
+    assert_eq!(report.drift_severity, SemanticDriftSeverity::High);
+}
+
+#[test]
+fn semantic_parity_verdict_display() {
+    assert_eq!(SemanticParityVerdict::Equivalent.to_string(), "equivalent");
+    assert_eq!(
+        SemanticParityVerdict::AcceptableDrift.to_string(),
+        "acceptable_drift"
+    );
+    assert_eq!(SemanticParityVerdict::Divergent.to_string(), "divergent");
+}
+
+#[test]
+fn semantic_drift_severity_display() {
+    assert_eq!(SemanticDriftSeverity::None.to_string(), "none");
+    assert_eq!(SemanticDriftSeverity::Low.to_string(), "low");
+    assert_eq!(SemanticDriftSeverity::Medium.to_string(), "medium");
+    assert_eq!(SemanticDriftSeverity::High.to_string(), "high");
+}
+
+#[test]
+fn semantic_drift_severity_is_acceptable() {
+    assert!(SemanticDriftSeverity::None.is_acceptable());
+    assert!(SemanticDriftSeverity::Low.is_acceptable());
+    assert!(!SemanticDriftSeverity::Medium.is_acceptable());
+    assert!(!SemanticDriftSeverity::High.is_acceptable());
+}
+
+#[test]
+fn semantic_parity_report_expansions() {
+    let before = graph_with_signals(
+        "ext-r",
+        vec![IntentSignal::RegistersTool("a".to_string())],
+    );
+    let after = graph_with_signals(
+        "ext-r",
+        vec![
+            IntentSignal::RegistersTool("a".to_string()),
+            IntentSignal::RequiresCapability("session".to_string()),
+            IntentSignal::RequiresCapability("tool".to_string()),
+        ],
+    );
+    let report = compute_semantic_parity(&before, &after, &[]);
+    let expansions = report.expansions();
+    assert_eq!(expansions.len(), 2);
+}
+
+#[test]
+fn semantic_parity_preserves_extension_id() {
+    let before = graph_with_signals("my-ext-456", vec![]);
+    let after = graph_with_signals("my-ext-456", vec![]);
+    let report = compute_semantic_parity(&before, &after, &[]);
+    assert_eq!(report.extension_id, "my-ext-456");
+}
+
+#[test]
+fn semantic_parity_safe_ops_no_drift() {
+    let before = graph_with_signals(
+        "ext-s",
+        vec![IntentSignal::RegistersTool("t".to_string())],
+    );
+    let after = before.clone();
+    let ops = [
+        PatchOp::ReplaceModulePath {
+            from: "./a.js".to_string(),
+            to: "./b.ts".to_string(),
+        },
+        PatchOp::RewriteRequire {
+            module_path: "./c.js".to_string(),
+            from_specifier: "old".to_string(),
+            to_specifier: "new".to_string(),
+        },
+    ];
+    let report = compute_semantic_parity(&before, &after, &ops);
+    assert!(report.is_safe());
+    assert_eq!(report.drift_severity, SemanticDriftSeverity::None);
+}
+
+#[test]
+fn hostcall_delta_display() {
+    let r = HostcallDelta::Retained(HostcallCategory::Register);
+    assert_eq!(r.to_string(), "retained: register");
+    let a = HostcallDelta::Added(HostcallCategory::Events("on_start".to_string()));
+    assert_eq!(a.to_string(), "added: events:on_start");
+}
+
+#[test]
+fn hostcall_delta_is_expansion() {
+    let r = HostcallDelta::Retained(HostcallCategory::Register);
+    assert!(!r.is_expansion());
+    let d = HostcallDelta::Removed(HostcallCategory::Register);
+    assert!(!d.is_expansion());
+    let a = HostcallDelta::Added(HostcallCategory::Register);
+    assert!(a.is_expansion());
+}
+
+// ─── Conformance replay and golden checksum tests (bd-k5q5.9.5.4) ──────────
+
+#[test]
+fn checksum_deterministic() {
+    let content = b"hello world";
+    let a = compute_artifact_checksum(content);
+    let b = compute_artifact_checksum(content);
+    assert_eq!(a, b);
+    // SHA-256 of "hello world" is well-known.
+    assert_eq!(a.len(), 64); // 256-bit hex = 64 chars
+}
+
+#[test]
+fn checksum_differs_for_different_content() {
+    let a = compute_artifact_checksum(b"alpha");
+    let b = compute_artifact_checksum(b"beta");
+    assert_ne!(a, b);
+}
+
+#[test]
+fn golden_manifest_build() {
+    let artifacts: &[(&str, &[u8])] = &[
+        ("src/index.ts", b"const x = 1;"),
+        ("package.json", b"{\"name\":\"ext\"}"),
+    ];
+    let manifest = build_golden_manifest("ext-a", artifacts, 1_700_000_000_000);
+    assert_eq!(manifest.extension_id, "ext-a");
+    assert_eq!(manifest.artifact_count(), 2);
+    assert_eq!(manifest.generated_at_ms, 1_700_000_000_000);
+    assert_eq!(manifest.entries[0].relative_path, "src/index.ts");
+    assert_eq!(manifest.entries[0].size_bytes, 12);
+}
+
+#[test]
+fn golden_manifest_verify_entry_match() {
+    let content = b"const x = 42;";
+    let manifest = build_golden_manifest("ext-b", &[("index.ts", content)], 0);
+    assert_eq!(manifest.verify_entry("index.ts", content), Some(true));
+}
+
+#[test]
+fn golden_manifest_verify_entry_mismatch() {
+    let manifest = build_golden_manifest("ext-c", &[("index.ts", b"original")], 0);
+    assert_eq!(
+        manifest.verify_entry("index.ts", b"tampered"),
+        Some(false)
+    );
+}
+
+#[test]
+fn golden_manifest_verify_entry_not_found() {
+    let manifest = build_golden_manifest("ext-d", &[("index.ts", b"code")], 0);
+    assert_eq!(manifest.verify_entry("missing.ts", b"code"), None);
+}
+
+#[test]
+fn replay_no_fixtures_is_acceptable() {
+    let report = replay_conformance_fixtures("ext-e", &[]);
+    assert!(report.is_acceptable());
+    assert_eq!(report.verdict, ConformanceReplayVerdict::NoFixtures);
+    assert_eq!(report.total_count, 0);
+}
+
+#[test]
+fn replay_all_pass() {
+    let fixtures = vec![
+        ConformanceFixture {
+            name: "loads without error".to_string(),
+            expected: "ok".to_string(),
+            actual: Some("ok".to_string()),
+            passed: true,
+        },
+        ConformanceFixture {
+            name: "registers tool".to_string(),
+            expected: "tool:search".to_string(),
+            actual: Some("tool:search".to_string()),
+            passed: true,
+        },
+    ];
+    let report = replay_conformance_fixtures("ext-f", &fixtures);
+    assert!(report.is_acceptable());
+    assert_eq!(report.verdict, ConformanceReplayVerdict::Pass);
+    assert_eq!(report.passed_count, 2);
+    assert_eq!(report.total_count, 2);
+}
+
+#[test]
+fn replay_some_fail() {
+    let fixtures = vec![
+        ConformanceFixture {
+            name: "loads".to_string(),
+            expected: "ok".to_string(),
+            actual: Some("ok".to_string()),
+            passed: true,
+        },
+        ConformanceFixture {
+            name: "registers tool".to_string(),
+            expected: "tool:search".to_string(),
+            actual: Some("tool:missing".to_string()),
+            passed: false,
+        },
+    ];
+    let report = replay_conformance_fixtures("ext-g", &fixtures);
+    assert!(!report.is_acceptable());
+    assert_eq!(report.verdict, ConformanceReplayVerdict::Fail);
+    assert_eq!(report.passed_count, 1);
+    assert_eq!(report.total_count, 2);
+}
+
+#[test]
+fn replay_verdict_display() {
+    assert_eq!(ConformanceReplayVerdict::Pass.to_string(), "pass");
+    assert_eq!(ConformanceReplayVerdict::Fail.to_string(), "fail");
+    assert_eq!(
+        ConformanceReplayVerdict::NoFixtures.to_string(),
+        "no_fixtures"
+    );
+}
+
+#[test]
+fn verification_bundle_all_pass() {
+    let intent = graph_with_signals(
+        "ext-h",
+        vec![IntentSignal::RegistersTool("t".to_string())],
+    );
+    let cap_proof = compute_capability_proof(&intent, &intent);
+    let sem_proof = compute_semantic_parity(&intent, &intent, &[]);
+    let conformance = replay_conformance_fixtures("ext-h", &[]);
+    let manifest = build_golden_manifest("ext-h", &[("index.ts", b"code")], 0);
+
+    let bundle = VerificationBundle {
+        extension_id: "ext-h".to_string(),
+        structural: StructuralVerdict::Valid,
+        capability_proof: cap_proof,
+        semantic_proof: sem_proof,
+        conformance,
+        checksum_manifest: manifest,
+    };
+    assert!(bundle.is_verified());
+    assert!(bundle.failure_reasons().is_empty());
+}
+
+#[test]
+fn verification_bundle_structural_fail() {
+    let intent = graph_with_signals("ext-i", vec![]);
+    let cap_proof = compute_capability_proof(&intent, &intent);
+    let sem_proof = compute_semantic_parity(&intent, &intent, &[]);
+    let conformance = replay_conformance_fixtures("ext-i", &[]);
+    let manifest = build_golden_manifest("ext-i", &[], 0);
+
+    let bundle = VerificationBundle {
+        extension_id: "ext-i".to_string(),
+        structural: StructuralVerdict::ParseError {
+            path: Path::new("index.ts").to_path_buf(),
+            message: "syntax error".to_string(),
+        },
+        capability_proof: cap_proof,
+        semantic_proof: sem_proof,
+        conformance,
+        checksum_manifest: manifest,
+    };
+    assert!(!bundle.is_verified());
+    let reasons = bundle.failure_reasons();
+    assert_eq!(reasons.len(), 1);
+    assert!(reasons[0].contains("structural"));
+}
+
+#[test]
+fn verification_bundle_capability_escalation() {
+    let before = graph_with_signals("ext-j", vec![]);
+    let after = graph_with_signals(
+        "ext-j",
+        vec![IntentSignal::RegistersTool("new".to_string())],
+    );
+    let cap_proof = compute_capability_proof(&before, &after);
+    let sem_proof = compute_semantic_parity(&before, &before, &[]);
+    let conformance = replay_conformance_fixtures("ext-j", &[]);
+    let manifest = build_golden_manifest("ext-j", &[], 0);
+
+    let bundle = VerificationBundle {
+        extension_id: "ext-j".to_string(),
+        structural: StructuralVerdict::Valid,
+        capability_proof: cap_proof,
+        semantic_proof: sem_proof,
+        conformance,
+        checksum_manifest: manifest,
+    };
+    assert!(!bundle.is_verified());
+    let reasons = bundle.failure_reasons();
+    assert!(reasons.iter().any(|r| r.contains("capability")));
+}
+
+#[test]
+fn verification_bundle_conformance_fail() {
+    let intent = graph_with_signals("ext-k", vec![]);
+    let cap_proof = compute_capability_proof(&intent, &intent);
+    let sem_proof = compute_semantic_parity(&intent, &intent, &[]);
+    let fixtures = vec![ConformanceFixture {
+        name: "broken".to_string(),
+        expected: "ok".to_string(),
+        actual: Some("error".to_string()),
+        passed: false,
+    }];
+    let conformance = replay_conformance_fixtures("ext-k", &fixtures);
+    let manifest = build_golden_manifest("ext-k", &[], 0);
+
+    let bundle = VerificationBundle {
+        extension_id: "ext-k".to_string(),
+        structural: StructuralVerdict::Valid,
+        capability_proof: cap_proof,
+        semantic_proof: sem_proof,
+        conformance,
+        checksum_manifest: manifest,
+    };
+    assert!(!bundle.is_verified());
+    let reasons = bundle.failure_reasons();
+    assert!(reasons.iter().any(|r| r.contains("conformance")));
+}
+
+#[test]
+fn verification_bundle_multiple_failures() {
+    let before = graph_with_signals("ext-l", vec![]);
+    let after = graph_with_signals(
+        "ext-l",
+        vec![IntentSignal::RegistersProvider("p".to_string())],
+    );
+    let cap_proof = compute_capability_proof(&before, &after);
+    let sem_proof = compute_semantic_parity(&before, &after, &[]);
+    let fixtures = vec![ConformanceFixture {
+        name: "broken".to_string(),
+        expected: "ok".to_string(),
+        actual: None,
+        passed: false,
+    }];
+    let conformance = replay_conformance_fixtures("ext-l", &fixtures);
+    let manifest = build_golden_manifest("ext-l", &[], 0);
+
+    let bundle = VerificationBundle {
+        extension_id: "ext-l".to_string(),
+        structural: StructuralVerdict::ParseError {
+            path: Path::new("x.ts").to_path_buf(),
+            message: "err".to_string(),
+        },
+        capability_proof: cap_proof,
+        semantic_proof: sem_proof,
+        conformance,
+        checksum_manifest: manifest,
+    };
+    assert!(!bundle.is_verified());
+    let reasons = bundle.failure_reasons();
+    // structural + capability + semantic + conformance = 4
+    assert_eq!(reasons.len(), 4);
+}
