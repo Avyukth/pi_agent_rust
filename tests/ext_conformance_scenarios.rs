@@ -1232,10 +1232,8 @@ impl MockSpecInterceptor {
             if mode == "vcr_or_stub" && interceptor.http_rules.is_empty() {
                 // 1px transparent PNG as base64 (valid image for any image-gen stub)
                 let stub_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=";
-                interceptor.http_default = serde_json::json!({
-                    "status": 200,
-                    "headers": {"content-type": "application/json"},
-                    "body": serde_json::json!({
+                let chunk = serde_json::json!({
+                    "response": {
                         "candidates": [{
                             "content": {
                                 "parts": [
@@ -1244,7 +1242,12 @@ impl MockSpecInterceptor {
                                 ]
                             }
                         }]
-                    }).to_string()
+                    }
+                });
+                interceptor.http_default = serde_json::json!({
+                    "status": 200,
+                    "headers": {"content-type": "text/event-stream"},
+                    "body": format!("data: {chunk}\n\n")
                 });
             }
         }
@@ -2796,6 +2799,65 @@ fn scenario_hello_tool() {
         result.status, "pass",
         "hello tool scenario failed: diffs={:?} error={:?} skip={:?}",
         result.diffs, result.error, result.skip_reason
+    );
+}
+
+/// Focused regression test: antigravity image scenario should parse synthetic
+/// vcr_or_stub SSE image chunk and pass.
+#[test]
+fn scenario_antigravity_image_mocked_sse() {
+    let sample = load_sample_json();
+    let ext = sample
+        .scenario_suite
+        .items
+        .iter()
+        .find(|e| e.extension_id == "antigravity-image-gen")
+        .expect("antigravity-image-gen extension in sample");
+    let scenario = ext
+        .scenarios
+        .iter()
+        .find(|s| s.id == "scn-antigravity-image-gen-002")
+        .expect("scn-antigravity-image-gen-002");
+
+    let result = run_scenario(ext, scenario, &sample.items);
+    assert_eq!(
+        result.status, "pass",
+        "antigravity mocked SSE scenario failed: diffs={:?} error={:?} skip={:?}",
+        result.diffs, result.error, result.skip_reason
+    );
+}
+
+#[test]
+fn mock_http_vcr_or_stub_default_emits_sse_data_line() {
+    let default_spec = load_default_mock_spec();
+    let setup = serde_json::json!({
+        "mock_http": {
+            "mode": "vcr_or_stub"
+        }
+    });
+    let interceptor = MockSpecInterceptor::from_scenario_setup(&setup, &default_spec);
+
+    let content_type = interceptor
+        .http_default
+        .get("headers")
+        .and_then(Value::as_object)
+        .and_then(|headers| headers.get("content-type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(content_type, "text/event-stream");
+
+    let body = interceptor
+        .http_default
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        body.starts_with("data: "),
+        "mock_http vcr_or_stub body must start with SSE data line, got: {body}"
+    );
+    assert!(
+        body.contains("\"inlineData\""),
+        "mock_http vcr_or_stub body must include inlineData image chunk, got: {body}"
     );
 }
 

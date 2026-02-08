@@ -383,6 +383,10 @@
         {
           "path": "tests/ext_conformance_artifacts.rs",
           "justification": "Artifact/report integrity validation."
+        },
+        {
+          "path": "tests/release_readiness.rs",
+          "justification": "Unified release-readiness report aggregating conformance, performance, security, provenance, and traceability evidence."
         }
       ],
       "e2e_scripts": [
@@ -401,6 +405,30 @@
           "path": "tests/e2e_results/**/*.json",
           "generated_by_ci": true,
           "justification": "Aggregated E2E run summaries for readiness output."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.14",
+      "title": "Golden-path first-time-user e2e suite (install -> configure -> run -> recover)",
+      "acceptance_criteria": "Complete onboarding journey is proven end-to-end: version/help, config, doctor (all formats), policy escalation, fix-and-recheck, and full user journey simulation.",
+      "unit_tests": [
+        {
+          "path": "tests/e2e_golden_path.rs",
+          "justification": "25 golden-path E2E tests covering install, configure, run, policy, recover, and full journey phases."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Unified E2E runner that includes golden-path suite."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Golden-path journey logs and artifact capture."
         }
       ]
     }

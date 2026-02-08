@@ -1191,7 +1191,12 @@ fn handle_config(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_doctor(cwd: &Path, path: &str, format: &str, policy_override: Option<&str>) -> Result<()> {
+fn handle_doctor(
+    cwd: &Path,
+    path: &str,
+    format: &str,
+    policy_override: Option<&str>,
+) -> Result<()> {
     use pi::extension_preflight::{PreflightAnalyzer, PreflightVerdict};
 
     let ext_path = if Path::new(path).is_absolute() {
@@ -1230,19 +1235,26 @@ fn handle_doctor(cwd: &Path, path: &str, format: &str, policy_override: Option<&
             };
             println!("Extension Doctor: {ext_id}");
             println!("Path: {}", ext_path.display());
-            println!("Policy: {} ({})", resolved.effective_profile, resolved.profile_source);
+            println!(
+                "Policy: {} ({})",
+                resolved.effective_profile, resolved.profile_source
+            );
             println!();
-            println!("Verdict: {verdict_indicator}");
+            println!(
+                "Verdict: {verdict_indicator} | Confidence: {}",
+                report.confidence
+            );
             println!(
                 "  {} error(s), {} warning(s), {} info",
                 report.summary.errors, report.summary.warnings, report.summary.info
             );
+            println!();
+            println!("{}", report.risk_banner);
 
+            println!();
             if report.findings.is_empty() {
-                println!();
                 println!("No issues found. Extension is expected to work.");
             } else {
-                println!();
                 for finding in &report.findings {
                     let icon = match finding.severity {
                         pi::extension_preflight::FindingSeverity::Error => "ERROR",
@@ -1269,10 +1281,7 @@ fn handle_doctor(cwd: &Path, path: &str, format: &str, policy_override: Option<&
                 println!("Suggested actions:");
                 if report.summary.errors > 0 {
                     println!("  - Review errors above and apply suggested fixes");
-                    println!(
-                        "  - Try a different policy: pi doctor {} --policy permissive",
-                        path
-                    );
+                    println!("  - Try a different policy: pi doctor {path} --policy permissive");
                 }
                 if report.summary.warnings > 0 {
                     println!("  - Warnings indicate partial support; extension may still work");

@@ -1,16 +1,16 @@
 # Extension Conformance Report
 
-> Generated: 2026-02-08T02:44:04Z
+> Generated: 2026-02-08T03:42:49Z
 
 ## Summary
 
 | Metric | Value |
 |----|----|
 | Total extensions | 223 |
-| PASS | 56 |
-| FAIL | 4 |
+| PASS | 57 |
+| FAIL | 3 |
 | N/A (not yet tested) | 163 |
-| Pass rate | 93.3% |
+| Pass rate | 95.0% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
 
@@ -171,11 +171,11 @@
 
 ## official-pi-mono
 
-66 extensions (56 pass, 4 fail, 6 untested)
+66 extensions (57 pass, 3 fail, 6 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
-| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | FAIL | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 1/2 pass | Happy-path: mocked SSE stream returns text + image blocks with saveMode=none |
+| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 2/2 pass |  |
 | [`auto-commit-on-exit`](tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`base_fixtures`](tests/ext_conformance/artifacts/base_fixtures/minimal_command/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`bash-spawn-hook`](tests/ext_conformance/artifacts/bash-spawn-hook/bash-spawn-hook.ts) | - | T1 (simple single-file) | PASS | - | 99ms | - |  |
