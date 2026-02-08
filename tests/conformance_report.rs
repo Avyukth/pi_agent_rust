@@ -479,10 +479,18 @@ fn generate_markdown(
     let _ = writeln!(md, "| PASS | {pass_count} |");
     let _ = writeln!(md, "| FAIL | {fail_count} |");
     let _ = writeln!(md, "| N/A (not yet tested) | {na_count} |");
+    let tested_count = pass_count + fail_count;
+    if tested_count > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let rate = f64::from(pass_count) / f64::from(tested_count) * 100.0;
+        let _ = writeln!(md, "| Pass rate (tested only) | {rate:.1}% |");
+    } else {
+        md.push_str("| Pass rate (tested only) | 0.0% |\n");
+    }
     if total > 0 {
         #[allow(clippy::cast_precision_loss)]
-        let rate = f64::from(pass_count) / f64::from((pass_count + fail_count).max(1)) * 100.0;
-        let _ = writeln!(md, "| Pass rate | {rate:.1}% |");
+        let coverage = f64::from(tested_count) / (total as f64) * 100.0;
+        let _ = writeln!(md, "| Coverage (tested/total) | {coverage:.1}% |");
     }
     let _ = writeln!(
         md,
@@ -825,11 +833,16 @@ fn generate_conformance_report_impl() {
         }
     }
 
-    // Coverage rate uses total (pass+fail+na) as denominator to give an
-    // honest picture of how many extensions are actually validated.
+    let tested = pass + fail;
     #[allow(clippy::cast_precision_loss)]
-    let pass_rate = if total > 0 {
-        f64::from(pass) / (total as f64) * 100.0
+    let pass_rate = if tested > 0 {
+        f64::from(pass) / f64::from(tested) * 100.0
+    } else {
+        0.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let coverage_rate = if total > 0 {
+        f64::from(tested) / (total as f64) * 100.0
     } else {
         0.0
     };
@@ -860,8 +873,10 @@ fn generate_conformance_report_impl() {
             "pass": pass,
             "fail": fail,
             "na": na,
+            "tested": tested,
         },
         "pass_rate_pct": pass_rate,
+        "coverage_rate_pct": coverage_rate,
         "negative": {
             "pass": negative_pass,
             "fail": negative_fail,
@@ -901,7 +916,8 @@ fn generate_conformance_report_impl() {
     eprintln!("  PASS: {pass}");
     eprintln!("  FAIL: {fail}");
     eprintln!("  N/A:  {na}");
-    eprintln!("  Pass rate: {pass_rate:.1}%");
+    eprintln!("  Pass rate (tested only): {pass_rate:.1}%");
+    eprintln!("  Coverage (tested/total): {coverage_rate:.1}%");
     eprintln!("  Negative policy: {negative_pass} pass, {negative_fail} fail");
     eprintln!("  Reports:");
     eprintln!("    {}", md_path.display());

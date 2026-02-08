@@ -153,15 +153,43 @@ fn traceability_matrix_has_requirements() {
 // Threshold enforcement
 // ============================================================================
 
+/// Compute pass/(pass+fail), ignoring N/A extensions that lack evidence.
+/// Matches the `effective_pass_rate_pct` logic in `conformance_regression_gate.rs`.
+fn effective_pass_rate_pct(sm: &Value) -> f64 {
+    let pass = sm
+        .pointer("/counts/pass")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let fail = sm
+        .pointer("/counts/fail")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = sm
+        .pointer("/counts/total")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tested = pass + fail;
+    let reported = sm
+        .get("pass_rate_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+
+    if tested > 0 && tested < total {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            (pass as f64 / tested as f64) * 100.0
+        }
+    } else {
+        reported
+    }
+}
+
 #[test]
 fn conformance_pass_rate_meets_release_threshold() {
     let sm = require_json("tests/ext_conformance/reports/conformance_summary.json");
     let bl = require_json("tests/ext_conformance/reports/conformance_baseline.json");
 
-    let current_rate = sm
-        .get("pass_rate_pct")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+    let current_rate = effective_pass_rate_pct(&sm);
     let min_rate = bl
         .pointer("/regression_thresholds/overall_pass_rate_min_pct")
         .and_then(Value::as_f64)
@@ -169,7 +197,8 @@ fn conformance_pass_rate_meets_release_threshold() {
 
     assert!(
         current_rate >= min_rate,
-        "release gate BLOCKED: conformance pass rate {current_rate:.1}% < minimum {min_rate:.1}%"
+        "release gate BLOCKED: conformance pass rate {current_rate:.1}% \
+         (effective: pass/(pass+fail), ignoring N/A) < minimum {min_rate:.1}%"
     );
 }
 

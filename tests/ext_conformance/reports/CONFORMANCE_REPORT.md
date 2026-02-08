@@ -1,6 +1,6 @@
 # Extension Conformance Report
 
-> Generated: 2026-02-08T21:18:07Z
+> Generated: 2026-02-08T21:26:41Z
 
 ## Summary
 
@@ -10,7 +10,8 @@
 | PASS | 60 |
 | FAIL | 0 |
 | N/A (not yet tested) | 163 |
-| Pass rate | 100.0% |
+| Pass rate (tested only) | 100.0% |
+| Coverage (tested/total) | 26.9% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
 
