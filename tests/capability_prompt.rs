@@ -348,6 +348,7 @@ mod policy_evaluation {
             max_memory_mb: 256,
             default_caps: vec!["read".to_string(), "write".to_string(), "http".to_string()],
             deny_caps: vec!["exec".to_string()],
+            ..Default::default()
         }
     }
 

@@ -69,6 +69,7 @@ fn deny_all() -> ExtensionPolicy {
             "env".into(),
             "log".into(),
         ],
+        ..Default::default()
     }
 }
 
@@ -78,6 +79,7 @@ fn allow_only(caps: &[&str]) -> ExtensionPolicy {
         max_memory_mb: 256,
         default_caps: caps.iter().map(|s| (*s).to_string()).collect(),
         deny_caps: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -775,6 +777,7 @@ fn deny_caps_override_default_caps_through_dispatch() {
         max_memory_mb: 256,
         default_caps: vec!["read".into(), "write".into(), "http".into()],
         deny_caps: vec!["read".into()],
+        ..Default::default()
     };
     let ctx = make_ctx(&tools, &http, &policy);
 
@@ -828,6 +831,7 @@ fn deny_caps_override_permissive_mode_through_dispatch() {
         max_memory_mb: 256,
         default_caps: Vec::new(),
         deny_caps: vec!["http".into(), "session".into()],
+        ..Default::default()
     };
     let ctx = make_ctx(&tools, &http, &policy);
 

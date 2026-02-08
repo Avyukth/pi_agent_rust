@@ -35,6 +35,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read as _;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -52,7 +53,8 @@ const REDACTION_KEYS: [&str; 10] = [
     "token",
 ];
 
-const TEST_LOG_SCHEMA: &str = "pi.test.log.v1";
+const TEST_LOG_SCHEMA_V1: &str = "pi.test.log.v1";
+const TEST_LOG_SCHEMA: &str = "pi.test.log.v2";
 const TEST_ARTIFACT_SCHEMA: &str = "pi.test.artifact.v1";
 const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
 const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
@@ -60,6 +62,8 @@ const PLACEHOLDER_TEST_ROOT: &str = "<TEST_ROOT>";
 const PLACEHOLDER_RUN_ID: &str = "<RUN_ID>";
 const PLACEHOLDER_UUID: &str = "<UUID>";
 const PLACEHOLDER_PORT: &str = "<PORT>";
+const PLACEHOLDER_TRACE_ID: &str = "<TRACE_ID>";
+const PLACEHOLDER_SPAN_ID: &str = "<SPAN_ID>";
 
 static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
 static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
@@ -144,6 +148,10 @@ pub struct LogEntry {
     pub message: String,
     /// Optional key-value context pairs.
     pub context: Vec<(String, String)>,
+    /// Span ID if this entry was logged within a span.
+    pub span_id: Option<String>,
+    /// Parent span ID for nested span hierarchy.
+    pub parent_span_id: Option<String>,
 }
 
 impl LogEntry {
@@ -217,6 +225,11 @@ struct TestLogJsonRecord {
     schema: &'static str,
     #[serde(rename = "type")]
     record_type: &'static str,
+    trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    span_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_span_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     test: Option<String>,
     seq: usize,
@@ -304,10 +317,56 @@ fn replace_path_variants(input: &str, path: &str, placeholder: &str) -> String {
     out
 }
 
+/// Active span on the logger's span stack.
+#[derive(Debug, Clone)]
+struct SpanInfo {
+    id: String,
+    parent_id: Option<String>,
+    name: String,
+    started_ms: u64,
+}
+
+/// RAII guard that ends a span when dropped.
+///
+/// Created by [`TestLogger::begin_span`]. When the guard is dropped,
+/// an automatic "span.end" log entry is emitted with duration info.
+pub struct SpanGuard<'a> {
+    logger: &'a TestLogger,
+    span_id: String,
+    name: String,
+}
+
+impl Drop for SpanGuard<'_> {
+    fn drop(&mut self) {
+        self.logger.end_span_internal(&self.span_id, &self.name);
+    }
+}
+
+impl SpanGuard<'_> {
+    /// Returns the span ID of this guard.
+    #[must_use]
+    pub fn span_id(&self) -> &str {
+        &self.span_id
+    }
+}
+
 /// Thread-safe test logger that captures all log entries.
 ///
 /// Entries are stored in memory and can be dumped on test failure.
 /// The logger is designed to have minimal overhead during normal test execution.
+///
+/// # Correlation Model
+///
+/// Every logger instance has a unique `trace_id` that tags all emitted JSONL
+/// records, enabling correlation of logs from the same test run. Logs emitted
+/// within a span carry a `span_id` (and optional `parent_span_id` for nesting).
+///
+/// ```ignore
+/// let logger = TestLogger::new();
+/// let span = logger.begin_span("load_extension");
+/// logger.info("ext", "Loading my-ext");   // tagged with span-1
+/// drop(span);                              // auto-logs span.end
+/// ```
 pub struct TestLogger {
     /// All captured log entries.
     entries: Mutex<Vec<LogEntry>>,
@@ -323,6 +382,12 @@ pub struct TestLogger {
     test_name: Mutex<Option<String>>,
     /// Optional root path to normalize in JSONL dumps (e.g. harness temp dir).
     normalize_root: Mutex<Option<String>>,
+    /// Unique trace ID for this logger instance (correlates all records).
+    trace_id: String,
+    /// Stack of active spans (most recent last).
+    active_spans: Mutex<Vec<SpanInfo>>,
+    /// Monotonic counter for generating span IDs.
+    next_span_seq: AtomicU64,
 }
 
 impl Default for TestLogger {
@@ -335,6 +400,7 @@ impl TestLogger {
     /// Create a new test logger with default settings.
     ///
     /// By default, captures all log levels (Debug and above).
+    /// A unique `trace_id` is generated automatically.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -345,6 +411,9 @@ impl TestLogger {
             min_level: LogLevel::Debug,
             test_name: Mutex::new(None),
             normalize_root: Mutex::new(None),
+            trace_id: generate_trace_id(),
+            active_spans: Mutex::new(Vec::new()),
+            next_span_seq: AtomicU64::new(1),
         }
     }
 
@@ -359,7 +428,16 @@ impl TestLogger {
             min_level,
             test_name: Mutex::new(None),
             normalize_root: Mutex::new(None),
+            trace_id: generate_trace_id(),
+            active_spans: Mutex::new(Vec::new()),
+            next_span_seq: AtomicU64::new(1),
         }
+    }
+
+    /// Returns the trace ID for this logger instance.
+    #[must_use]
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
     }
 
     /// Configure a root path for normalization in JSONL dumps.
@@ -380,18 +458,103 @@ impl TestLogger {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    /// Begin a named span. Returns a [`SpanGuard`] that automatically
+    /// ends the span when dropped, emitting a "span.end" log entry.
+    ///
+    /// Logs emitted while the span is active carry the span's ID.
+    /// Spans can be nested; child spans record their parent's ID.
+    pub fn begin_span(&self, name: &str) -> SpanGuard<'_> {
+        let seq = self.next_span_seq.fetch_add(1, Ordering::Relaxed);
+        let span_id = format!("span-{seq}");
+        let parent_id = self
+            .active_spans
+            .lock()
+            .unwrap()
+            .last()
+            .map(|s| s.id.clone());
+
+        let info = SpanInfo {
+            id: span_id.clone(),
+            parent_id: parent_id.clone(),
+            name: name.to_string(),
+            started_ms: self.elapsed_ms(),
+        };
+        self.active_spans.lock().unwrap().push(info);
+
+        // Log span.begin
+        let entry = LogEntry {
+            elapsed_ms: self.elapsed_ms(),
+            level: LogLevel::Debug,
+            category: "span.begin".to_string(),
+            message: name.to_string(),
+            context: Vec::new(),
+            span_id: Some(span_id.clone()),
+            parent_span_id: parent_id,
+        };
+        self.entries.lock().unwrap().push(entry);
+
+        SpanGuard {
+            logger: self,
+            span_id,
+            name: name.to_string(),
+        }
+    }
+
+    /// Internal: end a span and emit span.end log entry.
+    fn end_span_internal(&self, span_id: &str, name: &str) {
+        let started_ms = {
+            let mut spans = self.active_spans.lock().unwrap();
+            let started = spans
+                .iter()
+                .rfind(|s| s.id == span_id)
+                .map(|s| s.started_ms);
+            spans.retain(|s| s.id != span_id);
+            started
+        };
+        let elapsed = self.elapsed_ms();
+        let duration_ms = started_ms.map_or(0, |s| elapsed.saturating_sub(s));
+        let parent_id = self
+            .active_spans
+            .lock()
+            .unwrap()
+            .last()
+            .map(|s| s.id.clone());
+
+        let entry = LogEntry {
+            elapsed_ms: elapsed,
+            level: LogLevel::Debug,
+            category: "span.end".to_string(),
+            message: name.to_string(),
+            context: vec![("duration_ms".to_string(), duration_ms.to_string())],
+            span_id: Some(span_id.to_string()),
+            parent_span_id: parent_id,
+        };
+        self.entries.lock().unwrap().push(entry);
+    }
+
+    /// Returns the current active span ID, if any.
+    fn current_span(&self) -> (Option<String>, Option<String>) {
+        let spans = self.active_spans.lock().unwrap();
+        spans
+            .last()
+            .map_or((None, None), |span| (Some(span.id.clone()), span.parent_id.clone()))
+    }
+
     /// Log an entry with the given level and category.
     pub fn log(&self, level: LogLevel, category: &str, message: impl Into<String>) {
         if (level as u8) < (self.min_level as u8) {
             return;
         }
 
+        let (span_id, parent_span_id) = self.current_span();
         let entry = LogEntry {
             elapsed_ms: self.elapsed_ms(),
             level,
             category: category.to_string(),
             message: message.into(),
             context: Vec::new(),
+            span_id,
+            parent_span_id,
         };
 
         self.entries.lock().unwrap().push(entry);
@@ -442,12 +605,15 @@ impl TestLogger {
         f(&mut context);
         redact_context(&mut context);
 
+        let (span_id, parent_span_id) = self.current_span();
         let entry = LogEntry {
             elapsed_ms: self.elapsed_ms(),
             level,
             category: category.to_string(),
             message: message.into(),
             context,
+            span_id,
+            parent_span_id,
         };
 
         self.entries.lock().unwrap().push(entry);
@@ -554,7 +720,7 @@ impl TestLogger {
     /// Dump logs and artifacts as JSONL (one JSON object per line).
     ///
     /// This output is intended for machine parsing and deterministic diffs. It:
-    /// - includes a schema tag (`pi.test.log.v1` / `pi.test.artifact.v1`)
+    /// - includes a schema tag (`pi.test.log.v2` / `pi.test.artifact.v1`)
     /// - includes sequence numbers + ISO-8601 timestamps
     /// - uses elapsed milliseconds for ordering
     ///
@@ -615,13 +781,14 @@ impl TestLogger {
                     entry,
                     seq,
                     test_name,
+                    &self.trace_id,
                     ctx.as_ref(),
                     self.start_wall,
                     normalized,
                 );
                 seq = seq.saturating_add(1);
                 let line = serde_json::to_string(&record)
-                    .unwrap_or_else(|_| "{\"schema\":\"pi.test.log.v1\"}".to_string());
+                    .unwrap_or_else(|_| "{\"schema\":\"pi.test.log.v2\"}".to_string());
                 out.push_str(&line);
                 out.push('\n');
             }
@@ -713,6 +880,25 @@ impl TestLogger {
     }
 }
 
+/// Generate a unique trace ID for a logger instance.
+///
+/// Uses a combination of system time + monotonic counter to ensure uniqueness
+/// even when multiple loggers are created in the same millisecond.
+fn generate_trace_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(ts.to_le_bytes());
+    hasher.update(seq.to_le_bytes());
+    let digest = hasher.finalize();
+    // Use first 16 bytes (128 bits) formatted as hex for a compact trace ID.
+    to_hex(&digest[..16])
+}
+
 fn redact_context(context: &mut [(String, String)]) {
     for (key, value) in context.iter_mut() {
         if is_sensitive_key(key) {
@@ -730,6 +916,7 @@ fn build_log_record(
     entry: &LogEntry,
     seq: usize,
     test_name: Option<&str>,
+    trace_id: &str,
     ctx: Option<&NormalizationContext>,
     start_wall: SystemTime,
     normalized: bool,
@@ -758,9 +945,31 @@ fn build_log_record(
         context.insert(key.clone(), value);
     }
 
+    let resolved_trace_id = if normalized {
+        PLACEHOLDER_TRACE_ID.to_string()
+    } else {
+        trace_id.to_string()
+    };
+    let span_id = if normalized {
+        entry.span_id.as_ref().map(|_| PLACEHOLDER_SPAN_ID.to_string())
+    } else {
+        entry.span_id.clone()
+    };
+    let parent_span_id = if normalized {
+        entry
+            .parent_span_id
+            .as_ref()
+            .map(|_| PLACEHOLDER_SPAN_ID.to_string())
+    } else {
+        entry.parent_span_id.clone()
+    };
+
     TestLogJsonRecord {
         schema: TEST_LOG_SCHEMA,
         record_type: "log",
+        trace_id: resolved_trace_id,
+        span_id,
+        parent_span_id,
         test: test_name.map(ToString::to_string),
         seq,
         ts,
@@ -863,8 +1072,14 @@ fn write_string_to_path(path: &Path, contents: &str) -> std::io::Result<()> {
 // ============================================================================
 
 /// Required fields for a `pi.test.log.v1` JSONL record.
-const LOG_RECORD_REQUIRED_FIELDS: [&str; 8] = [
+const LOG_RECORD_V1_REQUIRED_FIELDS: [&str; 8] = [
     "schema", "type", "seq", "ts", "t_ms", "level", "category", "message",
+];
+
+/// Required fields for a `pi.test.log.v2` JSONL record.
+/// V2 adds `trace_id` as a required field; `span_id` and `parent_span_id` are optional.
+const LOG_RECORD_V2_REQUIRED_FIELDS: [&str; 9] = [
+    "schema", "type", "trace_id", "seq", "ts", "t_ms", "level", "category", "message",
 ];
 
 /// Required fields for a `pi.test.artifact.v1` JSONL record.
@@ -912,7 +1127,8 @@ pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlVa
 
     let schema = obj.get("schema").and_then(|v| v.as_str()).unwrap_or("");
     let required: &[&str] = match schema {
-        "pi.test.log.v1" => &LOG_RECORD_REQUIRED_FIELDS,
+        "pi.test.log.v1" => &LOG_RECORD_V1_REQUIRED_FIELDS,
+        "pi.test.log.v2" => &LOG_RECORD_V2_REQUIRED_FIELDS,
         "pi.test.artifact.v1" => &ARTIFACT_RECORD_REQUIRED_FIELDS,
         _ => {
             return Err(JsonlValidationError {
@@ -959,6 +1175,37 @@ pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlVa
                 field: "t_ms".to_string(),
                 message: format!("expected number, got {t_ms}"),
             });
+        }
+    }
+
+    // V2 type checks for correlation fields.
+    if schema == "pi.test.log.v2" {
+        if let Some(trace_id) = obj.get("trace_id") {
+            if !trace_id.is_string() {
+                return Err(JsonlValidationError {
+                    line: line_number,
+                    field: "trace_id".to_string(),
+                    message: format!("expected string, got {trace_id}"),
+                });
+            }
+        }
+        if let Some(span_id) = obj.get("span_id") {
+            if !span_id.is_string() {
+                return Err(JsonlValidationError {
+                    line: line_number,
+                    field: "span_id".to_string(),
+                    message: format!("expected string, got {span_id}"),
+                });
+            }
+        }
+        if let Some(parent_span_id) = obj.get("parent_span_id") {
+            if !parent_span_id.is_string() {
+                return Err(JsonlValidationError {
+                    line: line_number,
+                    field: "parent_span_id".to_string(),
+                    message: format!("expected string, got {parent_span_id}"),
+                });
+            }
         }
     }
 
@@ -1722,5 +1969,240 @@ mod tests {
         assert!(dump.contains("x-api-key-header = [REDACTED]"));
         assert!(dump.contains("my_secret_value = [REDACTED]"));
         assert!(dump.contains("safe_key = visible"));
+    }
+
+    // ====================================================================
+    // Correlation Model (trace_id, span_id)
+    // ====================================================================
+
+    #[test]
+    fn trace_id_is_unique_per_logger() {
+        let a = TestLogger::new();
+        let b = TestLogger::new();
+        assert_ne!(a.trace_id(), b.trace_id());
+        assert_eq!(a.trace_id().len(), 32); // 16 bytes hex = 32 chars
+    }
+
+    #[test]
+    fn trace_id_appears_in_jsonl_output() {
+        let logger = TestLogger::new();
+        logger.info("test", "hello");
+        let jsonl = logger.dump_jsonl();
+        let record: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        assert_eq!(record["trace_id"].as_str().unwrap(), logger.trace_id());
+        assert_eq!(record["schema"], "pi.test.log.v2");
+    }
+
+    #[test]
+    fn trace_id_normalized_to_placeholder() {
+        let logger = TestLogger::new();
+        logger.info("test", "hello");
+        let jsonl = logger.dump_jsonl_normalized();
+        let record: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        assert_eq!(record["trace_id"], PLACEHOLDER_TRACE_ID);
+    }
+
+    #[test]
+    fn log_without_span_has_no_span_id() {
+        let logger = TestLogger::new();
+        logger.info("test", "no span");
+        let entries = logger.entries();
+        assert!(entries[0].span_id.is_none());
+        assert!(entries[0].parent_span_id.is_none());
+    }
+
+    #[test]
+    fn span_tags_entries_with_span_id() {
+        let logger = TestLogger::new();
+        let span = logger.begin_span("load_extension");
+        logger.info("ext", "Loading extension");
+        drop(span);
+
+        let entries = logger.entries();
+        // entries[0] = span.begin, entries[1] = "Loading extension", entries[2] = span.end
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].category, "span.begin");
+        assert_eq!(entries[0].span_id.as_deref(), Some("span-1"));
+        assert_eq!(entries[1].span_id.as_deref(), Some("span-1"));
+        assert_eq!(entries[1].message, "Loading extension");
+        assert_eq!(entries[2].category, "span.end");
+        assert_eq!(entries[2].span_id.as_deref(), Some("span-1"));
+    }
+
+    #[test]
+    fn nested_spans_set_parent_span_id() {
+        let logger = TestLogger::new();
+        let outer = logger.begin_span("outer");
+        logger.info("test", "in outer");
+        let inner = logger.begin_span("inner");
+        logger.info("test", "in inner");
+        drop(inner);
+        logger.info("test", "back in outer");
+        drop(outer);
+
+        let entries = logger.entries();
+        // Find "in inner" entry
+        let in_inner = entries.iter().find(|e| e.message == "in inner").unwrap();
+        assert_eq!(in_inner.span_id.as_deref(), Some("span-2"));
+        assert_eq!(in_inner.parent_span_id.as_deref(), Some("span-1"));
+
+        // Find "in outer" entry
+        let in_outer = entries.iter().find(|e| e.message == "in outer").unwrap();
+        assert_eq!(in_outer.span_id.as_deref(), Some("span-1"));
+        assert!(in_outer.parent_span_id.is_none());
+
+        // Find "back in outer" entry (after inner dropped)
+        let back_in_outer = entries
+            .iter()
+            .find(|e| e.message == "back in outer")
+            .unwrap();
+        assert_eq!(back_in_outer.span_id.as_deref(), Some("span-1"));
+        assert!(back_in_outer.parent_span_id.is_none());
+    }
+
+    #[test]
+    fn span_guard_returns_span_id() {
+        let logger = TestLogger::new();
+        let span = logger.begin_span("test_span");
+        assert_eq!(span.span_id(), "span-1");
+        drop(span);
+    }
+
+    #[test]
+    fn span_end_includes_duration() {
+        let logger = TestLogger::new();
+        {
+            let _span = logger.begin_span("timed");
+            logger.info("test", "work");
+        }
+        let entries = logger.entries();
+        let end_entry = entries
+            .iter()
+            .find(|e| e.category == "span.end")
+            .unwrap();
+        assert!(end_entry
+            .context
+            .iter()
+            .any(|(k, _)| k == "duration_ms"));
+    }
+
+    #[test]
+    fn span_ids_in_jsonl_output() {
+        let logger = TestLogger::new();
+        {
+            let _span = logger.begin_span("my_op");
+            logger.info("test", "inside span");
+        }
+        let jsonl = logger.dump_jsonl();
+        let lines: Vec<serde_json::Value> = jsonl
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // All records should have trace_id
+        for line in &lines {
+            assert!(line["trace_id"].is_string());
+        }
+
+        // span.begin record should have span_id
+        let begin = lines.iter().find(|l| l["category"] == "span.begin").unwrap();
+        assert_eq!(begin["span_id"], "span-1");
+
+        // "inside span" record should have span_id
+        let inside = lines.iter().find(|l| l["message"] == "inside span").unwrap();
+        assert_eq!(inside["span_id"], "span-1");
+    }
+
+    #[test]
+    fn span_ids_normalized_to_placeholder() {
+        let logger = TestLogger::new();
+        {
+            let _span = logger.begin_span("op");
+            logger.info("test", "spanned");
+        }
+        let jsonl = logger.dump_jsonl_normalized();
+        let record: serde_json::Value =
+            serde_json::from_str(jsonl.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(record["span_id"], PLACEHOLDER_SPAN_ID);
+    }
+
+    #[test]
+    fn v2_jsonl_validates_against_schema() {
+        let logger = TestLogger::new();
+        {
+            let _span = logger.begin_span("validate_test");
+            logger.info("test", "validating");
+        }
+        let jsonl = logger.dump_jsonl();
+        let errors = validate_jsonl(&jsonl);
+        assert!(
+            errors.is_empty(),
+            "v2 JSONL validation errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn v2_schema_rejects_non_string_trace_id() {
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","trace_id":123,"seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "trace_id");
+    }
+
+    #[test]
+    fn v2_schema_rejects_non_string_span_id() {
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","trace_id":"abc","span_id":42,"seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "span_id");
+    }
+
+    #[test]
+    fn v2_schema_rejects_missing_trace_id() {
+        let record = r#"{"schema":"pi.test.log.v2","type":"log","seq":1,"ts":"x","t_ms":0,"level":"info","category":"c","message":"m"}"#;
+        let err = validate_jsonl_line(record, 1).unwrap_err();
+        assert_eq!(err.field, "trace_id");
+        assert!(err.message.contains("required field missing"));
+    }
+
+    #[test]
+    fn v1_schema_still_validates() {
+        // V1 records should still pass validation (backward compat).
+        let record = r#"{"schema":"pi.test.log.v1","type":"log","seq":1,"ts":"2026-01-01T00:00:00.000Z","t_ms":0,"level":"info","category":"setup","message":"hello"}"#;
+        assert!(validate_jsonl_line(record, 1).is_ok());
+    }
+
+    #[test]
+    fn multiple_spans_get_sequential_ids() {
+        let logger = TestLogger::new();
+        let s1 = logger.begin_span("first");
+        drop(s1);
+        let s2 = logger.begin_span("second");
+        drop(s2);
+        let s3 = logger.begin_span("third");
+        drop(s3);
+
+        let entries = logger.entries();
+        let begins: Vec<_> = entries
+            .iter()
+            .filter(|e| e.category == "span.begin")
+            .collect();
+        assert_eq!(begins[0].span_id.as_deref(), Some("span-1"));
+        assert_eq!(begins[1].span_id.as_deref(), Some("span-2"));
+        assert_eq!(begins[2].span_id.as_deref(), Some("span-3"));
+    }
+
+    #[test]
+    fn context_entries_within_span_carry_span_id() {
+        let logger = TestLogger::new();
+        let span = logger.begin_span("with_ctx");
+        logger.info_ctx("test", "ctx msg", |ctx| {
+            ctx.push(("key".into(), "val".into()));
+        });
+        drop(span);
+
+        let entries = logger.entries();
+        let ctx_entry = entries.iter().find(|e| e.message == "ctx msg").unwrap();
+        assert_eq!(ctx_entry.span_id.as_deref(), Some("span-1"));
+        assert!(!ctx_entry.context.is_empty());
     }
 }
