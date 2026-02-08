@@ -666,6 +666,26 @@ mod tests {
         assert_eq!(cli.thinking.as_deref(), Some("high"));
         assert_eq!(cli.message_args(), vec!["solve this problem"]);
     }
+
+    // ── 12. Extension policy flag ───────────────────────────────────
+
+    #[test]
+    fn extension_policy_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--extension-policy", "safe"]);
+        assert_eq!(cli.extension_policy.as_deref(), Some("safe"));
+    }
+
+    #[test]
+    fn extension_policy_flag_permissive() {
+        let cli = Cli::parse_from(["pi", "--extension-policy", "permissive"]);
+        assert_eq!(cli.extension_policy.as_deref(), Some("permissive"));
+    }
+
+    #[test]
+    fn extension_policy_flag_absent() {
+        let cli = Cli::parse_from(["pi"]);
+        assert!(cli.extension_policy.is_none());
+    }
 }
 
 /// Package management subcommands
