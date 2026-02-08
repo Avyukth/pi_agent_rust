@@ -86,6 +86,14 @@ fn main_impl() -> Result<()> {
                     return Ok(());
                 }
             }
+            cli::Commands::Doctor {
+                path,
+                format,
+                policy,
+            } => {
+                handle_doctor(&cwd, path, format, policy.as_deref())?;
+                return Ok(());
+            }
             _ => {}
         }
     }
