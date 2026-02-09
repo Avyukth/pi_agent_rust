@@ -22,7 +22,9 @@ use pi::model::{
     UserContent,
 };
 use pi::provider::{Context, Provider, StreamOptions};
-use pi::session::{Session, SessionEntry, SessionMessage, encode_cwd};
+use pi::session::{Session, SessionEntry, SessionMessage};
+#[cfg(unix)]
+use pi::session::encode_cwd;
 use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::BTreeMap;
