@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.provenance_verification.v1",
-  "generated_at": "2026-02-08T21:28:02.766619840+00:00",
+  "generated_at": "2026-02-09T05:04:52.502004856+00:00",
   "summary": {
     "total_artifacts": 208,
     "verified_ok": 208,
@@ -816,9 +816,9 @@
         "directory_exists": true,
         "id_naming_valid": true,
         "directory_layout_valid": true,
-        "on_disk_checksum": "8ccb331d582aa712c55da71b83a5a1d941e7469b673c76c30170974c2ebfa950",
-        "master_catalog_checksum": "8ccb331d582aa712c55da71b83a5a1d941e7469b673c76c30170974c2ebfa950",
-        "provenance_checksum": "8ccb331d582aa712c55da71b83a5a1d941e7469b673c76c30170974c2ebfa950",
+        "on_disk_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
+        "master_catalog_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
+        "provenance_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
         "checksums_consistent": true,
         "has_source_url": true,
         "has_license": true
@@ -2601,9 +2601,9 @@
         "directory_exists": true,
         "id_naming_valid": true,
         "directory_layout_valid": true,
-        "on_disk_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
-        "master_catalog_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
-        "provenance_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
+        "on_disk_checksum": "fe664f6434f7532d6751f29f43ab04131567e05644009651ceda5cb322a72adc",
+        "master_catalog_checksum": "fe664f6434f7532d6751f29f43ab04131567e05644009651ceda5cb322a72adc",
+        "provenance_checksum": "fe664f6434f7532d6751f29f43ab04131567e05644009651ceda5cb322a72adc",
         "checksums_consistent": true,
         "has_source_url": true,
         "has_license": true

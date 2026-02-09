@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-08T21:29:17Z
+> Generated: 2026-02-09T05:06:08Z
 
 ## Summary
 
@@ -40,7 +40,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 44 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 47 | PASS | No |
 
 ## Policy
 
@@ -59,7 +59,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | 12.9 | PASS | Yes |
+| `binary_size_release` | release binary size | 20 MB | 13.0 | PASS | Yes |
 
 ## Protocol
 

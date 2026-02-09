@@ -156,6 +156,16 @@ pub struct CompatibilityScanner {
     root: PathBuf,
 }
 
+const MARKER_IMPORT: u16 = 1 << 0;
+const MARKER_REQUIRE: u16 = 1 << 1;
+const MARKER_PI: u16 = 1 << 2;
+const MARKER_PROCESS_ENV: u16 = 1 << 3;
+const MARKER_PROCESS: u16 = 1 << 4;
+const MARKER_FUNCTION: u16 = 1 << 5;
+const MARKER_EVAL: u16 = 1 << 6;
+const MARKER_BINDING: u16 = 1 << 7;
+const MARKER_DLOPEN: u16 = 1 << 8;
+
 impl CompatibilityScanner {
     #[must_use]
     pub const fn new(root: PathBuf) -> Self {
@@ -296,30 +306,68 @@ impl CompatibilityScanner {
                 continue;
             }
 
-            let has_import_markers = scan_text.contains("import") || scan_text.contains("require");
-            if has_import_markers {
+            let markers = Self::detect_scan_markers(scan_text);
+            if markers & (MARKER_IMPORT | MARKER_REQUIRE) != 0 {
                 Self::scan_imports_in_line(
                     &rel, line_no, scan_text, caps, rewrites, forbidden, flagged,
                 );
             }
 
-            let has_capability_markers =
-                scan_text.contains("pi") || scan_text.contains("process.env");
-            if has_capability_markers {
+            if markers & (MARKER_PI | MARKER_PROCESS_ENV) != 0 {
                 Self::scan_pi_apis_in_line(&rel, line_no, scan_text, caps);
             }
 
-            let has_flagged_markers = scan_text.contains("Function") || scan_text.contains("eval");
-            if has_flagged_markers {
+            if markers & (MARKER_FUNCTION | MARKER_EVAL) != 0 {
                 Self::scan_flagged_apis_in_line(&rel, line_no, scan_text, flagged);
             }
 
-            let has_forbidden_markers = scan_text.contains("process")
-                && (scan_text.contains("binding") || scan_text.contains("dlopen"));
-            if has_forbidden_markers {
+            if (markers & MARKER_PROCESS) != 0 && (markers & (MARKER_BINDING | MARKER_DLOPEN) != 0)
+            {
                 Self::scan_forbidden_patterns_in_line(&rel, line_no, scan_text, forbidden);
             }
         }
+    }
+
+    #[must_use]
+    fn detect_scan_markers(text: &str) -> u16 {
+        let bytes = text.as_bytes();
+        let mut markers = 0_u16;
+        let mut idx = 0;
+
+        while idx < bytes.len() {
+            match bytes[idx] {
+                b'i' if bytes[idx..].starts_with(b"import") => markers |= MARKER_IMPORT,
+                b'r' if bytes[idx..].starts_with(b"require") => markers |= MARKER_REQUIRE,
+                b'p' => {
+                    if bytes[idx..].starts_with(b"pi") {
+                        markers |= MARKER_PI;
+                    }
+                    if bytes[idx..].starts_with(b"process") {
+                        markers |= MARKER_PROCESS;
+                        if bytes[idx..].starts_with(b"process.env") {
+                            markers |= MARKER_PROCESS_ENV;
+                        }
+                    }
+                }
+                b'F' if bytes[idx..].starts_with(b"Function") => markers |= MARKER_FUNCTION,
+                b'e' if bytes[idx..].starts_with(b"eval") => markers |= MARKER_EVAL,
+                b'b' if bytes[idx..].starts_with(b"binding") => markers |= MARKER_BINDING,
+                b'd' if bytes[idx..].starts_with(b"dlopen") => markers |= MARKER_DLOPEN,
+                _ => {}
+            }
+
+            if (markers & (MARKER_IMPORT | MARKER_REQUIRE) != 0)
+                && (markers & (MARKER_PI | MARKER_PROCESS_ENV) != 0)
+                && (markers & (MARKER_FUNCTION | MARKER_EVAL) != 0)
+                && (markers & MARKER_PROCESS != 0)
+                && (markers & (MARKER_BINDING | MARKER_DLOPEN) != 0)
+            {
+                break;
+            }
+            idx += 1;
+        }
+
+        markers
     }
 
     #[allow(clippy::too_many_arguments)]

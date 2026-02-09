@@ -1286,7 +1286,7 @@ a2d37dfdec748eadc271b715b11fa299a4c358244981b7b52f520843bf54e6ae  npm/zenobius-p
 d5c850ba08c22f1780392f7f63d24ad0c6a8d1e97c042aa5cd51ab301cc66d2f  npm/zenobius-pi-dcp/.mise/tasks/format
 931379e53c364306931b05742e65504b10b2e6202a397dac96cf8412917292d8  npm/zenobius-pi-dcp/.mise/tasks/link
 a47f82d470a1069cc1aad7916d8863bc0d078e7190ea3b4cff887230becf20b7  npm/zenobius-pi-dcp/.mise/tasks/lint
-876972d45b83e843d34d4e23142aa2cec73e0c7409a76e2945b98d43f69406c1  npm/zenobius-pi-dcp/.mise/tasks/lint:fix
+876972d45b83e843d34d4e23142aa2cec73e0c7409a76e2945b98d43f69406c1  npm/zenobius-pi-dcp/.mise/tasks/lint__fix
 8bf77fa1d42c78e813c55cc9d8f2cff5ca72e872ecae53f3f2b57337b6add662  npm/zenobius-pi-dcp/.mise/tasks/pkgjsonlint
 424f3bd571d744f1de94470394ad28b4b6fc3873c310370140db0392e0d3c31f  npm/zenobius-pi-dcp/.mise/tasks/prepare
 12a9d4aa165c110396c7e726b014dddd15a35e296f406fa67b05345bbe3b0f11  npm/zenobius-pi-dcp/.mise/tasks/publish

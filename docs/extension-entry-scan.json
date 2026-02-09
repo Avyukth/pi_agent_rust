@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1402,
+    "total_files": 1401,
     "entry_points": 401,
-    "sub_modules": 876,
+    "sub_modules": 875,
     "non_extensions": 119,
     "unknown": 6,
     "by_confidence": {
-      "high": 1298,
+      "high": 1297,
       "low": 14,
       "medium": 90
     },
@@ -35,9 +35,9 @@
         "sub_modules": 374
       },
       "official-pi-mono": {
-        "total_files": 89,
+        "total_files": 88,
         "entry_points": 81,
-        "sub_modules": 7
+        "sub_modules": 6
       },
       "third-party-github": {
         "total_files": 509,
@@ -8102,14 +8102,6 @@
         "ExtensionAPI_type",
         "registerCommand",
         "ui_api"
-      ]
-    },
-    {
-      "path": "shared/index.ts",
-      "classification": "sub_module",
-      "confidence": "high",
-      "patterns_found": [
-        "named_exports"
       ]
     },
     {
