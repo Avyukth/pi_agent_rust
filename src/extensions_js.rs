@@ -8174,6 +8174,7 @@ export function existsSync(path) {
 export function readFileSync(path, encoding) {
   const resolved = __pi_vfs.resolvePath(path, true);
   let bytes = __pi_vfs.files.get(resolved);
+  let hostError;
   if (!bytes && typeof globalThis.__pi_host_read_file_sync === "function") {
     try {
       const content = globalThis.__pi_host_read_file_sync(resolved);
@@ -8185,11 +8186,13 @@ export function readFileSync(path, encoding) {
       if (message.includes("host read denied")) {
         throw e;
       }
+      hostError = message;
       /* fall through to ENOENT */
     }
   }
   if (!bytes) {
-    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'`);
+    const detail = hostError ? ` (host: ${hostError})` : "";
+    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'${detail}`);
   }
   return __pi_vfs.decodeBytes(bytes, encoding);
 }
