@@ -3422,6 +3422,7 @@ impl AgentSession {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn enable_extensions_with_policy(
         &mut self,
         enabled_tools: &[&str],
@@ -3496,6 +3497,14 @@ impl AgentSession {
 
         if !js_specs.is_empty() {
             manager.load_js_extensions(js_specs).await?;
+        }
+
+        // Drain and log auto-repair diagnostics (bd-k5q5.8.11).
+        if let Some(rt) = manager.js_runtime() {
+            let events = rt.drain_repair_events().await;
+            if !events.is_empty() {
+                log_repair_diagnostics(&events);
+            }
         }
 
         #[cfg(feature = "wasm-host")]
@@ -3780,6 +3789,65 @@ impl AgentSession {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Log a summary of auto-repair events that fired during extension loading.
+///
+/// Default: one-line summary.  Set `PI_AUTO_REPAIR_VERBOSE=1` for per-extension
+/// detail.  Structured tracing events are always emitted regardless of verbosity.
+fn log_repair_diagnostics(events: &[crate::extensions_js::ExtensionRepairEvent]) {
+    use std::collections::BTreeMap;
+
+    // Always emit structured tracing events for each repair.
+    for ev in events {
+        tracing::info!(
+            event = "extension.auto_repair",
+            extension_id = %ev.extension_id,
+            pattern = %ev.pattern,
+            success = ev.success,
+            original_error = %ev.original_error,
+            repair_action = %ev.repair_action,
+        );
+    }
+
+    // Group by pattern for the summary line.
+    let mut by_pattern: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for ev in events {
+        by_pattern
+            .entry(ev.pattern.to_string())
+            .or_default()
+            .push(&ev.extension_id);
+    }
+
+    let verbose = std::env::var("PI_AUTO_REPAIR_VERBOSE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+    if verbose {
+        eprintln!(
+            "[auto-repair] {} extension{} auto-repaired:",
+            events.len(),
+            if events.len() == 1 { "" } else { "s" }
+        );
+        for ev in events {
+            eprintln!(
+                "  {}: {} ({})",
+                ev.pattern, ev.extension_id, ev.repair_action
+            );
+        }
+    } else {
+        // Compact one-line summary.
+        let patterns: Vec<String> = by_pattern
+            .iter()
+            .map(|(pat, ids)| format!("{pat}:{}", ids.len()))
+            .collect();
+        tracing::info!(
+            event = "extension.auto_repair.summary",
+            count = events.len(),
+            patterns = %patterns.join(", "),
+            "auto-repaired {} extension(s)",
+            events.len(),
+        );
+    }
+}
 
 /// Extract tool calls from content blocks.
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
