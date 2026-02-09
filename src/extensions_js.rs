@@ -11992,21 +11992,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                                 std::fs::canonicalize(ancestor)
                                                     .map(crate::extensions::strip_unc_prefix)
                                             {
-                                                if canonical_ancestor
-                                                    .starts_with(&workspace_root)
-                                                {
+                                                if canonical_ancestor.starts_with(&workspace_root) {
                                                     return Ok(requested_abs.clone());
                                                 }
-                                                if let Ok(roots) =
-                                                    allowed_read_roots.lock()
-                                                {
+                                                if let Ok(roots) = allowed_read_roots.lock() {
                                                     for root in roots.iter() {
-                                                        if canonical_ancestor
-                                                            .starts_with(root)
-                                                        {
-                                                            return Ok(
-                                                                requested_abs.clone(),
-                                                            );
+                                                        if canonical_ancestor.starts_with(root) {
+                                                            return Ok(requested_abs.clone());
                                                         }
                                                     }
                                                 }
