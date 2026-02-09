@@ -11978,23 +11978,39 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 .map(crate::extensions::strip_unc_prefix)
                                 .or_else(|err| {
                                     if err.kind() == std::io::ErrorKind::NotFound {
-                                        if let Some(parent) = requested_abs.parent() {
-                                            if let Ok(canonical_parent) =
-                                                std::fs::canonicalize(parent)
+                                        // Walk up the ancestor chain to find the nearest
+                                        // existing directory.  This handles cases where
+                                        // intermediate directories are missing (e.g.
+                                        // form/index.html where form/ doesn't exist).
+                                        let mut ancestor = requested_abs.as_path();
+                                        loop {
+                                            ancestor = match ancestor.parent() {
+                                                Some(p) if !p.as_os_str().is_empty() => p,
+                                                _ => break,
+                                            };
+                                            if let Ok(canonical_ancestor) =
+                                                std::fs::canonicalize(ancestor)
                                                     .map(crate::extensions::strip_unc_prefix)
                                             {
-                                                // Check workspace root
-                                                if canonical_parent.starts_with(&workspace_root) {
+                                                if canonical_ancestor
+                                                    .starts_with(&workspace_root)
+                                                {
                                                     return Ok(requested_abs.clone());
                                                 }
-                                                // Check allowed extension roots
-                                                if let Ok(roots) = allowed_read_roots.lock() {
+                                                if let Ok(roots) =
+                                                    allowed_read_roots.lock()
+                                                {
                                                     for root in roots.iter() {
-                                                        if canonical_parent.starts_with(root) {
-                                                            return Ok(requested_abs.clone());
+                                                        if canonical_ancestor
+                                                            .starts_with(root)
+                                                        {
+                                                            return Ok(
+                                                                requested_abs.clone(),
+                                                            );
                                                         }
                                                     }
                                                 }
+                                                break;
                                             }
                                         }
                                     }
