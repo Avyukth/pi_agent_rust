@@ -1457,10 +1457,12 @@ fn rpc_export_html_empty_session() {
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
 
         let output = harness.temp_path("export.html");
-        let cmd = format!(
-            r#"{{"id":"1","type":"export_html","outputPath":"{}"}}"#,
-            output.display()
-        );
+        let cmd = serde_json::json!({
+            "id": "1",
+            "type": "export_html",
+            "outputPath": output.display().to_string()
+        })
+        .to_string();
         let resp = send_recv(&in_tx, &out_rx, &cmd, "export_html").await;
         assert_ok(&resp, "export_html");
         assert!(resp["data"]["path"].is_string(), "should return path");
