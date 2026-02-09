@@ -1278,7 +1278,12 @@ pub mod snapshot {
             hasher.update(b"file\0");
             hasher.update(rel.as_bytes());
             hasher.update(b"\0");
-            hasher.update(&std::fs::read(path)?);
+            // Strip \r so CRLF (Windows autocrlf) hashes the same as LF (Unix)
+            let content: Vec<u8> = std::fs::read(path)?
+                .into_iter()
+                .filter(|&b| b != b'\r')
+                .collect();
+            hasher.update(&content);
             hasher.update(b"\0");
         }
         Ok(hex_lower(&hasher.finalize()))

@@ -48,7 +48,12 @@ fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
         hasher.update(b"file\0");
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
-        hasher.update(&fs::read(&path)?);
+        // Strip \r so CRLF (Windows autocrlf) hashes the same as LF (Unix)
+        let content: Vec<u8> = fs::read(&path)?
+            .into_iter()
+            .filter(|&b| b != b'\r')
+            .collect();
+        hasher.update(&content);
         hasher.update(b"\0");
     }
 
