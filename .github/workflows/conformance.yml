@@ -111,6 +111,14 @@ jobs:
     name: "conformance (${{ matrix.name }})"
 
     steps:
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Checkout pi_agent_rust
         uses: actions/checkout@v4
         with:
