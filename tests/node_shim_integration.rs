@@ -190,8 +190,10 @@ fn os_platform_matches_process_platform() {
         // On some CI environments, os.platform() and process.platform may
         // be derived from different sources. Accept as long as both are
         // reasonable platform strings.
-        let parts: Vec<&str> = result.split(',').collect();
-        assert!(parts.len() == 2, "unexpected mismatch format: {result}");
+        assert!(
+            result.split(',').count() == 2,
+            "unexpected mismatch format: {result}"
+        );
     } else {
         assert_eq!(result, "true");
     }
