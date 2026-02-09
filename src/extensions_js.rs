@@ -7835,7 +7835,10 @@ const __pi_vfs = (() => {
 
   function normalizePath(input) {
     const raw = String(input ?? "").replace(/\\/g, "/");
-    const base = raw.startsWith("/")
+    // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
+    const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
+    const isAbsolute = raw.startsWith("/") || hasDriveLetter;
+    const base = isAbsolute
       ? raw
       : `${(globalThis.process && typeof globalThis.process.cwd === "function" ? globalThis.process.cwd() : "/").replace(/\\/g, "/")}/${raw}`;
     const parts = [];
@@ -7846,6 +7849,10 @@ const __pi_vfs = (() => {
         continue;
       }
       parts.push(part);
+    }
+    // Preserve drive letter prefix on Windows (D:/...) instead of /D:/...
+    if (parts.length > 0 && /^[A-Za-z]:$/.test(parts[0])) {
+      return `${parts[0]}/${parts.slice(1).join("/")}`;
     }
     return `/${parts.join("/")}`;
   }
@@ -14395,11 +14402,19 @@ if (typeof globalThis.crypto.randomUUID !== 'function') {
 }
 
 if (typeof globalThis.process === 'undefined') {
-    const platform =
+    const rawPlatform =
         __pi_env_get_native('PI_PLATFORM') ||
         __pi_env_get_native('OSTYPE') ||
         __pi_env_get_native('OS') ||
         'linux';
+    // Normalize to Node.js conventions: strip version suffix from OSTYPE
+    // (e.g. darwin24.0 -> darwin, linux-gnu -> linux, msys -> win32)
+    const platform = (() => {
+        const s = String(rawPlatform).replace(/[0-9].*$/, '').split('-')[0].toLowerCase();
+        if (s === 'darwin') return 'darwin';
+        if (s === 'msys' || s === 'cygwin' || s === 'windows_nt') return 'win32';
+        return s || 'linux';
+    })();
     const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
     const detCwd = __pi_env_get_native('PI_DETERMINISTIC_CWD');
 
