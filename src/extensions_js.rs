@@ -5276,9 +5276,9 @@ fn resolve_module_path(base: &str, specifier: &str, repair_mode: RepairMode) -> 
         PathBuf::from(specifier)
     } else if specifier.len() > 2
         && specifier.as_bytes()[1] == b':'
-        && specifier.as_bytes()[2] == b'/'
+        && (specifier.as_bytes()[2] == b'/' || specifier.as_bytes()[2] == b'\\')
     {
-        // Windows absolute path: `C:/Users/...`
+        // Windows absolute path: `C:/Users/...` or `C:\Users\...`
         PathBuf::from(specifier)
     } else if specifier.starts_with('.') {
         let base_path = Path::new(base);
@@ -13427,7 +13427,7 @@ async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
     }
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
-    return await __pi_with_extension_async(record.extensionId, () =>
+    return __pi_with_extension_async(record.extensionId, () =>
         record.execute(tool_call_id, input, undefined, undefined, ctx)
     );
 }
@@ -13440,7 +13440,7 @@ async function __pi_execute_command(command_name, args, ctx_payload) {
     }
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
-    return await __pi_with_extension_async(record.extensionId, () => record.handler(args, ctx));
+    return __pi_with_extension_async(record.extensionId, () => record.handler(args, ctx));
 }
 
 async function __pi_execute_shortcut(key_id, ctx_payload) {
@@ -13451,7 +13451,7 @@ async function __pi_execute_shortcut(key_id, ctx_payload) {
     }
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
-    return await __pi_with_extension_async(record.extensionId, () => record.handler(ctx));
+    return __pi_with_extension_async(record.extensionId, () => record.handler(ctx));
 }
 
 // Hostcall stream class (async iterator for streaming hostcall results)

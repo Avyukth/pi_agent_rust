@@ -247,7 +247,7 @@ async fn run_bench_js(
 
 async fn load_extension(runtime: &PiJsRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
     let ext_id = js_literal(&spec.extension_id)?;
-    let entry = js_literal(&spec.entry_path.display().to_string())?;
+    let entry = js_literal(&spec.entry_path.display().to_string().replace('\\', "/"))?;
     let meta = js_literal(&json!({
         "name": spec.name,
         "version": spec.version,
