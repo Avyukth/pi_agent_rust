@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-09T05:06:08Z
+> Generated: 2026-02-09T06:28:01Z
 
 ## Summary
 
@@ -8,11 +8,11 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| CI-enforced with data | 2 |
+| CI-enforced with data | 1 |
 | CI-enforced FAIL | 0 |
-| PASS | 5 |
+| PASS | 4 |
 | FAIL | 0 |
-| No data | 8 |
+| No data | 9 |
 
 ## Startup
 
@@ -40,7 +40,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 47 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 45 | PASS | No |
 
 ## Policy
 
@@ -59,7 +59,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | 13.0 | PASS | Yes |
+| `binary_size_release` | release binary size | 20 MB | - | NO_DATA | Yes |
 
 ## Protocol
 
