@@ -7849,7 +7849,12 @@ const __pi_vfs = (() => {
   };
 
   function normalizePath(input) {
-    const raw = String(input ?? "").replace(/\\/g, "/");
+    let raw = String(input ?? "").replace(/\\/g, "/");
+    // Strip Windows UNC verbatim prefix that canonicalize() produces.
+    // \\?\C:\... becomes /?/C:/... after separator normalization.
+    if (raw.startsWith("/?/") && raw.length > 5 && /^[A-Za-z]:/.test(raw.substring(3, 5))) {
+      raw = raw.slice(3);
+    }
     // Detect Windows drive-letter absolute paths (e.g. "C:/Users/...")
     const hasDriveLetter = raw.length >= 3 && /^[A-Za-z]:\//.test(raw);
     const isAbsolute = raw.startsWith("/") || hasDriveLetter;
@@ -13216,17 +13221,18 @@ function __pi_snapshot_extensions() {
 }
 
 function __pi_make_extension_theme() {
-    // Minimal theme shim. Legacy emits ANSI; conformance harness should normalize ANSI away.
-    return {
-        fg: (_style, text) => String(text === undefined || text === null ? '' : text),
-        bold: (text) => String(text === undefined || text === null ? '' : text),
-        strikethrough: (text) => String(text === undefined || text === null ? '' : text),
-    };
+    return Object.create(__pi_extension_theme_template);
 }
 
-function __pi_make_extension_ui(hasUI) {
-    const ui = {
-        theme: __pi_make_extension_theme(),
+const __pi_extension_theme_template = {
+    // Minimal theme shim. Legacy emits ANSI; conformance harness should normalize ANSI away.
+    fg: (_style, text) => String(text === undefined || text === null ? '' : text),
+    bold: (text) => String(text === undefined || text === null ? '' : text),
+    strikethrough: (text) => String(text === undefined || text === null ? '' : text),
+};
+
+function __pi_build_extension_ui_template(hasUI) {
+    return {
         select: (title, options) => {
             if (!hasUI) return Promise.resolve(undefined);
             const list = Array.isArray(options) ? options : [];
@@ -13310,6 +13316,17 @@ function __pi_make_extension_ui(hasUI) {
             return pi.ui('custom', payload);
         },
     };
+}
+
+const __pi_extension_ui_templates = {
+    with_ui: __pi_build_extension_ui_template(true),
+    without_ui: __pi_build_extension_ui_template(false),
+};
+
+function __pi_make_extension_ui(hasUI) {
+    const template = hasUI ? __pi_extension_ui_templates.with_ui : __pi_extension_ui_templates.without_ui;
+    const ui = Object.create(template);
+    ui.theme = __pi_make_extension_theme();
     return ui;
 }
 
