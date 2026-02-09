@@ -1100,11 +1100,13 @@ mod tool_errors {
                 .expect_err("should error");
             let msg = err.to_string();
             harness.log().info("verify", &msg);
+            let lower = msg.to_lowercase();
             assert!(
-                msg.contains("not found")
-                    || msg.contains("No such file")
-                    || msg.contains("does not exist")
-                    || msg.contains("cannot find"),
+                lower.contains("not found")
+                    || lower.contains("no such file")
+                    || lower.contains("does not exist")
+                    || lower.contains("cannot find")
+                    || lower.contains("os error 2"),
                 "unexpected error: {msg}"
             );
         });

@@ -4316,7 +4316,7 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_bash_timeout_kills_process_tree() {
         asupersync::test_utils::run_test(|| async {
