@@ -753,6 +753,7 @@ fn ext_memory_stress_inline() {
 
 /// Verify that `/proc/self/statm` is readable and produces sane data.
 #[test]
+#[cfg(target_os = "linux")]
 fn statm_is_readable() {
     let result = read_statm();
     assert!(result.is_some(), "/proc/self/statm should be readable");

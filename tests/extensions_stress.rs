@@ -53,7 +53,11 @@ const MAX_PROFILE_ERROR_RATE_PCT: f64 = 25.0;
 /// pressure, different allocator fragmentation).  Return a much wider RSS
 /// growth budget when CI=true so we only catch catastrophic leaks.
 fn effective_rss_budget() -> f64 {
-    if std::env::var("CI").is_ok() { 10.0 } else { MAX_RSS_GROWTH_PCT }
+    if std::env::var("CI").is_ok() {
+        10.0
+    } else {
+        MAX_RSS_GROWTH_PCT
+    }
 }
 
 // ─── Helper Types ───────────────────────────────────────────────────────────
@@ -1144,7 +1148,11 @@ fn stress_extension_load_unload_cycle() {
     if initial_rss > 0 {
         #[allow(clippy::cast_precision_loss)]
         let growth = (final_rss.saturating_sub(initial_rss) as f64) / (initial_rss as f64);
-        let budget = if std::env::var("CI").is_ok() { 10.0 } else { 0.50 };
+        let budget = if std::env::var("CI").is_ok() {
+            10.0
+        } else {
+            0.50
+        };
         assert!(
             growth <= budget,
             "RSS after {CYCLES} load/unload cycles should not grow >{:.0}% (got {:.1}%)",

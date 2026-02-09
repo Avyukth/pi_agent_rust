@@ -6276,7 +6276,8 @@ async fn load_one_extension(
         }
     }
 
-    let entry_specifier = spec.entry_path.display().to_string();
+    // QuickJS module resolver requires forward-slash paths; convert backslashes on Windows.
+    let entry_specifier = spec.entry_path.display().to_string().replace('\\', "/");
     let meta = json!({
         "name": spec.name,
         "version": spec.version,

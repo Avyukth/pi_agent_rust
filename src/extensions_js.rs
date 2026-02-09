@@ -18057,9 +18057,15 @@ export default ConfigLoader;
             assert!(r["totalmem"].as_f64().unwrap() > 0.0);
             assert!(r["freemem"].as_f64().unwrap() > 0.0);
             // EOL is correct for platform
-            assert_eq!(r["eol"], serde_json::json!("\n"));
+            let expected_eol = if cfg!(windows) { "\r\n" } else { "\n" };
+            assert_eq!(r["eol"], serde_json::json!(expected_eol));
             assert_eq!(r["endianness"], serde_json::json!("LE"));
-            assert_eq!(r["devNull"], serde_json::json!("/dev/null"));
+            let expected_dev_null = if cfg!(windows) {
+                "\\\\.\\NUL"
+            } else {
+                "/dev/null"
+            };
+            assert_eq!(r["devNull"], serde_json::json!(expected_dev_null));
             // userInfo has real uid and non-empty username
             assert!(r["uid"].is_number());
             assert!(r["username"].as_str().is_some_and(|s| !s.is_empty()));
@@ -19683,8 +19689,14 @@ export default ConfigLoader;
             assert_eq!(r["userInfoHasShell"], serde_json::json!(true));
             // endianness / EOL / devNull / constants
             assert_eq!(r["endianness"], serde_json::json!("LE"));
-            assert_eq!(r["eol"], serde_json::json!("\n"));
-            assert_eq!(r["devNull"], serde_json::json!("/dev/null"));
+            let expected_eol = if cfg!(windows) { "\r\n" } else { "\n" };
+            assert_eq!(r["eol"], serde_json::json!(expected_eol));
+            let expected_dev_null = if cfg!(windows) {
+                "\\\\.\\NUL"
+            } else {
+                "/dev/null"
+            };
+            assert_eq!(r["devNull"], serde_json::json!(expected_dev_null));
             assert_eq!(r["hasConstants"], serde_json::json!(true));
         });
     }

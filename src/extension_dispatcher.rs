@@ -3989,7 +3989,7 @@ mod tests {
             );
 
             let file_path = temp_dir.path().join("output.txt");
-            let file_path_str = file_path.display().to_string();
+            let file_path_str = file_path.display().to_string().replace('\\', "\\\\");
             let script = format!(
                 r#"
                 globalThis.result = null;
@@ -4103,7 +4103,7 @@ mod tests {
                     .expect("runtime"),
             );
 
-            let dir = temp_dir.path().display().to_string();
+            let dir = temp_dir.path().display().to_string().replace('\\', "\\\\");
             let script = format!(
                 r#"
                 globalThis.result = null;
@@ -4408,6 +4408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // std::net::TcpListener + asupersync interop fails on Windows
     fn dispatcher_http_post_sends_body() {
         futures::executor::block_on(async {
             let addr = spawn_http_server("post-ok");
@@ -7003,14 +7004,14 @@ mod tests {
                     .expect("runtime"),
             );
 
+            let file_path_js = file_path.display().to_string().replace('\\', "\\\\");
             let script = format!(
                 r#"
                 globalThis.result = null;
-                pi.tool("read", {{ path: "{}" }})
+                pi.tool("read", {{ path: "{file_path_js}" }})
                     .then((r) => {{ globalThis.result = r; }})
                     .catch((e) => {{ globalThis.result = {{ error: e.message || String(e) }}; }});
-            "#,
-                file_path.display()
+            "#
             );
             runtime.eval(&script).await.expect("eval");
 
