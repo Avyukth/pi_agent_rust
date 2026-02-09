@@ -10831,7 +10831,7 @@ mod tests {
                     globalThis.timeoutErr = null;
                     (async () => {
                         try {
-                            const stream = pi.exec("sh", ["-c", "sleep 0.25"], { stream: true, timeoutMs: 20 });
+                            const stream = pi.exec("sh", ["-c", "sleep 10"], { stream: true, timeoutMs: 200 });
                             for await (const chunk of stream) {
                                 globalThis.timeoutChunks.push(chunk);
                             }
