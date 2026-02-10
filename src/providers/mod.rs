@@ -126,7 +126,7 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
             _ => {
                 return Err(Error::provider(
                     &entry.model.provider,
-                    format!("Provider not implemented (api: {})", effective_api),
+                    format!("Provider not implemented (api: {effective_api})"),
                 ));
             }
         },
@@ -536,6 +536,7 @@ pub fn create_provider(
             Ok(Arc::new(
                 anthropic::AnthropicProvider::new(entry.model.id.clone())
                     .with_base_url(entry.model.base_url.clone())
+                    .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
         }
@@ -544,6 +545,7 @@ pub fn create_provider(
                 openai::OpenAIProvider::new(entry.model.id.clone())
                     .with_provider_name(entry.model.provider.clone())
                     .with_base_url(normalize_openai_base(&entry.model.base_url))
+                    .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
         }
@@ -552,6 +554,7 @@ pub fn create_provider(
                 openai_responses::OpenAIResponsesProvider::new(entry.model.id.clone())
                     .with_provider_name(entry.model.provider.clone())
                     .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
+                    .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
         }
@@ -559,11 +562,13 @@ pub fn create_provider(
             cohere::CohereProvider::new(entry.model.id.clone())
                 .with_provider_name(entry.model.provider.clone())
                 .with_base_url(normalize_cohere_base(&entry.model.base_url))
+                .with_compat(entry.compat.clone())
                 .with_client(client),
         )),
         ProviderRouteKind::NativeGoogle | ProviderRouteKind::ApiGoogleGenerativeAi => Ok(Arc::new(
             gemini::GeminiProvider::new(entry.model.id.clone())
                 .with_base_url(entry.model.base_url.clone())
+                .with_compat(entry.compat.clone())
                 .with_client(client),
         )),
         ProviderRouteKind::NativeAzureUnsupported => Err(Error::provider(
@@ -1480,5 +1485,181 @@ export default function init(pi) {
             normalize_cohere_base("https://custom-cohere.example.com"),
             "https://custom-cohere.example.com/chat"
         );
+    }
+
+    // ── bd-3uqg.2.4: Compat override propagation ─────────────────────
+
+    use crate::models::CompatConfig;
+
+    fn compat_with_custom_headers() -> CompatConfig {
+        let mut custom = HashMap::new();
+        custom.insert("X-Custom-Header".to_string(), "test-value".to_string());
+        custom.insert("X-Provider-Tag".to_string(), "override".to_string());
+        CompatConfig {
+            custom_headers: Some(custom),
+            ..Default::default()
+        }
+    }
+
+    fn model_entry_with_compat(
+        provider: &str,
+        api: &str,
+        model_id: &str,
+        base_url: &str,
+        compat: CompatConfig,
+    ) -> ModelEntry {
+        let mut entry = model_entry(provider, api, model_id, base_url);
+        entry.compat = Some(compat);
+        entry
+    }
+
+    #[test]
+    fn create_provider_anthropic_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "anthropic",
+            "anthropic-messages",
+            "claude-sonnet-4-5",
+            "https://api.anthropic.com",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("anthropic with compat");
+        assert_eq!(provider.name(), "anthropic");
+    }
+
+    #[test]
+    fn create_provider_openai_completions_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "openai",
+            "openai-completions",
+            "gpt-4o",
+            "https://api.openai.com/v1",
+            CompatConfig {
+                max_tokens_field: Some("max_completion_tokens".to_string()),
+                system_role_name: Some("developer".to_string()),
+                supports_tools: Some(false),
+                ..Default::default()
+            },
+        );
+        let provider = create_provider(&entry, None).expect("openai completions with compat");
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn create_provider_openai_responses_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "openai",
+            "openai-responses",
+            "gpt-4o",
+            "https://api.openai.com/v1",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("openai responses with compat");
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn create_provider_cohere_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "cohere",
+            "cohere-chat",
+            "command-r-plus",
+            "https://api.cohere.com/v2",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("cohere with compat");
+        assert_eq!(provider.name(), "cohere");
+    }
+
+    #[test]
+    fn create_provider_google_accepts_compat_config() {
+        let entry = model_entry_with_compat(
+            "google",
+            "google-generative-ai",
+            "gemini-2.0-flash",
+            "https://generativelanguage.googleapis.com",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("google with compat");
+        assert_eq!(provider.name(), "google");
+    }
+
+    #[test]
+    fn create_provider_fallback_api_routes_accept_compat_config() {
+        // Custom provider using anthropic-messages API fallback
+        let entry = model_entry_with_compat(
+            "custom-anthropic",
+            "anthropic-messages",
+            "my-model",
+            "https://custom.api.com",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("fallback anthropic with compat");
+        assert_eq!(provider.model_id(), "my-model");
+
+        // Custom provider using openai-completions API fallback
+        let entry = model_entry_with_compat(
+            "my-groq-clone",
+            "openai-completions",
+            "llama-3.1",
+            "http://localhost:8080/v1",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("fallback openai with compat");
+        assert_eq!(provider.model_id(), "llama-3.1");
+
+        // Custom provider using cohere-chat API fallback
+        let entry = model_entry_with_compat(
+            "custom-cohere",
+            "cohere-chat",
+            "custom-r",
+            "https://custom-cohere.api.com/v2",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("fallback cohere with compat");
+        assert_eq!(provider.model_id(), "custom-r");
+
+        // Custom provider using google-generative-ai API fallback
+        let entry = model_entry_with_compat(
+            "custom-google",
+            "google-generative-ai",
+            "custom-gemini",
+            "https://custom.google.com",
+            compat_with_custom_headers(),
+        );
+        let provider = create_provider(&entry, None).expect("fallback google with compat");
+        assert_eq!(provider.model_id(), "custom-gemini");
+    }
+
+    #[test]
+    fn create_provider_compat_none_accepted_by_all_routes() {
+        // Verify None compat doesn't break anything (regression guard)
+        let routes = [
+            (
+                "anthropic",
+                "anthropic-messages",
+                "https://api.anthropic.com",
+            ),
+            ("openai", "openai-completions", "https://api.openai.com/v1"),
+            ("openai", "openai-responses", "https://api.openai.com/v1"),
+            ("cohere", "cohere-chat", "https://api.cohere.com/v2"),
+            (
+                "google",
+                "google-generative-ai",
+                "https://generativelanguage.googleapis.com",
+            ),
+        ];
+        for (provider, api, base_url) in routes {
+            let entry = model_entry(provider, api, "test-model", base_url);
+            assert!(
+                entry.compat.is_none(),
+                "expected None compat for {provider}"
+            );
+            let result = create_provider(&entry, None);
+            assert!(
+                result.is_ok(),
+                "create_provider failed for {provider} with None compat: {:?}",
+                result.err()
+            );
+        }
     }
 }

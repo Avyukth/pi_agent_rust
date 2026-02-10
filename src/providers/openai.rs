@@ -12,6 +12,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
     UserContent,
 };
+use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -38,6 +39,7 @@ pub struct OpenAIProvider {
     model: String,
     base_url: String,
     provider: String,
+    compat: Option<CompatConfig>,
 }
 
 impl OpenAIProvider {
@@ -48,6 +50,7 @@ impl OpenAIProvider {
             model: model.into(),
             base_url: OPENAI_API_URL.to_string(),
             provider: "openai".to_string(),
+            compat: None,
         }
     }
 
@@ -75,37 +78,77 @@ impl OpenAIProvider {
         self
     }
 
-    /// Build the request body for the OpenAI API.
-    fn build_request(&self, context: &Context, options: &StreamOptions) -> OpenAIRequest {
-        let messages = Self::build_messages(context);
+    /// Attach provider-specific compatibility overrides.
+    ///
+    /// Overrides are applied during request building (field names, headers,
+    /// capability flags) and response parsing (stop-reason mapping).
+    #[must_use]
+    pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
+        self.compat = compat;
+        self
+    }
 
-        let tools: Option<Vec<OpenAITool>> = if context.tools.is_empty() {
+    /// Build the request body for the OpenAI API.
+    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> OpenAIRequest {
+        let system_role = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.system_role_name.as_deref())
+            .unwrap_or("system");
+        let messages = Self::build_messages_with_role(context, system_role);
+
+        let tools_supported = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_tools)
+            .unwrap_or(true);
+
+        let tools: Option<Vec<OpenAITool>> = if context.tools.is_empty() || !tools_supported {
             None
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
         };
 
+        // Determine which max-tokens field to populate based on compat config.
+        let use_alt_field = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.max_tokens_field.as_deref())
+            .is_some_and(|f| f == "max_completion_tokens");
+
+        let token_limit = options.max_tokens.or(Some(DEFAULT_MAX_TOKENS));
+        let (max_tokens, max_completion_tokens) = if use_alt_field {
+            (None, token_limit)
+        } else {
+            (token_limit, None)
+        };
+
+        let include_usage = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_usage_in_streaming)
+            .unwrap_or(true);
+
         OpenAIRequest {
             model: self.model.clone(),
             messages,
-            max_tokens: options.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+            max_tokens,
+            max_completion_tokens,
             temperature: options.temperature,
             tools,
             stream: true,
-            stream_options: Some(OpenAIStreamOptions {
-                include_usage: true,
-            }),
+            stream_options: Some(OpenAIStreamOptions { include_usage }),
         }
     }
 
-    /// Build the messages array with system prompt prepended.
-    fn build_messages(context: &Context) -> Vec<OpenAIMessage> {
+    /// Build the messages array with system prompt prepended using the given role name.
+    fn build_messages_with_role(context: &Context, system_role: &str) -> Vec<OpenAIMessage> {
         let mut messages = Vec::new();
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(OpenAIMessage {
-                role: "system".to_string(),
+                role: system_role.to_string(),
                 content: Some(OpenAIContent::Text(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
@@ -171,6 +214,16 @@ impl Provider for OpenAIProvider {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
         }
 
+        // Apply provider-specific custom headers from compat config.
+        if let Some(compat) = &self.compat {
+            if let Some(custom_headers) = &compat.custom_headers {
+                for (key, value) in custom_headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
+
+        // Per-request headers from StreamOptions (highest priority).
         for (key, value) in &options.headers {
             request = request.header(key, value);
         }
@@ -528,11 +581,14 @@ where
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-struct OpenAIRequest {
+pub struct OpenAIRequest {
     model: String,
     messages: Vec<OpenAIMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Some providers (e.g., o1-series) use `max_completion_tokens` instead of `max_tokens`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1350,5 +1406,203 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    // ── bd-3uqg.2.4: compat override behavior ──────────────────────
+
+    fn context_with_tools() -> Context {
+        Context {
+            system_prompt: Some("You are helpful.".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Hi".to_string()),
+                timestamp: 0,
+            })],
+            tools: vec![ToolDef {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: json!({"type": "object", "properties": {}}),
+            }],
+        }
+    }
+
+    fn default_stream_options() -> StreamOptions {
+        StreamOptions {
+            max_tokens: Some(1024),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compat_system_role_name_overrides_default() {
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            system_role_name: Some("developer".to_string()),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            value["messages"][0]["role"], "developer",
+            "system message should use overridden role name"
+        );
+    }
+
+    #[test]
+    fn compat_none_uses_default_system_role() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            value["messages"][0]["role"], "system",
+            "default system role should be 'system'"
+        );
+    }
+
+    #[test]
+    fn compat_supports_tools_false_omits_tools() {
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            supports_tools: Some(false),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            value["tools"].is_null(),
+            "tools should be omitted when supports_tools=false"
+        );
+    }
+
+    #[test]
+    fn compat_supports_tools_true_includes_tools() {
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            supports_tools: Some(true),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            value["tools"].is_array(),
+            "tools should be included when supports_tools=true"
+        );
+    }
+
+    #[test]
+    fn compat_max_tokens_field_routes_to_max_completion_tokens() {
+        let provider = OpenAIProvider::new("o1").with_compat(Some(CompatConfig {
+            max_tokens_field: Some("max_completion_tokens".to_string()),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            value["max_tokens"].is_null(),
+            "max_tokens should be absent when routed to max_completion_tokens"
+        );
+        assert_eq!(
+            value["max_completion_tokens"], 1024,
+            "max_completion_tokens should carry the token limit"
+        );
+    }
+
+    #[test]
+    fn compat_default_routes_to_max_tokens() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            value["max_tokens"], 1024,
+            "default should use max_tokens field"
+        );
+        assert!(
+            value["max_completion_tokens"].is_null(),
+            "max_completion_tokens should be absent by default"
+        );
+    }
+
+    #[test]
+    fn compat_supports_usage_in_streaming_false() {
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            supports_usage_in_streaming: Some(false),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(
+            value["stream_options"]["include_usage"], false,
+            "include_usage should be false when supports_usage_in_streaming=false"
+        );
+    }
+
+    #[test]
+    fn compat_combined_overrides() {
+        let provider = OpenAIProvider::new("custom-model").with_compat(Some(CompatConfig {
+            system_role_name: Some("developer".to_string()),
+            max_tokens_field: Some("max_completion_tokens".to_string()),
+            supports_tools: Some(false),
+            supports_usage_in_streaming: Some(false),
+            ..Default::default()
+        }));
+        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let value = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(value["messages"][0]["role"], "developer");
+        assert!(value["max_tokens"].is_null());
+        assert_eq!(value["max_completion_tokens"], 1024);
+        assert!(value["tools"].is_null());
+        assert_eq!(value["stream_options"]["include_usage"], false);
+    }
+
+    #[test]
+    fn compat_custom_headers_injected_into_stream_request() {
+        let mut custom = HashMap::new();
+        custom.insert("X-Custom-Tag".to_string(), "test-123".to_string());
+        custom.insert("X-Provider-Region".to_string(), "us-east-1".to_string());
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("gpt-4o")
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom),
+                ..Default::default()
+            }));
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("x-custom-tag").map(String::as_str),
+            Some("test-123"),
+            "custom header should be present in request"
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("x-provider-region")
+                .map(String::as_str),
+            Some("us-east-1"),
+            "custom header should be present in request"
+        );
     }
 }

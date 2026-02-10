@@ -9,6 +9,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall, Usage,
     UserContent,
 };
+use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ pub struct GeminiProvider {
     client: Client,
     model: String,
     base_url: String,
+    compat: Option<CompatConfig>,
 }
 
 impl GeminiProvider {
@@ -43,6 +45,7 @@ impl GeminiProvider {
             client: Client::new(),
             model: model.into(),
             base_url: GEMINI_API_BASE.to_string(),
+            compat: None,
         }
     }
 
@@ -60,8 +63,15 @@ impl GeminiProvider {
         self
     }
 
+    /// Attach provider-specific compatibility overrides.
+    #[must_use]
+    pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
+        self.compat = compat;
+        self
+    }
+
     /// Build the streaming URL.
-    fn streaming_url(&self, api_key: &str) -> String {
+    pub fn streaming_url(&self, api_key: &str) -> String {
         format!(
             "{}/models/{}:streamGenerateContent?alt=sse&key={}",
             self.base_url, self.model, api_key
@@ -70,7 +80,7 @@ impl GeminiProvider {
 
     /// Build the request body for the Gemini API.
     #[allow(clippy::unused_self)]
-    fn build_request(&self, context: &Context, options: &StreamOptions) -> GeminiRequest {
+    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
         let system_instruction = context.system_prompt.as_ref().map(|s| GeminiContent {
             role: None,
@@ -152,6 +162,16 @@ impl Provider for GeminiProvider {
         // Build request (Content-Type set by .json() below)
         let mut request = self.client.post(&url).header("Accept", "text/event-stream");
 
+        // Apply provider-specific custom headers from compat config.
+        if let Some(compat) = &self.compat {
+            if let Some(custom_headers) = &compat.custom_headers {
+                for (key, value) in custom_headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
+
+        // Per-request headers from StreamOptions (highest priority).
         for (key, value) in &options.headers {
             request = request.header(key, value);
         }
@@ -394,7 +414,7 @@ where
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GeminiRequest {
+pub struct GeminiRequest {
     contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     system_instruction: Option<GeminiContent>,

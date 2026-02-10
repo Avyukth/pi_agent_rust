@@ -9,6 +9,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
     ThinkingLevel, ToolCall, Usage, UserContent,
 };
+use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ pub struct AnthropicProvider {
     client: Client,
     model: String,
     base_url: String,
+    compat: Option<CompatConfig>,
 }
 
 impl AnthropicProvider {
@@ -43,6 +45,7 @@ impl AnthropicProvider {
             client: Client::new(),
             model: model.into(),
             base_url: ANTHROPIC_API_URL.to_string(),
+            compat: None,
         }
     }
 
@@ -60,8 +63,18 @@ impl AnthropicProvider {
         self
     }
 
+    /// Attach provider-specific compatibility overrides.
+    ///
+    /// Overrides are applied during request building (custom headers)
+    /// and can be extended for Anthropic-specific quirks.
+    #[must_use]
+    pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
+        self.compat = compat;
+        self
+    }
+
     /// Build the request body for the Anthropic API.
-    fn build_request(&self, context: &Context, options: &StreamOptions) -> AnthropicRequest {
+    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> AnthropicRequest {
         let messages = context
             .messages
             .iter()
@@ -163,7 +176,16 @@ impl Provider for AnthropicProvider {
             request = request.header("anthropic-beta", "prompt-caching-2024-07-31");
         }
 
-        // Add custom headers
+        // Apply provider-specific custom headers from compat config.
+        if let Some(compat) = &self.compat {
+            if let Some(custom_headers) = &compat.custom_headers {
+                for (key, value) in custom_headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
+
+        // Per-request headers from StreamOptions (highest priority).
         for (key, value) in &options.headers {
             request = request.header(key, value);
         }
@@ -552,7 +574,7 @@ where
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-struct AnthropicRequest {
+pub struct AnthropicRequest {
     model: String,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1615,5 +1637,115 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    // ── bd-3uqg.2.4: Compat custom headers injection ─────────────────
+
+    #[test]
+    fn test_compat_custom_headers_injected_into_request() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+
+        let mut custom = HashMap::new();
+        custom.insert("X-Custom-Tag".to_string(), "anthropic-override".to_string());
+        custom.insert("X-Routing-Hint".to_string(), "us-east-1".to_string());
+        let compat = crate::models::CompatConfig {
+            custom_headers: Some(custom),
+            ..Default::default()
+        };
+
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url(base_url)
+            .with_compat(Some(compat));
+
+        let context = Context {
+            system_prompt: Some("test".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("x-custom-tag").map(String::as_str),
+            Some("anthropic-override"),
+            "compat custom header X-Custom-Tag missing"
+        );
+        assert_eq!(
+            captured.headers.get("x-routing-hint").map(String::as_str),
+            Some("us-east-1"),
+            "compat custom header X-Routing-Hint missing"
+        );
+        // Standard headers should still be present
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("test-key"),
+        );
+    }
+
+    #[test]
+    fn test_compat_none_does_not_affect_headers() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url(base_url)
+            .with_compat(None);
+
+        let context = Context {
+            system_prompt: Some("test".to_string()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })],
+            tools: Vec::new(),
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        // Standard Anthropic headers present, no custom headers
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("test-key"),
+        );
+        assert!(
+            !captured.headers.contains_key("x-custom-tag"),
+            "No custom headers should be present with compat=None"
+        );
     }
 }

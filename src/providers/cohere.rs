@@ -9,6 +9,7 @@ use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
     ToolCall, Usage, UserContent,
 };
+use crate::models::CompatConfig;
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::sse::SseStream;
 use async_trait::async_trait;
@@ -35,6 +36,7 @@ pub struct CohereProvider {
     model: String,
     base_url: String,
     provider: String,
+    compat: Option<CompatConfig>,
 }
 
 impl CohereProvider {
@@ -44,6 +46,7 @@ impl CohereProvider {
             model: model.into(),
             base_url: COHERE_CHAT_API_URL.to_string(),
             provider: "cohere".to_string(),
+            compat: None,
         }
     }
 
@@ -65,7 +68,14 @@ impl CohereProvider {
         self
     }
 
-    fn build_request(&self, context: &Context, options: &StreamOptions) -> CohereRequest {
+    /// Attach provider-specific compatibility overrides.
+    #[must_use]
+    pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
+        self.compat = compat;
+        self
+    }
+
+    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> CohereRequest {
         let messages = build_cohere_messages(context);
 
         let tools: Option<Vec<CohereTool>> = if context.tools.is_empty() {
@@ -86,6 +96,7 @@ impl CohereProvider {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl Provider for CohereProvider {
     fn name(&self) -> &str {
         &self.provider
@@ -133,6 +144,16 @@ impl Provider for CohereProvider {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
         }
 
+        // Apply provider-specific custom headers from compat config.
+        if let Some(compat) = &self.compat {
+            if let Some(custom_headers) = &compat.custom_headers {
+                for (key, value) in custom_headers {
+                    request = request.header(key, value);
+                }
+            }
+        }
+
+        // Per-request headers from StreamOptions (highest priority).
         for (key, value) in &options.headers {
             request = request.header(key, value);
         }
@@ -527,7 +548,7 @@ where
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-struct CohereRequest {
+pub struct CohereRequest {
     model: String,
     messages: Vec<CohereMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
