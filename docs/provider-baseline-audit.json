@@ -1,0 +1,375 @@
+{
+  "audit_version": "1.0",
+  "bead_id": "bd-3uqg.1.2",
+  "generated_at_utc": "2026-02-10T04:35:00Z",
+  "upstream_snapshot_ref": "bd-3uqg.1.1 (provider-upstream-catalog-snapshot.json)",
+  "upstream_canonical_count": 93,
+
+  "pi_provider_support": {
+    "native_provider_modules": [
+      {
+        "provider_id": "anthropic",
+        "struct": "AnthropicProvider",
+        "file": "src/providers/anthropic.rs",
+        "api_family": "anthropic-messages",
+        "base_url": "https://api.anthropic.com/v1/messages",
+        "auth_env_vars": ["ANTHROPIC_API_KEY"],
+        "auth_method": "x-api-key header",
+        "oauth_support": true,
+        "status": "fully-supported"
+      },
+      {
+        "provider_id": "openai",
+        "struct": "OpenAIProvider",
+        "file": "src/providers/openai.rs",
+        "api_family": "openai-completions",
+        "base_url": "https://api.openai.com/v1/chat/completions",
+        "auth_env_vars": ["OPENAI_API_KEY"],
+        "auth_method": "Authorization Bearer",
+        "oauth_support": false,
+        "status": "fully-supported",
+        "notes": "Also serves as base for all OpenAI-compatible providers"
+      },
+      {
+        "provider_id": "openai",
+        "struct": "OpenAIResponsesProvider",
+        "file": "src/providers/openai_responses.rs",
+        "api_family": "openai-responses",
+        "base_url": "https://api.openai.com/v1/responses",
+        "auth_env_vars": ["OPENAI_API_KEY"],
+        "auth_method": "Authorization Bearer",
+        "oauth_support": false,
+        "status": "fully-supported",
+        "notes": "Default for provider=openai in factory selection"
+      },
+      {
+        "provider_id": "google",
+        "struct": "GeminiProvider",
+        "file": "src/providers/gemini.rs",
+        "api_family": "google-generative-ai",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "auth_env_vars": ["GOOGLE_API_KEY"],
+        "auth_method": "URL query param (key=)",
+        "oauth_support": false,
+        "status": "fully-supported"
+      },
+      {
+        "provider_id": "cohere",
+        "struct": "CohereProvider",
+        "file": "src/providers/cohere.rs",
+        "api_family": "cohere-chat",
+        "base_url": "https://api.cohere.com/v2/chat",
+        "auth_env_vars": ["COHERE_API_KEY"],
+        "auth_method": "Authorization Bearer",
+        "oauth_support": false,
+        "status": "fully-supported"
+      },
+      {
+        "provider_id": "azure-openai",
+        "struct": "AzureOpenAIProvider",
+        "file": "src/providers/azure.rs",
+        "api_family": "azure-openai-responses",
+        "base_url": "https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}",
+        "auth_env_vars": ["AZURE_OPENAI_API_KEY"],
+        "auth_method": "api-key header",
+        "oauth_support": false,
+        "status": "fully-supported",
+        "notes": "Requires resource+deployment configuration"
+      }
+    ],
+
+    "extension_provider_module": {
+      "struct": "ExtensionStreamSimpleProvider",
+      "file": "src/providers/mod.rs",
+      "api_family": "dynamic (JS-registered)",
+      "description": "Wraps JS extension-registered providers via pi.registerProvider() with streamSimple generator",
+      "status": "fully-supported",
+      "notes": "Checked first in factory selection; supports OAuth config extraction"
+    },
+
+    "ad_hoc_oai_compatible_providers": [
+      {
+        "provider_id": "groq",
+        "api_family": "openai-completions",
+        "base_url": "https://api.groq.com/openai/v1",
+        "auth_env_vars": ["GROQ_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "deepinfra",
+        "api_family": "openai-completions",
+        "base_url": "https://api.deepinfra.com/v1/openai",
+        "auth_env_vars": ["DEEPINFRA_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "cerebras",
+        "api_family": "openai-completions",
+        "base_url": "https://api.cerebras.ai/v1",
+        "auth_env_vars": ["CEREBRAS_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "openrouter",
+        "api_family": "openai-completions",
+        "base_url": "https://openrouter.ai/api/v1",
+        "auth_env_vars": ["OPENROUTER_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "mistral",
+        "api_family": "openai-completions",
+        "base_url": "https://api.mistral.ai/v1",
+        "auth_env_vars": ["MISTRAL_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "moonshotai",
+        "aliases": ["moonshot", "kimi"],
+        "api_family": "openai-completions",
+        "base_url": "https://api.moonshot.ai/v1",
+        "auth_env_vars": ["MOONSHOT_API_KEY"],
+        "status": "ad-hoc-supported",
+        "upstream_id": "moonshotai"
+      },
+      {
+        "provider_id": "alibaba",
+        "aliases": ["dashscope", "qwen"],
+        "api_family": "openai-completions",
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "auth_env_vars": ["DASHSCOPE_API_KEY"],
+        "status": "ad-hoc-supported",
+        "upstream_id": "alibaba"
+      },
+      {
+        "provider_id": "deepseek",
+        "api_family": "openai-completions",
+        "base_url": "https://api.deepseek.com",
+        "auth_env_vars": ["DEEPSEEK_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "fireworks",
+        "api_family": "openai-completions",
+        "base_url": "https://api.fireworks.ai/inference/v1",
+        "auth_env_vars": ["FIREWORKS_API_KEY"],
+        "status": "ad-hoc-supported",
+        "upstream_id": "fireworks-ai",
+        "notes": "Pi uses 'fireworks', upstream uses 'fireworks-ai'"
+      },
+      {
+        "provider_id": "togetherai",
+        "api_family": "openai-completions",
+        "base_url": "https://api.together.xyz/v1",
+        "auth_env_vars": ["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "perplexity",
+        "api_family": "openai-completions",
+        "base_url": "https://api.perplexity.ai",
+        "auth_env_vars": ["PERPLEXITY_API_KEY"],
+        "status": "ad-hoc-supported"
+      },
+      {
+        "provider_id": "xai",
+        "api_family": "openai-completions",
+        "base_url": "https://api.x.ai/v1",
+        "auth_env_vars": ["XAI_API_KEY"],
+        "status": "ad-hoc-supported"
+      }
+    ],
+
+    "auth_only_entries": [
+      {
+        "provider_id": "google-vertex",
+        "auth_env_vars": ["GOOGLE_CLOUD_API_KEY"],
+        "notes": "Env var mapped but no native provider module. KnownProvider enum + Api enum entries exist (GoogleVertex, BedrockConverseStream)."
+      },
+      {
+        "provider_id": "amazon-bedrock",
+        "auth_env_vars": ["AWS_ACCESS_KEY_ID"],
+        "notes": "Env var mapped but no native provider module. Api::BedrockConverseStream enum exists."
+      },
+      {
+        "provider_id": "github-copilot",
+        "auth_env_vars": ["GITHUB_COPILOT_API_KEY"],
+        "notes": "Env var mapped + KnownProvider enum but no native provider module."
+      }
+    ],
+
+    "known_provider_enum_entries": [
+      "Anthropic", "OpenAI", "Google", "GoogleVertex", "AmazonBedrock",
+      "AzureOpenAI", "GithubCopilot", "XAI", "Groq", "Cerebras",
+      "OpenRouter", "Mistral", "Custom(String)"
+    ],
+
+    "api_enum_entries": [
+      "AnthropicMessages", "OpenAICompletions", "OpenAIResponses",
+      "AzureOpenAIResponses", "BedrockConverseStream", "GoogleGenerativeAI",
+      "GoogleGeminiCli", "GoogleVertex", "Custom(String)"
+    ],
+
+    "factory_selection_order": [
+      "1. Extension providers checked first (provider_has_stream_simple)",
+      "2. Match on entry.model.provider string (anthropic|openai|cohere|google|azure-openai)",
+      "3. Fallback: match on entry.model.api string (anthropic-messages|openai-completions|openai-responses|cohere-chat|google-generative-ai)"
+    ]
+  },
+
+  "gap_diff": {
+    "methodology": "Each upstream canonical provider ID classified against pi_agent_rust support level",
+    "categories": {
+      "fully-supported": "Native provider module with streaming, tool calls, auth",
+      "ad-hoc-supported": "OpenAI-compatible preset in ad_hoc_provider_defaults() with env var auth",
+      "partially-supported": "Auth env var and/or enum entry exists but no provider module",
+      "alias-only": "Pi uses different ID but maps to same provider",
+      "missing": "No support in pi_agent_rust codebase"
+    },
+
+    "classification": [
+      {"upstream_id": "302ai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "abacus", "status": "missing", "notes": "No support"},
+      {"upstream_id": "aihubmix", "status": "missing", "notes": "No support"},
+      {"upstream_id": "alibaba", "status": "ad-hoc-supported", "pi_id": "alibaba", "aliases": ["dashscope", "qwen"]},
+      {"upstream_id": "alibaba-cn", "status": "missing", "notes": "CN variant not distinguished from alibaba"},
+      {"upstream_id": "amazon-bedrock", "status": "partially-supported", "notes": "Auth env var + Api enum but no module"},
+      {"upstream_id": "anthropic", "status": "fully-supported", "pi_id": "anthropic"},
+      {"upstream_id": "azure", "status": "fully-supported", "pi_id": "azure-openai", "notes": "Pi uses 'azure-openai' ID"},
+      {"upstream_id": "azure-cognitive-services", "status": "missing", "notes": "Distinct from azure-openai"},
+      {"upstream_id": "bailing", "status": "missing", "notes": "No support"},
+      {"upstream_id": "baseten", "status": "missing", "notes": "No support"},
+      {"upstream_id": "bedrock", "status": "partially-supported", "notes": "opencode ID; same as amazon-bedrock"},
+      {"upstream_id": "berget", "status": "missing", "notes": "No support"},
+      {"upstream_id": "cerebras", "status": "ad-hoc-supported", "pi_id": "cerebras"},
+      {"upstream_id": "chutes", "status": "missing", "notes": "No support"},
+      {"upstream_id": "cloudflare-ai-gateway", "status": "missing", "notes": "No support"},
+      {"upstream_id": "cloudflare-workers-ai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "cohere", "status": "fully-supported", "pi_id": "cohere"},
+      {"upstream_id": "copilot", "status": "partially-supported", "notes": "opencode ID; maps to github-copilot"},
+      {"upstream_id": "cortecs", "status": "missing", "notes": "No support"},
+      {"upstream_id": "deepinfra", "status": "ad-hoc-supported", "pi_id": "deepinfra"},
+      {"upstream_id": "deepseek", "status": "ad-hoc-supported", "pi_id": "deepseek"},
+      {"upstream_id": "fastrouter", "status": "missing", "notes": "No support"},
+      {"upstream_id": "fireworks-ai", "status": "ad-hoc-supported", "pi_id": "fireworks", "notes": "ID mismatch: pi uses 'fireworks' not 'fireworks-ai'"},
+      {"upstream_id": "firmware", "status": "missing", "notes": "No support"},
+      {"upstream_id": "friendli", "status": "missing", "notes": "No support"},
+      {"upstream_id": "gemini", "status": "fully-supported", "notes": "opencode ID; same as google"},
+      {"upstream_id": "github-copilot", "status": "partially-supported", "notes": "Auth env var + KnownProvider enum but no module"},
+      {"upstream_id": "github-copilot-enterprise", "status": "missing", "notes": "opencode-only ID"},
+      {"upstream_id": "github-models", "status": "missing", "notes": "No support"},
+      {"upstream_id": "gitlab", "status": "missing", "notes": "No support"},
+      {"upstream_id": "google", "status": "fully-supported", "pi_id": "google"},
+      {"upstream_id": "google-vertex", "status": "partially-supported", "notes": "Auth env var + enum but no module"},
+      {"upstream_id": "google-vertex-anthropic", "status": "missing", "notes": "No support"},
+      {"upstream_id": "groq", "status": "ad-hoc-supported", "pi_id": "groq"},
+      {"upstream_id": "helicone", "status": "missing", "notes": "Proxy/gateway provider"},
+      {"upstream_id": "huggingface", "status": "missing", "notes": "No support"},
+      {"upstream_id": "iflowcn", "status": "missing", "notes": "No support"},
+      {"upstream_id": "inception", "status": "missing", "notes": "No support"},
+      {"upstream_id": "inference", "status": "missing", "notes": "No support"},
+      {"upstream_id": "io-net", "status": "missing", "notes": "No support"},
+      {"upstream_id": "jiekou", "status": "missing", "notes": "No support"},
+      {"upstream_id": "kimi-for-coding", "status": "alias-only", "notes": "Pi has moonshotai/moonshot/kimi aliases"},
+      {"upstream_id": "llama", "status": "missing", "notes": "Local runtime, no support"},
+      {"upstream_id": "lmstudio", "status": "missing", "notes": "codex built-in, not in pi"},
+      {"upstream_id": "local", "status": "missing", "notes": "opencode ID for local providers"},
+      {"upstream_id": "lucidquery", "status": "missing", "notes": "No support"},
+      {"upstream_id": "minimax", "status": "missing", "notes": "No support"},
+      {"upstream_id": "minimax-cn", "status": "missing", "notes": "No support"},
+      {"upstream_id": "minimax-cn-coding-plan", "status": "missing", "notes": "Coding-plan variant"},
+      {"upstream_id": "minimax-coding-plan", "status": "missing", "notes": "Coding-plan variant"},
+      {"upstream_id": "mistral", "status": "ad-hoc-supported", "pi_id": "mistral"},
+      {"upstream_id": "moark", "status": "missing", "notes": "No support"},
+      {"upstream_id": "modelscope", "status": "missing", "notes": "No support"},
+      {"upstream_id": "moonshotai", "status": "ad-hoc-supported", "pi_id": "moonshotai", "aliases": ["moonshot", "kimi"]},
+      {"upstream_id": "moonshotai-cn", "status": "missing", "notes": "CN variant not distinguished"},
+      {"upstream_id": "morph", "status": "missing", "notes": "No support"},
+      {"upstream_id": "nano-gpt", "status": "missing", "notes": "No support"},
+      {"upstream_id": "nebius", "status": "missing", "notes": "No support"},
+      {"upstream_id": "nova", "status": "missing", "notes": "No support"},
+      {"upstream_id": "novita-ai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "nvidia", "status": "missing", "notes": "No support"},
+      {"upstream_id": "ollama", "status": "missing", "notes": "codex built-in, not in pi"},
+      {"upstream_id": "ollama-cloud", "status": "missing", "notes": "No support"},
+      {"upstream_id": "openai", "status": "fully-supported", "pi_id": "openai"},
+      {"upstream_id": "opencode", "status": "missing", "notes": "Meta-provider/routing, not a real provider"},
+      {"upstream_id": "openrouter", "status": "ad-hoc-supported", "pi_id": "openrouter"},
+      {"upstream_id": "ovhcloud", "status": "missing", "notes": "No support"},
+      {"upstream_id": "perplexity", "status": "ad-hoc-supported", "pi_id": "perplexity"},
+      {"upstream_id": "poe", "status": "missing", "notes": "No support"},
+      {"upstream_id": "privatemode-ai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "requesty", "status": "missing", "notes": "No support"},
+      {"upstream_id": "sap-ai-core", "status": "missing", "notes": "No support"},
+      {"upstream_id": "scaleway", "status": "missing", "notes": "No support"},
+      {"upstream_id": "siliconflow", "status": "missing", "notes": "No support"},
+      {"upstream_id": "siliconflow-cn", "status": "missing", "notes": "No support"},
+      {"upstream_id": "submodel", "status": "missing", "notes": "No support"},
+      {"upstream_id": "synthetic", "status": "missing", "notes": "No support"},
+      {"upstream_id": "togetherai", "status": "ad-hoc-supported", "pi_id": "togetherai"},
+      {"upstream_id": "upstage", "status": "missing", "notes": "No support"},
+      {"upstream_id": "v0", "status": "missing", "notes": "No support"},
+      {"upstream_id": "venice", "status": "missing", "notes": "No support"},
+      {"upstream_id": "vercel", "status": "missing", "notes": "No support"},
+      {"upstream_id": "vertexai", "status": "partially-supported", "notes": "opencode ID; same as google-vertex"},
+      {"upstream_id": "vivgrid", "status": "missing", "notes": "No support"},
+      {"upstream_id": "vultr", "status": "missing", "notes": "No support"},
+      {"upstream_id": "wandb", "status": "missing", "notes": "No support"},
+      {"upstream_id": "xai", "status": "ad-hoc-supported", "pi_id": "xai"},
+      {"upstream_id": "xiaomi", "status": "missing", "notes": "No support"},
+      {"upstream_id": "zai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "zai-coding-plan", "status": "missing", "notes": "Coding-plan variant"},
+      {"upstream_id": "zenmux", "status": "missing", "notes": "Meta-routing provider"},
+      {"upstream_id": "zhipuai", "status": "missing", "notes": "No support"},
+      {"upstream_id": "zhipuai-coding-plan", "status": "missing", "notes": "Coding-plan variant"}
+    ],
+
+    "summary": {
+      "fully_supported": 7,
+      "ad_hoc_supported": 12,
+      "partially_supported": 5,
+      "alias_only": 1,
+      "missing": 68,
+      "total_upstream": 93
+    },
+
+    "id_mismatches": [
+      {"upstream": "azure", "pi": "azure-openai", "notes": "Pi includes 'openai' suffix"},
+      {"upstream": "fireworks-ai", "pi": "fireworks", "notes": "Pi drops '-ai' suffix"},
+      {"upstream": "amazon-bedrock", "opencode": "bedrock", "notes": "opencode uses shorter ID"},
+      {"upstream": "github-copilot", "opencode": "copilot", "notes": "opencode uses shorter ID"},
+      {"upstream": "google", "opencode": "gemini", "notes": "opencode uses product name"},
+      {"upstream": "google-vertex", "opencode": "vertexai", "notes": "Different naming convention"}
+    ],
+
+    "coverage_by_source": {
+      "models_dev_87": {
+        "supported": 19,
+        "missing": 68,
+        "coverage_pct": 21.8
+      },
+      "opencode_11": {
+        "supported": 8,
+        "partially": 3,
+        "missing": 0,
+        "coverage_pct": 72.7
+      },
+      "codex_3": {
+        "supported": 1,
+        "missing": 2,
+        "coverage_pct": 33.3,
+        "notes": "Only openai; ollama and lmstudio are local-only providers not yet supported"
+      }
+    }
+  },
+
+  "key_architectural_notes": [
+    "Provider trait requires: name(), api(), model_id(), stream() - all 6 native modules implement this",
+    "Factory selection: extension providers checked first, then match provider string, then fallback to api string",
+    "Ad-hoc providers are created on-the-fly via ad_hoc_model_entry() when user specifies a known provider ID with any model",
+    "Extension providers via streamSimple can cover any gap without native code changes",
+    "Api enum has forward-declared entries (BedrockConverseStream, GoogleVertex) without corresponding modules",
+    "KnownProvider enum has entries (AmazonBedrock, GithubCopilot, GoogleVertex) without corresponding modules",
+    "OAuth framework exists for Anthropic + extension providers; other native providers use API key auth only"
+  ]
+}
