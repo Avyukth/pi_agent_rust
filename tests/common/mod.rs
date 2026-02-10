@@ -19,16 +19,23 @@ pub mod logging;
 )]
 pub mod mocks;
 #[cfg(unix)]
+#[allow(dead_code)]
+pub mod scenario_runner;
+#[cfg(unix)]
 pub mod tmux;
+#[allow(dead_code)]
+pub mod transcript_diff;
 
 #[allow(unused_imports)]
 pub use harness::TestHarness;
 #[allow(unused_imports)]
 pub use harness::{
-    LIVE_E2E_GATE_ENV, LIVE_E2E_TIMEOUT, LIVE_SHORT_PROMPT, LiveE2eRegistry, LiveHttpTrace,
-    LiveProviderRun, LiveProviderTarget, LiveStreamSummary, build_live_context,
-    build_live_stream_options, ci_e2e_tests_enabled, create_anthropic_provider,
-    create_deepseek_provider, create_gemini_provider, create_live_provider, create_openai_provider,
+    LIVE_E2E_EXECUTION_MODE, LIVE_E2E_GATE_ENV, LIVE_E2E_MAX_ATTEMPTS, LIVE_E2E_REPLAY_BOUNDARY,
+    LIVE_E2E_RETRY_BACKOFF_MS, LIVE_E2E_RETRYABLE_HTTP_STATUS, LIVE_E2E_TIMEOUT,
+    LIVE_E2E_TRACE_ORIGIN, LIVE_SHORT_PROMPT, LiveE2eRegistry, LiveHttpTrace, LiveProviderRun,
+    LiveProviderTarget, LiveStreamSummary, build_live_context, build_live_stream_options,
+    ci_e2e_tests_enabled, create_anthropic_provider, create_deepseek_provider,
+    create_gemini_provider, create_live_provider, create_openai_provider,
     create_openrouter_provider, create_xai_provider, load_vcr_trace, parse_http_status,
     run_live_provider_target, write_live_provider_runs_jsonl,
 };
