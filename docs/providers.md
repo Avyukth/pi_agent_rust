@@ -45,9 +45,9 @@ Current artifact coverage (`docs/provider-implementation-modes.json`):
 |--------------|---------|------------|-------------------|-----------|------|----------------|---------------------|
 | `anthropic` | - | `anthropic-messages` | `https://api.anthropic.com/v1/messages` | `x-api-key` (`ANTHROPIC_API_KEY`) or `auth.json` OAuth/API key | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
 | `openai` | - | `openai-responses` (default), `openai-completions` (compat) | `https://api.openai.com/v1` (normalized to `/responses` or `/chat/completions`) | `Authorization: Bearer` (`OPENAI_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
-| `google` | - | `google-generative-ai` | `https://generativelanguage.googleapis.com/v1beta` | query key (`GOOGLE_API_KEY`, fallback `GEMINI_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
+| `google` | `gemini` | `google-generative-ai` | `https://generativelanguage.googleapis.com/v1beta` | query key (`GOOGLE_API_KEY`, fallback `GEMINI_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
 | `cohere` | - | `cohere-chat` | `https://api.cohere.com/v2` (normalized to `/chat`) | `Authorization: Bearer` (`COHERE_API_KEY`) | `native-implemented` | Implemented and dispatchable | unit + contract + live-smoke |
-| `azure-openai` | - | Azure chat/completions path | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` | `api-key` header (`AZURE_OPENAI_API_KEY`) | `native-partial` | Module exists; current factory path intentionally returns config/wiring error | unit + contract + live-smoke (after wiring) |
+| `azure-openai` | `azure` | Azure chat/completions path | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` | `api-key` header (`AZURE_OPENAI_API_KEY`) | `native-partial` | Module exists; current factory path intentionally returns config/wiring error | unit + contract + live-smoke (after wiring) |
 | `groq` | - | `openai-completions` | `https://api.groq.com/openai/v1` | `Authorization: Bearer` (`GROQ_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `deepinfra` | - | `openai-completions` | `https://api.deepinfra.com/v1/openai` | `Authorization: Bearer` (`DEEPINFRA_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `cerebras` | - | `openai-completions` | `https://api.cerebras.ai/v1` | `Authorization: Bearer` (`CEREBRAS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
@@ -56,7 +56,7 @@ Current artifact coverage (`docs/provider-implementation-modes.json`):
 | `moonshotai` | `moonshot`, `kimi` | `openai-completions` | `https://api.moonshot.ai/v1` | `Authorization: Bearer` (`MOONSHOT_API_KEY`) | `oai-compatible-preset` (`moonshot`,`kimi` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `dashscope` | `alibaba`, `qwen` | `openai-completions` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `Authorization: Bearer` (`DASHSCOPE_API_KEY`) | `oai-compatible-preset` (`alibaba`,`qwen` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `deepseek` | - | `openai-completions` | `https://api.deepseek.com` | `Authorization: Bearer` (`DEEPSEEK_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
-| `fireworks` | - | `openai-completions` | `https://api.fireworks.ai/inference/v1` | `Authorization: Bearer` (`FIREWORKS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
+| `fireworks` | `fireworks-ai` | `openai-completions` | `https://api.fireworks.ai/inference/v1` | `Authorization: Bearer` (`FIREWORKS_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `togetherai` | - | `openai-completions` | `https://api.together.xyz/v1` | `Authorization: Bearer` (`TOGETHER_API_KEY`, alt `TOGETHER_AI_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `perplexity` | - | `openai-completions` | `https://api.perplexity.ai` | `Authorization: Bearer` (`PERPLEXITY_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
 | `xai` | - | `openai-completions` | `https://api.x.ai/v1` | `Authorization: Bearer` (`XAI_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | unit + contract + live-smoke |
@@ -68,9 +68,9 @@ Provider IDs already recognized in auth/enums but not yet fully dispatchable:
 | ID | Current state | User impact | Required follow-up |
 |----|---------------|-------------|--------------------|
 | `azure-openai` | `native-partial` (implementation exists, factory currently returns error) | Requires manual models/config and cannot use normal provider-name routing yet | Factory wiring + config validation + contract/e2e coverage |
-| `google-vertex` | `missing` (enum/env mapping only) | Cannot route requests through a dedicated Vertex path | Add metadata + provider routing + tests |
-| `amazon-bedrock` | `missing` (enum/env mapping only) | No Bedrock dispatch path despite enum/env references | Add native or adapter implementation + tests |
-| `github-copilot` | `missing` (enum/env mapping only) | No runtime provider selection path | Decide implementation mode + add tests/docs |
+| `google-vertex` (`vertexai`) | `missing` (enum/env mapping only) | Cannot route requests through a dedicated Vertex path | Add metadata + provider routing + tests |
+| `amazon-bedrock` (`bedrock`) | `missing` (enum/env mapping only) | No Bedrock dispatch path despite enum/env references | Add native or adapter implementation + tests |
+| `github-copilot` (`copilot`) | `missing` (enum/env mapping only) | No runtime provider selection path | Decide implementation mode + add tests/docs |
 
 ## Already-Covered vs Missing Snapshot
 
@@ -89,6 +89,12 @@ Not fully covered yet:
   frozen upstream snapshot workflow (`bd-3uqg.1.1`).
 
 ## Provider Selection and Configuration
+
+Credential resolution precedence (runtime):
+1. explicit CLI override (`--api-key`)
+2. provider env vars from metadata (ordered; includes shared fallbacks like `GOOGLE_API_KEY` then `GEMINI_API_KEY`)
+3. persisted `auth.json` credential (`ApiKey` or unexpired OAuth `access_token`)
+4. inline `models.json` `apiKey` fallback (resolved from literal/env/file/shell sources)
 
 Choose provider/model via:
 - CLI flags: `pi --provider openai --model gpt-4o "Hello"`

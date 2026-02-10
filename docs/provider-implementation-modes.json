@@ -147,25 +147,25 @@
       "provider_id": "302ai",
       "canonical_id": "302ai",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No in-repo runtime/auth evidence yet; keep deferred until protocol/auth are verified."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "abacus",
       "canonical_id": "abacus",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No in-repo runtime/auth evidence yet; keep deferred until protocol/auth are verified."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "aihubmix",
       "canonical_id": "aihubmix",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No in-repo runtime/auth evidence yet; keep deferred until protocol/auth are verified."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "alibaba",
@@ -219,9 +219,9 @@
       "provider_id": "bailing",
       "canonical_id": "bailing",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "baseten",
@@ -243,9 +243,9 @@
       "provider_id": "berget",
       "canonical_id": "berget",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "cerebras",
@@ -259,9 +259,9 @@
       "provider_id": "chutes",
       "canonical_id": "chutes",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "cloudflare-ai-gateway",
@@ -299,9 +299,9 @@
       "provider_id": "cortecs",
       "canonical_id": "cortecs",
       "id_kind": "canonical",
-      "profile": "deferred-watchlist",
-      "current_runtime_status": "missing",
-      "rationale": "No runtime/auth evidence beyond upstream catalog listing."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "deepinfra",
@@ -323,9 +323,9 @@
       "provider_id": "fastrouter",
       "canonical_id": "fastrouter",
       "id_kind": "canonical",
-      "profile": "gateway-wrapper-high-risk",
-      "current_runtime_status": "missing",
-      "rationale": "Router-oriented provider likely multiplexes upstream models and needs wrapper diagnostics."
+      "profile": "oai-compatible-preset",
+      "current_runtime_status": "metadata-registered",
+      "rationale": "Batch A1 onboarding: gateway-style router but exposes standard OAI-compatible endpoint. Canonical metadata, env-key, and routing defaults added to PROVIDER_METADATA."
     },
     {
       "provider_id": "fireworks-ai",
@@ -943,25 +943,24 @@
     "classification_profile_counts": {
       "native-established": 4,
       "native-new-high-risk": 11,
-      "oai-compatible-preset": 12,
-      "gateway-wrapper-high-risk": 9,
-      "deferred-watchlist": 53,
+      "oai-compatible-preset": 20,
+      "gateway-wrapper-high-risk": 8,
+      "deferred-watchlist": 46,
       "alias-forwarder": 10
     },
     "bucket_counts": {
       "native-adapter-required": 15,
-      "openai-compatible-preset": 12,
-      "gateway-wrapper-routing": 9,
-      "deferred": 63
+      "openai-compatible-preset": 20,
+      "gateway-wrapper-routing": 8,
+      "deferred": 56
     },
-    "high_risk_provider_count": 20,
+    "high_risk_provider_count": 19,
     "high_risk_provider_ids": [
       "amazon-bedrock",
       "azure",
       "azure-cognitive-services",
       "cloudflare-ai-gateway",
       "cloudflare-workers-ai",
-      "fastrouter",
       "github-copilot",
       "github-models",
       "google-vertex",
