@@ -35,6 +35,9 @@ tests/ext_conformance/reports/*
 .tmp-*
 .white_deer_target/
 
+# Per-agent cargo target directories
+.target-*/
+
 # Patch/merge artifacts
 *.orig
 *.rej
