@@ -344,7 +344,7 @@ fn canonical_scenarios() -> Vec<CanonicalScenario> {
             )],
             tools: vec![tool_add(), tool_echo()],
             expectation: CanonicalExpectation::Stream(StreamExpectations {
-                min_tool_calls: 1,
+                min_tool_calls: 2,
                 allowed_stop_reasons: Some(vec![StopReason::ToolUse]),
                 ..Default::default()
             }),
@@ -477,6 +477,59 @@ fn assert_stream_ok(
         assert!(
             allowed.contains(&reason),
             "{tag}: stop reason {reason:?} not in {allowed:?}"
+        );
+    }
+
+    assert_timeline_shape(tag, summary);
+}
+
+fn assert_timeline_shape(tag: &str, summary: &StreamSummary) {
+    if summary.event_count == 0 {
+        return;
+    }
+
+    assert!(
+        !summary.timeline.is_empty(),
+        "{tag}: non-empty event stream produced an empty timeline"
+    );
+
+    let done_idx = summary.timeline.iter().position(|step| step == "done");
+    let error_idx = summary.timeline.iter().position(|step| step == "error");
+
+    assert!(
+        !(done_idx.is_some() && error_idx.is_some()),
+        "{tag}: timeline cannot contain both done and error terminal events: {:?}",
+        summary.timeline
+    );
+
+    if let Some(idx) = done_idx {
+        assert_eq!(
+            idx + 1,
+            summary.timeline.len(),
+            "{tag}: done must be terminal, timeline={:?}",
+            summary.timeline
+        );
+    }
+
+    if let Some(idx) = error_idx {
+        assert_eq!(
+            idx + 1,
+            summary.timeline.len(),
+            "{tag}: error must be terminal, timeline={:?}",
+            summary.timeline
+        );
+    }
+
+    if summary.has_start {
+        let start_idx = summary
+            .timeline
+            .iter()
+            .position(|step| step == "start")
+            .unwrap_or_else(|| panic!("{tag}: has_start=true but no start event in timeline"));
+        assert_eq!(
+            start_idx, 0,
+            "{tag}: start event must appear first, timeline={:?}",
+            summary.timeline
         );
     }
 }
@@ -693,6 +746,48 @@ fn openai_error_body(status: u16) -> Value {
     })
 }
 
+fn synthetic_tool_arg_value(type_name: Option<&str>) -> Value {
+    match type_name {
+        Some("number" | "integer") => json!(2),
+        Some("boolean") => json!(true),
+        Some("array") => json!([]),
+        Some("object") => json!({}),
+        _ => json!("verification test"),
+    }
+}
+
+fn synthesize_tool_args(tool: &ToolDef) -> Value {
+    let schema = &tool.parameters;
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    let required_fields: Vec<String> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .filter(|fields: &Vec<String>| !fields.is_empty())
+        .unwrap_or_else(|| properties.keys().cloned().collect());
+
+    let mut args = serde_json::Map::new();
+    for field in required_fields {
+        let type_name = properties
+            .get(&field)
+            .and_then(|entry| entry.get("type"))
+            .and_then(Value::as_str);
+        args.insert(field, synthetic_tool_arg_value(type_name));
+    }
+
+    Value::Object(args)
+}
+
 /// Build an OpenAI-compatible SSE response for plain text generation.
 fn openai_text_response(model: &str, text: &str) -> RecordedResponse {
     let chunk_start = json!({
@@ -811,6 +906,112 @@ fn openai_tool_response(model: &str, tool_name: &str, tool_args: &Value) -> Reco
         ],
         body_chunks_base64: None,
     }
+}
+
+fn openai_tool_response_multiple(model: &str, tools: &[ToolDef]) -> RecordedResponse {
+    let selected: Vec<&ToolDef> = if tools.is_empty() {
+        Vec::new()
+    } else {
+        tools.iter().take(2).collect()
+    };
+
+    let chunk_start_calls: Vec<Value> = selected
+        .iter()
+        .enumerate()
+        .map(|(idx, tool)| {
+            json!({
+                "index": idx,
+                "id": format!("call_verify_{}_{}", tool.name, idx),
+                "type": "function",
+                "function": {"name": tool.name, "arguments": ""}
+            })
+        })
+        .collect();
+
+    let chunk_args_calls: Vec<Value> = selected
+        .iter()
+        .enumerate()
+        .map(|(idx, tool)| {
+            let args = serde_json::to_string(&synthesize_tool_args(tool))
+                .unwrap_or_else(|_| "{}".to_string());
+            json!({
+                "index": idx,
+                "function": {"arguments": args}
+            })
+        })
+        .collect();
+
+    let chunk_start = json!({
+        "id": "chatcmpl-verify-003",
+        "object": "chat.completion.chunk",
+        "created": 1_738_875_600,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": chunk_start_calls
+            },
+            "finish_reason": Value::Null
+        }]
+    });
+    let chunk_args = json!({
+        "id": "chatcmpl-verify-003",
+        "object": "chat.completion.chunk",
+        "created": 1_738_875_600,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": chunk_args_calls
+            },
+            "finish_reason": Value::Null
+        }]
+    });
+    let chunk_done = json!({
+        "id": "chatcmpl-verify-003",
+        "object": "chat.completion.chunk",
+        "created": 1_738_875_600,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 18,
+            "total_tokens": 54
+        }
+    });
+
+    RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            format!("data: {}\n\n", serde_json::to_string(&chunk_start).unwrap()),
+            format!("data: {}\n\n", serde_json::to_string(&chunk_args).unwrap()),
+            format!("data: {}\n\n", serde_json::to_string(&chunk_done).unwrap()),
+            "data: [DONE]\n\n".to_string(),
+        ],
+        body_chunks_base64: None,
+    }
+}
+
+fn openai_tool_response_for_scenario(
+    model: &str,
+    scenario: &CanonicalScenario,
+) -> RecordedResponse {
+    if scenario.tag == "tool_call_multiple" {
+        return openai_tool_response_multiple(model, &scenario.tools);
+    }
+    let tool = scenario.tools.first();
+    let tool_name = tool.map_or("echo", |item| item.name.as_str());
+    let tool_args = tool.map_or_else(
+        || json!({"text": "verification test"}),
+        synthesize_tool_args,
+    );
+    openai_tool_response(model, tool_name, &tool_args)
 }
 
 /// Generate an error fixture cassette for the Bedrock Converse JSON format.
@@ -1500,15 +1701,7 @@ mod copilot_smoke {
                 ],
                 CanonicalExpectation::Stream(exp) => {
                     let response = if exp.min_tool_calls > 0 {
-                        let tool_name = scenario
-                            .tools
-                            .first()
-                            .map_or("echo", |tool| tool.name.as_str());
-                        openai_tool_response(
-                            TEST_MODEL,
-                            tool_name,
-                            &json!({"text": "verification test"}),
-                        )
+                        openai_tool_response_for_scenario(TEST_MODEL, scenario)
                     } else if exp.require_unicode {
                         openai_text_response(TEST_MODEL, "日本語テスト — émojis: 🦀🔥")
                     } else {
@@ -1942,12 +2135,7 @@ mod openai_smoke {
                 },
                 CanonicalExpectation::Stream(exp) => {
                     if exp.min_tool_calls > 0 {
-                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
-                        openai_tool_response(
-                            TEST_MODEL,
-                            tool_name,
-                            &json!({"text": "verification test"}),
-                        )
+                        openai_tool_response_for_scenario(TEST_MODEL, scenario)
                     } else if exp.require_unicode {
                         openai_text_response(TEST_MODEL, "日本語テスト — émojis: 🦀🔥")
                     } else {
@@ -2036,6 +2224,25 @@ mod openai_smoke {
             .expect("runtime")
             .block_on(async {
                 let harness = TestHarness::new("verify_openai_tool_call_single");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn openai_tool_call_multiple() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "tool_call_multiple")
+            .unwrap();
+        ensure_fixture("tool_call_multiple", scenario);
+        let provider = build_provider("tool_call_multiple");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_openai_tool_call_multiple");
                 run_canonical_scenario(&provider, scenario, &harness).await;
             });
     }
@@ -2134,12 +2341,7 @@ mod sap_ai_core_smoke {
                 },
                 CanonicalExpectation::Stream(exp) => {
                     if exp.min_tool_calls > 0 {
-                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
-                        openai_tool_response(
-                            TEST_DEPLOYMENT,
-                            tool_name,
-                            &json!({"text": "verification test"}),
-                        )
+                        openai_tool_response_for_scenario(TEST_DEPLOYMENT, scenario)
                     } else if exp.require_unicode {
                         openai_text_response(TEST_DEPLOYMENT, "日本語テスト — émojis: 🦀🔥")
                     } else {
@@ -2234,6 +2436,25 @@ mod sap_ai_core_smoke {
             .expect("runtime")
             .block_on(async {
                 let harness = TestHarness::new("verify_sap_ai_core_tool_call_single");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn sap_ai_core_tool_call_multiple() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "tool_call_multiple")
+            .unwrap();
+        ensure_fixture("tool_call_multiple", scenario);
+        let provider = build_provider("tool_call_multiple");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_sap_ai_core_tool_call_multiple");
                 run_canonical_scenario(&provider, scenario, &harness).await;
             });
     }
@@ -2351,12 +2572,7 @@ mod wave_b1_smoke {
                 },
                 CanonicalExpectation::Stream(exp) => {
                     if exp.min_tool_calls > 0 {
-                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
-                        openai_tool_response(
-                            model,
-                            tool_name,
-                            &json!({"text": "verification test"}),
-                        )
+                        openai_tool_response_for_scenario(model, scenario)
                     } else if exp.require_unicode {
                         openai_text_response(model, "日本語テスト — émojis: 🦀🔥")
                     } else {
@@ -2562,6 +2778,125 @@ mod wave_b1_smoke {
         }
     }
 
+    fn anthropic_multi_tool_sse(model: &str, tools: &[ToolDef]) -> RecordedResponse {
+        let tool0 = tools.first().expect("need at least 1 tool");
+        let tool1 = tools.get(1).unwrap_or(tool0);
+        let args0 = super::synthesize_tool_args(tool0);
+        let args1 = super::synthesize_tool_args(tool1);
+        let args0_str = serde_json::to_string(&args0).unwrap_or_else(|_| "{}".to_string());
+        let args1_str = serde_json::to_string(&args1).unwrap_or_else(|_| "{}".to_string());
+
+        let msg_start = format!(
+            "event: message_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_verify_b1_003",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": 30, "output_tokens": 1}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block0_start = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": format!("toolu_verify_b1_{}", tool0.name),
+                    "name": tool0.name,
+                    "input": {}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block0_delta = format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": args0_str}
+            }))
+            .unwrap_or_default()
+        );
+        let block0_stop = format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_stop",
+                "index": 0
+            }))
+            .unwrap_or_default()
+        );
+        let block1_start = format!(
+            "event: content_block_start\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": format!("toolu_verify_b1_{}", tool1.name),
+                    "name": tool1.name,
+                    "input": {}
+                }
+            }))
+            .unwrap_or_default()
+        );
+        let block1_delta = format!(
+            "event: content_block_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": args1_str}
+            }))
+            .unwrap_or_default()
+        );
+        let block1_stop = format!(
+            "event: content_block_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "content_block_stop",
+                "index": 1
+            }))
+            .unwrap_or_default()
+        );
+        let msg_delta = format!(
+            "event: message_delta\ndata: {}\n\n",
+            serde_json::to_string(&json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": Value::Null},
+                "usage": {"output_tokens": 18}
+            }))
+            .unwrap_or_default()
+        );
+        let msg_stop = format!(
+            "event: message_stop\ndata: {}\n\n",
+            serde_json::to_string(&json!({"type": "message_stop"})).unwrap_or_default()
+        );
+
+        RecordedResponse {
+            status: 200,
+            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+            body_chunks: vec![
+                msg_start,
+                block0_start,
+                block0_delta,
+                block0_stop,
+                block1_start,
+                block1_delta,
+                block1_stop,
+                msg_delta,
+                msg_stop,
+            ],
+            body_chunks_base64: None,
+        }
+    }
+
     fn ensure_anthropic_fixture(
         provider_id: &str,
         model: &str,
@@ -2590,7 +2925,9 @@ mod wave_b1_smoke {
                     body_chunks_base64: None,
                 },
                 CanonicalExpectation::Stream(exp) => {
-                    if exp.min_tool_calls > 0 {
+                    if exp.min_tool_calls > 1 {
+                        anthropic_multi_tool_sse(model, &scenario.tools)
+                    } else if exp.min_tool_calls > 0 {
                         let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
                         anthropic_tool_sse(model, tool_name, &json!({"text": "verification test"}))
                     } else if exp.require_unicode {
@@ -2691,6 +3028,16 @@ mod wave_b1_smoke {
     }
 
     #[test]
+    fn b1_alibaba_cn_tool_call_multiple() {
+        run_openai_case(
+            ALIBABA_CN_PROVIDER,
+            ALIBABA_CN_MODEL,
+            ALIBABA_CN_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b1_alibaba_cn_error_auth_401() {
         run_openai_case(
             ALIBABA_CN_PROVIDER,
@@ -2721,6 +3068,16 @@ mod wave_b1_smoke {
     }
 
     #[test]
+    fn b1_kimi_for_coding_tool_call_multiple() {
+        run_anthropic_case(
+            KIMI_FOR_CODING_PROVIDER,
+            KIMI_FOR_CODING_MODEL,
+            KIMI_FOR_CODING_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b1_kimi_for_coding_error_auth_401() {
         run_anthropic_case(
             KIMI_FOR_CODING_PROVIDER,
@@ -2742,6 +3099,16 @@ mod wave_b1_smoke {
             MINIMAX_MODEL,
             MINIMAX_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b1_minimax_tool_call_multiple() {
+        run_anthropic_case(
+            MINIMAX_PROVIDER,
+            MINIMAX_MODEL,
+            MINIMAX_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -2806,6 +3173,16 @@ mod wave_b2_smoke {
     }
 
     #[test]
+    fn b2_modelscope_tool_call_multiple() {
+        run_case(
+            MODELSCOPE_PROVIDER,
+            MODELSCOPE_MODEL,
+            MODELSCOPE_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b2_modelscope_error_auth_401() {
         run_case(
             MODELSCOPE_PROVIDER,
@@ -2836,6 +3213,16 @@ mod wave_b2_smoke {
     }
 
     #[test]
+    fn b2_moonshotai_cn_tool_call_multiple() {
+        run_case(
+            MOONSHOT_CN_PROVIDER,
+            MOONSHOT_CN_MODEL,
+            MOONSHOT_CN_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b2_moonshotai_cn_error_auth_401() {
         run_case(
             MOONSHOT_CN_PROVIDER,
@@ -2861,6 +3248,16 @@ mod wave_b2_smoke {
     }
 
     #[test]
+    fn b2_nebius_tool_call_multiple() {
+        run_case(
+            NEBIUS_PROVIDER,
+            NEBIUS_MODEL,
+            NEBIUS_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b2_nebius_error_auth_401() {
         run_case(NEBIUS_PROVIDER, NEBIUS_MODEL, NEBIUS_URL, "error_auth_401");
     }
@@ -2882,6 +3279,16 @@ mod wave_b2_smoke {
             OVHCLOUD_MODEL,
             OVHCLOUD_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_ovhcloud_tool_call_multiple() {
+        run_case(
+            OVHCLOUD_PROVIDER,
+            OVHCLOUD_MODEL,
+            OVHCLOUD_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -2912,6 +3319,16 @@ mod wave_b2_smoke {
             SCALEWAY_MODEL,
             SCALEWAY_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b2_scaleway_tool_call_multiple() {
+        run_case(
+            SCALEWAY_PROVIDER,
+            SCALEWAY_MODEL,
+            SCALEWAY_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -2972,6 +3389,16 @@ mod wave_c_special_smoke {
     }
 
     #[test]
+    fn c_special_opencode_tool_call_multiple() {
+        run_openai_case(
+            OPENCODE_PROVIDER,
+            OPENCODE_MODEL,
+            OPENCODE_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn c_special_opencode_error_auth_401() {
         run_openai_case(
             OPENCODE_PROVIDER,
@@ -2997,6 +3424,16 @@ mod wave_c_special_smoke {
     }
 
     #[test]
+    fn c_special_vercel_tool_call_multiple() {
+        run_openai_case(
+            VERCEL_PROVIDER,
+            VERCEL_MODEL,
+            VERCEL_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn c_special_vercel_error_auth_401() {
         run_openai_case(VERCEL_PROVIDER, VERCEL_MODEL, VERCEL_URL, "error_auth_401");
     }
@@ -3013,6 +3450,16 @@ mod wave_c_special_smoke {
             ZENMUX_MODEL,
             ZENMUX_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn c_special_zenmux_tool_call_multiple() {
+        run_anthropic_case(
+            ZENMUX_PROVIDER,
+            ZENMUX_MODEL,
+            ZENMUX_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -3084,6 +3531,16 @@ mod wave_b3_smoke {
     }
 
     #[test]
+    fn b3_siliconflow_tool_call_multiple() {
+        run_case(
+            SILICONFLOW_PROVIDER,
+            SILICONFLOW_MODEL,
+            SILICONFLOW_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b3_siliconflow_error_auth_401() {
         run_case(
             SILICONFLOW_PROVIDER,
@@ -3114,6 +3571,16 @@ mod wave_b3_smoke {
     }
 
     #[test]
+    fn b3_siliconflow_cn_tool_call_multiple() {
+        run_case(
+            SILICONFLOW_CN_PROVIDER,
+            SILICONFLOW_CN_MODEL,
+            SILICONFLOW_CN_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b3_siliconflow_cn_error_auth_401() {
         run_case(
             SILICONFLOW_CN_PROVIDER,
@@ -3135,6 +3602,16 @@ mod wave_b3_smoke {
             UPSTAGE_MODEL,
             UPSTAGE_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b3_upstage_tool_call_multiple() {
+        run_case(
+            UPSTAGE_PROVIDER,
+            UPSTAGE_MODEL,
+            UPSTAGE_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -3164,6 +3641,16 @@ mod wave_b3_smoke {
     }
 
     #[test]
+    fn b3_venice_tool_call_multiple() {
+        run_case(
+            VENICE_PROVIDER,
+            VENICE_MODEL,
+            VENICE_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b3_venice_error_auth_401() {
         run_case(VENICE_PROVIDER, VENICE_MODEL, VENICE_URL, "error_auth_401");
     }
@@ -3176,6 +3663,11 @@ mod wave_b3_smoke {
     #[test]
     fn b3_zai_tool_call_single() {
         run_case(ZAI_PROVIDER, ZAI_MODEL, ZAI_URL, "tool_call_single");
+    }
+
+    #[test]
+    fn b3_zai_tool_call_multiple() {
+        run_case(ZAI_PROVIDER, ZAI_MODEL, ZAI_URL, "tool_call_multiple");
     }
 
     #[test]
@@ -3204,6 +3696,16 @@ mod wave_b3_smoke {
     }
 
     #[test]
+    fn b3_zai_coding_tool_call_multiple() {
+        run_case(
+            ZAI_CODING_PROVIDER,
+            ZAI_CODING_MODEL,
+            ZAI_CODING_URL,
+            "tool_call_multiple",
+        );
+    }
+
+    #[test]
     fn b3_zai_coding_error_auth_401() {
         run_case(
             ZAI_CODING_PROVIDER,
@@ -3221,6 +3723,11 @@ mod wave_b3_smoke {
     #[test]
     fn b3_zhipuai_tool_call_single() {
         run_case(ZHIPU_PROVIDER, ZHIPU_MODEL, ZHIPU_URL, "tool_call_single");
+    }
+
+    #[test]
+    fn b3_zhipuai_tool_call_multiple() {
+        run_case(ZHIPU_PROVIDER, ZHIPU_MODEL, ZHIPU_URL, "tool_call_multiple");
     }
 
     #[test]
@@ -3245,6 +3752,16 @@ mod wave_b3_smoke {
             ZHIPU_CODING_MODEL,
             ZHIPU_CODING_URL,
             "tool_call_single",
+        );
+    }
+
+    #[test]
+    fn b3_zhipuai_coding_tool_call_multiple() {
+        run_case(
+            ZHIPU_CODING_PROVIDER,
+            ZHIPU_CODING_MODEL,
+            ZHIPU_CODING_URL,
+            "tool_call_multiple",
         );
     }
 
@@ -3298,12 +3815,7 @@ mod azure_smoke {
                 },
                 CanonicalExpectation::Stream(exp) => {
                     if exp.min_tool_calls > 0 {
-                        let tool_name = scenario.tools.first().map_or("echo", |t| t.name.as_str());
-                        openai_tool_response(
-                            TEST_DEPLOYMENT,
-                            tool_name,
-                            &json!({"text": "verification test"}),
-                        )
+                        openai_tool_response_for_scenario(TEST_DEPLOYMENT, scenario)
                     } else if exp.require_unicode {
                         openai_text_response(TEST_DEPLOYMENT, "日本語テスト — émojis: 🦀🔥")
                     } else {
@@ -3395,6 +3907,25 @@ mod azure_smoke {
             .expect("runtime")
             .block_on(async {
                 let harness = TestHarness::new("verify_azure_tool_call_single");
+                run_canonical_scenario(&provider, scenario, &harness).await;
+            });
+    }
+
+    #[test]
+    fn azure_tool_call_multiple() {
+        let scenarios = canonical_scenarios();
+        let scenario = scenarios
+            .iter()
+            .find(|s| s.tag == "tool_call_multiple")
+            .unwrap();
+        ensure_fixture("tool_call_multiple", scenario);
+        let provider = build_provider("tool_call_multiple");
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let harness = TestHarness::new("verify_azure_tool_call_multiple");
                 run_canonical_scenario(&provider, scenario, &harness).await;
             });
     }

@@ -1,30 +1,46 @@
 {
   "schema": "pi.qa.coverage_baseline.v1",
   "bead_id": "bd-1f42.1.2.1",
-  "status": "blocked_runtime_contention",
-  "generated_at": "2026-02-10T06:50:00Z",
+  "status": "complete_with_branch_metric_gap",
+  "generated_at": "2026-02-12T17:07:40Z",
   "workspace": "/data/projects/pi_agent_rust",
   "collection": {
-    "status": "incomplete",
+    "status": "complete_with_limits",
     "blockers": [
-      "Concurrent cargo/llvm-cov workloads in shared workspace generated stale object references and malformed coverage export records.",
-      "Observed llvm-cov export failures include missing temporary object paths and malformed function filename metadata in ext-conformance objects."
+      "llvm-cov export crashes with SIGSEGV whenever branch summary mode is enabled in this environment.",
+      "cargo llvm-cov invocations that include broad target sets (especially --all-targets and --lib --tests) can hit llvm-cov export SIGSEGV after successful test execution."
     ],
     "attempted_commands": [
       "cargo llvm-cov --workspace --all-targets --json --summary-only --branch --output-path target/coverage-summary-branch.json",
       "cargo llvm-cov report --json --summary-only --output-path target/coverage-summary.json",
       "CARGO_TARGET_DIR=target/coverage-fuchsia cargo llvm-cov --workspace --all-targets --json --summary-only --output-path target/coverage-baseline-raw.json --ignore-run-fail",
-      "CARGO_TARGET_DIR=target/coverage-fuchsia cargo llvm-cov report --json --summary-only --output-path target/coverage-baseline-raw.json"
+      "CARGO_TARGET_DIR=target/coverage-fuchsia cargo llvm-cov report --json --summary-only --output-path target/coverage-baseline-raw.json",
+      "CARGO_TARGET_DIR=/data/projects/pi_agent_rust/target_cov_rusticpeak cargo llvm-cov --workspace --all-targets --json --summary-only --branch --output-path target/coverage-baseline-raw.json --ignore-run-fail",
+      "CARGO_TARGET_DIR=/data/projects/pi_agent_rust/target_cov_rusticpeak cargo llvm-cov --workspace --lib --tests --json --summary-only --branch --output-path target/coverage-baseline-raw.json --ignore-run-fail",
+      "CARGO_TARGET_DIR=/data/projects/pi_agent_rust/target_cov_lib_rusticpeak cargo llvm-cov --lib --json --summary-only --branch --output-path target/coverage-baseline-raw.json --ignore-run-fail",
+      "CARGO_TARGET_DIR=/data/projects/pi_agent_rust/target_cov_lib_rusticpeak2 cargo llvm-cov --lib --json --summary-only --output-path target/coverage-baseline-raw.json --ignore-run-fail"
     ],
-    "recommended_next_command": "CARGO_TARGET_DIR=target/coverage-fuchsia cargo llvm-cov --workspace --all-targets --json --summary-only --output-path target/coverage-baseline-raw.json --ignore-run-fail"
+    "successful_command": "CARGO_TARGET_DIR=/data/projects/pi_agent_rust/target_cov_lib_rusticpeak2 cargo llvm-cov --lib --json --summary-only --output-path target/coverage-baseline-raw.json --ignore-run-fail",
+    "recommended_next_command": "If branch coverage is mandatory, reproduce and isolate llvm-cov branch-summary crash with rustup nightly llvm-cov export, then retry cargo llvm-cov with --branch after toolchain fix.",
+    "artifacts": {
+      "coverage_json": "target/coverage-baseline-raw.json",
+      "manual_export_json": "target/coverage-baseline-manual.json"
+    }
   },
   "summary": {
-    "line_pct": null,
+    "line_pct": 78.63711922255993,
     "branch_pct": null,
-    "function_pct": null,
-    "region_pct": null,
-    "uncovered_line_count": null,
-    "notes": "Populate after successful llvm-cov export; this placeholder keeps downstream schema contracts stable."
+    "function_pct": 77.35747386571829,
+    "region_pct": 78.2562918868574,
+    "line_count": 101667,
+    "covered_line_count": 79948,
+    "uncovered_line_count": 21719,
+    "function_count": 9279,
+    "covered_function_count": 7178,
+    "uncovered_function_count": 2101,
+    "branch_count": 0,
+    "covered_branch_count": 0,
+    "notes": "Line/function/region baselines are complete from llvm-cov JSON summary. Branch summary remains unavailable because branch-mode export crashes with SIGSEGV in this environment."
   },
   "critical_paths": [
     {
@@ -33,11 +49,19 @@
         "src/agent.rs"
       ],
       "coverage": {
-        "line_pct": null,
+        "line_pct": 79.541047188106,
         "branch_pct": null,
-        "function_pct": null
+        "function_pct": 74.76340694006309,
+        "line_count": 3094,
+        "covered_line_count": 2461,
+        "uncovered_line_count": 633,
+        "function_count": 317,
+        "covered_function_count": 237,
+        "uncovered_function_count": 80,
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
-      "status": "pending"
+      "status": "baseline_captured_branch_unavailable"
     },
     {
       "area": "tools",
@@ -45,11 +69,19 @@
         "src/tools.rs"
       ],
       "coverage": {
-        "line_pct": null,
+        "line_pct": 78.95778364116094,
         "branch_pct": null,
-        "function_pct": null
+        "function_pct": 76.65847665847666,
+        "line_count": 3032,
+        "covered_line_count": 2394,
+        "uncovered_line_count": 638,
+        "function_count": 407,
+        "covered_function_count": 312,
+        "uncovered_function_count": 95,
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
-      "status": "pending"
+      "status": "baseline_captured_branch_unavailable"
     },
     {
       "area": "providers",
@@ -59,11 +91,19 @@
         "src/providers/mod.rs"
       ],
       "coverage": {
-        "line_pct": null,
+        "line_pct": 86.30014526762767,
         "branch_pct": null,
-        "function_pct": null
+        "function_pct": 83.311432325887,
+        "line_count": 8949,
+        "covered_line_count": 7723,
+        "uncovered_line_count": 1226,
+        "function_count": 761,
+        "covered_function_count": 634,
+        "uncovered_function_count": 127,
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
-      "status": "pending"
+      "status": "baseline_captured_branch_unavailable"
     },
     {
       "area": "session",
@@ -71,11 +111,19 @@
         "src/session.rs"
       ],
       "coverage": {
-        "line_pct": null,
+        "line_pct": 80.49965301873699,
         "branch_pct": null,
-        "function_pct": null
+        "function_pct": 77.87878787878788,
+        "line_count": 2882,
+        "covered_line_count": 2320,
+        "uncovered_line_count": 562,
+        "function_count": 330,
+        "covered_function_count": 257,
+        "uncovered_function_count": 73,
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
-      "status": "pending"
+      "status": "baseline_captured_branch_unavailable"
     },
     {
       "area": "extensions",
@@ -85,20 +133,28 @@
         "src/extensions_js.rs"
       ],
       "coverage": {
-        "line_pct": null,
+        "line_pct": 85.01170219495224,
         "branch_pct": null,
-        "function_pct": null
+        "function_pct": 73.5281290885303,
+        "line_count": 31618,
+        "covered_line_count": 26879,
+        "uncovered_line_count": 4739,
+        "function_count": 2293,
+        "covered_function_count": 1686,
+        "uncovered_function_count": 607,
+        "branch_count": 0,
+        "covered_branch_count": 0
       },
-      "status": "pending"
+      "status": "baseline_captured_branch_unavailable"
     }
   ],
   "handoff": {
-    "owner": "FuchsiaLynx",
-    "next_owner": "StormyCastle",
+    "owner": "RusticPeak",
+    "next_owner": "RusticPeak",
     "next_actions": [
-      "Re-run the recommended llvm-cov command in a low-contention window.",
-      "Extract per-file summaries into this artifact for all critical paths.",
-      "Add uncovered critical-path risk notes consumed by bd-1f42.1.4."
+      "Use uncovered line/function counts above to generate risk-ranked backlog entries in bd-1f42.1.4.",
+      "If branch coverage remains required for release criteria, isolate and fix llvm-cov branch-summary SIGSEGV before re-running this artifact with branch metrics enabled.",
+      "Expand session critical path in a follow-up pass to include session_index/session_sqlite if QA policy scope requires full persistence surface."
     ]
   }
 }

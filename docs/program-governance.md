@@ -154,6 +154,42 @@ Top blocker graph pressure (open blockers):
 
 Next burndown checkpoint: `2026-02-17` (UTC), with updated blocker counts and owner-level action status.
 
+### Weekly Provider Parity Rollup (bd-3uqg, as of 2026-02-12)
+
+Snapshot:
+- Scope: `bd-3uqg*` provider-parity epic and sub-beads.
+- Ready front: only `bd-3uqg` is currently unblocked/open; most downstream tasks are intentionally dependency-gated.
+- Highest-impact current blocker: `bd-3uqg.3.8.4` (native parity consolidation), which unlocks `bd-3uqg.8`, `bd-3uqg.8.2`, and `bd-3uqg.9.1.2`.
+
+Execution lanes and ownership:
+
+| Lane | Active beads | Current owner/assignee | Handoff target |
+|------|--------------|------------------------|----------------|
+| Native implementation | `bd-3uqg.3` | `RusticPrairie` | `bd-3uqg.3.8` verification |
+| Native verification | `bd-3uqg.3.8` | `AmberHill` | `bd-3uqg.3.8.4` consolidated report |
+| Native parity consolidation | `bd-3uqg.3.8.4` | `IvoryPuma` | Test/docs expansion (`bd-3uqg.8*`, `bd-3uqg.9.1.2`) |
+| Provider onboarding docs | `bd-3uqg.9` | `TealFox` | Docs matrix and playbook children |
+| Provider support matrix | `bd-3uqg.9.1` | `QuietCove` | `bd-3uqg.9.1.2` and `bd-3uqg.9.1.3` |
+| Rollup orchestration | `bd-3uqg`, `bd-3uqg.10`, `bd-3uqg.10.1` | `CopperCreek` | `bd-3uqg.10.2` gate execution |
+
+Sequencing gates (ordered):
+1. **Gate A - Native parity evidence complete**
+Criteria: `bd-3uqg.3.8.4` includes provider-level pass/fail matrix with links to unit/e2e logs and explicit deviation notes.
+2. **Gate B - Core provider test harnesses**
+Criteria: `bd-3uqg.8.2`, `bd-3uqg.8.3`, and `bd-3uqg.8.4` land with deterministic fixtures, event-parity assertions, and CI artifact hooks.
+3. **Gate C - Provider docs evidence closure**
+Criteria: `bd-3uqg.9.1.2`, `bd-3uqg.9.1.3`, `bd-3uqg.9.2`, `bd-3uqg.9.3`, `bd-3uqg.9.4`, and `bd-3uqg.9.5` reference concrete test artifacts rather than narrative-only claims.
+4. **Gate D - Rollup certification path**
+Criteria: `bd-3uqg.10.2` runs mandatory quality gates, then `bd-3uqg.10.3` performs final parity audit, and `bd-3uqg.10.4` publishes completion handoff + remaining-gap beads.
+
+Anti-stall checkpoints:
+- Every active `bd-3uqg*` assignee posts a concise progress update in Agent Mail thread `br-3uqg` at least once per 24 hours while `in_progress`.
+- Any bead blocked for more than 12 hours must post a blocker note with exact blocking bead IDs, affected files, and required unblock action.
+- Rollup owner re-runs `bv --robot-triage` and `bv --robot-next` at each checkpoint and records priority deltas before reassigning effort.
+- No new provider-family onboarding starts until Gate A evidence exists, to prevent parallel drift and report mismatch.
+
+Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` completion and Gate A evidence audit.
+
 ### Monthly
 
 | Task | Owner | Verification |

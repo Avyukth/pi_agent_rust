@@ -264,38 +264,215 @@ Wave C execution status:
 | `minimax-cn` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimaxi.com/anthropic/v1/messages` | `x-api-key` (`MINIMAX_CN_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
 | `minimax-coding-plan` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimax.io/anthropic/v1/messages` | `x-api-key` (`MINIMAX_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
 | `minimax-cn-coding-plan` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://api.minimaxi.com/anthropic/v1/messages` | `x-api-key` (`MINIMAX_CN_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), family representative smoke via [`verify_minimax_simple_text.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json) |
+| `siliconflow` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.siliconflow.com/v1` | `Authorization: Bearer` (`SILICONFLOW_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_siliconflow_simple_text.json) |
+| `siliconflow-cn` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.siliconflow.cn/v1` | `Authorization: Bearer` (`SILICONFLOW_CN_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_siliconflow-cn_simple_text.json) |
+| `upstage` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.upstage.ai/v1/solar` | `Authorization: Bearer` (`UPSTAGE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_upstage_simple_text.json) |
+| `venice` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.venice.ai/api/v1` | `Authorization: Bearer` (`VENICE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_venice_simple_text.json) |
+| `zai` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.z.ai/api/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zai_simple_text.json) |
+| `zai-coding-plan` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.z.ai/api/coding/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zai-coding-plan_simple_text.json) |
+| `zhipuai` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://open.bigmodel.cn/api/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zhipuai_simple_text.json) |
+| `zhipuai-coding-plan` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://open.bigmodel.cn/api/coding/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zhipuai-coding-plan_simple_text.json) |
+| `amazon-bedrock` | `bedrock` | text + tool-calls | `bedrock-converse-stream` | Region-based AWS endpoint | SigV4/Bearer (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`) | `native-adapter-required` | VCR-verified (4 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_bedrock_simple_text.json), [parity-report](provider-native-parity-report.json) |
+| `sap-ai-core` | `sap` | text + tool-calls | OAuth2 + OpenAI-compatible | SAP AI Core service URL | OAuth2 client credentials (`SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`, `SAP_AI_CORE_TOKEN_URL`) | `native-adapter-required` | VCR-verified (6 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_sap_ai_core_simple_text.json), [parity-report](provider-native-parity-report.json) |
+| `github-copilot` | `copilot` | text + tool-calls | Copilot chat/completions | `https://api.githubcopilot.com` | `Authorization: Bearer` (`GITHUB_COPILOT_API_KEY`, `GITHUB_TOKEN`) | `native-adapter-required` | VCR-verified (6 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_copilot_simple_text.json), [parity-report](provider-native-parity-report.json) |
+| `gitlab` | `gitlab-duo` | text | GitLab AI API | GitLab instance URL | `Authorization: Bearer` (`GITLAB_TOKEN`, `GITLAB_API_KEY`) | `native-adapter-required` | VCR-verified (5 scenarios, no tool_call) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_gitlab_simple_text.json), [parity-report](provider-native-parity-report.json) |
+| `opencode` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://opencode.ai/zen/v1` | `Authorization: Bearer` (`OPENCODE_API_KEY`) | `oai-compatible-preset` | VCR-verified (3 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_opencode_simple_text.json) |
+| `vercel` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://ai-gateway.vercel.sh/v1` | `Authorization: Bearer` (`AI_GATEWAY_API_KEY`) | `oai-compatible-preset` | VCR-verified (3 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_vercel_simple_text.json) |
+| `zenmux` | - | text (Anthropic-compatible) | `anthropic-messages` | `https://zenmux.ai/api/anthropic/v1/messages` | `x-api-key` (`ZENMUX_API_KEY`) | `oai-compatible-preset` | VCR-verified (3 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zenmux_simple_text.json) |
 
-## Missing/Partial IDs in Current Runtime
+## Verification Status Summary
 
-Provider IDs already recognized in auth/enums but not yet fully dispatchable:
+All native and preset providers now have at least metadata + factory verification. The current VCR-verified provider count is 29 out of 85 canonical IDs.
 
-| ID | Current state | Rationale | Risk | Follow-up beads | Current evidence |
-|----|---------------|-----------|------|-----------------|------------------|
-| `google-vertex` (`vertexai`) | `native-implemented` (`bd-3uqg.3.1` closed) | Native Vertex AI adapter is dispatchable with streaming for both Google (Gemini) and Anthropic publishers. | Resolved | — | [unit](../src/providers/vertex.rs), [factory](../src/providers/mod.rs), [metadata](../tests/provider_metadata_comprehensive.rs) |
-| `amazon-bedrock` (`bedrock`) | `missing` (enum/env mapping only) | Bedrock Converse semantics need a native adapter path and credential-chain validation. | High: AWS users cannot route through first-class runtime path. | `bd-3uqg.3.3`, `bd-3uqg.3.8.2` | [metadata](../tests/provider_metadata_comprehensive.rs), [planning profile](provider-implementation-modes.json) |
-| `github-copilot` (`copilot`) | `missing` (enum/env mapping only) | Provider protocol/auth flow is not implemented in native runtime path. | High: Copilot IDs remain non-dispatchable despite auth/env mapping. | `bd-3uqg.3.2`, `bd-3uqg.3.8.2` | [metadata](../tests/provider_metadata_comprehensive.rs), [planning profile](provider-implementation-modes.json) |
+| Category | Count | VCR Coverage | Status |
+|----------|-------|-------------|--------|
+| Built-in native | 6 | 6/6 (100%) | Full 6-scenario VCR suites |
+| Native adapter required | 4 | 4/4 (100%) | 4-6 scenario VCR suites |
+| Wave B1-B3 preset | 19 | 19/19 (100%) | 3-scenario VCR suites |
+| Wave C special routing | 3 | 3/3 (100%) | 3-scenario VCR suites |
+| Batch A1-A4 preset | 34 | 0/34 (0%) | Metadata + factory verified; individual VCR fixtures pending (`bd-3uqg.8.4`) |
+| Local/self-hosted preset | 4 | 0/4 (0%) | Metadata + factory verified; VCR pending |
+| Cloudflare gateway | 2 | 0/2 (0%) | Metadata + factory verified; VCR pending |
 
-Full deferred/high-risk inventory (including rationale text for all classified IDs) lives in `docs/provider-implementation-modes.json`.
+Consolidated parity report: [`docs/provider-native-parity-report.json`](provider-native-parity-report.json)
+
+Full deferred/high-risk inventory lives in `docs/provider-implementation-modes.json`.
 
 ## Already-Covered vs Missing Snapshot
 
-Covered now:
-- 5 native dispatchable providers: `anthropic`, `openai`, `google`, `cohere`, `azure-openai`.
-- 12 OpenAI-compatible preset providers dispatchable via fallback adapters:
-  `groq`, `deepinfra`, `cerebras`, `openrouter`, `mistral`, `moonshotai`, `dashscope`,
-  `deepseek`, `fireworks`, `togetherai`, `perplexity`, `xai`.
-- 6 Wave B1 regional/coding-plan providers are now dispatchable with preset fallback defaults:
-  `alibaba-cn` via `openai-completions`; `kimi-for-coding`, `minimax`, `minimax-cn`,
-  `minimax-coding-plan`, `minimax-cn-coding-plan` via `anthropic-messages`.
-- 5 Wave B2 regional/cloud providers are now dispatchable with preset fallback defaults:
-  `modelscope`, `moonshotai-cn`, `nebius`, `ovhcloud`, and `scaleway` via `openai-completions`.
-- Alias coverage built into preset defaults:
-  `moonshot`/`kimi` -> `moonshotai`, and `alibaba`/`qwen` -> `dashscope`.
+Covered now (85 canonical IDs registered in `PROVIDER_METADATA`):
+- 6 built-in native providers: `anthropic`, `openai`, `google` (gemini), `cohere`, `azure-openai`, `google-vertex`.
+- 4 native adapter providers with VCR verification: `amazon-bedrock`, `sap-ai-core`, `github-copilot`, `gitlab`.
+- 12 Wave A OpenAI-compatible preset providers: `groq`, `deepinfra`, `cerebras`, `openrouter`, `mistral`, `moonshotai`, `alibaba` (dashscope), `deepseek`, `fireworks`, `togetherai`, `perplexity`, `xai`.
+- 34 Batch A1-A4 OpenAI-compatible preset providers (metadata + factory verified).
+- 6 Wave B1 regional/coding-plan providers: `alibaba-cn`, `kimi-for-coding`, `minimax`, `minimax-cn`, `minimax-coding-plan`, `minimax-cn-coding-plan`.
+- 5 Wave B2 regional/cloud providers: `modelscope`, `moonshotai-cn`, `nebius`, `ovhcloud`, `scaleway`.
+- 8 Wave B3 providers: `siliconflow`, `siliconflow-cn`, `upstage`, `venice`, `zai`, `zai-coding-plan`, `zhipuai`, `zhipuai-coding-plan`.
+- 4 Wave C1 local/self-hosted preset providers: `baseten`, `llama`, `lmstudio`, `ollama-cloud`.
+- 3 Wave C special routing providers: `opencode`, `vercel`, `zenmux`.
+- 2 Cloudflare gateway providers: `cloudflare-ai-gateway`, `cloudflare-workers-ai`.
+- Alias coverage: `moonshot`/`kimi` -> `moonshotai`, `alibaba`/`qwen` -> `dashscope`, `fireworks-ai` -> `fireworks`, `gemini` -> `google`, `bedrock` -> `amazon-bedrock`, `copilot` -> `github-copilot`, `azure` -> `azure-openai`, `vertexai` -> `google-vertex`, `sap` -> `sap-ai-core`, `gitlab-duo` -> `gitlab`.
 
-Not fully covered yet:
-- 3 recognized-but-missing paths: `google-vertex`, `amazon-bedrock`, `github-copilot`.
-- Additional upstream IDs from `models.dev + opencode + code` remain to be classified in the
-  frozen upstream snapshot workflow (`bd-3uqg.1.1`).
+Remaining gaps:
+- Batch A1-A4 providers need individual VCR fixture expansion (tracked in `bd-3uqg.8.4`).
+- `v0` (Vercel) deferred: no API endpoint published in models.dev.
+
+## Deferred Providers and Rationale
+
+The following providers are recognized in upstream catalogs but explicitly deferred from onboarding. Each entry includes the deferral reason and conditions for graduation.
+
+| Provider ID | Classification | Deferral Reason | Graduation Condition | Tracking |
+|-------------|---------------|-----------------|----------------------|----------|
+| `v0` | deferred-watchlist | No API endpoint published in `models.dev`; Vercel's `@ai-sdk/gateway` does not expose a static base URL suitable for preset routing. | Vercel publishes a stable REST API endpoint with documented auth flow. | `bd-3uqg.6.1` |
+| `google-vertex-anthropic` | native-new-high-risk | Hybrid Vertex + Anthropic publisher surface requires dedicated protocol/auth path distinct from the Google-publisher Vertex adapter. | Anthropic publisher endpoint is validated with streaming + tool-call parity against the existing `google-vertex` Google publisher path. | `bd-3uqg.3.3` |
+| `azure-cognitive-services` | native-new-high-risk | Distinct Cognitive Services path requires separate auth/routing semantics beyond current `azure-openai` handling. Already reachable via `azure-openai` alias for shared deployments. | Confirmed need for separate routing path vs. alias sufficiency; if alias-only, close as won't-fix. | `bd-3uqg.3.3` |
+| `local` | native-new-high-risk | Generic local runtime mode requires explicit process/model lifecycle integration (start, health-check, shutdown). | Local provider lifecycle adapter is implemented with process management tests. | `bd-3uqg.3.3` |
+| `ollama` | native-new-high-risk | Local OSS provider requires dedicated process/orchestration adapter and lifecycle tests distinct from `ollama-cloud`. | Ollama process lifecycle adapter is implemented; distinct from cloud variant. | `bd-3uqg.3.3` |
+
+### Batch A1-A4 VCR Gap
+
+34 providers are fully metadata-registered and factory-verified but lack individual VCR fixtures: `302ai`, `abacus`, `aihubmix`, `bailing`, `berget`, `chutes`, `cortecs`, `fastrouter`, `firmware`, `friendli`, `github-models`, `helicone`, `huggingface`, `iflowcn`, `inception`, `inference`, `io-net`, `jiekou`, `lucidquery`, `moark`, `morph`, `nano-gpt`, `nova`, `novita-ai`, `nvidia`, `poe`, `privatemode-ai`, `requesty`, `submodel`, `synthetic`, `vivgrid`, `vultr`, `wandb`, `xiaomi`.
+
+These providers are dispatchable through the OpenAI-compatible fallback and pass metadata + factory tests. Individual VCR fixture expansion is tracked in `bd-3uqg.8.4`.
+
+### Implementation Modes Reference
+
+Deferred classification profiles are documented in [`docs/provider-implementation-modes.json`](provider-implementation-modes.json). Key profile definitions:
+
+| Profile | Meaning |
+|---------|---------|
+| `deferred-watchlist` | No validated protocol/auth route; awaiting upstream evidence. |
+| `native-new-high-risk` | Requires dedicated native adapter; high test burden (unit + contract + conformance + e2e). |
+| `gateway-wrapper-high-risk` | Gateway/router/wrapper requiring routing semantics and upstream provider provenance. |
+| `alias-forwarder` | Alias-only resolution; no distinct implementation needed. |
+
+## Matrix Maintenance Guide
+
+When updating the Canonical Provider Matrix table or related sections, follow these annotations to keep the documentation accurate and consistent.
+
+### Adding a New Provider Row
+
+1. Add the canonical metadata entry in `src/provider_metadata.rs` first.
+2. Run `cargo test provider_metadata_comprehensive provider_factory -- --nocapture` to confirm metadata + factory pass.
+3. Add the provider row to the matrix table above, filling all columns:
+   - **Canonical ID**: from `PROVIDER_METADATA.canonical_id`
+   - **Aliases**: from `PROVIDER_METADATA.aliases` (dash-separated list, or `-` if none)
+   - **Capability flags**: `text`, `+ image`, `+ tool-calls`, etc. based on API family
+   - **API family**: one of `anthropic-messages`, `openai-completions`, `openai-responses`, `google-generative-ai`, `google-vertex`, `cohere-chat`, `bedrock-converse-stream`, or provider-specific
+   - **Base URL template**: from `PROVIDER_METADATA.routing_defaults.base_url`
+   - **Auth mode**: from `PROVIDER_METADATA.auth_env_keys` (header style + env var names)
+   - **Mode**: `native-implemented`, `oai-compatible-preset`, `native-adapter-required`, or `alias-only`
+   - **Runtime status**: current dispatchability (e.g., "Dispatchable through OpenAI-compatible fallback")
+   - **Verification evidence**: links to test files, VCR cassettes, and reports
+4. Update the **Verification Status Summary** counts if the VCR coverage changed.
+5. Update the **Already-Covered vs Missing Snapshot** category counts.
+
+### Updating VCR Coverage Counts
+
+When new VCR fixtures are added in `tests/fixtures/vcr/verify_*.json`:
+1. Count fixtures: `ls tests/fixtures/vcr/verify_*.json | wc -l`
+2. Update the "VCR Coverage" column in the Verification Status Summary table.
+3. Move the provider from "Metadata + factory verified" to "VCR-verified (N scenarios)" in its matrix row.
+
+### Graduating a Deferred Provider
+
+1. Confirm the graduation condition in the Deferred Providers table is met.
+2. Remove the provider from the Deferred Providers table.
+3. Add it to the Canonical Provider Matrix with full evidence links.
+4. Update `docs/provider-implementation-modes.json` entry to reflect new status.
+5. Close the associated tracking bead.
+
+### Source-of-Truth Cross-References
+
+| Artifact | Path | Purpose |
+|----------|------|---------|
+| Provider metadata (canonical IDs, aliases, env keys, routing) | `src/provider_metadata.rs` | Authoritative provider registry |
+| Provider factory (route selection, dispatch) | `src/providers/mod.rs` | Runtime provider creation |
+| API key resolution | `src/app.rs`, `src/auth.rs`, `src/models.rs` | Credential resolution precedence |
+| Metadata invariant tests | `tests/provider_metadata_comprehensive.rs` | 112 assertions covering all 85 IDs |
+| Factory routing tests | `tests/provider_factory.rs` | 144 assertions covering factory dispatch |
+| Native verify harness (VCR) | `tests/provider_native_verify.rs` | 206 offline streaming/error replay tests |
+| Parity report | `docs/provider-native-parity-report.json` | Consolidated per-provider pass/fail matrix |
+| Implementation modes | `docs/provider-implementation-modes.json` | Classification profiles and deferral rationale |
+| Onboarding playbook | `docs/provider-onboarding-playbook.md` | Execution guide for adding/configuring providers |
+
+## Alias Migration Notes
+
+This section documents all alias-to-canonical-ID mappings with migration guidance. Aliases are permanently supported for backward compatibility; no breaking changes are introduced by alias normalization.
+
+### Migration Guarantee
+
+All aliases resolve transparently to their canonical ID at provider-selection time. This means:
+- Config files using an alias (`"provider": "gemini"`) continue to work identically to the canonical form (`"provider": "google"`).
+- Auth env vars are shared: the alias and canonical ID use the same env key(s).
+- API routing is identical: both resolve to the same base URL, API family, and streaming behavior.
+- No deprecation warnings are emitted for alias usage.
+
+### Alias-to-Canonical Mapping Table
+
+| Alias | Canonical ID | API Family | Shared Auth Env Key(s) | Notes |
+|-------|-------------|------------|----------------------|-------|
+| `gemini` | `google` | `google-generative-ai` | `GOOGLE_API_KEY`, `GEMINI_API_KEY` | Gemini is the model family; `google` is the canonical provider ID. |
+| `moonshot` | `moonshotai` | `openai-completions` | `MOONSHOT_API_KEY` | `moonshot` was the original ID; `moonshotai` is canonical per upstream. |
+| `kimi` | `moonshotai` | `openai-completions` | `MOONSHOT_API_KEY` | Kimi is the product name; routes to same endpoint as `moonshotai`. Note: `kimi-for-coding` is a **distinct** canonical ID with its own Anthropic-compatible route. |
+| `dashscope` | `alibaba` | `openai-completions` | `DASHSCOPE_API_KEY` | DashScope is the API platform name; `alibaba` is canonical. Note: `alibaba-cn` is a **distinct** canonical ID with a separate CN base URL. |
+| `qwen` | `alibaba` | `openai-completions` | `DASHSCOPE_API_KEY` | Qwen is the model family; routes to same endpoint as `alibaba`/`dashscope`. |
+| `fireworks-ai` | `fireworks` | `openai-completions` | `FIREWORKS_API_KEY` | Legacy naming convention; `fireworks` is canonical per upstream. |
+| `vertexai` | `google-vertex` | `google-vertex` | `GOOGLE_CLOUD_API_KEY`, `VERTEX_API_KEY` | Alternative naming for Vertex AI; `google-vertex` is canonical. |
+| `bedrock` | `amazon-bedrock` | `bedrock-converse-stream` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Short form; `amazon-bedrock` is canonical per AWS naming. |
+| `sap` | `sap-ai-core` | OAuth2 + OpenAI-compatible | `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET` | Short form; `sap-ai-core` is canonical per SAP naming. |
+| `azure` | `azure-openai` | Azure chat/completions | `AZURE_OPENAI_API_KEY` | Short form; `azure-openai` is canonical. |
+| `azure-cognitive-services` | `azure-openai` | Azure chat/completions | `AZURE_OPENAI_API_KEY` | Legacy Azure branding; routes identically to `azure-openai`. |
+| `copilot` | `github-copilot` | Copilot chat/completions | `GITHUB_COPILOT_API_KEY`, `GITHUB_TOKEN` | Short form; `github-copilot` is canonical. |
+| `gitlab-duo` | `gitlab` | GitLab AI API | `GITLAB_TOKEN`, `GITLAB_API_KEY` | Product name; `gitlab` is canonical. |
+
+### Config Migration Examples
+
+**Before (alias)**:
+```json
+{
+  "providers": {
+    "fireworks-ai": {
+      "models": [{ "id": "accounts/fireworks/models/llama-v3p3-70b-instruct" }]
+    }
+  }
+}
+```
+
+**After (canonical, recommended)**:
+```json
+{
+  "providers": {
+    "fireworks": {
+      "models": [{ "id": "accounts/fireworks/models/llama-v3p3-70b-instruct" }]
+    }
+  }
+}
+```
+
+Both configs produce identical runtime behavior. The alias form continues to work indefinitely.
+
+**CLI migration** (equivalent commands):
+```bash
+# Alias (still supported)
+pi --provider gemini --model gemini-2.5-flash -p "Hello"
+# Canonical (recommended)
+pi --provider google --model gemini-2.5-flash -p "Hello"
+```
+
+### Common Pitfalls
+
+- **`kimi` vs `kimi-for-coding`**: `kimi` is an alias for `moonshotai` (OpenAI-compatible). `kimi-for-coding` is a distinct canonical ID that routes through `anthropic-messages` with `KIMI_API_KEY`. Do not conflate them.
+- **`alibaba` vs `alibaba-cn`**: `alibaba` routes to the international DashScope endpoint. `alibaba-cn` is a distinct canonical ID routing to the CN endpoint (`dashscope.aliyuncs.com`). Both use `DASHSCOPE_API_KEY`.
+- **`moonshotai` vs `moonshotai-cn`**: Same auth key (`MOONSHOT_API_KEY`), but distinct base URLs (`api.moonshot.ai` vs `api.moonshot.cn`). `moonshotai-cn` is a distinct canonical ID, not an alias.
+
+### Verification Evidence
+
+Alias resolution is tested by:
+- `every_alias_resolves_to_its_canonical_id` in [`tests/provider_metadata_comprehensive.rs`](../tests/provider_metadata_comprehensive.rs): confirms each alias maps to its canonical ID.
+- `no_alias_collides_with_canonical_id` in [`tests/provider_metadata_comprehensive.rs`](../tests/provider_metadata_comprehensive.rs): confirms no alias shadows a different provider's canonical ID.
+- `fireworks_ai_alias_migration_matches_fireworks_canonical_defaults` in [`tests/provider_factory.rs`](../tests/provider_factory.rs): validates fireworks-ai -> fireworks migration produces identical routing.
+- `create_provider_azure_cognitive_services_alias_routes_natively` in [`tests/provider_factory.rs`](../tests/provider_factory.rs): validates azure-cognitive-services -> azure-openai alias routing.
 
 ## Provider Selection and Configuration
 

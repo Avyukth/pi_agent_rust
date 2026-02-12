@@ -122,7 +122,7 @@
   "ci_fail": 0,
   "ci_with_data": 1,
   "fail": 0,
-  "generated_at": "2026-02-10T03:59:15.627118636+00:00",
+  "generated_at": "2026-02-12T17:02:12.568748440+00:00",
   "no_data": 9,
   "pass": 4,
   "schema": "pi.perf.budget_summary.v1",

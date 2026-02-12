@@ -61,6 +61,42 @@ fn protocol_hostcall_op(params: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolHostcallMethod {
+    Tool,
+    Exec,
+    Http,
+    Session,
+    Ui,
+    Events,
+    Log,
+}
+
+fn parse_protocol_hostcall_method(method: &str) -> Option<ProtocolHostcallMethod> {
+    let method = method.trim();
+    if method.is_empty() {
+        return None;
+    }
+
+    if method.eq_ignore_ascii_case("tool") {
+        Some(ProtocolHostcallMethod::Tool)
+    } else if method.eq_ignore_ascii_case("exec") {
+        Some(ProtocolHostcallMethod::Exec)
+    } else if method.eq_ignore_ascii_case("http") {
+        Some(ProtocolHostcallMethod::Http)
+    } else if method.eq_ignore_ascii_case("session") {
+        Some(ProtocolHostcallMethod::Session)
+    } else if method.eq_ignore_ascii_case("ui") {
+        Some(ProtocolHostcallMethod::Ui)
+    } else if method.eq_ignore_ascii_case("events") {
+        Some(ProtocolHostcallMethod::Events)
+    } else if method.eq_ignore_ascii_case("log") {
+        Some(ProtocolHostcallMethod::Log)
+    } else {
+        None
+    }
+}
+
 fn protocol_normalize_output(value: Value) -> Value {
     if value.is_object() {
         value
@@ -84,12 +120,13 @@ fn protocol_error_fallback_reason(method: &str, code: &str) -> &'static str {
         "denied" => "policy_denied",
         "timeout" => "handler_timeout",
         "io" | "tool_error" => "handler_error",
-        "invalid_request" => match method.trim().to_ascii_lowercase().as_str() {
-            "tool" | "exec" | "http" | "session" | "ui" | "events" | "log" => {
+        "invalid_request" => {
+            if parse_protocol_hostcall_method(method).is_some() {
                 "schema_validation_failed"
+            } else {
+                "unsupported_method_fallback"
             }
-            _ => "unsupported_method_fallback",
-        },
+        }
         _ => "runtime_internal_error",
     }
 }
@@ -393,10 +430,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             }
         }
 
-        let method = payload.method.trim().to_ascii_lowercase();
+        let method = payload.method.trim();
 
-        match method.as_str() {
-            "tool" => {
+        match parse_protocol_hostcall_method(method) {
+            Some(ProtocolHostcallMethod::Tool) => {
                 let Some(name) = payload
                     .params
                     .get("name")
@@ -416,7 +453,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
                 self.dispatch_tool(&payload.call_id, name, input).await
             }
-            "exec" => {
+            Some(ProtocolHostcallMethod::Exec) => {
                 let Some(cmd) = payload
                     .params
                     .get("cmd")
@@ -433,11 +470,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 self.dispatch_exec(&payload.call_id, cmd, payload.params.clone())
                     .await
             }
-            "http" => {
+            Some(ProtocolHostcallMethod::Http) => {
                 self.dispatch_http(&payload.call_id, payload.params.clone())
                     .await
             }
-            "session" => {
+            Some(ProtocolHostcallMethod::Session) => {
                 let Some(op) = protocol_hostcall_op(&payload.params) else {
                     return HostcallOutcome::Error {
                         code: "invalid_request".to_string(),
@@ -447,7 +484,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 self.dispatch_session_ref(&payload.call_id, op, &payload.params)
                     .await
             }
-            "ui" => {
+            Some(ProtocolHostcallMethod::Ui) => {
                 let Some(op) = protocol_hostcall_op(&payload.params) else {
                     return HostcallOutcome::Error {
                         code: "invalid_request".to_string(),
@@ -457,7 +494,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 self.dispatch_ui(&payload.call_id, op, payload.params.clone(), None)
                     .await
             }
-            "events" => {
+            Some(ProtocolHostcallMethod::Events) => {
                 let Some(op) = protocol_hostcall_op(&payload.params) else {
                     return HostcallOutcome::Error {
                         code: "invalid_request".to_string(),
@@ -467,8 +504,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 self.dispatch_events(&payload.call_id, None, op, payload.params.clone())
                     .await
             }
-            "log" => HostcallOutcome::Success(serde_json::json!({ "logged": true })),
-            _ => HostcallOutcome::Error {
+            Some(ProtocolHostcallMethod::Log) => {
+                HostcallOutcome::Success(serde_json::json!({ "logged": true }))
+            }
+            None => HostcallOutcome::Error {
                 code: "invalid_request".to_string(),
                 message: format!("Unsupported host_call method: {method}"),
             },

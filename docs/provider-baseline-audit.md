@@ -111,3 +111,54 @@ Other missing: 302ai, abacus, aihubmix, alibaba-cn, azure-cognitive-services, ba
 - Extension `streamSimple` can cover **any** gap without native code changes
 - `Api` enum has forward-declared variants (`BedrockConverseStream`, `GoogleVertex`) with no corresponding modules
 - OAuth framework exists for Anthropic + extension providers; other natives use API key auth only
+
+---
+
+## Provider Test Coverage Map Seed (`bd-3uqg.8`, updated 2026-02-12)
+
+Source of truth for this update:
+- `docs/provider-native-parity-report.json` (`report.generated_at`: `2026-02-12T16:45:00Z`)
+- `tests/provider_native_verify.rs`
+- `tests/provider_metadata_comprehensive.rs`
+- `tests/provider_factory.rs`
+
+Current test-lane health:
+
+| Lane | Passed | Failed | Total | Status | Notes |
+|------|--------|--------|-------|--------|-------|
+| `provider_native_verify` | 206 | 0 | 206 | green | Native and preset parity fixtures passing. |
+| `provider_metadata_comprehensive` | 112 | 0 | 112 | green | Metadata/routing coverage green. |
+| `provider_factory` | 134 | 10 | 144 | yellow | Infrastructure-only failures from missing `pi_runtime.json` VCR cassette (not provider logic regressions). |
+
+Coverage footprint snapshot:
+
+| Metric | Value |
+|--------|-------|
+| Total registered providers | 84 |
+| Providers with VCR verification | 29 |
+| Providers without VCR verification | 55 |
+| Total VCR fixture scenarios | 114 |
+| Total test scenarios passing | 206 |
+| Total test scenarios failing | 0 |
+
+VCR-verified provider tiers:
+- Tier-1 built-in native (6-scenario): `6`
+- Tier-2 native adapter: `4`
+- Wave B1 regional/coding-plan (3-scenario): `3`
+- Wave B2 regional/cloud (3-scenario): `5`
+- Wave B3 (3-scenario): `8`
+- Wave C special routing (3-scenario): `3`
+
+Known deviations and mapped follow-ups:
+
+| Deviation ID | Scope | Gap | Follow-up bead |
+|--------------|-------|-----|----------------|
+| `DEV-001` | `gitlab` | Missing `tool_call_single` VCR fixture (API shape mismatch). | `bd-3uqg.3` |
+| `DEV-002` | `amazon-bedrock` | Missing `error_bad_request_400` and `error_rate_limit_429` fixtures. | `bd-3uqg.8.2` (contract coverage expansion) |
+| `DEV-003` | Wave B + C presets | 3-scenario coverage only (`simple_text`, `tool_call_single`, `error_auth_401`) vs 6-scenario Tier-1 baseline. | `bd-3uqg.8` |
+| `DEV-004` | `provider_factory` lane | 10 failures caused by missing `pi_runtime.json` cassette. | `bd-3uqg.8.4` |
+
+Execution implications for `bd-3uqg.8`:
+1. Prioritize `bd-3uqg.8.2` for native-adapter contract closure (Bedrock/GitLab delta + schema assertions).
+2. Land `bd-3uqg.8.4` to resolve infrastructure cassette gaps and stabilize factory smoke coverage.
+3. Keep docs matrix work (`bd-3uqg.9.1.2`) aligned to this parity evidence so capability/auth/API claims stay artifact-backed.

@@ -47,8 +47,7 @@ Important caveat:
 |---|---|---|---|
 | Built-in native | `anthropic`, `openai`, `google`, `cohere` | Native provider modules | Usually `--provider/--model` + env key |
 | OpenAI-compatible presets | `openrouter`, `xai`, `deepseek`, `groq`, `cloudflare-ai-gateway`, `cloudflare-workers-ai`, etc. | API fallback to `openai-completions` | Provider metadata defaults + standard bearer auth |
-| Native adapters | `azure-openai`, `google-vertex`, `github-copilot`, `gitlab` | Dedicated adapter route in factory | Provider-specific env/config requirements |
-| Native adapter required (not wired yet) | `amazon-bedrock`, `sap-ai-core` | Metadata/auth surface present; dispatch path pending | Track dependent provider beads before marking dispatchable |
+| Native adapters | `azure-openai`, `google-vertex`, `github-copilot`, `gitlab`, `amazon-bedrock`, `sap-ai-core` | Dedicated adapter route in factory | Provider-specific env/config requirements |
 
 ## Copy-paste configuration examples
 
@@ -310,8 +309,9 @@ curl -s https://models.dev/api.json | jq '{
 ```
 
 Current Wave C routing stance:
-- `baseten`, `llama`, `lmstudio`, and `ollama-cloud` are OpenAI-compatible preset candidates.
-- `opencode`, `vercel`, and `zenmux` remain coupled to special-routing decisions in `bd-3uqg.3.9`.
+- `baseten`, `llama`, `lmstudio`, and `ollama-cloud` are onboarded as OpenAI-compatible presets (metadata + factory verified, VCR pending).
+- `opencode` and `vercel` are onboarded as OpenAI-compatible presets with VCR verification (3 scenarios each).
+- `zenmux` is onboarded as an Anthropic-compatible preset with VCR verification (3 scenarios).
 
 Wave C defaults (from `models.dev`):
 
@@ -346,9 +346,9 @@ Representative `models.json` for unblocked Wave C presets:
 }
 ```
 
-Special-routing blockers still open:
-- `bd-3uqg.6.1` is blocked by `bd-3uqg.3.9` for `vercel` classification.
-- `bd-3uqg.6.3` is blocked by `bd-3uqg.3.9` and `bd-3uqg.6.2` for `opencode`/`zenmux` routing semantics.
+Special-routing status:
+- `opencode`, `vercel`, and `zenmux` are now onboarded and VCR-verified as preset providers.
+- VCR cassettes: `tests/fixtures/vcr/verify_opencode_*.json`, `tests/fixtures/vcr/verify_vercel_*.json`, `tests/fixtures/vcr/verify_zenmux_*.json`.
 
 ### 3) Azure OpenAI (`azure-openai` / aliases `azure`, `azure-cognitive-services`)
 
@@ -455,14 +455,20 @@ pi --provider gitlab --model gitlab-duo-chat -p "Say hello"
 Expected check:
 - Provider sends request to `/api/v4/chat/completions` and returns a non-streaming done event path.
 
-### 7) Bedrock / SAP AI Core (planned native adapters)
+### 7) Bedrock / SAP AI Core (native adapters - VCR-verified)
 
-Current status in runtime metadata:
-- `amazon-bedrock` and `sap-ai-core` are classified as native-adapter-required.
+Current status:
+- `amazon-bedrock` and `sap-ai-core` are classified as `native-adapter-required` and are now VCR-verified.
 - Auth/env mapping exists in `../src/provider_metadata.rs` and `../src/auth.rs`.
-- Dedicated factory dispatch path is not yet the default in `../src/providers/mod.rs`.
+- VCR cassettes: `tests/fixtures/vcr/verify_bedrock_*.json` (4 scenarios), `tests/fixtures/vcr/verify_sap_ai_core_*.json` (6 scenarios).
+- Parity evidence: [`docs/provider-native-parity-report.json`](provider-native-parity-report.json).
 
-Do not claim dispatch parity for these until linked provider implementation and parity beads are closed.
+Bedrock auth:
+- SigV4 credentials: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`
+- Bearer token alternative: `AWS_BEARER_TOKEN_BEDROCK`
+
+SAP AI Core auth:
+- OAuth2 client credentials: `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`, `SAP_AI_CORE_TOKEN_URL`
 
 ## Troubleshooting matrix (symptom -> action)
 
