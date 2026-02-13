@@ -2115,6 +2115,39 @@ Your input will be treated as sensitive and is not added to message history.",
     }
 }
 
+fn save_provider_credential(
+    auth: &mut crate::auth::AuthStorage,
+    provider: &str,
+    credential: crate::auth::AuthCredential,
+) -> crate::error::Result<()> {
+    let requested = provider.trim().to_ascii_lowercase();
+    let canonical = normalize_auth_provider_input(&requested);
+    auth.set(canonical.clone(), credential);
+    if canonical == "google" {
+        let _ = auth.remove("gemini");
+    } else if requested != canonical {
+        let _ = auth.remove(&requested);
+    }
+    auth.save()
+}
+
+fn remove_provider_credentials(
+    auth: &mut crate::auth::AuthStorage,
+    requested_provider: &str,
+) -> bool {
+    let requested = requested_provider.trim().to_ascii_lowercase();
+    let canonical = normalize_auth_provider_input(&requested);
+
+    let mut removed = auth.remove(&canonical);
+    if requested != canonical {
+        removed |= auth.remove(&requested);
+    }
+    if canonical == "google" {
+        removed |= auth.remove("gemini");
+    }
+    removed
+}
+
 async fn dispatch_input_event(
     manager: &ExtensionManager,
     text: String,
@@ -8936,8 +8969,7 @@ impl PiApp {
                 }
             };
 
-            auth.set(provider.clone(), credential);
-            if let Err(e) = auth.save_async().await {
+            if let Err(e) = save_provider_credential(&mut auth, &provider, credential) {
                 let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                 return;
             }
@@ -9688,7 +9720,7 @@ impl PiApp {
                 let requested_provider = if args.is_empty() {
                     self.model_entry.model.provider.clone()
                 } else {
-                    args.to_string()
+                    args.split_whitespace().next().unwrap_or(args).to_string()
                 };
                 let provider = normalize_auth_provider_input(&requested_provider);
 
@@ -9787,7 +9819,7 @@ impl PiApp {
                 let requested_provider = if args.is_empty() {
                     self.model_entry.model.provider.clone()
                 } else {
-                    args.to_string()
+                    args.split_whitespace().next().unwrap_or(args).to_string()
                 };
                 let requested_provider = requested_provider.trim().to_ascii_lowercase();
                 let provider = normalize_auth_provider_input(&requested_provider);
@@ -9795,13 +9827,7 @@ impl PiApp {
                 let auth_path = crate::config::Config::auth_path();
                 match crate::auth::AuthStorage::load(auth_path) {
                     Ok(mut auth) => {
-                        let removed_canonical = auth.remove(&provider);
-                        let removed_alias = if requested_provider == provider {
-                            false
-                        } else {
-                            auth.remove(&requested_provider)
-                        };
-                        let removed = removed_canonical || removed_alias;
+                        let removed = remove_provider_credentials(&mut auth, &requested_provider);
                         if let Err(err) = auth.save() {
                             self.status_message = Some(err.to_string());
                             return None;

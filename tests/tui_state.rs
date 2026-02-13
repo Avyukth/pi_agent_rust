@@ -2468,14 +2468,18 @@ fn tui_state_run_pending_content_submits_next_input() {
 }
 
 #[test]
-fn tui_state_run_pending_system_appends_system_message_without_processing() {
-    let harness =
-        TestHarness::new("tui_state_run_pending_system_appends_system_message_without_processing");
+fn tui_state_system_message_appends_without_processing() {
+    let harness = TestHarness::new("tui_state_system_message_appends_without_processing");
     let message = "OAuth token for anthropic has expired. Run /login anthropic to re-authenticate.";
-    let mut app = build_app(&harness, vec![PendingInput::System(message.to_string())]);
+    let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
-    let step = apply_pi(&harness, &mut app, "PiMsg::RunPending", PiMsg::RunPending);
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::System",
+        PiMsg::System(message.to_string()),
+    );
     assert_after_contains(&harness, &step, message);
     assert_after_not_contains(&harness, &step, "Processing...");
 }
