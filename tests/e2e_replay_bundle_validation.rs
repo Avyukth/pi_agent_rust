@@ -333,10 +333,7 @@ fn synthetic_summary_with_failures_is_valid() {
         .expect("failed_names should be array");
     assert_eq!(failed.len(), 2);
     assert_eq!(failed[0].as_str().unwrap(), "e2e_provider_scenarios");
-    assert_eq!(
-        failed[1].as_str().unwrap(),
-        "e2e_extension_registration"
-    );
+    assert_eq!(failed[1].as_str().unwrap(), "e2e_extension_registration");
 
     // Verify rerun command can be constructed
     let base_cmd = "./scripts/e2e/run_all.sh --profile ci";
@@ -376,16 +373,18 @@ fn replay_command_templates_are_well_formed() {
 
     for suite in &suites {
         // Level 1: Full runner replay
-        let cmd1 = format!(
-            "./scripts/e2e/run_all.sh --profile focused --skip-lint --suite {suite}"
-        );
+        let cmd1 =
+            format!("./scripts/e2e/run_all.sh --profile focused --skip-lint --suite {suite}");
         assert!(cmd1.contains("--profile"), "missing --profile in level 1");
         assert!(cmd1.contains("--suite"), "missing --suite in level 1");
 
         // Level 2: Cargo test replay
         let cmd2 = format!("cargo test --test {suite} -- --nocapture");
         assert!(cmd2.contains("--test"), "missing --test in level 2");
-        assert!(cmd2.contains("--nocapture"), "missing --nocapture in level 2");
+        assert!(
+            cmd2.contains("--nocapture"),
+            "missing --nocapture in level 2"
+        );
 
         // Level 3: Targeted test replay
         let test_name = "simple_conversation";
@@ -426,10 +425,7 @@ fn failure_diagnostics_index_generation() {
 fn failure_digest_includes_artifact_paths() {
     let script = load_run_all_script();
     // The failure digest should reference key artifacts for replay
-    let expected_artifact_refs = [
-        "result.json",
-        "output.log",
-    ];
+    let expected_artifact_refs = ["result.json", "output.log"];
     for artifact in &expected_artifact_refs {
         assert!(
             script.contains(artifact),
@@ -524,22 +520,34 @@ fn synthetic_failure_digest_structure_valid() {
     });
 
     // Validate structure
-    assert_eq!(digest["schema"].as_str().unwrap(), "pi.e2e.failure_digest.v1");
+    assert_eq!(
+        digest["schema"].as_str().unwrap(),
+        "pi.e2e.failure_digest.v1"
+    );
     assert!(digest["exit_code"].as_u64().unwrap() > 0);
     assert!(digest["root_cause_class"].is_string());
     assert!(!digest["impacted_tests"].as_array().unwrap().is_empty());
 
     // Validate replay commands
     let rp = &digest["remediation_pointer"];
-    assert!(rp["replay_command"].as_str().unwrap().contains("run_all.sh"));
-    assert!(rp["suite_replay_command"]
-        .as_str()
-        .unwrap()
-        .contains("cargo test"));
-    assert!(rp["targeted_test_replay_command"]
-        .as_str()
-        .unwrap()
-        .contains("provider_streaming_round_trip"));
+    assert!(
+        rp["replay_command"]
+            .as_str()
+            .unwrap()
+            .contains("run_all.sh")
+    );
+    assert!(
+        rp["suite_replay_command"]
+            .as_str()
+            .unwrap()
+            .contains("cargo test")
+    );
+    assert!(
+        rp["targeted_test_replay_command"]
+            .as_str()
+            .unwrap()
+            .contains("provider_streaming_round_trip")
+    );
 
     // Validate artifact paths
     let ap = &digest["artifact_paths"];
@@ -660,7 +668,12 @@ fn matrix_test_paths_consistent_with_replay_suites() {
 #[test]
 fn run_all_emits_required_per_suite_artifacts() {
     let script = load_run_all_script();
-    let required = ["result.json", "output.log", "test-log.jsonl", "artifact-index.jsonl"];
+    let required = [
+        "result.json",
+        "output.log",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+    ];
     for artifact in &required {
         assert!(
             script.contains(artifact),

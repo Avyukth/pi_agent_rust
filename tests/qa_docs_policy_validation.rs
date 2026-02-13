@@ -34,8 +34,7 @@ const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 const COVERAGE_BASELINE_PATH: &str = "docs/coverage-baseline-map.json";
 
 fn load_json(path: &str) -> Value {
-    let content =
-        std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
     serde_json::from_str(&content).unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
 }
 
@@ -50,7 +49,10 @@ fn load_text(path: &str) -> String {
 #[test]
 fn testing_policy_defines_all_three_suites() {
     let policy = load_text(TESTING_POLICY_PATH);
-    assert!(policy.contains("Suite 1: Unit"), "must define Suite 1 (Unit)");
+    assert!(
+        policy.contains("Suite 1: Unit"),
+        "must define Suite 1 (Unit)"
+    );
     assert!(
         policy.contains("Suite 2: VCR"),
         "must define Suite 2 (VCR / Fixture Replay)"
@@ -286,7 +288,10 @@ fn rubric_has_floor_and_target_for_each_module() {
 fn rubric_global_thresholds_are_consistent() {
     let rubric = load_json(NON_MOCK_RUBRIC_PATH);
     let global = &rubric["module_thresholds"]["global"];
-    assert!(global.is_object(), "rubric must have module_thresholds.global");
+    assert!(
+        global.is_object(),
+        "rubric must have module_thresholds.global"
+    );
 
     let line_floor = global["line_floor_pct"]
         .as_f64()
@@ -313,7 +318,10 @@ fn rubric_critical_modules_have_highest_thresholds() {
     // Critical modules must have thresholds >= global floor
     let critical = ["providers", "extensions", "agent_loop", "tools"];
     for crit_name in &critical {
-        if let Some(module) = modules.iter().find(|m| m["name"].as_str() == Some(crit_name)) {
+        if let Some(module) = modules
+            .iter()
+            .find(|m| m["name"].as_str() == Some(crit_name))
+        {
             let line_floor = module["line_floor_pct"].as_f64().unwrap_or(0.0);
             assert!(
                 line_floor >= global_floor,
@@ -825,11 +833,7 @@ fn testing_policy_allowlist_entries_have_cleanup_beads() {
 #[test]
 fn testing_policy_rejected_doubles_are_explicit() {
     let policy = load_text(TESTING_POLICY_PATH);
-    let rejected = [
-        "DummyProvider",
-        "NullSession",
-        "NullUiHandler",
-    ];
+    let rejected = ["DummyProvider", "NullSession", "NullUiHandler"];
     for name in &rejected {
         assert!(
             policy.contains(name),
@@ -890,7 +894,9 @@ fn test_double_inventory_entry_count_matches_policy_baseline() {
 #[test]
 fn non_mock_rubric_schema_is_versioned() {
     let rubric = load_json(NON_MOCK_RUBRIC_PATH);
-    let schema = rubric["schema"].as_str().expect("rubric must have schema field");
+    let schema = rubric["schema"]
+        .as_str()
+        .expect("rubric must have schema field");
     assert!(
         schema.starts_with("pi.qa.non_mock_rubric"),
         "rubric schema must be pi.qa.non_mock_rubric.*, got: {schema}"
@@ -900,7 +906,9 @@ fn non_mock_rubric_schema_is_versioned() {
 #[test]
 fn scenario_matrix_schema_is_versioned() {
     let matrix = load_json(SCENARIO_MATRIX_PATH);
-    let schema = matrix["schema"].as_str().expect("matrix must have schema field");
+    let schema = matrix["schema"]
+        .as_str()
+        .expect("matrix must have schema field");
     assert!(
         schema.starts_with("pi.e2e.scenario_matrix"),
         "matrix schema must be pi.e2e.scenario_matrix.*, got: {schema}"
@@ -1076,10 +1084,7 @@ fn all_doc_files_referenced_in_runbook_exist() {
     for path in &doc_refs {
         // Strip "docs/" prefix since runbook might use relative paths
         let short = path.trim_start_matches("docs/");
-        assert!(
-            runbook.contains(short),
-            "runbook must reference {path}"
-        );
+        assert!(runbook.contains(short), "runbook must reference {path}");
         assert!(
             std::path::Path::new(path).exists(),
             "referenced doc must exist: {path}"

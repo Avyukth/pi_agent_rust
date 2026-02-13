@@ -15,13 +15,13 @@ use pi::cli::Cli;
 use pi::error::Error;
 use pi::error_hints::{format_error_with_hints, hints_for_error};
 use pi::model::{ContentBlock, ImageContent};
-use pi::tools::{truncate_head, truncate_tail, TruncatedBy};
+use pi::tools::{TruncatedBy, truncate_head, truncate_tail};
 use pi::vcr::{
     Cassette, Interaction, RecordedRequest, RecordedResponse, RedactionSummary, VcrMode,
 };
 
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -235,11 +235,8 @@ fn truncate_tail_many_empty_lines() {
 #[test]
 fn process_file_arguments_nonexistent_file() {
     let dir = TempDir::new().unwrap();
-    let result = pi::tools::process_file_arguments(
-        &["nonexistent.txt".to_string()],
-        dir.path(),
-        false,
-    );
+    let result =
+        pi::tools::process_file_arguments(&["nonexistent.txt".to_string()], dir.path(), false);
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("Cannot access file"));
@@ -325,8 +322,8 @@ fn process_file_arguments_png_image_detected() {
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
         0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, // RGB, etc
         0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
-        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
-        0xE2, 0x21, 0xBC, 0x33, // IDAT data
+        0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+        0x33, // IDAT data
         0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
         0xAE, 0x42, 0x60, 0x82,
     ];
@@ -561,15 +558,13 @@ fn cassette_serde_round_trip() {
     assert_eq!(deserialized.version, "1");
     assert_eq!(deserialized.test_name, "test");
     assert_eq!(deserialized.interactions.len(), 1);
-    assert_eq!(
-        deserialized.interactions[0].request.method,
-        "POST"
-    );
+    assert_eq!(deserialized.interactions[0].request.method, "POST");
 }
 
 #[test]
 fn cassette_serde_with_body_text() {
-    let mut interaction = make_interaction("POST", "https://api.example.com", vec![], None, vec![], 200);
+    let mut interaction =
+        make_interaction("POST", "https://api.example.com", vec![], None, vec![], 200);
     interaction.request.body_text = Some("raw body text".to_string());
     let cassette = make_cassette(vec![interaction]);
     let json_str = serde_json::to_string(&cassette).unwrap();
@@ -582,7 +577,8 @@ fn cassette_serde_with_body_text() {
 
 #[test]
 fn cassette_serde_with_base64_chunks() {
-    let mut interaction = make_interaction("POST", "https://api.example.com", vec![], None, vec![], 200);
+    let mut interaction =
+        make_interaction("POST", "https://api.example.com", vec![], None, vec![], 200);
     interaction.response.body_chunks_base64 = Some(vec!["SGVsbG8gV29ybGQ=".to_string()]);
     let cassette = make_cassette(vec![interaction]);
     let json_str = serde_json::to_string(&cassette).unwrap();
@@ -772,7 +768,12 @@ fn validate_rpc_args_rpc_mode_with_files_is_error() {
     let cli = Cli::parse_from(["pi", "--mode", "rpc", "@file.txt"]);
     let result = app::validate_rpc_args(&cli);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("not supported in RPC mode"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("not supported in RPC mode")
+    );
 }
 
 #[test]
@@ -863,15 +864,8 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
     let cwd = Path::new("/tmp/test_cwd");
     let global_dir = Path::new("/tmp/nonexistent_global");
     let package_dir = Path::new("/tmp/nonexistent_package");
-    let prompt = app::build_system_prompt(
-        &cli,
-        cwd,
-        &["read"],
-        None,
-        global_dir,
-        package_dir,
-        false,
-    );
+    let prompt =
+        app::build_system_prompt(&cli, cwd, &["read"], None, global_dir, package_dir, false);
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
 }
@@ -1548,7 +1542,12 @@ fn redact_cassette_apikey_variations() {
         "my_api_key_here": "key4",
     });
     let mut cassette = make_cassette(vec![make_interaction(
-        "POST", "https://x.com", vec![], Some(body), vec![], 200,
+        "POST",
+        "https://x.com",
+        vec![],
+        Some(body),
+        vec![],
+        200,
     )]);
     let summary = pi::vcr::redact_cassette(&mut cassette);
     assert_eq!(summary.json_fields_redacted, 4);
@@ -1564,7 +1563,12 @@ fn redact_cassette_secret_and_password_fields() {
         "safe_field": "not redacted",
     });
     let mut cassette = make_cassette(vec![make_interaction(
-        "POST", "https://x.com", vec![], Some(body), vec![], 200,
+        "POST",
+        "https://x.com",
+        vec![],
+        Some(body),
+        vec![],
+        200,
     )]);
     let summary = pi::vcr::redact_cassette(&mut cassette);
     assert_eq!(summary.json_fields_redacted, 4);
@@ -1575,7 +1579,12 @@ fn redact_cassette_scalar_values_not_recursed() {
     // Body is a plain string, number, or bool — redact_json returns 0
     let body = json!("just a string");
     let mut cassette = make_cassette(vec![make_interaction(
-        "POST", "https://x.com", vec![], Some(body), vec![], 200,
+        "POST",
+        "https://x.com",
+        vec![],
+        Some(body),
+        vec![],
+        200,
     )]);
     let summary = pi::vcr::redact_cassette(&mut cassette);
     assert_eq!(summary.json_fields_redacted, 0);
@@ -1585,7 +1594,12 @@ fn redact_cassette_scalar_values_not_recursed() {
 fn redact_cassette_null_body_value() {
     let body = json!(null);
     let mut cassette = make_cassette(vec![make_interaction(
-        "POST", "https://x.com", vec![], Some(body), vec![], 200,
+        "POST",
+        "https://x.com",
+        vec![],
+        Some(body),
+        vec![],
+        200,
     )]);
     let summary = pi::vcr::redact_cassette(&mut cassette);
     assert_eq!(summary.json_fields_redacted, 0);

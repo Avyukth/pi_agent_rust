@@ -19,8 +19,7 @@ use common::TestHarness;
 use pi::models::ModelEntry;
 use pi::provider::{Api, CacheRetention, KnownProvider, Model, ModelCost, StreamOptions};
 use pi::providers::{
-    create_provider, normalize_cohere_base, normalize_openai_base,
-    normalize_openai_responses_base,
+    create_provider, normalize_cohere_base, normalize_openai_base, normalize_openai_responses_base,
 };
 use pi::session::{Session, SessionEntry, SessionMessage, SessionOpenDiagnostics};
 use serde_json::json;
@@ -258,15 +257,9 @@ fn normalize_cohere_base_appends_endpoint() {
             "https://api.cohere.com/v2/chat",
         ),
         // Bare URL gets /chat appended
-        (
-            "https://api.cohere.com",
-            "https://api.cohere.com/chat",
-        ),
+        ("https://api.cohere.com", "https://api.cohere.com/chat"),
         // Trailing slash stripped, then /chat appended
-        (
-            "https://api.cohere.com/",
-            "https://api.cohere.com/chat",
-        ),
+        ("https://api.cohere.com/", "https://api.cohere.com/chat"),
     ];
     for (input, expected) in &cases {
         let result = normalize_cohere_base(input);
@@ -289,7 +282,11 @@ fn model_entry_clamp_thinking_non_reasoning() {
     let entry = ModelEntry {
         model: Model {
             reasoning: false,
-            ..make_model("anthropic", "anthropic-messages", "https://api.anthropic.com")
+            ..make_model(
+                "anthropic",
+                "anthropic-messages",
+                "https://api.anthropic.com",
+            )
         },
         api_key: Some("key".to_string()),
         headers: HashMap::new(),
@@ -298,9 +295,18 @@ fn model_entry_clamp_thinking_non_reasoning() {
         oauth_config: None,
     };
 
-    assert_eq!(entry.clamp_thinking_level(ThinkingLevel::High), ThinkingLevel::Off);
-    assert_eq!(entry.clamp_thinking_level(ThinkingLevel::Medium), ThinkingLevel::Off);
-    assert_eq!(entry.clamp_thinking_level(ThinkingLevel::Off), ThinkingLevel::Off);
+    assert_eq!(
+        entry.clamp_thinking_level(ThinkingLevel::High),
+        ThinkingLevel::Off
+    );
+    assert_eq!(
+        entry.clamp_thinking_level(ThinkingLevel::Medium),
+        ThinkingLevel::Off
+    );
+    assert_eq!(
+        entry.clamp_thinking_level(ThinkingLevel::Off),
+        ThinkingLevel::Off
+    );
 }
 
 /// Reasoning model without xhigh support clamps XHigh to High.
@@ -312,7 +318,11 @@ fn model_entry_clamp_thinking_xhigh_downgrade() {
         model: Model {
             id: "claude-sonnet-4-5".to_string(),
             reasoning: true,
-            ..make_model("anthropic", "anthropic-messages", "https://api.anthropic.com")
+            ..make_model(
+                "anthropic",
+                "anthropic-messages",
+                "https://api.anthropic.com",
+            )
         },
         api_key: Some("key".to_string()),
         headers: HashMap::new(),
@@ -346,7 +356,11 @@ fn model_entry_clamp_thinking_xhigh_supported() {
         model: Model {
             id: "gpt-5.1-codex-max".to_string(),
             reasoning: true,
-            ..make_model("openai", "openai-chat-completions", "https://api.openai.com/v1")
+            ..make_model(
+                "openai",
+                "openai-chat-completions",
+                "https://api.openai.com/v1",
+            )
         },
         api_key: Some("key".to_string()),
         headers: HashMap::new(),
@@ -396,7 +410,10 @@ fn stream_options_default_values() {
 fn session_create_has_valid_id() {
     asupersync::test_utils::run_test(|| async {
         let session = Session::create();
-        assert!(!session.header.id.is_empty(), "session ID should not be empty");
+        assert!(
+            !session.header.id.is_empty(),
+            "session ID should not be empty"
+        );
         assert!(
             session.entries.is_empty(),
             "new session should have no entries"
@@ -471,7 +488,10 @@ fn session_add_label_nonexistent_returns_none() {
     asupersync::test_utils::run_test(|| async {
         let mut session = Session::create();
         let result = session.add_label("nonexistent-id", Some("label".to_string()));
-        assert!(result.is_none(), "labeling nonexistent entry should return None");
+        assert!(
+            result.is_none(),
+            "labeling nonexistent entry should return None"
+        );
     });
 }
 
@@ -540,7 +560,10 @@ fn session_save_and_open_round_trip() {
 
         // Save
         session.save().await.expect("save should succeed");
-        let path = session.path.as_ref().expect("should have a path after save");
+        let path = session
+            .path
+            .as_ref()
+            .expect("should have a path after save");
         let path_str = path.to_string_lossy().to_string();
 
         // Re-open
@@ -605,7 +628,9 @@ fn session_open_corrupted_jsonl_reports_diagnostics() {
                 // If it errors, that's also acceptable for corrupted data
                 let err_str = format!("{e}");
                 assert!(
-                    err_str.contains("json") || err_str.contains("parse") || err_str.contains("invalid"),
+                    err_str.contains("json")
+                        || err_str.contains("parse")
+                        || err_str.contains("invalid"),
                     "error should mention parsing issue: got {err_str}"
                 );
             }
@@ -664,9 +689,7 @@ fn session_save_after_mutations() {
         let path = session.path.as_ref().expect("path").clone();
 
         // Verify round-trip
-        let restored = Session::open(&path.to_string_lossy())
-            .await
-            .expect("open");
+        let restored = Session::open(&path.to_string_lossy()).await.expect("open");
         assert_eq!(restored.get_name().as_deref(), Some("mutated"));
         // Should have: message + label + model_change + thinking_change + custom + session_info(name)
         assert!(
@@ -713,7 +736,10 @@ fn session_get_children_empty() {
     asupersync::test_utils::run_test(|| async {
         let session = Session::create();
         let children = session.get_children(None);
-        assert!(children.is_empty(), "empty session should have no root children");
+        assert!(
+            children.is_empty(),
+            "empty session should have no root children"
+        );
     });
 }
 
@@ -726,7 +752,10 @@ fn session_get_path_to_entry() {
         let _id2 = session.append_message(user_msg("second"));
 
         let path = session.get_path_to_entry(&id1);
-        assert!(!path.is_empty(), "path to existing entry should not be empty");
+        assert!(
+            !path.is_empty(),
+            "path to existing entry should not be empty"
+        );
     });
 }
 
@@ -744,7 +773,10 @@ fn create_provider_anthropic_succeeds() {
             "https://api.anthropic.com",
         );
         let provider = create_provider(&entry, None);
-        assert!(provider.is_ok(), "Anthropic provider creation should succeed");
+        assert!(
+            provider.is_ok(),
+            "Anthropic provider creation should succeed"
+        );
         let p = provider.unwrap();
         assert_eq!(p.name(), "anthropic");
     });
@@ -754,8 +786,11 @@ fn create_provider_anthropic_succeeds() {
 #[test]
 fn create_provider_openai_succeeds() {
     asupersync::test_utils::run_test(|| async {
-        let entry =
-            make_model_entry("openai", "openai-chat-completions", "https://api.openai.com/v1");
+        let entry = make_model_entry(
+            "openai",
+            "openai-chat-completions",
+            "https://api.openai.com/v1",
+        );
         let provider = create_provider(&entry, None);
         assert!(provider.is_ok(), "OpenAI provider creation should succeed");
     });
@@ -839,8 +874,7 @@ fn create_provider_empty_api_uses_default() {
 #[test]
 fn create_provider_openai_responses() {
     asupersync::test_utils::run_test(|| async {
-        let entry =
-            make_model_entry("openai", "openai-responses", "https://api.openai.com/v1");
+        let entry = make_model_entry("openai", "openai-responses", "https://api.openai.com/v1");
         let provider = create_provider(&entry, None);
         assert!(
             provider.is_ok(),
@@ -891,8 +925,7 @@ fn encode_cwd_root() {
 /// encode_cwd handles paths with special characters.
 #[test]
 fn encode_cwd_special_chars() {
-    let encoded =
-        pi::session::encode_cwd(std::path::Path::new("/home/user/my project (v2.0)/src"));
+    let encoded = pi::session::encode_cwd(std::path::Path::new("/home/user/my project (v2.0)/src"));
     assert!(!encoded.is_empty());
     assert!(!encoded.contains('/'));
 }

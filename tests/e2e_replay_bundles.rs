@@ -251,9 +251,7 @@ fn gate_reproduce_commands_reference_valid_targets() {
                         // Script-based commands are valid by definition
                         eprintln!("  [OK] {gate_id}: script command");
                     } else {
-                        eprintln!(
-                            "  [WARN] {gate_id}: could not extract test target from: {cmd}"
-                        );
+                        eprintln!("  [WARN] {gate_id}: could not extract test target from: {cmd}");
                     }
                 }
             }
@@ -364,9 +362,7 @@ fn replay_bundle_schema_validation() {
     eprintln!();
 
     // Write the schema example as an artifact
-    let artifact_dir = repo_root()
-        .join("tests")
-        .join("full_suite_gate");
+    let artifact_dir = repo_root().join("tests").join("full_suite_gate");
     let _ = std::fs::create_dir_all(&artifact_dir);
     let artifact_path = artifact_dir.join("replay_bundle_schema_example.json");
     let _ = std::fs::write(&artifact_path, &json);
@@ -436,8 +432,7 @@ fn failure_digest_replay_fields_enforced() {
     // The evidence contract in run_all.sh validates these fields.
     // We verify here that the schema definition includes all three.
     let run_all_path = root.join("scripts/e2e/run_all.sh");
-    let content = std::fs::read_to_string(&run_all_path)
-        .expect("run_all.sh must exist");
+    let content = std::fs::read_to_string(&run_all_path).expect("run_all.sh must exist");
 
     let required_fields = [
         "replay_command",
@@ -449,10 +444,7 @@ fn failure_digest_replay_fields_enforced() {
         let pattern = format!("\"{field}\"");
         let found = content.contains(&pattern);
         eprintln!("  {field}: {}", if found { "enforced" } else { "MISSING" });
-        assert!(
-            found,
-            "failure_digest schema must enforce field: {field}"
-        );
+        assert!(found, "failure_digest schema must enforce field: {field}");
     }
 
     // Verify the evidence contract checks these fields
@@ -544,14 +536,15 @@ fn generate_and_validate_replay_bundle() {
     // ── Read scenario matrix for coverage ──
     let matrix_path = root.join("docs/e2e_scenario_matrix.json");
     let matrix = load_json(&matrix_path);
-    let covered_workflows: usize = matrix
-        .as_ref()
-        .and_then(|m| m["rows"].as_array())
-        .map_or(0, |rows| {
-            rows.iter()
-                .filter(|r| r["status"].as_str() == Some("covered"))
-                .count()
-        });
+    let covered_workflows: usize =
+        matrix
+            .as_ref()
+            .and_then(|m| m["rows"].as_array())
+            .map_or(0, |rows| {
+                rows.iter()
+                    .filter(|r| r["status"].as_str() == Some("covered"))
+                    .count()
+            });
 
     // ── Validate all replay commands reference valid targets ──
     let mut all_valid = true;
@@ -600,10 +593,7 @@ fn generate_and_validate_replay_bundle() {
     let bundle = ReplayBundle {
         schema: "pi.e2e.replay_bundle.v1".to_string(),
         generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        correlation_id: format!(
-            "replay-bundle-{}",
-            Utc::now().format("%Y%m%dT%H%M%SZ")
-        ),
+        correlation_id: format!("replay-bundle-{}", Utc::now().format("%Y%m%dT%H%M%SZ")),
         source_summary_path: "tests/full_suite_gate/full_suite_verdict.json".to_string(),
         one_command_replay:
             "cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact"
@@ -671,8 +661,7 @@ fn rerun_from_reads_failed_names() {
     eprintln!("\n=== --rerun-from Mechanism Validation ===\n");
 
     let run_all_path = root.join("scripts/e2e/run_all.sh");
-    let content = std::fs::read_to_string(&run_all_path)
-        .expect("run_all.sh must exist");
+    let content = std::fs::read_to_string(&run_all_path).expect("run_all.sh must exist");
 
     // Verify the rerun-from mechanism reads failed_names
     assert!(
@@ -713,27 +702,60 @@ fn triage_diff_includes_replay_metadata() {
     eprintln!("\n=== Triage Diff Replay Metadata ===\n");
 
     let run_all_path = root.join("scripts/e2e/run_all.sh");
-    let content = std::fs::read_to_string(&run_all_path)
-        .expect("run_all.sh must exist");
+    let content = std::fs::read_to_string(&run_all_path).expect("run_all.sh must exist");
 
     // Verify triage_diff includes recommended commands
     let has_runner_repro = content.contains("runner_repro_command");
     let has_target_commands = content.contains("target_commands");
     let has_ranked_repro = content.contains("ranked_repro_commands");
 
-    eprintln!("  runner_repro_command: {}", if has_runner_repro { "present" } else { "MISSING" });
-    eprintln!("  target_commands: {}", if has_target_commands { "present" } else { "MISSING" });
-    eprintln!("  ranked_repro_commands: {}", if has_ranked_repro { "present" } else { "MISSING" });
+    eprintln!(
+        "  runner_repro_command: {}",
+        if has_runner_repro {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  target_commands: {}",
+        if has_target_commands {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  ranked_repro_commands: {}",
+        if has_ranked_repro {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
 
-    assert!(has_runner_repro, "triage_diff must include runner_repro_command");
-    assert!(has_target_commands, "triage_diff must include target_commands");
-    assert!(has_ranked_repro, "triage_diff must include ranked_repro_commands");
+    assert!(
+        has_runner_repro,
+        "triage_diff must include runner_repro_command"
+    );
+    assert!(
+        has_target_commands,
+        "triage_diff must include target_commands"
+    );
+    assert!(
+        has_ranked_repro,
+        "triage_diff must include ranked_repro_commands"
+    );
 
     // Verify triage_diff is written to summary.json
     let has_triage_in_summary = content.contains("triage_diff");
     eprintln!(
         "  triage_diff in summary.json: {}",
-        if has_triage_in_summary { "present" } else { "MISSING" }
+        if has_triage_in_summary {
+            "present"
+        } else {
+            "MISSING"
+        }
     );
     assert!(
         has_triage_in_summary,
@@ -751,8 +773,7 @@ fn release_readiness_includes_replay_context() {
     eprintln!("\n=== Release Readiness Replay Context ===\n");
 
     let run_all_path = root.join("scripts/e2e/run_all.sh");
-    let content = std::fs::read_to_string(&run_all_path)
-        .expect("run_all.sh must exist");
+    let content = std::fs::read_to_string(&run_all_path).expect("run_all.sh must exist");
 
     // Release readiness should reference failure diagnostics
     let has_failure_diag = content.contains("failure_diagnostics");
@@ -761,14 +782,21 @@ fn release_readiness_includes_replay_context() {
 
     eprintln!(
         "  failure_diagnostics reference: {}",
-        if has_failure_diag { "present" } else { "MISSING" }
+        if has_failure_diag {
+            "present"
+        } else {
+            "MISSING"
+        }
     );
     eprintln!(
         "  release_readiness_summary: {}",
         if has_readiness { "present" } else { "MISSING" }
     );
 
-    assert!(has_failure_diag, "release readiness must reference failure diagnostics");
+    assert!(
+        has_failure_diag,
+        "release readiness must reference failure diagnostics"
+    );
     assert!(has_readiness, "release readiness summary must be generated");
 
     eprintln!();
@@ -818,7 +846,10 @@ fn e2e_suite_test_files_exist() {
     for f in &missing_files {
         eprintln!("    {f}");
     }
-    eprintln!("  Missing classifications: {}", missing_classification.len());
+    eprintln!(
+        "  Missing classifications: {}",
+        missing_classification.len()
+    );
     for c in &missing_classification {
         eprintln!("    {c}");
     }

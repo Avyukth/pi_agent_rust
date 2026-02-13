@@ -126,9 +126,8 @@ fn config_merge_nested_compaction_deep_merges() {
 
 #[test]
 fn config_merge_nested_retry_deep_merges() {
-    let base: Config =
-        serde_json::from_str(r#"{"retry": {"enabled": true, "max_retries": 5}}"#)
-            .expect("parse base");
+    let base: Config = serde_json::from_str(r#"{"retry": {"enabled": true, "max_retries": 5}}"#)
+        .expect("parse base");
     let other: Config =
         serde_json::from_str(r#"{"retry": {"base_delay_ms": 500}}"#).expect("parse other");
 
@@ -216,10 +215,7 @@ fn config_serde_camel_case_aliases() {
     assert_eq!(config.steering_mode.as_deref(), Some("queue"));
     assert_eq!(config.follow_up_mode.as_deref(), Some("queue"));
     assert_eq!(config.collapse_changelog, Some(true));
-    assert_eq!(
-        config.last_changelog_version.as_deref(),
-        Some("1.2.3")
-    );
+    assert_eq!(config.last_changelog_version.as_deref(), Some("1.2.3"));
 }
 
 #[test]
@@ -343,8 +339,7 @@ fn patch_settings_creates_file_if_missing() {
 
     let cwd = harness.create_dir("cwd");
     let global_dir = harness.create_dir("global");
-    let settings_path =
-        Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+    let settings_path = Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
 
     assert!(!settings_path.exists());
 
@@ -371,8 +366,7 @@ fn patch_settings_preserves_existing_keys() {
 
     let cwd = harness.create_dir("cwd");
     let global_dir = harness.create_dir("global");
-    let settings_path =
-        Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+    let settings_path = Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
 
     write_file(
         &settings_path,
@@ -401,8 +395,7 @@ fn patch_settings_deep_merges_nested_objects() {
 
     let cwd = harness.create_dir("cwd");
     let global_dir = harness.create_dir("global");
-    let settings_path =
-        Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
+    let settings_path = Config::settings_path_with_roots(SettingsScope::Project, &global_dir, &cwd);
 
     write_file(
         &settings_path,
@@ -440,10 +433,8 @@ fn extension_policy_defaults_to_safe() {
 #[test]
 fn extension_policy_cli_override_wins() {
     let _lock = config_lock();
-    let config: Config = serde_json::from_str(
-        r#"{"extensionPolicy": {"profile": "permissive"}}"#,
-    )
-    .expect("parse");
+    let config: Config =
+        serde_json::from_str(r#"{"extensionPolicy": {"profile": "permissive"}}"#).expect("parse");
     let resolved = config.resolve_extension_policy_with_metadata(Some("balanced"));
     assert_eq!(resolved.effective_profile, "balanced");
     assert_eq!(resolved.profile_source, "cli");
@@ -453,10 +444,8 @@ fn extension_policy_cli_override_wins() {
 fn extension_policy_config_profile() {
     let _lock = config_lock();
 
-    let config: Config = serde_json::from_str(
-        r#"{"extensionPolicy": {"profile": "permissive"}}"#,
-    )
-    .expect("parse");
+    let config: Config =
+        serde_json::from_str(r#"{"extensionPolicy": {"profile": "permissive"}}"#).expect("parse");
     // CLI override always wins over config and env, so use it to test indirectly
     // that config parsing works (the profile field deserialises correctly).
     let resolved = config.resolve_extension_policy_with_metadata(Some("permissive"));
@@ -556,10 +545,9 @@ fn branch_summary_reserve_tokens_uses_own_when_set() {
 
 #[test]
 fn thinking_budgets_custom_values_override_defaults() {
-    let config: Config = serde_json::from_str(
-        r#"{"thinkingBudgets": {"minimal": 256, "xhigh": 100000}}"#,
-    )
-    .expect("parse");
+    let config: Config =
+        serde_json::from_str(r#"{"thinkingBudgets": {"minimal": 256, "xhigh": 100000}}"#)
+            .expect("parse");
     assert_eq!(config.thinking_budget("minimal"), 256);
     assert_eq!(config.thinking_budget("low"), 2048); // default
     assert_eq!(config.thinking_budget("xhigh"), 100_000);
@@ -587,8 +575,7 @@ fn image_auto_resize_can_be_disabled() {
 
 #[test]
 fn retry_can_be_explicitly_disabled() {
-    let config: Config =
-        serde_json::from_str(r#"{"retry": {"enabled": false}}"#).expect("parse");
+    let config: Config = serde_json::from_str(r#"{"retry": {"enabled": false}}"#).expect("parse");
     assert!(!config.retry_enabled());
 }
 
@@ -597,12 +584,10 @@ fn retry_can_be_explicitly_disabled() {
 #[test]
 fn session_store_aliases_work() {
     // sessionStore alias
-    let config: Config =
-        serde_json::from_str(r#"{"sessionStore": "sqlite"}"#).expect("parse");
+    let config: Config = serde_json::from_str(r#"{"sessionStore": "sqlite"}"#).expect("parse");
     assert_eq!(config.session_store.as_deref(), Some("sqlite"));
 
     // sessionBackend alias
-    let config: Config =
-        serde_json::from_str(r#"{"sessionBackend": "jsonl"}"#).expect("parse");
+    let config: Config = serde_json::from_str(r#"{"sessionBackend": "jsonl"}"#).expect("parse");
     assert_eq!(config.session_store.as_deref(), Some("jsonl"));
 }

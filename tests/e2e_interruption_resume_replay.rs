@@ -82,9 +82,7 @@ fn make_assistant(
     }
 }
 
-fn stream_done(
-    msg: AssistantMessage,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     let partial = AssistantMessage {
         content: Vec::new(),
         api: msg.api.clone(),
@@ -183,9 +181,15 @@ impl SimpleProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for SimpleProvider {
-    fn name(&self) -> &str { "simple-provider" }
-    fn api(&self) -> &str { "simple-api" }
-    fn model_id(&self) -> &str { "simple-model" }
+    fn name(&self) -> &str {
+        "simple-provider"
+    }
+    fn api(&self) -> &str {
+        "simple-api"
+    }
+    fn model_id(&self) -> &str {
+        "simple-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -218,9 +222,15 @@ impl ToolThenFinalizeProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for ToolThenFinalizeProvider {
-    fn name(&self) -> &str { "tool-finalize-provider" }
-    fn api(&self) -> &str { "tool-finalize-api" }
-    fn model_id(&self) -> &str { "tool-finalize-model" }
+    fn name(&self) -> &str {
+        "tool-finalize-provider"
+    }
+    fn api(&self) -> &str {
+        "tool-finalize-api"
+    }
+    fn model_id(&self) -> &str {
+        "tool-finalize-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -270,9 +280,15 @@ impl ReplayVerifyProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for ReplayVerifyProvider {
-    fn name(&self) -> &str { "replay-verify-provider" }
-    fn api(&self) -> &str { "replay-verify-api" }
-    fn model_id(&self) -> &str { "replay-verify-model" }
+    fn name(&self) -> &str {
+        "replay-verify-provider"
+    }
+    fn api(&self) -> &str {
+        "replay-verify-api"
+    }
+    fn model_id(&self) -> &str {
+        "replay-verify-model"
+    }
     async fn stream(
         &self,
         context: &Context,
@@ -331,11 +347,13 @@ fn abort_before_run_returns_immediately() {
 
     // Agent should still return a result (abort message)
     let cap = capture.lock().expect("lock capture");
-    harness.log().info_ctx("result", "ABORT-1: Pre-abort", |ctx| {
-        ctx.push(("is_ok".into(), result.is_ok().to_string()));
-        ctx.push(("event_count".into(), cap.labels.len().to_string()));
-        ctx.push(("events".into(), format!("{:?}", cap.labels)));
-    });
+    harness
+        .log()
+        .info_ctx("result", "ABORT-1: Pre-abort", |ctx| {
+            ctx.push(("is_ok".into(), result.is_ok().to_string()));
+            ctx.push(("event_count".into(), cap.labels.len().to_string()));
+            ctx.push(("events".into(), format!("{:?}", cap.labels)));
+        });
 
     // Should have agent_start and agent_end at minimum
     if !cap.labels.is_empty() {
@@ -391,15 +409,20 @@ fn abort_during_tool_execution() {
     });
 
     let cap = capture.lock().expect("lock capture");
-    harness.log().info_ctx("result", "ABORT-2: During tool", |ctx| {
-        ctx.push(("is_ok".into(), result.is_ok().to_string()));
-        ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
-        ctx.push(("tool_ends".into(), cap.tool_ends.to_string()));
-        ctx.push(("events".into(), format!("{:?}", cap.labels)));
-    });
+    harness
+        .log()
+        .info_ctx("result", "ABORT-2: During tool", |ctx| {
+            ctx.push(("is_ok".into(), result.is_ok().to_string()));
+            ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
+            ctx.push(("tool_ends".into(), cap.tool_ends.to_string()));
+            ctx.push(("events".into(), format!("{:?}", cap.labels)));
+        });
 
     // Tool should have started
-    assert!(cap.tool_starts >= 1, "At least one tool should have started");
+    assert!(
+        cap.tool_starts >= 1,
+        "At least one tool should have started"
+    );
 
     write_jsonl_artifacts(&harness, test_name);
 }
@@ -425,8 +448,7 @@ fn resume_after_abort_continues_from_persisted_state() {
         let cwd = cwd.clone();
         let session = Arc::clone(&session);
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(SimpleProvider::new("first turn response"));
+            let provider: Arc<dyn Provider> = Arc::new(SimpleProvider::new("first turn response"));
             let mut agent_session = make_agent_session(&cwd, provider, session.clone(), 4);
             let msg = agent_session
                 .run_text("first question".to_string(), |_| {})
@@ -447,11 +469,7 @@ fn resume_after_abort_continues_from_persisted_state() {
     // Step 2: Reload session and verify messages survived
     let (reloaded, diagnostics) = run_async({
         let path = session_path.display().to_string();
-        async move {
-            Session::open_with_diagnostics(&path)
-                .await
-                .expect("reload")
-        }
+        async move { Session::open_with_diagnostics(&path).await.expect("reload") }
     });
     assert!(diagnostics.skipped_entries.is_empty(), "No corruption");
 
@@ -462,10 +480,15 @@ fn resume_after_abort_continues_from_persisted_state() {
         messages.len()
     );
 
-    harness.log().info_ctx("result", "RESUME-1: Session resumed", |ctx| {
-        ctx.push(("messages_after_first_turn".into(), messages.len().to_string()));
-        ctx.push(("session_path".into(), session_path.display().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "RESUME-1: Session resumed", |ctx| {
+            ctx.push((
+                "messages_after_first_turn".into(),
+                messages.len().to_string(),
+            ));
+            ctx.push(("session_path".into(), session_path.display().to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -540,11 +563,13 @@ fn resume_multi_turn_conversation_intact() {
     assert_eq!(user_count, 2, "Should have 2 user messages");
     assert_eq!(assistant_count, 2, "Should have 2 assistant messages");
 
-    harness.log().info_ctx("result", "RESUME-2: Multi-turn intact", |ctx| {
-        ctx.push(("total_messages".into(), messages.len().to_string()));
-        ctx.push(("user_messages".into(), user_count.to_string()));
-        ctx.push(("assistant_messages".into(), assistant_count.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "RESUME-2: Multi-turn intact", |ctx| {
+            ctx.push(("total_messages".into(), messages.len().to_string()));
+            ctx.push(("user_messages".into(), user_count.to_string()));
+            ctx.push(("assistant_messages".into(), assistant_count.to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -567,16 +592,12 @@ fn replay_same_input_produces_same_output() {
         let cwd = cwd.clone();
         let input = input.to_string();
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(ReplayVerifyProvider::new("run1"));
+            let provider: Arc<dyn Provider> = Arc::new(ReplayVerifyProvider::new("run1"));
             let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
                 Some(cwd.clone()),
             )));
             let mut agent_session = make_agent_session(&cwd, provider, session.clone(), 4);
-            let msg = agent_session
-                .run_text(input, |_| {})
-                .await
-                .expect("run 1");
+            let msg = agent_session.run_text(input, |_| {}).await.expect("run 1");
             let cx = asupersync::Cx::for_testing();
             let guard = session.lock(&cx).await.expect("lock");
             let messages = guard.to_messages_for_current_path();
@@ -589,16 +610,12 @@ fn replay_same_input_produces_same_output() {
         let cwd = cwd.clone();
         let input = input.to_string();
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(ReplayVerifyProvider::new("run1"));
+            let provider: Arc<dyn Provider> = Arc::new(ReplayVerifyProvider::new("run1"));
             let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
                 Some(cwd.clone()),
             )));
             let mut agent_session = make_agent_session(&cwd, provider, session.clone(), 4);
-            let msg = agent_session
-                .run_text(input, |_| {})
-                .await
-                .expect("run 2");
+            let msg = agent_session.run_text(input, |_| {}).await.expect("run 2");
             let cx = asupersync::Cx::for_testing();
             let guard = session.lock(&cx).await.expect("lock");
             let messages = guard.to_messages_for_current_path();
@@ -613,11 +630,13 @@ fn replay_same_input_produces_same_output() {
         "Same input should produce same message count"
     );
 
-    harness.log().info_ctx("result", "REPLAY-1: Determinism verified", |ctx| {
-        ctx.push(("text_1".into(), text_1));
-        ctx.push(("text_2".into(), text_2));
-        ctx.push(("msg_count".into(), msg_count_1.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "REPLAY-1: Determinism verified", |ctx| {
+            ctx.push(("text_1".into(), text_1));
+            ctx.push(("text_2".into(), text_2));
+            ctx.push(("msg_count".into(), msg_count_1.to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -633,8 +652,7 @@ fn replay_different_input_produces_different_output() {
     let text_a = run_async({
         let cwd = cwd.clone();
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(ReplayVerifyProvider::new("inputA"));
+            let provider: Arc<dyn Provider> = Arc::new(ReplayVerifyProvider::new("inputA"));
             let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
                 Some(cwd.clone()),
             )));
@@ -650,8 +668,7 @@ fn replay_different_input_produces_different_output() {
     let text_b = run_async({
         let cwd = cwd.clone();
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(ReplayVerifyProvider::new("inputB"));
+            let provider: Arc<dyn Provider> = Arc::new(ReplayVerifyProvider::new("inputB"));
             let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
                 Some(cwd.clone()),
             )));
@@ -664,12 +681,17 @@ fn replay_different_input_produces_different_output() {
         }
     });
 
-    assert_ne!(text_a, text_b, "Different inputs should produce different outputs");
+    assert_ne!(
+        text_a, text_b,
+        "Different inputs should produce different outputs"
+    );
 
-    harness.log().info_ctx("result", "REPLAY-2: Different input verified", |ctx| {
-        ctx.push(("text_a".into(), text_a));
-        ctx.push(("text_b".into(), text_b));
-    });
+    harness
+        .log()
+        .info_ctx("result", "REPLAY-2: Different input verified", |ctx| {
+            ctx.push(("text_a".into(), text_a));
+            ctx.push(("text_b".into(), text_b));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -770,12 +792,14 @@ fn cycle_run_abort_persist_reload_resume() {
         user_msgs.len()
     );
 
-    harness.log().info_ctx("result", "CYCLE-1: Abort/resume cycle verified", |ctx| {
-        ctx.push(("turn3_text".into(), turn3_text));
-        ctx.push(("total_messages".into(), messages.len().to_string()));
-        ctx.push(("user_messages".into(), user_msgs.len().to_string()));
-        ctx.push(("abort_result".into(), result.is_ok().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "CYCLE-1: Abort/resume cycle verified", |ctx| {
+            ctx.push(("turn3_text".into(), turn3_text));
+            ctx.push(("total_messages".into(), messages.len().to_string()));
+            ctx.push(("user_messages".into(), user_msgs.len().to_string()));
+            ctx.push(("abort_result".into(), result.is_ok().to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -802,15 +826,11 @@ fn cycle_tool_abort_then_fresh_success() {
             let handle = Arc::new(handle);
             let handle_clone = Arc::clone(&handle);
             agent_session
-                .run_text_with_abort(
-                    "use a tool".to_string(),
-                    Some(signal),
-                    move |event| {
-                        if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
-                            handle_clone.abort();
-                        }
-                    },
-                )
+                .run_text_with_abort("use a tool".to_string(), Some(signal), move |event| {
+                    if matches!(event, AgentEvent::ToolExecutionEnd { .. }) {
+                        handle_clone.abort();
+                    }
+                })
                 .await
         }
     });
@@ -840,9 +860,11 @@ fn cycle_tool_abort_then_fresh_success() {
         "Fresh run after tool abort should succeed: {fresh_text}"
     );
 
-    harness.log().info_ctx("result", "CYCLE-2: Tool abort/resume verified", |ctx| {
-        ctx.push(("fresh_text".into(), fresh_text));
-    });
+    harness
+        .log()
+        .info_ctx("result", "CYCLE-2: Tool abort/resume verified", |ctx| {
+            ctx.push(("fresh_text".into(), fresh_text));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -889,11 +911,13 @@ fn events_balanced_start_end_normal_run() {
     assert_eq!(turn_starts, turn_ends, "turn_start/end balanced");
     assert_eq!(msg_starts, msg_ends, "message_start/end balanced");
 
-    harness.log().info_ctx("result", "EVENTS-1: Balanced events verified", |ctx| {
-        ctx.push(("total_events".into(), cap.labels.len().to_string()));
-        ctx.push(("turns".into(), turn_starts.to_string()));
-        ctx.push(("messages".into(), msg_starts.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "EVENTS-1: Balanced events verified", |ctx| {
+            ctx.push(("total_events".into(), cap.labels.len().to_string()));
+            ctx.push(("turns".into(), turn_starts.to_string()));
+            ctx.push(("messages".into(), msg_starts.to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -933,9 +957,11 @@ fn events_balanced_tool_start_end() {
     );
     assert!(tool_starts >= 1, "Should have at least 1 tool execution");
 
-    harness.log().info_ctx("result", "EVENTS-2: Tool events balanced", |ctx| {
-        ctx.push(("tool_starts".into(), tool_starts.to_string()));
-        ctx.push(("tool_ends".into(), tool_ends.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "EVENTS-2: Tool events balanced", |ctx| {
+            ctx.push(("tool_starts".into(), tool_starts.to_string()));
+            ctx.push(("tool_ends".into(), tool_ends.to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }

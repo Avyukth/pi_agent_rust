@@ -284,11 +284,7 @@ fn triage_workflow_covers_provider_failure_patterns() {
     let ci_runbook = root.join("docs/ci-operator-runbook.md");
     let ci_content = load_text(&ci_runbook).expect("ci-operator-runbook.md must exist");
 
-    let provider_patterns = [
-        "provider_streaming",
-        "VCR",
-        "cassette",
-    ];
+    let provider_patterns = ["provider_streaming", "VCR", "cassette"];
 
     for pattern in &provider_patterns {
         assert!(
@@ -333,7 +329,9 @@ fn artifact_retention_policy_consistent() {
         "Most artifact uploads should specify if-no-files-found policy"
     );
 
-    eprintln!("[OK] Artifact retention policy consistent ({retention_count} explicit retention-days)");
+    eprintln!(
+        "[OK] Artifact retention policy consistent ({retention_count} explicit retention-days)"
+    );
 }
 
 #[test]
@@ -349,10 +347,7 @@ fn provider_test_infrastructure_produces_structured_output() {
 
     for file in &provider_test_files {
         let path = root.join(file);
-        assert!(
-            path.exists(),
-            "Provider test file must exist: {file}"
-        );
+        assert!(path.exists(), "Provider test file must exist: {file}");
         let content = load_text(&path).unwrap_or_default();
         // Each test should use TestHarness for structured output
         assert!(

@@ -103,9 +103,7 @@ fn make_assistant(
     }
 }
 
-fn stream_done(
-    msg: AssistantMessage,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     let partial = AssistantMessage {
         content: Vec::new(),
         api: msg.api.clone(),
@@ -220,7 +218,6 @@ impl SoakCapture {
             }));
         }
     }
-
 }
 
 fn write_timeline_artifact(harness: &TestHarness, test_name: &str, timeline: &[serde_json::Value]) {
@@ -281,7 +278,11 @@ fn compute_latency_stats(durations: &[u128]) -> (f64, f64, f64, f64, f64) {
     let n = durations.len() as f64;
     let sum: f64 = durations.iter().map(|d| *d as f64).sum();
     let mean = sum / n;
-    let variance = durations.iter().map(|d| (*d as f64 - mean).powi(2)).sum::<f64>() / n;
+    let variance = durations
+        .iter()
+        .map(|d| (*d as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
     let stddev = variance.sqrt();
     let min = durations.iter().copied().min().unwrap_or(0) as f64;
     let max = durations.iter().copied().max().unwrap_or(0) as f64;
@@ -437,7 +438,9 @@ impl Provider for IntermittentErrorProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let index = self.call_count.fetch_add(1, Ordering::SeqCst);
         if index % self.fail_every_n == 0 && index > 0 {
-            return Err(Error::api(format!("soak intermittent error at call {index}")));
+            return Err(Error::api(format!(
+                "soak intermittent error at call {index}"
+            )));
         }
         Ok(stream_done(make_assistant(
             StopReason::Stop,
@@ -548,7 +551,8 @@ fn soak_multi_turn_sustained_conversation() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
         let mut cumulative_tokens: u64 = 0;
 
         for turn in 0..SOAK_TURN_COUNT {
@@ -630,7 +634,9 @@ fn soak_multi_turn_sustained_conversation() {
 
     // Re-run to get metrics out (run_async returns ())
     // We capture everything inside the async block via side effects in the harness
-    harness.log().info("soak", "multi-turn sustained conversation completed");
+    harness
+        .log()
+        .info("soak", "multi-turn sustained conversation completed");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -654,7 +660,8 @@ fn soak_multi_turn_metrics_and_token_accumulation() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
         let mut cumulative_tokens: u64 = 0;
 
         for turn in 0..SOAK_TURN_COUNT {
@@ -668,7 +675,9 @@ fn soak_multi_turn_metrics_and_token_accumulation() {
 
             {
                 let guard = capture.lock().expect("lock");
-                ts.lock().expect("timeline lock").extend(guard.timeline.clone());
+                ts.lock()
+                    .expect("timeline lock")
+                    .extend(guard.timeline.clone());
             }
 
             let (tokens, error) = match &result {
@@ -740,21 +749,27 @@ fn soak_multi_turn_metrics_and_token_accumulation() {
 
     let durations: Vec<u128> = metrics.iter().map(|m| m.duration_ms).collect();
     let (mean, stddev, min, max, _) = compute_latency_stats(&durations);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "total_tokens": final_cumulative,
-        "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
-        "latency": {
-            "mean_ms": mean,
-            "stddev_ms": stddev,
-            "min_ms": min,
-            "max_ms": max,
-        },
-        "errors": 0,
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "total_tokens": final_cumulative,
+            "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
+            "latency": {
+                "mean_ms": mean,
+                "stddev_ms": stddev,
+                "min_ms": min,
+                "max_ms": max,
+            },
+            "errors": 0,
+        }),
+    );
 
-    harness.log().info("soak", "multi-turn metrics test completed");
+    harness
+        .log()
+        .info("soak", "multi-turn metrics test completed");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -774,12 +789,12 @@ fn soak_repeated_tool_execution() {
     let ms = Arc::clone(&metrics_store);
 
     run_async(async move {
-        let provider: Arc<dyn Provider> =
-            Arc::new(RepeatedToolProvider::new(fixture_path, 18));
+        let provider: Arc<dyn Provider> = Arc::new(RepeatedToolProvider::new(fixture_path, 18));
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 10);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 10);
         let mut cumulative_tokens: u64 = 0;
         let mut total_tool_calls: usize = 0;
 
@@ -825,7 +840,10 @@ fn soak_repeated_tool_execution() {
         }
 
         agent_session.persist_session().await.expect("persist");
-        assert!(total_tool_calls >= TOOL_ITERATION_COUNT, "Expected at least {TOOL_ITERATION_COUNT} tool calls, got {total_tool_calls}");
+        assert!(
+            total_tool_calls >= TOOL_ITERATION_COUNT,
+            "Expected at least {TOOL_ITERATION_COUNT} tool calls, got {total_tool_calls}"
+        );
     });
 
     let metrics = metrics_store.lock().expect("final metrics");
@@ -849,20 +867,26 @@ fn soak_repeated_tool_execution() {
 
     let durations: Vec<u128> = metrics.iter().map(|m| m.duration_ms).collect();
     let (mean, stddev, min, max, _) = compute_latency_stats(&durations);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "iterations": TOOL_ITERATION_COUNT,
-        "total_tokens": metrics.last().map_or(0, |m| m.cumulative_tokens),
-        "total_tool_starts": metrics.iter().map(|m| m.tool_starts).sum::<usize>(),
-        "latency": {
-            "mean_ms": mean,
-            "stddev_ms": stddev,
-            "min_ms": min,
-            "max_ms": max,
-        },
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "iterations": TOOL_ITERATION_COUNT,
+            "total_tokens": metrics.last().map_or(0, |m| m.cumulative_tokens),
+            "total_tool_starts": metrics.iter().map(|m| m.tool_starts).sum::<usize>(),
+            "latency": {
+                "mean_ms": mean,
+                "stddev_ms": stddev,
+                "min_ms": min,
+                "max_ms": max,
+            },
+        }),
+    );
 
-    harness.log().info("soak", "repeated tool execution test completed");
+    harness
+        .log()
+        .info("soak", "repeated tool execution test completed");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -884,7 +908,8 @@ fn soak_latency_stability_bounded_drift() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
 
         for turn in 0..SOAK_TURN_COUNT {
             let started_at = Instant::now();
@@ -924,27 +949,33 @@ fn soak_latency_stability_bounded_drift() {
             "Latency drift too high: last={last}ms, baseline={baseline}ms, ratio={drift_ratio:.2}, max={MAX_LATENCY_DRIFT_RATIO}"
         );
 
-        harness.log().info_ctx("soak", "latency drift check passed", |ctx| {
-            ctx.push(("baseline_ms".into(), baseline.to_string()));
-            ctx.push(("last_ms".into(), last.to_string()));
-            ctx.push(("drift_ratio".into(), format!("{drift_ratio:.2}")));
-        });
+        harness
+            .log()
+            .info_ctx("soak", "latency drift check passed", |ctx| {
+                ctx.push(("baseline_ms".into(), baseline.to_string()));
+                ctx.push(("last_ms".into(), last.to_string()));
+                ctx.push(("drift_ratio".into(), format!("{drift_ratio:.2}")));
+            });
     }
 
     let (mean, stddev, min, max, _) = compute_latency_stats(&durations);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "latency": {
-            "mean_ms": mean,
-            "stddev_ms": stddev,
-            "min_ms": min,
-            "max_ms": max,
-            "drift_ratio": if durations.len() > 2 {
-                durations[durations.len() - 1] as f64 / durations[1].max(1) as f64
-            } else { 0.0 },
-        },
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "latency": {
+                "mean_ms": mean,
+                "stddev_ms": stddev,
+                "min_ms": min,
+                "max_ms": max,
+                "drift_ratio": if durations.len() > 2 {
+                    durations[durations.len() - 1] as f64 / durations[1].max(1) as f64
+                } else { 0.0 },
+            },
+        }),
+    );
 
     write_metrics_artifact(&harness, test_name, &metrics);
     write_jsonl_artifacts(&harness, test_name);
@@ -969,7 +1000,8 @@ fn soak_error_recovery_sustainability() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
         let mut success_count: usize = 0;
         let mut error_count: usize = 0;
 
@@ -1001,10 +1033,15 @@ fn soak_error_recovery_sustainability() {
 
         // Verify that we had BOTH successes and errors
         assert!(success_count > 0, "Expected some successful turns");
-        assert!(error_count > 0, "Expected some error turns (intermittent failures)");
+        assert!(
+            error_count > 0,
+            "Expected some error turns (intermittent failures)"
+        );
 
         // Verify that errors did not prevent subsequent successes
-        let last_few: Vec<bool> = ms.lock().expect("lock")
+        let last_few: Vec<bool> = ms
+            .lock()
+            .expect("lock")
             .iter()
             .rev()
             .take(3)
@@ -1022,18 +1059,24 @@ fn soak_error_recovery_sustainability() {
     let success_count = metrics.len() - error_count;
 
     write_metrics_artifact(&harness, test_name, &metrics);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "successes": success_count,
-        "errors": error_count,
-        "error_rate": error_count as f64 / SOAK_TURN_COUNT as f64,
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "successes": success_count,
+            "errors": error_count,
+            "error_rate": error_count as f64 / SOAK_TURN_COUNT as f64,
+        }),
+    );
 
-    harness.log().info_ctx("soak", "error recovery sustainability completed", |ctx| {
-        ctx.push(("successes".into(), success_count.to_string()));
-        ctx.push(("errors".into(), error_count.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("soak", "error recovery sustainability completed", |ctx| {
+            ctx.push(("successes".into(), success_count.to_string()));
+            ctx.push(("errors".into(), error_count.to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1055,7 +1098,8 @@ fn soak_session_persist_reload_cycle() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
 
         // Phase 1: Run half the turns and persist
         let half = SOAK_TURN_COUNT / 2;
@@ -1107,8 +1151,9 @@ fn soak_session_persist_reload_cycle() {
 
         // Reload
         let session_path_str = session_path.to_string_lossy().to_string();
-        let (reloaded, diagnostics) =
-            Session::open_with_diagnostics(&session_path_str).await.expect("reload");
+        let (reloaded, diagnostics) = Session::open_with_diagnostics(&session_path_str)
+            .await
+            .expect("reload");
         assert!(
             diagnostics.skipped_entries.is_empty(),
             "no corruption expected during soak"
@@ -1189,12 +1234,16 @@ fn soak_session_persist_reload_cycle() {
     );
 
     write_metrics_artifact(&harness, test_name, &metrics);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "reload_at_turn": SOAK_TURN_COUNT / 2,
-        "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "reload_at_turn": SOAK_TURN_COUNT / 2,
+            "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
+        }),
+    );
 
     harness.log().info("soak", "persist/reload cycle completed");
     write_jsonl_artifacts(&harness, test_name);
@@ -1216,12 +1265,12 @@ fn soak_mixed_workload() {
     let ms = Arc::clone(&metrics_store);
 
     run_async(async move {
-        let provider: Arc<dyn Provider> =
-            Arc::new(MixedWorkloadProvider::new(fixture_path, 14));
+        let provider: Arc<dyn Provider> = Arc::new(MixedWorkloadProvider::new(fixture_path, 14));
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 10);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 10);
         let mut success_count: usize = 0;
         let mut tool_turn_count: usize = 0;
 
@@ -1281,13 +1330,17 @@ fn soak_mixed_workload() {
 
     let error_count = metrics.iter().filter(|m| m.error).count();
     let tool_count = metrics.iter().filter(|m| m.tool_starts > 0).count();
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "successes": metrics.len() - error_count,
-        "errors": error_count,
-        "tool_turns": tool_count,
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "successes": metrics.len() - error_count,
+            "errors": error_count,
+            "tool_turns": tool_count,
+        }),
+    );
 
     harness.log().info("soak", "mixed workload test completed");
     write_jsonl_artifacts(&harness, test_name);
@@ -1311,7 +1364,8 @@ fn soak_session_message_growth_linear() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
 
         for turn in 0..SOAK_TURN_COUNT {
             let started_at = Instant::now();
@@ -1382,15 +1436,21 @@ fn soak_session_message_growth_linear() {
     );
 
     write_metrics_artifact(&harness, test_name, &metrics);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "first_message_count": metrics.first().map_or(0, |m| m.session_message_count),
-        "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
-        "growth_ratio": last / first.max(1.0),
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "first_message_count": metrics.first().map_or(0, |m| m.session_message_count),
+            "final_message_count": metrics.last().map_or(0, |m| m.session_message_count),
+            "growth_ratio": last / first.max(1.0),
+        }),
+    );
 
-    harness.log().info("soak", "session message growth linearity verified");
+    harness
+        .log()
+        .info("soak", "session message growth linearity verified");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1413,7 +1473,8 @@ fn soak_token_budget_monotonic() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
         let mut cumulative_tokens: u64 = 0;
 
         for turn in 0..SOAK_TURN_COUNT {
@@ -1479,8 +1540,7 @@ fn soak_token_budget_monotonic() {
         assert_eq!(
             m.tokens, 25,
             "turn {}: expected 25 tokens per turn, got {}",
-            m.turn_index,
-            m.tokens
+            m.turn_index, m.tokens
         );
     }
 
@@ -1493,15 +1553,21 @@ fn soak_token_budget_monotonic() {
     );
 
     write_metrics_artifact(&harness, test_name, &metrics);
-    write_summary_artifact(&harness, test_name, &json!({
-        "test": test_name,
-        "turns": SOAK_TURN_COUNT,
-        "tokens_per_turn": 25,
-        "expected_total": expected_total,
-        "actual_total": actual_total,
-    }));
+    write_summary_artifact(
+        &harness,
+        test_name,
+        &json!({
+            "test": test_name,
+            "turns": SOAK_TURN_COUNT,
+            "tokens_per_turn": 25,
+            "expected_total": expected_total,
+            "actual_total": actual_total,
+        }),
+    );
 
-    harness.log().info("soak", "token budget monotonic accumulation verified");
+    harness
+        .log()
+        .info("soak", "token budget monotonic accumulation verified");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1523,7 +1589,8 @@ fn soak_stability_report_generation() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(cwd.clone()),
         )));
-        let mut agent_session = make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
+        let mut agent_session =
+            make_agent_session(&cwd, Arc::clone(&provider), Arc::clone(&session), 4);
         let mut cumulative_tokens: u64 = 0;
 
         for turn in 0..SOAK_TURN_COUNT {
@@ -1630,7 +1697,11 @@ fn soak_stability_report_generation() {
         stddev,
         min,
         max,
-        if mean > 0.0 { (stddev / mean) * 100.0 } else { 0.0 },
+        if mean > 0.0 {
+            (stddev / mean) * 100.0
+        } else {
+            0.0
+        },
     );
     std::fs::write(&md_path, md_content).expect("write markdown report");
     harness.record_artifact(format!("{test_name}.report.md"), &md_path);
@@ -1638,15 +1709,21 @@ fn soak_stability_report_generation() {
     // All stability checks should pass
     assert_eq!(error_count, 0, "stability report: unexpected errors");
     assert!(
-        report["stability_checks"]["monotonic_tokens"].as_bool().unwrap_or(false),
+        report["stability_checks"]["monotonic_tokens"]
+            .as_bool()
+            .unwrap_or(false),
         "stability report: tokens not monotonic"
     );
     assert!(
-        report["stability_checks"]["monotonic_messages"].as_bool().unwrap_or(false),
+        report["stability_checks"]["monotonic_messages"]
+            .as_bool()
+            .unwrap_or(false),
         "stability report: messages not monotonic"
     );
     assert!(
-        report["stability_checks"]["latency_bounded"].as_bool().unwrap_or(false),
+        report["stability_checks"]["latency_bounded"]
+            .as_bool()
+            .unwrap_or(false),
         "stability report: latency drift exceeded"
     );
 

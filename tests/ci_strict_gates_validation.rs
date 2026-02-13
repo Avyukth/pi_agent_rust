@@ -29,15 +29,12 @@ const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
 const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 
 fn load_json(path: &str) -> Value {
-    let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Should read {path}"));
-    serde_json::from_str(&content)
-        .unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
+    serde_json::from_str(&content).unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
 }
 
 fn load_text(path: &str) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Should read {path}"))
+    std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -48,7 +45,9 @@ fn load_text(path: &str) -> String {
 fn non_mock_rubric_exists_with_valid_schema() {
     let rubric = load_json(NON_MOCK_RUBRIC_PATH);
     assert!(
-        rubric["schema"].as_str().is_some_and(|s| s.starts_with("pi.qa.non_mock_rubric")),
+        rubric["schema"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("pi.qa.non_mock_rubric")),
         "non-mock-rubric.json must have a schema field"
     );
 }
@@ -319,10 +318,7 @@ fn scenario_matrix_consumed_by_ci_gates() {
     let consumed_by = matrix["ci_policy"]["consumed_by"]
         .as_array()
         .expect("consumed_by array");
-    let consumers: Vec<&str> = consumed_by
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
+    let consumers: Vec<&str> = consumed_by.iter().filter_map(Value::as_str).collect();
     assert!(
         consumers.iter().any(|c| c.contains("ci_full_suite_gate")),
         "scenario matrix must be consumed by ci_full_suite_gate"

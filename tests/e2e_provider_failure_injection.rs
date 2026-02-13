@@ -177,9 +177,7 @@ fn classify_result(
             let has_error = events
                 .iter()
                 .any(|e| matches!(e, StreamEvent::Error { .. }));
-            let has_done = events
-                .iter()
-                .any(|e| matches!(e, StreamEvent::Done { .. }));
+            let has_done = events.iter().any(|e| matches!(e, StreamEvent::Done { .. }));
             let text_chars = events
                 .iter()
                 .map(|e| match e {
@@ -283,7 +281,8 @@ fn empty_body_200_is_detected_as_error() {
     results.push(classified);
 
     // Anthropic: 200 with empty body
-    let (provider, _server) = setup_anthropic(&harness, make_response(200, "text/event-stream", b""));
+    let (provider, _server) =
+        setup_anthropic(&harness, make_response(200, "text/event-stream", b""));
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("empty_body_200", "anthropic", &r);
     // Empty body: provider may error, produce no events, or produce a Done with no content
@@ -304,16 +303,14 @@ fn null_json_body_is_handled() {
     let harness = TestHarness::new("null_json_body_is_handled");
     let mut results = Vec::new();
 
-    let (provider, _server) = setup_openai(&harness, make_response(200, "application/json", b"null"));
+    let (provider, _server) =
+        setup_openai(&harness, make_response(200, "application/json", b"null"));
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("null_json_body", "openai", &r);
     // Should not panic
     results.push(classified);
 
-    let (provider, _server) = setup_openai(
-        &harness,
-        make_response(200, "application/json", b"{}"),
-    );
+    let (provider, _server) = setup_openai(&harness, make_response(200, "application/json", b"{}"));
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("empty_json_object", "openai", &r);
     results.push(classified);
@@ -414,10 +411,8 @@ fn wrong_content_type_is_detected() {
 
     // 200 with text/html instead of event-stream
     let body = r"<html><body>Not an API</body></html>";
-    let (provider, _server) = setup_openai(
-        &harness,
-        make_response(200, "text/html", body.as_bytes()),
-    );
+    let (provider, _server) =
+        setup_openai(&harness, make_response(200, "text/html", body.as_bytes()));
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("text_html_response", "openai", &r);
     assert!(
@@ -445,7 +440,7 @@ fn missing_content_type_header() {
 
     let response = MockHttpResponse {
         status: 200,
-        headers: vec![],  // No Content-Type header
+        headers: vec![], // No Content-Type header
         body: b"data: [DONE]\n\n".to_vec(),
     };
     let server = harness.start_mock_http_server();
@@ -478,7 +473,11 @@ fn http_500_with_json_error_body() {
     });
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(500, "application/json", serde_json::to_vec(&error_body).unwrap().as_slice()),
+        make_response(
+            500,
+            "application/json",
+            serde_json::to_vec(&error_body).unwrap().as_slice(),
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("500_json", "openai", &r);
@@ -513,7 +512,11 @@ fn http_503_service_unavailable() {
 
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(503, "application/json", br#"{"error":{"message":"Service temporarily unavailable","type":"server_error"}}"#),
+        make_response(
+            503,
+            "application/json",
+            br#"{"error":{"message":"Service temporarily unavailable","type":"server_error"}}"#,
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("503_unavailable", "openai", &r);
@@ -532,7 +535,11 @@ fn http_502_bad_gateway() {
 
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(502, "text/html", b"<html><body>502 Bad Gateway</body></html>"),
+        make_response(
+            502,
+            "text/html",
+            b"<html><body>502 Bad Gateway</body></html>",
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("502_bad_gateway", "openai", &r);
@@ -707,7 +714,11 @@ fn large_error_payload_is_handled() {
     });
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(500, "application/json", serde_json::to_vec(&error_body).unwrap().as_slice()),
+        make_response(
+            500,
+            "application/json",
+            serde_json::to_vec(&error_body).unwrap().as_slice(),
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("large_error_payload", "openai", &r);
@@ -731,7 +742,8 @@ fn anthropic_overloaded_error_event() {
         r"event: error",
         r#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
         "",
-    ].join("\n");
+    ]
+    .join("\n");
 
     let (provider, _server) = setup_anthropic(&harness, make_sse_response(&sse));
     let r = collect_events(provider, simple_context(), default_options());
@@ -752,7 +764,8 @@ fn anthropic_api_error_event() {
         r"event: error",
         r#"data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}"#,
         "",
-    ].join("\n");
+    ]
+    .join("\n");
 
     let (provider, _server) = setup_anthropic(&harness, make_sse_response(&sse));
     let r = collect_events(provider, simple_context(), default_options());
@@ -789,7 +802,11 @@ fn http_4xx_error_codes_produce_errors() {
         let body = json!({"error": {"message": format!("Error: {label}"), "type": label}});
         let (provider, _server) = setup_openai(
             &harness,
-            make_response(*code, "application/json", serde_json::to_vec(&body).unwrap().as_slice()),
+            make_response(
+                *code,
+                "application/json",
+                serde_json::to_vec(&body).unwrap().as_slice(),
+            ),
         );
         let r = collect_events(provider, simple_context(), default_options());
         let classified = classify_result(&format!("http_{code}"), "openai", &r);
@@ -816,7 +833,11 @@ fn error_messages_are_non_empty_strings() {
     // Auth error should produce a non-empty error message
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(401, "application/json", br#"{"error":{"message":"Invalid API key","type":"authentication_error"}}"#),
+        make_response(
+            401,
+            "application/json",
+            br#"{"error":{"message":"Invalid API key","type":"authentication_error"}}"#,
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("auth_error_msg", "openai", &r);
@@ -847,7 +868,11 @@ fn error_events_include_stop_reason() {
 
     let (provider, _server) = setup_openai(
         &harness,
-        make_response(500, "application/json", br#"{"error":{"message":"Server error","type":"server_error"}}"#),
+        make_response(
+            500,
+            "application/json",
+            br#"{"error":{"message":"Server error","type":"server_error"}}"#,
+        ),
     );
     let r = collect_events(provider, simple_context(), default_options());
     if let Ok(events) = &r {
@@ -857,10 +882,7 @@ fn error_events_include_stop_reason() {
                 StreamEvent::Done { reason, .. } | StreamEvent::Error { reason, .. } => {
                     // Reason should be set (not the default Unknown)
                     let reason_str = format!("{reason:?}");
-                    assert!(
-                        !reason_str.is_empty(),
-                        "terminal events must have a reason"
-                    );
+                    assert!(!reason_str.is_empty(), "terminal events must have a reason");
                 }
                 _ => {}
             }
@@ -883,11 +905,23 @@ fn comprehensive_failure_injection_report() {
     // Test suite of failure injections with summary
     let scenarios: Vec<(&str, MockHttpResponse)> = vec![
         ("empty_200", make_response(200, "text/event-stream", b"")),
-        ("html_200", make_response(200, "text/html", b"<html>error</html>")),
-        ("json_500", make_response(500, "application/json", br#"{"error":{"message":"fail"}}"#)),
+        (
+            "html_200",
+            make_response(200, "text/html", b"<html>error</html>"),
+        ),
+        (
+            "json_500",
+            make_response(500, "application/json", br#"{"error":{"message":"fail"}}"#),
+        ),
         ("empty_500", make_response(500, "text/plain", b"")),
-        ("text_429", make_response(429, "text/plain", b"rate limited")),
-        ("binary_200", make_response(200, "application/octet-stream", &[0xFF, 0xFE, 0x00, 0x01])),
+        (
+            "text_429",
+            make_response(429, "text/plain", b"rate limited"),
+        ),
+        (
+            "binary_200",
+            make_response(200, "application/octet-stream", &[0xFF, 0xFE, 0x00, 0x01]),
+        ),
     ];
 
     for (name, response) in scenarios {
@@ -915,8 +949,11 @@ fn comprehensive_failure_injection_report() {
     });
 
     let summary_path = harness.temp_path("failure_injection_summary.json");
-    std::fs::write(&summary_path, serde_json::to_string_pretty(&summary).unwrap())
-        .expect("write summary");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_string_pretty(&summary).unwrap(),
+    )
+    .expect("write summary");
     harness.record_artifact("failure_injection_summary.json", &summary_path);
     write_results(&harness, "comprehensive_report", &all_results);
 
@@ -1347,26 +1384,38 @@ fn cross_provider_error_parity_matrix() {
     // Test same error codes across OpenAI and Anthropic
     let error_scenarios: Vec<(&str, u16, &[u8])> = vec![
         ("auth_401", 401, br#"{"error":{"message":"Unauthorized"}}"#),
-        ("bad_request_400", 400, br#"{"error":{"message":"Bad request"}}"#),
-        ("rate_limit_429", 429, br#"{"error":{"message":"Rate limited"}}"#),
-        ("server_error_500", 500, br#"{"error":{"message":"Internal error"}}"#),
-        ("unavailable_503", 503, br#"{"error":{"message":"Service unavailable"}}"#),
+        (
+            "bad_request_400",
+            400,
+            br#"{"error":{"message":"Bad request"}}"#,
+        ),
+        (
+            "rate_limit_429",
+            429,
+            br#"{"error":{"message":"Rate limited"}}"#,
+        ),
+        (
+            "server_error_500",
+            500,
+            br#"{"error":{"message":"Internal error"}}"#,
+        ),
+        (
+            "unavailable_503",
+            503,
+            br#"{"error":{"message":"Service unavailable"}}"#,
+        ),
     ];
 
     for (name, status, body) in &error_scenarios {
         // OpenAI
-        let (provider, _server) = setup_openai(
-            &harness,
-            make_response(*status, "application/json", body),
-        );
+        let (provider, _server) =
+            setup_openai(&harness, make_response(*status, "application/json", body));
         let r = collect_events(provider, simple_context(), default_options());
         all_results.push(classify_result(name, "openai", &r));
 
         // Anthropic
-        let (provider, _server) = setup_anthropic(
-            &harness,
-            make_response(*status, "application/json", body),
-        );
+        let (provider, _server) =
+            setup_anthropic(&harness, make_response(*status, "application/json", body));
         let r = collect_events(provider, simple_context(), default_options());
         all_results.push(classify_result(name, "anthropic", &r));
     }

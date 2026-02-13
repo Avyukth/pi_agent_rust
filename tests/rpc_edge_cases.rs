@@ -79,7 +79,10 @@ async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<Str
     }
 }
 
-fn make_rpc_options(harness: &TestHarness, handle: &asupersync::runtime::RuntimeHandle) -> RpcOptions {
+fn make_rpc_options(
+    harness: &TestHarness,
+    handle: &asupersync::runtime::RuntimeHandle,
+) -> RpcOptions {
     let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
     RpcOptions {
         config: Config::default(),
@@ -315,7 +318,9 @@ fn rpc_get_last_assistant_text_with_messages() {
         });
         session.append_message(SessionMessage::Assistant {
             message: AssistantMessage {
-                content: vec![ContentBlock::Text(TextContent::new("Hello! How can I help?"))],
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "Hello! How can I help?",
+                ))],
                 api: "test".to_string(),
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
@@ -644,15 +649,9 @@ fn rpc_multiple_commands_preserve_id_ordering() {
             .await
             .expect("send c");
 
-        let line_a = recv_line(&out_rx, "response a")
-            .await
-            .expect("recv a");
-        let line_b = recv_line(&out_rx, "response b")
-            .await
-            .expect("recv b");
-        let line_c = recv_line(&out_rx, "response c")
-            .await
-            .expect("recv c");
+        let line_a = recv_line(&out_rx, "response a").await.expect("recv a");
+        let line_b = recv_line(&out_rx, "response b").await.expect("recv b");
+        let line_c = recv_line(&out_rx, "response c").await.expect("recv c");
 
         drop(in_tx);
         let _ = server.await;
@@ -776,10 +775,7 @@ fn rpc_empty_line_is_skipped_gracefully() {
         let cx = asupersync::Cx::for_testing();
 
         // Send empty string, then a valid command
-        in_tx
-            .send(&cx, String::new())
-            .await
-            .expect("send empty");
+        in_tx.send(&cx, String::new()).await.expect("send empty");
         in_tx
             .send(&cx, r#"{"id":"1","type":"get_state"}"#.to_string())
             .await
@@ -813,7 +809,10 @@ fn rpc_empty_line_is_skipped_gracefully() {
         drop(in_tx);
         let _ = server.await;
 
-        assert!(found_get_state, "Expected get_state response after empty line");
+        assert!(
+            found_get_state,
+            "Expected get_state response after empty line"
+        );
     });
 }
 
@@ -842,9 +841,6 @@ fn rpc_server_exits_cleanly_when_input_channel_closes() {
         drop(in_tx);
 
         let result = server.await;
-        assert!(
-            result.is_ok(),
-            "RPC server should exit cleanly: {result:?}"
-        );
+        assert!(result.is_ok(), "RPC server should exit cleanly: {result:?}");
     });
 }

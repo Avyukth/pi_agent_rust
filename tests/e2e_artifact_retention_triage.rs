@@ -37,14 +37,12 @@ const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
 
 fn load_text(path: &str) -> String {
-    std::fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Should read {path}"))
+    std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
 }
 
 fn load_json(path: &str) -> Value {
     let content = load_text(path);
-    serde_json::from_str(&content)
-        .unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
+    serde_json::from_str(&content).unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -82,10 +80,7 @@ fn test_logger_produces_jsonl_output() {
     // Each line should be valid JSON
     for line in &lines {
         let parsed: Result<Value, _> = serde_json::from_str(line);
-        assert!(
-            parsed.is_ok(),
-            "Each log line should be valid JSON: {line}"
-        );
+        assert!(parsed.is_ok(), "Each log line should be valid JSON: {line}");
     }
 }
 
@@ -172,10 +167,7 @@ fn log_redacts_authorization_headers() {
 #[test]
 fn log_redacts_x_api_key_headers() {
     let harness = TestHarness::new("redaction_x_api_key_test");
-    harness.info_ctx(
-        "anthropic request",
-        &[("x-api-key", "sk-ant-api03-secret")],
-    );
+    harness.info_ctx("anthropic request", &[("x-api-key", "sk-ant-api03-secret")]);
 
     let log_content = harness.dump_logs();
     assert!(
@@ -389,7 +381,7 @@ fn scenario_matrix_requires_evidence_contract() {
         .expect("required_run_artifacts array");
     let has_evidence = run_artifacts
         .iter()
-        .any(|a| a.as_str().map_or(false, |s| s.contains("evidence")));
+        .any(|a| a.as_str().is_some_and(|s| s.contains("evidence")));
     assert!(
         has_evidence,
         "required_run_artifacts must include evidence_contract.json"
@@ -402,9 +394,10 @@ fn scenario_matrix_requires_test_log_jsonl() {
     let suite_artifacts = matrix["ci_policy"]["required_suite_artifacts"]
         .as_array()
         .expect("required_suite_artifacts array");
-    let has_test_log = suite_artifacts
-        .iter()
-        .any(|a| a.as_str().map_or(false, |s| s.contains("test-log") || s.contains("log")));
+    let has_test_log = suite_artifacts.iter().any(|a| {
+        a.as_str()
+            .is_some_and(|s| s.contains("test-log") || s.contains("log"))
+    });
     assert!(
         has_test_log,
         "required_suite_artifacts must include test-log.jsonl"
@@ -417,9 +410,11 @@ fn scenario_matrix_requires_artifact_index() {
     let suite_artifacts = matrix["ci_policy"]["required_suite_artifacts"]
         .as_array()
         .expect("required_suite_artifacts array");
-    let has_index = suite_artifacts
-        .iter()
-        .any(|a| a.as_str().map_or(false, |s| s.contains("artifact-index") || s.contains("index")));
+    let has_index = suite_artifacts.iter().any(|a| {
+        a.as_str().is_some_and(|s| {
+            s.contains("artifact-index") || s.contains("index")
+        })
+    });
     assert!(
         has_index,
         "required_suite_artifacts must include artifact-index.jsonl"
@@ -704,13 +699,28 @@ fn comprehensive_artifact_retention_report() {
         ("upload-artifact steps", ci.contains("upload-artifact")),
         ("retention-days config", ci.contains("retention-days")),
         ("always-upload condition", ci.contains("if: always()")),
-        ("shard artifacts", ci.contains("shard") && ci.contains("artifact")),
-        ("evidence bundle", ci.contains("evidence-bundle") || ci.contains("evidence_bundle")),
+        (
+            "shard artifacts",
+            ci.contains("shard") && ci.contains("artifact"),
+        ),
+        (
+            "evidence bundle",
+            ci.contains("evidence-bundle") || ci.contains("evidence_bundle"),
+        ),
         ("conformance reports", ci.contains("conformance")),
         ("quarantine system", ci.contains("quarantine")),
-        ("failure signatures", ci.contains("signature") || ci.contains("failure")),
-        ("correlation IDs", ci.contains("CORRELATION_ID") || ci.contains("correlation_id")),
-        ("gate promotion", ci.contains("promotion") || ci.contains("PROMOTION")),
+        (
+            "failure signatures",
+            ci.contains("signature") || ci.contains("failure"),
+        ),
+        (
+            "correlation IDs",
+            ci.contains("CORRELATION_ID") || ci.contains("correlation_id"),
+        ),
+        (
+            "gate promotion",
+            ci.contains("promotion") || ci.contains("PROMOTION"),
+        ),
     ];
 
     for (name, present) in &artifact_features {
@@ -723,10 +733,22 @@ fn comprehensive_artifact_retention_report() {
 
     // Count policy features
     let policy_features = [
-        ("artifact requirements", policy.contains("artifact") || policy.contains("JSONL")),
-        ("quarantine reference", policy.contains("quarantine") || policy.contains("Quarantine")),
-        ("triage workflow", runbook.contains("triage") || runbook.contains("Triage")),
-        ("reproduction commands", runbook.contains("cargo test") || runbook.contains("reproduce")),
+        (
+            "artifact requirements",
+            policy.contains("artifact") || policy.contains("JSONL"),
+        ),
+        (
+            "quarantine reference",
+            policy.contains("quarantine") || policy.contains("Quarantine"),
+        ),
+        (
+            "triage workflow",
+            runbook.contains("triage") || runbook.contains("Triage"),
+        ),
+        (
+            "reproduction commands",
+            runbook.contains("cargo test") || runbook.contains("reproduce"),
+        ),
     ];
 
     for (name, present) in &policy_features {

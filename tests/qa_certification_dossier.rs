@@ -233,21 +233,24 @@ fn certification_dossier() {
     // ── Scenario matrix ──
     let matrix_path = root.join("docs/e2e_scenario_matrix.json");
     let matrix = load_json(&matrix_path);
-    let (covered, waived, planned, total_workflows) =
-        matrix.as_ref().map_or((0, 0, 0, 0), |m| {
-            let rows = m["rows"].as_array().map_or(&[] as &[Value], std::vec::Vec::as_slice);
-            let c = rows.iter().filter(|r| r["status"] == "covered").count();
-            let w = rows.iter().filter(|r| r["status"] == "waived").count();
-            let p = rows.iter().filter(|r| r["status"] == "planned").count();
-            (c, w, p, rows.len())
-        });
+    let (covered, waived, planned, total_workflows) = matrix.as_ref().map_or((0, 0, 0, 0), |m| {
+        let rows = m["rows"]
+            .as_array()
+            .map_or(&[] as &[Value], std::vec::Vec::as_slice);
+        let c = rows.iter().filter(|r| r["status"] == "covered").count();
+        let w = rows.iter().filter(|r| r["status"] == "waived").count();
+        let p = rows.iter().filter(|r| r["status"] == "planned").count();
+        (c, w, p, rows.len())
+    });
     let coverage_pct = if total_workflows > 0 {
         100.0 * covered as f64 / total_workflows as f64
     } else {
         0.0
     };
 
-    eprintln!("\nScenario matrix: {covered}/{total_workflows} covered ({coverage_pct:.0}%), {waived} waived");
+    eprintln!(
+        "\nScenario matrix: {covered}/{total_workflows} covered ({coverage_pct:.0}%), {waived} waived"
+    );
 
     // ── CI gate status ──
     let verdict_path = report_dir.join("full_suite_verdict.json");
@@ -274,9 +277,18 @@ fn certification_dossier() {
         ("Test double inventory", "docs/test_double_inventory.json"),
         ("Non-mock rubric", "docs/non-mock-rubric.json"),
         ("E2E scenario matrix", "docs/e2e_scenario_matrix.json"),
-        ("CI gate verdict", "tests/full_suite_gate/full_suite_verdict.json"),
-        ("Preflight verdict", "tests/full_suite_gate/preflight_verdict.json"),
-        ("Certification verdict", "tests/full_suite_gate/certification_verdict.json"),
+        (
+            "CI gate verdict",
+            "tests/full_suite_gate/full_suite_verdict.json",
+        ),
+        (
+            "Preflight verdict",
+            "tests/full_suite_gate/preflight_verdict.json",
+        ),
+        (
+            "Certification verdict",
+            "tests/full_suite_gate/certification_verdict.json",
+        ),
         ("Waiver audit", "tests/full_suite_gate/waiver_audit.json"),
         ("Replay bundle", "tests/full_suite_gate/replay_bundle.json"),
         ("Testing policy", "docs/testing-policy.md"),
@@ -413,7 +425,9 @@ fn certification_dossier() {
         ],
         quantified_residuals: vec![
             format!("3 recording doubles tracked for migration (bd-m9rk)"),
-            format!("{inv_high} high-risk entries in inventory (mostly extension_dispatcher inline stubs)"),
+            format!(
+                "{inv_high} high-risk entries in inventory (mostly extension_dispatcher inline stubs)"
+            ),
             "model_selector_cycling uses DummyProvider (known, tracked)".to_string(),
         ],
     };
@@ -439,7 +453,9 @@ fn certification_dossier() {
         ],
         quantified_residuals: vec![
             "1 waived workflow (live provider parity, requires credentials)".to_string(),
-            format!("{gate_fail} CI gate failure (cross_platform), {gate_skip} skipped (missing conformance artifacts)"),
+            format!(
+                "{gate_fail} CI gate failure (cross_platform), {gate_skip} skipped (missing conformance artifacts)"
+            ),
             "Evidence bundle only generated during full E2E runs".to_string(),
         ],
     };
@@ -506,38 +522,73 @@ fn certification_dossier() {
     md.push_str("# QA Certification Dossier\n\n");
     md.push_str(&format!("> Generated: {}\n", dossier.generated_at));
     md.push_str(&format!("> Bead: {}\n", dossier.bead));
-    md.push_str(&format!("> Verdict: **{}**\n\n", dossier.verdict.to_uppercase()));
+    md.push_str(&format!(
+        "> Verdict: **{}**\n\n",
+        dossier.verdict.to_uppercase()
+    ));
 
     md.push_str("## Closure Question 1: Non-Mock Coverage\n\n");
-    md.push_str(&format!("**{}**\n\n", dossier.closure_questions.q1_non_mock_coverage.question));
-    md.push_str(&format!("{}\n\n", dossier.closure_questions.q1_non_mock_coverage.answer));
+    md.push_str(&format!(
+        "**{}**\n\n",
+        dossier.closure_questions.q1_non_mock_coverage.question
+    ));
+    md.push_str(&format!(
+        "{}\n\n",
+        dossier.closure_questions.q1_non_mock_coverage.answer
+    ));
     md.push_str("Evidence:\n");
     for e in &dossier.closure_questions.q1_non_mock_coverage.evidence {
         md.push_str(&format!("- `{e}`\n"));
     }
     md.push_str("\nResiduals:\n");
-    for r in &dossier.closure_questions.q1_non_mock_coverage.quantified_residuals {
+    for r in &dossier
+        .closure_questions
+        .q1_non_mock_coverage
+        .quantified_residuals
+    {
         md.push_str(&format!("- {r}\n"));
     }
 
     md.push_str("\n## Closure Question 2: E2E Logging\n\n");
-    md.push_str(&format!("**{}**\n\n", dossier.closure_questions.q2_e2e_logging.question));
-    md.push_str(&format!("{}\n\n", dossier.closure_questions.q2_e2e_logging.answer));
+    md.push_str(&format!(
+        "**{}**\n\n",
+        dossier.closure_questions.q2_e2e_logging.question
+    ));
+    md.push_str(&format!(
+        "{}\n\n",
+        dossier.closure_questions.q2_e2e_logging.answer
+    ));
     md.push_str("Evidence:\n");
     for e in &dossier.closure_questions.q2_e2e_logging.evidence {
         md.push_str(&format!("- `{e}`\n"));
     }
     md.push_str("\nResiduals:\n");
-    for r in &dossier.closure_questions.q2_e2e_logging.quantified_residuals {
+    for r in &dossier
+        .closure_questions
+        .q2_e2e_logging
+        .quantified_residuals
+    {
         md.push_str(&format!("- {r}\n"));
     }
 
     md.push_str("\n## Suite Classification\n\n");
     md.push_str("| Suite | Files |\n|-------|-------|\n");
-    md.push_str(&format!("| Unit | {} |\n", dossier.suite_classification.unit_files));
-    md.push_str(&format!("| VCR | {} |\n", dossier.suite_classification.vcr_files));
-    md.push_str(&format!("| E2E | {} |\n", dossier.suite_classification.e2e_files));
-    md.push_str(&format!("| **Total** | **{}** |\n", dossier.suite_classification.total_classified));
+    md.push_str(&format!(
+        "| Unit | {} |\n",
+        dossier.suite_classification.unit_files
+    ));
+    md.push_str(&format!(
+        "| VCR | {} |\n",
+        dossier.suite_classification.vcr_files
+    ));
+    md.push_str(&format!(
+        "| E2E | {} |\n",
+        dossier.suite_classification.e2e_files
+    ));
+    md.push_str(&format!(
+        "| **Total** | **{}** |\n",
+        dossier.suite_classification.total_classified
+    ));
 
     md.push_str("\n## Allowlisted Exceptions\n\n");
     md.push_str("| Identifier | Owner | Status | Plan |\n|------------|-------|--------|------|\n");
@@ -651,8 +702,7 @@ fn docs_cross_references_valid() {
     eprintln!("\n=== Documentation Cross-Reference Validation ===\n");
 
     // qa-runbook.md must reference testing-policy.md
-    let runbook = std::fs::read_to_string(root.join("docs/qa-runbook.md"))
-        .unwrap_or_default();
+    let runbook = std::fs::read_to_string(root.join("docs/qa-runbook.md")).unwrap_or_default();
     assert!(
         runbook.contains("testing-policy.md"),
         "qa-runbook.md must reference testing-policy.md"
@@ -660,8 +710,7 @@ fn docs_cross_references_valid() {
     eprintln!("  [OK] qa-runbook.md -> testing-policy.md");
 
     // testing-policy.md must reference qa-runbook.md
-    let policy = std::fs::read_to_string(root.join("docs/testing-policy.md"))
-        .unwrap_or_default();
+    let policy = std::fs::read_to_string(root.join("docs/testing-policy.md")).unwrap_or_default();
     assert!(
         policy.contains("qa-runbook.md"),
         "testing-policy.md must reference qa-runbook.md"
@@ -669,8 +718,8 @@ fn docs_cross_references_valid() {
     eprintln!("  [OK] testing-policy.md -> qa-runbook.md");
 
     // ci-operator-runbook.md must reference both
-    let operator = std::fs::read_to_string(root.join("docs/ci-operator-runbook.md"))
-        .unwrap_or_default();
+    let operator =
+        std::fs::read_to_string(root.join("docs/ci-operator-runbook.md")).unwrap_or_default();
     assert!(
         operator.contains("testing-policy.md"),
         "ci-operator-runbook.md must reference testing-policy.md"
@@ -727,8 +776,7 @@ fn allowlist_has_complete_metadata() {
 
     eprintln!("\n=== Allowlist Metadata Completeness ===\n");
 
-    let policy = std::fs::read_to_string(root.join("docs/testing-policy.md"))
-        .unwrap_or_default();
+    let policy = std::fs::read_to_string(root.join("docs/testing-policy.md")).unwrap_or_default();
 
     // The allowlist table must include Owner and Replacement Plan columns
     assert!(

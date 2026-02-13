@@ -81,10 +81,7 @@ fn load_skills_empty_directories_returns_empty() {
     });
 
     assert!(result.skills.is_empty(), "Expected no skills");
-    assert!(
-        result.diagnostics.is_empty(),
-        "Expected no diagnostics"
-    );
+    assert!(result.diagnostics.is_empty(), "Expected no diagnostics");
 }
 
 #[test]
@@ -103,7 +100,10 @@ fn load_skills_nonexistent_skill_path_ignored() {
         include_defaults: false,
     });
 
-    assert!(result.skills.is_empty(), "Expected no skills for missing path");
+    assert!(
+        result.skills.is_empty(),
+        "Expected no skills for missing path"
+    );
 }
 
 #[test]

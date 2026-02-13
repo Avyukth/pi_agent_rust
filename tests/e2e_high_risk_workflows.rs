@@ -86,9 +86,7 @@ fn make_assistant(
     }
 }
 
-fn stream_done(
-    msg: AssistantMessage,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     let partial = AssistantMessage {
         content: Vec::new(),
         api: msg.api.clone(),
@@ -578,9 +576,7 @@ fn provider_error_on_stream_surfaces_to_caller() {
                 Some(cwd.clone()),
             )));
             let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-            agent_session
-                .run_text("hello".to_string(), |_| {})
-                .await
+            agent_session.run_text("hello".to_string(), |_| {}).await
         }
     });
 
@@ -618,10 +614,7 @@ fn provider_mid_stream_error_handled_gracefully() {
         }
     });
 
-    assert!(
-        result.is_err(),
-        "Expected error from mid-stream failure"
-    );
+    assert!(result.is_err(), "Expected error from mid-stream failure");
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("connection reset") || err_msg.contains("streaming"),
@@ -649,9 +642,7 @@ fn provider_empty_response_does_not_crash() {
                 Some(cwd.clone()),
             )));
             let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-            agent_session
-                .run_text("hello".to_string(), |_| {})
-                .await
+            agent_session.run_text("hello".to_string(), |_| {}).await
         }
     });
 
@@ -699,7 +690,9 @@ fn provider_max_tokens_stop_reason_surfaced() {
         "Should have partial text content"
     );
 
-    harness.log().info("result", "MaxTokens stop reason surfaced");
+    harness
+        .log()
+        .info("result", "MaxTokens stop reason surfaced");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -743,12 +736,14 @@ fn agent_loop_max_tool_iterations_enforced() {
 
     // The agent should eventually terminate (either with error or a forced stop)
     let cap = capture.lock().expect("lock capture");
-    harness.log().info_ctx("summary", "max iterations test", |ctx| {
-        ctx.push(("turn_count".into(), cap.turn_count.to_string()));
-        ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
-        ctx.push(("tool_ends".into(), cap.tool_ends.to_string()));
-        ctx.push(("result_is_ok".into(), result.is_ok().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("summary", "max iterations test", |ctx| {
+            ctx.push(("turn_count".into(), cap.turn_count.to_string()));
+            ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
+            ctx.push(("tool_ends".into(), cap.tool_ends.to_string()));
+            ctx.push(("result_is_ok".into(), result.is_ok().to_string()));
+        });
 
     // Should have executed tools but eventually stopped
     assert!(
@@ -934,9 +929,7 @@ fn session_corrupted_jsonl_skips_bad_entries() {
         "Should have 1 skipped entry"
     );
     assert!(
-        diagnostics.skipped_entries[0]
-            .error
-            .contains("expected"),
+        diagnostics.skipped_entries[0].error.contains("expected"),
         "Skipped entry error should mention parse failure"
     );
     // Both valid entries should have been loaded
@@ -946,16 +939,18 @@ fn session_corrupted_jsonl_skips_bad_entries() {
         "Should have loaded at least the valid entries"
     );
 
-    harness.log().info_ctx("result", "Corrupted session recovery", |ctx| {
-        ctx.push((
-            "skipped_entries".into(),
-            diagnostics.skipped_entries.len().to_string(),
-        ));
-        ctx.push((
-            "orphaned_links".into(),
-            diagnostics.orphaned_parent_links.len().to_string(),
-        ));
-    });
+    harness
+        .log()
+        .info_ctx("result", "Corrupted session recovery", |ctx| {
+            ctx.push((
+                "skipped_entries".into(),
+                diagnostics.skipped_entries.len().to_string(),
+            ));
+            ctx.push((
+                "orphaned_links".into(),
+                diagnostics.orphaned_parent_links.len().to_string(),
+            ));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1104,12 +1099,14 @@ fn session_orphaned_parent_links_reported() {
         "missing-parent-id"
     );
 
-    harness.log().info_ctx("result", "Orphaned links detected", |ctx| {
-        ctx.push((
-            "orphan_count".into(),
-            diagnostics.orphaned_parent_links.len().to_string(),
-        ));
-    });
+    harness
+        .log()
+        .info_ctx("result", "Orphaned links detected", |ctx| {
+            ctx.push((
+                "orphan_count".into(),
+                diagnostics.orphaned_parent_links.len().to_string(),
+            ));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1161,8 +1158,7 @@ fn session_persist_reload_messages_survive() {
             let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
                 Some(cwd.clone()),
             )));
-            let mut agent_session =
-                make_agent_session(&cwd, provider, Arc::clone(&session), 4);
+            let mut agent_session = make_agent_session(&cwd, provider, Arc::clone(&session), 4);
             let _ = agent_session
                 .run_text("persist me".to_string(), |_| {})
                 .await
@@ -1214,10 +1210,12 @@ fn session_persist_reload_messages_survive() {
     });
     assert!(has_user_msg, "User message should survive persist/reload");
 
-    harness.log().info_ctx("result", "Session persist/reload verified", |ctx| {
-        ctx.push(("message_count".into(), messages.len().to_string()));
-        ctx.push(("session_path".into(), session_path.display().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "Session persist/reload verified", |ctx| {
+            ctx.push(("message_count".into(), messages.len().to_string()));
+            ctx.push(("session_path".into(), session_path.display().to_string()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1233,10 +1231,12 @@ fn cli_conflicting_flags_error() {
     // --rpc and --print cannot be combined (both are output modes)
     let result = run_cli(&harness, &env, &["--rpc", "--print", "hello"], None);
 
-    harness.log().info_ctx("result", "CLI conflicting flags", |ctx| {
-        ctx.push(("exit_code".into(), result.exit_code.to_string()));
-        ctx.push(("stderr_len".into(), result.stderr.len().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "CLI conflicting flags", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+            ctx.push(("stderr_len".into(), result.stderr.len().to_string()));
+        });
 
     // Should exit with non-zero
     assert_ne!(
@@ -1274,9 +1274,11 @@ fn cli_invalid_model_id_errors_before_streaming() {
         None,
     );
 
-    harness.log().info_ctx("result", "CLI invalid model", |ctx| {
-        ctx.push(("exit_code".into(), result.exit_code.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "CLI invalid model", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+        });
 
     // Empty model ID should trigger an error
     assert_ne!(
@@ -1365,9 +1367,11 @@ fn cli_unknown_provider_errors() {
         None,
     );
 
-    harness.log().info_ctx("result", "CLI unknown provider", |ctx| {
-        ctx.push(("exit_code".into(), result.exit_code.to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "CLI unknown provider", |ctx| {
+            ctx.push(("exit_code".into(), result.exit_code.to_string()));
+        });
 
     assert_ne!(
         result.exit_code, 0,
@@ -1418,8 +1422,12 @@ fn cli_help_flag_contains_expected_sections() {
         result.stderr
     );
     let help_text = result.stdout.to_lowercase();
-    assert!(help_text.contains("usage") || help_text.contains("options") || help_text.contains("arguments"),
-        "Help should contain usage info");
+    assert!(
+        help_text.contains("usage")
+            || help_text.contains("options")
+            || help_text.contains("arguments"),
+        "Help should contain usage info"
+    );
 
     harness.log().info("result", "Help text verified");
     write_jsonl_artifacts(&harness, test_name);
@@ -1698,6 +1706,8 @@ fn session_unicode_messages_round_trip() {
     });
     assert!(has_unicode, "Unicode characters should survive round-trip");
 
-    harness.log().info("result", "Unicode session round-trip OK");
+    harness
+        .log()
+        .info("result", "Unicode session round-trip OK");
     write_jsonl_artifacts(&harness, test_name);
 }

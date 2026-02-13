@@ -83,9 +83,7 @@ fn make_assistant(
     }
 }
 
-fn stream_done(
-    msg: AssistantMessage,
-) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
+fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>> {
     let partial = AssistantMessage {
         content: Vec::new(),
         api: msg.api.clone(),
@@ -184,9 +182,15 @@ impl AuthFailureProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for AuthFailureProvider {
-    fn name(&self) -> &str { "auth-failure-provider" }
-    fn api(&self) -> &str { "auth-failure-api" }
-    fn model_id(&self) -> &str { "auth-failure-model" }
+    fn name(&self) -> &str {
+        "auth-failure-provider"
+    }
+    fn api(&self) -> &str {
+        "auth-failure-api"
+    }
+    fn model_id(&self) -> &str {
+        "auth-failure-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -204,9 +208,15 @@ struct ForbiddenProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for ForbiddenProvider {
-    fn name(&self) -> &str { "forbidden-provider" }
-    fn api(&self) -> &str { "forbidden-api" }
-    fn model_id(&self) -> &str { "forbidden-model" }
+    fn name(&self) -> &str {
+        "forbidden-provider"
+    }
+    fn api(&self) -> &str {
+        "forbidden-api"
+    }
+    fn model_id(&self) -> &str {
+        "forbidden-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -233,9 +243,7 @@ fn auth_401_surfaces_clear_error_no_retry() {
         )));
         let mut agent_session =
             make_agent_session(&cwd, provider_ref as Arc<dyn Provider>, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     // Recovery assertion: error is surfaced, not swallowed
@@ -253,10 +261,12 @@ fn auth_401_surfaces_clear_error_no_retry() {
         "Auth errors should not be retried"
     );
 
-    harness.log().info_ctx("result", "AUTH-1: 401 verified", |ctx| {
-        ctx.push(("error".into(), err_msg));
-        ctx.push(("retry_count".into(), "0".into()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "AUTH-1: 401 verified", |ctx| {
+            ctx.push(("error".into(), err_msg));
+            ctx.push(("retry_count".into(), "0".into()));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -274,9 +284,7 @@ fn auth_403_surfaces_model_specific_error() {
             Some(cwd.clone()),
         )));
         let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     assert!(result.is_err(), "403 should propagate as error");
@@ -286,7 +294,9 @@ fn auth_403_surfaces_model_specific_error() {
         "Error should contain forbidden details: {err_msg}"
     );
 
-    harness.log().info("result", format!("AUTH-2: 403 verified: {err_msg}"));
+    harness
+        .log()
+        .info("result", format!("AUTH-2: 403 verified: {err_msg}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -311,16 +321,24 @@ impl RateLimitProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for RateLimitProvider {
-    fn name(&self) -> &str { "rate-limit-provider" }
-    fn api(&self) -> &str { "rate-limit-api" }
-    fn model_id(&self) -> &str { "rate-limit-model" }
+    fn name(&self) -> &str {
+        "rate-limit-provider"
+    }
+    fn api(&self) -> &str {
+        "rate-limit-api"
+    }
+    fn model_id(&self) -> &str {
+        "rate-limit-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
         _options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
-        Err(Error::api("429 Too Many Requests: Rate limit exceeded. Please retry after 30s"))
+        Err(Error::api(
+            "429 Too Many Requests: Rate limit exceeded. Please retry after 30s",
+        ))
     }
 }
 
@@ -331,9 +349,15 @@ struct QuotaExhaustedProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for QuotaExhaustedProvider {
-    fn name(&self) -> &str { "quota-exhausted-provider" }
-    fn api(&self) -> &str { "quota-exhausted-api" }
-    fn model_id(&self) -> &str { "quota-exhausted-model" }
+    fn name(&self) -> &str {
+        "quota-exhausted-provider"
+    }
+    fn api(&self) -> &str {
+        "quota-exhausted-api"
+    }
+    fn model_id(&self) -> &str {
+        "quota-exhausted-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -360,9 +384,7 @@ fn rate_limit_429_surfaces_error_with_hint() {
         )));
         let mut agent_session =
             make_agent_session(&cwd, provider_ref as Arc<dyn Provider>, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     assert!(result.is_err(), "429 should propagate as error");
@@ -372,13 +394,15 @@ fn rate_limit_429_surfaces_error_with_hint() {
         "Error should contain rate limit info: {err_msg}"
     );
 
-    harness.log().info_ctx("result", "RATE-1: 429 verified", |ctx| {
-        ctx.push(("error".into(), err_msg));
-        ctx.push((
-            "call_count".into(),
-            provider.call_count.load(Ordering::SeqCst).to_string(),
-        ));
-    });
+    harness
+        .log()
+        .info_ctx("result", "RATE-1: 429 verified", |ctx| {
+            ctx.push(("error".into(), err_msg));
+            ctx.push((
+                "call_count".into(),
+                provider.call_count.load(Ordering::SeqCst).to_string(),
+            ));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -396,9 +420,7 @@ fn quota_exhaustion_surfaces_clear_error() {
             Some(cwd.clone()),
         )));
         let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     assert!(result.is_err(), "402 should propagate as error");
@@ -408,7 +430,9 @@ fn quota_exhaustion_surfaces_clear_error() {
         "Error should contain quota info: {err_msg}"
     );
 
-    harness.log().info("result", format!("RATE-2: Quota verified: {err_msg}"));
+    harness
+        .log()
+        .info("result", format!("RATE-2: Quota verified: {err_msg}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -433,9 +457,15 @@ impl TimeoutProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for TimeoutProvider {
-    fn name(&self) -> &str { "timeout-provider" }
-    fn api(&self) -> &str { "timeout-api" }
-    fn model_id(&self) -> &str { "timeout-model" }
+    fn name(&self) -> &str {
+        "timeout-provider"
+    }
+    fn api(&self) -> &str {
+        "timeout-api"
+    }
+    fn model_id(&self) -> &str {
+        "timeout-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -453,9 +483,15 @@ struct StreamTimeoutProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for StreamTimeoutProvider {
-    fn name(&self) -> &str { "stream-timeout-provider" }
-    fn api(&self) -> &str { "stream-timeout-api" }
-    fn model_id(&self) -> &str { "stream-timeout-model" }
+    fn name(&self) -> &str {
+        "stream-timeout-provider"
+    }
+    fn api(&self) -> &str {
+        "stream-timeout-api"
+    }
+    fn model_id(&self) -> &str {
+        "stream-timeout-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -487,9 +523,7 @@ fn timeout_connection_surfaces_bounded_error() {
         )));
         let mut agent_session =
             make_agent_session(&cwd, provider_ref as Arc<dyn Provider>, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     assert!(result.is_err(), "Timeout should propagate as error");
@@ -499,13 +533,15 @@ fn timeout_connection_surfaces_bounded_error() {
         "Error should contain timeout info: {err_msg}"
     );
 
-    harness.log().info_ctx("result", "TIMEOUT-1: Connection timeout verified", |ctx| {
-        ctx.push(("error".into(), err_msg));
-        ctx.push((
-            "call_count".into(),
-            provider.call_count.load(Ordering::SeqCst).to_string(),
-        ));
-    });
+    harness
+        .log()
+        .info_ctx("result", "TIMEOUT-1: Connection timeout verified", |ctx| {
+            ctx.push(("error".into(), err_msg));
+            ctx.push((
+                "call_count".into(),
+                provider.call_count.load(Ordering::SeqCst).to_string(),
+            ));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -523,9 +559,7 @@ fn timeout_stream_hang_surfaces_error() {
             Some(cwd.clone()),
         )));
         let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     assert!(result.is_err(), "Stream timeout should propagate as error");
@@ -535,7 +569,10 @@ fn timeout_stream_hang_surfaces_error() {
         "Error should contain stream timeout info: {err_msg}"
     );
 
-    harness.log().info("result", format!("TIMEOUT-2: Stream timeout verified: {err_msg}"));
+    harness.log().info(
+        "result",
+        format!("TIMEOUT-2: Stream timeout verified: {err_msg}"),
+    );
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -550,18 +587,24 @@ struct MalformedStreamProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for MalformedStreamProvider {
-    fn name(&self) -> &str { "malformed-provider" }
-    fn api(&self) -> &str { "malformed-api" }
-    fn model_id(&self) -> &str { "malformed-model" }
+    fn name(&self) -> &str {
+        "malformed-provider"
+    }
+    fn api(&self) -> &str {
+        "malformed-api"
+    }
+    fn model_id(&self) -> &str {
+        "malformed-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
         _options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         // Return a stream with only an error event (no Start)
-        Ok(Box::pin(futures::stream::iter(vec![
-            Err(Error::api("Malformed response: unexpected JSON structure")),
-        ])))
+        Ok(Box::pin(futures::stream::iter(vec![Err(Error::api(
+            "Malformed response: unexpected JSON structure",
+        ))])))
     }
 }
 
@@ -572,9 +615,15 @@ struct TruncatedResponseProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for TruncatedResponseProvider {
-    fn name(&self) -> &str { "truncated-provider" }
-    fn api(&self) -> &str { "truncated-api" }
-    fn model_id(&self) -> &str { "truncated-model" }
+    fn name(&self) -> &str {
+        "truncated-provider"
+    }
+    fn api(&self) -> &str {
+        "truncated-api"
+    }
+    fn model_id(&self) -> &str {
+        "truncated-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -599,9 +648,15 @@ struct EmptyContentProvider;
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for EmptyContentProvider {
-    fn name(&self) -> &str { "empty-content-provider" }
-    fn api(&self) -> &str { "empty-content-api" }
-    fn model_id(&self) -> &str { "empty-content-model" }
+    fn name(&self) -> &str {
+        "empty-content-provider"
+    }
+    fn api(&self) -> &str {
+        "empty-content-api"
+    }
+    fn model_id(&self) -> &str {
+        "empty-content-model"
+    }
     async fn stream(
         &self,
         _context: &Context,
@@ -632,9 +687,7 @@ fn malformed_stream_without_start_handled() {
             Some(cwd.clone()),
         )));
         let mut agent_session = make_agent_session(&cwd, provider, session, 4);
-        agent_session
-            .run_text("hello".to_string(), |_| {})
-            .await
+        agent_session.run_text("hello".to_string(), |_| {}).await
     });
 
     // Recovery assertion: agent handles error gracefully
@@ -643,7 +696,9 @@ fn malformed_stream_without_start_handled() {
         "Malformed stream should propagate as error"
     );
     let err_msg = result.unwrap_err().to_string();
-    harness.log().info("result", format!("MALFORMED-1: {err_msg}"));
+    harness
+        .log()
+        .info("result", format!("MALFORMED-1: {err_msg}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -670,16 +725,17 @@ fn malformed_truncated_response_preserved() {
     // Recovery assertions
     assert_eq!(message.stop_reason, StopReason::Length);
     let text = assistant_text(&message);
-    assert!(
-        !text.is_empty(),
-        "Partial content should be preserved"
-    );
+    assert!(!text.is_empty(), "Partial content should be preserved");
     assert_eq!(message.usage.total_tokens, 8192);
 
-    harness.log().info_ctx("result", "MALFORMED-2: Truncated response preserved", |ctx| {
-        ctx.push(("text_len".into(), text.len().to_string()));
-        ctx.push(("stop_reason".into(), format!("{:?}", message.stop_reason)));
-    });
+    harness.log().info_ctx(
+        "result",
+        "MALFORMED-2: Truncated response preserved",
+        |ctx| {
+            ctx.push(("text_len".into(), text.len().to_string()));
+            ctx.push(("stop_reason".into(), format!("{:?}", message.stop_reason)));
+        },
+    );
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -707,7 +763,9 @@ fn malformed_empty_text_block_no_crash() {
     let text = assistant_text(&message);
     assert!(text.is_empty(), "Should have empty text content");
 
-    harness.log().info("result", "MALFORMED-3: Empty text handled");
+    harness
+        .log()
+        .info("result", "MALFORMED-3: Empty text handled");
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -748,9 +806,15 @@ impl ToolFailurePropagationProvider {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Provider for ToolFailurePropagationProvider {
-    fn name(&self) -> &str { "tool-failure-provider" }
-    fn api(&self) -> &str { "tool-failure-api" }
-    fn model_id(&self) -> &str { "tool-failure-model" }
+    fn name(&self) -> &str {
+        "tool-failure-provider"
+    }
+    fn api(&self) -> &str {
+        "tool-failure-api"
+    }
+    fn model_id(&self) -> &str {
+        "tool-failure-model"
+    }
     async fn stream(
         &self,
         context: &Context,
@@ -994,7 +1058,9 @@ fn tool_missing_name_propagates_error() {
         "Tool error should be propagated: {text}"
     );
 
-    harness.log().info("result", format!("TOOL-1: Missing tool verified: {text}"));
+    harness
+        .log()
+        .info("result", format!("TOOL-1: Missing tool verified: {text}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1026,7 +1092,9 @@ fn tool_bad_arguments_propagates_error() {
         "Bad args should propagate error: {text}"
     );
 
-    harness.log().info("result", format!("TOOL-2: Bad args verified: {text}"));
+    harness
+        .log()
+        .info("result", format!("TOOL-2: Bad args verified: {text}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1063,7 +1131,9 @@ fn tool_file_not_found_propagates_error() {
         "File not found should propagate: {text}"
     );
 
-    harness.log().info("result", format!("TOOL-3: File not found verified: {text}"));
+    harness
+        .log()
+        .info("result", format!("TOOL-3: File not found verified: {text}"));
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1114,10 +1184,12 @@ fn tool_mixed_batch_both_results_propagated() {
         "Bad tool should be marked error: {text}"
     );
 
-    harness.log().info_ctx("result", "TOOL-4: Mixed batch verified", |ctx| {
-        ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
-        ctx.push(("response".into(), text));
-    });
+    harness
+        .log()
+        .info_ctx("result", "TOOL-4: Mixed batch verified", |ctx| {
+            ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
+            ctx.push(("response".into(), text));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1158,18 +1230,26 @@ fn tool_recovery_chain_fail_then_succeed() {
     let text = assistant_text(&message);
 
     // Recovery assertions
-    assert!(cap.turn_count >= 3, "Should have at least 3 turns (fail + recover + final)");
-    assert!(cap.tool_starts >= 2, "Should have at least 2 tool executions");
+    assert!(
+        cap.turn_count >= 3,
+        "Should have at least 3 turns (fail + recover + final)"
+    );
+    assert!(
+        cap.tool_starts >= 2,
+        "Should have at least 2 tool executions"
+    );
     assert!(
         text.contains("recovered=true"),
         "Recovery should succeed: {text}"
     );
 
-    harness.log().info_ctx("result", "TOOL-5: Recovery chain verified", |ctx| {
-        ctx.push(("turn_count".into(), cap.turn_count.to_string()));
-        ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
-        ctx.push(("response".into(), text));
-    });
+    harness
+        .log()
+        .info_ctx("result", "TOOL-5: Recovery chain verified", |ctx| {
+            ctx.push(("turn_count".into(), cap.turn_count.to_string()));
+            ctx.push(("tool_starts".into(), cap.tool_starts.to_string()));
+            ctx.push(("response".into(), text));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }
 
@@ -1195,8 +1275,7 @@ fn session_clean_after_provider_failure() {
         let cwd = cwd.clone();
         let session = Arc::clone(&session_ref);
         async move {
-            let provider: Arc<dyn Provider> =
-                Arc::new(AuthFailureProvider::new());
+            let provider: Arc<dyn Provider> = Arc::new(AuthFailureProvider::new());
             let mut agent_session = make_agent_session(&cwd, provider, session, 4);
             agent_session
                 .run_text("this will fail".to_string(), |_| {})
@@ -1215,9 +1294,11 @@ fn session_clean_after_provider_failure() {
         }
     });
 
-    harness.log().info_ctx("result", "Session state after failure", |ctx| {
-        ctx.push(("message_count".into(), messages.len().to_string()));
-    });
+    harness
+        .log()
+        .info_ctx("result", "Session state after failure", |ctx| {
+            ctx.push(("message_count".into(), messages.len().to_string()));
+        });
 
     // Session should either be empty or have the failed user message
     // but no corrupted assistant messages
@@ -1281,25 +1362,31 @@ fn session_reflects_tool_errors_accurately() {
             _ => None,
         })
         .collect();
-    assert!(
-        !tool_results.is_empty(),
-        "Should have tool result messages"
-    );
+    assert!(!tool_results.is_empty(), "Should have tool result messages");
     assert!(
         tool_results.iter().any(|r| r.is_error),
         "At least one tool result should be marked as error"
     );
 
     let text = assistant_text(&message);
-    assert!(text.contains("true"), "Final response should confirm error propagation");
+    assert!(
+        text.contains("true"),
+        "Final response should confirm error propagation"
+    );
 
-    harness.log().info_ctx("result", "Session tool error accuracy verified", |ctx| {
-        ctx.push(("total_messages".into(), messages.len().to_string()));
-        ctx.push(("tool_results".into(), tool_results.len().to_string()));
-        ctx.push((
-            "error_results".into(),
-            tool_results.iter().filter(|r| r.is_error).count().to_string(),
-        ));
-    });
+    harness
+        .log()
+        .info_ctx("result", "Session tool error accuracy verified", |ctx| {
+            ctx.push(("total_messages".into(), messages.len().to_string()));
+            ctx.push(("tool_results".into(), tool_results.len().to_string()));
+            ctx.push((
+                "error_results".into(),
+                tool_results
+                    .iter()
+                    .filter(|r| r.is_error)
+                    .count()
+                    .to_string(),
+            ));
+        });
     write_jsonl_artifacts(&harness, test_name);
 }

@@ -405,8 +405,7 @@ fn build_transcript(
 ) -> GoldenTranscript {
     match result {
         Ok(events) => {
-            let normalized: Vec<NormalizedEvent> =
-                events.iter().map(normalize_event).collect();
+            let normalized: Vec<NormalizedEvent> = events.iter().map(normalize_event).collect();
             let final_text = extract_final_text(events);
             let tool_call_count = events
                 .iter()
@@ -627,11 +626,7 @@ fn write_markdown_summary(harness: &TestHarness, name: &str, report: &DiffReport
     let mut md = String::new();
     let _ = writeln!(md, "# Golden Transcript Diff: {}", report.scenario);
     let _ = writeln!(md, "\nBaseline: **{}**", report.baseline_family);
-    let _ = writeln!(
-        md,
-        "Compared: {}",
-        report.families_compared.join(", ")
-    );
+    let _ = writeln!(md, "Compared: {}", report.families_compared.join(", "));
     let _ = writeln!(
         md,
         "Result: **{}**\n",
@@ -812,7 +807,11 @@ fn setup_openai_completions(
     sse: &str,
 ) -> (Arc<dyn pi::provider::Provider>, MockHttpServer) {
     let server = harness.start_mock_http_server();
-    server.add_route("POST", "/openai/v1/chat/completions", make_sse_response(sse));
+    server.add_route(
+        "POST",
+        "/openai/v1/chat/completions",
+        make_sse_response(sse),
+    );
     let base_url = format!("{}/openai/v1", server.base_url());
     let mut entry = make_entry("groq", "golden-llama", &base_url);
     entry.model.api.clear();
@@ -889,8 +888,7 @@ fn capture_text_golden_transcripts() {
     ));
 
     // OpenAI Completions (via groq)
-    let (provider, _server) =
-        setup_openai_completions(&harness, &openai_completions_text_sse());
+    let (provider, _server) = setup_openai_completions(&harness, &openai_completions_text_sse());
     let result = collect_events(provider, ctx.clone(), opts.clone());
     transcripts.push(build_transcript(
         "openai-completions",
@@ -904,8 +902,7 @@ fn capture_text_golden_transcripts() {
         assert!(
             t.sequence_valid,
             "{} transcript should be valid: {:?}",
-            t.family,
-            t.sequence_error
+            t.family, t.sequence_error
         );
     }
 
@@ -918,15 +915,36 @@ fn text_transcripts_all_extract_hello_world() {
     let ctx = simple_context();
     let opts = default_options();
 
-    let families: Vec<(&str, &str, String, Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>)> = vec![
-        ("openai-responses", "openai", openai_responses_text_sse(),
-         Box::new(|h, s| setup_openai_responses(h, s))),
-        ("anthropic-messages", "anthropic", anthropic_text_sse(),
-         Box::new(|h, s| setup_anthropic(h, s))),
-        ("gemini-generative", "google", gemini_text_sse(),
-         Box::new(|h, s| setup_gemini(h, s))),
-        ("openai-completions", "groq", openai_completions_text_sse(),
-         Box::new(|h, s| setup_openai_completions(h, s))),
+    let families: Vec<(
+        &str,
+        &str,
+        String,
+        Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>,
+    )> = vec![
+        (
+            "openai-responses",
+            "openai",
+            openai_responses_text_sse(),
+            Box::new(|h, s| setup_openai_responses(h, s)),
+        ),
+        (
+            "anthropic-messages",
+            "anthropic",
+            anthropic_text_sse(),
+            Box::new(|h, s| setup_anthropic(h, s)),
+        ),
+        (
+            "gemini-generative",
+            "google",
+            gemini_text_sse(),
+            Box::new(|h, s| setup_gemini(h, s)),
+        ),
+        (
+            "openai-completions",
+            "groq",
+            openai_completions_text_sse(),
+            Box::new(|h, s| setup_openai_completions(h, s)),
+        ),
     ];
 
     for (family, provider, sse, setup) in &families {
@@ -934,8 +952,7 @@ fn text_transcripts_all_extract_hello_world() {
         let result = collect_events(prov, ctx.clone(), opts.clone());
         let transcript = build_transcript(family, provider, "text", &result);
         assert!(
-            transcript.final_text.contains("Hello")
-                && transcript.final_text.contains("world"),
+            transcript.final_text.contains("Hello") && transcript.final_text.contains("world"),
             "{family}: expected 'Hello world' but got '{}'",
             transcript.final_text
         );
@@ -948,11 +965,31 @@ fn text_transcripts_all_have_stop_reason() {
     let ctx = simple_context();
     let opts = default_options();
 
-    let setups: Vec<(&str, String, Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>)> = vec![
-        ("openai-responses", openai_responses_text_sse(), Box::new(|h, s| setup_openai_responses(h, s))),
-        ("anthropic-messages", anthropic_text_sse(), Box::new(|h, s| setup_anthropic(h, s))),
-        ("gemini-generative", gemini_text_sse(), Box::new(|h, s| setup_gemini(h, s))),
-        ("openai-completions", openai_completions_text_sse(), Box::new(|h, s| setup_openai_completions(h, s))),
+    let setups: Vec<(
+        &str,
+        String,
+        Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>,
+    )> = vec![
+        (
+            "openai-responses",
+            openai_responses_text_sse(),
+            Box::new(|h, s| setup_openai_responses(h, s)),
+        ),
+        (
+            "anthropic-messages",
+            anthropic_text_sse(),
+            Box::new(|h, s| setup_anthropic(h, s)),
+        ),
+        (
+            "gemini-generative",
+            gemini_text_sse(),
+            Box::new(|h, s| setup_gemini(h, s)),
+        ),
+        (
+            "openai-completions",
+            openai_completions_text_sse(),
+            Box::new(|h, s| setup_openai_completions(h, s)),
+        ),
     ];
 
     for (family, sse, setup) in &setups {
@@ -979,22 +1016,36 @@ fn capture_tool_golden_transcripts() {
 
     let (provider, _server) = setup_openai_responses(&harness, &openai_responses_tool_sse());
     let result = collect_events(provider, ctx.clone(), opts.clone());
-    transcripts.push(build_transcript("openai-responses", "openai", "tool", &result));
+    transcripts.push(build_transcript(
+        "openai-responses",
+        "openai",
+        "tool",
+        &result,
+    ));
 
     let (provider, _server) = setup_anthropic(&harness, &anthropic_tool_sse());
     let result = collect_events(provider, ctx.clone(), opts.clone());
-    transcripts.push(build_transcript("anthropic-messages", "anthropic", "tool", &result));
+    transcripts.push(build_transcript(
+        "anthropic-messages",
+        "anthropic",
+        "tool",
+        &result,
+    ));
 
     let (provider, _server) = setup_gemini(&harness, &gemini_tool_sse());
     let result = collect_events(provider, ctx.clone(), opts.clone());
-    transcripts.push(build_transcript("gemini-generative", "google", "tool", &result));
+    transcripts.push(build_transcript(
+        "gemini-generative",
+        "google",
+        "tool",
+        &result,
+    ));
 
     for t in &transcripts {
         assert!(
             t.sequence_valid,
             "{} tool transcript should be valid: {:?}",
-            t.family,
-            t.sequence_error
+            t.family, t.sequence_error
         );
         assert!(
             t.tool_call_count >= 1,
@@ -1013,10 +1064,26 @@ fn tool_transcripts_all_call_echo() {
     let ctx = tool_context();
     let opts = default_options();
 
-    let setups: Vec<(&str, String, Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>)> = vec![
-        ("openai-responses", openai_responses_tool_sse(), Box::new(|h, s| setup_openai_responses(h, s))),
-        ("anthropic-messages", anthropic_tool_sse(), Box::new(|h, s| setup_anthropic(h, s))),
-        ("gemini-generative", gemini_tool_sse(), Box::new(|h, s| setup_gemini(h, s))),
+    let setups: Vec<(
+        &str,
+        String,
+        Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>,
+    )> = vec![
+        (
+            "openai-responses",
+            openai_responses_tool_sse(),
+            Box::new(|h, s| setup_openai_responses(h, s)),
+        ),
+        (
+            "anthropic-messages",
+            anthropic_tool_sse(),
+            Box::new(|h, s| setup_anthropic(h, s)),
+        ),
+        (
+            "gemini-generative",
+            gemini_tool_sse(),
+            Box::new(|h, s| setup_gemini(h, s)),
+        ),
     ];
 
     for (family, sse, setup) in &setups {
@@ -1037,10 +1104,26 @@ fn tool_transcripts_have_valid_arguments() {
     let ctx = tool_context();
     let opts = default_options();
 
-    let setups: Vec<(&str, String, Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>)> = vec![
-        ("openai-responses", openai_responses_tool_sse(), Box::new(|h, s| setup_openai_responses(h, s))),
-        ("anthropic-messages", anthropic_tool_sse(), Box::new(|h, s| setup_anthropic(h, s))),
-        ("gemini-generative", gemini_tool_sse(), Box::new(|h, s| setup_gemini(h, s))),
+    let setups: Vec<(
+        &str,
+        String,
+        Box<dyn Fn(&TestHarness, &str) -> (Arc<dyn pi::provider::Provider>, MockHttpServer)>,
+    )> = vec![
+        (
+            "openai-responses",
+            openai_responses_tool_sse(),
+            Box::new(|h, s| setup_openai_responses(h, s)),
+        ),
+        (
+            "anthropic-messages",
+            anthropic_tool_sse(),
+            Box::new(|h, s| setup_anthropic(h, s)),
+        ),
+        (
+            "gemini-generative",
+            gemini_tool_sse(),
+            Box::new(|h, s| setup_gemini(h, s)),
+        ),
     ];
 
     for (family, sse, setup) in &setups {
@@ -1267,7 +1350,10 @@ fn diff_identical_transcripts_has_no_diffs() {
         ..t1.clone()
     };
     let diffs = diff_transcripts(&t1, &t2);
-    assert!(diffs.is_empty(), "identical content should produce no diffs");
+    assert!(
+        diffs.is_empty(),
+        "identical content should produce no diffs"
+    );
 }
 
 #[test]
@@ -1724,8 +1810,7 @@ fn comprehensive_golden_transcript_report() {
     let gemini_tool = build_transcript("gemini-generative", "google", "tool", &result);
     all_transcripts.push(gemini_tool.clone());
 
-    let tool_report =
-        build_diff_report("tool", &anthropic_tool, &[openai_tool, gemini_tool]);
+    let tool_report = build_diff_report("tool", &anthropic_tool, &[openai_tool, gemini_tool]);
     all_reports.push(tool_report.clone());
 
     // Write comprehensive artifacts
@@ -1733,14 +1818,26 @@ fn comprehensive_golden_transcript_report() {
 
     // Write per-scenario diff reports
     for report in &all_reports {
-        write_diff_report_jsonl(&harness, &format!("comprehensive_{}", report.scenario), report);
-        write_markdown_summary(&harness, &format!("comprehensive_{}", report.scenario), report);
+        write_diff_report_jsonl(
+            &harness,
+            &format!("comprehensive_{}", report.scenario),
+            report,
+        );
+        write_markdown_summary(
+            &harness,
+            &format!("comprehensive_{}", report.scenario),
+            report,
+        );
     }
 
     // Write summary
     let mut summary = String::new();
     let _ = writeln!(summary, "# Golden Transcript Comprehensive Report\n");
-    let _ = writeln!(summary, "Total transcripts captured: {}", all_transcripts.len());
+    let _ = writeln!(
+        summary,
+        "Total transcripts captured: {}",
+        all_transcripts.len()
+    );
     let _ = writeln!(summary, "Scenarios: text, tool\n");
     for report in &all_reports {
         let _ = writeln!(

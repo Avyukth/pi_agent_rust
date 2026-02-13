@@ -446,8 +446,7 @@ fn all_rows_declare_expected_artifacts() {
     for row in matrix_rows(&matrix) {
         let wf_id = row["workflow_id"].as_str().unwrap_or("<unknown>");
         if let Some(artifacts) = row["expected_artifacts"].as_array() {
-            let artifact_strs: HashSet<&str> =
-                artifacts.iter().filter_map(Value::as_str).collect();
+            let artifact_strs: HashSet<&str> = artifacts.iter().filter_map(Value::as_str).collect();
             for req in &required_strs {
                 assert!(
                     artifact_strs.contains(req),

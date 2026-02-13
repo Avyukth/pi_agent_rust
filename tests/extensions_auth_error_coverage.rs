@@ -44,14 +44,20 @@ fn auth_storage_save_reload_api_key() {
     let path = h.temp_dir().join("auth.json");
 
     let mut storage = AuthStorage::load(path.clone()).unwrap();
-    storage.set("anthropic", AuthCredential::ApiKey {
-        key: "sk-test-key-123".to_string(),
-    });
+    storage.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "sk-test-key-123".to_string(),
+        },
+    );
     storage.save().expect("save should succeed");
 
     // Reload
     let restored = AuthStorage::load(path).unwrap();
-    assert_eq!(restored.credential_status("anthropic"), CredentialStatus::ApiKey);
+    assert_eq!(
+        restored.credential_status("anthropic"),
+        CredentialStatus::ApiKey
+    );
     assert_eq!(
         restored.api_key("anthropic").as_deref(),
         Some("sk-test-key-123")
@@ -65,9 +71,12 @@ fn auth_storage_save_reload_bearer_token() {
     let path = h.temp_dir().join("auth.json");
 
     let mut storage = AuthStorage::load(path.clone()).unwrap();
-    storage.set("custom-provider", AuthCredential::BearerToken {
-        token: "bearer-xyz".to_string(),
-    });
+    storage.set(
+        "custom-provider",
+        AuthCredential::BearerToken {
+            token: "bearer-xyz".to_string(),
+        },
+    );
     storage.save().unwrap();
 
     let restored = AuthStorage::load(path).unwrap();
@@ -84,12 +93,15 @@ fn auth_storage_save_reload_aws_credentials() {
     let path = h.temp_dir().join("auth.json");
 
     let mut storage = AuthStorage::load(path.clone()).unwrap();
-    storage.set("amazon-bedrock", AuthCredential::AwsCredentials {
-        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/REDACTED".to_string(),
-        session_token: Some("session-token-xyz".to_string()),
-        region: Some("us-west-2".to_string()),
-    });
+    storage.set(
+        "amazon-bedrock",
+        AuthCredential::AwsCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/REDACTED".to_string(),
+            session_token: Some("session-token-xyz".to_string()),
+            region: Some("us-west-2".to_string()),
+        },
+    );
     storage.save().unwrap();
 
     let restored = AuthStorage::load(path).unwrap();
@@ -106,12 +118,15 @@ fn auth_storage_save_reload_service_key() {
     let path = h.temp_dir().join("auth.json");
 
     let mut storage = AuthStorage::load(path.clone()).unwrap();
-    storage.set("sap-ai-core", AuthCredential::ServiceKey {
-        client_id: Some("sap-client-id".to_string()),
-        client_secret: Some("sap-client-secret".to_string()),
-        token_url: Some("https://auth.sap.com/token".to_string()),
-        service_url: Some("https://api.sap.com/ai".to_string()),
-    });
+    storage.set(
+        "sap-ai-core",
+        AuthCredential::ServiceKey {
+            client_id: Some("sap-client-id".to_string()),
+            client_secret: Some("sap-client-secret".to_string()),
+            token_url: Some("https://auth.sap.com/token".to_string()),
+            service_url: Some("https://api.sap.com/ai".to_string()),
+        },
+    );
     storage.save().unwrap();
 
     let restored = AuthStorage::load(path).unwrap();
@@ -162,13 +177,16 @@ fn credential_status_oauth_valid() {
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
     let future_ts = chrono::Utc::now().timestamp_millis() + 3_600_000; // +1hr
-    storage.set("test-oauth", AuthCredential::OAuth {
-        access_token: "access-token".to_string(),
-        refresh_token: "refresh-token".to_string(),
-        expires: future_ts,
-        token_url: None,
-        client_id: None,
-    });
+    storage.set(
+        "test-oauth",
+        AuthCredential::OAuth {
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            expires: future_ts,
+            token_url: None,
+            client_id: None,
+        },
+    );
 
     match storage.credential_status("test-oauth") {
         CredentialStatus::OAuthValid { expires_in_ms } => {
@@ -185,13 +203,16 @@ fn credential_status_oauth_expired() {
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
     let past_ts = chrono::Utc::now().timestamp_millis() - 3_600_000; // -1hr
-    storage.set("test-expired", AuthCredential::OAuth {
-        access_token: "old-token".to_string(),
-        refresh_token: "old-refresh".to_string(),
-        expires: past_ts,
-        token_url: None,
-        client_id: None,
-    });
+    storage.set(
+        "test-expired",
+        AuthCredential::OAuth {
+            access_token: "old-token".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            expires: past_ts,
+            token_url: None,
+            client_id: None,
+        },
+    );
 
     match storage.credential_status("test-expired") {
         CredentialStatus::OAuthExpired { expired_by_ms } => {
@@ -210,9 +231,12 @@ fn credential_status_oauth_expired() {
 fn resolve_api_key_override_wins() {
     let h = TestHarness::new("resolve_override");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
-    storage.set("provider", AuthCredential::ApiKey {
-        key: "stored-key".to_string(),
-    });
+    storage.set(
+        "provider",
+        AuthCredential::ApiKey {
+            key: "stored-key".to_string(),
+        },
+    );
 
     let result = storage.resolve_api_key("provider", Some("override-key"));
     assert_eq!(result.as_deref(), Some("override-key"));
@@ -223,9 +247,12 @@ fn resolve_api_key_override_wins() {
 fn resolve_api_key_stored_used() {
     let h = TestHarness::new("resolve_stored");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
-    storage.set("provider", AuthCredential::ApiKey {
-        key: "stored-key".to_string(),
-    });
+    storage.set(
+        "provider",
+        AuthCredential::ApiKey {
+            key: "stored-key".to_string(),
+        },
+    );
 
     let result = storage.resolve_api_key("provider", None);
     assert_eq!(result.as_deref(), Some("stored-key"));
@@ -247,13 +274,16 @@ fn api_key_returns_oauth_access_token() {
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
     let future_ts = chrono::Utc::now().timestamp_millis() + 3_600_000;
-    storage.set("provider", AuthCredential::OAuth {
-        access_token: "oauth-access-token".to_string(),
-        refresh_token: "refresh".to_string(),
-        expires: future_ts,
-        token_url: None,
-        client_id: None,
-    });
+    storage.set(
+        "provider",
+        AuthCredential::OAuth {
+            access_token: "oauth-access-token".to_string(),
+            refresh_token: "refresh".to_string(),
+            expires: future_ts,
+            token_url: None,
+            client_id: None,
+        },
+    );
 
     let key = storage.api_key("provider");
     assert_eq!(key.as_deref(), Some("oauth-access-token"));
@@ -264,9 +294,12 @@ fn api_key_returns_oauth_access_token() {
 fn api_key_returns_bearer_token() {
     let h = TestHarness::new("api_key_bearer");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
-    storage.set("provider", AuthCredential::BearerToken {
-        token: "bearer-token-value".to_string(),
-    });
+    storage.set(
+        "provider",
+        AuthCredential::BearerToken {
+            token: "bearer-token-value".to_string(),
+        },
+    );
 
     let key = storage.api_key("provider");
     assert_eq!(key.as_deref(), Some("bearer-token-value"));
@@ -284,23 +317,29 @@ fn prune_stale_removes_old_oauth() {
 
     // Add a very old OAuth credential with no refresh metadata
     let old_ts = chrono::Utc::now().timestamp_millis() - 100_000_000; // ~27 hours ago
-    storage.set("old-provider", AuthCredential::OAuth {
-        access_token: "old-token".to_string(),
-        refresh_token: "old-refresh".to_string(),
-        expires: old_ts,
-        token_url: None,
-        client_id: None,
-    });
+    storage.set(
+        "old-provider",
+        AuthCredential::OAuth {
+            access_token: "old-token".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            expires: old_ts,
+            token_url: None,
+            client_id: None,
+        },
+    );
 
     // Also add a fresh one
     let fresh_ts = chrono::Utc::now().timestamp_millis() + 3_600_000;
-    storage.set("fresh-provider", AuthCredential::OAuth {
-        access_token: "fresh-token".to_string(),
-        refresh_token: "fresh-refresh".to_string(),
-        expires: fresh_ts,
-        token_url: None,
-        client_id: None,
-    });
+    storage.set(
+        "fresh-provider",
+        AuthCredential::OAuth {
+            access_token: "fresh-token".to_string(),
+            refresh_token: "fresh-refresh".to_string(),
+            expires: fresh_ts,
+            token_url: None,
+            client_id: None,
+        },
+    );
 
     // Prune with a 1-day cutoff
     let pruned = storage.prune_stale_credentials(86_400_000);
@@ -324,13 +363,16 @@ fn prune_stale_preserves_refreshable_tokens() {
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
     let old_ts = chrono::Utc::now().timestamp_millis() - 100_000_000;
-    storage.set("refreshable", AuthCredential::OAuth {
-        access_token: "old-token".to_string(),
-        refresh_token: "old-refresh".to_string(),
-        expires: old_ts,
-        token_url: Some("https://auth.example.com/token".to_string()),
-        client_id: Some("client-123".to_string()),
-    });
+    storage.set(
+        "refreshable",
+        AuthCredential::OAuth {
+            access_token: "old-token".to_string(),
+            refresh_token: "old-refresh".to_string(),
+            expires: old_ts,
+            token_url: Some("https://auth.example.com/token".to_string()),
+            client_id: Some("client-123".to_string()),
+        },
+    );
 
     let pruned = storage.prune_stale_credentials(86_400_000);
     assert!(pruned.is_empty(), "refreshable token should not be pruned");
@@ -346,18 +388,27 @@ fn prune_stale_preserves_non_oauth() {
     let h = TestHarness::new("prune_non_oauth");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("api-key-provider", AuthCredential::ApiKey {
-        key: "key".to_string(),
-    });
-    storage.set("bearer-provider", AuthCredential::BearerToken {
-        token: "token".to_string(),
-    });
-    storage.set("aws-provider", AuthCredential::AwsCredentials {
-        access_key_id: "AKIA".to_string(),
-        secret_access_key: "secret".to_string(),
-        session_token: None,
-        region: None,
-    });
+    storage.set(
+        "api-key-provider",
+        AuthCredential::ApiKey {
+            key: "key".to_string(),
+        },
+    );
+    storage.set(
+        "bearer-provider",
+        AuthCredential::BearerToken {
+            token: "token".to_string(),
+        },
+    );
+    storage.set(
+        "aws-provider",
+        AuthCredential::AwsCredentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+            session_token: None,
+            region: None,
+        },
+    );
 
     let pruned = storage.prune_stale_credentials(0); // Even with 0 cutoff
     assert!(
@@ -372,11 +423,20 @@ fn auth_storage_remove() {
     let h = TestHarness::new("auth_remove");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("provider", AuthCredential::ApiKey {
-        key: "key".to_string(),
-    });
-    assert!(storage.remove("provider"), "should return true for existing");
-    assert!(!storage.remove("provider"), "should return false for already-removed");
+    storage.set(
+        "provider",
+        AuthCredential::ApiKey {
+            key: "key".to_string(),
+        },
+    );
+    assert!(
+        storage.remove("provider"),
+        "should return true for existing"
+    );
+    assert!(
+        !storage.remove("provider"),
+        "should return false for already-removed"
+    );
     assert_eq!(
         storage.credential_status("provider"),
         CredentialStatus::Missing
@@ -394,12 +454,15 @@ fn resolve_aws_stored_iam_credentials() {
     let h = TestHarness::new("aws_stored_iam");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("amazon-bedrock", AuthCredential::AwsCredentials {
-        access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/EXAMPLE".to_string(),
-        session_token: Some("session-token".to_string()),
-        region: Some("eu-west-1".to_string()),
-    });
+    storage.set(
+        "amazon-bedrock",
+        AuthCredential::AwsCredentials {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/EXAMPLE".to_string(),
+            session_token: Some("session-token".to_string()),
+            region: Some("eu-west-1".to_string()),
+        },
+    );
 
     // resolve_aws_credentials checks env vars first, then falls back to stored.
     // If env vars happen to be set, the result will differ.
@@ -414,9 +477,12 @@ fn resolve_aws_stored_bearer_token() {
     let h = TestHarness::new("aws_stored_bearer");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("amazon-bedrock", AuthCredential::BearerToken {
-        token: "stored-bearer".to_string(),
-    });
+    storage.set(
+        "amazon-bedrock",
+        AuthCredential::BearerToken {
+            token: "stored-bearer".to_string(),
+        },
+    );
 
     let resolved = pi::auth::resolve_aws_credentials(&storage);
     assert!(resolved.is_some(), "should resolve stored bearer token");
@@ -437,13 +503,19 @@ fn resolve_aws_legacy_api_key_as_bearer() {
     let h = TestHarness::new("aws_legacy_key");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("amazon-bedrock", AuthCredential::ApiKey {
-        key: "legacy-bedrock-key".to_string(),
-    });
+    storage.set(
+        "amazon-bedrock",
+        AuthCredential::ApiKey {
+            key: "legacy-bedrock-key".to_string(),
+        },
+    );
 
     let resolved = pi::auth::resolve_aws_credentials(&storage);
     // If env vars are not set, this should resolve as Bearer with legacy key
-    assert!(resolved.is_some(), "legacy API key should resolve for bedrock");
+    assert!(
+        resolved.is_some(),
+        "legacy API key should resolve for bedrock"
+    );
 }
 
 // ===========================================================================
@@ -456,12 +528,15 @@ fn resolve_sap_stored_service_key() {
     let h = TestHarness::new("sap_stored");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("sap-ai-core", AuthCredential::ServiceKey {
-        client_id: Some("sap-client".to_string()),
-        client_secret: Some("sap-secret".to_string()),
-        token_url: Some("https://auth.sap.com/token".to_string()),
-        service_url: Some("https://api.sap.com/ai".to_string()),
-    });
+    storage.set(
+        "sap-ai-core",
+        AuthCredential::ServiceKey {
+            client_id: Some("sap-client".to_string()),
+            client_secret: Some("sap-secret".to_string()),
+            token_url: Some("https://auth.sap.com/token".to_string()),
+            service_url: Some("https://api.sap.com/ai".to_string()),
+        },
+    );
 
     // If AICORE_SERVICE_KEY env var is set, it takes precedence.
     // We verify the function works without panicking.
@@ -476,12 +551,15 @@ fn resolve_sap_stored_incomplete() {
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
     // Missing client_secret and service_url
-    storage.set("sap-ai-core", AuthCredential::ServiceKey {
-        client_id: Some("sap-client".to_string()),
-        client_secret: None,
-        token_url: Some("https://auth.sap.com/token".to_string()),
-        service_url: None,
-    });
+    storage.set(
+        "sap-ai-core",
+        AuthCredential::ServiceKey {
+            client_id: Some("sap-client".to_string()),
+            client_secret: None,
+            token_url: Some("https://auth.sap.com/token".to_string()),
+            service_url: None,
+        },
+    );
 
     // If env vars provide the missing fields, this will succeed.
     // Otherwise, it returns None. Either way, no panic.
@@ -514,7 +592,8 @@ fn error_hints_config_cassette() {
     let err = Error::config("cassette file not found");
     let hint = hints_for_error(&err);
     assert!(
-        hint.summary.to_lowercase().contains("cassette") || hint.summary.to_lowercase().contains("vcr"),
+        hint.summary.to_lowercase().contains("cassette")
+            || hint.summary.to_lowercase().contains("vcr"),
         "cassette config error should mention VCR: got '{}'",
         hint.summary
     );
@@ -636,36 +715,51 @@ fn format_error_with_hints_tool() {
 #[test]
 fn auth_credential_serde_round_trip() {
     let variants: Vec<(&str, AuthCredential)> = vec![
-        ("api_key", AuthCredential::ApiKey {
-            key: "test-key".to_string(),
-        }),
-        ("oauth", AuthCredential::OAuth {
-            access_token: "access".to_string(),
-            refresh_token: "refresh".to_string(),
-            expires: 1_707_782_400_000,
-            token_url: Some("https://auth.example.com/token".to_string()),
-            client_id: Some("client-123".to_string()),
-        }),
-        ("bearer", AuthCredential::BearerToken {
-            token: "bearer-xyz".to_string(),
-        }),
-        ("aws", AuthCredential::AwsCredentials {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_access_key: "wJalrXUtnFEMI/EXAMPLE".to_string(),
-            session_token: Some("session".to_string()),
-            region: Some("us-west-2".to_string()),
-        }),
-        ("service_key", AuthCredential::ServiceKey {
-            client_id: Some("client".to_string()),
-            client_secret: Some("secret".to_string()),
-            token_url: Some("https://token.example.com".to_string()),
-            service_url: Some("https://api.example.com".to_string()),
-        }),
+        (
+            "api_key",
+            AuthCredential::ApiKey {
+                key: "test-key".to_string(),
+            },
+        ),
+        (
+            "oauth",
+            AuthCredential::OAuth {
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                expires: 1_707_782_400_000,
+                token_url: Some("https://auth.example.com/token".to_string()),
+                client_id: Some("client-123".to_string()),
+            },
+        ),
+        (
+            "bearer",
+            AuthCredential::BearerToken {
+                token: "bearer-xyz".to_string(),
+            },
+        ),
+        (
+            "aws",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/EXAMPLE".to_string(),
+                session_token: Some("session".to_string()),
+                region: Some("us-west-2".to_string()),
+            },
+        ),
+        (
+            "service_key",
+            AuthCredential::ServiceKey {
+                client_id: Some("client".to_string()),
+                client_secret: Some("secret".to_string()),
+                token_url: Some("https://token.example.com".to_string()),
+                service_url: Some("https://api.example.com".to_string()),
+            },
+        ),
     ];
 
     for (name, cred) in &variants {
-        let json = serde_json::to_string(cred)
-            .unwrap_or_else(|e| panic!("serialize {name} failed: {e}"));
+        let json =
+            serde_json::to_string(cred).unwrap_or_else(|e| panic!("serialize {name} failed: {e}"));
         let restored: AuthCredential = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("deserialize {name} failed: {e}"));
         // Verify type tag round-trips correctly
@@ -749,10 +843,7 @@ fn load_default_auth_creates_if_missing() {
     let h = TestHarness::new("default_auth");
     let path = h.temp_dir().join("auth.json");
     let storage = pi::auth::load_default_auth(&path).expect("should succeed");
-    assert_eq!(
-        storage.credential_status("any"),
-        CredentialStatus::Missing
-    );
+    assert_eq!(storage.credential_status("any"), CredentialStatus::Missing);
 }
 
 // ===========================================================================
@@ -766,19 +857,31 @@ fn auth_storage_multiple_providers() {
     let path = h.temp_dir().join("auth.json");
 
     let mut storage = AuthStorage::load(path.clone()).unwrap();
-    storage.set("anthropic", AuthCredential::ApiKey {
-        key: "anthropic-key".to_string(),
-    });
-    storage.set("openai", AuthCredential::ApiKey {
-        key: "openai-key".to_string(),
-    });
-    storage.set("google", AuthCredential::BearerToken {
-        token: "google-bearer".to_string(),
-    });
+    storage.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "anthropic-key".to_string(),
+        },
+    );
+    storage.set(
+        "openai",
+        AuthCredential::ApiKey {
+            key: "openai-key".to_string(),
+        },
+    );
+    storage.set(
+        "google",
+        AuthCredential::BearerToken {
+            token: "google-bearer".to_string(),
+        },
+    );
     storage.save().unwrap();
 
     let restored = AuthStorage::load(path).unwrap();
-    assert_eq!(restored.api_key("anthropic").as_deref(), Some("anthropic-key"));
+    assert_eq!(
+        restored.api_key("anthropic").as_deref(),
+        Some("anthropic-key")
+    );
     assert_eq!(restored.api_key("openai").as_deref(), Some("openai-key"));
     assert_eq!(restored.api_key("google").as_deref(), Some("google-bearer"));
     assert_eq!(
@@ -793,13 +896,19 @@ fn auth_storage_overwrite_provider() {
     let h = TestHarness::new("overwrite_provider");
     let mut storage = AuthStorage::load(h.temp_dir().join("auth.json")).unwrap();
 
-    storage.set("provider", AuthCredential::ApiKey {
-        key: "old-key".to_string(),
-    });
+    storage.set(
+        "provider",
+        AuthCredential::ApiKey {
+            key: "old-key".to_string(),
+        },
+    );
     assert_eq!(storage.api_key("provider").as_deref(), Some("old-key"));
 
-    storage.set("provider", AuthCredential::ApiKey {
-        key: "new-key".to_string(),
-    });
+    storage.set(
+        "provider",
+        AuthCredential::ApiKey {
+            key: "new-key".to_string(),
+        },
+    );
     assert_eq!(storage.api_key("provider").as_deref(), Some("new-key"));
 }

@@ -80,8 +80,15 @@ struct WaiverAuditReport {
     raw_waivers: Vec<Waiver>,
 }
 
-const WAIVER_REQUIRED_FIELDS: &[&str] =
-    &["owner", "created", "expires", "bead", "reason", "scope", "remove_when"];
+const WAIVER_REQUIRED_FIELDS: &[&str] = &[
+    "owner",
+    "created",
+    "expires",
+    "bead",
+    "reason",
+    "scope",
+    "remove_when",
+];
 const WAIVER_VALID_SCOPES: &[&str] = &["full", "preflight", "both"];
 const WAIVER_MAX_DURATION_DAYS: i64 = 30;
 const WAIVER_EXPIRY_WARN_DAYS: i64 = 3;
@@ -236,9 +243,7 @@ fn validate_waiver_dates(waiver: &Waiver, today: &str) -> WaiverValidation {
             status: "expired".to_string(),
             detail: Some(format!(
                 "Expired {} day(s) ago (owner: {}, bead: {})",
-                -days_remaining,
-                waiver.owner,
-                waiver.bead
+                -days_remaining, waiver.owner, waiver.bead
             )),
             days_remaining: Some(days_remaining),
         }
@@ -263,13 +268,17 @@ fn validate_waiver_dates(waiver: &Waiver, today: &str) -> WaiverValidation {
 }
 
 /// Build a set of waived gate_ids for a given lane scope.
-fn waived_gate_ids(waivers: &[Waiver], validations: &[WaiverValidation], lane: &str) -> HashMap<String, Waiver> {
+fn waived_gate_ids(
+    waivers: &[Waiver],
+    validations: &[WaiverValidation],
+    lane: &str,
+) -> HashMap<String, Waiver> {
     let mut map = HashMap::new();
     for waiver in waivers {
         // Only active/expiring_soon waivers take effect (not expired/invalid)
-        let is_valid = validations
-            .iter()
-            .any(|v| v.gate_id == waiver.gate_id && (v.status == "active" || v.status == "expiring_soon"));
+        let is_valid = validations.iter().any(|v| {
+            v.gate_id == waiver.gate_id && (v.status == "active" || v.status == "expiring_soon")
+        });
         if !is_valid {
             continue;
         }
@@ -1014,10 +1023,7 @@ fn preflight_fast_fail() {
     let (waivers, validations) = parse_waivers(&root);
     let waived = waived_gate_ids(&waivers, &validations, "preflight");
 
-    let blocking_gates: Vec<SubGate> = all_gates
-        .into_iter()
-        .filter(|g| g.blocking)
-        .collect();
+    let blocking_gates: Vec<SubGate> = all_gates.into_iter().filter(|g| g.blocking).collect();
 
     let mut evaluated = Vec::new();
     let mut first_failure: Option<SubGate> = None;
@@ -1310,7 +1316,9 @@ fn full_certification() {
         ));
     }
     if expired > 0 {
-        conditions.push(format!("{expired} expired waiver(s) must be renewed or fixed"));
+        conditions.push(format!(
+            "{expired} expired waiver(s) must be renewed or fixed"
+        ));
     }
 
     let report = CertificationVerdict {
@@ -1463,10 +1471,7 @@ fn full_certification() {
     let _ = std::fs::write(&cert_md_path, &md);
 
     // Print summary
-    eprintln!(
-        "=== Certification Verdict: {} ===",
-        verdict.to_uppercase()
-    );
+    eprintln!("=== Certification Verdict: {} ===", verdict.to_uppercase());
     eprintln!("  Gates:    {passed}/{} passed", gates.len());
     eprintln!("  Blocking: {blocking_pass}/{blocking_total}");
     eprintln!("  Waived:   {waived_count}");
@@ -1594,7 +1599,10 @@ fn waiver_date_validation_active() {
         "Should be active or expiring_soon, got: {}",
         v.status
     );
-    assert!(v.days_remaining.unwrap_or(-1) >= 0, "Should have positive days remaining");
+    assert!(
+        v.days_remaining.unwrap_or(-1) >= 0,
+        "Should have positive days remaining"
+    );
 }
 
 #[test]
@@ -1611,7 +1619,10 @@ fn waiver_date_validation_expired() {
     };
     let v = validate_waiver_dates(&waiver, "2026-02-13");
     assert_eq!(v.status, "expired", "Should be expired");
-    assert!(v.days_remaining.unwrap_or(0) < 0, "Should have negative days remaining");
+    assert!(
+        v.days_remaining.unwrap_or(0) < 0,
+        "Should have negative days remaining"
+    );
 }
 
 #[test]
@@ -1627,7 +1638,10 @@ fn waiver_date_validation_too_long_duration() {
         remove_when: "never".to_string(),
     };
     let v = validate_waiver_dates(&waiver, "2026-02-13");
-    assert_eq!(v.status, "invalid", "Should be invalid due to excessive duration");
+    assert_eq!(
+        v.status, "invalid",
+        "Should be invalid due to excessive duration"
+    );
 }
 
 #[test]
@@ -1643,7 +1657,10 @@ fn waiver_date_validation_expiring_soon() {
         remove_when: "never".to_string(),
     };
     let v = validate_waiver_dates(&waiver, "2026-02-13");
-    assert_eq!(v.status, "expiring_soon", "Should be expiring_soon (2 days left)");
+    assert_eq!(
+        v.status, "expiring_soon",
+        "Should be expiring_soon (2 days left)"
+    );
     assert_eq!(v.days_remaining, Some(2));
 }
 
@@ -1703,8 +1720,14 @@ fn waiver_scope_filtering() {
     ];
 
     let preflight = waived_gate_ids(&waivers, &validations, "preflight");
-    assert!(preflight.contains_key("gate_a"), "gate_a scoped to preflight");
-    assert!(!preflight.contains_key("gate_b"), "gate_b scoped to full only");
+    assert!(
+        preflight.contains_key("gate_a"),
+        "gate_a scoped to preflight"
+    );
+    assert!(
+        !preflight.contains_key("gate_b"),
+        "gate_b scoped to full only"
+    );
     assert!(preflight.contains_key("gate_c"), "gate_c scoped to both");
 
     let full = waived_gate_ids(&waivers, &validations, "full");
@@ -1741,6 +1764,10 @@ fn parse_waivers_empty_is_ok() {
     // When no waiver sections exist, should return empty with no errors
     let (waivers, validations) = parse_waivers(&repo_root());
     // Currently no waivers defined, so both should be empty
-    eprintln!("  Parsed {} waivers, {} validations", waivers.len(), validations.len());
+    eprintln!(
+        "  Parsed {} waivers, {} validations",
+        waivers.len(),
+        validations.len()
+    );
     // This test just verifies parsing doesn't panic
 }

@@ -2806,9 +2806,7 @@ mod docs_runtime_consistency {
         // Collect env var entries from all category arrays
         let categories = ["built_in_native", "native_adapter", "openai_compatible"];
         for category in &categories {
-            let entries = env_ref
-                .get(*category)
-                .and_then(|v| v.as_array());
+            let entries = env_ref.get(*category).and_then(|v| v.as_array());
             let Some(entries) = entries else { continue };
             for entry in entries {
                 let var_name = entry.get("var").and_then(|v| v.as_str()).unwrap_or("");
