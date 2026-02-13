@@ -168,7 +168,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "openrouter",
-        aliases: &[],
+        aliases: &["open-router"],
         auth_env_keys: &["OPENROUTER_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1482,6 +1482,9 @@ mod tests {
         let copilot_enterprise_alias = provider_metadata("github-copilot-enterprise")
             .expect("github-copilot-enterprise alias metadata");
         assert_eq!(copilot_enterprise_alias.canonical_id, "github-copilot");
+        let openrouter_alias =
+            provider_metadata("open-router").expect("open-router alias metadata");
+        assert_eq!(openrouter_alias.canonical_id, "openrouter");
     }
 
     #[test]
@@ -1537,6 +1540,10 @@ mod tests {
         assert_eq!(
             provider_auth_env_keys("google-vertex-anthropic"),
             &["GOOGLE_CLOUD_API_KEY", "VERTEX_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("open-router"),
+            &["OPENROUTER_API_KEY"]
         );
     }
 

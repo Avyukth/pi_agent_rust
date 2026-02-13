@@ -180,6 +180,53 @@ fn select_model_and_thinking_clamps_xhigh_when_model_does_not_support_it() {
 }
 
 #[test]
+fn select_model_and_thinking_resolves_model_flag_with_provider_prefixed_openrouter_id() {
+    let harness = TestHarness::new(
+        "select_model_and_thinking_resolves_model_flag_with_provider_prefixed_openrouter_id",
+    );
+    let registry = make_registry(&harness, &[("openrouter", "test-openrouter-key")]);
+    let cli = cli::Cli::parse_from(["pi", "--model", "openrouter/anthropic/claude-3.5-sonnet"]);
+
+    let selection = select_model_and_thinking(
+        &cli,
+        &Config::default(),
+        &Session::in_memory(),
+        &registry,
+        &[],
+        harness.temp_dir(),
+    )
+    .expect("select model");
+
+    assert_eq!(selection.model_entry.model.provider, "openrouter");
+    assert_eq!(
+        selection.model_entry.model.id,
+        "anthropic/claude-3.5-sonnet"
+    );
+}
+
+#[test]
+fn select_model_and_thinking_resolves_openrouter_provider_alias_and_model_alias() {
+    let harness = TestHarness::new(
+        "select_model_and_thinking_resolves_openrouter_provider_alias_and_model_alias",
+    );
+    let registry = make_registry(&harness, &[("openrouter", "test-openrouter-key")]);
+    let cli = cli::Cli::parse_from(["pi", "--provider", "open-router", "--model", "gpt-4o-mini"]);
+
+    let selection = select_model_and_thinking(
+        &cli,
+        &Config::default(),
+        &Session::in_memory(),
+        &registry,
+        &[],
+        harness.temp_dir(),
+    )
+    .expect("select model");
+
+    assert_eq!(selection.model_entry.model.provider, "openrouter");
+    assert_eq!(selection.model_entry.model.id, "openai/gpt-4o-mini");
+}
+
+#[test]
 fn select_model_and_thinking_uses_scoped_thinking_level_when_cli_unset() {
     let harness =
         TestHarness::new("select_model_and_thinking_uses_scoped_thinking_level_when_cli_unset");

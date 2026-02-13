@@ -28,6 +28,33 @@ use std::pin::Pin;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
+const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
+
+fn map_has_any_header(headers: &std::collections::HashMap<String, String>, names: &[&str]) -> bool {
+    headers
+        .keys()
+        .any(|key| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+}
+
+fn first_non_empty_env(keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn openrouter_default_http_referer() -> String {
+    first_non_empty_env(&["OPENROUTER_HTTP_REFERER", "PI_OPENROUTER_HTTP_REFERER"])
+        .unwrap_or_else(|| OPENROUTER_DEFAULT_HTTP_REFERER.to_string())
+}
+
+fn openrouter_default_x_title() -> String {
+    first_non_empty_env(&["OPENROUTER_X_TITLE", "PI_OPENROUTER_X_TITLE"])
+        .unwrap_or_else(|| OPENROUTER_DEFAULT_X_TITLE.to_string())
+}
 
 // ============================================================================
 // OpenAI Provider
@@ -259,6 +286,26 @@ impl Provider for OpenAIProvider {
 
         if let Some(auth_value) = auth_value {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
+        }
+
+        if self.provider.eq_ignore_ascii_case("openrouter") {
+            let compat_headers = self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref());
+            let has_referer = map_has_any_header(&options.headers, &["http-referer", "referer"])
+                || compat_headers.is_some_and(|headers| {
+                    map_has_any_header(headers, &["http-referer", "referer"])
+                });
+            if !has_referer {
+                request = request.header("HTTP-Referer", openrouter_default_http_referer());
+            }
+
+            let has_title = map_has_any_header(&options.headers, &["x-title"])
+                || compat_headers.is_some_and(|headers| map_has_any_header(headers, &["x-title"]));
+            if !has_title {
+                request = request.header("X-Title", openrouter_default_x_title());
+            }
         }
 
         // Apply provider-specific custom headers from compat config.
@@ -1226,6 +1273,60 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
     }
 
+    #[test]
+    fn test_stream_openrouter_injects_default_attribution_headers() {
+        let options = StreamOptions {
+            api_key: Some("test-openrouter-key".to_string()),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("openai/gpt-4o-mini").with_provider_name("openrouter"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert_eq!(
+            captured.headers.get("http-referer").map(String::as_str),
+            Some(OPENROUTER_DEFAULT_HTTP_REFERER)
+        );
+        assert_eq!(
+            captured.headers.get("x-title").map(String::as_str),
+            Some(OPENROUTER_DEFAULT_X_TITLE)
+        );
+    }
+
+    #[test]
+    fn test_stream_openrouter_respects_explicit_attribution_headers() {
+        let options = StreamOptions {
+            api_key: Some("test-openrouter-key".to_string()),
+            headers: HashMap::from([
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://example.test/app".to_string(),
+                ),
+                (
+                    "X-Title".to_string(),
+                    "Custom OpenRouter Client".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("openai/gpt-4o-mini").with_provider_name("openrouter"),
+            &options,
+        )
+        .expect("captured request");
+
+        assert_eq!(
+            captured.headers.get("http-referer").map(String::as_str),
+            Some("https://example.test/app")
+        );
+        assert_eq!(
+            captured.headers.get("x-title").map(String::as_str),
+            Some("Custom OpenRouter Client")
+        );
+    }
+
     #[derive(Debug, Deserialize)]
     struct ProviderFixture {
         cases: Vec<ProviderCase>,
@@ -1276,8 +1377,19 @@ mod tests {
     }
 
     fn run_stream_and_capture_headers() -> Option<CapturedRequest> {
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+        run_stream_and_capture_headers_with(OpenAIProvider::new("gpt-4o"), &options)
+    }
+
+    fn run_stream_and_capture_headers_with(
+        provider: OpenAIProvider,
+        options: &StreamOptions,
+    ) -> Option<CapturedRequest> {
         let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
-        let provider = OpenAIProvider::new("gpt-4o").with_base_url(base_url);
+        let provider = provider.with_base_url(base_url);
         let context = Context {
             system_prompt: None,
             messages: vec![Message::User(crate::model::UserMessage {
@@ -1286,16 +1398,12 @@ mod tests {
             })],
             tools: Vec::new(),
         };
-        let options = StreamOptions {
-            api_key: Some("test-openai-key".to_string()),
-            ..Default::default()
-        };
 
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
         runtime.block_on(async {
-            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut stream = provider.stream(&context, options).await.expect("stream");
             while let Some(event) = stream.next().await {
                 if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
                     break;

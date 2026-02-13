@@ -138,8 +138,8 @@
     ],
     "routing_payload_forwarding_semantics": {
       "open_router_routing_config_field": "CompatConfig.open_router_routing is parsed and merged in model loading.",
-      "current_runtime_behavior": "OpenAI-compatible request builders do not yet auto-emit open_router_routing payload fields.",
-      "implementation_note": "Provider implementation bead must map routing metadata into request JSON deterministically."
+      "current_runtime_behavior": "OpenAI-compatible request builders inject open_router_routing object keys into outbound request JSON when provider is openrouter.",
+      "implementation_note": "Routing metadata is merged after request serialization with provider-specific validation that openRouterRouting is an object."
     },
     "tests": [
       "tests/provider_factory.rs::schema_compat_overrides_flow_through_factory_for_openai_completions",

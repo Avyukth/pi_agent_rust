@@ -70,14 +70,67 @@ Expected check:
 
 ### 2) OpenAI-compatible preset providers (`models.json` optional)
 
-Minimal env-only path (example: OpenRouter):
+OpenRouter minimal path (env-only):
 
 ```bash
 export OPENROUTER_API_KEY="..."
 pi --provider openrouter --model openai/gpt-4o-mini -p "Say hello"
 ```
 
-Optional explicit config (example: Cloudflare AI Gateway):
+OpenRouter advanced path (explicit config + routing metadata + attribution overrides):
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "openai-completions",
+      "compat": {
+        "openRouterRouting": {
+          "provider": { "order": ["anthropic", "openai"] }
+        }
+      },
+      "models": [
+        {
+          "id": "anthropic/claude-3.5-sonnet",
+          "name": "OpenRouter Claude 3.5 Sonnet",
+          "compat": {
+            "customHeaders": {
+              "X-Debug-Trace": "openrouter-doc-example"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+```bash
+export OPENROUTER_API_KEY="..."
+# Optional attribution overrides (defaults are injected if absent)
+export OPENROUTER_HTTP_REFERER="https://example.com/pi-agent-rust"
+export OPENROUTER_X_TITLE="Pi Agent Rust (Docs Example)"
+
+# Provider alias and model alias are both supported:
+pi --provider open-router --model claude-3.5-sonnet -p "Say hello"
+```
+
+Expected OpenRouter checks:
+- OpenRouter resolves through `openai-completions` to `/chat/completions` route shape.
+- Provider alias `open-router` resolves to canonical `openrouter`.
+- Model alias forms (for example `claude-3.5-sonnet`) normalize to canonical IDs.
+- `openRouterRouting` is forwarded when configured and must be a JSON object.
+- `HTTP-Referer` and `X-Title` headers are injected by default unless already set by compat/per-request headers.
+
+OpenRouter evidence anchors:
+- `tests/provider_native_contract.rs` (`openrouter_contract::*`)
+- `tests/provider_native_verify.rs` (`openrouter_conformance::*`)
+- `tests/e2e_provider_scenarios.rs` (`e2e_openai_compatible_wave_presets`, `e2e_error_auth_all_families`, `e2e_error_rate_limit_all_families`, `e2e_error_schema_drift_all_families`)
+- `src/providers/openai.rs` (`test_build_request_applies_openrouter_routing_overrides`, `test_stream_openrouter_injects_default_attribution_headers`, `test_stream_openrouter_respects_explicit_attribution_headers`)
+- `tests/main_cli_selection.rs` (`select_model_and_thinking_resolves_model_flag_with_provider_prefixed_openrouter_id`, `select_model_and_thinking_resolves_openrouter_provider_alias_and_model_alias`)
+
+Other preset explicit config example (Cloudflare AI Gateway):
 
 ```json
 {
@@ -475,6 +528,9 @@ SAP AI Core auth:
 | Symptom | Fast diagnosis | Remediation |
 |---|---|---|
 | `Missing API key` / auth error at startup | Check provider env key mapping in `provider_auth_env_keys(...)` | Set provider env var, or `--api-key`, or persisted `auth.json`; re-run |
+| `OpenAI API error (HTTP 401)` when provider is `openrouter` | Invalid/missing OpenRouter key (or wrong key routed to provider alias) | Set `OPENROUTER_API_KEY` (or `--api-key`) and re-run a known-good model (`openrouter/auto`, `openai/gpt-4o-mini`). Evidence: `tests/provider_native_contract.rs::openrouter_contract::error_401_auth_failure`, `tests/provider_native_verify.rs::openrouter_conformance::error_auth_401` |
+| `OpenAI API error (HTTP 429)` when provider is `openrouter` | Provider/model quota or rate limit | Retry with backoff, reduce request/token size, or switch model/provider route. Evidence: `tests/provider_native_contract.rs::openrouter_contract::error_429_rate_limit`, `tests/provider_native_verify.rs::openrouter_conformance::error_rate_limit_429` |
+| `openRouterRouting must be a JSON object when configured` | `compat.openRouterRouting` is not an object in `models.json` | Change `compat.openRouterRouting` to an object (for example `{ "provider": { "order": ["openai"] } }`). Evidence: runtime guard in `src/providers/openai.rs::apply_openrouter_routing_overrides`, behavior lock in `src/providers/openai.rs::test_build_request_applies_openrouter_routing_overrides` |
 | `Provider not implemented (api: ...)` | Route fell through unknown provider/api in `resolve_provider_route(...)` | Fix provider ID/api in `models.json`; verify canonical ID or alias in `../src/provider_metadata.rs` |
 | Azure missing resource/deployment | Resolver could not infer `resource` / `deployment` from base URL/env | Set `AZURE_OPENAI_RESOURCE`, `AZURE_OPENAI_DEPLOYMENT`, or include full Azure host/deployments path |
 | Vertex missing project | Project not in base URL and not in env | Set `GOOGLE_CLOUD_PROJECT` or `VERTEX_PROJECT`; or encode project in base URL |
@@ -495,6 +551,9 @@ Targeted checks (fast):
 ```bash
 cargo test provider_factory -- --nocapture
 cargo test provider_metadata_comprehensive -- --nocapture
+cargo test --test provider_native_contract openrouter_contract:: -- --nocapture
+cargo test --test provider_native_verify openrouter_conformance:: -- --nocapture
+cargo test --test e2e_provider_scenarios e2e_openai_compatible_wave_presets -- --nocapture
 ```
 
 Broader quality gates:

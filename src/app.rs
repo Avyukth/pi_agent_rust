@@ -384,30 +384,38 @@ pub fn select_model_and_thinking(
             selected_model = Some(candidates.remove(0));
         }
     } else if let Some(model_id) = cli.model.as_deref() {
-        let matches: Vec<ModelEntry> = registry
-            .models()
-            .iter()
-            .filter(|m| m.model.id == model_id)
-            .cloned()
-            .collect();
-        if matches.is_empty() {
-            bail!("Model {model_id} not found");
+        if let Some((provider, scoped_model_id)) = split_provider_model_spec(model_id) {
+            selected_model = registry
+                .find(provider, scoped_model_id)
+                .or_else(|| crate::models::ad_hoc_model_entry(provider, scoped_model_id));
         }
-        if let Some(default_provider) = config.default_provider.as_deref() {
-            if let Some(found) = matches
+
+        if selected_model.is_none() {
+            let matches: Vec<ModelEntry> = registry
+                .models()
                 .iter()
-                .find(|m| m.model.provider == default_provider)
-            {
-                selected_model = Some(found.clone());
+                .filter(|m| m.model.id == model_id)
+                .cloned()
+                .collect();
+            if matches.is_empty() {
+                bail!("Model {model_id} not found");
             }
-        }
-        if selected_model.is_none() {
-            if let Some(found) = matches.iter().find(|m| m.api_key.is_some()) {
-                selected_model = Some(found.clone());
+            if let Some(default_provider) = config.default_provider.as_deref() {
+                if let Some(found) = matches
+                    .iter()
+                    .find(|m| m.model.provider == default_provider)
+                {
+                    selected_model = Some(found.clone());
+                }
             }
-        }
-        if selected_model.is_none() {
-            selected_model = Some(matches[0].clone());
+            if selected_model.is_none() {
+                if let Some(found) = matches.iter().find(|m| m.api_key.is_some()) {
+                    selected_model = Some(found.clone());
+                }
+            }
+            if selected_model.is_none() {
+                selected_model = Some(matches[0].clone());
+            }
         }
     } else if !scoped_models.is_empty() && !is_continuing {
         if let (Some(default_provider), Some(default_model)) = (
@@ -796,13 +804,27 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     result
 }
 
+fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
+    let (provider, model_id) = model_spec.split_once('/')?;
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    if provider.is_empty() || model_id.is_empty() {
+        return None;
+    }
+    Some((provider, model_id))
+}
+
 fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<ModelEntry> {
-    if let Some((provider, model_id)) = pattern.split_once('/') {
+    if let Some((provider, model_id)) = split_provider_model_spec(pattern) {
         if let Some(found) = available_models.iter().find(|m| {
             m.model.provider.eq_ignore_ascii_case(provider)
                 && m.model.id.eq_ignore_ascii_case(model_id)
         }) {
             return Some(found.clone());
+        }
+
+        if let Some(ad_hoc) = crate::models::ad_hoc_model_entry(provider, model_id) {
+            return Some(ad_hoc);
         }
     }
 
@@ -998,6 +1020,28 @@ mod tests {
         assert_eq!(model.model.id, "gpt-5.1-codex-20250601");
         assert!(parsed.thinking_level.is_none());
         assert!(parsed.warning.is_none());
+    }
+
+    #[test]
+    fn split_provider_model_spec_preserves_nested_model_paths() {
+        let parsed = split_provider_model_spec("openrouter/anthropic/claude-sonnet-4.5")
+            .expect("provider/model spec");
+        assert_eq!(parsed.0, "openrouter");
+        assert_eq!(parsed.1, "anthropic/claude-sonnet-4.5");
+
+        assert!(split_provider_model_spec("openrouter/").is_none());
+        assert!(split_provider_model_spec("/anthropic/claude").is_none());
+        assert!(split_provider_model_spec("no-slash").is_none());
+    }
+
+    #[test]
+    fn try_match_model_supports_openrouter_dynamic_provider_model_ids() {
+        let matched = try_match_model("openrouter/google/gemini-2.5-pro", &[])
+            .expect("openrouter ad-hoc fallback should resolve");
+        assert_eq!(matched.model.provider, "openrouter");
+        assert_eq!(matched.model.id, "google/gemini-2.5-pro");
+        assert_eq!(matched.model.api, "openai-completions");
+        assert_eq!(matched.model.base_url, "https://openrouter.ai/api/v1");
     }
 
     #[test]

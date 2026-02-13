@@ -7,7 +7,7 @@ use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -127,6 +127,35 @@ pub struct ModelRegistry {
     error: Option<String>,
 }
 
+fn canonicalize_openrouter_model_id(model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "auto" => "openrouter/auto".to_string(),
+        "gpt-4o-mini" => "openai/gpt-4o-mini".to_string(),
+        "gpt-4o" => "openai/gpt-4o".to_string(),
+        "claude-3.5-sonnet" => "anthropic/claude-3.5-sonnet".to_string(),
+        "gemini-2.5-pro" => "google/gemini-2.5-pro".to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
+fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String {
+    if canonical_provider_id(provider).is_some_and(|canonical| canonical == "openrouter") {
+        return canonicalize_openrouter_model_id(model_id);
+    }
+    model_id.trim().to_string()
+}
+
+fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
+    let raw = model_id.trim().to_string();
+    let canonical = canonicalize_openrouter_model_id(model_id);
+    if canonical.eq_ignore_ascii_case(&raw) {
+        vec![canonical]
+    } else {
+        vec![raw, canonical]
+    }
+}
+
 impl ModelRegistry {
     pub fn load(auth: &AuthStorage, models_path: Option<PathBuf>) -> Self {
         let mut models = built_in_models(auth);
@@ -168,9 +197,23 @@ impl ModelRegistry {
     }
 
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
+        let provider = provider.trim();
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+        let lookup_ids = if canonical_provider.eq_ignore_ascii_case("openrouter") {
+            openrouter_model_lookup_ids(id)
+        } else {
+            vec![id.trim().to_string()]
+        };
+
         self.models
             .iter()
-            .find(|m| m.model.provider == provider && m.model.id == id)
+            .find(|m| {
+                (m.model.provider.eq_ignore_ascii_case(provider)
+                    || m.model.provider.eq_ignore_ascii_case(canonical_provider))
+                    && lookup_ids
+                        .iter()
+                        .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
+            })
             .cloned()
     }
 
@@ -303,6 +346,45 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         });
     }
 
+    let openrouter_key = auth.resolve_api_key("openrouter", None);
+    for (id, name, reasoning) in [
+        ("openrouter/auto", "OpenRouter Auto", true),
+        ("openai/gpt-4o-mini", "OpenRouter GPT-4o Mini", true),
+        ("openai/gpt-4o", "OpenRouter GPT-4o", true),
+        (
+            "anthropic/claude-3.5-sonnet",
+            "OpenRouter Claude 3.5 Sonnet",
+            true,
+        ),
+        ("google/gemini-2.5-pro", "OpenRouter Gemini 2.5 Pro", true),
+    ] {
+        models.push(ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: name.to_string(),
+                api: Api::OpenAICompletions.to_string(),
+                provider: "openrouter".to_string(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                reasoning,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 16_384,
+                headers: HashMap::new(),
+            },
+            api_key: openrouter_key.clone(),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
+    }
+
     models
 }
 
@@ -380,7 +462,30 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
         // Remove built-in provider models if fully overridden
         models.retain(|m| m.model.provider != *provider_id);
 
+        let mut normalized_provider_ids = HashSet::new();
         for model_cfg in provider_cfg.models.clone().unwrap_or_default() {
+            let normalized_model_id =
+                canonicalize_model_id_for_provider(provider_id, &model_cfg.id);
+            if normalized_model_id.is_empty() {
+                tracing::warn!(
+                    provider = %provider_id,
+                    model_id = %model_cfg.id,
+                    "Skipping model with empty normalized id"
+                );
+                continue;
+            }
+
+            if canonical_provider == "openrouter"
+                && !normalized_provider_ids.insert(normalized_model_id.to_ascii_lowercase())
+            {
+                tracing::warn!(
+                    provider = %provider_id,
+                    model_id = %normalized_model_id,
+                    "Skipping duplicate OpenRouter model id after alias normalization"
+                );
+                continue;
+            }
+
             let model_api = model_cfg.api.as_deref().unwrap_or(provider_api);
             let model_api_parsed: Api = model_api
                 .parse()
@@ -416,11 +521,11 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 routing_defaults.map_or(16_384, |defaults| defaults.max_tokens);
 
             let model = Model {
-                id: model_cfg.id.clone(),
+                id: normalized_model_id.clone(),
                 name: model_cfg
                     .name
                     .clone()
-                    .unwrap_or_else(|| model_cfg.id.clone()),
+                    .unwrap_or_else(|| normalized_model_id.clone()),
                 api: model_api_parsed.to_string(),
                 provider: provider_id.clone(),
                 base_url: provider_base.clone(),
@@ -681,10 +786,14 @@ where
     }
 
     let defaults = ad_hoc_provider_defaults(provider)?;
+    let normalized_model_id = canonicalize_model_id_for_provider(provider, model_id);
+    if normalized_model_id.is_empty() {
+        return None;
+    }
     Some(ModelEntry {
         model: Model {
-            id: model_id.to_string(),
-            name: model_id.to_string(),
+            id: normalized_model_id.clone(),
+            name: normalized_model_id,
             api: defaults.api.to_string(),
             provider: provider.to_string(),
             base_url: defaults.base_url.to_string(),
@@ -744,6 +853,12 @@ mod tests {
             },
         );
         auth.set(
+            "openrouter",
+            AuthCredential::ApiKey {
+                key: "openrouter-auth-key".to_string(),
+            },
+        );
+        auth.set(
             "acme",
             AuthCredential::ApiKey {
                 key: "acme-auth-key".to_string(),
@@ -785,6 +900,11 @@ mod tests {
                 .iter()
                 .any(|m| m.model.provider == "google" && m.model.id == "gemini-2.5-pro")
         );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model.provider == "openrouter" && m.model.id == "openrouter/auto")
+        );
 
         let anthropic = models
             .iter()
@@ -798,9 +918,14 @@ mod tests {
             .iter()
             .find(|m| m.model.provider == "google")
             .expect("google model");
+        let openrouter = models
+            .iter()
+            .find(|m| m.model.provider == "openrouter")
+            .expect("openrouter model");
         assert_eq!(anthropic.api_key.as_deref(), Some("anthropic-auth-key"));
         assert_eq!(openai.api_key.as_deref(), Some("openai-auth-key"));
         assert_eq!(google.api_key.as_deref(), Some("google-auth-key"));
+        assert_eq!(openrouter.api_key.as_deref(), Some("openrouter-auth-key"));
     }
 
     #[test]
@@ -1048,6 +1173,39 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_find_normalizes_openrouter_model_aliases() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let gpt4o_mini = registry
+            .find("openrouter", "gpt-4o-mini")
+            .expect("openrouter alias should resolve");
+        assert_eq!(gpt4o_mini.model.provider, "openrouter");
+        assert_eq!(gpt4o_mini.model.id, "openai/gpt-4o-mini");
+
+        let auto = registry
+            .find("openrouter", "auto")
+            .expect("openrouter auto alias should resolve");
+        assert_eq!(auto.model.id, "openrouter/auto");
+
+        let provider_alias = registry
+            .find("open-router", "gpt-4o-mini")
+            .expect("open-router provider alias should resolve");
+        assert_eq!(provider_alias.model.provider, "openrouter");
+        assert_eq!(provider_alias.model.id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn ad_hoc_model_entry_normalizes_openrouter_aliases() {
+        let auto = ad_hoc_model_entry("openrouter", "auto").expect("openrouter auto ad-hoc");
+        assert_eq!(auto.model.id, "openrouter/auto");
+
+        let gpt4o_mini =
+            ad_hoc_model_entry("openrouter", "gpt-4o-mini").expect("openrouter gpt-4o-mini ad-hoc");
+        assert_eq!(gpt4o_mini.model.id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
     fn model_registry_merge_entries_deduplicates() {
         let (_dir, auth) = test_auth_storage();
         let mut registry = ModelRegistry::load(&auth, None);
@@ -1085,6 +1243,52 @@ mod tests {
         registry.merge_entries(vec![duplicate, new_entry]);
         assert_eq!(registry.models().len(), before + 1);
         assert!(registry.find("acme", "acme-chat").is_some());
+    }
+
+    #[test]
+    fn apply_custom_models_dedupes_openrouter_alias_conflicts() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "openrouter".to_string(),
+                ProviderConfig {
+                    models: Some(vec![
+                        ModelConfig {
+                            id: "gpt-4o-mini".to_string(),
+                            ..ModelConfig::default()
+                        },
+                        ModelConfig {
+                            id: "openai/gpt-4o-mini".to_string(),
+                            ..ModelConfig::default()
+                        },
+                        ModelConfig {
+                            id: "auto".to_string(),
+                            ..ModelConfig::default()
+                        },
+                    ]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config);
+
+        let openrouter_models: Vec<&ModelEntry> = models
+            .iter()
+            .filter(|entry| entry.model.provider == "openrouter")
+            .collect();
+        assert_eq!(openrouter_models.len(), 2);
+        assert!(
+            openrouter_models
+                .iter()
+                .any(|entry| entry.model.id == "openai/gpt-4o-mini")
+        );
+        assert!(
+            openrouter_models
+                .iter()
+                .any(|entry| entry.model.id == "openrouter/auto")
+        );
     }
 
     #[test]
