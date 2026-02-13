@@ -4531,7 +4531,7 @@ const FRAME_BUDGET_US: u64 = 16_667;
 impl FrameTimingStats {
     fn new() -> Self {
         let enabled =
-            std::env::var_os("PI_PERF_TELEMETRY").map_or(false, |v| v == "1" || v == "true");
+            std::env::var_os("PI_PERF_TELEMETRY").is_some_and(|v| v == "1" || v == "true");
         Self {
             frame_times_us: std::cell::RefCell::new(VecDeque::with_capacity(FRAME_TIMING_WINDOW)),
             content_build_times_us: std::cell::RefCell::new(VecDeque::with_capacity(
@@ -9789,12 +9789,19 @@ impl PiApp {
                 } else {
                     args.to_string()
                 };
+                let requested_provider = requested_provider.trim().to_ascii_lowercase();
                 let provider = normalize_auth_provider_input(&requested_provider);
 
                 let auth_path = crate::config::Config::auth_path();
                 match crate::auth::AuthStorage::load(auth_path) {
                     Ok(mut auth) => {
-                        let removed = auth.remove(&provider);
+                        let removed_canonical = auth.remove(&provider);
+                        let removed_alias = if requested_provider == provider {
+                            false
+                        } else {
+                            auth.remove(&requested_provider)
+                        };
+                        let removed = removed_canonical || removed_alias;
                         if let Err(err) = auth.save() {
                             self.status_message = Some(err.to_string());
                             return None;

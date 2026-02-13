@@ -2468,6 +2468,19 @@ fn tui_state_run_pending_content_submits_next_input() {
 }
 
 #[test]
+fn tui_state_run_pending_system_appends_system_message_without_processing() {
+    let harness =
+        TestHarness::new("tui_state_run_pending_system_appends_system_message_without_processing");
+    let message = "OAuth token for anthropic has expired. Run /login anthropic to re-authenticate.";
+    let mut app = build_app(&harness, vec![PendingInput::System(message.to_string())]);
+    log_initial_state(&harness, &app);
+
+    let step = apply_pi(&harness, &mut app, "PiMsg::RunPending", PiMsg::RunPending);
+    assert_after_contains(&harness, &step, message);
+    assert_after_not_contains(&harness, &step, "Processing...");
+}
+
+#[test]
 fn tui_state_slash_help_adds_help_text() {
     let harness = TestHarness::new("tui_state_slash_help_adds_help_text");
     let mut app = build_app(&harness, Vec::new());
@@ -2477,6 +2490,31 @@ fn tui_state_slash_help_adds_help_text() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Available commands:");
     assert_after_contains(&harness, &step, "/help, /h, /?");
+}
+
+#[test]
+fn tui_state_slash_login_google_shows_api_key_guidance() {
+    let harness = TestHarness::new("tui_state_slash_login_google_shows_api_key_guidance");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/login google");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "API key login: google/gemini");
+    assert_after_contains(&harness, &step, "ai.google.dev/gemini-api/docs/api-key");
+}
+
+#[test]
+fn tui_state_slash_login_gemini_alias_shows_google_api_key_guidance() {
+    let harness =
+        TestHarness::new("tui_state_slash_login_gemini_alias_shows_google_api_key_guidance");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/login gemini");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "API key login: google/gemini");
+    assert_after_contains(&harness, &step, "ai.google.dev/gemini-api/docs/api-key");
 }
 
 #[test]
