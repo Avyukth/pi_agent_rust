@@ -16,7 +16,6 @@ use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
-use bubbles::list::{DefaultDelegate, Item as ListItem, List};
 use bubbles::spinner::{SpinnerModel, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -29,7 +28,6 @@ use futures::future::BoxFuture;
 use glamour::{Renderer as MarkdownRenderer, StyleConfig as GlamourStyleConfig};
 use glob::Pattern;
 use serde_json::{Value, json};
-use url::Url;
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -56,7 +54,7 @@ use crate::model::{
     AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
     StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
-use crate::models::{ModelEntry, ModelRegistry, OAuthConfig, default_models_path};
+use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
 use crate::providers;
 use crate::resources::{DiagnosticKind, ResourceCliOptions, ResourceDiagnostic, ResourceLoader};
@@ -71,38 +69,59 @@ use arboard::Clipboard as ArboardClipboard;
 #[cfg(feature = "clipboard")]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
+mod commands;
+mod conversation;
+mod file_refs;
+mod perf;
+mod share;
+mod state;
+mod text_utils;
+mod tool_render;
+mod view;
+
+pub use self::commands::SlashCommand;
+use self::commands::{
+    api_key_login_prompt, format_login_provider_listing, normalize_api_key_input,
+    normalize_auth_provider_input, parse_bash_command, parse_extension_command,
+    remove_provider_credentials, save_provider_credential,
+};
+use self::conversation::{
+    assistant_content_to_text, build_content_blocks_for_input, content_blocks_to_text,
+    split_content_blocks_for_input, user_content_to_text,
+};
+#[cfg(test)]
+use self::conversation::tool_content_blocks_to_text;
+use self::file_refs::{
+    file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
+    parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
+    unescape_dragged_path,
+};
+use self::perf::{
+    CRITICAL_KEEP_MESSAGES, FrameTimingStats, MemoryLevel, MemoryMonitor, micros_as_u64,
+};
+use self::share::{
+    format_command_output, parse_gist_url_and_id, parse_share_is_public, run_command_output,
+    share_gist_description,
+};
+#[cfg(test)]
+use self::state::TOOL_AUTO_COLLAPSE_THRESHOLD;
+pub use self::state::{AgentState, InputMode, PendingInput};
+pub use self::state::{ConversationMessage, MessageRole};
+use self::state::{
+    HistoryList, InjectedMessageQueue, InteractiveMessageQueue, PendingLoginKind, PendingOAuth,
+    QueuedMessageKind, TOOL_COLLAPSE_PREVIEW_LINES, ToolProgress, format_count,
+};
+#[cfg(test)]
+use self::text_utils::push_line;
+use self::text_utils::{queued_message_preview, truncate};
+use self::tool_render::{format_tool_output, render_tool_message};
+#[cfg(test)]
+use self::tool_render::{pretty_json, split_diff_prefix};
+use self::view::{clamp_to_terminal_height, normalize_raw_terminal_newlines};
+
 // ============================================================================
 // Slash Commands
 // ============================================================================
-
-/// Available slash commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashCommand {
-    Help,
-    Login,
-    Logout,
-    Clear,
-    Model,
-    Thinking,
-    ScopedModels,
-    Exit,
-    History,
-    Export,
-    Session,
-    Settings,
-    Theme,
-    Resume,
-    New,
-    Copy,
-    Name,
-    Hotkeys,
-    Changelog,
-    Tree,
-    Fork,
-    Compact,
-    Reload,
-    Share,
-}
 
 impl PiApp {
     /// Returns true when the viewport is currently anchored to the tail of the
@@ -572,12 +591,8 @@ impl PiApp {
     /// Find the next uncollapsed Tool message starting from `next_collapse_index`.
     fn find_next_uncollapsed_tool_output(&self) -> Option<usize> {
         let start = self.memory_monitor.next_collapse_index;
-        for i in start..self.messages.len() {
-            if self.messages[i].role == MessageRole::Tool && !self.messages[i].collapsed {
-                return Some(i);
-            }
-        }
-        None
+        (start..self.messages.len())
+            .find(|&i| self.messages[i].role == MessageRole::Tool && !self.messages[i].collapsed)
     }
 
     fn format_session_info(&self, session: &Session) -> String {
@@ -1406,8 +1421,8 @@ impl PiApp {
             return None;
         };
 
-        let steering_len = queue.steering.len();
-        let follow_len = queue.follow_up.len();
+        let steering_len = queue.steering_len();
+        let follow_len = queue.follow_up_len();
         if steering_len == 0 && follow_len == 0 {
             return None;
         }
@@ -1428,7 +1443,7 @@ impl PiApp {
         out.push_str(&self.styles.muted.render(&format!("{follow_len} follow-up")));
         out.push('\n');
 
-        if let Some(text) = queue.steering.front() {
+        if let Some(text) = queue.steering_front() {
             let preview = queued_message_preview(text, max_preview);
             out.push_str("  ");
             out.push_str(&self.styles.accent_bold.render("steering →"));
@@ -1437,7 +1452,7 @@ impl PiApp {
             out.push('\n');
         }
 
-        if let Some(text) = queue.follow_up.front() {
+        if let Some(text) = queue.follow_up_front() {
             let preview = queued_message_preview(text, max_preview);
             out.push_str("  ");
             out.push_str(&self.styles.muted_bold.render("follow-up →"));
@@ -1936,108 +1951,7 @@ const fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
-fn run_command_output(
-    program: &str,
-    args: &[OsString],
-    cwd: &Path,
-    abort_signal: &crate::agent::AbortSignal,
-) -> std::io::Result<std::process::Output> {
-    use std::process::{Command, Stdio};
-    use std::sync::mpsc as std_mpsc;
-    use std::time::Duration;
-
-    let child = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let pid = child.id();
-
-    let (tx, rx) = std_mpsc::channel();
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
-
-    let tick = Duration::from_millis(10);
-    loop {
-        if abort_signal.is_aborted() {
-            crate::tools::kill_process_tree(Some(pid));
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "command aborted",
-            ));
-        }
-
-        match rx.recv_timeout(tick) {
-            Ok(result) => return result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(std::io::Error::other("command output channel disconnected"));
-            }
-        }
-    }
-}
-
-fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
-    for raw in output.split_whitespace() {
-        let candidate_url = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
-        let Ok(url) = Url::parse(candidate_url) else {
-            continue;
-        };
-        let Some(host) = url.host_str() else {
-            continue;
-        };
-        if host != "gist.github.com" {
-            continue;
-        }
-        let Some(gist_id) = url.path_segments().and_then(|mut seg| seg.next_back()) else {
-            continue;
-        };
-        if gist_id.is_empty() {
-            continue;
-        }
-        return Some((candidate_url.to_string(), gist_id.to_string()));
-    }
-    None
-}
-
-fn format_command_output(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => "(no output)".to_string(),
-        (false, true) => format!("stdout:\n{stdout}"),
-        (true, false) => format!("stderr:\n{stderr}"),
-        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
-    }
-}
-
 use crate::config::parse_queue_mode_or_default;
-
-fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
-    let input = input.trim();
-    if !input.starts_with('/') {
-        return None;
-    }
-
-    // Built-in slash commands are handled elsewhere.
-    if SlashCommand::parse(input).is_some() {
-        return None;
-    }
-
-    let (cmd, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-    let cmd = cmd.trim_start_matches('/').trim();
-    if cmd.is_empty() {
-        return None;
-    }
-    let args = rest
-        .split_whitespace()
-        .map(std::string::ToString::to_string)
-        .collect();
-    Some((cmd.to_string(), args))
-}
 
 fn extension_commands_for_catalog(
     manager: &ExtensionManager,
@@ -2056,167 +1970,11 @@ fn extension_commands_for_catalog(
         .collect()
 }
 
-fn parse_bash_command(input: &str) -> Option<(String, bool)> {
-    let trimmed = input.trim_start();
-    let (rest, force) = trimmed
-        .strip_prefix("!!")
-        .map(|r| (r, true))
-        .or_else(|| trimmed.strip_prefix('!').map(|r| (r, false)))?;
-    let command = rest.trim();
-    if command.is_empty() {
-        return None;
-    }
-    Some((command.to_string(), force))
-}
-
-fn user_content_to_text(content: &UserContent) -> String {
-    match content {
-        UserContent::Text(text) => text.clone(),
-        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
-    }
-}
-
-fn assistant_content_to_text(content: &[ContentBlock]) -> (String, Option<String>) {
-    let mut text = String::new();
-    let mut thinking = String::new();
-
-    for block in content {
-        match block {
-            ContentBlock::Text(t) => text.push_str(&t.text),
-            ContentBlock::Thinking(t) => thinking.push_str(&t.thinking),
-            _ => {}
-        }
-    }
-
-    let thinking = if thinking.trim().is_empty() {
-        None
-    } else {
-        Some(thinking)
-    };
-
-    (text, thinking)
-}
-
 fn build_user_message(text: String) -> ModelMessage {
     ModelMessage::User(UserMessage {
         content: UserContent::Text(text),
         timestamp: Utc::now().timestamp_millis(),
     })
-}
-
-fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
-    let mut output = String::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
-            ContentBlock::Image(image) => {
-                let rendered =
-                    crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                push_line(&mut output, &rendered);
-            }
-            ContentBlock::Thinking(thinking_block) => {
-                push_line(&mut output, &thinking_block.thinking);
-            }
-            ContentBlock::ToolCall(call) => {
-                push_line(&mut output, &format!("[tool call: {}]", call.name));
-            }
-        }
-    }
-    output
-}
-
-fn split_content_blocks_for_input(blocks: &[ContentBlock]) -> (String, Vec<ImageContent>) {
-    let mut text = String::new();
-    let mut images = Vec::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut text, &text_block.text),
-            ContentBlock::Image(image) => images.push(image.clone()),
-            _ => {}
-        }
-    }
-    (text, images)
-}
-
-fn build_content_blocks_for_input(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
-    let mut content = Vec::new();
-    if !text.trim().is_empty() {
-        content.push(ContentBlock::Text(TextContent::new(text.to_string())));
-    }
-    for image in images {
-        content.push(ContentBlock::Image(image.clone()));
-    }
-    content
-}
-
-fn normalize_api_key_input(raw: &str) -> std::result::Result<String, String> {
-    let key = raw.trim();
-    if key.is_empty() {
-        return Err("API key cannot be empty".to_string());
-    }
-    if key.chars().any(char::is_whitespace) {
-        return Err("API key must not contain whitespace".to_string());
-    }
-    Ok(key.to_string())
-}
-
-fn normalize_auth_provider_input(raw: &str) -> String {
-    let provider = raw.trim().to_ascii_lowercase();
-    crate::provider_metadata::canonical_provider_id(&provider)
-        .unwrap_or(provider.as_str())
-        .to_string()
-}
-
-fn api_key_login_prompt(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some(
-            "API key login: openai\n\n\
-Paste your OpenAI API key to save it in auth.json.\n\
-Get a key from platform.openai.com/api-keys.\n\
-Rotate/revoke keys from that dashboard if compromised.\n\n\
-Your input will be treated as sensitive and is not added to message history.",
-        ),
-        "google" => Some(
-            "API key login: google/gemini\n\n\
-Paste your Google Gemini API key to save it in auth.json under google.\n\
-Get a key from ai.google.dev/gemini-api/docs/api-key.\n\
-Rotate/revoke keys from Google AI Studio if compromised.\n\n\
-Your input will be treated as sensitive and is not added to message history.",
-        ),
-        _ => None,
-    }
-}
-
-fn save_provider_credential(
-    auth: &mut crate::auth::AuthStorage,
-    provider: &str,
-    credential: crate::auth::AuthCredential,
-) {
-    let requested = provider.trim().to_ascii_lowercase();
-    let canonical = normalize_auth_provider_input(&requested);
-    auth.set(canonical.clone(), credential);
-    if canonical == "google" {
-        let _ = auth.remove("gemini");
-    } else if requested != canonical {
-        let _ = auth.remove(&requested);
-    }
-}
-
-fn remove_provider_credentials(
-    auth: &mut crate::auth::AuthStorage,
-    requested_provider: &str,
-) -> bool {
-    let requested = requested_provider.trim().to_ascii_lowercase();
-    let canonical = normalize_auth_provider_input(&requested);
-
-    let mut removed = auth.remove(&canonical);
-    if requested != canonical {
-        removed |= auth.remove(&requested);
-    }
-    if canonical == "google" {
-        removed |= auth.remove("gemini");
-    }
-    removed
 }
 
 async fn dispatch_input_event(
@@ -2238,385 +1996,6 @@ async fn dispatch_input_event(
         )
         .await?;
     Ok(apply_input_event_response(response, text, images))
-}
-
-fn next_non_whitespace_token(text: &str, start: usize) -> (&str, usize) {
-    if start >= text.len() {
-        return ("", text.len());
-    }
-    let mut end = text.len();
-    for (offset, ch) in text[start..].char_indices() {
-        if ch.is_whitespace() {
-            end = start + offset;
-            break;
-        }
-    }
-    (&text[start..end], end)
-}
-
-fn parse_quoted_file_ref(text: &str, start: usize) -> Option<(String, String, usize)> {
-    let mut chars = text[start..].chars();
-    let quote = chars.next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-
-    let mut path = String::new();
-    let mut escaped = false;
-    let mut end = None;
-    let after_quote = start + quote.len_utf8();
-
-    for (offset, ch) in text[after_quote..].char_indices() {
-        if escaped {
-            path.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if ch == quote {
-            end = Some(after_quote + offset);
-            break;
-        }
-        path.push(ch);
-    }
-
-    let end = end?;
-    let mut trailing = String::new();
-    let mut token_end = end + quote.len_utf8();
-    for ch in text[token_end..].chars() {
-        if is_trailing_punct(ch) {
-            trailing.push(ch);
-            token_end += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    Some((path, trailing, token_end))
-}
-
-fn strip_wrapping_quotes(input: &str) -> &str {
-    let bytes = input.as_bytes();
-    if bytes.len() >= 2 {
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return &input[1..bytes.len() - 1];
-        }
-    }
-    input
-}
-
-fn looks_like_windows_path(input: &str) -> bool {
-    let bytes = input.as_bytes();
-    (bytes.len() >= 2 && bytes[1] == b':') || input.starts_with("\\\\")
-}
-
-fn unescape_dragged_path(input: &str) -> String {
-    if looks_like_windows_path(input) {
-        return input.to_string();
-    }
-
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.peek().copied() {
-                if matches!(
-                    next,
-                    ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '\\'
-                ) {
-                    out.push(next);
-                    chars.next();
-                    continue;
-                }
-            }
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn file_url_to_path(input: &str) -> Option<PathBuf> {
-    if !input.starts_with("file://") {
-        return None;
-    }
-    Url::parse(input).ok()?.to_file_path().ok()
-}
-
-fn path_for_display(path: &Path, cwd: &Path) -> String {
-    path.strip_prefix(cwd).map_or_else(
-        |_| path.to_string_lossy().to_string(),
-        |p| p.to_string_lossy().to_string(),
-    )
-}
-
-fn format_file_ref(path: &str) -> String {
-    if path.chars().any(char::is_whitespace) {
-        if !path.contains('"') {
-            format!("@\"{path}\"")
-        } else if !path.contains('\'') {
-            format!("@'{path}'")
-        } else {
-            format!("@\"{}\"", path.replace('"', "\\\""))
-        }
-    } else {
-        format!("@{path}")
-    }
-}
-
-fn split_trailing_punct(token: &str) -> (&str, &str) {
-    let mut split = token.len();
-    for (idx, ch) in token.char_indices().rev() {
-        if is_trailing_punct(ch) {
-            split = idx;
-        } else {
-            break;
-        }
-    }
-    token.split_at(split)
-}
-
-const fn is_trailing_punct(ch: char) -> bool {
-    matches!(
-        ch,
-        ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
-    )
-}
-
-fn is_file_ref_boundary(text: &str, at: usize) -> bool {
-    if at == 0 {
-        return true;
-    }
-    let prev = text[..at].chars().last().unwrap_or(' ');
-    prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '<' | '"' | '\'')
-}
-
-fn format_tool_output(
-    content: &[ContentBlock],
-    details: Option<&Value>,
-    show_images: bool,
-) -> Option<String> {
-    let mut output = tool_content_blocks_to_text(content, show_images);
-    if let Some(details) = details {
-        // `edit` includes a unified diff-like view in `details.diff`. Surface it in the TUI
-        // even when the primary content is a short "success" message.
-        if let Some(diff) = details.get("diff").and_then(Value::as_str) {
-            let diff = diff.trim();
-            if !diff.is_empty() {
-                if !output.trim().is_empty() {
-                    output.push_str("\n\n");
-                }
-                output.push_str("Diff:\n");
-                output.push_str(diff);
-            }
-        } else if output.trim().is_empty() {
-            output = pretty_json(details);
-        }
-    } else if output.trim().is_empty() {
-        // No primary content and no details payload.
-    }
-    if output.trim().is_empty() {
-        None
-    } else {
-        Some(output)
-    }
-}
-
-/// Maximum number of diff lines to show before truncating.
-const DIFF_TRUNCATE_THRESHOLD: usize = 50;
-/// Lines to show at the beginning of a truncated diff.
-const DIFF_TRUNCATE_HEAD: usize = 20;
-/// Lines to show at the end of a truncated diff.
-const DIFF_TRUNCATE_TAIL: usize = 10;
-
-fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
-    let mut out = String::new();
-    let mut diff_lines: Vec<&str> = Vec::new();
-
-    // First pass: separate pre-diff text from diff lines.
-    let mut pre_diff_lines: Vec<&str> = Vec::new();
-    let mut found_diff_header = false;
-    for line in text.lines() {
-        if found_diff_header {
-            diff_lines.push(line);
-        } else if line.trim() == "Diff:" {
-            found_diff_header = true;
-        } else {
-            pre_diff_lines.push(line);
-        }
-    }
-
-    // Render pre-diff content (tool name, success message, etc.)
-    for (idx, line) in pre_diff_lines.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        out.push_str(&styles.muted.render(line));
-    }
-
-    if !found_diff_header {
-        return out;
-    }
-
-    // Extract file path from "Successfully replaced text in {path}." pattern.
-    let file_path = pre_diff_lines.iter().find_map(|line| {
-        line.strip_prefix("Successfully replaced text in ")
-            .and_then(|rest| rest.strip_suffix('.'))
-    });
-
-    // Render diff header.
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    if let Some(path) = file_path {
-        out.push_str(&styles.muted_bold.render(&format!("@@ {path} @@")));
-    } else {
-        out.push_str(&styles.muted_bold.render("Diff:"));
-    }
-
-    // Truncate large diffs.
-    let total_changed = diff_lines
-        .iter()
-        .filter(|l| l.starts_with('+') || l.starts_with('-'))
-        .count();
-    let truncated = total_changed > DIFF_TRUNCATE_THRESHOLD;
-    let visible_lines = if truncated {
-        // Show head + tail with separator.
-        let mut visible = Vec::with_capacity(DIFF_TRUNCATE_HEAD + DIFF_TRUNCATE_TAIL + 1);
-        visible.extend_from_slice(&diff_lines[..DIFF_TRUNCATE_HEAD.min(diff_lines.len())]);
-        let omitted = diff_lines
-            .len()
-            .saturating_sub(DIFF_TRUNCATE_HEAD + DIFF_TRUNCATE_TAIL);
-        if omitted > 0 {
-            // We'll render a separator inline.
-            visible.push(""); // placeholder for separator
-            let tail_start = diff_lines.len().saturating_sub(DIFF_TRUNCATE_TAIL);
-            visible.extend_from_slice(&diff_lines[tail_start..]);
-        }
-        visible
-    } else {
-        diff_lines
-    };
-
-    // Collect diff lines for word-level highlighting.
-    render_diff_lines(&visible_lines, truncated, styles, &mut out);
-
-    out
-}
-
-/// Render diff lines with word-level highlighting for paired -/+ lines.
-fn render_diff_lines(lines: &[&str], truncated: bool, styles: &TuiStyles, out: &mut String) {
-    let mut i = 0;
-    let mut rendered_separator = false;
-    while i < lines.len() {
-        let line = lines[i];
-
-        // Handle truncation separator placeholder.
-        if truncated && !rendered_separator && line.is_empty() && i > 0 {
-            out.push('\n');
-            out.push_str(&styles.muted.render("  ... (diff truncated) ..."));
-            rendered_separator = true;
-            i += 1;
-            continue;
-        }
-
-        out.push('\n');
-
-        // Check for paired -/+ lines for word-level highlighting.
-        if line.starts_with('-') {
-            // Look ahead for a matching + line.
-            if i + 1 < lines.len() && lines[i + 1].starts_with('+') {
-                let removed = line;
-                let added = lines[i + 1];
-                render_word_diff_pair(removed, added, styles, out);
-                i += 2;
-                continue;
-            }
-            out.push_str(&styles.error_bold.render(line));
-        } else if line.starts_with('+') {
-            out.push_str(&styles.success_bold.render(line));
-        } else {
-            out.push_str(&styles.muted.render(line));
-        }
-
-        i += 1;
-    }
-}
-
-/// Render a paired removed/added line with word-level change highlighting.
-///
-/// The line format from `generate_diff_string` is: `-NN content` / `+NN content`.
-/// We diff the content portions and bold just the changed segments.
-fn render_word_diff_pair(removed: &str, added: &str, styles: &TuiStyles, out: &mut String) {
-    // Extract the prefix (e.g. "-  3 ") and the content after it.
-    let (rem_prefix, rem_content) = split_diff_prefix(removed);
-    let (add_prefix, add_content) = split_diff_prefix(added);
-
-    // If either line has no content (just a prefix), fall back to simple coloring.
-    if rem_content.is_empty() || add_content.is_empty() {
-        out.push_str(&styles.error_bold.render(removed));
-        out.push('\n');
-        out.push_str(&styles.success_bold.render(added));
-        return;
-    }
-
-    // Compute word-level diff.
-    let diff = similar::TextDiff::from_words(rem_content, add_content);
-
-    // Render removed line with deletions highlighted.
-    out.push_str(&styles.error_bold.render(rem_prefix));
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Delete => {
-                // Bold + underline for the specific changed text.
-                let styled = styles.error_bold.clone().underline();
-                out.push_str(&styled.render(change.value()));
-            }
-            similar::ChangeTag::Equal => {
-                out.push_str(&styles.error_bold.render(change.value()));
-            }
-            similar::ChangeTag::Insert => {} // skip insertions on removed line
-        }
-    }
-
-    // Render added line with insertions highlighted.
-    out.push('\n');
-    out.push_str(&styles.success_bold.render(add_prefix));
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Insert => {
-                let styled = styles.success_bold.clone().underline();
-                out.push_str(&styled.render(change.value()));
-            }
-            similar::ChangeTag::Equal => {
-                out.push_str(&styles.success_bold.render(change.value()));
-            }
-            similar::ChangeTag::Delete => {} // skip deletions on added line
-        }
-    }
-}
-
-/// Split a diff line like `"-  3 content here"` into prefix `"-  3 "` and content `"content here"`.
-fn split_diff_prefix(line: &str) -> (&str, &str) {
-    // Format: [+-] then line number with spaces, then a space, then content.
-    // E.g., "+  3 let x = 1;" → prefix "+  3 ", content "let x = 1;"
-    // Or "- 12 old text"    → prefix "- 12 ", content "old text"
-    if line.len() < 2 {
-        return (line, "");
-    }
-    let rest = &line[1..]; // skip +/-
-    // Find the first non-whitespace-non-digit character after the prefix.
-    // The prefix is: sign + digits/spaces + one space separator.
-    rest.find(|c: char| !c.is_ascii_digit() && c != ' ')
-        .map_or((line, ""), |content_start| {
-            // Include the sign character in the prefix.
-            let prefix_end = 1 + content_start;
-            (&line[..prefix_end], &line[prefix_end..])
-        })
 }
 
 #[cfg(test)]
@@ -2769,42 +2148,6 @@ mod render_tool_message_tests {
     }
 }
 
-fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> String {
-    let mut output = String::new();
-    let mut hidden_images = 0usize;
-
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
-            ContentBlock::Image(image) => {
-                if show_images {
-                    let rendered =
-                        crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                    push_line(&mut output, &rendered);
-                } else {
-                    hidden_images = hidden_images.saturating_add(1);
-                }
-            }
-            ContentBlock::Thinking(thinking_block) => {
-                push_line(&mut output, &thinking_block.thinking);
-            }
-            ContentBlock::ToolCall(call) => {
-                push_line(&mut output, &format!("[tool call: {}]", call.name));
-            }
-        }
-    }
-
-    if !show_images && hidden_images > 0 {
-        push_line(&mut output, &format!("[{hidden_images} image(s) hidden]"));
-    }
-
-    output
-}
-
-fn pretty_json(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
 const fn kind_rank(kind: &DiagnosticKind) -> u8 {
     match kind {
         DiagnosticKind::Warning => 0,
@@ -2893,37 +2236,6 @@ fn build_reload_diagnostics(
     }
 }
 
-fn push_line(out: &mut String, line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(line);
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-
-    let count = s.chars().count();
-    if count <= max_len {
-        return s.to_string();
-    }
-
-    if max_len <= 3 {
-        return ".".repeat(max_len);
-    }
-
-    let take_len = max_len - 3;
-    let mut out = String::with_capacity(max_len);
-    out.extend(s.chars().take(take_len));
-    out.push_str("...");
-    out
-}
-
 pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
     let Some((prefix, suffix)) = pattern.rsplit_once(':') else {
         return pattern;
@@ -3003,18 +2315,6 @@ pub fn resolve_scoped_model_entries(
     });
 
     Ok(resolved)
-}
-
-fn queued_message_preview(text: &str, max_len: usize) -> String {
-    let first_line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    if first_line.is_empty() {
-        return "(empty)".to_string();
-    }
-    truncate(first_line, max_len)
 }
 
 /// Run the interactive mode.
@@ -3434,86 +2734,6 @@ pub fn parse_extension_ui_response(
             value: Some(Value::String(input.to_string())),
             cancelled: false,
         }),
-    }
-}
-
-impl SlashCommand {
-    /// Parse a slash command from input.
-    pub fn parse(input: &str) -> Option<(Self, &str)> {
-        let input = input.trim();
-        if !input.starts_with('/') {
-            return None;
-        }
-
-        let (cmd, args) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-
-        let command = match cmd.to_lowercase().as_str() {
-            "/help" | "/h" | "/?" => Self::Help,
-            "/login" => Self::Login,
-            "/logout" => Self::Logout,
-            "/clear" | "/cls" => Self::Clear,
-            "/model" | "/m" => Self::Model,
-            "/thinking" | "/think" | "/t" => Self::Thinking,
-            "/scoped-models" | "/scoped" => Self::ScopedModels,
-            "/exit" | "/quit" | "/q" => Self::Exit,
-            "/history" | "/hist" => Self::History,
-            "/export" => Self::Export,
-            "/session" | "/info" => Self::Session,
-            "/settings" => Self::Settings,
-            "/theme" => Self::Theme,
-            "/resume" | "/r" => Self::Resume,
-            "/new" => Self::New,
-            "/copy" | "/cp" => Self::Copy,
-            "/name" => Self::Name,
-            "/hotkeys" | "/keys" | "/keybindings" => Self::Hotkeys,
-            "/changelog" => Self::Changelog,
-            "/tree" => Self::Tree,
-            "/fork" => Self::Fork,
-            "/compact" => Self::Compact,
-            "/reload" => Self::Reload,
-            "/share" => Self::Share,
-            _ => return None,
-        };
-
-        Some((command, args.trim()))
-    }
-
-    /// Get help text for all commands.
-    pub const fn help_text() -> &'static str {
-        r"Available commands:
-  /help, /h, /?      - Show this help message
-  /login [provider]  - Login/setup credentials (OAuth or API key, provider-specific)
-  /logout [provider] - Remove stored credentials
-  /clear, /cls       - Clear conversation history
-  /model, /m [id|provider/id] - Show or change the current model
-  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
-  /scoped-models [patterns|clear] - Show or set scoped models for cycling
-  /history, /hist    - Show input history
-  /export [path]     - Export conversation to HTML
-  /session, /info    - Show session info (path, tokens, cost)
-  /settings          - Open settings selector
-  /theme [name]      - List or switch themes (dark/light/custom)
-  /resume, /r        - Pick and resume a previous session
-  /new               - Start a new session
-  /copy, /cp         - Copy last assistant message to clipboard
-  /name <name>       - Set session display name
-  /hotkeys, /keys    - Show keyboard shortcuts
-  /changelog         - Show changelog entries
-  /tree              - Show session branch tree summary
-  /fork [id|index]   - Fork from a user message (default: last on current path)
-  /compact [notes]   - Compact older context with optional instructions
-  /reload            - Reload skills/prompts from disk
-  /share             - Upload session HTML to a secret GitHub gist and show URL
-  /exit, /quit, /q   - Exit Pi
-
-  Tips:
-    • Use ↑/↓ arrows to navigate input history
-    • Use Ctrl+L to open model selector
-    • Use Ctrl+P to cycle scoped models
-    • Use Shift+Enter (Ctrl+Enter on Windows) to insert a newline
-    • Use PageUp/PageDown to scroll conversation history
-    • Use Escape to cancel current input
-    • Use /skill:name or /template to expand resources"
     }
 }
 
@@ -4164,240 +3384,6 @@ fn collect_tree_branch_entries(
     (entries_rev, boundary)
 }
 
-/// State of the agent processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentState {
-    /// Ready for input.
-    Idle,
-    /// Processing user request.
-    Processing,
-    /// Executing a tool.
-    ToolRunning,
-}
-
-/// Progress metrics emitted by long-running tools (e.g. bash).
-#[derive(Debug, Clone)]
-struct ToolProgress {
-    started_at: std::time::Instant,
-    elapsed_ms: u128,
-    line_count: usize,
-    byte_count: usize,
-    timeout_ms: Option<u64>,
-}
-
-impl ToolProgress {
-    fn new() -> Self {
-        Self {
-            started_at: std::time::Instant::now(),
-            elapsed_ms: 0,
-            line_count: 0,
-            byte_count: 0,
-            timeout_ms: None,
-        }
-    }
-
-    /// Update from a `details.progress` JSON object emitted by tool callbacks.
-    fn update_from_details(&mut self, details: Option<&serde_json::Value>) {
-        // Always update elapsed from wall clock as fallback.
-        self.elapsed_ms = self.started_at.elapsed().as_millis();
-
-        let Some(details) = details else {
-            return;
-        };
-        if let Some(progress) = details.get("progress") {
-            if let Some(v) = progress
-                .get("elapsedMs")
-                .and_then(serde_json::Value::as_u64)
-            {
-                self.elapsed_ms = u128::from(v);
-            }
-            if let Some(v) = progress
-                .get("lineCount")
-                .and_then(serde_json::Value::as_u64)
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let count = v as usize;
-                self.line_count = count;
-            }
-            if let Some(v) = progress
-                .get("byteCount")
-                .and_then(serde_json::Value::as_u64)
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let count = v as usize;
-                self.byte_count = count;
-            }
-            if let Some(v) = progress
-                .get("timeoutMs")
-                .and_then(serde_json::Value::as_u64)
-            {
-                self.timeout_ms = Some(v);
-            }
-        }
-    }
-
-    /// Format a compact status string like `"Running bash · 3s · 42 lines"`.
-    fn format_display(&self, tool_name: &str) -> String {
-        let secs = self.elapsed_ms / 1000;
-        let mut parts = vec![format!("Running {tool_name}"), format!("{secs}s")];
-        if self.line_count > 0 {
-            parts.push(format!("{} lines", format_count(self.line_count)));
-        } else if self.byte_count > 0 {
-            parts.push(format!("{} bytes", format_count(self.byte_count)));
-        }
-        if let Some(timeout_ms) = self.timeout_ms {
-            let timeout_s = timeout_ms / 1000;
-            if timeout_s > 0 {
-                parts.push(format!("timeout {timeout_s}s"));
-            }
-        }
-        parts.join(" \u{2022} ")
-    }
-}
-
-/// Format a count with K/M suffix for compact display.
-#[allow(clippy::cast_precision_loss)]
-fn format_count(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-/// Input mode for the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputMode {
-    /// Single-line input mode (default).
-    SingleLine,
-    /// Multi-line input mode (activated with Shift+Enter or \).
-    MultiLine,
-}
-
-#[derive(Debug, Clone)]
-pub enum PendingInput {
-    Text(String),
-    Content(Vec<ContentBlock>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueuedMessageKind {
-    Steering,
-    FollowUp,
-}
-
-#[derive(Debug)]
-struct InteractiveMessageQueue {
-    steering: VecDeque<String>,
-    follow_up: VecDeque<String>,
-    steering_mode: QueueMode,
-    follow_up_mode: QueueMode,
-}
-
-impl InteractiveMessageQueue {
-    const fn new(steering_mode: QueueMode, follow_up_mode: QueueMode) -> Self {
-        Self {
-            steering: VecDeque::new(),
-            follow_up: VecDeque::new(),
-            steering_mode,
-            follow_up_mode,
-        }
-    }
-
-    const fn set_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
-        self.steering_mode = steering_mode;
-        self.follow_up_mode = follow_up_mode;
-    }
-
-    fn push_steering(&mut self, text: String) {
-        self.steering.push_back(text);
-    }
-
-    fn push_follow_up(&mut self, text: String) {
-        self.follow_up.push_back(text);
-    }
-
-    fn pop_steering(&mut self) -> Vec<String> {
-        self.pop_kind(QueuedMessageKind::Steering)
-    }
-
-    fn pop_follow_up(&mut self) -> Vec<String> {
-        self.pop_kind(QueuedMessageKind::FollowUp)
-    }
-
-    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<String> {
-        let (queue, mode) = match kind {
-            QueuedMessageKind::Steering => (&mut self.steering, self.steering_mode),
-            QueuedMessageKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
-        };
-        match mode {
-            QueueMode::All => queue.drain(..).collect(),
-            QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
-        }
-    }
-
-    fn clear_all(&mut self) -> (Vec<String>, Vec<String>) {
-        let steering = self.steering.drain(..).collect();
-        let follow_up = self.follow_up.drain(..).collect();
-        (steering, follow_up)
-    }
-}
-
-#[derive(Debug)]
-struct InjectedMessageQueue {
-    steering: VecDeque<ModelMessage>,
-    follow_up: VecDeque<ModelMessage>,
-    steering_mode: QueueMode,
-    follow_up_mode: QueueMode,
-}
-
-impl InjectedMessageQueue {
-    const fn new(steering_mode: QueueMode, follow_up_mode: QueueMode) -> Self {
-        Self {
-            steering: VecDeque::new(),
-            follow_up: VecDeque::new(),
-            steering_mode,
-            follow_up_mode,
-        }
-    }
-
-    fn push_kind(&mut self, kind: QueuedMessageKind, message: ModelMessage) {
-        match kind {
-            QueuedMessageKind::Steering => self.steering.push_back(message),
-            QueuedMessageKind::FollowUp => self.follow_up.push_back(message),
-        }
-    }
-
-    fn push_steering(&mut self, message: ModelMessage) {
-        self.push_kind(QueuedMessageKind::Steering, message);
-    }
-
-    fn push_follow_up(&mut self, message: ModelMessage) {
-        self.push_kind(QueuedMessageKind::FollowUp, message);
-    }
-
-    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<ModelMessage> {
-        let (queue, mode) = match kind {
-            QueuedMessageKind::Steering => (&mut self.steering, self.steering_mode),
-            QueuedMessageKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
-        };
-        match mode {
-            QueueMode::All => queue.drain(..).collect(),
-            QueueMode::OneAtATime => queue.pop_front().into_iter().collect(),
-        }
-    }
-
-    fn pop_steering(&mut self) -> Vec<ModelMessage> {
-        self.pop_kind(QueuedMessageKind::Steering)
-    }
-
-    fn pop_follow_up(&mut self) -> Vec<ModelMessage> {
-        self.pop_kind(QueuedMessageKind::FollowUp)
-    }
-}
-
 #[derive(Clone)]
 struct InteractiveExtensionHostActions {
     session: Arc<Mutex<Session>>,
@@ -4513,464 +3499,6 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
     }
 }
 
-#[derive(Debug, Clone)]
-struct HistoryItem {
-    value: String,
-}
-
-impl ListItem for HistoryItem {
-    fn filter_value(&self) -> &str {
-        &self.value
-    }
-}
-
-#[derive(Clone)]
-struct HistoryList {
-    // We never render the list UI; we use it as a battle-tested cursor+navigation model.
-    // The final item is always a sentinel representing "empty input".
-    list: List<HistoryItem, DefaultDelegate>,
-}
-
-impl HistoryList {
-    fn new() -> Self {
-        let mut list = List::new(
-            vec![HistoryItem {
-                value: String::new(),
-            }],
-            DefaultDelegate::new(),
-            0,
-            0,
-        );
-
-        // Keep behavior minimal/predictable for now; this is used as an index model.
-        list.filtering_enabled = false;
-        list.infinite_scrolling = false;
-
-        // Start at the "empty input" sentinel.
-        list.select(0);
-
-        Self { list }
-    }
-
-    fn entries(&self) -> &[HistoryItem] {
-        let items = self.list.items();
-        if items.len() <= 1 {
-            return &[];
-        }
-        &items[..items.len().saturating_sub(1)]
-    }
-
-    fn has_entries(&self) -> bool {
-        !self.entries().is_empty()
-    }
-
-    fn cursor_is_empty(&self) -> bool {
-        // Sentinel is always the final item.
-        self.list.index() + 1 == self.list.items().len()
-    }
-
-    fn reset_cursor(&mut self) {
-        let last = self.list.items().len().saturating_sub(1);
-        self.list.select(last);
-    }
-
-    fn push(&mut self, value: String) {
-        let mut items = self.entries().to_vec();
-        items.push(HistoryItem { value });
-        items.push(HistoryItem {
-            value: String::new(),
-        });
-
-        self.list.set_items(items);
-        self.reset_cursor();
-    }
-
-    fn cursor_up(&mut self) {
-        self.list.cursor_up();
-    }
-
-    fn cursor_down(&mut self) {
-        self.list.cursor_down();
-    }
-
-    fn selected_value(&self) -> &str {
-        self.list
-            .selected_item()
-            .map_or("", |item| item.value.as_str())
-    }
-}
-
-// ============================================================================
-// Frame Timing Telemetry (PERF-3)
-// ============================================================================
-
-/// Safely convert `Duration::as_micros()` (u128) to u64 with saturation.
-#[inline]
-#[allow(clippy::cast_possible_truncation)]
-fn micros_as_u64(micros: u128) -> u64 {
-    micros.min(u128::from(u64::MAX)) as u64
-}
-
-/// Microsecond-precision frame timing stats for TUI performance measurement.
-///
-/// Uses interior mutability (`RefCell`/`Cell`) because `view(&self)` cannot
-/// take `&mut self` (the `bubbletea::Model` trait requires `&self` for `view`).
-/// This is safe because the TUI event loop is single-threaded.
-///
-/// Gated behind `PI_PERF_TELEMETRY=1` environment variable.  When disabled,
-/// no `Instant::now()` calls are made — zero runtime overhead.
-pub struct FrameTimingStats {
-    frame_times_us: std::cell::RefCell<VecDeque<u64>>,
-    content_build_times_us: std::cell::RefCell<VecDeque<u64>>,
-    viewport_sync_times_us: std::cell::RefCell<VecDeque<u64>>,
-    update_times_us: VecDeque<u64>,
-    total_frames: std::cell::Cell<u64>,
-    budget_exceeded_count: std::cell::Cell<u64>,
-    enabled: bool,
-}
-
-const FRAME_TIMING_WINDOW: usize = 60;
-const FRAME_BUDGET_US: u64 = 16_667;
-
-impl FrameTimingStats {
-    fn new() -> Self {
-        let enabled =
-            std::env::var_os("PI_PERF_TELEMETRY").is_some_and(|v| v == "1" || v == "true");
-        Self {
-            frame_times_us: std::cell::RefCell::new(VecDeque::with_capacity(FRAME_TIMING_WINDOW)),
-            content_build_times_us: std::cell::RefCell::new(VecDeque::with_capacity(
-                FRAME_TIMING_WINDOW,
-            )),
-            viewport_sync_times_us: std::cell::RefCell::new(VecDeque::with_capacity(
-                FRAME_TIMING_WINDOW,
-            )),
-            update_times_us: VecDeque::with_capacity(FRAME_TIMING_WINDOW),
-            total_frames: std::cell::Cell::new(0),
-            budget_exceeded_count: std::cell::Cell::new(0),
-            enabled,
-        }
-    }
-
-    fn record_frame(&self, elapsed_us: u64) {
-        if !self.enabled {
-            return;
-        }
-        let mut times = self.frame_times_us.borrow_mut();
-        if times.len() >= FRAME_TIMING_WINDOW {
-            times.pop_front();
-        }
-        times.push_back(elapsed_us);
-        let total = self.total_frames.get() + 1;
-        self.total_frames.set(total);
-        if elapsed_us > FRAME_BUDGET_US {
-            self.budget_exceeded_count
-                .set(self.budget_exceeded_count.get() + 1);
-        }
-        if total % FRAME_TIMING_WINDOW as u64 == 0 {
-            drop(times);
-            self.emit_stats();
-        }
-    }
-
-    fn record_content_build(&self, elapsed_us: u64) {
-        if !self.enabled {
-            return;
-        }
-        let mut times = self.content_build_times_us.borrow_mut();
-        if times.len() >= FRAME_TIMING_WINDOW {
-            times.pop_front();
-        }
-        times.push_back(elapsed_us);
-    }
-
-    fn record_viewport_sync(&self, elapsed_us: u64) {
-        if !self.enabled {
-            return;
-        }
-        let mut times = self.viewport_sync_times_us.borrow_mut();
-        if times.len() >= FRAME_TIMING_WINDOW {
-            times.pop_front();
-        }
-        times.push_back(elapsed_us);
-    }
-
-    fn record_update(&mut self, elapsed_us: u64) {
-        if !self.enabled {
-            return;
-        }
-        if self.update_times_us.len() >= FRAME_TIMING_WINDOW {
-            self.update_times_us.pop_front();
-        }
-        self.update_times_us.push_back(elapsed_us);
-    }
-
-    fn percentiles(times: &VecDeque<u64>) -> (u64, u64, u64) {
-        if times.is_empty() {
-            return (0, 0, 0);
-        }
-        let mut sorted: Vec<u64> = times.iter().copied().collect();
-        sorted.sort_unstable();
-        let len = sorted.len();
-        let p50 = sorted[len / 2];
-        let p95 = sorted[(len * 95 / 100).min(len - 1)];
-        let p99 = sorted[(len * 99 / 100).min(len - 1)];
-        (p50, p95, p99)
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn emit_stats(&self) {
-        let frame = Self::percentiles(&self.frame_times_us.borrow());
-        let content = Self::percentiles(&self.content_build_times_us.borrow());
-        let viewport = Self::percentiles(&self.viewport_sync_times_us.borrow());
-        let total = self.total_frames.get();
-        let exceeded = self.budget_exceeded_count.get();
-        let window = self.frame_times_us.borrow().len();
-        let recent_exceeded = self
-            .frame_times_us
-            .borrow()
-            .iter()
-            .filter(|&&t| t > FRAME_BUDGET_US)
-            .count();
-        tracing::debug!(
-            "[perf] frame p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
-             content p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
-             viewport p50={:.1}ms p95={:.1}ms p99={:.1}ms | \
-             budget_exceeded={recent_exceeded}/{window} (total={exceeded}/{total})",
-            frame.0 as f64 / 1000.0,
-            frame.1 as f64 / 1000.0,
-            frame.2 as f64 / 1000.0,
-            content.0 as f64 / 1000.0,
-            content.1 as f64 / 1000.0,
-            content.2 as f64 / 1000.0,
-            viewport.0 as f64 / 1000.0,
-            viewport.1 as f64 / 1000.0,
-            viewport.2 as f64 / 1000.0,
-        );
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn summary(&self) -> String {
-        if !self.enabled {
-            return String::from("Frame telemetry disabled (set PI_PERF_TELEMETRY=1 to enable)");
-        }
-        let frame = Self::percentiles(&self.frame_times_us.borrow());
-        let content = Self::percentiles(&self.content_build_times_us.borrow());
-        let viewport = Self::percentiles(&self.viewport_sync_times_us.borrow());
-        let update = Self::percentiles(&self.update_times_us);
-        let total = self.total_frames.get();
-        let exceeded = self.budget_exceeded_count.get();
-        format!(
-            "Frame timing (last {FRAME_TIMING_WINDOW} frames):\n  \
-             view()   p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
-             content  p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
-             viewport p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
-             update() p50={:.1}ms  p95={:.1}ms  p99={:.1}ms\n  \
-             Budget exceeded: {exceeded}/{total} frames (>{:.1}ms)",
-            frame.0 as f64 / 1000.0,
-            frame.1 as f64 / 1000.0,
-            frame.2 as f64 / 1000.0,
-            content.0 as f64 / 1000.0,
-            content.1 as f64 / 1000.0,
-            content.2 as f64 / 1000.0,
-            viewport.0 as f64 / 1000.0,
-            viewport.1 as f64 / 1000.0,
-            viewport.2 as f64 / 1000.0,
-            update.0 as f64 / 1000.0,
-            update.1 as f64 / 1000.0,
-            update.2 as f64 / 1000.0,
-            FRAME_BUDGET_US as f64 / 1000.0,
-        )
-    }
-}
-
-// ============================================================================
-// Memory pressure monitoring (PERF-6)
-// ============================================================================
-
-/// Memory pressure level based on RSS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryLevel {
-    /// RSS < 50MB — no action needed.
-    Normal,
-    /// 50MB <= RSS < 100MB — log warning, show in /session.
-    Warning,
-    /// 100MB <= RSS < 200MB — progressive tool output collapse.
-    Pressure,
-    /// RSS >= 200MB — truncate old messages, force degraded rendering.
-    Critical,
-}
-
-impl MemoryLevel {
-    const fn from_rss_bytes(rss: usize) -> Self {
-        const MB: usize = 1_000_000;
-        if rss >= 200 * MB {
-            Self::Critical
-        } else if rss >= 100 * MB {
-            Self::Pressure
-        } else if rss >= 50 * MB {
-            Self::Warning
-        } else {
-            Self::Normal
-        }
-    }
-}
-
-/// Abstraction for reading RSS, injectable for testing.
-trait RssReader: Send {
-    fn read_rss_bytes(&self) -> Option<usize>;
-}
-
-/// Reads RSS from /proc/self/statm on Linux.
-struct ProcSelfRssReader;
-
-/// Page size in bytes. Hardcoded to 4096 (standard for x86_64/aarch64 Linux)
-/// to avoid unsafe libc::sysconf — crate uses `#![forbid(unsafe_code)]`.
-const PROC_PAGE_SIZE: usize = 4096;
-
-impl RssReader for ProcSelfRssReader {
-    fn read_rss_bytes(&self) -> Option<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            // /proc/self/statm: "total_pages resident_pages shared_pages ..."
-            let content = std::fs::read_to_string("/proc/self/statm").ok()?;
-            let resident_pages: usize = content.split_whitespace().nth(1)?.parse().ok()?;
-            Some(resident_pages * PROC_PAGE_SIZE)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    }
-}
-
-/// Hysteresis threshold: stop collapsing when RSS drops below this.
-const MEMORY_RELIEF_BYTES: usize = 80_000_000;
-
-/// Maximum messages retained when Critical truncation triggers.
-const CRITICAL_KEEP_MESSAGES: usize = 30;
-
-/// Memory monitor that drives progressive conversation management.
-pub struct MemoryMonitor {
-    reader: Box<dyn RssReader>,
-    last_sample: std::time::Instant,
-    sample_interval: std::time::Duration,
-    current_rss_bytes: usize,
-    peak_rss_bytes: usize,
-    level: MemoryLevel,
-    /// Index into messages vec: next tool output to collapse.
-    next_collapse_index: usize,
-    /// Whether progressive collapse is in progress.
-    collapsing: bool,
-    /// When the last collapse action was performed (rate-limit to 1/sec).
-    last_collapse: std::time::Instant,
-    /// Whether Critical truncation has already been applied this session.
-    truncated: bool,
-}
-
-impl MemoryMonitor {
-    fn new(reader: Box<dyn RssReader>) -> Self {
-        let now = std::time::Instant::now();
-        Self {
-            reader,
-            last_sample: now,
-            sample_interval: std::time::Duration::from_secs(5),
-            current_rss_bytes: 0,
-            peak_rss_bytes: 0,
-            level: MemoryLevel::Normal,
-            next_collapse_index: 0,
-            collapsing: false,
-            last_collapse: now,
-            truncated: false,
-        }
-    }
-
-    fn new_default() -> Self {
-        Self::new(Box::new(ProcSelfRssReader))
-    }
-
-    /// Sample RSS if the interval has elapsed. Returns true if level changed.
-    fn maybe_sample(&mut self) -> bool {
-        if self.last_sample.elapsed() < self.sample_interval {
-            return false;
-        }
-        self.last_sample = std::time::Instant::now();
-        let Some(rss) = self.reader.read_rss_bytes() else {
-            return false;
-        };
-        self.current_rss_bytes = rss;
-        if rss > self.peak_rss_bytes {
-            self.peak_rss_bytes = rss;
-        }
-        let new_level = MemoryLevel::from_rss_bytes(rss);
-        let changed = new_level != self.level;
-        if changed {
-            match new_level {
-                MemoryLevel::Warning => {
-                    tracing::warn!(
-                        rss_mb = rss / 1_000_000,
-                        "Memory pressure: Warning level reached"
-                    );
-                }
-                MemoryLevel::Pressure => {
-                    tracing::warn!(
-                        rss_mb = rss / 1_000_000,
-                        "Memory pressure: Pressure level — starting progressive collapse"
-                    );
-                    self.collapsing = true;
-                }
-                MemoryLevel::Critical => {
-                    tracing::error!(
-                        rss_mb = rss / 1_000_000,
-                        "Memory pressure: Critical level — truncating conversation"
-                    );
-                }
-                MemoryLevel::Normal => {
-                    tracing::info!(
-                        rss_mb = rss / 1_000_000,
-                        "Memory pressure relieved — back to Normal"
-                    );
-                    self.collapsing = false;
-                }
-            }
-            self.level = new_level;
-        }
-        changed
-    }
-
-    /// Re-sample RSS immediately (used after collapse actions).
-    fn resample_now(&mut self) {
-        if let Some(rss) = self.reader.read_rss_bytes() {
-            self.current_rss_bytes = rss;
-            if rss > self.peak_rss_bytes {
-                self.peak_rss_bytes = rss;
-            }
-            self.level = MemoryLevel::from_rss_bytes(rss);
-            if rss < MEMORY_RELIEF_BYTES {
-                self.collapsing = false;
-            }
-        }
-    }
-
-    /// Format memory stats for /session display.
-    #[allow(clippy::cast_precision_loss)]
-    fn summary(&self) -> String {
-        let current_mb = self.current_rss_bytes as f64 / 1_000_000.0;
-        let peak_mb = self.peak_rss_bytes as f64 / 1_000_000.0;
-        let level_str = match self.level {
-            MemoryLevel::Normal => "Normal",
-            MemoryLevel::Warning => "Warning",
-            MemoryLevel::Pressure => "Pressure (collapsing old outputs...)",
-            MemoryLevel::Critical => "CRITICAL",
-        };
-        format!("Memory: {current_mb:.1}MB (peak {peak_mb:.1}MB) [{level_str}]")
-    }
-
-    /// Whether Critical-level rendering degradation should be forced.
-    const fn should_force_degraded(&self) -> bool {
-        matches!(self.level, MemoryLevel::Critical)
-    }
-}
-
 /// The main interactive TUI application model.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
@@ -4983,7 +3511,7 @@ pub struct PiApp {
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
 
     // Display state - viewport for scrollable conversation
-    conversation_viewport: Viewport,
+    pub conversation_viewport: Viewport,
     /// When true, the viewport auto-scrolls to the bottom on new content.
     /// Set to false when the user manually scrolls up; re-enabled when they
     /// scroll back to the bottom or a new user message is submitted.
@@ -5612,21 +4140,6 @@ impl SessionPickerOverlay {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingLoginKind {
-    OAuth,
-    ApiKey,
-}
-
-#[derive(Debug, Clone)]
-struct PendingOAuth {
-    provider: String,
-    kind: PendingLoginKind,
-    verifier: String,
-    /// OAuth config for extension-registered providers (None for built-in like anthropic).
-    oauth_config: Option<OAuthConfig>,
-}
-
 struct InteractiveExtensionSession {
     session: Arc<Mutex<Session>>,
     model_entry: Arc<StdMutex<ModelEntry>>,
@@ -5845,53 +4358,6 @@ impl ExtensionSession for InteractiveExtensionSession {
         }
         Ok(())
     }
-}
-
-/// Tool output line count above which blocks auto-collapse.
-const TOOL_AUTO_COLLAPSE_THRESHOLD: usize = 20;
-/// Number of preview lines to show when a tool block is collapsed.
-const TOOL_COLLAPSE_PREVIEW_LINES: usize = 5;
-
-/// A message in the conversation history.
-#[derive(Debug, Clone)]
-pub struct ConversationMessage {
-    pub role: MessageRole,
-    pub content: String,
-    pub thinking: Option<String>,
-    /// Per-message collapse state for tool outputs.
-    pub collapsed: bool,
-}
-
-impl ConversationMessage {
-    /// Create a non-tool message (never collapsed).
-    const fn new(role: MessageRole, content: String, thinking: Option<String>) -> Self {
-        Self {
-            role,
-            content,
-            thinking,
-            collapsed: false,
-        }
-    }
-
-    /// Create a tool output message with auto-collapse for large outputs.
-    fn tool(content: String) -> Self {
-        let line_count = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
-        Self {
-            role: MessageRole::Tool,
-            content,
-            thinking: None,
-            collapsed: line_count > TOOL_AUTO_COLLAPSE_THRESHOLD,
-        }
-    }
-}
-
-/// Role of a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageRole {
-    User,
-    Assistant,
-    Tool,
-    System,
 }
 
 impl PiApp {
@@ -6124,15 +4590,48 @@ impl PiApp {
         Arc::clone(&self.session)
     }
 
-    /// Run memory-pressure mitigation actions sampled by `MemoryMonitor`.
-    ///
-    /// PERF-6 behavior is being staged incrementally; keep this as a no-op
-    /// until collapse/truncation actions are finalized.
-    fn run_memory_pressure_actions(&mut self) {}
-
     /// Get the current status message (for testing).
     pub fn status_message(&self) -> Option<&str> {
         self.status_message.as_deref()
+    }
+
+    /// Snapshot the in-memory conversation buffer (integration test helper).
+    pub fn conversation_messages_for_test(&self) -> &[ConversationMessage] {
+        &self.messages
+    }
+
+    /// Return the memory summary string (integration test helper).
+    pub fn memory_summary_for_test(&self) -> String {
+        self.memory_monitor.summary()
+    }
+
+    /// Install a deterministic RSS sampler for integration tests.
+    ///
+    /// This replaces `/proc/self` RSS sampling with a caller-provided function
+    /// and enables immediate sampling cadence (`sample_interval = 0`).
+    pub fn install_memory_rss_reader_for_test(
+        &mut self,
+        read_fn: Box<dyn Fn() -> Option<usize> + Send>,
+    ) {
+        let mut monitor = MemoryMonitor::new_with_reader_fn(read_fn);
+        monitor.sample_interval = std::time::Duration::ZERO;
+        monitor.last_collapse = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        self.memory_monitor = monitor;
+    }
+
+    /// Force a memory monitor sample + action pass (integration test helper).
+    pub fn force_memory_cycle_for_test(&mut self) {
+        self.memory_monitor.maybe_sample();
+        self.run_memory_pressure_actions();
+    }
+
+    /// Force progressive-collapse timing eligibility (integration test helper).
+    pub fn force_memory_collapse_tick_for_test(&mut self) {
+        self.memory_monitor.last_collapse = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
     }
 
     /// Get a reference to the model selector overlay (for testing).
@@ -7671,7 +6170,7 @@ impl PiApp {
 
     /// Build the conversation content string for the viewport.
     #[allow(clippy::too_many_lines)]
-    fn build_conversation_content(&self) -> String {
+    pub fn build_conversation_content(&self) -> String {
         let mut output = String::new();
 
         for msg in &self.messages {
@@ -9991,11 +8490,30 @@ impl PiApp {
                     return None;
                 }
 
-                let requested_provider = if args.is_empty() {
-                    self.model_entry.model.provider.clone()
-                } else {
-                    args.split_whitespace().next().unwrap_or(args).to_string()
-                };
+                let args = args.trim();
+                if args.is_empty() {
+                    let auth_path = crate::config::Config::auth_path();
+                    match crate::auth::AuthStorage::load(auth_path) {
+                        Ok(auth) => {
+                            let listing =
+                                format_login_provider_listing(&auth, &self.available_models);
+                            self.messages.push(ConversationMessage {
+                                role: MessageRole::System,
+                                content: listing,
+                                thinking: None,
+                                collapsed: false,
+                            });
+                            self.scroll_to_last_match("Available login providers:");
+                        }
+                        Err(err) => {
+                            self.status_message =
+                                Some(format!("Unable to load auth status: {err}"));
+                        }
+                    }
+                    return None;
+                }
+
+                let requested_provider = args.split_whitespace().next().unwrap_or(args).to_string();
                 let provider = normalize_auth_provider_input(&requested_provider);
 
                 if let Some(prompt) = api_key_login_prompt(&provider) {
@@ -10346,11 +8864,26 @@ impl PiApp {
                 }
 
                 if value.eq_ignore_ascii_case("clear") {
+                    let previous_patterns = self
+                        .config
+                        .enabled_models
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .to_vec();
                     self.config.enabled_models = Some(Vec::new());
                     self.model_scope.clear();
 
                     let global_dir = Config::global_dir();
                     let patch = json!({ "enabled_models": [] });
+                    let cleared_msg = if previous_patterns.is_empty() {
+                        "Scoped models cleared (was: all models)".to_string()
+                    } else {
+                        format!(
+                            "Cleared {} pattern(s) (was: {})",
+                            previous_patterns.len(),
+                            previous_patterns.join(", ")
+                        )
+                    };
                     if let Err(err) = Config::patch_settings_with_roots(
                         SettingsScope::Project,
                         &global_dir,
@@ -10358,10 +8891,9 @@ impl PiApp {
                         patch,
                     ) {
                         tracing::warn!("Failed to persist enabled_models: {err}");
-                        self.status_message =
-                            Some(format!("Scoped models cleared (not saved: {err})"));
+                        self.status_message = Some(format!("{cleared_msg} (not saved: {err})"));
                     } else {
-                        self.status_message = Some("Scoped models cleared".to_string());
+                        self.status_message = Some(cleared_msg);
                     }
                     return None;
                 }
@@ -10377,7 +8909,8 @@ impl PiApp {
                 {
                     Ok(resolved) => resolved,
                     Err(err) => {
-                        self.status_message = Some(err);
+                        self.status_message =
+                            Some(format!("{err}\n  Example: /scoped-models gpt-4*,claude-3*"));
                         return None;
                     }
                 };
@@ -10386,11 +8919,49 @@ impl PiApp {
                 self.config.enabled_models = Some(patterns.clone());
 
                 let match_count = self.model_scope.len();
-                let status = if match_count == 0 {
-                    "Scoped models updated: 0 matched; cycling will use all available models"
-                        .to_string()
+
+                // Build a preview of matched models for the conversation pane.
+                let mut preview = String::new();
+                if match_count == 0 {
+                    let _ = writeln!(
+                        preview,
+                        "Warning: No models matched patterns: {}",
+                        patterns.join(", ")
+                    );
+                    let _ = writeln!(preview, "Ctrl+P cycling will use all available models.");
                 } else {
-                    format!("Scoped models updated: {match_count} matched")
+                    let _ = writeln!(preview, "Matching {match_count} model(s):");
+                    let mut model_names: Vec<String> = self
+                        .model_scope
+                        .iter()
+                        .map(|e| format!("{}/{}", e.model.provider, e.model.id))
+                        .collect();
+                    model_names.sort_by_key(|s| s.to_ascii_lowercase());
+                    model_names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                    for name in &model_names {
+                        let _ = writeln!(preview, "  {name}");
+                    }
+                }
+                let _ = writeln!(
+                    preview,
+                    "Patterns saved. Press Ctrl+P to cycle through matched models."
+                );
+
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: preview,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+
+                let status = if match_count == 0 {
+                    format!(
+                        "Scoped models: 0 matched for {}; cycling all available",
+                        patterns.join(", ")
+                    )
+                } else {
+                    format!("Scoped models: {match_count} matched")
                 };
                 let global_dir = Config::global_dir();
                 let patch = json!({ "enabled_models": patterns });
@@ -11308,6 +9879,8 @@ impl PiApp {
                     return None;
                 }
 
+                let is_public = parse_share_is_public(args);
+
                 self.agent_state = AgentState::Processing;
                 self.status_message = Some("Sharing session... (Esc to cancel)".to_string());
 
@@ -11333,14 +9906,18 @@ impl PiApp {
                             if !output.status.success() {
                                 let details = format_command_output(&output);
                                 let message = format!(
-                                    "`gh` is not authenticated.\nRun `gh auth login` and retry.\n\n{details}"
+                                    "`gh` is not authenticated.\n\
+                                     Run `gh auth login` to authenticate, then retry `/share`.\n\n\
+                                     {details}"
                                 );
                                 let _ = event_tx.try_send(PiMsg::AgentError(message));
                                 return;
                             }
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                            let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();
+                            let message = "GitHub CLI `gh` not found.\n\
+                                 Install it from https://cli.github.com, then run `gh auth login`."
+                                .to_string();
                             let _ = event_tx.try_send(PiMsg::AgentError(message));
                             return;
                         }
@@ -11362,8 +9939,8 @@ impl PiApp {
                     }
 
                     let cx = Cx::for_request();
-                    let html = match session.lock(&cx).await {
-                        Ok(guard) => guard.to_html(),
+                    let (html, session_name) = match session.lock(&cx).await {
+                        Ok(guard) => (guard.to_html(), guard.get_name()),
                         Err(err) => {
                             let _ = event_tx.try_send(PiMsg::AgentError(format!(
                                 "Failed to lock session: {err}"
@@ -11376,6 +9953,8 @@ impl PiApp {
                         let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
                         return;
                     }
+
+                    let gist_desc = share_gist_description(session_name.as_deref());
 
                     let temp_file = match tempfile::Builder::new()
                         .prefix("pi-share-")
@@ -11401,28 +9980,31 @@ impl PiApp {
                     let gist_args = vec![
                         OsString::from("gist"),
                         OsString::from("create"),
-                        OsString::from("--public=false"),
+                        OsString::from(format!("--public={is_public}")),
+                        OsString::from("--desc"),
+                        OsString::from(&gist_desc),
                         temp_path.as_os_str().to_os_string(),
                     ];
                     let output = match run_command_output(&gh, &gist_args, &cwd, &abort_signal) {
-                            Ok(output) => output,
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                                let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();
-                                let _ = event_tx.try_send(PiMsg::AgentError(message));
-                                return;
-                            }
-                            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                                let _ = event_tx
-                                    .try_send(PiMsg::System("Share cancelled".to_string()));
-                                return;
-                            }
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to run `gh gist create`: {err}"
-                                )));
-                                return;
-                            }
-                        };
+                        Ok(output) => output,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            let message = "GitHub CLI `gh` not found.\n\
+                                 Install it from https://cli.github.com, then run `gh auth login`."
+                                .to_string();
+                            let _ = event_tx.try_send(PiMsg::AgentError(message));
+                            return;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                            let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                "Failed to run `gh gist create`: {err}"
+                            )));
+                            return;
+                        }
+                    };
 
                     if !output.status.success() {
                         let details = format_command_output(&output);
@@ -11444,7 +10026,17 @@ impl PiApp {
                     let share_url = crate::session::get_share_viewer_url(&gist_id);
                     drop(temp_path);
 
-                    let message = format!("Share URL: {share_url}\nGist: {gist_url}");
+                    // Copy viewer URL to clipboard (best-effort).
+                    #[cfg(feature = "clipboard")]
+                    {
+                        let _ = ClipboardProvider::new().and_then(|mut ctx: ClipboardContext| {
+                            ctx.set_contents(share_url.clone())
+                        });
+                    }
+
+                    let privacy = if is_public { "public" } else { "private" };
+                    let message =
+                        format!("Created {privacy} gist\nShare URL: {share_url}\nGist: {gist_url}");
                     let _ = event_tx.try_send(PiMsg::System(message));
                 });
                 None
@@ -11453,121 +10045,10 @@ impl PiApp {
     }
 }
 
-/// Ensure the view output fits within `term_height` terminal rows.
-///
-/// The output must contain at most `term_height - 1` newline characters so
-/// that the cursor never advances past the last visible row, which would
-/// trigger terminal scrolling in the alternate-screen buffer.
-fn clamp_to_terminal_height(mut output: String, term_height: usize) -> String {
-    if term_height == 0 {
-        output.clear();
-        return output;
-    }
-    let max_newlines = term_height.saturating_sub(1);
-
-    // Fast path: count newlines and bail if we fit.
-    let newline_count = memchr::memchr_iter(b'\n', output.as_bytes()).count();
-    if newline_count <= max_newlines {
-        return output;
-    }
-
-    // Truncate: keep only the first `max_newlines` newlines.
-    let mut seen = 0usize;
-    let cut = output
-        .bytes()
-        .position(|b| {
-            if b == b'\n' {
-                seen += 1;
-                seen > max_newlines
-            } else {
-                false
-            }
-        })
-        .unwrap_or(output.len());
-    output.truncate(cut);
-    output
-}
-
-fn normalize_raw_terminal_newlines(input: String) -> String {
-    if !input.contains('\n') {
-        return input;
-    }
-
-    let mut out = String::with_capacity(input.len() + 16);
-    let mut prev_was_cr = false;
-    for ch in input.chars() {
-        if ch == '\n' {
-            if !prev_was_cr {
-                out.push('\r');
-            }
-            out.push('\n');
-            prev_was_cr = false;
-        } else {
-            prev_was_cr = ch == '\r';
-            out.push(ch);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn normalize_raw_terminal_newlines_inserts_crlf() {
-        let normalized = normalize_raw_terminal_newlines("hello\nworld\n".to_string());
-        assert_eq!(normalized, "hello\r\nworld\r\n");
-    }
-
-    #[test]
-    fn normalize_raw_terminal_newlines_preserves_existing_crlf() {
-        let normalized = normalize_raw_terminal_newlines("hello\r\nworld\r\n".to_string());
-        assert_eq!(normalized, "hello\r\nworld\r\n");
-    }
-
-    #[test]
-    fn normalize_raw_terminal_newlines_handles_mixed_newlines() {
-        let normalized = normalize_raw_terminal_newlines("a\r\nb\nc\r\nd\n".to_string());
-        assert_eq!(normalized, "a\r\nb\r\nc\r\nd\r\n");
-    }
-
-    #[test]
-    fn clamp_to_terminal_height_noop_when_fits() {
-        let input = "line1\nline2\nline3".to_string();
-        // 2 newlines → 3 rows; term_height=4 allows 3 newlines → fits.
-        assert_eq!(clamp_to_terminal_height(input.clone(), 4), input);
-    }
-
-    #[test]
-    fn clamp_to_terminal_height_truncates_excess() {
-        let input = "a\nb\nc\nd\ne\n".to_string(); // 5 newlines = 6 rows
-        // term_height=4 → max 3 newlines → keeps "a\nb\nc\nd"
-        let clamped = clamp_to_terminal_height(input, 4);
-        assert_eq!(clamped, "a\nb\nc\nd");
-    }
-
-    #[test]
-    fn clamp_to_terminal_height_zero_height() {
-        let clamped = clamp_to_terminal_height("hello\nworld".to_string(), 0);
-        assert_eq!(clamped, "");
-    }
-
-    #[test]
-    fn clamp_to_terminal_height_exact_fit() {
-        // term_height=3 → max 2 newlines.  Input has exactly 2 → fits.
-        let input = "a\nb\nc".to_string();
-        assert_eq!(clamp_to_terminal_height(input.clone(), 3), input);
-    }
-
-    #[test]
-    fn clamp_to_terminal_height_trailing_newline() {
-        // "a\nb\n" = 2 newlines, 3 rows (last row empty).
-        // term_height=2 → max 1 newline → "a\nb"
-        let clamped = clamp_to_terminal_height("a\nb\n".to_string(), 2);
-        assert_eq!(clamped, "a\nb");
-    }
 
     #[test]
     fn format_count_suffixes() {
@@ -11664,17 +10145,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_bash_command_distinguishes_exclusion() {
-        let (command, exclude) = parse_bash_command("! ls -la").expect("bang command");
-        assert_eq!(command, "ls -la");
-        assert!(!exclude);
-
-        let (command, exclude) = parse_bash_command("!! ls -la").expect("double bang command");
-        assert_eq!(command, "ls -la");
-        assert!(exclude);
-    }
-
-    #[test]
     fn extension_ui_select_accepts_string_options() {
         let request = ExtensionUiRequest::new(
             "req-1",
@@ -11746,69 +10216,6 @@ mod tests {
         assert_eq!(path.extension().and_then(|s| s.to_str()), Some("png"));
     }
 
-    // --- parse_extension_command tests ---
-
-    #[test]
-    fn parse_ext_cmd_basic() {
-        let result = parse_extension_command("/deploy");
-        assert_eq!(result, Some(("deploy".to_string(), vec![])));
-    }
-
-    #[test]
-    fn parse_ext_cmd_with_args() {
-        let result = parse_extension_command("/deploy staging fast");
-        assert_eq!(
-            result,
-            Some((
-                "deploy".to_string(),
-                vec!["staging".to_string(), "fast".to_string()]
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_ext_cmd_builtin_filtered() {
-        // Built-in slash commands should return None
-        assert!(parse_extension_command("/help").is_none());
-        assert!(parse_extension_command("/clear").is_none());
-        assert!(parse_extension_command("/model").is_none());
-        assert!(parse_extension_command("/exit").is_none());
-        assert!(parse_extension_command("/compact").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_no_slash() {
-        assert!(parse_extension_command("deploy").is_none());
-        assert!(parse_extension_command("hello world").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_empty_slash() {
-        assert!(parse_extension_command("/").is_none());
-        assert!(parse_extension_command("/  ").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_whitespace_trimming() {
-        let result = parse_extension_command("  /deploy  arg1  arg2  ");
-        assert_eq!(
-            result,
-            Some((
-                "deploy".to_string(),
-                vec!["arg1".to_string(), "arg2".to_string()]
-            ))
-        );
-    }
-
-    #[test]
-    fn parse_ext_cmd_single_arg() {
-        let result = parse_extension_command("/greet world");
-        assert_eq!(
-            result,
-            Some(("greet".to_string(), vec!["world".to_string()]))
-        );
-    }
-
     // --- extension_commands_for_catalog tests ---
 
     #[test]
@@ -11843,168 +10250,6 @@ mod tests {
         let manager = crate::extensions::ExtensionManager::new();
         let entries = extension_commands_for_catalog(&manager);
         assert!(entries.is_empty());
-    }
-
-    // --- strip_wrapping_quotes tests ---
-
-    #[test]
-    fn strip_wrapping_quotes_double() {
-        assert_eq!(strip_wrapping_quotes("\"hello\""), "hello");
-    }
-
-    #[test]
-    fn strip_wrapping_quotes_single() {
-        assert_eq!(strip_wrapping_quotes("'hello'"), "hello");
-    }
-
-    #[test]
-    fn strip_wrapping_quotes_mismatched() {
-        assert_eq!(strip_wrapping_quotes("\"hello'"), "\"hello'");
-    }
-
-    #[test]
-    fn strip_wrapping_quotes_no_quotes() {
-        assert_eq!(strip_wrapping_quotes("hello"), "hello");
-    }
-
-    #[test]
-    fn strip_wrapping_quotes_empty() {
-        assert_eq!(strip_wrapping_quotes(""), "");
-    }
-
-    #[test]
-    fn strip_wrapping_quotes_single_char() {
-        assert_eq!(strip_wrapping_quotes("\""), "\"");
-    }
-
-    // --- looks_like_windows_path tests ---
-
-    #[test]
-    fn windows_path_drive_letter() {
-        assert!(looks_like_windows_path("C:\\Users\\foo"));
-        assert!(looks_like_windows_path("D:file.txt"));
-    }
-
-    #[test]
-    fn windows_path_unc() {
-        assert!(looks_like_windows_path("\\\\server\\share"));
-    }
-
-    #[test]
-    fn unix_path_not_windows() {
-        assert!(!looks_like_windows_path("/home/user/file"));
-        assert!(!looks_like_windows_path("relative/path"));
-    }
-
-    // --- unescape_dragged_path tests ---
-
-    #[test]
-    fn unescape_dragged_path_backslash_space() {
-        assert_eq!(unescape_dragged_path("my\\ file.txt"), "my file.txt");
-    }
-
-    #[test]
-    fn unescape_dragged_path_backslash_parens() {
-        assert_eq!(unescape_dragged_path("file\\(1\\).txt"), "file(1).txt");
-    }
-
-    #[test]
-    fn unescape_dragged_path_windows_preserved() {
-        assert_eq!(unescape_dragged_path("C:\\Users\\foo"), "C:\\Users\\foo");
-    }
-
-    #[test]
-    fn unescape_dragged_path_no_escapes() {
-        assert_eq!(unescape_dragged_path("simple.txt"), "simple.txt");
-    }
-
-    // --- file_url_to_path tests ---
-
-    #[test]
-    #[cfg(unix)]
-    fn file_url_to_path_valid() {
-        let result = file_url_to_path("file:///tmp/test.txt");
-        assert_eq!(result, Some(std::path::PathBuf::from("/tmp/test.txt")));
-    }
-
-    #[test]
-    fn file_url_to_path_not_file_url() {
-        assert!(file_url_to_path("https://example.com").is_none());
-        assert!(file_url_to_path("/tmp/test.txt").is_none());
-    }
-
-    // --- format_file_ref tests ---
-
-    #[test]
-    fn format_file_ref_simple() {
-        assert_eq!(format_file_ref("src/main.rs"), "@src/main.rs");
-    }
-
-    #[test]
-    fn format_file_ref_with_spaces() {
-        assert_eq!(format_file_ref("my file.rs"), "@\"my file.rs\"");
-    }
-
-    #[test]
-    fn format_file_ref_with_double_quotes_in_path() {
-        assert_eq!(format_file_ref("my \"file\".rs"), "@'my \"file\".rs'");
-    }
-
-    #[test]
-    fn format_file_ref_with_both_quotes() {
-        assert_eq!(
-            format_file_ref("it's a \"file\" name.rs"),
-            "@\"it's a \\\"file\\\" name.rs\""
-        );
-    }
-
-    // --- split_trailing_punct tests ---
-
-    #[test]
-    fn split_trailing_punct_period() {
-        assert_eq!(split_trailing_punct("file.rs."), ("file.rs", "."));
-    }
-
-    #[test]
-    fn split_trailing_punct_comma() {
-        assert_eq!(split_trailing_punct("word,"), ("word", ","));
-    }
-
-    #[test]
-    fn split_trailing_punct_no_trailing() {
-        assert_eq!(split_trailing_punct("word"), ("word", ""));
-    }
-
-    #[test]
-    fn split_trailing_punct_all_punct() {
-        assert_eq!(split_trailing_punct("!?"), ("", "!?"));
-    }
-
-    #[test]
-    fn split_trailing_punct_empty() {
-        assert_eq!(split_trailing_punct(""), ("", ""));
-    }
-
-    // --- is_file_ref_boundary tests ---
-
-    #[test]
-    fn file_ref_boundary_at_start() {
-        assert!(is_file_ref_boundary("@file", 0));
-    }
-
-    #[test]
-    fn file_ref_boundary_after_space() {
-        assert!(is_file_ref_boundary("see @file", 4));
-    }
-
-    #[test]
-    fn file_ref_boundary_after_paren() {
-        assert!(is_file_ref_boundary("(@file)", 1));
-    }
-
-    #[test]
-    fn file_ref_boundary_mid_word() {
-        assert!(!is_file_ref_boundary("foo@bar", 3));
     }
 
     // --- truncate tests ---
@@ -12148,6 +10393,32 @@ mod tests {
         );
     }
 
+    // --- share command helpers tests ---
+
+    #[test]
+    fn share_parse_public_flag() {
+        assert!(parse_share_is_public("public"));
+        assert!(parse_share_is_public("PUBLIC"));
+        assert!(parse_share_is_public("  Public  "));
+        assert!(!parse_share_is_public(""));
+        assert!(!parse_share_is_public("private"));
+        assert!(!parse_share_is_public("something else"));
+    }
+
+    #[test]
+    fn share_gist_description_with_session_name() {
+        let desc = share_gist_description(Some("my-project-debug"));
+        assert_eq!(desc, "Pi session: my-project-debug");
+    }
+
+    #[test]
+    fn share_gist_description_without_session_name() {
+        let desc = share_gist_description(None);
+        assert!(desc.starts_with("Pi session 20"));
+        assert!(desc.contains('T'));
+        assert!(desc.ends_with('Z'));
+    }
+
     // --- parse_queue_mode tests ---
 
     #[test]
@@ -12194,26 +10465,6 @@ mod tests {
     }
 
     // --- parse_bash_command additional edge cases ---
-
-    #[test]
-    fn parse_bash_command_empty_bang() {
-        assert!(parse_bash_command("!").is_none());
-        assert!(parse_bash_command("!!").is_none());
-        assert!(parse_bash_command("!  ").is_none());
-    }
-
-    #[test]
-    fn parse_bash_command_no_bang() {
-        assert!(parse_bash_command("ls -la").is_none());
-        assert!(parse_bash_command("").is_none());
-    }
-
-    #[test]
-    fn parse_bash_command_leading_whitespace() {
-        let (cmd, exclude) = parse_bash_command("  ! echo hi").expect("should parse");
-        assert_eq!(cmd, "echo hi");
-        assert!(!exclude);
-    }
 
     // --- pretty_json tests ---
 
@@ -12370,29 +10621,6 @@ mod tests {
         // Should NOT contain Diff: header since diff is effectively empty
         assert!(!result.contains("Diff:"));
         assert!(result.contains("Success"));
-    }
-
-    // --- path_for_display tests ---
-
-    #[test]
-    fn path_for_display_within_cwd() {
-        let cwd = Path::new("/home/user/project");
-        let path = Path::new("/home/user/project/src/main.rs");
-        assert_eq!(path_for_display(path, cwd), "src/main.rs");
-    }
-
-    #[test]
-    fn path_for_display_outside_cwd() {
-        let cwd = Path::new("/home/user/project");
-        let path = Path::new("/tmp/file.txt");
-        assert_eq!(path_for_display(path, cwd), "/tmp/file.txt");
-    }
-
-    #[test]
-    fn path_for_display_same_as_cwd() {
-        let cwd = Path::new("/home/user");
-        let path = Path::new("/home/user");
-        assert_eq!(path_for_display(path, cwd), "");
     }
 
     // --- assistant_content_to_text tests ---
@@ -12782,8 +11010,66 @@ mod tests {
     #[test]
     fn slash_help_mentions_generic_login_flow() {
         let help = SlashCommand::help_text();
-        assert!(help.contains("/login [provider]  - Login/setup credentials"));
+        assert!(help.contains(
+            "/login [provider]  - Login/setup credentials; without provider shows status table"
+        ));
         assert!(help.contains("/logout [provider] - Remove stored credentials"));
+    }
+
+    #[test]
+    fn format_login_provider_listing_includes_builtin_and_extension_status() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = crate::auth::AuthStorage::load(auth_path).expect("load auth");
+
+        auth.set(
+            "anthropic",
+            crate::auth::AuthCredential::OAuth {
+                access_token: "anthropic-access".to_string(),
+                refresh_token: "anthropic-refresh".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+        auth.set(
+            "google",
+            crate::auth::AuthCredential::ApiKey {
+                key: "google-api-key".to_string(),
+            },
+        );
+        auth.set(
+            "my-ext",
+            crate::auth::AuthCredential::OAuth {
+                access_token: "ext-access".to_string(),
+                refresh_token: "ext-refresh".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() - 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let mut ext_entry = test_model_entry("my-ext", "model-1");
+        ext_entry.oauth_config = Some(crate::models::OAuthConfig {
+            auth_url: "https://auth.example.invalid/oauth/authorize".to_string(),
+            token_url: "https://auth.example.invalid/oauth/token".to_string(),
+            client_id: "ext-client".to_string(),
+            scopes: vec!["scope.read".to_string()],
+            redirect_uri: None,
+        });
+        let available_models = vec![test_model_entry("openai", "gpt-4o"), ext_entry];
+
+        let listing = format_login_provider_listing(&auth, &available_models);
+        assert!(listing.contains("Available login providers:"));
+        assert!(listing.contains("Built-in:"));
+        assert!(listing.contains("anthropic"));
+        assert!(listing.contains("openai"));
+        assert!(listing.contains("google"));
+        assert!(listing.contains("Extension providers:"));
+        assert!(listing.contains("my-ext"));
+        assert!(listing.contains("Authenticated (expires in"));
+        assert!(listing.contains("Authenticated (expired"));
+        assert!(listing.contains("Usage: /login <provider>"));
     }
 
     #[test]
@@ -12832,29 +11118,6 @@ mod tests {
         let loaded = crate::auth::AuthStorage::load(auth_path).expect("reload post-remove");
         assert!(loaded.get("google").is_none());
         assert!(loaded.get("gemini").is_none());
-    }
-
-    // --- next_non_whitespace_token tests ---
-
-    #[test]
-    fn next_token_basic() {
-        let (token, end) = next_non_whitespace_token("hello world", 0);
-        assert_eq!(token, "hello");
-        assert_eq!(end, 5);
-    }
-
-    #[test]
-    fn next_token_past_end() {
-        let (token, end) = next_non_whitespace_token("abc", 10);
-        assert_eq!(token, "");
-        assert_eq!(end, 3);
-    }
-
-    #[test]
-    fn next_token_last_word() {
-        let (token, end) = next_non_whitespace_token("a bc", 2);
-        assert_eq!(token, "bc");
-        assert_eq!(end, 4);
     }
 
     // --- SlashCommand::parse additional coverage ---
@@ -12958,6 +11221,16 @@ mod tests {
             .iter()
             .map(|e| format!("{}/{}", e.model.provider, e.model.id))
             .collect()
+    }
+
+    fn make_test_models() -> Vec<ModelEntry> {
+        vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("openai", "o1"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+            test_model_entry("google", "gemini-pro"),
+        ]
     }
 
     #[test]
@@ -13099,128 +11372,98 @@ mod tests {
     }
 
     // ========================================================================
-    // FrameTimingStats unit tests (PERF-3)
+    // Scoped-models UI polish tests (TUI-2)
     // ========================================================================
 
-    fn make_stats(enabled: bool) -> FrameTimingStats {
-        FrameTimingStats {
-            frame_times_us: std::cell::RefCell::new(VecDeque::new()),
-            content_build_times_us: std::cell::RefCell::new(VecDeque::new()),
-            viewport_sync_times_us: std::cell::RefCell::new(VecDeque::new()),
-            update_times_us: VecDeque::new(),
-            total_frames: std::cell::Cell::new(0),
-            budget_exceeded_count: std::cell::Cell::new(0),
-            enabled,
+    #[test]
+    fn scoped_models_invalid_glob_error_includes_pattern() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        let patterns = vec!["[invalid".to_string()];
+        let err = resolve_scoped_model_entries(&patterns, &models).unwrap_err();
+        assert!(
+            err.contains("[invalid"),
+            "Error should include the bad pattern: {err}"
+        );
+        assert!(
+            err.contains("Invalid"),
+            "Error should describe the issue: {err}"
+        );
+    }
+
+    #[test]
+    fn scoped_models_glob_preview_matches_expected() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        let patterns = vec!["gpt-4*".to_string()];
+        let resolved = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert!(
+            !resolved.is_empty(),
+            "Should match at least one gpt-4 model"
+        );
+        // Verify all matched models contain "gpt-4" in the id
+        for entry in &resolved {
+            let id_lower = entry.model.id.to_lowercase();
+            assert!(
+                id_lower.starts_with("gpt-4"),
+                "Matched model {id_lower} should start with gpt-4"
+            );
         }
     }
 
     #[test]
-    fn frame_timing_disabled_by_default() {
-        let stats = make_stats(false);
-        stats.record_frame(5000);
-        assert_eq!(stats.total_frames.get(), 0);
-        assert!(stats.frame_times_us.borrow().is_empty());
-    }
-
-    #[test]
-    fn frame_timing_records_when_enabled() {
-        let stats = make_stats(true);
-        stats.record_frame(5000);
-        stats.record_frame(10_000);
-        stats.record_frame(20_000);
-        assert_eq!(stats.total_frames.get(), 3);
-        assert_eq!(stats.budget_exceeded_count.get(), 1);
-        assert_eq!(stats.frame_times_us.borrow().len(), 3);
-    }
-
-    #[test]
-    fn frame_timing_content_build_records() {
-        let stats = make_stats(true);
-        stats.record_content_build(1500);
-        stats.record_content_build(2500);
-        assert_eq!(stats.content_build_times_us.borrow().len(), 2);
-    }
-
-    #[test]
-    fn frame_timing_viewport_sync_records() {
-        let stats = make_stats(true);
-        stats.record_viewport_sync(800);
-        stats.record_viewport_sync(1200);
-        assert_eq!(stats.viewport_sync_times_us.borrow().len(), 2);
-    }
-
-    #[test]
-    fn frame_timing_update_records() {
-        let mut stats = make_stats(true);
-        stats.record_update(500);
-        stats.record_update(1000);
-        assert_eq!(stats.update_times_us.len(), 2);
-    }
-
-    #[test]
-    fn frame_timing_rolling_window_evicts_oldest() {
-        let stats = make_stats(true);
-        for i in 0..=FRAME_TIMING_WINDOW as u64 {
-            stats.record_frame(i * 100);
+    fn scoped_models_dedup_overlapping_patterns() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        // Two patterns that can match the same models
+        let patterns = vec!["gpt-4*".to_string(), "openai/*".to_string()];
+        let resolved = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        // Count how many times each model appears
+        let mut seen = std::collections::HashSet::new();
+        for entry in &resolved {
+            let key = format!(
+                "{}/{}",
+                entry.model.provider.to_lowercase(),
+                entry.model.id.to_lowercase()
+            );
+            assert!(
+                seen.insert(key.clone()),
+                "Duplicate model in resolved list: {key}"
+            );
         }
-        assert_eq!(stats.frame_times_us.borrow().len(), FRAME_TIMING_WINDOW);
-        assert_eq!(*stats.frame_times_us.borrow().front().unwrap(), 100);
     }
 
     #[test]
-    fn frame_timing_percentiles_empty() {
-        let empty = VecDeque::new();
-        assert_eq!(FrameTimingStats::percentiles(&empty), (0, 0, 0));
+    fn scoped_models_no_match_returns_empty() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        let patterns = vec!["nonexistent-provider-xyz*".to_string()];
+        let resolved = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert!(resolved.is_empty(), "Should return empty for no matches");
     }
 
     #[test]
-    fn frame_timing_percentiles_single_value() {
-        let mut times = VecDeque::new();
-        times.push_back(5000);
-        assert_eq!(FrameTimingStats::percentiles(&times), (5000, 5000, 5000));
-    }
-
-    #[test]
-    fn frame_timing_percentiles_known_distribution() {
-        let mut times = VecDeque::new();
-        for i in 1..=100 {
-            times.push_back(i * 1000);
-        }
-        let (p50, p95, p99) = FrameTimingStats::percentiles(&times);
-        assert_eq!(p50, 51_000);
-        assert_eq!(p95, 96_000);
-        assert_eq!(p99, 100_000);
-    }
-
-    #[test]
-    fn frame_timing_summary_disabled() {
-        let stats = make_stats(false);
-        assert!(stats.summary().contains("disabled"));
-    }
-
-    #[test]
-    fn frame_timing_summary_enabled_contains_stats() {
-        let stats = make_stats(true);
-        stats.record_frame(5000);
-        stats.record_content_build(2000);
-        let summary = stats.summary();
-        assert!(summary.contains("Frame timing"));
-        assert!(summary.contains("view()"));
-        assert!(summary.contains("content"));
-        assert!(summary.contains("viewport"));
-        assert!(summary.contains("update()"));
-        assert!(summary.contains("Budget exceeded"));
-    }
-
-    #[test]
-    fn frame_timing_budget_exceeded_counts_correctly() {
-        let stats = make_stats(true);
-        stats.record_frame(10_000);
-        stats.record_frame(16_000);
-        stats.record_frame(FRAME_BUDGET_US);
-        assert_eq!(stats.budget_exceeded_count.get(), 0);
-        stats.record_frame(FRAME_BUDGET_US + 1);
-        stats.record_frame(20_000);
-        assert_eq!(stats.budget_exceeded_count.get(), 2);
+    fn scoped_models_clear_message_format() {
+        let previous_patterns = ["gpt-4*".to_string(), "claude*".to_string()];
+        let cleared_msg = format!(
+            "Cleared {} pattern(s) (was: {})",
+            previous_patterns.len(),
+            previous_patterns.join(", ")
+        );
+        assert!(cleared_msg.contains("gpt-4*"));
+        assert!(cleared_msg.contains("claude*"));
+        assert!(cleared_msg.contains("2 pattern(s)"));
     }
 }
