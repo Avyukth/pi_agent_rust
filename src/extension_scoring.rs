@@ -436,8 +436,12 @@ fn score_github_stars(signals: &Signals, missing: &mut BTreeSet<String>) -> u32 
         return 0;
     };
     // Log-linear: 10 * ln(1 + stars) / ln(1 + 5000), clamped to [0, 10]
-    let score = 10.0 * (1.0 + stars as f64).ln() / (1.0 + 5000_f64).ln();
-    (score.round() as u32).min(10)
+    #[allow(clippy::cast_precision_loss)]
+    let score = 10.0 * (stars as f64).ln_1p() / 5000_f64.ln_1p();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (score.round() as u32).min(10)
+    }
 }
 
 fn score_marketplace_visibility(signals: &Signals, missing: &mut BTreeSet<String>) -> u32 {
@@ -486,8 +490,12 @@ fn score_npm_downloads(signals: &Signals, missing: &mut BTreeSet<String>) -> u32
         return 0;
     };
     // Log-linear: 8 * ln(1 + downloads) / ln(1 + 50_000), clamped to [0, 8]
-    let score = 8.0 * (1.0 + downloads as f64).ln() / (1.0 + 50_000_f64).ln();
-    (score.round() as u32).min(8)
+    #[allow(clippy::cast_precision_loss)]
+    let score = 8.0 * (downloads as f64).ln_1p() / 50_000_f64.ln_1p();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (score.round() as u32).min(8)
+    }
 }
 
 fn score_marketplace_installs(signals: &Signals, missing: &mut BTreeSet<String>) -> u32 {
@@ -587,11 +595,15 @@ fn score_activity(recency: &Recency, as_of: DateTime<Utc>, missing: &mut BTreeSe
         return 0;
     };
     let updated_at = parsed.with_timezone(&Utc);
+    #[allow(clippy::cast_precision_loss)]
     let days = (as_of - updated_at).num_days().max(0) as f64;
     // Exponential decay: 15 * exp(-ln(2) * days / half_life), half_life = 180 days
     let half_life = 180.0_f64;
     let score = 15.0 * (-std::f64::consts::LN_2 * days / half_life).exp();
-    (score.round() as u32).min(15)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        (score.round() as u32).min(15)
+    }
 }
 
 fn score_compatibility(compat: &Compatibility) -> u32 {

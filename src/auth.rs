@@ -1862,8 +1862,11 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
 
         let base_ms: u64 = 10;
         let cap_ms: u64 = 500;
-        let sleep_ms = base_ms.checked_shl(attempt.min(5)).unwrap_or(cap_ms).min(cap_ms);
-        let jitter = start.elapsed().subsec_nanos() as u64 % (sleep_ms / 2 + 1);
+        let sleep_ms = base_ms
+            .checked_shl(attempt.min(5))
+            .unwrap_or(cap_ms)
+            .min(cap_ms);
+        let jitter = u64::from(start.elapsed().subsec_nanos()) % (sleep_ms / 2 + 1);
         let delay = sleep_ms / 2 + jitter;
         std::thread::sleep(Duration::from_millis(delay));
         attempt = attempt.saturating_add(1);
@@ -1888,8 +1891,11 @@ async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
 
         let base_ms: u64 = 10;
         let cap_ms: u64 = 500;
-        let sleep_ms = base_ms.checked_shl(attempt.min(5)).unwrap_or(cap_ms).min(cap_ms);
-        let jitter = start.elapsed().subsec_nanos() as u64 % (sleep_ms / 2 + 1);
+        let sleep_ms = base_ms
+            .checked_shl(attempt.min(5))
+            .unwrap_or(cap_ms)
+            .min(cap_ms);
+        let jitter = u64::from(start.elapsed().subsec_nanos()) % (sleep_ms / 2 + 1);
         let delay = sleep_ms / 2 + jitter;
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(delay)).await;
         attempt = attempt.saturating_add(1);
