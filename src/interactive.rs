@@ -7377,6 +7377,7 @@ impl PiApp {
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
+                self.refresh_conversation_viewport(true);
 
                 if !self.pending_inputs.is_empty() {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
@@ -10501,6 +10502,7 @@ impl PiApp {
                         enabled: true,
                         reserve_tokens,
                         keep_recent_tokens,
+                        ..Default::default()
                     };
                     let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings)
                     else {

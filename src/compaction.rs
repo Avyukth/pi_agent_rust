@@ -21,6 +21,16 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+/// Approximate characters per token for English text with GPT-family tokenizers.
+/// Intentionally conservative (overestimates tokens) to avoid exceeding context windows.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
+
+/// Estimated tokens for an image content block (~1200 tokens).
+const IMAGE_TOKEN_ESTIMATE: usize = 1200;
+
+/// Character-equivalent estimate for an image (IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE).
+const IMAGE_CHAR_ESTIMATE: usize = IMAGE_TOKEN_ESTIMATE * CHARS_PER_TOKEN_ESTIMATE;
+
 // =============================================================================
 // Public types
 // =============================================================================
@@ -28,15 +38,20 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ResolvedCompactionSettings {
     pub enabled: bool,
+    pub context_window_tokens: u32,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
 }
 
 impl Default for ResolvedCompactionSettings {
     fn default() -> Self {
+        let context_window_tokens: u32 = 200_000;
         Self {
             enabled: true,
+            context_window_tokens,
+            // ~8% of context window
             reserve_tokens: 16_384,
+            // 10% of context window
             keep_recent_tokens: 20_000,
         }
     }
@@ -242,7 +257,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                 for block in blocks {
                     match block {
                         ContentBlock::Text(text) => chars += text.text.len(),
-                        ContentBlock::Image(_) => chars += 4800, // ~1200 tokens
+                        ContentBlock::Image(_) => chars += IMAGE_CHAR_ESTIMATE,
                         ContentBlock::Thinking(thinking) => chars += thinking.thinking.len(),
                         ContentBlock::ToolCall(call) => {
                             chars += call.name.len();
@@ -259,7 +274,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                 match block {
                     ContentBlock::Text(text) => chars += text.text.len(),
                     ContentBlock::Thinking(thinking) => chars += thinking.thinking.len(),
-                    ContentBlock::Image(_) => chars += 4800,
+                    ContentBlock::Image(_) => chars += IMAGE_CHAR_ESTIMATE,
                     ContentBlock::ToolCall(call) => {
                         chars += call.name.len();
                         chars += serde_json::to_string(&call.arguments)
@@ -274,7 +289,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                 match block {
                     ContentBlock::Text(text) => chars += text.text.len(),
                     ContentBlock::Thinking(thinking) => chars += thinking.thinking.len(),
-                    ContentBlock::Image(_) => chars += 4800,
+                    ContentBlock::Image(_) => chars += IMAGE_CHAR_ESTIMATE,
                     ContentBlock::ToolCall(call) => {
                         chars += call.name.len();
                         chars += serde_json::to_string(&call.arguments)
@@ -292,7 +307,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
         | SessionMessage::CompactionSummary { summary, .. } => chars = summary.len(),
     }
 
-    u64::try_from(chars.div_ceil(4)).unwrap_or(u64::MAX)
+    u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
 }
 
 // =============================================================================
@@ -876,6 +891,7 @@ pub async fn summarize_entries(
         enabled: true,
         reserve_tokens,
         keep_recent_tokens: 0,
+        ..Default::default()
     };
 
     let summary = generate_summary(
@@ -1054,6 +1070,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 10_000,
             keep_recent_tokens: 5_000,
+            ..Default::default()
         };
         // window=100k, reserve=10k => threshold=90k, context=95k => should compact
         assert!(should_compact(95_000, 100_000, &settings));
@@ -1065,6 +1082,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 10_000,
             keep_recent_tokens: 5_000,
+            ..Default::default()
         };
         // window=100k, reserve=10k => threshold=90k, context=80k => should not compact
         assert!(!should_compact(80_000, 100_000, &settings));
@@ -1076,6 +1094,7 @@ mod tests {
             enabled: false,
             reserve_tokens: 0,
             keep_recent_tokens: 0,
+            ..Default::default()
         };
         assert!(!should_compact(1_000_000, 100_000, &settings));
     }
@@ -1086,6 +1105,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 10_000,
             keep_recent_tokens: 5_000,
+            ..Default::default()
         };
         // window=100k, reserve=10k => threshold=90k, context=90k => NOT compacting (not >)
         assert!(!should_compact(90_000, 100_000, &settings));
@@ -1813,6 +1833,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            ..Default::default()
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -1836,6 +1857,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            ..Default::default()
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -1856,6 +1878,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            ..Default::default()
         };
         if let Some(prep) = prepare_compaction(&entries, settings) {
             let has_read = prep.file_ops.read.contains("/src/main.rs");
@@ -1924,6 +1947,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 100,
+            ..Default::default()
         };
 
         let prep = prepare_compaction(&entries, settings).expect("should compact");
@@ -1982,6 +2006,7 @@ mod tests {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 150,
+            ..Default::default()
         };
 
         // We use prepare_compaction as the entry point

@@ -637,6 +637,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         enabled: config.compaction_enabled(),
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
+        ..Default::default()
     };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),

@@ -1187,6 +1187,7 @@ pub async fn run(
                         enabled: options.config.compaction_enabled(),
                         reserve_tokens: options.config.compaction_reserve_tokens(),
                         keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
+                        ..Default::default()
                     };
 
                     let prep = prepare_compaction(&path_entries, settings).ok_or_else(|| {
@@ -2542,6 +2543,7 @@ async fn maybe_auto_compact(
             enabled: true,
             reserve_tokens,
             keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
+            ..Default::default()
         };
 
         (path_entries, context_window, reserve_tokens, settings)
