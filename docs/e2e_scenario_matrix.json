@@ -1,0 +1,373 @@
+{
+  "schema": "pi.e2e.scenario_matrix.v1",
+  "bead_id": "bd-1f42.8.5.1",
+  "updated_at": "2026-02-13",
+  "source_inputs": [
+    "tests/suite_classification.toml",
+    "scripts/e2e/run_all.sh",
+    "docs/testing-policy.md"
+  ],
+  "ci_policy": {
+    "consumed_by": [
+      "scripts/check_traceability_matrix.py",
+      "tests/ci_full_suite_gate.rs"
+    ],
+    "allowed_statuses": [
+      "covered",
+      "waived",
+      "planned"
+    ],
+    "required_suite_artifacts": [
+      "output.log",
+      "result.json",
+      "test-log.jsonl",
+      "artifact-index.jsonl"
+    ],
+    "required_run_artifacts": [
+      "summary.json",
+      "environment.json",
+      "evidence_contract.json"
+    ],
+    "min_e2e_suite_matrix_coverage_pct": 100
+  },
+  "rows": [
+    {
+      "workflow_id": "wf-cli-onboarding-and-slash-commands",
+      "workflow_class": "success_path",
+      "workflow_title": "First-run CLI onboarding and slash-command control flow",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "core-runtime",
+        "provider-routing"
+      ],
+      "suite_ids": [
+        "e2e_cli",
+        "e2e_golden_path"
+      ],
+      "test_paths": [
+        "tests/e2e_cli.rs",
+        "tests/e2e_golden_path.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_cli --suite e2e_golden_path"
+    },
+    {
+      "workflow_id": "wf-agent-loop-and-tool-roundtrip",
+      "workflow_class": "success_path",
+      "workflow_title": "Core agent orchestration and built-in tool execution round trips",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "core-runtime",
+        "tooling"
+      ],
+      "suite_ids": [
+        "e2e_agent_loop",
+        "e2e_tools"
+      ],
+      "test_paths": [
+        "tests/e2e_agent_loop.rs",
+        "tests/e2e_tools.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_agent_loop --suite e2e_tools"
+    },
+    {
+      "workflow_id": "wf-provider-streaming-and-deterministic-parity",
+      "workflow_class": "success_path",
+      "workflow_title": "Deterministic multi-provider streaming/event-ordering and parity checks",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "provider-native",
+        "provider-openai-compatible"
+      ],
+      "suite_ids": [
+        "e2e_provider_scenarios",
+        "e2e_provider_streaming"
+      ],
+      "test_paths": [
+        "tests/e2e_provider_scenarios.rs",
+        "tests/e2e_provider_streaming.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_provider_scenarios --suite e2e_provider_streaming"
+    },
+    {
+      "workflow_id": "wf-extension-registration-and-ts-loading",
+      "workflow_class": "success_path",
+      "workflow_title": "Extension registration lifecycle and TypeScript extension loading",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "extensions",
+        "quickjs"
+      ],
+      "suite_ids": [
+        "e2e_extension_registration",
+        "e2e_ts_extension_loading"
+      ],
+      "test_paths": [
+        "tests/e2e_extension_registration.rs",
+        "tests/e2e_ts_extension_loading.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_extension_registration --suite e2e_ts_extension_loading"
+    },
+    {
+      "workflow_id": "wf-session-control-persistence-recovery",
+      "workflow_class": "recovery_path",
+      "workflow_title": "Message/session control operations and persistence/replay resilience",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "session",
+        "extensions"
+      ],
+      "suite_ids": [
+        "e2e_message_session_control",
+        "e2e_session_persistence"
+      ],
+      "test_paths": [
+        "tests/e2e_message_session_control.rs",
+        "tests/e2e_session_persistence.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_message_session_control --suite e2e_session_persistence"
+    },
+    {
+      "workflow_id": "wf-rpc-endpoint-integration",
+      "workflow_class": "success_path",
+      "workflow_title": "End-to-end RPC command/protocol coverage",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "rpc",
+        "provider-openai-compatible"
+      ],
+      "suite_ids": [
+        "e2e_rpc"
+      ],
+      "test_paths": [
+        "tests/e2e_rpc.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_rpc"
+    },
+    {
+      "workflow_id": "wf-tui-interactive-journeys",
+      "workflow_class": "success_path",
+      "workflow_title": "Interactive TUI journey scripts via tmux capture",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "tui",
+        "provider-openai-compatible"
+      ],
+      "suite_ids": [
+        "e2e_tui"
+      ],
+      "test_paths": [
+        "tests/e2e_tui.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_tui"
+    },
+    {
+      "workflow_id": "wf-library-runtime-integration",
+      "workflow_class": "success_path",
+      "workflow_title": "Library integration checks for markdown/render/runtime wiring",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "tui",
+        "extensions"
+      ],
+      "suite_ids": [
+        "e2e_library_integration"
+      ],
+      "test_paths": [
+        "tests/e2e_library_integration.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_library_integration"
+    },
+    {
+      "workflow_id": "wf-preflight-policy-and-auto-repair",
+      "workflow_class": "recovery_path",
+      "workflow_title": "Workflow preflight/policy escalation plus extension auto-repair diagnostics",
+      "status": "covered",
+      "owner": "bd-1f42.8.5.2",
+      "provider_families": [
+        "extensions",
+        "policy"
+      ],
+      "suite_ids": [
+        "e2e_workflow_preflight",
+        "e2e_auto_repair"
+      ],
+      "test_paths": [
+        "tests/e2e_workflow_preflight.rs",
+        "tests/e2e_auto_repair.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_workflow_preflight --suite e2e_auto_repair"
+    },
+    {
+      "workflow_id": "wf-live-provider-parity-and-auth",
+      "workflow_class": "live_boundary",
+      "workflow_title": "Live-provider parity/auth smoke workflows (credential and network gated)",
+      "status": "waived",
+      "owner": "bd-1f42.8.5.3",
+      "provider_families": [
+        "provider-native",
+        "provider-openai-compatible"
+      ],
+      "suite_ids": [
+        "e2e_live",
+        "e2e_live_harness",
+        "e2e_cross_provider_parity",
+        "provider_live_verify"
+      ],
+      "test_paths": [
+        "tests/e2e_live.rs",
+        "tests/e2e_live_harness.rs",
+        "tests/e2e_cross_provider_parity.rs",
+        "tests/provider_live_verify.rs"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "waiver_reason": "These suites require live credentials/network and remain non-blocking in default CI; deterministic parity boundaries are enforced separately.",
+      "waiver_issue_id": "bd-1f42.8.5.3",
+      "replay_command": "PI_E2E_TESTS=1 ./scripts/e2e/run_all.sh --profile full --suite e2e_live --suite e2e_live_harness --suite e2e_cross_provider_parity --suite provider_live_verify"
+    },
+    {
+      "workflow_id": "wf-failure-injection-and-recovery-pack",
+      "workflow_class": "failure_recovery",
+      "workflow_title": "Failure injection scenarios for retry/backoff/recovery guarantees",
+      "status": "planned",
+      "owner": "bd-1f42.8.5.4",
+      "provider_families": [
+        "all"
+      ],
+      "planned_suite_ids": [
+        "e2e_failure_injection_recovery"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "planned_issue_id": "bd-1f42.8.5.4",
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_failure_injection_recovery"
+    },
+    {
+      "workflow_id": "wf-interruption-resume-replay-pack",
+      "workflow_class": "interruption_resume",
+      "workflow_title": "Interrupt/resume/replay continuity scenarios with deterministic rerun pointers",
+      "status": "planned",
+      "owner": "bd-1f42.8.5.5",
+      "provider_families": [
+        "all"
+      ],
+      "planned_suite_ids": [
+        "e2e_interruption_resume_replay"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "planned_issue_id": "bd-1f42.8.5.5",
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_interruption_resume_replay"
+    }
+  ]
+}

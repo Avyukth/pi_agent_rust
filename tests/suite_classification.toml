@@ -9,7 +9,7 @@
 #   e2e  - Full system: real providers, network, or tmux
 #
 # See docs/testing-policy.md for full definitions and rules.
-# Test-double evidence baseline: docs/test_double_inventory.json (bd-1f42.1.1).
+# Test-double evidence baseline: docs/test_double_inventory.json (bd-1f42.8.1).
 
 [suite.unit]
 files = [

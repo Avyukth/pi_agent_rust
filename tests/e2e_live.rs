@@ -359,8 +359,14 @@ fn provider_env_var_names_uses_canonical_metadata_for_oai_compat() {
     );
     assert_eq!(provider_env_var_names("xai"), &["XAI_API_KEY"]);
     assert_eq!(provider_env_var_names("deepseek"), &["DEEPSEEK_API_KEY"]);
-    assert_eq!(provider_env_var_names("dashscope"), &["DASHSCOPE_API_KEY"]);
-    assert_eq!(provider_env_var_names("kimi"), &["MOONSHOT_API_KEY"]);
+    assert_eq!(
+        provider_env_var_names("dashscope"),
+        &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]
+    );
+    assert_eq!(
+        provider_env_var_names("kimi"),
+        &["MOONSHOT_API_KEY", "KIMI_API_KEY"]
+    );
 }
 
 #[test]

@@ -1463,7 +1463,10 @@ fn wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings() {
 
     let alibaba = provider_routing_defaults("alibaba").expect("alibaba defaults");
     let alibaba_cn = provider_routing_defaults("alibaba-cn").expect("alibaba-cn defaults");
-    assert_eq!(provider_auth_env_keys("alibaba"), &["DASHSCOPE_API_KEY"]);
+    assert_eq!(
+        provider_auth_env_keys("alibaba"),
+        &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]
+    );
     assert_eq!(provider_auth_env_keys("alibaba-cn"), &["DASHSCOPE_API_KEY"]);
     assert_ne!(alibaba.base_url, alibaba_cn.base_url);
 }
@@ -1581,7 +1584,10 @@ fn wave_b2_moonshot_cn_and_global_moonshot_mapping_are_distinct() {
         canonical_provider_id("moonshotai-cn"),
         Some("moonshotai-cn")
     );
-    assert_eq!(provider_auth_env_keys("moonshotai"), &["MOONSHOT_API_KEY"]);
+    assert_eq!(
+        provider_auth_env_keys("moonshotai"),
+        &["MOONSHOT_API_KEY", "KIMI_API_KEY"]
+    );
     assert_eq!(
         provider_auth_env_keys("moonshotai-cn"),
         &["MOONSHOT_API_KEY"]

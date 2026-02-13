@@ -18,6 +18,8 @@
 //! 7. Conformance regression gate
 //! 8. Release gate (evidence completeness)
 //! 9. Suite classification guard
+//! 10. Requirement traceability matrix
+//! 11. Canonical E2E scenario matrix
 //!
 //! Run:
 //!   cargo test --test `ci_full_suite_gate` -- --nocapture
@@ -367,6 +369,19 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
         artifact_path: Some("docs/traceability_matrix.json".to_string()),
         detail,
         reproduce_command: None,
+    });
+
+    // Gate 11: Canonical E2E scenario matrix.
+    let (status, detail) = check_artifact_present(root, "docs/e2e_scenario_matrix.json");
+    gates.push(SubGate {
+        id: "e2e_scenario_matrix".to_string(),
+        name: "Canonical E2E scenario matrix".to_string(),
+        bead: "bd-1f42.8.5.1".to_string(),
+        status,
+        blocking: false,
+        artifact_path: Some("docs/e2e_scenario_matrix.json".to_string()),
+        detail,
+        reproduce_command: Some("python3 scripts/check_traceability_matrix.py".to_string()),
     });
 
     gates

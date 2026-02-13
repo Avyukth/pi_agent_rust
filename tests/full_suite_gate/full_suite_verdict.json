@@ -1,0 +1,118 @@
+{
+  "schema": "pi.ci.full_suite_gate.v1",
+  "generated_at": "2026-02-13T04:38:24.572Z",
+  "verdict": "fail",
+  "policy": "Full-suite gate: all blocking gates must pass for release. Non-blocking gates produce warnings but do not block.",
+  "gates": [
+    {
+      "id": "non_mock_unit",
+      "name": "Non-mock unit compliance",
+      "bead": "bd-1f42.2.6",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "docs/non-mock-rubric.json",
+      "reproduce_command": "cargo test --test non_mock_compliance_gate -- --nocapture"
+    },
+    {
+      "id": "e2e_log_contract",
+      "name": "E2E log contract and transcripts",
+      "bead": "bd-1f42.3.6",
+      "status": "pass",
+      "blocking": false,
+      "artifact_path": "tests/e2e_results"
+    },
+    {
+      "id": "ext_must_pass",
+      "name": "Extension must-pass gate (208 extensions)",
+      "bead": "bd-1f42.4.4",
+      "status": "skip",
+      "blocking": true,
+      "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+      "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
+    },
+    {
+      "id": "ext_provider_compat",
+      "name": "Extension provider compatibility matrix",
+      "bead": "bd-1f42.4.6",
+      "status": "skip",
+      "blocking": false,
+      "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+      "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"
+    },
+    {
+      "id": "evidence_bundle",
+      "name": "Unified evidence bundle",
+      "bead": "bd-1f42.6.8",
+      "status": "skip",
+      "blocking": false,
+      "artifact_path": "tests/evidence_bundle/index.json",
+      "detail": "Artifact not found: tests/evidence_bundle/index.json",
+      "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
+    },
+    {
+      "id": "cross_platform",
+      "name": "Cross-platform matrix validation",
+      "bead": "bd-1f42.6.7",
+      "status": "fail",
+      "blocking": true,
+      "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
+      "detail": "Not all required platform checks passed",
+      "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
+    },
+    {
+      "id": "conformance_regression",
+      "name": "Conformance regression gate",
+      "bead": "bd-1f42.4",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
+      "reproduce_command": "cargo test --test conformance_regression_gate -- --nocapture"
+    },
+    {
+      "id": "conformance_pass_rate",
+      "name": "Conformance pass rate >= 80%",
+      "bead": "bd-1f42.4",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
+      "reproduce_command": "cargo test --test conformance_report -- --nocapture"
+    },
+    {
+      "id": "suite_classification",
+      "name": "Suite classification guard",
+      "bead": "bd-1f42.6.1",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/suite_classification.toml"
+    },
+    {
+      "id": "traceability_matrix",
+      "name": "Requirement traceability matrix",
+      "bead": "bd-1f42.6.4",
+      "status": "pass",
+      "blocking": false,
+      "artifact_path": "docs/traceability_matrix.json"
+    },
+    {
+      "id": "e2e_scenario_matrix",
+      "name": "Canonical E2E scenario matrix",
+      "bead": "bd-1f42.8.5.1",
+      "status": "pass",
+      "blocking": false,
+      "artifact_path": "docs/e2e_scenario_matrix.json",
+      "reproduce_command": "python3 scripts/check_traceability_matrix.py"
+    }
+  ],
+  "summary": {
+    "total_gates": 11,
+    "passed": 7,
+    "failed": 1,
+    "warned": 0,
+    "skipped": 3,
+    "blocking_pass": 4,
+    "blocking_total": 6,
+    "all_blocking_pass": false
+  }
+}

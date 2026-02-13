@@ -1848,8 +1848,11 @@ mod tests {
         assert_eq!(provider_api_key_env_vars("deepseek"), &["DEEPSEEK_API_KEY"]);
         assert_eq!(
             provider_api_key_env_vars("dashscope"),
-            &["DASHSCOPE_API_KEY"]
+            &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]
         );
-        assert_eq!(provider_api_key_env_vars("kimi"), &["MOONSHOT_API_KEY"]);
+        assert_eq!(
+            provider_api_key_env_vars("kimi"),
+            &["MOONSHOT_API_KEY", "KIMI_API_KEY"]
+        );
     }
 }
