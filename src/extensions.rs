@@ -2395,8 +2395,20 @@ pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> Str
     result
 }
 
+/// Compute SHA-256 hex digest of a string.
+///
+/// Used by SEC-4.3 ledger recording to hash command strings and env var names
+/// without exposing raw values in telemetry.
+#[must_use]
+pub fn sha256_hex_standalone(input: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}")
+}
+
 /// Telemetry entry for exec mediation decisions.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecMediationLedgerEntry {
     /// Unix epoch milliseconds.
     pub ts_ms: i64,
@@ -2415,7 +2427,7 @@ pub struct ExecMediationLedgerEntry {
 }
 
 /// Telemetry entry for secret broker decisions.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretBrokerLedgerEntry {
     /// Unix epoch milliseconds.
     pub ts_ms: i64,
@@ -2427,6 +2439,32 @@ pub struct SecretBrokerLedgerEntry {
     pub redacted: bool,
     /// Reason for redaction or disclosure.
     pub reason: String,
+}
+
+/// Structured artifact for exec mediation decision history (SEC-4.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecMediationArtifact {
+    /// Schema identifier.
+    pub schema: String,
+    /// Generation timestamp (Unix epoch ms).
+    pub generated_at_ms: i64,
+    /// Number of entries.
+    pub entry_count: usize,
+    /// Decision entries.
+    pub entries: Vec<ExecMediationLedgerEntry>,
+}
+
+/// Structured artifact for secret broker decision history (SEC-4.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretBrokerArtifact {
+    /// Schema identifier.
+    pub schema: String,
+    /// Generation timestamp (Unix epoch ms).
+    pub generated_at_ms: i64,
+    /// Number of entries.
+    pub entry_count: usize,
+    /// Decision entries.
+    pub entries: Vec<SecretBrokerLedgerEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -4359,7 +4397,7 @@ fn runtime_risk_build_explanation(
             RuntimeRiskExplanationContributor {
                 code: "budget_exhausted".to_string(),
                 signed_impact: 1.0,
-                magnitude: 0.95,
+                magnitude: 1.0,
                 rationale: "explanation budget exhausted; omitted speculative contributor terms"
                     .to_string(),
             },
@@ -4399,7 +4437,7 @@ fn runtime_risk_build_explanation(
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDecision {
     Allow,
@@ -4412,6 +4450,80 @@ pub struct PolicyCheck {
     pub decision: PolicyDecision,
     pub capability: String,
     pub reason: String,
+}
+
+// ---------------------------------------------------------------------------
+// Policy explanation types (SEC-4.4)
+// ---------------------------------------------------------------------------
+
+/// Structured explanation of a single capability decision within a policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityExplanation {
+    pub capability: String,
+    pub decision: PolicyDecision,
+    pub reason: String,
+    pub is_dangerous: bool,
+}
+
+/// Full structured explanation of an effective policy, suitable for runtime
+/// diagnostics and audit logging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyExplanation {
+    pub mode: ExtensionPolicyMode,
+    pub default_caps: Vec<String>,
+    pub deny_caps: Vec<String>,
+    pub exec_mediation_enabled: bool,
+    pub secret_broker_enabled: bool,
+    pub capability_decisions: Vec<CapabilityExplanation>,
+    /// Dangerous capabilities that the effective policy allows.
+    pub dangerous_allowed: Vec<String>,
+    /// Dangerous capabilities that the effective policy denies.
+    pub dangerous_denied: Vec<String>,
+    /// Extension ID used for evaluation, if any.
+    pub extension_id: Option<String>,
+}
+
+/// Result of checking whether a profile transition constitutes a valid
+/// downgrade (tightening of security posture).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileTransitionCheck {
+    pub is_valid_downgrade: bool,
+    pub exec_before: PolicyDecision,
+    pub exec_after: PolicyDecision,
+    pub env_before: PolicyDecision,
+    pub env_after: PolicyDecision,
+    pub mode_before: ExtensionPolicyMode,
+    pub mode_after: ExtensionPolicyMode,
+}
+
+/// Audit trail entry for dangerous-capability opt-in via `allow_dangerous`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DangerousOptInAuditEntry {
+    /// Source of the `allow_dangerous` flag (e.g. "config", "env").
+    pub source: String,
+    /// The effective profile at the time of opt-in.
+    pub profile: String,
+    /// Capabilities removed from the deny list.
+    pub capabilities_unblocked: Vec<String>,
+}
+
+/// Map a [`PolicyDecision`] to a numeric strictness level.
+/// Higher = stricter.
+const fn decision_strictness(d: PolicyDecision) -> u8 {
+    match d {
+        PolicyDecision::Allow => 0,
+        PolicyDecision::Prompt => 1,
+        PolicyDecision::Deny => 2,
+    }
+}
+
+/// Map a policy mode to a numeric strictness level.
+const fn mode_strictness(m: ExtensionPolicyMode) -> u8 {
+    match m {
+        ExtensionPolicyMode::Permissive => 0,
+        ExtensionPolicyMode::Prompt => 1,
+        ExtensionPolicyMode::Strict => 2,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4554,6 +4666,78 @@ impl ExtensionPolicy {
     /// Create a policy from a named profile.
     pub fn from_profile(profile: PolicyProfile) -> Self {
         profile.to_policy()
+    }
+
+    /// Produce a structured explanation of the effective policy for all
+    /// known capabilities. This is the runtime-callable counterpart to the
+    /// CLI `--explain-extension-policy` flag — it can be invoked at any
+    /// point during execution to inspect the live policy state.
+    pub fn explain_effective_policy(
+        &self,
+        extension_id: Option<&str>,
+    ) -> PolicyExplanation {
+        let capability_decisions: Vec<CapabilityExplanation> = ALL_CAPABILITIES
+            .iter()
+            .map(|cap| {
+                let check = self.evaluate_for(cap.as_str(), extension_id);
+                CapabilityExplanation {
+                    capability: cap.as_str().to_string(),
+                    decision: check.decision,
+                    reason: check.reason,
+                    is_dangerous: cap.is_dangerous(),
+                }
+            })
+            .collect();
+
+        let dangerous_allowed = capability_decisions
+            .iter()
+            .filter(|c| c.is_dangerous && c.decision == PolicyDecision::Allow)
+            .map(|c| c.capability.clone())
+            .collect::<Vec<_>>();
+
+        let dangerous_denied = capability_decisions
+            .iter()
+            .filter(|c| c.is_dangerous && c.decision == PolicyDecision::Deny)
+            .map(|c| c.capability.clone())
+            .collect::<Vec<_>>();
+
+        PolicyExplanation {
+            mode: self.mode,
+            default_caps: self.default_caps.clone(),
+            deny_caps: self.deny_caps.clone(),
+            exec_mediation_enabled: self.exec_mediation.enabled,
+            secret_broker_enabled: self.secret_broker.enabled,
+            capability_decisions,
+            dangerous_allowed,
+            dangerous_denied,
+            extension_id: extension_id.map(String::from),
+        }
+    }
+
+    /// Verify that a profile transition from `from` to `to` produces a
+    /// strictly tighter policy for dangerous capabilities. Returns `true`
+    /// if the downgrade is valid (all dangerous caps that were denied in
+    /// `from` are still denied in `to`, AND `to` denies at least as many).
+    pub fn is_valid_downgrade(from: &Self, to: &Self) -> ProfileTransitionCheck {
+        let from_exec = from.evaluate("exec").decision;
+        let to_exec = to.evaluate("exec").decision;
+        let from_env = from.evaluate("env").decision;
+        let to_env = to.evaluate("env").decision;
+
+        let exec_tightened = decision_strictness(to_exec) >= decision_strictness(from_exec);
+        let env_tightened = decision_strictness(to_env) >= decision_strictness(from_env);
+
+        let mode_tightened = mode_strictness(to.mode) >= mode_strictness(from.mode);
+
+        ProfileTransitionCheck {
+            is_valid_downgrade: exec_tightened && env_tightened && mode_tightened,
+            exec_before: from_exec,
+            exec_after: to_exec,
+            env_before: from_env,
+            env_after: to_env,
+            mode_before: from.mode,
+            mode_after: to.mode,
+        }
     }
 }
 
@@ -10443,11 +10627,11 @@ fn log_policy_decision(
     call_id: &str,
     extension_id: Option<&str>,
     capability: &str,
-    decision: &PolicyDecision,
+    decision: PolicyDecision,
     reason: &str,
     params_hash: &str,
 ) {
-    if *decision == PolicyDecision::Allow {
+    if decision == PolicyDecision::Allow {
         tracing::info!(
             event = "policy.decision",
             runtime = runtime,
@@ -10582,7 +10766,7 @@ pub async fn dispatch_host_call_shared(
         &call_id,
         ctx.extension_id,
         capability,
-        &decision,
+        decision,
         &reason,
         &params_hash,
     );
@@ -10928,6 +11112,37 @@ async fn dispatch_shared_allowed(
 
             // SEC-4.3: Exec mediation — classify and gate dangerous commands.
             let mediation = evaluate_exec_mediation(&ctx.policy.exec_mediation, cmd, &args);
+
+            // Record mediation decision in the SEC-4.3 ledger.
+            let (decision_label, class_label, tier_label) = match &mediation {
+                ExecMediationResult::Allow => ("allow", None, None),
+                ExecMediationResult::AllowWithAudit { class, .. } => {
+                    ("allow_with_audit", Some(class.label()), Some(class.risk_tier().label()))
+                }
+                ExecMediationResult::Deny { class, .. } => (
+                    "deny",
+                    class.map(DangerousCommandClass::label),
+                    class.map(|c| c.risk_tier().label()),
+                ),
+            };
+            let reason_text = match &mediation {
+                ExecMediationResult::Allow => String::new(),
+                ExecMediationResult::AllowWithAudit { reason, .. }
+                | ExecMediationResult::Deny { reason, .. } => reason.clone(),
+            };
+            if let Some(ref manager) = ctx.manager {
+                let redacted = redact_command_for_logging(&ctx.policy.secret_broker, cmd);
+                manager.record_exec_mediation(ExecMediationLedgerEntry {
+                    ts_ms: runtime_risk_now_ms(),
+                    extension_id: ctx.extension_id.map(ToString::to_string),
+                    command_hash: sha256_hex_standalone(&redacted),
+                    command_class: class_label.map(ToString::to_string),
+                    risk_tier: tier_label.map(ToString::to_string),
+                    decision: decision_label.to_string(),
+                    reason: reason_text,
+                });
+            }
+
             match &mediation {
                 ExecMediationResult::Deny { class, reason } => {
                     tracing::warn!(
@@ -13020,6 +13235,37 @@ impl ExtensionManager {
             triggers.push("feature_budget_exceeded".to_string());
         }
 
+        // SEC-3.3: Deterministic reason codes for specific feature anomalies.
+        if features.burst_density_1s >= 0.5 {
+            triggers.push("burst_rate_anomaly".to_string());
+        }
+        if features.recent_error_rate >= 0.4 {
+            triggers.push("high_error_rate".to_string());
+        }
+        if features.prior_failure_streak_norm >= 0.25 {
+            triggers.push("consecutive_failure_escalation".to_string());
+        }
+        if runtime_risk_is_dangerous(capability)
+            && matches!(state.last_decision, Some(RuntimeRiskAction::Harden))
+        {
+            triggers.push("dangerous_capability_escalation".to_string());
+        }
+        if let Some(ref prev_cap) = state.last_capability {
+            if prev_cap != capability
+                && runtime_risk_is_dangerous(capability)
+                && !runtime_risk_is_dangerous(prev_cap)
+            {
+                triggers.push("unseen_capability_transition".to_string());
+            }
+        }
+        if matches!(
+            meta.resource_target_class,
+            "fs" | "process" | "network" | "credential"
+        ) && features.dangerous_capability > 0.5
+        {
+            triggers.push("sensitive_target_mismatch".to_string());
+        }
+
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut fallback_reason = None;
         if elapsed_ms > config.decision_timeout_ms {
@@ -13376,6 +13622,91 @@ impl ExtensionManager {
             .lock()
             .unwrap()
             .runtime_hostcall_telemetry
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-4.3: Exec mediation + secret broker ledger accumulation & export
+    // -----------------------------------------------------------------------
+
+    /// Record an exec mediation decision into the SEC-4.3 ledger.
+    pub fn record_exec_mediation(&self, entry: ExecMediationLedgerEntry) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.exec_mediation_ledger.push_back(entry);
+        // Cap at same limit as runtime-risk ledger.
+        while guard.exec_mediation_ledger.len() > guard.runtime_risk_config.ledger_limit {
+            let _ = guard.exec_mediation_ledger.pop_front();
+        }
+        drop(guard);
+    }
+
+    /// Record a secret broker decision into the SEC-4.3 ledger.
+    pub fn record_secret_broker(&self, entry: SecretBrokerLedgerEntry) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.secret_broker_ledger.push_back(entry);
+        while guard.secret_broker_ledger.len() > guard.runtime_risk_config.ledger_limit {
+            let _ = guard.secret_broker_ledger.pop_front();
+        }
+        drop(guard);
+    }
+
+    /// Export the exec mediation ledger as a structured artifact.
+    pub fn exec_mediation_artifact(&self) -> ExecMediationArtifact {
+        let entries: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .exec_mediation_ledger
+            .iter()
+            .cloned()
+            .collect();
+        ExecMediationArtifact {
+            schema: "pi.ext.exec_mediation_ledger.v1".to_string(),
+            generated_at_ms: runtime_risk_now_ms(),
+            entry_count: entries.len(),
+            entries,
+        }
+    }
+
+    /// Export the secret broker ledger as a structured artifact.
+    pub fn secret_broker_artifact(&self) -> SecretBrokerArtifact {
+        let entries: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .secret_broker_ledger
+            .iter()
+            .cloned()
+            .collect();
+        SecretBrokerArtifact {
+            schema: "pi.ext.secret_broker_ledger.v1".to_string(),
+            generated_at_ms: runtime_risk_now_ms(),
+            entry_count: entries.len(),
+            entries,
+        }
+    }
+
+    /// Snapshot of exec mediation entries (test helper).
+    #[cfg(test)]
+    fn exec_mediation_snapshot(&self) -> Vec<ExecMediationLedgerEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .exec_mediation_ledger
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot of secret broker entries (test helper).
+    #[cfg(test)]
+    fn secret_broker_snapshot(&self) -> Vec<SecretBrokerLedgerEntry> {
+        self.inner
+            .lock()
+            .unwrap()
+            .secret_broker_ledger
             .iter()
             .cloned()
             .collect()
@@ -26626,6 +26957,417 @@ mod tests {
         assert!(!budget.fallback_mode);
     }
 
+    // ── SEC-3.3: Online deterministic risk scorer golden fixtures (bd-3f1ab) ──
+
+    #[test]
+    fn golden_base_score_exec() {
+        assert!((runtime_risk_base_score("exec", "exec", "") - 1.0).abs() < 1e-10);
+        assert!((runtime_risk_base_score("exec", "run", "") - 0.95).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_base_score_env() {
+        assert!((runtime_risk_base_score("env", "get", "") - 0.85).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_base_score_http() {
+        assert!((runtime_risk_base_score("http", "http", "") - 0.82).abs() < 1e-10);
+        assert!((runtime_risk_base_score("http", "fetch", "") - 0.70).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_base_score_low_risk() {
+        assert!((runtime_risk_base_score("log", "log", "") - 0.25).abs() < 1e-10);
+        assert!((runtime_risk_base_score("read", "read", "") - 0.15).abs() < 1e-10);
+        assert!((runtime_risk_base_score("ui", "render", "") - 0.20).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_base_score_policy_bonus() {
+        let base = runtime_risk_base_score("exec", "exec", "prompt_user_confirm");
+        // exec(0.95) + exec_method(0.20) + prompt_user(0.15) = 1.30 → clamped to 1.0
+        assert!((base - 1.0).abs() < 1e-10);
+
+        let base = runtime_risk_base_score("log", "log", "prompt_cache_hit");
+        // log(0.25) + prompt_cache(0.08) = 0.33
+        assert!((base - 0.33).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_is_dangerous() {
+        assert!(runtime_risk_is_dangerous("exec"));
+        assert!(runtime_risk_is_dangerous("env"));
+        assert!(runtime_risk_is_dangerous("http"));
+        assert!(!runtime_risk_is_dangerous("log"));
+        assert!(!runtime_risk_is_dangerous("read"));
+        assert!(!runtime_risk_is_dangerous("write"));
+        assert!(!runtime_risk_is_dangerous("ui"));
+        assert!(!runtime_risk_is_dangerous("session"));
+    }
+
+    #[test]
+    fn golden_clamp01() {
+        assert!((runtime_risk_clamp01(0.5) - 0.5).abs() < 1e-10);
+        assert!((runtime_risk_clamp01(-0.1) - 0.0).abs() < 1e-10);
+        assert!((runtime_risk_clamp01(1.5) - 1.0).abs() < 1e-10);
+        assert!((runtime_risk_clamp01(f64::NAN) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn golden_score_formula_deterministic_replay() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "fs",
+            timeout_ms: None,
+            policy_profile: "default",
+        };
+
+        // Run the same 5-call sequence twice and compare
+        let mut scores_a = Vec::new();
+        let mut scores_b = Vec::new();
+        for run_scores in [&mut scores_a, &mut scores_b] {
+            let manager = ExtensionManager::new();
+            manager.set_runtime_risk_config(config.clone());
+            let calls = [
+                ("log", "log", "permissive"),
+                ("log", "log", "permissive"),
+                ("exec", "exec", "permissive"),
+                ("exec", "exec", "permissive"),
+                ("log", "log", "permissive"),
+            ];
+            for (i, (cap, method, reason)) in calls.iter().enumerate() {
+                let decision = manager
+                    .evaluate_runtime_risk(
+                        Some("ext.golden"),
+                        &format!("call-{i}"),
+                        cap,
+                        method,
+                        "hash",
+                        meta,
+                        reason,
+                    )
+                    .expect("decision");
+                run_scores.push(decision.risk_score);
+            }
+        }
+        assert_eq!(scores_a.len(), scores_b.len());
+        for (i, (a, b)) in scores_a.iter().zip(scores_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "score mismatch at call {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn golden_reason_codes_burst_rate() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "fs",
+            timeout_ms: Some(10),
+            policy_profile: "default",
+        };
+
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(config);
+        // Fire many calls rapidly to trigger burst_rate_anomaly
+        // burst_density_1s = burst_count_1s / 8.0, threshold ≥ 0.5 means ≥ 4 calls/s
+        // We fire calls in quick succession; since they all happen "at once" in test,
+        // the timestamps are nearly identical, triggering burst detection.
+        let mut found_burst = false;
+        for i in 0..10 {
+            let decision = manager
+                .evaluate_runtime_risk(
+                    Some("ext.burst"),
+                    &format!("rapid-{i}"),
+                    "exec",
+                    "exec",
+                    "hash",
+                    meta,
+                    "permissive",
+                )
+                .expect("decision");
+            manager.record_runtime_risk_outcome(
+                Some("ext.burst"),
+                &format!("rapid-{i}"),
+                "permissive",
+                &decision,
+                None,
+                1,
+            );
+            if decision.triggers.contains(&"burst_rate_anomaly".to_string()) {
+                found_burst = true;
+            }
+        }
+        assert!(found_burst, "burst_rate_anomaly must trigger with rapid calls");
+    }
+
+    #[test]
+    fn golden_reason_codes_dangerous_capability_escalation() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "fs",
+            timeout_ms: None,
+            policy_profile: "default",
+        };
+
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(config);
+        // First call: exec → likely Harden due to high base score
+        let d1 = manager
+            .evaluate_runtime_risk(
+                Some("ext.escalate"),
+                "call-0",
+                "exec",
+                "exec",
+                "hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision");
+        manager.record_runtime_risk_outcome(
+            Some("ext.escalate"),
+            "call-0",
+            "permissive",
+            &d1,
+            None,
+            1,
+        );
+        // If first call was Harden, second exec call should trigger escalation
+        if matches!(d1.action, RuntimeRiskAction::Harden) {
+            let d2 = manager
+                .evaluate_runtime_risk(
+                    Some("ext.escalate"),
+                    "call-1",
+                    "exec",
+                    "exec",
+                    "hash",
+                    meta,
+                    "permissive",
+                )
+                .expect("decision");
+            assert!(
+                d2.triggers
+                    .contains(&"dangerous_capability_escalation".to_string()),
+                "second exec after harden must trigger dangerous_capability_escalation, got: {:?}",
+                d2.triggers
+            );
+        }
+    }
+
+    #[test]
+    fn golden_reason_codes_sensitive_target() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta_fs = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "fs",
+            timeout_ms: None,
+            policy_profile: "default",
+        };
+
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(config);
+        let decision = manager
+            .evaluate_runtime_risk(
+                Some("ext.target"),
+                "call-0",
+                "exec",
+                "exec",
+                "hash",
+                meta_fs,
+                "permissive",
+            )
+            .expect("decision");
+        assert!(
+            decision
+                .triggers
+                .contains(&"sensitive_target_mismatch".to_string()),
+            "exec on fs target must trigger sensitive_target_mismatch, got: {:?}",
+            decision.triggers
+        );
+    }
+
+    #[test]
+    fn golden_reason_codes_unseen_capability_transition() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "unknown",
+            timeout_ms: None,
+            policy_profile: "default",
+        };
+
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(config);
+        // First call: benign log
+        let d1 = manager
+            .evaluate_runtime_risk(
+                Some("ext.transition"),
+                "call-0",
+                "log",
+                "log",
+                "hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision");
+        manager.record_runtime_risk_outcome(
+            Some("ext.transition"),
+            "call-0",
+            "permissive",
+            &d1,
+            None,
+            1,
+        );
+        // Second call: dangerous exec → transition from safe to dangerous
+        let d2 = manager
+            .evaluate_runtime_risk(
+                Some("ext.transition"),
+                "call-1",
+                "exec",
+                "exec",
+                "hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision");
+        assert!(
+            d2.triggers
+                .contains(&"unseen_capability_transition".to_string()),
+            "log→exec transition must trigger unseen_capability_transition, got: {:?}",
+            d2.triggers
+        );
+    }
+
+    #[test]
+    fn golden_reason_codes_stable_across_replays() {
+        let config = RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        };
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "golden",
+            resource_target_class: "unknown",
+            timeout_ms: None,
+            policy_profile: "default",
+        };
+
+        let mut all_triggers = Vec::new();
+        for _ in 0..3 {
+            let manager = ExtensionManager::new();
+            manager.set_runtime_risk_config(config.clone());
+            let mut run_triggers = Vec::new();
+            for i in 0..5 {
+                let cap = if i < 2 { "log" } else { "exec" };
+                let decision = manager
+                    .evaluate_runtime_risk(
+                        Some("ext.stable"),
+                        &format!("call-{i}"),
+                        cap,
+                        cap,
+                        "hash",
+                        meta,
+                        "permissive",
+                    )
+                    .expect("decision");
+                manager.record_runtime_risk_outcome(
+                    Some("ext.stable"),
+                    &format!("call-{i}"),
+                    "permissive",
+                    &decision,
+                    None,
+                    1,
+                );
+                run_triggers.push(decision.triggers.clone());
+            }
+            all_triggers.push(run_triggers);
+        }
+        for run_idx in 1..all_triggers.len() {
+            for (call_idx, (a, b)) in all_triggers[0]
+                .iter()
+                .zip(all_triggers[run_idx].iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    a, b,
+                    "reason codes mismatch at call {call_idx} between run 0 and {run_idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_score_composition_weights() {
+        // Verify the documented score formula weights
+        let features = RuntimeHostcallFeatureVector {
+            schema: "test".to_string(),
+            base_score: 0.5,
+            recent_mean_score: 0.3,
+            recent_error_rate: 0.4,
+            burst_density_1s: 0.2,
+            burst_density_10s: 0.0,
+            prior_failure_streak_norm: 0.1,
+            dangerous_capability: 0.0,
+            timeout_requested: 0.0,
+            policy_prompt_bias: 0.0,
+        };
+        // Expected: clamp01((0.65 * 0.5) + (0.35 * 0.3))
+        //         = clamp01(0.325 + 0.105)
+        //         = 0.43
+        // Then: clamp01(0.43 + (0.12 * 0.4) + (0.08 * 0.2) + (0.05 * 0.1))
+        //     = clamp01(0.43 + 0.048 + 0.016 + 0.005)
+        //     = 0.499
+        let step1 = runtime_risk_clamp01(0.65 * 0.5 + 0.35 * 0.3);
+        let step2 = runtime_risk_clamp01(
+            step1 + 0.12 * features.recent_error_rate + 0.08 * features.burst_density_1s + 0.05 * features.prior_failure_streak_norm,
+        );
+        assert!((step1 - 0.43).abs() < 1e-10, "step1 weight check");
+        assert!((step2 - 0.499).abs() < 1e-10, "step2 weight check");
+    }
+
     // ========================================================================
     // SEC-4.3: Exec mediation and secret broker tests (bd-zh0hj)
     // ========================================================================
@@ -27240,6 +27982,310 @@ mod tests {
                 assert_eq!(class.unwrap().risk_tier(), ExecRiskTier::Critical);
             }
             other => panic!("Expected Deny, got {other:?}"),
+        }
+    }
+
+    // ====================================================================
+    // SEC-4.4: Policy explanation and profile transition tests
+    // ====================================================================
+
+    #[test]
+    fn explain_effective_policy_safe_profile() {
+        let policy = PolicyProfile::Safe.to_policy();
+        let explanation = policy.explain_effective_policy(None);
+
+        assert_eq!(explanation.mode, ExtensionPolicyMode::Strict);
+        assert!(explanation.exec_mediation_enabled);
+        assert!(explanation.secret_broker_enabled);
+        // Dangerous caps should be denied in safe profile.
+        assert!(
+            explanation.dangerous_denied.contains(&"exec".to_string()),
+            "exec should be denied in safe profile"
+        );
+        assert!(
+            explanation.dangerous_denied.contains(&"env".to_string()),
+            "env should be denied in safe profile"
+        );
+        assert!(
+            explanation.dangerous_allowed.is_empty(),
+            "No dangerous caps should be allowed in safe profile"
+        );
+        assert!(explanation.extension_id.is_none());
+    }
+
+    #[test]
+    fn explain_effective_policy_permissive_profile() {
+        let policy = PolicyProfile::Permissive.to_policy();
+        let explanation = policy.explain_effective_policy(None);
+
+        assert_eq!(explanation.mode, ExtensionPolicyMode::Permissive);
+        // Permissive allows everything including dangerous caps.
+        assert!(
+            explanation.dangerous_allowed.contains(&"exec".to_string()),
+            "exec should be allowed in permissive profile"
+        );
+        assert!(
+            explanation.dangerous_allowed.contains(&"env".to_string()),
+            "env should be allowed in permissive profile"
+        );
+        assert!(explanation.dangerous_denied.is_empty());
+    }
+
+    #[test]
+    fn explain_effective_policy_standard_profile() {
+        let policy = PolicyProfile::Standard.to_policy();
+        let explanation = policy.explain_effective_policy(None);
+
+        assert_eq!(explanation.mode, ExtensionPolicyMode::Prompt);
+        // Standard denies exec/env via deny_caps.
+        assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
+        assert!(explanation.dangerous_denied.contains(&"env".to_string()));
+    }
+
+    #[test]
+    fn explain_effective_policy_with_extension_override() {
+        let mut policy = PolicyProfile::Safe.to_policy();
+        policy.per_extension.insert(
+            "my-ext".to_string(),
+            ExtensionOverride {
+                allow: vec!["exec".to_string()],
+                deny: Vec::new(),
+                mode: None,
+                quota: None,
+            },
+        );
+        // Without extension context: exec is denied.
+        let explanation = policy.explain_effective_policy(None);
+        assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
+
+        // With extension context: exec should still be denied because
+        // deny_caps (layer 2) takes precedence over per-extension allow
+        // (layer 3).
+        let explanation = policy.explain_effective_policy(Some("my-ext"));
+        assert!(explanation.dangerous_denied.contains(&"exec".to_string()));
+        assert_eq!(explanation.extension_id.as_deref(), Some("my-ext"));
+    }
+
+    #[test]
+    fn explain_effective_policy_all_capabilities_present() {
+        let policy = PolicyProfile::Safe.to_policy();
+        let explanation = policy.explain_effective_policy(None);
+        // Every known capability must have a decision.
+        assert_eq!(
+            explanation.capability_decisions.len(),
+            ALL_CAPABILITIES.len()
+        );
+        for cap in ALL_CAPABILITIES {
+            assert!(
+                explanation
+                    .capability_decisions
+                    .iter()
+                    .any(|c| c.capability == cap.as_str()),
+                "Missing capability: {}",
+                cap.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn explain_effective_policy_serializes_to_json() {
+        let policy = PolicyProfile::Safe.to_policy();
+        let explanation = policy.explain_effective_policy(None);
+        let json = serde_json::to_string(&explanation).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["mode"], "strict");
+        assert!(parsed["exec_mediation_enabled"].as_bool().unwrap());
+        assert!(parsed["dangerous_denied"].is_array());
+    }
+
+    // --- Profile transition checks ---
+
+    #[test]
+    fn downgrade_permissive_to_safe_is_valid() {
+        let from = PolicyProfile::Permissive.to_policy();
+        let to = PolicyProfile::Safe.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            check.is_valid_downgrade,
+            "Permissive → Safe should be a valid downgrade"
+        );
+        assert_eq!(check.exec_before, PolicyDecision::Allow);
+        assert_eq!(check.exec_after, PolicyDecision::Deny);
+        assert_eq!(check.env_before, PolicyDecision::Allow);
+        assert_eq!(check.env_after, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn downgrade_permissive_to_standard_is_valid() {
+        let from = PolicyProfile::Permissive.to_policy();
+        let to = PolicyProfile::Standard.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            check.is_valid_downgrade,
+            "Permissive → Standard should be a valid downgrade"
+        );
+    }
+
+    #[test]
+    fn downgrade_standard_to_safe_is_valid() {
+        let from = PolicyProfile::Standard.to_policy();
+        let to = PolicyProfile::Safe.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            check.is_valid_downgrade,
+            "Standard → Safe should be a valid downgrade"
+        );
+    }
+
+    #[test]
+    fn upgrade_safe_to_permissive_is_not_downgrade() {
+        let from = PolicyProfile::Safe.to_policy();
+        let to = PolicyProfile::Permissive.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            !check.is_valid_downgrade,
+            "Safe → Permissive should NOT be a valid downgrade"
+        );
+    }
+
+    #[test]
+    fn upgrade_safe_to_standard_is_not_downgrade() {
+        let from = PolicyProfile::Safe.to_policy();
+        let to = PolicyProfile::Standard.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            !check.is_valid_downgrade,
+            "Safe → Standard should NOT be a valid downgrade"
+        );
+    }
+
+    #[test]
+    fn identity_transition_is_valid_downgrade() {
+        // Same profile → same policy: weakly valid (nothing loosened).
+        let from = PolicyProfile::Safe.to_policy();
+        let to = PolicyProfile::Safe.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        assert!(
+            check.is_valid_downgrade,
+            "Same profile → same profile is a (trivial) valid downgrade"
+        );
+    }
+
+    #[test]
+    fn downgrade_is_immediate_no_residual_dangerous_caps() {
+        // Simulate: start with permissive, "downgrade" to safe, verify
+        // that exec and env are immediately denied.
+        let permissive = PolicyProfile::Permissive.to_policy();
+        assert_eq!(permissive.evaluate("exec").decision, PolicyDecision::Allow);
+        assert_eq!(permissive.evaluate("env").decision, PolicyDecision::Allow);
+
+        let safe = PolicyProfile::Safe.to_policy();
+        assert_eq!(safe.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(safe.evaluate("env").decision, PolicyDecision::Deny);
+
+        // Transition check confirms it.
+        let check = ExtensionPolicy::is_valid_downgrade(&permissive, &safe);
+        assert!(check.is_valid_downgrade);
+        assert_eq!(check.exec_after, PolicyDecision::Deny);
+        assert_eq!(check.env_after, PolicyDecision::Deny);
+    }
+
+    // --- Dangerous opt-in cannot be implicit ---
+
+    #[test]
+    fn dangerous_caps_not_enabled_by_default() {
+        let policy = ExtensionPolicy::default();
+        assert_eq!(policy.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(policy.evaluate("env").decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn dangerous_caps_not_enabled_by_safe_profile() {
+        let policy = PolicyProfile::Safe.to_policy();
+        assert_eq!(policy.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(policy.evaluate("env").decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn dangerous_caps_not_enabled_by_standard_profile() {
+        let policy = PolicyProfile::Standard.to_policy();
+        assert_eq!(policy.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(policy.evaluate("env").decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn dangerous_caps_only_enabled_by_permissive_profile() {
+        let safe = PolicyProfile::Safe.to_policy();
+        let standard = PolicyProfile::Standard.to_policy();
+        let permissive = PolicyProfile::Permissive.to_policy();
+
+        // Only permissive allows dangerous caps.
+        assert_eq!(safe.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(standard.evaluate("exec").decision, PolicyDecision::Deny);
+        assert_eq!(
+            permissive.evaluate("exec").decision,
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn dangerous_opt_in_audit_entry_serializes() {
+        let entry = DangerousOptInAuditEntry {
+            source: "config".to_string(),
+            profile: "safe".to_string(),
+            capabilities_unblocked: vec!["exec".to_string(), "env".to_string()],
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["source"], "config");
+        assert_eq!(parsed["profile"], "safe");
+        assert_eq!(parsed["capabilities_unblocked"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn profile_transition_check_serializes() {
+        let from = PolicyProfile::Permissive.to_policy();
+        let to = PolicyProfile::Safe.to_policy();
+        let check = ExtensionPolicy::is_valid_downgrade(&from, &to);
+        let json = serde_json::to_string(&check).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert!(parsed["is_valid_downgrade"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn decision_strictness_ordering() {
+        // Allow < Prompt < Deny
+        assert!(decision_strictness(PolicyDecision::Allow) < decision_strictness(PolicyDecision::Prompt));
+        assert!(decision_strictness(PolicyDecision::Prompt) < decision_strictness(PolicyDecision::Deny));
+    }
+
+    #[test]
+    fn mode_strictness_ordering() {
+        // Permissive < Prompt < Strict
+        assert!(mode_strictness(ExtensionPolicyMode::Permissive) < mode_strictness(ExtensionPolicyMode::Prompt));
+        assert!(mode_strictness(ExtensionPolicyMode::Prompt) < mode_strictness(ExtensionPolicyMode::Strict));
+    }
+
+    #[test]
+    fn explain_policy_dangerous_flag_consistency() {
+        // Verify that dangerous_allowed + dangerous_denied covers exactly
+        // the dangerous capabilities.
+        for profile in [PolicyProfile::Safe, PolicyProfile::Standard, PolicyProfile::Permissive] {
+            let policy = profile.to_policy();
+            let explanation = policy.explain_effective_policy(None);
+            let mut all_dangerous: Vec<String> = explanation
+                .dangerous_allowed
+                .iter()
+                .chain(explanation.dangerous_denied.iter())
+                .cloned()
+                .collect();
+            all_dangerous.sort();
+            let mut expected: Vec<String> = Capability::dangerous_list()
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect();
+            expected.sort();
+            assert_eq!(all_dangerous, expected, "Profile {profile:?} must cover all dangerous caps");
         }
     }
 }

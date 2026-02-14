@@ -179,6 +179,9 @@ pub struct ResolvedExtensionPolicy {
     pub allow_dangerous: bool,
     /// Final effective policy used by runtime components.
     pub policy: crate::extensions::ExtensionPolicy,
+    /// Audit trail for dangerous-capability opt-in, if `allow_dangerous`
+    /// was true and modified the policy. `None` when no opt-in occurred.
+    pub dangerous_opt_in_audit: Option<crate::extensions::DangerousOptInAuditEntry>,
 }
 
 /// Resolved repair policy plus explainability metadata.
@@ -265,6 +268,15 @@ pub enum PackageSource {
 pub enum SettingsScope {
     Global,
     Project,
+}
+
+/// Map a [`PolicyProfile`] to its normalized string name.
+const fn effective_profile_str(profile: crate::extensions::PolicyProfile) -> &'static str {
+    match profile {
+        crate::extensions::PolicyProfile::Safe => "safe",
+        crate::extensions::PolicyProfile::Standard => "balanced",
+        crate::extensions::PolicyProfile::Permissive => "permissive",
+    }
 }
 
 impl Config {
@@ -605,23 +617,46 @@ impl Config {
         let mut policy = profile.to_policy();
 
         // Check allow_dangerous: config setting or PI_EXTENSION_ALLOW_DANGEROUS env
-        let allow_dangerous = self
+        let config_allows = self
             .extension_policy
             .as_ref()
             .and_then(|p| p.allow_dangerous)
-            .unwrap_or(false)
-            || std::env::var("PI_EXTENSION_ALLOW_DANGEROUS")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            .unwrap_or(false);
+        let env_allows = std::env::var("PI_EXTENSION_ALLOW_DANGEROUS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let allow_dangerous = config_allows || env_allows;
+
+        // Build audit trail before mutating deny_caps.
+        let dangerous_opt_in_audit = if allow_dangerous {
+            let source = if env_allows { "env" } else { "config" }.to_string();
+            let unblocked: Vec<String> = policy
+                .deny_caps
+                .iter()
+                .filter(|cap| *cap == "exec" || *cap == "env")
+                .cloned()
+                .collect();
+            if !unblocked.is_empty() {
+                tracing::warn!(
+                    source = %source,
+                    profile = %effective_profile_str(profile),
+                    capabilities = ?unblocked,
+                    "Dangerous capabilities explicitly unblocked via allow_dangerous"
+                );
+            }
+            Some(crate::extensions::DangerousOptInAuditEntry {
+                source,
+                profile: effective_profile_str(profile).to_string(),
+                capabilities_unblocked: unblocked,
+            })
+        } else {
+            None
+        };
 
         if allow_dangerous {
             policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
         }
 
-        let effective_profile = match profile {
-            PolicyProfile::Safe => "safe",
-            PolicyProfile::Standard => "balanced",
-            PolicyProfile::Permissive => "permissive",
-        };
+        let effective_profile = effective_profile_str(profile);
 
         ResolvedExtensionPolicy {
             requested_profile,
@@ -629,6 +664,7 @@ impl Config {
             profile_source,
             allow_dangerous,
             policy,
+            dangerous_opt_in_audit,
         }
     }
 
@@ -1976,6 +2012,123 @@ mod tests {
         let ext_config = config.extension_policy.as_ref().unwrap();
         assert_eq!(ext_config.profile.as_deref(), Some("safe"));
         assert_eq!(ext_config.allow_dangerous, Some(true));
+    }
+
+    // ====================================================================
+    // SEC-4.4: Dangerous opt-in audit and profile transition tests
+    // ====================================================================
+
+    #[test]
+    fn dangerous_opt_in_audit_present_when_allow_dangerous() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "extensionPolicy": { "profile": "safe", "allowDangerous": true } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let resolved = config.resolve_extension_policy_with_metadata(None);
+        assert!(resolved.allow_dangerous);
+        let audit = resolved
+            .dangerous_opt_in_audit
+            .expect("audit entry must be present");
+        assert_eq!(audit.source, "config");
+        assert_eq!(audit.profile, "safe");
+        assert!(audit.capabilities_unblocked.contains(&"exec".to_string()));
+        assert!(audit.capabilities_unblocked.contains(&"env".to_string()));
+    }
+
+    #[test]
+    fn dangerous_opt_in_audit_absent_when_not_opted_in() {
+        let config = Config::default();
+        let resolved = config.resolve_extension_policy_with_metadata(None);
+        assert!(!resolved.allow_dangerous);
+        assert!(resolved.dangerous_opt_in_audit.is_none());
+    }
+
+    #[test]
+    fn dangerous_opt_in_audit_empty_unblocked_when_permissive() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "extensionPolicy": { "profile": "permissive", "allowDangerous": true } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let resolved = config.resolve_extension_policy_with_metadata(None);
+        let audit = resolved
+            .dangerous_opt_in_audit
+            .expect("audit entry must be present");
+        assert!(
+            audit.capabilities_unblocked.is_empty(),
+            "permissive has no deny_caps to remove"
+        );
+    }
+
+    #[test]
+    fn profile_downgrade_safe_roundtrip_verifiable() {
+        let config = Config::default();
+        let permissive = config.resolve_extension_policy(Some("permissive"));
+        let safe = config.resolve_extension_policy(Some("safe"));
+
+        assert_eq!(
+            permissive.evaluate("exec").decision,
+            crate::extensions::PolicyDecision::Allow
+        );
+        assert_eq!(
+            safe.evaluate("exec").decision,
+            crate::extensions::PolicyDecision::Deny
+        );
+
+        let check = crate::extensions::ExtensionPolicy::is_valid_downgrade(&permissive, &safe);
+        assert!(check.is_valid_downgrade);
+    }
+
+    #[test]
+    fn profile_upgrade_safe_to_permissive_not_downgrade() {
+        let config = Config::default();
+        let safe = config.resolve_extension_policy(Some("safe"));
+        let permissive = config.resolve_extension_policy(Some("permissive"));
+
+        let check = crate::extensions::ExtensionPolicy::is_valid_downgrade(&safe, &permissive);
+        assert!(!check.is_valid_downgrade);
+    }
+
+    #[test]
+    fn profile_metadata_includes_audit_for_balanced_allow_dangerous() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "extensionPolicy": { "profile": "balanced", "allowDangerous": true } }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
+        let resolved = config.resolve_extension_policy_with_metadata(None);
+        assert_eq!(resolved.effective_profile, "balanced");
+        assert!(resolved.allow_dangerous);
+        let audit = resolved.dangerous_opt_in_audit.unwrap();
+        assert_eq!(audit.source, "config");
+        assert_eq!(audit.profile, "balanced");
+        assert!(audit.capabilities_unblocked.contains(&"exec".to_string()));
+    }
+
+    #[test]
+    fn explain_policy_runtime_callable_from_config() {
+        let config = Config::default();
+        let policy = config.resolve_extension_policy(Some("safe"));
+        let explanation = policy.explain_effective_policy(None);
+        assert_eq!(
+            explanation.mode,
+            crate::extensions::ExtensionPolicyMode::Strict
+        );
+        assert!(!explanation.dangerous_denied.is_empty());
+        assert!(explanation.dangerous_allowed.is_empty());
     }
 
     // ====================================================================
