@@ -110,6 +110,19 @@ fn parse_streaming_behavior(value: Option<&Value>) -> Result<Option<StreamingBeh
     }
 }
 
+fn normalize_command_type(command_type: &str) -> &str {
+    match command_type {
+        "follow-up" | "followUp" | "queue-follow-up" | "queueFollowUp" => "follow_up",
+        "get-state" | "getState" => "get_state",
+        "set-model" | "setModel" => "set_model",
+        "set-steering-mode" | "setSteeringMode" => "set_steering_mode",
+        "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
+        "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
+        "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
+        _ => command_type,
+    }
+}
+
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
     if images.is_empty() {
@@ -395,11 +408,12 @@ pub async fn run(
             }
         };
 
-        let Some(command_type) = parsed.get("type").and_then(Value::as_str) else {
+        let Some(command_type_raw) = parsed.get("type").and_then(Value::as_str) else {
             let resp = response_error(None, "parse", "Missing command type".to_string());
             let _ = out_tx.send(resp);
             continue;
         };
+        let command_type = normalize_command_type(command_type_raw);
 
         let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
 
@@ -1502,8 +1516,8 @@ pub async fn run(
             _ => {
                 let _ = out_tx.send(response_error(
                     id,
-                    command_type,
-                    format!("Unknown command: {command_type}"),
+                    command_type_raw,
+                    format!("Unknown command: {command_type_raw}"),
                 ));
             }
         }
@@ -3506,6 +3520,55 @@ mod tests {
     fn parse_streaming_behavior_non_string_errors() {
         let val = json!(42);
         assert!(parse_streaming_behavior(Some(&val)).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_command_type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_command_type_passthrough() {
+        assert_eq!(normalize_command_type("prompt"), "prompt");
+        assert_eq!(normalize_command_type("compact"), "compact");
+    }
+
+    #[test]
+    fn normalize_command_type_follow_up_aliases() {
+        assert_eq!(normalize_command_type("follow-up"), "follow_up");
+        assert_eq!(normalize_command_type("followUp"), "follow_up");
+        assert_eq!(normalize_command_type("queue-follow-up"), "follow_up");
+        assert_eq!(normalize_command_type("queueFollowUp"), "follow_up");
+    }
+
+    #[test]
+    fn normalize_command_type_kebab_and_camel_aliases() {
+        assert_eq!(normalize_command_type("get-state"), "get_state");
+        assert_eq!(normalize_command_type("getState"), "get_state");
+        assert_eq!(normalize_command_type("set-model"), "set_model");
+        assert_eq!(normalize_command_type("setModel"), "set_model");
+        assert_eq!(
+            normalize_command_type("set-steering-mode"),
+            "set_steering_mode"
+        );
+        assert_eq!(normalize_command_type("setSteeringMode"), "set_steering_mode");
+        assert_eq!(
+            normalize_command_type("set-follow-up-mode"),
+            "set_follow_up_mode"
+        );
+        assert_eq!(
+            normalize_command_type("setFollowUpMode"),
+            "set_follow_up_mode"
+        );
+        assert_eq!(
+            normalize_command_type("set-auto-compaction"),
+            "set_auto_compaction"
+        );
+        assert_eq!(
+            normalize_command_type("setAutoCompaction"),
+            "set_auto_compaction"
+        );
+        assert_eq!(normalize_command_type("set-auto-retry"), "set_auto_retry");
+        assert_eq!(normalize_command_type("setAutoRetry"), "set_auto_retry");
     }
 
     // -----------------------------------------------------------------------

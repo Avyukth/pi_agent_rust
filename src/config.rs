@@ -2250,9 +2250,16 @@ mod tests {
                 ..Config::default()
             };
 
+            let baseline = Config::default().resolve_extension_risk_with_metadata();
             let resolved = config.resolve_extension_risk_with_metadata();
-            prop_assert_eq!(resolved.settings.alpha, alpha.clamp(1.0e-6, 0.5));
-            prop_assert_eq!(resolved.source, "config");
+            if baseline.source == "env" {
+                // Env overrides config; ensure config input does not bypass env precedence.
+                prop_assert_eq!(resolved.settings.alpha, baseline.settings.alpha);
+                prop_assert_eq!(resolved.source, "env");
+            } else {
+                prop_assert_eq!(resolved.settings.alpha, alpha.clamp(1.0e-6, 0.5));
+                prop_assert_eq!(resolved.source, "config");
+            }
         }
 
         #[test]
@@ -2282,12 +2289,12 @@ mod tests {
                 ..Config::default()
             };
 
+            let baseline = Config::default().resolve_extension_risk_with_metadata();
             let resolved = config.resolve_extension_risk_with_metadata();
-            prop_assert_eq!(
-                resolved.settings.alpha,
-                crate::extensions::RuntimeRiskConfig::default().alpha
-            );
-            prop_assert_eq!(resolved.source, "default");
+            // Non-finite config alpha must be ignored, so result should match
+            // baseline resolution under the same environment.
+            prop_assert_eq!(resolved.settings.alpha, baseline.settings.alpha);
+            prop_assert_eq!(resolved.source, baseline.source);
         }
 
         #[test]
@@ -2313,7 +2320,9 @@ mod tests {
                 }
             }))
             .expect("config should deserialize");
-            let resolved = config.resolve_extension_policy_with_metadata(None);
+            // Use CLI override so test remains deterministic even when env
+            // policy variables are present in the runner.
+            let resolved = config.resolve_extension_policy_with_metadata(Some(&raw));
             prop_assert_eq!(resolved.effective_profile, "safe");
             prop_assert_eq!(
                 resolved.policy.mode,
