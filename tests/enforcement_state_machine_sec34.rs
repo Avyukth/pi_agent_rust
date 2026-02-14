@@ -965,14 +965,12 @@ fn shadow_mode_vs_enforced_mode_telemetry_comparison() {
 // SEC-7.2: Graduated enforcement rollout with rollback guards
 // ============================================================================
 
-use pi::extensions::{
-    RollbackTrigger, RollbackWindowStats, RolloutPhase, RolloutState,
-};
+use pi::extensions::{RollbackTrigger, RolloutPhase};
 
-/// Rollout phase progression: Shadow → LogOnly → EnforceNew → EnforceAll.
+/// Rollout phase progression: Shadow → `LogOnly` → `EnforceNew` → `EnforceAll`.
 #[test]
 fn rollout_phase_progression() {
-    let _harness = TestHarness::new("rollout_phase_progression");
+    let harness = TestHarness::new("rollout_phase_progression");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: false, // Start in shadow
@@ -982,7 +980,7 @@ fn rollout_phase_progression() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::Shadow);
 
     // Verify initial state
@@ -1018,7 +1016,7 @@ fn rollout_phase_progression() {
 /// Rollout phase is explicitly reversible: operator can set any phase.
 #[test]
 fn rollout_phase_reversible() {
-    let _harness = TestHarness::new("rollout_phase_reversible");
+    let harness = TestHarness::new("rollout_phase_reversible");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: true,
@@ -1028,7 +1026,7 @@ fn rollout_phase_reversible() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
 
     // Start at EnforceAll (default)
     assert_eq!(manager.rollout_state().phase, RolloutPhase::EnforceAll);
@@ -1055,7 +1053,7 @@ fn rollout_phase_reversible() {
 /// Rollback triggers activate when error rate exceeds threshold.
 #[test]
 fn rollback_trigger_on_error_rate() {
-    let _harness = TestHarness::new("rollback_trigger_error_rate");
+    let harness = TestHarness::new("rollback_trigger_error_rate");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: true,
@@ -1065,9 +1063,9 @@ fn rollback_trigger_on_error_rate() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -1083,22 +1081,32 @@ fn rollback_trigger_on_error_rate() {
     // Feed 2 error decisions to reach 10 total (2/10 = 20% > 10% threshold)
     manager.record_rollout_decision(5, true, false);
     let triggered = manager.record_rollout_decision(5, true, false);
-    assert!(triggered, "should rollback on 20% error rate exceeding 10% threshold");
+    assert!(
+        triggered,
+        "should rollback on 20% error rate exceeding 10% threshold"
+    );
 
     let state = manager.rollout_state();
-    assert_eq!(state.phase, RolloutPhase::Shadow, "should roll back to Shadow");
+    assert_eq!(
+        state.phase,
+        RolloutPhase::Shadow,
+        "should roll back to Shadow"
+    );
     assert_eq!(
         state.rolled_back_from,
         Some(RolloutPhase::EnforceAll),
         "should record where we rolled back from"
     );
-    assert!(!state.enforce, "enforce flag should be disabled after rollback");
+    assert!(
+        !state.enforce,
+        "enforce flag should be disabled after rollback"
+    );
 }
 
 /// Rollback triggers activate when false positive rate exceeds threshold.
 #[test]
 fn rollback_trigger_on_false_positive_rate() {
-    let _harness = TestHarness::new("rollback_trigger_fp_rate");
+    let harness = TestHarness::new("rollback_trigger_fp_rate");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: true,
@@ -1108,9 +1116,9 @@ fn rollback_trigger_on_false_positive_rate() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.50,
         window_size: 20,
@@ -1122,14 +1130,17 @@ fn rollback_trigger_on_false_positive_rate() {
         manager.record_rollout_decision(5, false, false);
     }
     let triggered = manager.record_rollout_decision(5, false, true);
-    assert!(triggered, "should rollback on 10% FP rate exceeding 5% threshold");
+    assert!(
+        triggered,
+        "should rollback on 10% FP rate exceeding 5% threshold"
+    );
     assert_eq!(manager.rollout_state().phase, RolloutPhase::Shadow);
 }
 
 /// Rollback triggers activate when average latency exceeds threshold.
 #[test]
 fn rollback_trigger_on_high_latency() {
-    let _harness = TestHarness::new("rollback_trigger_latency");
+    let harness = TestHarness::new("rollback_trigger_latency");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: true,
@@ -1139,9 +1150,9 @@ fn rollback_trigger_on_high_latency() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.50,
         max_error_rate: 0.50,
         window_size: 20,
@@ -1153,14 +1164,17 @@ fn rollback_trigger_on_high_latency() {
         manager.record_rollout_decision(150, false, false);
     }
     let triggered = manager.record_rollout_decision(150, false, false);
-    assert!(triggered, "should rollback on avg latency 150ms > 100ms threshold");
+    assert!(
+        triggered,
+        "should rollback on avg latency 150ms > 100ms threshold"
+    );
     assert_eq!(manager.rollout_state().phase, RolloutPhase::Shadow);
 }
 
-/// Rollback triggers do NOT fire in non-enforcing phases (Shadow, LogOnly).
+/// Rollback triggers do NOT fire in non-enforcing phases (Shadow, `LogOnly`).
 #[test]
 fn rollback_triggers_skip_non_enforcing_phases() {
-    let _harness = TestHarness::new("rollback_skip_non_enforcing");
+    let harness = TestHarness::new("rollback_skip_non_enforcing");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: false,
@@ -1170,9 +1184,9 @@ fn rollback_triggers_skip_non_enforcing_phases() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::Shadow);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.01,
         max_error_rate: 0.01,
         window_size: 10,
@@ -1190,7 +1204,7 @@ fn rollback_triggers_skip_non_enforcing_phases() {
 /// Rollout state is inspectable: all fields are populated correctly.
 #[test]
 fn rollout_state_inspectable() {
-    let _harness = TestHarness::new("rollout_state_inspectable");
+    let harness = TestHarness::new("rollout_state_inspectable");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: true,
@@ -1200,7 +1214,7 @@ fn rollout_state_inspectable() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
 
     // Initial state
     let state = manager.rollout_state();
@@ -1230,7 +1244,7 @@ fn rollout_state_inspectable() {
 /// Graduated rollout syncs enforce flag with phase transitions.
 #[test]
 fn rollout_enforce_flag_sync() {
-    let _harness = TestHarness::new("rollout_enforce_flag_sync");
+    let harness = TestHarness::new("rollout_enforce_flag_sync");
     let config = RuntimeRiskConfig {
         enabled: true,
         enforce: false,
@@ -1240,7 +1254,7 @@ fn rollout_enforce_flag_sync() {
         decision_timeout_ms: 5000,
         fail_closed: true,
     };
-    let (_tools, _http, manager, _policy) = setup(&_harness, config);
+    let (_tools, _http, manager, _policy) = setup(&harness, config);
     manager.set_rollout_phase(RolloutPhase::Shadow);
 
     // Shadow → enforce=false

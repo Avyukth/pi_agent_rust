@@ -1761,7 +1761,8 @@ fn contains_eval_call(text: &str) -> bool {
         // Not preceded by a dot (method call on object) or letter (part of
         // another identifier like `retrieval`).
         if pos == 0
-            || !text.as_bytes()[pos - 1].is_ascii_alphanumeric() && text.as_bytes()[pos - 1] != b'.'
+            || !search.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && search.as_bytes()[pos - 1] != b'.'
         {
             return true;
         }

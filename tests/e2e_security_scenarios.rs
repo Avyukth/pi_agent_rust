@@ -6,8 +6,8 @@
 //!   → evidence gathering → artifact validation.
 //!
 //! Each scenario emits structured JSONL logs via `TestHarness` with:
-//! timestamp, issue_id, extension_id, capability, policy_profile, score,
-//! reason_codes, action, latency_ms, correlation_id, redaction_summary.
+//! timestamp, `issue_id`, `extension_id`, capability, `policy_profile`, score,
+//! `reason_codes`, action, `latency_ms`, `correlation_id`, `redaction_summary`.
 //!
 //! Acceptance criteria:
 //! - [x] E2E suite covers critical attack classes and normal-user workflows.
@@ -20,9 +20,10 @@ use common::TestHarness;
 use pi::connectors::http::HttpConnector;
 use pi::extension_preflight::{PREFLIGHT_SCHEMA, PreflightAnalyzer, PreflightVerdict};
 use pi::extensions::{
-    ExecMediationPolicy, ExtensionManager, ExtensionPolicy, ExtensionPolicyMode, HostCallContext,
-    HostCallPayload, IncidentBundleFilter, IncidentBundleRedactionPolicy, PolicyDecision,
-    PolicyProfile, RUNTIME_RISK_LEDGER_SCHEMA_VERSION, RuntimeRiskActionValue, RuntimeRiskConfig,
+    ExecMediationPolicy, ExtensionManager, ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode,
+    ExtensionQuotaConfig, HostCallContext, HostCallPayload, IncidentBundleFilter,
+    IncidentBundleRedactionPolicy, PolicyDecision, PolicyProfile,
+    RUNTIME_RISK_LEDGER_SCHEMA_VERSION, RuntimeRiskActionValue, RuntimeRiskConfig,
     SECURITY_ALERT_SCHEMA_VERSION, SecretBrokerPolicy, SecurityAlertCategory,
     dispatch_host_call_shared, verify_runtime_risk_ledger_artifact,
 };
@@ -208,6 +209,7 @@ fn log_scenario_event(
 /// Normal-user workflow: clean extension passes preflight, runs safely,
 /// produces no alerts, and emits clean artifacts.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_benign_extension_lifecycle() {
     let harness = TestHarness::new("scenario_benign_extension_lifecycle");
     let _span = harness.log().begin_span("benign_lifecycle");
@@ -308,11 +310,7 @@ export default function init(pi) {
 
     // Verify ledger integrity
     let verification = verify_runtime_risk_ledger_artifact(&ledger);
-    assert!(
-        verification.valid,
-        "Ledger must be valid: {:?}",
-        verification
-    );
+    assert!(verification.valid, "Ledger must be valid: {verification:?}");
 
     // Verify the extension never reached Deny/Terminate state
     // (Harden is acceptable as a precautionary measure for error outcomes)
@@ -422,6 +420,7 @@ export default function init(pi) {
 /// Extension starts with benign behavior, transitions to adversarial calls,
 /// triggering risk score escalation, enforcement state changes, and alerts.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_runtime_anomaly_escalation() {
     let harness = TestHarness::new("scenario_runtime_anomaly_escalation");
     let _span = harness.log().begin_span("anomaly_escalation");
@@ -448,7 +447,7 @@ fn scenario_runtime_anomaly_escalation() {
         .iter()
         .map(|e| e.risk_score)
         .collect();
-    let max_benign_score = benign_scores.iter().cloned().fold(0.0_f64, f64::max);
+    let max_benign_score = benign_scores.iter().copied().fold(0.0_f64, f64::max);
 
     log_scenario_event(
         &harness,
@@ -493,7 +492,7 @@ fn scenario_runtime_anomaly_escalation() {
         .skip(20)
         .map(|e| e.risk_score)
         .collect();
-    let max_adversarial_score = adversarial_scores.iter().cloned().fold(0.0_f64, f64::max);
+    let max_adversarial_score = adversarial_scores.iter().copied().fold(0.0_f64, f64::max);
 
     log_scenario_event(
         &harness,
@@ -503,7 +502,7 @@ fn scenario_runtime_anomaly_escalation() {
         &[
             ("calls", "15".to_string()),
             ("max_risk_score", format!("{max_adversarial_score:.4}")),
-            ("actions", format!("{:?}", adversarial_actions)),
+            ("actions", format!("{adversarial_actions:?}")),
         ],
     );
 
@@ -541,8 +540,7 @@ fn scenario_runtime_anomaly_escalation() {
     let verification = verify_runtime_risk_ledger_artifact(&full_ledger);
     assert!(
         verification.valid,
-        "Ledger must remain valid through escalation: {:?}",
-        verification
+        "Ledger must remain valid through escalation: {verification:?}"
     );
 
     log_scenario_event(
@@ -568,12 +566,10 @@ fn scenario_quota_breach_enforcement() {
     let harness = TestHarness::new("scenario_quota_breach_enforcement");
     let ext_id = "quota-breacher";
 
-    use pi::extensions::{ExtensionOverride, ExtensionQuotaConfig};
-
     let (tools, http, manager, policy) = setup(&harness, default_risk_config());
 
     // Set tight quotas via per-extension override
-    let mut tight_policy = policy.clone();
+    let mut tight_policy = policy;
     tight_policy.per_extension.insert(
         ext_id.to_string(),
         ExtensionOverride {
@@ -669,7 +665,7 @@ fn scenario_policy_profile_escalation() {
 
     // Under safe policy, exec should be denied
     assert!(
-        matches!(safe_check.decision, PolicyDecision::Deny { .. }),
+        matches!(safe_check.decision, PolicyDecision::Deny),
         "Safe profile should deny exec: got {:?}",
         safe_check.decision
     );
@@ -1153,7 +1149,7 @@ fn scenario_jsonl_contract_conformance() {
             v.get("context")
                 .and_then(|c| c.get("schema"))
                 .and_then(|s| s.as_str())
-                .map_or(false, |s| s == E2E_SCENARIO_SCHEMA)
+                == Some(E2E_SCENARIO_SCHEMA)
         })
         .collect();
 
@@ -1400,6 +1396,7 @@ fn scenario_filtered_incident_bundle() {
 /// quarantine-level risk → evidence bundle export → verification.
 /// This is the "golden path" E2E test.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_full_attack_lifecycle() {
     let harness = TestHarness::new("scenario_full_attack_lifecycle");
     let _span = harness.log().begin_span("full_attack_lifecycle");

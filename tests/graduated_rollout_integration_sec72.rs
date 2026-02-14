@@ -28,8 +28,7 @@ use common::TestHarness;
 use pi::connectors::http::HttpConnector;
 use pi::extensions::{
     ExtensionManager, ExtensionPolicy, ExtensionPolicyMode, HostCallContext, HostCallPayload,
-    RollbackTrigger, RolloutPhase, RolloutState, RuntimeRiskConfig,
-    dispatch_host_call_shared,
+    RollbackTrigger, RolloutPhase, RolloutState, RuntimeRiskConfig, dispatch_host_call_shared,
 };
 use pi::tools::ToolRegistry;
 use serde_json::json;
@@ -63,7 +62,12 @@ const fn default_risk_config() -> RuntimeRiskConfig {
 fn setup(
     harness: &TestHarness,
     config: RuntimeRiskConfig,
-) -> (ToolRegistry, HttpConnector, ExtensionManager, ExtensionPolicy) {
+) -> (
+    ToolRegistry,
+    HttpConnector,
+    ExtensionManager,
+    ExtensionPolicy,
+) {
     let tools = ToolRegistry::new(&[], harness.temp_dir(), None);
     let http = HttpConnector::with_defaults();
     let manager = ExtensionManager::new();
@@ -248,7 +252,7 @@ fn fp_rate_triggers_rollback() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -295,7 +299,7 @@ fn error_rate_triggers_rollback() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceNew);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.50, // High FP threshold (won't trigger)
         max_error_rate: 0.10,
         window_size: 20,
@@ -318,7 +322,7 @@ fn latency_slo_triggers_rollback() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.50,
         max_error_rate: 0.50,
         window_size: 20,
@@ -340,7 +344,7 @@ fn no_rollback_below_min_samples() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 100,
@@ -363,7 +367,7 @@ fn no_rollback_below_min_samples() {
 fn no_rollback_in_shadow_phase() {
     let manager = ExtensionManager::new();
     manager.set_rollout_phase(RolloutPhase::Shadow);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.01,
         max_error_rate: 0.01,
         window_size: 10,
@@ -382,7 +386,7 @@ fn no_rollback_in_shadow_phase() {
 fn no_rollback_in_log_only_phase() {
     let manager = ExtensionManager::new();
     manager.set_rollout_phase(RolloutPhase::LogOnly);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.01,
         max_error_rate: 0.01,
         window_size: 10,
@@ -405,7 +409,7 @@ fn re_advance_after_rollback() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -456,7 +460,7 @@ fn rollout_state_window_stats_accuracy() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.90, // Very high — won't trigger
         max_error_rate: 0.90,
         window_size: 100,
@@ -484,7 +488,7 @@ fn custom_trigger_thresholds_are_respected() {
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
 
     // Set very permissive triggers — should not rollback even with many FPs.
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.95,
         max_error_rate: 0.95,
         window_size: 100,
@@ -509,7 +513,7 @@ fn trigger_update_takes_effect_immediately() {
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
 
     // Initially permissive triggers.
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 20,
@@ -523,7 +527,7 @@ fn trigger_update_takes_effect_immediately() {
 
     // Now tighten the trigger — the existing window should cause rollback
     // on the next decision.
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -624,7 +628,7 @@ fn full_lifecycle_advance_rollback_readvance() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::Shadow);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -761,7 +765,7 @@ fn window_stats_latency_average() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 100,
@@ -786,7 +790,7 @@ fn window_evicts_old_samples() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 10,
@@ -834,7 +838,7 @@ fn rollback_from_enforce_new_records_provenance() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceNew);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.05,
         max_error_rate: 0.10,
         window_size: 20,
@@ -880,7 +884,7 @@ fn window_stats_in_rollout_state_artifact() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 100,
@@ -911,7 +915,7 @@ fn concurrent_decision_recording() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 1000,
@@ -950,7 +954,7 @@ fn mixed_error_and_fp_both_tracked() {
     let manager = ExtensionManager::new();
     manager.set_runtime_risk_config(default_risk_config());
     manager.set_rollout_phase(RolloutPhase::EnforceAll);
-    manager.set_rollback_trigger(RollbackTrigger {
+    manager.set_rollback_trigger(&RollbackTrigger {
         max_false_positive_rate: 0.99,
         max_error_rate: 0.99,
         window_size: 100,

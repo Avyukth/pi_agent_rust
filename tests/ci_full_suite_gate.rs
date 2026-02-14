@@ -739,9 +739,7 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
         bead: "bd-1a2cu".to_string(),
         status,
         blocking: true,
-        artifact_path: Some(
-            "tests/full_suite_gate/sec_conformance_verdict.json".to_string(),
-        ),
+        artifact_path: Some("tests/full_suite_gate/sec_conformance_verdict.json".to_string()),
         detail,
         reproduce_command: Some(
             "cargo test --test sec_compatibility_conformance -- --nocapture".to_string(),

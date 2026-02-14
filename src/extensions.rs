@@ -1752,7 +1752,7 @@ impl RolloutTracker {
         };
         self.phase = next;
         self.last_transition_ms = runtime_risk_now_ms();
-        self.transition_count += 1;
+        self.transition_count = self.transition_count.saturating_add(1);
         self.rolled_back_from = None;
         true
     }
@@ -1763,7 +1763,7 @@ impl RolloutTracker {
             self.rolled_back_from = Some(self.phase);
             self.phase = RolloutPhase::Shadow;
             self.last_transition_ms = runtime_risk_now_ms();
-            self.transition_count += 1;
+            self.transition_count = self.transition_count.saturating_add(1);
         }
     }
 
@@ -1773,7 +1773,7 @@ impl RolloutTracker {
             self.rolled_back_from = None;
             self.phase = phase;
             self.last_transition_ms = runtime_risk_now_ms();
-            self.transition_count += 1;
+            self.transition_count = self.transition_count.saturating_add(1);
         }
     }
 
@@ -1842,7 +1842,7 @@ impl RolloutTracker {
             if s.was_false_positive {
                 fps += 1;
             }
-            total_lat += s.latency_ms;
+            total_lat = total_lat.saturating_add(s.latency_ms);
         }
         RollbackWindowStats {
             total_decisions: n,
@@ -2316,7 +2316,12 @@ fn classify_recursive_delete(lower: &str) -> bool {
     if !lower.contains("rm") {
         return false;
     }
-    let has_rf = lower.contains("-rf") || lower.contains("-fr") || lower.contains("--recursive");
+    // Detect recursive+force in any combination: -rf, -fr, --recursive,
+    // or separate flags like -r -f / -f -r.
+    let has_rf = lower.contains("-rf")
+        || lower.contains("-fr")
+        || lower.contains("--recursive")
+        || (lower.contains("-r") && lower.contains("-f"));
     if !has_rf {
         return false;
     }
@@ -5052,10 +5057,30 @@ fn redact_security_alert(alert: &mut SecurityAlert, policy: &IncidentBundleRedac
     }
 }
 
-/// Compute the SHA-256 integrity hash of a bundle's content sections.
+/// Compute the SHA-256 integrity hash of a bundle's content and metadata.
+///
+/// Covers all sections including summary, filter, redaction policy, schema,
+/// and timestamp to prevent metadata tampering.
 pub fn compute_incident_bundle_hash(bundle: &IncidentEvidenceBundle) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    // Include metadata fields to prevent tampering with summary, filter, etc.
+    hasher.update(bundle.schema.as_bytes());
+    hasher.update(b"|");
+    hasher.update(bundle.generated_at_ms.to_le_bytes());
+    hasher.update(b"|");
+    hasher.update(
+        serde_json::to_string(&bundle.filter)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(b"|");
+    hasher.update(
+        serde_json::to_string(&bundle.redaction)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(b"|");
     hasher.update(
         serde_json::to_string(&bundle.risk_ledger)
             .unwrap_or_default()
@@ -5094,6 +5119,12 @@ pub fn compute_incident_bundle_hash(bundle: &IncidentEvidenceBundle) -> String {
     hasher.update(b"|");
     hasher.update(
         serde_json::to_string(&bundle.risk_replay)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(b"|");
+    hasher.update(
+        serde_json::to_string(&bundle.summary)
             .unwrap_or_default()
             .as_bytes(),
     );
@@ -13032,13 +13063,19 @@ async fn dispatch_shared_allowed(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             // Extract args for mediation classification.
+            // IMPORTANT: Must use the same normalization as dispatch_hostcall_exec
+            // (which converts non-string values via to_string) to prevent bypass
+            // by passing dangerous arguments as non-string JSON types.
             let args: Vec<String> = call
                 .params
                 .get("args")
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .map(|v| {
+                            v.as_str()
+                                .map_or_else(|| v.to_string(), ToString::to_string)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
@@ -14917,8 +14954,7 @@ impl ExtensionManager {
         let mut guard = self.inner.lock().unwrap();
         let advanced = guard.rollout_tracker.advance();
         if advanced {
-            guard.runtime_risk_config.enforce =
-                guard.rollout_tracker.phase.is_enforcing();
+            guard.runtime_risk_config.enforce = guard.rollout_tracker.phase.is_enforcing();
         }
         advanced
     }
@@ -14932,9 +14968,10 @@ impl ExtensionManager {
         was_false_positive: bool,
     ) -> bool {
         let mut guard = self.inner.lock().unwrap();
-        let triggered = guard
-            .rollout_tracker
-            .record_decision(latency_ms, was_error, was_false_positive);
+        let triggered =
+            guard
+                .rollout_tracker
+                .record_decision(latency_ms, was_error, was_false_positive);
         if triggered {
             guard.runtime_risk_config.enforce = false;
         }
@@ -14942,9 +14979,24 @@ impl ExtensionManager {
     }
 
     /// Configure the rollback trigger thresholds.
-    pub fn set_rollback_trigger(&self, trigger: RollbackTrigger) {
+    pub fn set_rollback_trigger(&self, trigger: &RollbackTrigger) {
         let mut guard = self.inner.lock().unwrap();
-        guard.rollout_tracker.trigger = trigger;
+        // Validate inputs to prevent misconfiguration that could silently
+        // disable rollback triggers (NaN, 0 window, negative rates).
+        guard.rollout_tracker.trigger = RollbackTrigger {
+            max_false_positive_rate: if trigger.max_false_positive_rate.is_nan() {
+                RollbackTrigger::default().max_false_positive_rate
+            } else {
+                trigger.max_false_positive_rate.clamp(0.0, 1.0)
+            },
+            max_error_rate: if trigger.max_error_rate.is_nan() {
+                RollbackTrigger::default().max_error_rate
+            } else {
+                trigger.max_error_rate.clamp(0.0, 1.0)
+            },
+            window_size: trigger.window_size.clamp(10, 10_000),
+            max_latency_ms: trigger.max_latency_ms.max(1),
+        };
     }
 
     /// Get a snapshot of the current rollout state for operator inspection.
@@ -31507,11 +31559,11 @@ mod tests {
             category: Some(SecurityAlertCategory::PolicyDenial),
             ..Default::default()
         };
-        let filtered: Vec<_> = alerts
+        let count = alerts
             .into_iter()
-            .filter(|a| filter.category.map_or(true, |c| a.category == c))
-            .collect();
-        assert_eq!(filtered.len(), 2);
+            .filter(|a| filter.category.is_none_or(|c| a.category == c))
+            .count();
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -31525,11 +31577,11 @@ mod tests {
             min_severity: Some(SecurityAlertSeverity::Error),
             ..Default::default()
         };
-        let filtered: Vec<_> = alerts
+        let count = alerts
             .into_iter()
-            .filter(|a| filter.min_severity.map_or(true, |s| a.severity >= s))
-            .collect();
-        assert_eq!(filtered.len(), 2);
+            .filter(|a| filter.min_severity.is_none_or(|s| a.severity >= s))
+            .count();
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -31548,7 +31600,7 @@ mod tests {
                 filter
                     .extension_id
                     .as_ref()
-                    .map_or(true, |e| a.extension_id == *e)
+                    .is_none_or(|e| a.extension_id == *e)
             })
             .collect();
         assert_eq!(filtered.len(), 1);
@@ -31618,9 +31670,15 @@ mod tests {
     fn kill_switch_quarantines_in_risk_controller() {
         let mgr = ExtensionManager::new();
         mgr.kill_switch("ext-b", "threat detected", "system");
-        let guard = mgr.inner.lock().unwrap();
-        let state = guard.runtime_risk_states.get("ext-b").unwrap();
-        assert!(state.quarantined);
+        let quarantined = mgr
+            .inner
+            .lock()
+            .unwrap()
+            .runtime_risk_states
+            .get("ext-b")
+            .unwrap()
+            .quarantined;
+        assert!(quarantined);
     }
 
     #[test]
@@ -31700,8 +31758,14 @@ mod tests {
         let mgr = ExtensionManager::new();
         mgr.kill_switch("ext-i", "threat", "user");
         mgr.lift_kill_switch("ext-i", "safe now", "admin");
-        let guard = mgr.inner.lock().unwrap();
-        let state = guard.runtime_risk_states.get("ext-i").unwrap();
+        let state = mgr
+            .inner
+            .lock()
+            .unwrap()
+            .runtime_risk_states
+            .get("ext-i")
+            .unwrap()
+            .clone();
         assert!(!state.quarantined);
         assert_eq!(state.consecutive_unsafe, 0);
     }
@@ -31774,9 +31838,15 @@ mod tests {
     fn trust_onboarding_reject_quarantines() {
         let mgr = ExtensionManager::new();
         mgr.record_trust_onboarding("ext-p", "critical", false, "user");
-        let guard = mgr.inner.lock().unwrap();
-        let state = guard.runtime_risk_states.get("ext-p").unwrap();
-        assert!(state.quarantined);
+        let quarantined = mgr
+            .inner
+            .lock()
+            .unwrap()
+            .runtime_risk_states
+            .get("ext-p")
+            .unwrap()
+            .quarantined;
+        assert!(quarantined);
     }
 
     #[test]

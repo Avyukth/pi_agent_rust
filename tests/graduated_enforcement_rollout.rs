@@ -343,8 +343,8 @@ fn window_evicts_old_samples_beyond_limit() {
     tracker.trigger.window_size = 5;
 
     // Record 10 decisions
-    for i in 0..10 {
-        tracker.record_decision(i as u64, false, false);
+    for i in 0u64..10 {
+        tracker.record_decision(i, false, false);
     }
     let stats = tracker.window_stats();
     // Only last 5 should remain

@@ -337,6 +337,12 @@ where
                         // Accumulate text into partial
                         let last_is_text =
                             matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
+
+                        // Ensure Start is emitted before any TextStart/TextDelta events
+                        // so downstream consumers see the correct event order:
+                        // Start → TextStart → TextDelta
+                        self.ensure_started();
+
                         let content_index = if last_is_text {
                             self.partial.content.len() - 1
                         } else {
@@ -356,8 +362,6 @@ where
                         {
                             t.text.push_str(&text);
                         }
-
-                        self.ensure_started();
 
                         self.pending_events.push_back(StreamEvent::TextDelta {
                             content_index,

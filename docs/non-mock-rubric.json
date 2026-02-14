@@ -12,7 +12,7 @@
   },
 
   "module_thresholds": {
-    "_doc": "Per-module coverage minimums. 'floor' is the hard CI-gate minimum (fail below). 'target' is the aspirational goal. Branch enforcement is deferred, but coverage artifacts must emit deterministic fallback branch metrics (0.0/0/0) while llvm-cov branch-summary crashes persist (see coverage baseline).",
+    "_doc": "Per-module coverage minimums. 'floor' is the hard CI-gate minimum (fail below). 'target' is the aspirational goal. Branch metrics are available for 63/107 source files via per-file llvm-cov export workaround (51.95% branch coverage). Branch floor enforcement is deferred until full-file coverage is achievable (see coverage-baseline-map.json).",
     "global": {
       "line_floor_pct": 75.0,
       "function_floor_pct": 73.0,
@@ -402,7 +402,7 @@
       "command": "cargo llvm-cov --workspace --lib --json --summary-only --output-path target/coverage-summary.json --ignore-run-fail",
       "evaluation": "Compare target/coverage-summary.json per-file metrics against module_thresholds.modules[].line_floor_pct and function_floor_pct.",
       "failure_mode": "CI job fails if any module's line or function coverage drops below its floor.",
-      "notes": "Branch coverage gate is deferred until llvm-cov branch-summary crash is resolved; fallback branch metrics are still required in coverage artifacts."
+      "notes": "Branch metrics now available for 63/107 files (51.95%) via per-file llvm-cov export workaround. Branch gate deferred until full-file coverage is achievable. See docs/coverage-baseline-map.json for deterministic command path."
     },
     "exception_audit": {
       "source": "docs/testing-policy.md (Allowlisted Exceptions table)",

@@ -656,9 +656,16 @@ impl Session {
                 let mut diagnostics = SessionOpenDiagnostics::default();
 
                 for (line_num, line_res) in lines.enumerate() {
-                    let line = line_res.map_err(|e| {
-                        crate::Error::session(format!("Failed to read line {}: {e}", line_num + 2))
-                    })?;
+                    let line = match line_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            diagnostics.skipped_entries.push(SessionOpenSkippedEntry {
+                                line_number: line_num + 2,
+                                error: format!("I/O read error: {e}"),
+                            });
+                            continue;
+                        }
+                    };
 
                     match serde_json::from_str::<SessionEntry>(&line) {
                         Ok(entry) => entries.push(entry),
@@ -1578,7 +1585,12 @@ impl Session {
         start_id: &str,
     ) -> String {
         let mut current = start_id.to_string();
+        let mut visited = HashSet::new();
         loop {
+            if !visited.insert(current.clone()) {
+                tracing::warn!("Cycle detected in session tree at entry: {current}");
+                return current;
+            }
             let children = children_map.get(&Some(current.clone()));
             match children.and_then(|c| c.first()) {
                 Some(child) => current.clone_from(child),

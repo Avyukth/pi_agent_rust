@@ -16,6 +16,7 @@ pub fn register_crypto_hostcalls(global: &rquickjs::Object<'_>) -> rquickjs::Res
     register_hmac_hostcall(global)?;
     register_uuid_hostcall(global)?;
     register_random_int_hostcall(global)?;
+    register_random_bytes_hostcall(global)?;
     register_timing_safe_equal_hostcall(global)?;
     Ok(())
 }
@@ -148,6 +149,14 @@ fn register_random_int_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Resu
     )
 }
 
+fn register_random_bytes_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<()> {
+    // __pi_crypto_random_bytes_native(size) -> hex string of random bytes
+    global.set(
+        "__pi_crypto_random_bytes_native",
+        Func::from(|size: usize| -> String { hex_lower(&random_bytes(size)) }),
+    )
+}
+
 fn register_timing_safe_equal_hostcall(global: &rquickjs::Object<'_>) -> rquickjs::Result<()> {
     // __pi_crypto_timing_safe_equal_native(a_hex, b_hex) -> bool
     global.set(
@@ -269,7 +278,8 @@ export function createHash(algorithm) {
       if (!encoding) return hexToBuffer(hex);
       if (encoding === 'hex') return hex;
       if (encoding === 'base64') {
-        return hashNative(algorithm, data, 'base64');
+        const buf = hexToBuffer(hex);
+        return globalThis.btoa(String.fromCharCode(...buf));
       }
       throw new Error(`createHash.digest: unsupported encoding '${encoding}'`);
     },
@@ -289,7 +299,8 @@ export function createHmac(algorithm, key) {
       if (!encoding) return hexToBuffer(hex);
       if (encoding === 'hex') return hex;
       if (encoding === 'base64') {
-        return hmacNative(algorithm, String(key), data, 'base64');
+        const buf = hexToBuffer(hex);
+        return globalThis.btoa(String.fromCharCode(...buf));
       }
       throw new Error(`createHmac.digest: unsupported encoding '${encoding}'`);
     },
@@ -304,14 +315,7 @@ export function randomBytes(size) {
     '__pi_crypto_random_bytes_native',
     'randomBytes',
   );
-  const arr = new Uint8Array(randomBytesNative(size));
-  const hex = bufToHex(arr);
-  arr.toString = function(enc) {
-    if (enc === 'hex') return hex;
-    if (enc === 'base64') return globalThis.btoa(String.fromCharCode(...this));
-    return new TextDecoder().decode(this);
-  };
-  return arr;
+  return hexToBuffer(randomBytesNative(size));
 }
 
 export function randomInt(min, max) {
@@ -647,6 +651,19 @@ mod tests {
         h.update(b"hello");
         let result = encode_output(&h.finalize(), "base64");
         assert_eq!(result, "LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=");
+    }
+
+    // ─── random_bytes hostcall returns valid hex ──────────────────────────
+
+    #[test]
+    fn random_bytes_hostcall_roundtrip() {
+        // Verify the hex encoding used by the hostcall decodes back correctly.
+        for len in [0, 1, 8, 16, 32] {
+            let hex = hex_lower(&random_bytes(len));
+            assert_eq!(hex.len(), len * 2, "hex should be 2x the byte length");
+            let decoded = hex_decode(&hex);
+            assert_eq!(decoded.len(), len, "decoded length should match original");
+        }
     }
 
     // ─── NODE_CRYPTO_JS constant is non-empty ────────────────────────────

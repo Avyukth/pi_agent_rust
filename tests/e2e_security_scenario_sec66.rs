@@ -395,6 +395,7 @@ fn scenario_adversarial_escalation_triggers_alerts() {
 // ============================================================================
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_trust_lifecycle_full_cycle() {
     let harness = TestHarness::new("scenario_trust_lifecycle");
     let manager = ExtensionManager::new();
@@ -878,6 +879,7 @@ fn scenario_shadow_vs_enforcement_mode() {
 // ============================================================================
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn scenario_rollback_recovery_after_incident() {
     let harness = TestHarness::new("scenario_rollback_recovery");
     let (tools, http, manager, policy) = setup(&harness, default_risk_config());

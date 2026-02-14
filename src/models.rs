@@ -445,7 +445,9 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 if provider_cfg.api.is_some() {
                     entry.model.api.clone_from(&provider_api_string);
                 }
-                entry.headers.clone_from(&provider_headers);
+                if provider_cfg.headers.is_some() {
+                    entry.headers.clone_from(&provider_headers);
+                }
                 if provider_key.is_some() {
                     entry.api_key.clone_from(&provider_key);
                 }

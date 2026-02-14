@@ -613,6 +613,10 @@ enum AnthropicContent {
     Text {
         text: String,
     },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     Image {
         source: AnthropicImageSource,
     },
@@ -823,8 +827,18 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
             name: tc.name.clone(),
             input: tc.arguments.clone(),
         }),
-        // Thinking blocks are not sent back to the API
-        ContentBlock::Thinking(_) | ContentBlock::Image(_) => None,
+        // Thinking blocks must be echoed back with their signature for
+        // multi-turn extended thinking.  Skip blocks without a signature
+        // (the API would reject them).
+        ContentBlock::Thinking(t) => {
+            t.thinking_signature
+                .as_ref()
+                .map(|sig| AnthropicContent::Thinking {
+                    thinking: t.thinking.clone(),
+                    signature: sig.clone(),
+                })
+        }
+        ContentBlock::Image(_) => None,
     }
 }
 

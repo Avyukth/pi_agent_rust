@@ -1698,9 +1698,9 @@ impl PiApp {
                                             Some(format!("Switched to theme: {theme_name}"));
                                     }
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     self.status_message =
-                                        Some("Failed to load selected theme".to_string());
+                                        Some(format!("Failed to load selected theme: {e}"));
                                 }
                             }
                         }

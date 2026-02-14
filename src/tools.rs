@@ -1740,18 +1740,25 @@ fn map_normalized_range_to_original(
         let trimmed_len = line_content.trim_end().len();
 
         for (char_offset, c) in line_content.char_indices() {
-            if norm_idx == norm_match_start && match_start.is_none() {
-                match_start = Some(orig_idx + char_offset);
-            }
+            // match_end can be detected at any position including trailing
+            // whitespace — it correctly points to right after the last content char.
             if norm_idx == norm_match_end && match_end.is_none() {
                 match_end = Some(orig_idx + char_offset);
-            }
-            if match_start.is_some() && match_end.is_some() {
-                break;
             }
 
             if char_offset >= trimmed_len {
                 continue;
+            }
+
+            // match_start must only be detected at non-trailing-whitespace positions.
+            // During trailing whitespace, norm_idx is "frozen" at the value after the
+            // last real char, which corresponds to the newline in normalized content —
+            // not the trailing space. The post-loop newline check handles that case.
+            if norm_idx == norm_match_start && match_start.is_none() {
+                match_start = Some(orig_idx + char_offset);
+            }
+            if match_start.is_some() && match_end.is_some() {
+                break;
             }
 
             let normalized_char = if is_special_unicode_space(c) {

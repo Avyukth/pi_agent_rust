@@ -100,7 +100,7 @@ Every test file belongs to exactly one suite. See `tests/suite_classification.to
 | `request URL mismatch` in VCR | Model ID drift | VCR uses strict URL matching. Ensure model ID in test matches cassette URL path |
 | `connection refused` | Missing test infrastructure | Check if mock server or VCR is configured; verify `VCR_MODE` env var |
 | `DummyProvider` / `NullSession` in unit test | Policy violation | Move test to VCR suite or replace double with real implementation |
-| `SIGSEGV` in `llvm-cov` | Known toolchain bug | Use deterministic branch fallback metrics (`branch_pct=0.0`, `branch_count=0`, `covered_branch_count=0`) and continue gating on line/function (see bd-1f42.1.5) |
+| `SIGSEGV` in `llvm-cov` | LLVM bug with branch coverage on large files | Use per-file `llvm-cov export -sources FILE -summary-only` workaround. 63/107 files work; 44 files SIGSEGV. See `docs/coverage-baseline-map.json` for the full file list and deterministic command path (bd-1f42.1.5) |
 | `thread panicked` in extension test | Extension dispatcher issue | Check `src/extension_dispatcher.rs`; review mock stub usage |
 | Flaky: passes locally, fails on CI | Non-determinism | Classify per flake taxonomy (FLAKE-TIMING/ENV/NET/RES/EXT/LOGIC) |
 | `No such file or directory` for cassette | Missing VCR fixture | Record new cassette or check cassette naming convention |
