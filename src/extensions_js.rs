@@ -11767,6 +11767,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let process_cwd = self.config.cwd.clone();
         let process_args = self.config.args.clone();
         let env = self.config.env.clone();
+        let repair_mode = self.config.repair_mode;
+        let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
 
