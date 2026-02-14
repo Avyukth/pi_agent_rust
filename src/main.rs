@@ -258,7 +258,7 @@ fn policy_reason_detail(reason: &str) -> &'static str {
     }
 }
 
-fn capability_remediation(capability: Capability, decision: &PolicyDecision) -> serde_json::Value {
+fn capability_remediation(capability: Capability, decision: PolicyDecision) -> serde_json::Value {
     let is_dangerous = capability.is_dangerous();
 
     let (to_allow_cli, to_allow_config, recommendation) = match (is_dangerous, decision) {
@@ -355,7 +355,7 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
                 "decision": check.decision,
                 "reason": check.reason,
                 "reason_detail": policy_reason_detail(&check.reason),
-                "remediation": capability_remediation(*capability, &check.decision),
+                "remediation": capability_remediation(*capability, check.decision),
             })
         })
         .collect::<Vec<_>>();
@@ -369,7 +369,7 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
                 "decision": check.decision,
                 "reason": check.reason,
                 "reason_detail": policy_reason_detail(&check.reason),
-                "remediation": capability_remediation(*capability, &check.decision),
+                "remediation": capability_remediation(*capability, check.decision),
             })
         })
         .collect::<Vec<_>>();

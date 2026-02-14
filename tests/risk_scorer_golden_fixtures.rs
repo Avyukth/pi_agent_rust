@@ -645,7 +645,9 @@ fn golden_score_escalation_pattern() {
         .collect();
 
     // Exec calls should generally have higher risk scores than benign calls
+    #[allow(clippy::cast_precision_loss)]
     let avg_benign: f64 = benign_scores.iter().sum::<f64>() / benign_scores.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
     let avg_exec: f64 = exec_scores.iter().sum::<f64>() / exec_scores.len() as f64;
 
     assert!(
