@@ -10,7 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-pi_agent_rust = { path = "..", default-features = false, features = ["fuzzing"] }
+pi = { package = "pi_agent_rust", path = "..", default-features = false, features = ["fuzzing"] }
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -31,4 +34,24 @@ debug = 1
 [[bin]]
 name = "fuzz_smoke"
 path = "fuzz_targets/fuzz_smoke.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sse_parser"
+path = "fuzz_targets/fuzz_sse_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sse_stream"
+path = "fuzz_targets/fuzz_sse_stream.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_session_jsonl"
+path = "fuzz_targets/fuzz_session_jsonl.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_session_entry"
+path = "fuzz_targets/fuzz_session_entry.rs"
 doc = false
