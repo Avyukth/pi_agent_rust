@@ -574,6 +574,17 @@ pub fn process_file_arguments(
             continue;
         }
 
+        if meta.len() > READ_TOOL_MAX_BYTES {
+            let path_str = absolute_path.display();
+            let _ = writeln!(
+                out.text,
+                "<file name=\"{path_str}\">\n[File is too large ({} bytes). Max allowed is {} bytes.]\n</file>",
+                meta.len(),
+                READ_TOOL_MAX_BYTES
+            );
+            continue;
+        }
+
         let bytes = std::fs::read(&absolute_path).map_err(|e| {
             Error::tool(
                 "read",
@@ -625,8 +636,20 @@ pub fn process_file_arguments(
         let content = String::from_utf8_lossy(&bytes);
         let path_str = absolute_path.display();
         let _ = writeln!(out.text, "<file name=\"{path_str}\">");
-        out.text.push_str(&content);
-        if !content.ends_with('\n') {
+
+        let truncation = truncate_head(&content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        out.text.push_str(&truncation.content);
+
+        if truncation.truncated {
+            let _ = write!(
+                out.text,
+                "\n... [Truncated: showing {}/{} lines, {}/{} bytes]",
+                truncation.output_lines,
+                truncation.total_lines,
+                format_size(truncation.output_bytes),
+                format_size(truncation.total_bytes)
+            );
+        } else if !content.ends_with('\n') {
             out.text.push('\n');
         }
         let _ = writeln!(out.text, "</file>");
@@ -1977,6 +2000,7 @@ impl Tool for EditTool {
                 },
                 "oldText": {
                     "type": "string",
+                    "minLength": 1,
                     "description": "Exact text to find and replace (must match exactly)"
                 },
                 "newText": {
@@ -2046,6 +2070,13 @@ impl Tool for EditTool {
         let normalized_content = normalize_to_lf(&content_no_bom);
         let normalized_old_text = normalize_to_lf(&input.old_text);
         let normalized_new_text = normalize_to_lf(&input.new_text);
+
+        if normalized_old_text.is_empty() {
+            return Err(Error::tool(
+                "edit",
+                "The old text cannot be empty. To prepend text, include the first line's content in oldText and newText.".to_string(),
+            ));
+        }
 
         let match_result = fuzzy_find_text(&normalized_content, &normalized_old_text);
         if !match_result.found {
@@ -2117,13 +2148,15 @@ impl Tool for EditTool {
         asupersync::fs::write(temp_file.path(), &final_content)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to write temp file: {e}")))?;
+
+        // Restore original file permissions (tempfile defaults to 0o600) before persisting.
+        if let Some(perms) = original_perms {
+            let _ = temp_file.as_file().set_permissions(perms);
+        }
+
         temp_file
             .persist(&absolute_path)
             .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
-        // Restore original file permissions (tempfile defaults to 0o600).
-        if let Some(perms) = original_perms {
-            let _ = std::fs::set_permissions(&absolute_path, perms);
-        }
 
         let (diff, first_changed_line) = generate_diff_string(&base_content, &new_content);
         let mut details = serde_json::Map::new();
@@ -2233,14 +2266,15 @@ impl Tool for WriteTool {
             .await
             .map_err(|e| Error::tool("write", format!("Failed to write temp file: {e}")))?;
 
+        // Restore original file permissions (tempfile defaults to 0o600) before persisting.
+        if let Some(perms) = original_perms {
+            let _ = temp_file.as_file().set_permissions(perms);
+        }
+
         // Persist (atomic rename)
         temp_file
             .persist(&path)
             .map_err(|e| Error::tool("write", format!("Failed to persist file: {e}")))?;
-        // Restore original file permissions (tempfile defaults to 0o600).
-        if let Some(perms) = original_perms {
-            let _ = std::fs::set_permissions(&path, perms);
-        }
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
@@ -4161,6 +4195,37 @@ mod tests {
                 )
                 .await;
             assert!(err.is_err());
+        });
+    }
+
+    #[test]
+    fn test_edit_empty_old_text_error() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("code.rs");
+            std::fs::write(&path, "fn foo() {}").unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "",
+                        "newText": "prefix"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("empty oldText should be rejected");
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("old text cannot be empty"),
+                "unexpected error: {msg}"
+            );
+            let after = std::fs::read_to_string(path).unwrap();
+            assert_eq!(after, "fn foo() {}");
         });
     }
 

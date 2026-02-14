@@ -212,6 +212,7 @@ pub fn is_env_var_allowed(key: &str) -> bool {
         "_PASSWD",
         "_CREDENTIAL",
         "_CREDENTIALS",
+        "_TOKEN",
     ];
     const BLOCKED_PREFIXES: &[&str] = &["AWS_SECRET_", "AWS_SESSION_"];
 
@@ -6523,7 +6524,7 @@ export function createEditTool(_cwd, _opts = {}) {
       type: "object",
       properties: {
         path: { type: "string", description: "The path to the file to edit" },
-        oldText: { type: "string", description: "The exact text to find and replace" },
+        oldText: { type: "string", minLength: 1, description: "The exact text to find and replace" },
         newText: { type: "string", description: "The text to replace oldText with" },
       },
       required: ["path", "oldText", "newText"],
