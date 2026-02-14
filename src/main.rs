@@ -1665,6 +1665,7 @@ fn provider_from_token(token: &str) -> Option<ProviderChoice> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_first_time_setup(
     startup_error: &StartupError,
     auth: &mut AuthStorage,
@@ -1708,11 +1709,9 @@ async fn run_first_time_setup(
         "  [cyan]{})[/] Custom provider via models.json\n",
         num_choices + 1
     ));
-    console.print_markup(&format!(
-        "  [cyan]{})[/] Exit setup\n\n",
-        num_choices + 2
-    ));
-    console.print_markup("[dim]Or type any provider name (e.g., deepseek, cerebras, ollama).[/]\n\n");
+    console.print_markup(&format!("  [cyan]{})[/] Exit setup\n\n", num_choices + 2));
+    console
+        .print_markup("[dim]Or type any provider name (e.g., deepseek, cerebras, ollama).[/]\n\n");
 
     let custom_num = (num_choices + 1).to_string();
     let exit_num = (num_choices + 2).to_string();
@@ -2229,10 +2228,7 @@ mod tests {
         assert_eq!(provider_from_token("cohere").unwrap().id, "cohere");
         assert_eq!(provider_from_token("perplexity").unwrap().id, "perplexity");
         // Aliases resolve through metadata
-        assert_eq!(
-            provider_from_token("open-router").unwrap().id,
-            "openrouter"
-        );
+        assert_eq!(provider_from_token("open-router").unwrap().id, "openrouter");
         assert_eq!(provider_from_token("dashscope").unwrap().id, "alibaba");
     }
 
