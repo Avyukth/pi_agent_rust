@@ -9,6 +9,7 @@
 // Allow dead code and unused async during scaffolding phase - remove once implementation is complete
 #![allow(dead_code, clippy::unused_async)]
 
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1517,7 +1518,7 @@ impl PackageFilterState {
         }
     }
 
-    fn values_for_kind(&self, kind: ConfigResourceKind) -> Option<&Vec<String>> {
+    const fn values_for_kind(&self, kind: ConfigResourceKind) -> Option<&Vec<String>> {
         match kind {
             ConfigResourceKind::Extensions => self.extensions.as_ref(),
             ConfigResourceKind::Skills => self.skills.as_ref(),
@@ -1526,7 +1527,7 @@ impl PackageFilterState {
         }
     }
 
-    fn has_any_field(&self) -> bool {
+    const fn has_any_field(&self) -> bool {
         self.extensions.is_some()
             || self.skills.is_some()
             || self.prompts.is_some()
@@ -1594,9 +1595,13 @@ impl ConfigUiApp {
             return;
         }
 
-        let current = self.selected as isize;
-        let next = (current + delta).clamp(0, (total.saturating_sub(1)) as isize) as usize;
-        self.selected = next;
+        let max_index = total.saturating_sub(1);
+        let step = delta.unsigned_abs();
+        if delta.is_negative() {
+            self.selected = self.selected.saturating_sub(step);
+        } else {
+            self.selected = self.selected.saturating_add(step).min(max_index);
+        }
     }
 
     fn toggle_selected(&mut self) {
@@ -1611,20 +1616,22 @@ impl ConfigUiApp {
         }
     }
 
-    fn finish(&mut self, save_requested: bool) -> Option<Cmd> {
+    fn finish(&self, save_requested: bool) -> Cmd {
         if let Ok(mut slot) = self.result_slot.lock() {
             *slot = Some(ConfigUiResult {
                 save_requested,
                 packages: self.packages.clone(),
             });
         }
-        Some(quit())
+        quit()
     }
 
+    #[allow(clippy::missing_const_for_fn, clippy::unused_self)]
     fn init(&self) -> Option<Cmd> {
         None
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn update(&mut self, msg: BubbleMessage) -> Option<Cmd> {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             match key.key_type {
@@ -1633,9 +1640,9 @@ impl ConfigUiApp {
                 KeyType::Runes if key.runes == ['k'] => self.move_selection(-1),
                 KeyType::Runes if key.runes == ['j'] => self.move_selection(1),
                 KeyType::Space => self.toggle_selected(),
-                KeyType::Enter => return self.finish(true),
-                KeyType::Esc | KeyType::CtrlC => return self.finish(false),
-                KeyType::Runes if key.runes == ['q'] => return self.finish(false),
+                KeyType::Enter => return Some(self.finish(true)),
+                KeyType::Esc | KeyType::CtrlC => return Some(self.finish(false)),
+                KeyType::Runes if key.runes == ['q'] => return Some(self.finish(false)),
                 _ => {}
             }
         }
@@ -1645,16 +1652,17 @@ impl ConfigUiApp {
     fn view(&self) -> String {
         let mut out = String::new();
         out.push_str("Pi Config UI\n");
-        out.push_str(&format!("{}\n", self.settings_summary));
+        let _ = writeln!(out, "{}", self.settings_summary);
         out.push_str("Keys: ↑/↓ (or j/k) move, Space toggle, Enter save, q cancel\n\n");
 
         let mut cursor = 0usize;
         for package in &self.packages {
-            out.push_str(&format!(
-                "{} package: {}\n",
+            let _ = writeln!(
+                out,
+                "{} package: {}",
                 scope_label(package.scope),
                 package.source
-            ));
+            );
 
             if package.resources.is_empty() {
                 out.push_str("    (no discovered resources)\n");
@@ -1665,13 +1673,14 @@ impl ConfigUiApp {
                 let selected = cursor == self.selected;
                 let marker = if resource.enabled { "x" } else { " " };
                 let prefix = if selected { ">" } else { " " };
-                out.push_str(&format!(
-                    "{} [{}] {:<10} {}\n",
+                let _ = writeln!(
+                    out,
+                    "{} [{}] {:<10} {}",
                     prefix,
                     marker,
                     resource.kind.label(),
                     resource.path
-                ));
+                );
                 cursor = cursor.saturating_add(1);
             }
 
@@ -1679,21 +1688,21 @@ impl ConfigUiApp {
         }
 
         if !self.status.is_empty() {
-            out.push_str(&format!("{}\n", self.status));
+            let _ = writeln!(out, "{}", self.status);
         }
 
         out
     }
 }
 
-fn scope_label(scope: SettingsScope) -> &'static str {
+const fn scope_label(scope: SettingsScope) -> &'static str {
     match scope {
         SettingsScope::Global => "Global",
         SettingsScope::Project => "Project",
     }
 }
 
-fn scope_key(scope: SettingsScope) -> &'static str {
+const fn scope_key(scope: SettingsScope) -> &'static str {
     match scope {
         SettingsScope::Global => "global",
         SettingsScope::Project => "project",
@@ -1739,9 +1748,7 @@ fn merge_resolved_resources(
         };
 
         let key = package_lookup_key(scope, &resource.metadata.source);
-        let idx = if let Some(idx) = lookup.get(&key).copied() {
-            idx
-        } else {
+        let idx = lookup.get(&key).copied().unwrap_or_else(|| {
             let idx = packages.len();
             packages.push(ConfigPackageState {
                 scope,
@@ -1750,7 +1757,7 @@ fn merge_resolved_resources(
             });
             lookup.insert(key, idx);
             idx
-        };
+        });
 
         let path =
             normalize_path_for_display(&resource.path, resource.metadata.base_dir.as_deref());
@@ -1999,6 +2006,7 @@ fn persist_package_toggles(cwd: &Path, packages: &[ConfigPackageState]) -> Resul
     persist_package_toggles_with_roots(cwd, &global_dir, packages)
 }
 
+#[allow(clippy::too_many_lines)]
 fn persist_package_toggles_with_roots(
     cwd: &Path,
     global_dir: &Path,
@@ -2727,8 +2735,21 @@ async fn run_print_mode(
                 if let Some((event_name, data)) = extension_event_from_agent(&event) {
                     let manager = manager.clone();
                     let runtime_handle = runtime_for_events.clone();
+                    let emit_json = emit_json_events;
+                    let ext_event_name = event_name.to_string();
                     runtime_handle.spawn(async move {
-                        let _ = manager.dispatch_event(event_name, data).await;
+                        if let Err(err) = manager.dispatch_event(event_name, data).await {
+                            if emit_json {
+                                let ext_err = AgentEvent::ExtensionError {
+                                    extension_id: None,
+                                    event: ext_event_name,
+                                    error: err.to_string(),
+                                };
+                                if let Ok(serialized) = serde_json::to_string(&ext_err) {
+                                    println!("{serialized}");
+                                }
+                            }
+                        }
                     });
                 }
             }
@@ -3001,6 +3022,84 @@ mod tests {
     }
 
     #[test]
+    fn config_ui_app_empty_packages_shows_empty_message() {
+        let result_slot = Arc::new(StdMutex::new(None));
+        let app = ConfigUiApp::new(
+            Vec::new(),
+            "provider=(default)  model=(default)  thinking=(default)".to_string(),
+            result_slot,
+        );
+
+        let view = app.view();
+        assert!(
+            view.contains("Pi Config UI"),
+            "missing config ui header:\n{view}"
+        );
+        assert!(
+            view.contains("No package resources discovered. Press Enter to exit."),
+            "missing empty packages hint:\n{view}"
+        );
+    }
+
+    #[test]
+    fn config_ui_app_toggle_selected_updates_resource_state() {
+        let result_slot = Arc::new(StdMutex::new(None));
+        let mut app = ConfigUiApp::new(
+            vec![ConfigPackageState {
+                scope: SettingsScope::Project,
+                source: "local:demo".to_string(),
+                resources: vec![
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Extensions,
+                        path: "extensions/a.js".to_string(),
+                        enabled: true,
+                    },
+                    ConfigResourceState {
+                        kind: ConfigResourceKind::Skills,
+                        path: "skills/demo/SKILL.md".to_string(),
+                        enabled: false,
+                    },
+                ],
+            }],
+            "provider=(default)  model=(default)  thinking=(default)".to_string(),
+            result_slot,
+        );
+
+        assert!(
+            app.packages[0].resources[0].enabled,
+            "first resource should start enabled"
+        );
+        app.toggle_selected();
+        assert!(
+            !app.packages[0].resources[0].enabled,
+            "toggling selected resource should flip enabled flag"
+        );
+
+        app.move_selection(1);
+        app.toggle_selected();
+        assert!(
+            app.packages[0].resources[1].enabled,
+            "second resource should toggle on after moving selection"
+        );
+    }
+
+    #[test]
+    fn format_settings_summary_uses_effective_config_values() {
+        let config = Config {
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-4.1".to_string()),
+            default_thinking_level: Some("high".to_string()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            format_settings_summary(&config),
+            "provider=openai  model=gpt-4.1  thinking=high"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn persist_package_toggles_writes_filters_per_scope() {
         let temp = TempDir::new().expect("tempdir");
         let cwd = temp.path().join("repo");
@@ -3117,12 +3216,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["skills/demo/SKILL.md"]
         );
-        assert_eq!(
+        assert!(
             project_pkg
                 .get("local")
                 .and_then(serde_json::Value::as_bool)
-                .expect("local"),
-            true
+                .expect("local")
         );
     }
 }
