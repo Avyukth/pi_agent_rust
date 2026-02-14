@@ -49,12 +49,14 @@ fn row_get_str<'a>(row: &'a SqliteRow, column: &str) -> Result<&'a str> {
         .map_err(|err| Error::session(format!("SQLite row read failed: {err}")))
 }
 
-fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<String>) {
+fn compute_message_count_and_name(
+    entries: &[std::sync::Arc<SessionEntry>],
+) -> (u64, Option<String>) {
     let mut message_count = 0u64;
     let mut name = None;
 
     for entry in entries {
-        match entry {
+        match &**entry {
             SessionEntry::Message(_) => message_count += 1,
             SessionEntry::SessionInfo(info) => {
                 if info.name.is_some() {
@@ -68,7 +70,9 @@ fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<Stri
     (message_count, name)
 }
 
-pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+pub async fn load_session(
+    path: &Path,
+) -> Result<(SessionHeader, Vec<std::sync::Arc<SessionEntry>>)> {
     if !path.exists() {
         return Err(Error::SessionNotFound {
             path: path.display().to_string(),
@@ -101,7 +105,7 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
     for row in entry_rows {
         let json = row_get_str(&row, "json")?;
         let entry: SessionEntry = serde_json::from_str(json)?;
-        entries.push(entry);
+        entries.push(std::sync::Arc::new(entry));
     }
 
     Ok((header, entries))
@@ -164,10 +168,15 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         for row in entry_rows {
             let json = row_get_str(&row, "json")?;
             let entry: SessionEntry = serde_json::from_str(json)?;
-            entries.push(entry);
+            entries.push(std::sync::Arc::new(entry));
         }
 
-        let (message_count, fallback_name) = compute_message_count_and_name(&entries);
+        let (message_count, fallback_name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         if name.is_none() {
             name = fallback_name;
         }
@@ -221,7 +230,12 @@ mod tests {
     #[test]
     fn compute_counts_messages_only() {
         let entries = vec![message_entry(), message_entry(), message_entry()];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 3);
         assert!(name.is_none());
     }
@@ -233,7 +247,12 @@ mod tests {
             session_info_entry(Some("My Session".to_string())),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 2);
         assert_eq!(name, Some("My Session".to_string()));
     }
@@ -245,7 +264,12 @@ mod tests {
             session_info_entry(None),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 1);
         // The second SessionInfo has name=None, so it doesn't overwrite.
         assert_eq!(name, Some("First".to_string()));
@@ -257,7 +281,12 @@ mod tests {
             session_info_entry(Some("First".to_string())),
             session_info_entry(Some("Second".to_string())),
         ];
-        let (_, name) = compute_message_count_and_name(&entries);
+        let (_, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(name, Some("Second".to_string()));
     }
 
@@ -275,7 +304,12 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 2);
         assert!(name.is_none());
     }
@@ -291,7 +325,12 @@ mod tests {
                 label: Some("important".to_string()),
             }),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -307,7 +346,12 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -328,7 +372,12 @@ mod tests {
             message_entry(),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 3);
         assert!(name.is_none());
     }
@@ -365,7 +414,12 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 3);
         assert_eq!(name, Some("Named".to_string()));
     }
@@ -447,7 +501,9 @@ mod tests {
 
     #[test]
     fn compute_counts_large_message_set() {
-        let entries: Vec<SessionEntry> = (0..1000).map(|_| message_entry()).collect();
+        let entries: Vec<std::sync::Arc<SessionEntry>> = (0..1000)
+            .map(|_| std::sync::Arc::new(message_entry()))
+            .collect();
         let (count, name) = compute_message_count_and_name(&entries);
         assert_eq!(count, 1000);
         assert!(name.is_none());
@@ -463,7 +519,12 @@ mod tests {
             message_entry(),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 3);
         assert_eq!(name, Some("Early Name".to_string()));
     }
@@ -483,7 +544,12 @@ mod tests {
                 from_hook: None,
             }),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -500,7 +566,12 @@ mod tests {
             }),
             message_entry(),
         ];
-        let (count, name) = compute_message_count_and_name(&entries);
+        let (count, name) = compute_message_count_and_name(
+            &entries
+                .into_iter()
+                .map(std::sync::Arc::new)
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(count, 1);
         assert!(name.is_none());
     }
@@ -509,7 +580,7 @@ mod tests {
 pub async fn save_session(
     path: &Path,
     header: &SessionHeader,
-    entries: &[SessionEntry],
+    entries: &[std::sync::Arc<SessionEntry>],
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         asupersync::fs::create_dir_all(parent).await?;
@@ -548,7 +619,7 @@ pub async fn save_session(
     )?;
 
     for (idx, entry) in entries.iter().enumerate() {
-        let json = serde_json::to_string(entry)?;
+        let json = serde_json::to_string(&**entry)?;
         map_outcome(
             tx.execute(
                 cx.cx(),

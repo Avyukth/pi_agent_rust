@@ -7,6 +7,7 @@ use fs4::fs_std::FileExt;
 use serde::Deserialize;
 use sqlmodel_core::Value;
 use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
+use std::borrow::Borrow;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,35 @@ impl SessionIndex {
         };
 
         let meta = build_meta(path, &session.header, &session.entries)?;
+        self.upsert_meta(meta)
+    }
+
+    /// Update index metadata for an already-persisted session snapshot.
+    ///
+    /// This avoids requiring a full `Session` clone when callers already have
+    /// header + aggregate entry stats.
+    pub fn index_session_snapshot(
+        &self,
+        path: &Path,
+        header: &SessionHeader,
+        message_count: u64,
+        name: Option<String>,
+    ) -> Result<()> {
+        let (last_modified_ms, size_bytes) = file_stats(path)?;
+        let meta = SessionMeta {
+            path: path.display().to_string(),
+            id: header.id.clone(),
+            cwd: header.cwd.clone(),
+            timestamp: header.timestamp.clone(),
+            message_count,
+            last_modified_ms,
+            size_bytes,
+            name,
+        };
+        self.upsert_meta(meta)
+    }
+
+    fn upsert_meta(&self, meta: SessionMeta) -> Result<()> {
         self.with_lock(|conn| {
             init_schema(conn)?;
             conn.execute_sync(
@@ -410,11 +440,14 @@ fn build_meta_from_sqlite(path: &Path) -> Result<SessionMeta> {
     })
 }
 
-fn session_stats(entries: &[SessionEntry]) -> (u64, Option<String>) {
+fn session_stats<T>(entries: &[T]) -> (u64, Option<String>)
+where
+    T: Borrow<SessionEntry>,
+{
     let mut message_count = 0u64;
     let mut name = None;
     for entry in entries {
-        match entry {
+        match entry.borrow() {
             SessionEntry::Message(_) => message_count += 1,
             SessionEntry::SessionInfo(info) => {
                 if info.name.is_some() {
@@ -935,7 +968,7 @@ mod tests {
 
     #[test]
     fn session_stats_empty_entries() {
-        let (count, name) = session_stats(&[]);
+        let (count, name) = session_stats::<SessionEntry>(&[]);
         assert_eq!(count, 0);
         assert!(name.is_none());
     }
