@@ -612,7 +612,6 @@ pub struct MessageRenderCache {
     // During streaming, only the tail (current_response/current_thinking)
     // changes. The prefix (all finalized messages) is cached here so
     // `build_conversation_content()` can skip re-iterating messages.
-
     /// Cached rendered content of all finalized messages.
     prefix: RefCell<String>,
     /// Number of messages included when the prefix was built.

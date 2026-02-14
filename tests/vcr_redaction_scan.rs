@@ -28,8 +28,8 @@ const SENSITIVE_HEADERS: [&str; 6] = [
 ];
 
 /// Extract provider name from a VCR cassette filename.
-/// e.g., "anthropic_auth_failure_401.json" -> "anthropic"
-///       "verify_bedrock_simple_text.json" -> "bedrock"
+/// e.g., `anthropic_auth_failure_401.json` -> "anthropic"
+///       `verify_bedrock_simple_text.json` -> "bedrock"
 fn provider_from_filename(filename: &str) -> &str {
     let name = filename.strip_suffix(".json").unwrap_or(filename);
     // Handle "verify_" prefix

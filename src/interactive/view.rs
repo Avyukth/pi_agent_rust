@@ -547,14 +547,11 @@ impl PiApp {
     /// all messages during streaming. Streaming content (current_response)
     /// always renders fresh.
     pub fn build_conversation_content(&self) -> String {
-        let is_streaming =
-            !self.current_response.is_empty() || !self.current_thinking.is_empty();
+        let is_streaming = !self.current_response.is_empty() || !self.current_thinking.is_empty();
 
         // PERF-2 fast path: during streaming, reuse the cached prefix
         // (all finalized messages) and only rebuild the streaming tail.
-        if is_streaming
-            && self.message_render_cache.prefix_valid(self.messages.len())
-        {
+        if is_streaming && self.message_render_cache.prefix_valid(self.messages.len()) {
             let mut output = self.message_render_cache.prefix_get();
             self.append_streaming_tail(&mut output);
             return output;
