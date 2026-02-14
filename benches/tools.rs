@@ -157,6 +157,93 @@ fn bench_sse_stream(c: &mut Criterion) {
 }
 
 // ============================================================================
+// Streaming Clone Benchmark — Arc<AssistantMessage> vs deep clone
+// ============================================================================
+
+/// Simulates the streaming hot path: accumulate text via push_str, then share
+/// with event consumers via Arc::clone (O(1)) instead of deep clone (O(n)).
+fn bench_streaming_arc(c: &mut Criterion) {
+    use pi::model::{
+        AssistantMessage, ContentBlock, StopReason, TextContent, Usage,
+    };
+    use std::sync::Arc;
+
+    let mut group = c.benchmark_group("streaming_clone");
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+
+    // Simulate 500 tokens building up a ~10KB response
+    let token_count = 500usize;
+    let token_text = "Hello world "; // ~12 bytes per token
+
+    // Benchmark: Arc::make_mut + Arc::clone pattern (current, optimized)
+    group.bench_function("arc_make_mut_clone_500tok", |b| {
+        b.iter(|| {
+            let msg = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                api: "anthropic".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            let mut arc = Arc::new(msg);
+
+            for _ in 0..token_count {
+                // Mutate via make_mut (O(1) when refcount=1)
+                let m = Arc::make_mut(&mut arc);
+                if let Some(ContentBlock::Text(t)) = m.content.first_mut() {
+                    t.text.push_str(token_text);
+                }
+                // Share via clone (O(1) refcount bump)
+                let shared = Arc::clone(&arc);
+                // Simulate two event consumers
+                black_box(&shared);
+                let shared2 = Arc::clone(&arc);
+                black_box(&shared2);
+                // Both dropped before next iteration → refcount returns to 1
+            }
+
+            black_box(&arc);
+        });
+    });
+
+    // Benchmark: Deep clone pattern (old, unoptimized)
+    group.bench_function("deep_clone_500tok", |b| {
+        b.iter(|| {
+            let mut msg = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                api: "anthropic".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+
+            for _ in 0..token_count {
+                // Mutate directly
+                if let Some(ContentBlock::Text(t)) = msg.content.first_mut() {
+                    t.text.push_str(token_text);
+                }
+                // Deep clone to share with events (O(accumulated_text))
+                let ev = msg.clone();
+                black_box(&ev);
+                let ev2 = msg.clone();
+                black_box(&ev2);
+            }
+
+            black_box(&msg);
+        });
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Groups
 // ============================================================================
 
@@ -166,5 +253,6 @@ criterion_group!(
     bench_truncate_tail,
     bench_sse_parsing,
     bench_sse_stream,
+    bench_streaming_arc,
 );
 criterion_main!(benches);
