@@ -134,10 +134,17 @@ pub const RUNTIME_RISK_CALIBRATION_SCHEMA_VERSION: &str = "pi.ext.runtime_risk_c
 pub const RUNTIME_HOSTCALL_TELEMETRY_SCHEMA_VERSION: &str = "pi.ext.hostcall_telemetry.v1";
 pub const RUNTIME_HOSTCALL_FEATURE_SCHEMA_VERSION: &str = "pi.ext.hostcall_feature_vector.v1";
 pub const RUNTIME_HOSTCALL_FEATURE_BUDGET_US: u64 = 250;
+pub const RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION: &str = "pi.ext.runtime_risk_explanation.v1";
+pub const RUNTIME_RISK_EXPLANATION_TERM_BUDGET: usize = 12;
+pub const RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS: u64 = 2;
 pub const RUNTIME_RISK_BASELINE_SCHEMA_VERSION: &str = "pi.ext.runtime_risk_baseline.v1";
 const RUNTIME_HOSTCALL_SEQUENCE_WINDOW: usize = 64;
 const CAPABILITY_MANIFEST_SCHEMA_V1: &str = "pi.ext.cap.v1";
 const CAPABILITY_MANIFEST_SCHEMA_V2: &str = "pi.ext.cap.v2";
+
+fn runtime_risk_explanation_schema_default() -> String {
+    RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION.to_string()
+}
 
 // ============================================================================
 // Compatibility Scanner (bd-3bs)
@@ -1439,6 +1446,8 @@ impl PolicyProfile {
                 ],
                 deny_caps: vec!["exec".to_string(), "env".to_string()],
                 per_extension: HashMap::new(),
+                exec_mediation: ExecMediationPolicy::strict(),
+                secret_broker: SecretBrokerPolicy::default(),
             },
             Self::Standard => ExtensionPolicy::default(),
             Self::Permissive => ExtensionPolicy {
@@ -1447,6 +1456,8 @@ impl PolicyProfile {
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
                 per_extension: HashMap::new(),
+                exec_mediation: ExecMediationPolicy::permissive(),
+                secret_broker: SecretBrokerPolicy::default(),
             },
         }
     }
@@ -1511,6 +1522,14 @@ pub struct ExtensionPolicy {
     /// Per-extension overrides keyed by extension ID.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub per_extension: HashMap<String, ExtensionOverride>,
+    /// Exec mediation policy (SEC-4.3). Controls command-level allow/deny
+    /// after capability-level exec is granted.
+    #[serde(default)]
+    pub exec_mediation: ExecMediationPolicy,
+    /// Secret broker policy (SEC-4.3). Controls redaction of secret env vars
+    /// and prevents raw disclosure when policy forbids it.
+    #[serde(default)]
+    pub secret_broker: SecretBrokerPolicy,
 }
 
 impl Default for ExtensionPolicy {
@@ -1527,6 +1546,8 @@ impl Default for ExtensionPolicy {
             ],
             deny_caps: vec!["exec".to_string(), "env".to_string()],
             per_extension: HashMap::new(),
+            exec_mediation: ExecMediationPolicy::default(),
+            secret_broker: SecretBrokerPolicy::default(),
         }
     }
 }
@@ -1772,6 +1793,642 @@ fn check_extension_quota(
     QuotaCheckResult::Allowed
 }
 
+// ---------------------------------------------------------------------------
+// Exec mediation and secret broker (SEC-4.3 / bd-zh0hj)
+// ---------------------------------------------------------------------------
+
+/// Classification of dangerous command patterns for exec mediation.
+///
+/// Each variant represents a class of commands that pose a security risk when
+/// executed by an extension. The classifier is deterministic: given the same
+/// command string, the same classification is always returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DangerousCommandClass {
+    /// Recursive deletion targeting root or broad paths (`rm -rf /`).
+    RecursiveDelete,
+    /// Device-level writes (`dd`, `mkfs`, `fdisk`).
+    DeviceWrite,
+    /// Fork bomb or process exhaustion patterns.
+    ForkBomb,
+    /// Pipe to shell execution (`curl | sh`, `wget | bash`).
+    PipeToShell,
+    /// System shutdown or reboot commands.
+    SystemShutdown,
+    /// Broad permission changes (`chmod 777`, `chmod -R 777`).
+    PermissionEscalation,
+    /// Killing critical system processes (`kill -9 1`, `pkill init`).
+    ProcessTermination,
+    /// Modifying /etc/passwd, /etc/shadow, or sudoers.
+    CredentialFileModification,
+    /// Disk wipe or overwrite patterns (`shred`, `wipefs`).
+    DiskWipe,
+    /// Network exfiltration via raw sockets or reverse shells.
+    ReverseShell,
+}
+
+impl DangerousCommandClass {
+    /// Human-readable label for incident logging.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RecursiveDelete => "recursive_delete",
+            Self::DeviceWrite => "device_write",
+            Self::ForkBomb => "fork_bomb",
+            Self::PipeToShell => "pipe_to_shell",
+            Self::SystemShutdown => "system_shutdown",
+            Self::PermissionEscalation => "permission_escalation",
+            Self::ProcessTermination => "process_termination",
+            Self::CredentialFileModification => "credential_file_modification",
+            Self::DiskWipe => "disk_wipe",
+            Self::ReverseShell => "reverse_shell",
+        }
+    }
+
+    /// Risk tier for this command class (used for policy decisions).
+    #[must_use]
+    pub const fn risk_tier(self) -> ExecRiskTier {
+        match self {
+            Self::RecursiveDelete
+            | Self::DeviceWrite
+            | Self::ForkBomb
+            | Self::DiskWipe
+            | Self::ReverseShell => ExecRiskTier::Critical,
+            Self::PipeToShell
+            | Self::SystemShutdown
+            | Self::PermissionEscalation
+            | Self::ProcessTermination
+            | Self::CredentialFileModification => ExecRiskTier::High,
+        }
+    }
+}
+
+/// Risk tier for exec command classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecRiskTier {
+    /// Low risk — normal commands.
+    Low,
+    /// Medium risk — commands that could be misused.
+    Medium,
+    /// High risk — commands with significant destructive potential.
+    High,
+    /// Critical risk — commands that could cause irreversible damage.
+    Critical,
+}
+
+/// Policy configuration for exec mediation (SEC-4.3).
+///
+/// Controls which commands are allowed/denied based on pattern matching
+/// and dangerous command classification. Evaluated after capability-level
+/// policy and quota checks but before the actual command is spawned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExecMediationPolicy {
+    /// When true, exec mediation is active and commands are classified.
+    pub enabled: bool,
+    /// Minimum risk tier that triggers a deny (default: Critical).
+    /// Commands at or above this tier are blocked.
+    pub deny_threshold: ExecRiskTier,
+    /// Explicit command prefixes to deny (case-insensitive substring match).
+    /// These are checked before the built-in classifier.
+    #[serde(default)]
+    pub deny_patterns: Vec<String>,
+    /// Explicit command prefixes to allow even if classified as dangerous.
+    /// Use sparingly — allows overriding the classifier for specific tools.
+    #[serde(default)]
+    pub allow_patterns: Vec<String>,
+    /// When true, commands classified as dangerous are logged even if allowed.
+    pub audit_all_classified: bool,
+}
+
+impl Default for ExecMediationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            deny_threshold: ExecRiskTier::Critical,
+            deny_patterns: Vec::new(),
+            allow_patterns: Vec::new(),
+            audit_all_classified: true,
+        }
+    }
+}
+
+impl ExecMediationPolicy {
+    /// Strict preset: blocks High and above.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self {
+            enabled: true,
+            deny_threshold: ExecRiskTier::High,
+            deny_patterns: Vec::new(),
+            allow_patterns: Vec::new(),
+            audit_all_classified: true,
+        }
+    }
+
+    /// Permissive preset: only blocks Critical.
+    #[must_use]
+    pub const fn permissive() -> Self {
+        Self {
+            enabled: true,
+            deny_threshold: ExecRiskTier::Critical,
+            deny_patterns: Vec::new(),
+            allow_patterns: Vec::new(),
+            audit_all_classified: false,
+        }
+    }
+
+    /// Disabled preset: no exec mediation.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            deny_threshold: ExecRiskTier::Critical,
+            deny_patterns: Vec::new(),
+            allow_patterns: Vec::new(),
+            audit_all_classified: false,
+        }
+    }
+}
+
+/// Result of exec mediation evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecMediationResult {
+    /// Command is allowed to proceed.
+    Allow,
+    /// Command is allowed but was classified as potentially dangerous.
+    AllowWithAudit {
+        class: DangerousCommandClass,
+        reason: String,
+    },
+    /// Command is denied.
+    Deny {
+        class: Option<DangerousCommandClass>,
+        reason: String,
+    },
+}
+
+/// Classify a command string into dangerous command classes.
+///
+/// Returns all matching classifications. A command may match multiple
+/// classes (e.g., a reverse shell that also pipes to shell).
+/// The classifier is deterministic and case-insensitive.
+#[must_use]
+pub fn classify_dangerous_command(cmd: &str, args: &[String]) -> Vec<DangerousCommandClass> {
+    let mut classes = Vec::new();
+    let full_cmd = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{cmd} {}", args.join(" "))
+    };
+    let lower = full_cmd.to_ascii_lowercase();
+
+    // --- Critical tier ---
+
+    // Recursive delete targeting root or broad paths.
+    if classify_recursive_delete(&lower) {
+        classes.push(DangerousCommandClass::RecursiveDelete);
+    }
+
+    // Device-level writes.
+    if classify_device_write(&lower) {
+        classes.push(DangerousCommandClass::DeviceWrite);
+    }
+
+    // Fork bomb patterns.
+    if classify_fork_bomb(&lower) {
+        classes.push(DangerousCommandClass::ForkBomb);
+    }
+
+    // Disk wipe.
+    if classify_disk_wipe(&lower) {
+        classes.push(DangerousCommandClass::DiskWipe);
+    }
+
+    // Reverse shell.
+    if classify_reverse_shell(&lower) {
+        classes.push(DangerousCommandClass::ReverseShell);
+    }
+
+    // --- High tier ---
+
+    // Pipe to shell.
+    if classify_pipe_to_shell(&lower) {
+        classes.push(DangerousCommandClass::PipeToShell);
+    }
+
+    // System shutdown.
+    if classify_system_shutdown(&lower) {
+        classes.push(DangerousCommandClass::SystemShutdown);
+    }
+
+    // Permission escalation.
+    if classify_permission_escalation(&lower) {
+        classes.push(DangerousCommandClass::PermissionEscalation);
+    }
+
+    // Process termination of critical processes.
+    if classify_process_termination(&lower) {
+        classes.push(DangerousCommandClass::ProcessTermination);
+    }
+
+    // Credential file modification.
+    if classify_credential_file_modification(&lower) {
+        classes.push(DangerousCommandClass::CredentialFileModification);
+    }
+
+    classes
+}
+
+fn classify_recursive_delete(lower: &str) -> bool {
+    // rm -rf / or rm -rf /* or rm -rf ~
+    if !lower.contains("rm") {
+        return false;
+    }
+    let has_rf = lower.contains("-rf") || lower.contains("-fr") || lower.contains("--recursive");
+    if !has_rf {
+        return false;
+    }
+    // Target root, home, or wildcard
+    let dangerous_targets = [" /", " /*", " ~/", " ~/*", " --no-preserve-root"];
+    dangerous_targets.iter().any(|t| lower.contains(t))
+}
+
+fn classify_device_write(lower: &str) -> bool {
+    // dd writing to devices, mkfs, fdisk
+    let dd_to_dev = lower.contains("dd ") && lower.contains("of=/dev/");
+    let mkfs = lower.starts_with("mkfs") || lower.contains(" mkfs") || lower.contains(";mkfs");
+    let fdisk = lower.starts_with("fdisk") || lower.contains(" fdisk") || lower.contains(";fdisk");
+    dd_to_dev || mkfs || fdisk
+}
+
+fn classify_fork_bomb(lower: &str) -> bool {
+    // Classic bash fork bomb: :(){ :|:& };:
+    // Also: while true; do ... & done
+    lower.contains(":(){ :|:&")
+        || lower.contains(":(){ :|: &")
+        || (lower.contains("while true") && lower.contains("& done"))
+        || (lower.contains("fork") && lower.contains("while") && lower.contains('&'))
+}
+
+fn classify_disk_wipe(lower: &str) -> bool {
+    let shred = lower.starts_with("shred") || lower.contains(" shred ") || lower.contains(";shred");
+    let wipefs =
+        lower.starts_with("wipefs") || lower.contains(" wipefs") || lower.contains(";wipefs");
+    let dd_zero = lower.contains("dd ") && lower.contains("if=/dev/zero");
+    let dd_urandom = lower.contains("dd ") && lower.contains("if=/dev/urandom");
+    shred || wipefs || dd_zero || dd_urandom
+}
+
+fn classify_reverse_shell(lower: &str) -> bool {
+    // Common reverse shell patterns
+    let bash_rev = lower.contains("/dev/tcp/") && lower.contains("bash");
+    let nc_rev = (lower.contains("nc ") || lower.contains("ncat ") || lower.contains("netcat "))
+        && lower.contains("-e ");
+    let python_rev = lower.contains("socket") && lower.contains("connect") && lower.contains("sh");
+    bash_rev || nc_rev || python_rev
+}
+
+fn classify_pipe_to_shell(lower: &str) -> bool {
+    // curl/wget piped to sh/bash
+    let has_download = lower.contains("curl ") || lower.contains("wget ");
+    let has_pipe_to_shell = lower.contains("| sh")
+        || lower.contains("| bash")
+        || lower.contains("|sh")
+        || lower.contains("|bash")
+        || lower.contains("| /bin/sh")
+        || lower.contains("| /bin/bash");
+    has_download && has_pipe_to_shell
+}
+
+fn classify_system_shutdown(lower: &str) -> bool {
+    lower.starts_with("shutdown")
+        || lower.contains(" shutdown")
+        || lower.contains(";shutdown")
+        || lower.starts_with("reboot")
+        || lower.contains(" reboot")
+        || lower.contains(";reboot")
+        || lower.starts_with("halt")
+        || lower.contains(" halt")
+        || lower.contains(";halt")
+        || lower.starts_with("poweroff")
+        || lower.contains(" poweroff")
+        || lower.contains(";poweroff")
+        || lower.starts_with("init 0")
+        || lower.contains(" init 0")
+        || lower.starts_with("init 6")
+        || lower.contains(" init 6")
+}
+
+fn classify_permission_escalation(lower: &str) -> bool {
+    // chmod 777, chmod -R 777, chown root
+    let chmod_broad = lower.contains("chmod")
+        && (lower.contains("777") || lower.contains("a+rwx") || lower.contains("o+w"));
+    let chmod_suid = lower.contains("chmod") && (lower.contains("+s") || lower.contains("4755"));
+    chmod_broad || chmod_suid
+}
+
+fn classify_process_termination(lower: &str) -> bool {
+    // kill -9 1, pkill init, killall
+    let kill_pid1 = lower.contains("kill") && (lower.contains(" 1 ") || lower.ends_with(" 1"));
+    let kill_9 = lower.contains("kill -9") || lower.contains("kill -kill");
+    let pkill_critical = lower.contains("pkill")
+        && (lower.contains("init") || lower.contains("systemd") || lower.contains("sshd"));
+    let killall = lower.starts_with("killall") || lower.contains(" killall");
+    // Only flag kill of PID 1 or critical processes
+    (kill_pid1 && kill_9) || pkill_critical || killall
+}
+
+fn classify_credential_file_modification(lower: &str) -> bool {
+    let cred_files = [
+        "/etc/passwd",
+        "/etc/shadow",
+        "/etc/sudoers",
+        "/etc/ssh/sshd_config",
+    ];
+    let write_cmds = ["tee ", "cat >", "echo >", "sed -i", "cp ", "mv "];
+    cred_files
+        .iter()
+        .any(|f| lower.contains(f) && write_cmds.iter().any(|w| lower.contains(w)))
+}
+
+/// Evaluate exec mediation policy for a command.
+///
+/// Called after capability-level policy allows exec, but before spawning.
+/// Returns [`ExecMediationResult`] indicating whether the command should
+/// proceed, be audited, or be denied.
+#[must_use]
+pub fn evaluate_exec_mediation(
+    policy: &ExecMediationPolicy,
+    cmd: &str,
+    args: &[String],
+) -> ExecMediationResult {
+    if !policy.enabled {
+        return ExecMediationResult::Allow;
+    }
+
+    let full_cmd = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{cmd} {}", args.join(" "))
+    };
+    let lower = full_cmd.to_ascii_lowercase();
+
+    // 1. Check explicit allow patterns (highest precedence override).
+    for pattern in &policy.allow_patterns {
+        if lower.contains(&pattern.to_ascii_lowercase()) {
+            return ExecMediationResult::Allow;
+        }
+    }
+
+    // 2. Check explicit deny patterns.
+    for pattern in &policy.deny_patterns {
+        if lower.contains(&pattern.to_ascii_lowercase()) {
+            return ExecMediationResult::Deny {
+                class: None,
+                reason: format!("Command matches deny pattern: {pattern}"),
+            };
+        }
+    }
+
+    // 3. Classify via built-in rules.
+    let classes = classify_dangerous_command(cmd, args);
+    if classes.is_empty() {
+        return ExecMediationResult::Allow;
+    }
+
+    // Find the highest-risk classification.
+    let worst = classes
+        .iter()
+        .max_by_key(|c| c.risk_tier())
+        .copied()
+        .expect("classes is non-empty");
+
+    if worst.risk_tier() >= policy.deny_threshold {
+        ExecMediationResult::Deny {
+            class: Some(worst),
+            reason: format!(
+                "Command classified as {} ({})",
+                worst.label(),
+                worst.risk_tier().label()
+            ),
+        }
+    } else if policy.audit_all_classified {
+        ExecMediationResult::AllowWithAudit {
+            class: worst,
+            reason: format!(
+                "Command classified as {} ({}) — below deny threshold",
+                worst.label(),
+                worst.risk_tier().label()
+            ),
+        }
+    } else {
+        ExecMediationResult::Allow
+    }
+}
+
+impl ExecRiskTier {
+    /// Human-readable label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Secret broker (SEC-4.3 / bd-zh0hj)
+// ---------------------------------------------------------------------------
+
+/// Patterns used to identify environment variables likely to contain secrets.
+///
+/// The broker uses suffix and prefix matching to catch common naming
+/// conventions for API keys, tokens, passwords, and credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretBrokerPolicy {
+    /// When true, the secret broker is active.
+    pub enabled: bool,
+    /// Env var name suffixes that indicate a secret (case-insensitive).
+    pub secret_suffixes: Vec<String>,
+    /// Env var name prefixes that indicate a secret (case-insensitive).
+    pub secret_prefixes: Vec<String>,
+    /// Exact env var names that are always treated as secrets (case-insensitive).
+    pub secret_exact: Vec<String>,
+    /// Env vars on this list are never redacted, even if they match a pattern.
+    pub disclosure_allowlist: Vec<String>,
+    /// The replacement string used in place of secret values.
+    pub redaction_placeholder: String,
+}
+
+impl Default for SecretBrokerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            secret_suffixes: vec![
+                "_KEY".to_string(),
+                "_SECRET".to_string(),
+                "_TOKEN".to_string(),
+                "_PASSWORD".to_string(),
+                "_PASSWD".to_string(),
+                "_CREDENTIAL".to_string(),
+                "_CREDENTIALS".to_string(),
+                "_AUTH".to_string(),
+                "_API_KEY".to_string(),
+                "_PRIVATE_KEY".to_string(),
+            ],
+            secret_prefixes: vec![
+                "SECRET_".to_string(),
+                "AUTH_".to_string(),
+                "CREDENTIAL_".to_string(),
+            ],
+            secret_exact: vec![
+                "ANTHROPIC_API_KEY".to_string(),
+                "OPENAI_API_KEY".to_string(),
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "AWS_SESSION_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+                "GOOGLE_API_KEY".to_string(),
+                "AZURE_CLIENT_SECRET".to_string(),
+                "DATABASE_URL".to_string(),
+                "REDIS_URL".to_string(),
+                "PRIVATE_KEY".to_string(),
+                "NPM_TOKEN".to_string(),
+                "DOCKER_PASSWORD".to_string(),
+                "SLACK_TOKEN".to_string(),
+                "STRIPE_SECRET_KEY".to_string(),
+                "TWILIO_AUTH_TOKEN".to_string(),
+                "SENDGRID_API_KEY".to_string(),
+            ],
+            disclosure_allowlist: Vec::new(),
+            redaction_placeholder: "[REDACTED]".to_string(),
+        }
+    }
+}
+
+impl SecretBrokerPolicy {
+    /// Returns `true` if the given env var name matches a known secret pattern.
+    #[must_use]
+    pub fn is_secret(&self, name: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        // Check disclosure allowlist first (overrides everything).
+        if self
+            .disclosure_allowlist
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(name))
+        {
+            return false;
+        }
+
+        let upper = name.to_ascii_uppercase();
+
+        // Exact match.
+        if self
+            .secret_exact
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+
+        // Suffix match.
+        if self
+            .secret_suffixes
+            .iter()
+            .any(|s| upper.ends_with(&s.to_ascii_uppercase()))
+        {
+            return true;
+        }
+
+        // Prefix match.
+        self.secret_prefixes
+            .iter()
+            .any(|p| upper.starts_with(&p.to_ascii_uppercase()))
+    }
+
+    /// Redact a value if the env var name is a secret.
+    ///
+    /// Returns the original value if not a secret, or the redaction
+    /// placeholder if it is.
+    #[must_use]
+    pub fn maybe_redact<'a>(&'a self, name: &str, value: &'a str) -> &'a str {
+        if self.is_secret(name) {
+            &self.redaction_placeholder
+        } else {
+            value
+        }
+    }
+}
+
+/// Redact secrets in a command string for safe logging.
+///
+/// Scans for patterns like `KEY=value` and replaces the value portion
+/// for any key that matches the secret broker policy. Also redacts
+/// inline `-p password` style arguments.
+#[must_use]
+pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> String {
+    if !policy.enabled {
+        return cmd.to_string();
+    }
+    let mut result = cmd.to_string();
+
+    // Redact KEY=VALUE patterns in env-style assignments.
+    // Matches: SOME_KEY=somevalue or SOME_KEY="somevalue"
+    for part in cmd.split_whitespace() {
+        if let Some(eq_pos) = part.find('=') {
+            let key = &part[..eq_pos];
+            if policy.is_secret(key) {
+                let replacement = format!("{key}={}", policy.redaction_placeholder);
+                result = result.replace(part, &replacement);
+            }
+        }
+    }
+
+    result
+}
+
+/// Telemetry entry for exec mediation decisions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecMediationLedgerEntry {
+    /// Unix epoch milliseconds.
+    pub ts_ms: i64,
+    /// Extension that requested exec.
+    pub extension_id: Option<String>,
+    /// Hash of the command (never log raw command).
+    pub command_hash: String,
+    /// Dangerous command class if classified.
+    pub command_class: Option<String>,
+    /// Risk tier of the classification.
+    pub risk_tier: Option<String>,
+    /// Mediation decision.
+    pub decision: String,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+/// Telemetry entry for secret broker decisions.
+#[derive(Debug, Clone, Serialize)]
+pub struct SecretBrokerLedgerEntry {
+    /// Unix epoch milliseconds.
+    pub ts_ms: i64,
+    /// Extension requesting env access.
+    pub extension_id: Option<String>,
+    /// Hash of the env var name (never log raw name for denied vars).
+    pub name_hash: String,
+    /// Whether the value was redacted.
+    pub redacted: bool,
+    /// Reason for redaction or disclosure.
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeRiskStateLabelValue {
@@ -1805,6 +2462,47 @@ pub struct RuntimeRiskExpectedLossEvidence {
     pub terminate: f64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeRiskExplanationLevelValue {
+    Compact,
+    #[default]
+    Standard,
+    Full,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeRiskExplanationContributor {
+    pub code: String,
+    pub signed_impact: f64,
+    pub magnitude: f64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeRiskExplanationBudgetState {
+    pub time_budget_ms: u64,
+    pub elapsed_ms: u64,
+    pub term_budget: usize,
+    pub terms_emitted: usize,
+    pub exhausted: bool,
+    pub fallback_mode: bool,
+}
+
+impl Default for RuntimeRiskExplanationBudgetState {
+    fn default() -> Self {
+        Self {
+            time_budget_ms: RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+            elapsed_ms: 0,
+            term_budget: RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            terms_emitted: 0,
+            exhausted: false,
+            fallback_mode: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeRiskLedgerArtifactEntry {
     pub ts_ms: i64,
@@ -1827,6 +2525,16 @@ pub struct RuntimeRiskLedgerArtifactEntry {
     pub conformal_quantile: f64,
     pub drift_detected: bool,
     pub outcome_error_code: Option<String>,
+    #[serde(default = "runtime_risk_explanation_schema_default")]
+    pub explanation_schema: String,
+    #[serde(default)]
+    pub explanation_level: RuntimeRiskExplanationLevelValue,
+    #[serde(default)]
+    pub explanation_summary: String,
+    #[serde(default)]
+    pub top_contributors: Vec<RuntimeRiskExplanationContributor>,
+    #[serde(default)]
+    pub budget_state: RuntimeRiskExplanationBudgetState,
     pub ledger_hash: String,
     pub prev_ledger_hash: Option<String>,
 }
@@ -1873,6 +2581,14 @@ pub struct RuntimeRiskReplayStep {
     pub derived_state: RuntimeRiskStateLabelValue,
     pub risk_score: f64,
     pub reason_codes: Vec<String>,
+    #[serde(default)]
+    pub explanation_level: RuntimeRiskExplanationLevelValue,
+    #[serde(default)]
+    pub explanation_summary: String,
+    #[serde(default)]
+    pub top_contributors: Vec<RuntimeRiskExplanationContributor>,
+    #[serde(default)]
+    pub budget_state: RuntimeRiskExplanationBudgetState,
     pub fallback_reason: Option<String>,
     pub drift_detected: bool,
     pub e_process: f64,
@@ -2118,6 +2834,10 @@ pub struct RuntimeHostcallTelemetryEvent {
     pub outcome_error_code: Option<String>,
     pub selected_action: RuntimeRiskActionValue,
     pub reason_codes: Vec<String>,
+    pub explanation_level: RuntimeRiskExplanationLevelValue,
+    pub explanation_summary: String,
+    pub top_contributors: Vec<RuntimeRiskExplanationContributor>,
+    pub budget_state: RuntimeRiskExplanationBudgetState,
     pub sequence: RuntimeHostcallSequenceContext,
     pub features: RuntimeHostcallFeatureVector,
     pub extraction_latency_us: u64,
@@ -2147,6 +2867,10 @@ impl Default for RuntimeHostcallTelemetryEvent {
             outcome_error_code: None,
             selected_action: RuntimeRiskActionValue::Allow,
             reason_codes: Vec::new(),
+            explanation_level: RuntimeRiskExplanationLevelValue::Standard,
+            explanation_summary: "no explanation generated".to_string(),
+            top_contributors: Vec::new(),
+            budget_state: RuntimeRiskExplanationBudgetState::default(),
             sequence: RuntimeHostcallSequenceContext::default(),
             features: RuntimeHostcallFeatureVector::default(),
             extraction_latency_us: 0,
@@ -2231,6 +2955,11 @@ struct RuntimeRiskLedgerEntry {
     conformal_quantile: f64,
     drift_detected: bool,
     outcome_error_code: Option<String>,
+    explanation_schema: String,
+    explanation_level: RuntimeRiskExplanationLevelValue,
+    explanation_summary: String,
+    top_contributors: Vec<RuntimeRiskExplanationContributor>,
+    budget_state: RuntimeRiskExplanationBudgetState,
     ledger_hash: String,
     prev_ledger_hash: Option<String>,
 }
@@ -2255,6 +2984,11 @@ struct RuntimeRiskDecision {
     conformal_quantile: f64,
     drift_detected: bool,
     triggers: Vec<String>,
+    explanation_schema: String,
+    explanation_level: RuntimeRiskExplanationLevelValue,
+    explanation_summary: String,
+    top_contributors: Vec<RuntimeRiskExplanationContributor>,
+    budget_state: RuntimeRiskExplanationBudgetState,
     fallback_reason: Option<String>,
     elapsed_ms: u64,
     state_label: RuntimeRiskStateLabel,
@@ -2403,6 +3137,11 @@ impl From<&RuntimeRiskLedgerEntry> for RuntimeRiskLedgerArtifactEntry {
             conformal_quantile: value.conformal_quantile,
             drift_detected: value.drift_detected,
             outcome_error_code: value.outcome_error_code.clone(),
+            explanation_schema: value.explanation_schema.clone(),
+            explanation_level: value.explanation_level,
+            explanation_summary: value.explanation_summary.clone(),
+            top_contributors: value.top_contributors.clone(),
+            budget_state: value.budget_state.clone(),
             ledger_hash: value.ledger_hash.clone(),
             prev_ledger_hash: value.prev_ledger_hash.clone(),
         }
@@ -2441,6 +3180,11 @@ impl From<&RuntimeRiskLedgerArtifactEntry> for RuntimeRiskLedgerEntry {
             conformal_quantile: value.conformal_quantile,
             drift_detected: value.drift_detected,
             outcome_error_code: value.outcome_error_code.clone(),
+            explanation_schema: value.explanation_schema.clone(),
+            explanation_level: value.explanation_level,
+            explanation_summary: value.explanation_summary.clone(),
+            top_contributors: value.top_contributors.clone(),
+            budget_state: value.budget_state.clone(),
             ledger_hash: value.ledger_hash.clone(),
             prev_ledger_hash: value.prev_ledger_hash.clone(),
         }
@@ -2669,7 +3413,7 @@ fn runtime_risk_compute_ledger_hash(
     format!("{:x}", hasher.finalize())
 }
 
-fn runtime_risk_compute_ledger_hash_artifact(
+pub fn runtime_risk_compute_ledger_hash_artifact(
     entry: &RuntimeRiskLedgerArtifactEntry,
     prev_hash: Option<&str>,
 ) -> String {
@@ -2677,7 +3421,7 @@ fn runtime_risk_compute_ledger_hash_artifact(
     runtime_risk_compute_ledger_hash(&internal, prev_hash)
 }
 
-fn runtime_risk_ledger_data_hash(entries: &[RuntimeRiskLedgerArtifactEntry]) -> String {
+pub fn runtime_risk_ledger_data_hash(entries: &[RuntimeRiskLedgerArtifactEntry]) -> String {
     let mut hasher = sha2::Sha256::new();
     for entry in entries {
         hasher.update(entry.ledger_hash.as_bytes());
@@ -2824,6 +3568,10 @@ pub fn replay_runtime_risk_ledger_artifact(
             derived_state: entry.derived_state,
             risk_score: entry.risk_score,
             reason_codes: entry.triggers.clone(),
+            explanation_level: entry.explanation_level,
+            explanation_summary: entry.explanation_summary.clone(),
+            top_contributors: entry.top_contributors.clone(),
+            budget_state: entry.budget_state.clone(),
             fallback_reason: entry.fallback_reason.clone(),
             drift_detected: entry.drift_detected,
             e_process: entry.e_process,
@@ -3445,6 +4193,210 @@ fn runtime_risk_choose_action(
     };
 
     (best, expected, triggers, state_label)
+}
+
+const fn runtime_risk_action_code(action: RuntimeRiskAction) -> &'static str {
+    match action {
+        RuntimeRiskAction::Allow => "allow",
+        RuntimeRiskAction::Harden => "harden",
+        RuntimeRiskAction::Deny => "deny",
+        RuntimeRiskAction::Terminate => "terminate",
+    }
+}
+
+const fn runtime_risk_selected_expected_loss(
+    action: RuntimeRiskAction,
+    expected_loss: &RuntimeRiskExpectedLoss,
+) -> f64 {
+    match action {
+        RuntimeRiskAction::Allow => expected_loss.allow,
+        RuntimeRiskAction::Harden => expected_loss.harden,
+        RuntimeRiskAction::Deny => expected_loss.deny,
+        RuntimeRiskAction::Terminate => expected_loss.terminate,
+    }
+}
+
+const fn runtime_risk_default_explanation_level(
+    action: RuntimeRiskAction,
+    triggers: &[String],
+    fallback_reason: Option<&str>,
+) -> RuntimeRiskExplanationLevelValue {
+    if fallback_reason.is_some()
+        || matches!(
+            action,
+            RuntimeRiskAction::Deny | RuntimeRiskAction::Terminate
+        )
+    {
+        RuntimeRiskExplanationLevelValue::Full
+    } else if matches!(action, RuntimeRiskAction::Harden) || !triggers.is_empty() {
+        RuntimeRiskExplanationLevelValue::Standard
+    } else {
+        RuntimeRiskExplanationLevelValue::Compact
+    }
+}
+
+fn runtime_risk_sort_contributors(contributors: &mut [RuntimeRiskExplanationContributor]) {
+    contributors.sort_by(|left, right| {
+        right
+            .magnitude
+            .total_cmp(&left.magnitude)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn runtime_risk_build_explanation(
+    action: RuntimeRiskAction,
+    risk_score: f64,
+    posterior: &RuntimeRiskPosterior,
+    expected_loss: &RuntimeRiskExpectedLoss,
+    features: &RuntimeHostcallFeatureVector,
+    triggers: &[String],
+    fallback_reason: Option<&str>,
+    term_budget: usize,
+    time_budget_ms: u64,
+) -> (
+    RuntimeRiskExplanationLevelValue,
+    String,
+    Vec<RuntimeRiskExplanationContributor>,
+    RuntimeRiskExplanationBudgetState,
+) {
+    let started = Instant::now();
+    let normalized_term_budget = term_budget.max(1);
+    let mut level = runtime_risk_default_explanation_level(action, triggers, fallback_reason);
+    let mut contributors = vec![
+        RuntimeRiskExplanationContributor {
+            code: "feature_base_score".to_string(),
+            signed_impact: 0.65 * features.base_score,
+            magnitude: (0.65 * features.base_score).abs(),
+            rationale: "base capability/method risk contribution".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "feature_recent_mean_score".to_string(),
+            signed_impact: 0.35 * features.recent_mean_score,
+            magnitude: (0.35 * features.recent_mean_score).abs(),
+            rationale: "recent moving-average risk contribution".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "feature_recent_error_rate".to_string(),
+            signed_impact: 0.12 * features.recent_error_rate,
+            magnitude: (0.12 * features.recent_error_rate).abs(),
+            rationale: "recent hostcall failure-rate contribution".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "feature_burst_density_1s".to_string(),
+            signed_impact: 0.08 * features.burst_density_1s,
+            magnitude: (0.08 * features.burst_density_1s).abs(),
+            rationale: "short-horizon call burst density contribution".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "feature_prior_failure_streak".to_string(),
+            signed_impact: 0.05 * features.prior_failure_streak_norm,
+            magnitude: (0.05 * features.prior_failure_streak_norm).abs(),
+            rationale: "prior failure streak contribution".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "posterior_unsafe".to_string(),
+            signed_impact: posterior.unsafe_,
+            magnitude: posterior.unsafe_.abs(),
+            rationale: "posterior probability of unsafe behavior".to_string(),
+        },
+        RuntimeRiskExplanationContributor {
+            code: "posterior_suspicious".to_string(),
+            signed_impact: 0.5 * posterior.suspicious,
+            magnitude: (0.5 * posterior.suspicious).abs(),
+            rationale: "posterior probability of suspicious behavior".to_string(),
+        },
+    ];
+
+    let selected_loss = runtime_risk_selected_expected_loss(action, expected_loss);
+    let loss_delta_vs_allow = expected_loss.allow - selected_loss;
+    contributors.push(RuntimeRiskExplanationContributor {
+        code: "expected_loss_delta_vs_allow".to_string(),
+        signed_impact: loss_delta_vs_allow,
+        magnitude: loss_delta_vs_allow.abs(),
+        rationale: "expected-loss improvement versus allow action".to_string(),
+    });
+
+    for trigger in triggers {
+        contributors.push(RuntimeRiskExplanationContributor {
+            code: format!("trigger_{trigger}"),
+            signed_impact: 0.1,
+            magnitude: 0.1,
+            rationale: format!("trigger `{trigger}` tightened action selection"),
+        });
+    }
+
+    if let Some(reason) = fallback_reason {
+        contributors.push(RuntimeRiskExplanationContributor {
+            code: format!("fallback_{reason}"),
+            signed_impact: 0.25,
+            magnitude: 0.25,
+            rationale: format!("fallback reason `{reason}` constrained decision output"),
+        });
+    }
+
+    runtime_risk_sort_contributors(&mut contributors);
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let budget_exhausted_by_terms = contributors.len() > normalized_term_budget;
+    let budget_exhausted_by_time = elapsed_ms > time_budget_ms;
+    let exhausted = budget_exhausted_by_terms || budget_exhausted_by_time;
+    let mut fallback_mode = false;
+
+    if exhausted {
+        level = RuntimeRiskExplanationLevelValue::Compact;
+        fallback_mode = true;
+        let action_code = runtime_risk_action_code(action);
+        contributors = vec![
+            RuntimeRiskExplanationContributor {
+                code: format!("action_{action_code}"),
+                signed_impact: 1.0,
+                magnitude: 1.0,
+                rationale: "conservative fallback preserves deterministic selected action"
+                    .to_string(),
+            },
+            RuntimeRiskExplanationContributor {
+                code: "budget_exhausted".to_string(),
+                signed_impact: 1.0,
+                magnitude: 0.95,
+                rationale: "explanation budget exhausted; omitted speculative contributor terms"
+                    .to_string(),
+            },
+        ];
+    }
+
+    let mut trigger_labels = triggers.to_vec();
+    trigger_labels.sort();
+    let trigger_summary = if trigger_labels.is_empty() {
+        "none".to_string()
+    } else {
+        trigger_labels.join("|")
+    };
+    let action_code = runtime_risk_action_code(action);
+    let summary = if fallback_mode {
+        format!("action={action_code} score={risk_score:.3} conservative_explanation_fallback=true")
+    } else {
+        format!(
+            "action={action_code} score={risk_score:.3} unsafe={:.3} suspicious={:.3} triggers={trigger_summary}",
+            posterior.unsafe_, posterior.suspicious
+        )
+    };
+
+    let terms_emitted = contributors.len();
+    (
+        level,
+        summary,
+        contributors,
+        RuntimeRiskExplanationBudgetState {
+            time_budget_ms,
+            elapsed_ms,
+            term_budget: normalized_term_budget,
+            terms_emitted,
+            exhausted,
+            fallback_mode,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -6035,6 +6987,7 @@ mod wasm_host {
             }
 
             let mut values = serde_json::Map::new();
+            let broker = &self.policy;
             for name in names {
                 match std::env::var_os(&name) {
                     None => {
@@ -6042,7 +6995,16 @@ mod wasm_host {
                     }
                     Some(value) => match value.into_string() {
                         Ok(value) => {
-                            values.insert(name, Value::String(value));
+                            // SEC-4.3: Apply secret broker redaction.
+                            let final_value = broker.secret_broker.maybe_redact(&name, &value);
+                            if final_value != value {
+                                tracing::info!(
+                                    event = "secret_broker.redact",
+                                    name_hash = %Self::sha256_hex(&name),
+                                    "Secret broker redacted env var value"
+                                );
+                            }
+                            values.insert(name, Value::String(final_value.to_string()));
                         }
                         Err(_) => {
                             return Err(Self::host_error_json(
@@ -9952,6 +10914,46 @@ async fn dispatch_shared_allowed(
                 .get("cmd")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            // Extract args for mediation classification.
+            let args: Vec<String> = call
+                .params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // SEC-4.3: Exec mediation — classify and gate dangerous commands.
+            let mediation = evaluate_exec_mediation(&ctx.policy.exec_mediation, cmd, &args);
+            match &mediation {
+                ExecMediationResult::Deny { class, reason } => {
+                    tracing::warn!(
+                        event = "exec.mediation.deny",
+                        extension_id = ?ctx.extension_id,
+                        command_class = ?class.map(DangerousCommandClass::label),
+                        reason = %reason,
+                        "Exec command denied by mediation policy"
+                    );
+                    return HostcallOutcome::Error {
+                        code: "denied".to_string(),
+                        message: format!("Exec denied by mediation policy: {reason}"),
+                    };
+                }
+                ExecMediationResult::AllowWithAudit { class, reason } => {
+                    tracing::info!(
+                        event = "exec.mediation.audit",
+                        extension_id = ?ctx.extension_id,
+                        command_class = class.label(),
+                        reason = %reason,
+                        "Exec command allowed with audit"
+                    );
+                }
+                ExecMediationResult::Allow => {}
+            }
+
             // Reconstruct exec payload: everything except "cmd".
             let payload = if let Value::Object(map) = &call.params {
                 let mut out = map.clone();
@@ -11868,6 +12870,29 @@ impl ExtensionManager {
             if feature_budget_exceeded {
                 triggers.push("feature_budget_exceeded".to_string());
             }
+            let posterior = RuntimeRiskPosterior {
+                safe_fast: 0.0,
+                suspicious: 0.0,
+                unsafe_: 1.0,
+            };
+            let expected_loss = RuntimeRiskExpectedLoss {
+                allow: 120.0,
+                harden: 35.0,
+                deny: 2.0,
+                terminate: 1.0,
+            };
+            let (explanation_level, explanation_summary, top_contributors, budget_state) =
+                runtime_risk_build_explanation(
+                    RuntimeRiskAction::Terminate,
+                    1.0,
+                    &posterior,
+                    &expected_loss,
+                    &features,
+                    &triggers,
+                    None,
+                    RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+                    RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+                );
             return Some(RuntimeRiskDecision {
                 action: RuntimeRiskAction::Terminate,
                 reason: "quarantined".to_string(),
@@ -11879,23 +12904,19 @@ impl ExtensionManager {
                 policy_profile: meta.policy_profile.to_string(),
                 timeout_ms: meta.timeout_ms,
                 risk_score: 1.0,
-                posterior: RuntimeRiskPosterior {
-                    safe_fast: 0.0,
-                    suspicious: 0.0,
-                    unsafe_: 1.0,
-                },
-                expected_loss: RuntimeRiskExpectedLoss {
-                    allow: 120.0,
-                    harden: 35.0,
-                    deny: 2.0,
-                    terminate: 1.0,
-                },
+                posterior,
+                expected_loss,
                 e_process: f64::INFINITY,
                 e_threshold: 1.0 / config.alpha,
                 conformal_residual: 1.0,
                 conformal_quantile: state.previous_residual_quantile,
                 drift_detected: true,
                 triggers,
+                explanation_schema: RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION.to_string(),
+                explanation_level,
+                explanation_summary,
+                top_contributors,
+                budget_state,
                 fallback_reason: None,
                 elapsed_ms,
                 state_label: RuntimeRiskStateLabel::Unsafe,
@@ -12007,6 +13028,19 @@ impl ExtensionManager {
             triggers.push("decision_timeout".to_string());
         }
 
+        let (explanation_level, explanation_summary, top_contributors, budget_state) =
+            runtime_risk_build_explanation(
+                action,
+                risk_score,
+                &posterior,
+                &expected_loss,
+                &features,
+                &triggers,
+                fallback_reason.as_deref(),
+                RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+                RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+            );
+
         state.last_decision = Some(action);
 
         Some(RuntimeRiskDecision {
@@ -12028,6 +13062,11 @@ impl ExtensionManager {
             conformal_quantile,
             drift_detected,
             triggers,
+            explanation_schema: RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION.to_string(),
+            explanation_level,
+            explanation_summary,
+            top_contributors,
+            budget_state,
             fallback_reason,
             elapsed_ms,
             state_label,
@@ -12147,6 +13186,10 @@ impl ExtensionManager {
                 outcome_error_code: outcome_error_code.map(ToString::to_string),
                 selected_action: RuntimeRiskActionValue::from(decision.action),
                 reason_codes: decision.triggers.clone(),
+                explanation_level: decision.explanation_level,
+                explanation_summary: decision.explanation_summary.clone(),
+                top_contributors: decision.top_contributors.clone(),
+                budget_state: decision.budget_state.clone(),
                 sequence: decision.sequence_context.clone(),
                 features: decision.features.clone(),
                 extraction_latency_us: decision.feature_extraction_latency_us,
@@ -12176,6 +13219,11 @@ impl ExtensionManager {
                 conformal_quantile: state.previous_residual_quantile,
                 drift_detected: decision.drift_detected,
                 outcome_error_code: outcome_error_code.map(ToString::to_string),
+                explanation_schema: decision.explanation_schema.clone(),
+                explanation_level: decision.explanation_level,
+                explanation_summary: decision.explanation_summary.clone(),
+                top_contributors: decision.top_contributors.clone(),
+                budget_state: decision.budget_state.clone(),
                 ledger_hash: String::new(),
                 prev_ledger_hash: None,
             };
@@ -12185,6 +13233,11 @@ impl ExtensionManager {
         Self::runtime_risk_push_telemetry(&mut guard, telemetry);
 
         let entry = Self::runtime_risk_push_ledger(&mut guard, entry);
+        let top_contributor_codes = entry
+            .top_contributors
+            .iter()
+            .map(|contributor| contributor.code.clone())
+            .collect::<Vec<_>>();
 
         if matches!(
             decision.action,
@@ -12205,6 +13258,10 @@ impl ExtensionManager {
                 conformal_quantile = entry.conformal_quantile,
                 triggers = ?entry.triggers,
                 fallback_reason = ?entry.fallback_reason,
+                explanation_level = ?entry.explanation_level,
+                explanation_budget_exhausted = entry.budget_state.exhausted,
+                explanation_terms = entry.budget_state.terms_emitted,
+                top_contributors = ?top_contributor_codes,
                 outcome_error_code = ?entry.outcome_error_code,
                 ledger_hash = %entry.ledger_hash,
                 "Runtime risk controller applied defensive action"
@@ -12224,6 +13281,10 @@ impl ExtensionManager {
                 conformal_residual = entry.conformal_residual,
                 conformal_quantile = entry.conformal_quantile,
                 triggers = ?entry.triggers,
+                explanation_level = ?entry.explanation_level,
+                explanation_budget_exhausted = entry.budget_state.exhausted,
+                explanation_terms = entry.budget_state.terms_emitted,
+                top_contributors = ?top_contributor_codes,
                 ledger_hash = %entry.ledger_hash,
                 "Runtime risk controller allowed hostcall"
             );
@@ -20307,6 +21368,112 @@ mod tests {
             parsed.redaction_summary,
             "params redacted via hash-only telemetry"
         );
+        assert_eq!(
+            parsed.explanation_level,
+            RuntimeRiskExplanationLevelValue::Standard
+        );
+        assert_eq!(parsed.top_contributors.len(), 0);
+        assert!(!parsed.budget_state.exhausted);
+        assert_eq!(
+            parsed.budget_state.term_budget,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET
+        );
+    }
+
+    #[test]
+    fn runtime_risk_explanation_order_is_deterministic_with_ties() {
+        let features = RuntimeHostcallFeatureVector::default();
+        let posterior = RuntimeRiskPosterior {
+            safe_fast: 0.0,
+            suspicious: 0.0,
+            unsafe_: 0.0,
+        };
+        let expected_loss = RuntimeRiskExpectedLoss {
+            allow: 0.0,
+            harden: 0.0,
+            deny: 0.0,
+            terminate: 0.0,
+        };
+        let triggers = vec!["zeta".to_string(), "alpha".to_string()];
+
+        let (level_a, summary_a, contributors_a, budget_a) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.0,
+            &posterior,
+            &expected_loss,
+            &features,
+            &triggers,
+            None,
+            32,
+            1_000,
+        );
+        let (level_b, summary_b, contributors_b, budget_b) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.0,
+            &posterior,
+            &expected_loss,
+            &features,
+            &triggers,
+            None,
+            32,
+            1_000,
+        );
+
+        assert_eq!(level_a, RuntimeRiskExplanationLevelValue::Standard);
+        assert_eq!(level_a, level_b);
+        assert_eq!(summary_a, summary_b);
+        assert_eq!(contributors_a, contributors_b);
+        assert_eq!(budget_a, budget_b);
+        assert!(!budget_a.exhausted);
+        assert!(
+            contributors_a.len() >= 2,
+            "expected at least two contributors for trigger tie test"
+        );
+        assert_eq!(contributors_a[0].code, "trigger_alpha");
+        assert_eq!(contributors_a[1].code, "trigger_zeta");
+    }
+
+    #[test]
+    fn runtime_risk_explanation_budget_exhaustion_falls_back_conservatively() {
+        let features = RuntimeHostcallFeatureVector::default();
+        let posterior = RuntimeRiskPosterior {
+            safe_fast: 0.1,
+            suspicious: 0.2,
+            unsafe_: 0.3,
+        };
+        let expected_loss = RuntimeRiskExpectedLoss {
+            allow: 1.0,
+            harden: 0.9,
+            deny: 0.8,
+            terminate: 0.7,
+        };
+        let triggers = (0..16)
+            .map(|idx| format!("trigger-{idx}"))
+            .collect::<Vec<_>>();
+
+        let (level, summary, contributors, budget) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Deny,
+            0.7,
+            &posterior,
+            &expected_loss,
+            &features,
+            &triggers,
+            Some("decision_timeout"),
+            2,
+            1_000,
+        );
+
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Compact);
+        assert!(budget.exhausted);
+        assert!(budget.fallback_mode);
+        assert_eq!(budget.term_budget, 2);
+        assert_eq!(contributors.len(), 2);
+        assert_eq!(contributors[0].code, "action_deny");
+        assert_eq!(contributors[1].code, "budget_exhausted");
+        assert!(
+            summary.contains("conservative_explanation_fallback=true"),
+            "expected conservative fallback summary, got: {summary}"
+        );
     }
 
     // ========================================================================
@@ -20557,6 +21724,7 @@ mod tests {
             default_caps: vec!["read".to_string()],
             deny_caps: vec!["exec".to_string()],
             per_extension: HashMap::new(),
+            ..Default::default()
         };
         policy.per_extension.insert(
             "ext.trusted".to_string(),
@@ -20659,6 +21827,7 @@ mod tests {
             default_caps: Vec::new(),
             deny_caps: Vec::new(),
             per_extension: HashMap::new(),
+            ..Default::default()
         };
         policy.per_extension.insert(
             "ext.test".to_string(),
@@ -23847,6 +25016,16 @@ mod tests {
             conformal_quantile: 0.05,
             drift_detected: false,
             outcome_error_code: outcome_error.map(ToString::to_string),
+            explanation_schema: RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION.to_string(),
+            explanation_level: RuntimeRiskExplanationLevelValue::Standard,
+            explanation_summary: "test explanation".to_string(),
+            top_contributors: vec![RuntimeRiskExplanationContributor {
+                code: "test_contributor".to_string(),
+                signed_impact: 0.25,
+                magnitude: 0.25,
+                rationale: "test rationale".to_string(),
+            }],
+            budget_state: RuntimeRiskExplanationBudgetState::default(),
             ledger_hash: String::new(),
             prev_ledger_hash: None,
         }
@@ -24719,5 +25898,722 @@ mod tests {
             build_baseline_from_ledger_with_options(&artifact, "ext.a", 5.0, 2.0, 0.1).unwrap();
         assert!((model.anomaly_threshold_mads - 5.0).abs() < 1e-10);
         assert!((model.transition_divergence_threshold - 2.0).abs() < 1e-10);
+    }
+
+    // ── SEC-3.3A: Bayesian evidence decomposition tests (bd-3ihzn) ──
+
+    fn make_test_features(base: f64, recent_mean: f64) -> RuntimeHostcallFeatureVector {
+        RuntimeHostcallFeatureVector {
+            schema: "test".to_string(),
+            base_score: base,
+            recent_mean_score: recent_mean,
+            recent_error_rate: 0.0,
+            burst_density_1s: 0.0,
+            burst_density_10s: 0.0,
+            prior_failure_streak_norm: 0.0,
+            dangerous_capability: 0.0,
+            timeout_requested: 0.0,
+            policy_prompt_bias: 0.0,
+        }
+    }
+
+    fn make_test_posterior(safe: f64, suspicious: f64, unsafe_: f64) -> RuntimeRiskPosterior {
+        RuntimeRiskPosterior {
+            safe_fast: safe,
+            suspicious,
+            unsafe_,
+        }
+    }
+
+    fn make_test_expected_loss() -> RuntimeRiskExpectedLoss {
+        RuntimeRiskExpectedLoss {
+            allow: 50.0,
+            harden: 20.0,
+            deny: 8.0,
+            terminate: 5.0,
+        }
+    }
+
+    #[test]
+    fn explanation_allow_has_contributors() {
+        let features = make_test_features(0.1, 0.05);
+        let posterior = make_test_posterior(0.8, 0.15, 0.05);
+        let loss = make_test_expected_loss();
+        let (level, summary, contributors, budget) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.1,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Compact);
+        assert!(!contributors.is_empty(), "allow must have contributors");
+        assert!(summary.contains("action=allow"));
+        assert!(!budget.exhausted);
+    }
+
+    #[test]
+    fn explanation_deny_has_full_detail() {
+        let features = make_test_features(0.8, 0.7);
+        let posterior = make_test_posterior(0.1, 0.3, 0.6);
+        let loss = make_test_expected_loss();
+        let (level, summary, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Deny,
+            0.85,
+            &posterior,
+            &loss,
+            &features,
+            &["e_process_breach".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Full);
+        assert!(summary.contains("action=deny"));
+        assert!(
+            contributors.iter().any(|c| c.code == "posterior_unsafe"),
+            "deny explanation must include posterior_unsafe contributor"
+        );
+        assert!(
+            contributors
+                .iter()
+                .any(|c| c.code == "trigger_e_process_breach"),
+            "deny explanation must include trigger contributor"
+        );
+    }
+
+    #[test]
+    fn explanation_terminate_has_full_detail() {
+        let features = make_test_features(0.9, 0.85);
+        let posterior = make_test_posterior(0.05, 0.15, 0.8);
+        let loss = make_test_expected_loss();
+        let (level, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Terminate,
+            0.95,
+            &posterior,
+            &loss,
+            &features,
+            &["unsafe_streak".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Full);
+        assert!(
+            contributors.iter().any(|c| c.code == "posterior_unsafe"),
+            "terminate explanation must include posterior_unsafe"
+        );
+    }
+
+    #[test]
+    fn explanation_harden_has_standard_level() {
+        let features = make_test_features(0.4, 0.3);
+        let posterior = make_test_posterior(0.5, 0.35, 0.15);
+        let loss = make_test_expected_loss();
+        let (level, summary, _, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.4,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Standard);
+        assert!(summary.contains("action=harden"));
+    }
+
+    #[test]
+    fn explanation_contributors_sorted_by_magnitude_desc() {
+        let features = RuntimeHostcallFeatureVector {
+            schema: "test".to_string(),
+            base_score: 0.5,
+            recent_mean_score: 0.3,
+            recent_error_rate: 0.8,
+            burst_density_1s: 0.6,
+            burst_density_10s: 0.0,
+            prior_failure_streak_norm: 0.2,
+            dangerous_capability: 0.0,
+            timeout_requested: 0.0,
+            policy_prompt_bias: 0.0,
+        };
+        let posterior = make_test_posterior(0.3, 0.3, 0.4);
+        let loss = make_test_expected_loss();
+        let (_, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.5,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        for window in contributors.windows(2) {
+            assert!(
+                window[0].magnitude >= window[1].magnitude
+                    || (window[0].magnitude == window[1].magnitude
+                        && window[0].code <= window[1].code),
+                "contributors must be sorted by magnitude desc, then code asc: {:?} vs {:?}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn explanation_deterministic_replay() {
+        let features = make_test_features(0.6, 0.5);
+        let posterior = make_test_posterior(0.3, 0.4, 0.3);
+        let loss = make_test_expected_loss();
+        let triggers = vec!["drift_detected".to_string()];
+        let results: Vec<_> = (0..5)
+            .map(|_| {
+                runtime_risk_build_explanation(
+                    RuntimeRiskAction::Harden,
+                    0.55,
+                    &posterior,
+                    &loss,
+                    &features,
+                    &triggers,
+                    None,
+                    RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+                    RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+                )
+            })
+            .collect();
+        for (i, (level, summary, contributors, _)) in results.iter().enumerate().skip(1) {
+            assert_eq!(*level, results[0].0, "level mismatch at iteration {i}");
+            assert_eq!(*summary, results[0].1, "summary mismatch at iteration {i}");
+            assert_eq!(
+                contributors.len(),
+                results[0].2.len(),
+                "contributor count mismatch at iteration {i}"
+            );
+            for (j, contrib) in contributors.iter().enumerate() {
+                assert_eq!(
+                    contrib.code, results[0].2[j].code,
+                    "contributor code mismatch at [{i}][{j}]"
+                );
+                assert!(
+                    (contrib.signed_impact - results[0].2[j].signed_impact).abs() < 1e-12,
+                    "contributor impact mismatch at [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explanation_deterministic_ordering_stable() {
+        let features = make_test_features(0.3, 0.3);
+        let posterior = make_test_posterior(0.5, 0.3, 0.2);
+        let loss = make_test_expected_loss();
+        let first = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.3,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        let second = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.3,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        let codes_first: Vec<&str> = first.2.iter().map(|c| c.code.as_str()).collect();
+        let codes_second: Vec<&str> = second.2.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(
+            codes_first, codes_second,
+            "contributor ordering must be stable across replays"
+        );
+    }
+
+    #[test]
+    fn explanation_budget_exhausted_by_terms() {
+        let features = make_test_features(0.5, 0.4);
+        let posterior = make_test_posterior(0.3, 0.3, 0.4);
+        let loss = make_test_expected_loss();
+        // Use term_budget=1 to force budget exhaustion (normal produces 8+ contributors)
+        let (level, summary, contributors, budget) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Deny,
+            0.7,
+            &posterior,
+            &loss,
+            &features,
+            &["e_process_breach".to_string(), "drift_detected".to_string()],
+            None,
+            1,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Compact);
+        assert!(budget.exhausted, "budget must be exhausted");
+        assert!(budget.fallback_mode, "must be in fallback mode");
+        assert_eq!(contributors.len(), 2, "fallback produces exactly 2 terms");
+        assert!(
+            contributors[0].code.starts_with("action_"),
+            "first fallback contributor must be action code"
+        );
+        assert_eq!(
+            contributors[1].code, "budget_exhausted",
+            "second fallback contributor must be budget_exhausted"
+        );
+        assert!(
+            summary.contains("conservative_explanation_fallback=true"),
+            "summary must indicate fallback mode"
+        );
+    }
+
+    #[test]
+    fn explanation_budget_fallback_preserves_action() {
+        let features = make_test_features(0.5, 0.5);
+        let posterior = make_test_posterior(0.2, 0.3, 0.5);
+        let loss = make_test_expected_loss();
+        for action in [
+            RuntimeRiskAction::Allow,
+            RuntimeRiskAction::Harden,
+            RuntimeRiskAction::Deny,
+            RuntimeRiskAction::Terminate,
+        ] {
+            let (_, _, contributors, budget) = runtime_risk_build_explanation(
+                action,
+                0.7,
+                &posterior,
+                &loss,
+                &features,
+                &["trigger".to_string()],
+                None,
+                1,
+                RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+            );
+            assert!(budget.fallback_mode);
+            let action_code = runtime_risk_action_code(action);
+            assert_eq!(
+                contributors[0].code,
+                format!("action_{action_code}"),
+                "fallback must preserve action {action_code}"
+            );
+        }
+    }
+
+    #[test]
+    fn explanation_budget_state_tracks_terms() {
+        let features = make_test_features(0.2, 0.1);
+        let posterior = make_test_posterior(0.7, 0.2, 0.1);
+        let loss = make_test_expected_loss();
+        let (_, _, contributors, budget) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.15,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(budget.terms_emitted, contributors.len());
+        assert_eq!(budget.term_budget, RUNTIME_RISK_EXPLANATION_TERM_BUDGET);
+        assert_eq!(
+            budget.time_budget_ms,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS
+        );
+        assert!(!budget.exhausted);
+        assert!(!budget.fallback_mode);
+    }
+
+    #[test]
+    fn explanation_trigger_adds_contributor() {
+        let features = make_test_features(0.5, 0.4);
+        let posterior = make_test_posterior(0.4, 0.3, 0.3);
+        let loss = make_test_expected_loss();
+        let (_, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.5,
+            &posterior,
+            &loss,
+            &features,
+            &["e_process_breach".to_string(), "drift_detected".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert!(
+            contributors
+                .iter()
+                .any(|c| c.code == "trigger_e_process_breach"),
+            "e_process_breach trigger must generate contributor"
+        );
+        assert!(
+            contributors
+                .iter()
+                .any(|c| c.code == "trigger_drift_detected"),
+            "drift_detected trigger must generate contributor"
+        );
+    }
+
+    #[test]
+    fn explanation_fallback_reason_adds_contributor() {
+        let features = make_test_features(0.3, 0.2);
+        let posterior = make_test_posterior(0.6, 0.25, 0.15);
+        let loss = make_test_expected_loss();
+        let (level, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.3,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            Some("decision_timeout"),
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Full);
+        assert!(
+            contributors
+                .iter()
+                .any(|c| c.code == "fallback_decision_timeout"),
+            "fallback reason must generate contributor"
+        );
+    }
+
+    #[test]
+    fn explanation_posterior_decomposition_present() {
+        let features = make_test_features(0.5, 0.4);
+        let posterior = make_test_posterior(0.3, 0.35, 0.35);
+        let loss = make_test_expected_loss();
+        let (_, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.5,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert!(
+            contributors.iter().any(|c| c.code == "posterior_unsafe"),
+            "must include posterior_unsafe contributor"
+        );
+        assert!(
+            contributors
+                .iter()
+                .any(|c| c.code == "posterior_suspicious"),
+            "must include posterior_suspicious contributor"
+        );
+    }
+
+    #[test]
+    fn explanation_expected_loss_delta_present() {
+        let features = make_test_features(0.5, 0.4);
+        let posterior = make_test_posterior(0.3, 0.35, 0.35);
+        let loss = RuntimeRiskExpectedLoss {
+            allow: 80.0,
+            harden: 30.0,
+            deny: 10.0,
+            terminate: 5.0,
+        };
+        let (_, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Deny,
+            0.7,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        let loss_contrib = contributors
+            .iter()
+            .find(|c| c.code == "expected_loss_delta_vs_allow")
+            .expect("must include expected_loss_delta_vs_allow contributor");
+        assert!(
+            (loss_contrib.signed_impact - (80.0 - 10.0)).abs() < 1e-10,
+            "loss delta must be allow_loss - deny_loss = 70.0, got {}",
+            loss_contrib.signed_impact
+        );
+    }
+
+    #[test]
+    fn explanation_feature_weights_match_scoring() {
+        let features = RuntimeHostcallFeatureVector {
+            schema: "test".to_string(),
+            base_score: 0.6,
+            recent_mean_score: 0.4,
+            recent_error_rate: 0.5,
+            burst_density_1s: 0.3,
+            burst_density_10s: 0.0,
+            prior_failure_streak_norm: 0.2,
+            dangerous_capability: 0.0,
+            timeout_requested: 0.0,
+            policy_prompt_bias: 0.0,
+        };
+        let posterior = make_test_posterior(0.4, 0.3, 0.3);
+        let loss = make_test_expected_loss();
+        let (_, _, contributors, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.5,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        let base = contributors
+            .iter()
+            .find(|c| c.code == "feature_base_score")
+            .expect("must have feature_base_score");
+        assert!(
+            (base.signed_impact - 0.65 * 0.6).abs() < 1e-10,
+            "base_score weight must be 0.65"
+        );
+        let recent = contributors
+            .iter()
+            .find(|c| c.code == "feature_recent_mean_score")
+            .expect("must have feature_recent_mean_score");
+        assert!(
+            (recent.signed_impact - 0.35 * 0.4).abs() < 1e-10,
+            "recent_mean_score weight must be 0.35"
+        );
+        let error = contributors
+            .iter()
+            .find(|c| c.code == "feature_recent_error_rate")
+            .expect("must have feature_recent_error_rate");
+        assert!(
+            (error.signed_impact - 0.12 * 0.5).abs() < 1e-10,
+            "recent_error_rate weight must be 0.12"
+        );
+        let burst = contributors
+            .iter()
+            .find(|c| c.code == "feature_burst_density_1s")
+            .expect("must have feature_burst_density_1s");
+        assert!(
+            (burst.signed_impact - 0.08 * 0.3).abs() < 1e-10,
+            "burst_density_1s weight must be 0.08"
+        );
+        let streak = contributors
+            .iter()
+            .find(|c| c.code == "feature_prior_failure_streak")
+            .expect("must have feature_prior_failure_streak");
+        assert!(
+            (streak.signed_impact - 0.05 * 0.2).abs() < 1e-10,
+            "prior_failure_streak_norm weight must be 0.05"
+        );
+    }
+
+    #[test]
+    fn explanation_level_escalation_with_triggers() {
+        let features = make_test_features(0.3, 0.2);
+        let posterior = make_test_posterior(0.6, 0.25, 0.15);
+        let loss = make_test_expected_loss();
+        // Allow with no triggers → Compact
+        let (level, _, _, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.2,
+            &posterior,
+            &loss,
+            &features,
+            &[],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Compact);
+        // Allow with triggers → Standard
+        let (level, _, _, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Allow,
+            0.2,
+            &posterior,
+            &loss,
+            &features,
+            &["feature_budget_exceeded".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert_eq!(level, RuntimeRiskExplanationLevelValue::Standard);
+    }
+
+    #[test]
+    fn explanation_schema_version_correct() {
+        assert_eq!(
+            RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION,
+            "pi.ext.runtime_risk_explanation.v1"
+        );
+    }
+
+    #[test]
+    fn explanation_sort_tiebreak_by_code() {
+        let mut contributors = vec![
+            RuntimeRiskExplanationContributor {
+                code: "zzz".to_string(),
+                signed_impact: 0.5,
+                magnitude: 0.5,
+                rationale: String::new(),
+            },
+            RuntimeRiskExplanationContributor {
+                code: "aaa".to_string(),
+                signed_impact: 0.5,
+                magnitude: 0.5,
+                rationale: String::new(),
+            },
+        ];
+        runtime_risk_sort_contributors(&mut contributors);
+        assert_eq!(contributors[0].code, "aaa");
+        assert_eq!(contributors[1].code, "zzz");
+    }
+
+    #[test]
+    fn explanation_summary_format_normal() {
+        let features = make_test_features(0.4, 0.3);
+        let posterior = make_test_posterior(0.4, 0.35, 0.25);
+        let loss = make_test_expected_loss();
+        let (_, summary, _, budget) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Harden,
+            0.4,
+            &posterior,
+            &loss,
+            &features,
+            &["drift_detected".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert!(!budget.fallback_mode);
+        assert!(summary.contains("action=harden"));
+        assert!(summary.contains("score=0.400"));
+        assert!(summary.contains("unsafe="));
+        assert!(summary.contains("suspicious="));
+        assert!(summary.contains("triggers=drift_detected"));
+    }
+
+    #[test]
+    fn explanation_summary_triggers_sorted() {
+        let features = make_test_features(0.5, 0.4);
+        let posterior = make_test_posterior(0.3, 0.35, 0.35);
+        let loss = make_test_expected_loss();
+        let (_, summary, _, _) = runtime_risk_build_explanation(
+            RuntimeRiskAction::Deny,
+            0.7,
+            &posterior,
+            &loss,
+            &features,
+            &["zzz_trigger".to_string(), "aaa_trigger".to_string()],
+            None,
+            RUNTIME_RISK_EXPLANATION_TERM_BUDGET,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS,
+        );
+        assert!(
+            summary.contains("triggers=aaa_trigger|zzz_trigger"),
+            "triggers in summary must be sorted: {summary}"
+        );
+    }
+
+    #[test]
+    fn explanation_e2e_through_manager() {
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        });
+        let meta = RuntimeRiskCallMetadata {
+            args_shape_hash: "hash_test",
+            resource_target_class: "fs",
+            timeout_ms: None,
+            policy_profile: "permissive",
+        };
+        let decision = manager
+            .evaluate_runtime_risk(
+                Some("ext.test.explain"),
+                "call-1",
+                "exec",
+                "exec",
+                "param_hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision must be returned when enabled");
+        assert_eq!(
+            decision.explanation_schema,
+            RUNTIME_RISK_EXPLANATION_SCHEMA_VERSION
+        );
+        assert!(!decision.top_contributors.is_empty());
+        assert!(!decision.explanation_summary.is_empty());
+        // Verify deterministic replay
+        let manager2 = ExtensionManager::new();
+        manager2.set_runtime_risk_config(RuntimeRiskConfig {
+            enabled: true,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 1024,
+            decision_timeout_ms: 5000,
+            fail_closed: true,
+        });
+        let decision2 = manager2
+            .evaluate_runtime_risk(
+                Some("ext.test.explain"),
+                "call-1",
+                "exec",
+                "exec",
+                "param_hash",
+                meta,
+                "permissive",
+            )
+            .expect("decision must be returned");
+        assert_eq!(decision.explanation_level, decision2.explanation_level);
+        assert_eq!(
+            decision.top_contributors.len(),
+            decision2.top_contributors.len()
+        );
+        for (a, b) in decision
+            .top_contributors
+            .iter()
+            .zip(decision2.top_contributors.iter())
+        {
+            assert_eq!(a.code, b.code);
+            assert!(
+                (a.signed_impact - b.signed_impact).abs() < 1e-12,
+                "contributor impacts must be identical across replays"
+            );
+        }
+    }
+
+    #[test]
+    fn explanation_budget_default_values() {
+        let budget = RuntimeRiskExplanationBudgetState::default();
+        assert_eq!(
+            budget.time_budget_ms,
+            RUNTIME_RISK_EXPLANATION_TIME_BUDGET_MS
+        );
+        assert_eq!(budget.term_budget, RUNTIME_RISK_EXPLANATION_TERM_BUDGET);
+        assert_eq!(budget.elapsed_ms, 0);
+        assert_eq!(budget.terms_emitted, 0);
+        assert!(!budget.exhausted);
+        assert!(!budget.fallback_mode);
     }
 }
