@@ -176,6 +176,23 @@
     },
     "verdict": "ALL 4 E2E PROVIDER GATE SUITES PASS (411/411). Full provider stack validated: scenarios, streaming, cross-provider parity, and failure injection. Structured logging contract verified (correlation IDs, redaction, artifacts). 1 non-defect failure in supporting suite (ollama auth-key assertion)."
   },
+  "live_provider_tests": {
+    "e2e_ollama_live": {
+      "command": "cargo test --test e2e_ollama_live",
+      "result": "PASS",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "duration_seconds": 8.69,
+      "scope": "Live E2E tests against real ollama server (qwen2.5:0.5b at 127.0.0.1:11434)",
+      "key_tests": [
+        "live_ollama_simple_text_streaming (correct '4' response to 2+2)",
+        "live_ollama_event_ordering (Start → TextDelta(s) → Done verified)",
+        "live_ollama_provider_properties (name=ollama, api=openai-completions)"
+      ],
+      "evidence": "Full provider stack validated: create_provider → stream → collect events → verify content against live ollama server with qwen2.5:0.5b model"
+    }
+  },
   "remediation_items": [
     {
       "id": "R1",

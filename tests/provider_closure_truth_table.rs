@@ -14,8 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 fn load_truth_table() -> Value {
-    let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider-closure-truth-table.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider-closure-truth-table.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read truth table file: {e}"));
     serde_json::from_str(&content)
@@ -35,9 +34,7 @@ fn truth_table_file_exists_and_parses() {
         doc["schema"].as_str().unwrap(),
         "pi.qa.provider_closure_truth_table.v1"
     );
-    harness
-        .log()
-        .info("schema", "Truth table file valid");
+    harness.log().info("schema", "Truth table file valid");
 }
 
 #[test]
@@ -334,12 +331,16 @@ fn aggregate_total_vcr_cassettes_matches() {
 #[test]
 fn aggregate_all_dispositions_closed() {
     let doc = load_truth_table();
-    assert!(doc["aggregate_summary"]["all_dispositions_closed"]
-        .as_bool()
-        .unwrap());
-    assert!(doc["aggregate_summary"]["all_production_ready"]
-        .as_bool()
-        .unwrap());
+    assert!(
+        doc["aggregate_summary"]["all_dispositions_closed"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(
+        doc["aggregate_summary"]["all_production_ready"]
+            .as_bool()
+            .unwrap()
+    );
     assert_eq!(
         doc["aggregate_summary"]["blocking_issues"]
             .as_u64()
@@ -370,10 +371,7 @@ fn cross_provider_matrix_rows_match_header_width() {
     let matrix = &doc["cross_provider_matrix"];
     let headers = matrix["headers"].as_array().unwrap();
     let rows = matrix["rows"].as_array().unwrap();
-    assert!(
-        !rows.is_empty(),
-        "Matrix should have at least one row"
-    );
+    assert!(!rows.is_empty(), "Matrix should have at least one row");
     for (i, row) in rows.iter().enumerate() {
         let row_arr = row.as_array().unwrap();
         assert_eq!(
@@ -456,15 +454,14 @@ fn all_dispositions_are_valid_values() {
 
 #[test]
 fn vcr_cassette_files_exist_for_simple_providers() {
-    let fixtures_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
     let doc = load_truth_table();
 
     for provider_key in &["groq", "cerebras", "openrouter"] {
-        let scenarios = doc["providers"][provider_key]["test_evidence"]["vcr_cassettes"]
-            ["scenarios"]
-            .as_array()
-            .unwrap();
+        let scenarios =
+            doc["providers"][provider_key]["test_evidence"]["vcr_cassettes"]["scenarios"]
+                .as_array()
+                .unwrap();
         for scenario in scenarios {
             let name = scenario.as_str().unwrap();
             let cassette_path = fixtures_dir.join(format!("{name}.json"));
@@ -478,8 +475,7 @@ fn vcr_cassette_files_exist_for_simple_providers() {
 
 #[test]
 fn vcr_cassette_files_exist_for_kimi_variants() {
-    let fixtures_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
     let doc = load_truth_table();
 
     let by_entry = doc["providers"]["kimi"]["test_evidence"]["vcr_cassettes"]["by_entry"]
@@ -500,8 +496,7 @@ fn vcr_cassette_files_exist_for_kimi_variants() {
 
 #[test]
 fn vcr_cassette_files_exist_for_qwen_variants() {
-    let fixtures_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
+    let fixtures_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vcr");
     let doc = load_truth_table();
 
     let by_entry = doc["providers"]["qwen"]["test_evidence"]["vcr_cassettes"]["by_entry"]
@@ -599,9 +594,7 @@ fn aggregate_discrepancy_count_matches_refs() {
 #[test]
 fn kimi_has_three_variants() {
     let doc = load_truth_table();
-    let variants = doc["providers"]["kimi"]["variants"]
-        .as_object()
-        .unwrap();
+    let variants = doc["providers"]["kimi"]["variants"].as_object().unwrap();
     assert_eq!(
         variants.len(),
         3,
@@ -615,9 +608,7 @@ fn kimi_has_three_variants() {
 #[test]
 fn qwen_has_two_variants() {
     let doc = load_truth_table();
-    let variants = doc["providers"]["qwen"]["variants"]
-        .as_object()
-        .unwrap();
+    let variants = doc["providers"]["qwen"]["variants"].as_object().unwrap();
     assert_eq!(
         variants.len(),
         2,
@@ -654,10 +645,9 @@ fn comprehensive_truth_table_report() {
 
     // Verify provider count
     let providers = doc["providers"].as_object().unwrap();
-    harness.log().info(
-        "count",
-        &format!("Providers audited: {}", providers.len()),
-    );
+    harness
+        .log()
+        .info("count", &format!("Providers audited: {}", providers.len()));
     assert_eq!(providers.len(), 5);
 
     // Verify all are CLOSED

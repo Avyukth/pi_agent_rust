@@ -2628,8 +2628,7 @@ mod tests {
             ("lmstudio", "LM Studio"),
         ];
         for &(id, expected_name) in cases {
-            let meta =
-                provider_metadata(id).unwrap_or_else(|| panic!("provider '{id}' not found"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!("provider '{id}' not found"));
             assert_eq!(
                 meta.display_name,
                 Some(expected_name),

@@ -1084,10 +1084,22 @@ fn evidence_contract_schema_defines_suite_entry() {
         .filter_map(|v| v.as_str())
         .collect();
 
-    assert!(required.contains(&"suite_id"), "suite_entry must require suite_id");
-    assert!(required.contains(&"status"), "suite_entry must require status");
-    assert!(required.contains(&"artifacts"), "suite_entry must require artifacts");
-    assert!(required.contains(&"elapsed_ms"), "suite_entry must require elapsed_ms");
+    assert!(
+        required.contains(&"suite_id"),
+        "suite_entry must require suite_id"
+    );
+    assert!(
+        required.contains(&"status"),
+        "suite_entry must require status"
+    );
+    assert!(
+        required.contains(&"artifacts"),
+        "suite_entry must require artifacts"
+    );
+    assert!(
+        required.contains(&"elapsed_ms"),
+        "suite_entry must require elapsed_ms"
+    );
 }
 
 #[test]
@@ -1178,13 +1190,13 @@ fn evidence_contract_schema_environment_matches_replay_bundle() {
     let contract_path = repo_root().join("docs/provider_e2e_artifact_contract.json");
     let contract = load_json(&contract_path).expect("parse artifact contract");
 
-    let replay_env_fields: Vec<&str> = contract["failure_diagnostics"]["replay_bundle"]
-        ["environment_fields"]
-        .as_array()
-        .expect("replay bundle environment_fields")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let replay_env_fields: Vec<&str> =
+        contract["failure_diagnostics"]["replay_bundle"]["environment_fields"]
+            .as_array()
+            .expect("replay bundle environment_fields")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
 
     let schema_env_props = schema["properties"]["environment"]["properties"]
         .as_object()
@@ -1310,7 +1322,10 @@ fn synthetic_evidence_contract_validates_against_schema() {
         assert!(suite["suite_id"].is_string(), "suite must have suite_id");
         assert!(suite["status"].is_string(), "suite must have status");
         assert!(suite["artifacts"].is_object(), "suite must have artifacts");
-        assert!(suite["elapsed_ms"].is_number(), "suite must have elapsed_ms");
+        assert!(
+            suite["elapsed_ms"].is_number(),
+            "suite must have elapsed_ms"
+        );
 
         // Verify artifact paths
         let artifacts = &suite["artifacts"];

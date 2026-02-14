@@ -53,15 +53,13 @@ fn check_headers_redacted(headers: &serde_json::Value, path: &str) -> Vec<String
         for (i, pair) in arr.iter().enumerate() {
             if let Some(pair_arr) = pair.as_array() {
                 if pair_arr.len() >= 2 {
-                    if let (Some(key), Some(value)) = (pair_arr[0].as_str(), pair_arr[1].as_str())
-                    {
+                    if let (Some(key), Some(value)) = (pair_arr[0].as_str(), pair_arr[1].as_str()) {
                         let key_lower = key.to_ascii_lowercase();
                         if SENSITIVE_HEADERS.iter().any(|h| key_lower == *h)
                             && !is_header_value_redacted(value)
                         {
-                            violations.push(format!(
-                                "{path}[{i}]: header '{key}' has unredacted value"
-                            ));
+                            violations
+                                .push(format!("{path}[{i}]: header '{key}' has unredacted value"));
                         }
                     }
                 }
@@ -115,9 +113,8 @@ fn scan_cassette(cassette: &serde_json::Value, filename: &str) -> Vec<String> {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(chunk_str) {
                             let chunk_leaks = find_unredacted_keys(&parsed);
                             for leak in chunk_leaks {
-                                violations.push(format!(
-                                    "{prefix}.response.body_chunks[{ci}].{leak}"
-                                ));
+                                violations
+                                    .push(format!("{prefix}.response.body_chunks[{ci}].{leak}"));
                             }
                         }
                     }

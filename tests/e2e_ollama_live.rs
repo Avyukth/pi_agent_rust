@@ -71,7 +71,8 @@ fn stream_options() -> StreamOptions {
     StreamOptions {
         temperature: Some(0.0),
         max_tokens: Some(128),
-        api_key: None,
+        // Ollama doesn't need auth but the OpenAI-compat provider requires a non-empty key.
+        api_key: Some("ollama-no-key-needed".to_string()),
         ..Default::default()
     }
 }
@@ -84,9 +85,7 @@ fn live_ollama_simple_text_streaming() {
         return;
     }
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("runtime");
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
 
     rt.block_on(async {
         let entry = ollama_entry();
@@ -143,9 +142,7 @@ fn live_ollama_event_ordering() {
         return;
     }
 
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("runtime");
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
 
     rt.block_on(async {
         let entry = ollama_entry();
@@ -179,18 +176,11 @@ fn live_ollama_event_ordering() {
         eprintln!("event sequence: {events:?}");
 
         // Must start with Start and end with Done
-        assert_eq!(
-            events.first(),
-            Some(&"Start"),
-            "first event must be Start"
-        );
+        assert_eq!(events.first(), Some(&"Start"), "first event must be Start");
         assert_eq!(events.last(), Some(&"Done"), "last event must be Done");
 
         // Must have at least one TextDelta
-        assert!(
-            events.contains(&"TextDelta"),
-            "must have TextDelta events"
-        );
+        assert!(events.contains(&"TextDelta"), "must have TextDelta events");
     });
 }
 

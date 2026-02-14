@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 fn load_classification() -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("docs/provider-discrepancy-classification.json");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider-discrepancy-classification.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read classification file: {e}"));
     serde_json::from_str(&content)
@@ -34,9 +34,7 @@ fn classification_file_exists_and_parses() {
         doc["schema"].as_str().unwrap(),
         "pi.qa.provider_discrepancy_classification.v1"
     );
-    harness
-        .log()
-        .info("schema", "Classification file valid");
+    harness.log().info("schema", "Classification file valid");
 }
 
 #[test]
@@ -114,7 +112,10 @@ fn discrepancy_ids_are_sequential() {
     for (i, entry) in entries.iter().enumerate() {
         let expected = format!("DISC-{:03}", i + 1);
         let actual = entry["id"].as_str().unwrap();
-        assert_eq!(actual, expected, "Expected {expected} at index {i}, got {actual}");
+        assert_eq!(
+            actual, expected,
+            "Expected {expected} at index {i}, got {actual}"
+        );
     }
 }
 
@@ -166,9 +167,7 @@ fn taxonomy_covers_bead_required_classes() {
 #[test]
 fn all_severity_values_are_from_grading() {
     let doc = load_classification();
-    let grading = doc["methodology"]["severity_grading"]
-        .as_object()
-        .unwrap();
+    let grading = doc["methodology"]["severity_grading"].as_object().unwrap();
     let allowed_severities: HashSet<&str> = grading.keys().map(String::as_str).collect();
 
     let entries = doc["discrepancies"].as_array().unwrap();
@@ -256,10 +255,7 @@ fn summary_by_severity_matches_actual_distribution() {
 fn cross_reference_by_root_cause_ids_exist_in_discrepancies() {
     let doc = load_classification();
     let entries = doc["discrepancies"].as_array().unwrap();
-    let all_ids: HashSet<&str> = entries
-        .iter()
-        .map(|e| e["id"].as_str().unwrap())
-        .collect();
+    let all_ids: HashSet<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
 
     let by_root_cause = doc["cross_reference_matrix"]["by_root_cause"]
         .as_object()
@@ -298,10 +294,7 @@ fn cross_reference_by_root_cause_counts_match() {
 fn cross_reference_by_user_impact_ids_exist_in_discrepancies() {
     let doc = load_classification();
     let entries = doc["discrepancies"].as_array().unwrap();
-    let all_ids: HashSet<&str> = entries
-        .iter()
-        .map(|e| e["id"].as_str().unwrap())
-        .collect();
+    let all_ids: HashSet<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
 
     let by_impact = doc["cross_reference_matrix"]["by_user_impact"]
         .as_object()
@@ -322,10 +315,7 @@ fn cross_reference_by_user_impact_ids_exist_in_discrepancies() {
 fn cross_reference_by_user_impact_covers_all_discrepancies() {
     let doc = load_classification();
     let entries = doc["discrepancies"].as_array().unwrap();
-    let all_ids: HashSet<&str> = entries
-        .iter()
-        .map(|e| e["id"].as_str().unwrap())
-        .collect();
+    let all_ids: HashSet<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
 
     let by_impact = doc["cross_reference_matrix"]["by_user_impact"]
         .as_object()
@@ -373,10 +363,7 @@ fn evidence_refs_are_non_empty_arrays() {
     for entry in entries {
         let id = entry["id"].as_str().unwrap();
         let refs = entry["evidence_refs"].as_array().unwrap();
-        assert!(
-            !refs.is_empty(),
-            "Discrepancy {id} has empty evidence_refs"
-        );
+        assert!(!refs.is_empty(), "Discrepancy {id} has empty evidence_refs");
         for r in refs {
             assert!(
                 r.as_str().is_some() && !r.as_str().unwrap().is_empty(),
@@ -390,20 +377,13 @@ fn evidence_refs_are_non_empty_arrays() {
 fn evidence_refs_point_to_known_files_or_beads() {
     let doc = load_classification();
     let entries = doc["discrepancies"].as_array().unwrap();
-    let known_prefixes = [
-        "docs/",
-        "src/",
-        "tests/",
-        "bd-",
-    ];
+    let known_prefixes = ["docs/", "src/", "tests/", "bd-"];
     for entry in entries {
         let id = entry["id"].as_str().unwrap();
         let refs = entry["evidence_refs"].as_array().unwrap();
         for r in refs {
             let ref_str = r.as_str().unwrap();
-            let has_known_prefix = known_prefixes
-                .iter()
-                .any(|p| ref_str.starts_with(p));
+            let has_known_prefix = known_prefixes.iter().any(|p| ref_str.starts_with(p));
             assert!(
                 has_known_prefix,
                 "Discrepancy {id} evidence_ref '{ref_str}' does not start with a known prefix ({known_prefixes:?})"
@@ -433,10 +413,7 @@ fn remediation_ranks_are_sequential() {
 fn remediation_entries_reference_existing_discrepancies() {
     let doc = load_classification();
     let entries = doc["discrepancies"].as_array().unwrap();
-    let all_ids: HashSet<&str> = entries
-        .iter()
-        .map(|e| e["id"].as_str().unwrap())
-        .collect();
+    let all_ids: HashSet<&str> = entries.iter().map(|e| e["id"].as_str().unwrap()).collect();
 
     let priorities = doc["remediation_priority"].as_array().unwrap();
     for entry in priorities {
@@ -489,9 +466,7 @@ fn remediation_entries_have_required_fields() {
 #[test]
 fn acceptance_criteria_all_pass() {
     let doc = load_classification();
-    let criteria = doc["acceptance_criteria_compliance"]
-        .as_object()
-        .unwrap();
+    let criteria = doc["acceptance_criteria_compliance"].as_object().unwrap();
     for (criterion, data) in criteria {
         let status = data["status"].as_str().unwrap();
         assert!(
@@ -505,12 +480,10 @@ fn acceptance_criteria_all_pass() {
 
 #[test]
 fn artifact_contract_gaps_are_covered_in_classification() {
-    let contract_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("docs/provider_e2e_artifact_contract.json");
-    let contract: Value = serde_json::from_str(
-        &std::fs::read_to_string(&contract_path).unwrap(),
-    )
-    .unwrap();
+    let contract_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider_e2e_artifact_contract.json");
+    let contract: Value =
+        serde_json::from_str(&std::fs::read_to_string(&contract_path).unwrap()).unwrap();
 
     let gaps = contract["gaps_identified"].as_array().unwrap();
     let classification = load_classification();
@@ -532,9 +505,7 @@ fn artifact_contract_gaps_are_covered_in_classification() {
     // Each gap should be referenced
     for gap in gaps {
         let gap_id = gap["id"].as_str().unwrap();
-        let is_covered = contract_refs
-            .iter()
-            .any(|r| r.contains(gap_id));
+        let is_covered = contract_refs.iter().any(|r| r.contains(gap_id));
         assert!(
             is_covered,
             "Artifact contract gap {gap_id} is not referenced in classification evidence_refs"
@@ -562,18 +533,15 @@ fn comprehensive_discrepancy_classification_report() {
         *by_severity.entry(severity).or_insert(0) += 1;
     }
 
-    harness.log().info(
-        "report",
-        format!("Total discrepancies: {total}"),
-    );
-    harness.log().info(
-        "report",
-        format!("By type: {by_type:?}"),
-    );
-    harness.log().info(
-        "report",
-        format!("By severity: {by_severity:?}"),
-    );
+    harness
+        .log()
+        .info("report", format!("Total discrepancies: {total}"));
+    harness
+        .log()
+        .info("report", format!("By type: {by_type:?}"));
+    harness
+        .log()
+        .info("report", format!("By severity: {by_severity:?}"));
 
     // Validate structure
     let checks = [
@@ -582,17 +550,28 @@ fn comprehensive_discrepancy_classification_report() {
         ("has_discrepancies", !entries.is_empty()),
         ("has_cross_ref", doc.get("cross_reference_matrix").is_some()),
         ("has_remediation", doc.get("remediation_priority").is_some()),
-        ("has_acceptance", doc.get("acceptance_criteria_compliance").is_some()),
-        ("no_implementation_gaps", by_type.get("implementation_gap").copied().unwrap_or(0) == 0),
-        ("taxonomy_complete", doc["methodology"]["classification_rules"].as_object().unwrap().len() >= 5),
+        (
+            "has_acceptance",
+            doc.get("acceptance_criteria_compliance").is_some(),
+        ),
+        (
+            "no_implementation_gaps",
+            by_type.get("implementation_gap").copied().unwrap_or(0) == 0,
+        ),
+        (
+            "taxonomy_complete",
+            doc["methodology"]["classification_rules"]
+                .as_object()
+                .unwrap()
+                .len()
+                >= 5,
+        ),
     ];
 
     let mut pass_count = 0;
     for (name, passed) in &checks {
         let status = if *passed { "PASS" } else { "FAIL" };
-        harness
-            .log()
-            .info("check", format!("{name}: {status}"));
+        harness.log().info("check", format!("{name}: {status}"));
         if *passed {
             pass_count += 1;
         }
