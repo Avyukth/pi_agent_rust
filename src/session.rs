@@ -673,7 +673,9 @@ impl Session {
             let res = (|| -> Result<(Self, SessionOpenDiagnostics)> {
                 let file =
                     std::fs::File::open(&path_buf).map_err(|e| crate::Error::Io(Box::new(e)))?;
-                let reader = BufReader::new(file);
+                // Opening large JSONL sessions is a sequential line scan; using a
+                // larger buffer reduces read syscall overhead.
+                let reader = BufReader::with_capacity(1 << 20, file);
                 let mut lines = reader.lines();
 
                 // Parse header (first line)
