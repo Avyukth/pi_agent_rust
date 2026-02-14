@@ -766,6 +766,14 @@ impl Config {
             std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
         }
 
+        fn sanitize_alpha(alpha: f64) -> Option<f64> {
+            if alpha.is_finite() {
+                Some(alpha.clamp(1.0e-6, 0.5))
+            } else {
+                None
+            }
+        }
+
         fn parse_env_u32(name: &str) -> Option<u32> {
             std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
         }
@@ -782,8 +790,8 @@ impl Config {
                 settings.enabled = enabled;
                 source = "config";
             }
-            if let Some(alpha) = cfg.alpha {
-                settings.alpha = alpha.clamp(1.0e-6, 0.5);
+            if let Some(alpha) = cfg.alpha.and_then(sanitize_alpha) {
+                settings.alpha = alpha;
                 source = "config";
             }
             if let Some(window_size) = cfg.window_size {
@@ -812,8 +820,8 @@ impl Config {
             settings.enabled = enabled;
             source = "env";
         }
-        if let Some(alpha) = parse_env_f64("PI_EXTENSION_RISK_ALPHA") {
-            settings.alpha = alpha.clamp(1.0e-6, 0.5);
+        if let Some(alpha) = parse_env_f64("PI_EXTENSION_RISK_ALPHA").and_then(sanitize_alpha) {
+            settings.alpha = alpha;
             source = "env";
         }
         if let Some(window_size) = parse_env_u32("PI_EXTENSION_RISK_WINDOW") {
@@ -1155,6 +1163,8 @@ mod tests {
         global_dir_from_env, package_dir_from_env, sessions_dir_from_env,
     };
     use crate::agent::QueueMode;
+    use proptest::prelude::*;
+    use proptest::string::string_regex;
     use serde_json::json;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2225,5 +2235,90 @@ mod tests {
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
         let policy = config.resolve_repair_policy(None);
         assert_eq!(policy, crate::extensions::RepairPolicyMode::AutoSafe);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
+
+        #[test]
+        fn proptest_extension_risk_alpha_finite_values_clamp(alpha in -1.0e6f64..1.0e6f64) {
+            let config = Config {
+                extension_risk: Some(ExtensionRiskConfig {
+                    alpha: Some(alpha),
+                    ..ExtensionRiskConfig::default()
+                }),
+                ..Config::default()
+            };
+
+            let resolved = config.resolve_extension_risk_with_metadata();
+            prop_assert_eq!(resolved.settings.alpha, alpha.clamp(1.0e-6, 0.5));
+            prop_assert_eq!(resolved.source, "config");
+        }
+
+        #[test]
+        fn proptest_config_deserializes_extension_risk_alpha_values(alpha in -1.0e6f64..1.0e6f64) {
+            let parsed: Config = serde_json::from_value(json!({
+                "extensionRisk": {
+                    "alpha": alpha
+                }
+            }))
+            .expect("config with finite alpha should deserialize");
+
+            prop_assert_eq!(
+                parsed.extension_risk.as_ref().and_then(|risk| risk.alpha),
+                Some(alpha)
+            );
+        }
+
+        #[test]
+        fn proptest_extension_risk_alpha_non_finite_values_are_ignored(
+            alpha in prop_oneof![Just(f64::NAN), Just(f64::INFINITY), Just(f64::NEG_INFINITY)]
+        ) {
+            let config = Config {
+                extension_risk: Some(ExtensionRiskConfig {
+                    alpha: Some(alpha),
+                    ..ExtensionRiskConfig::default()
+                }),
+                ..Config::default()
+            };
+
+            let resolved = config.resolve_extension_risk_with_metadata();
+            prop_assert_eq!(
+                resolved.settings.alpha,
+                crate::extensions::RuntimeRiskConfig::default().alpha
+            );
+            prop_assert_eq!(resolved.source, "default");
+        }
+
+        #[test]
+        fn proptest_parse_queue_mode_unknown_values_return_none(raw in string_regex("[A-Za-z0-9_-]{1,24}").unwrap()) {
+            let lowered = raw.to_ascii_lowercase();
+            prop_assume!(lowered != "all" && lowered != "one-at-a-time");
+            prop_assert_eq!(super::parse_queue_mode(Some(&raw)), None);
+        }
+
+        #[test]
+        fn proptest_extension_policy_unknown_profile_fails_closed(raw in string_regex("[A-Za-z0-9_-]{1,24}").unwrap()) {
+            let lowered = raw.to_ascii_lowercase();
+            prop_assume!(
+                lowered != "safe"
+                    && lowered != "balanced"
+                    && lowered != "standard"
+                    && lowered != "permissive"
+            );
+
+            let config: Config = serde_json::from_value(json!({
+                "extensionPolicy": {
+                    "profile": raw
+                }
+            }))
+            .expect("config should deserialize");
+            let resolved = config.resolve_extension_policy_with_metadata(None);
+            prop_assert_eq!(resolved.effective_profile, "safe");
+            prop_assert_eq!(
+                resolved.policy.mode,
+                crate::extensions::ExtensionPolicyMode::Strict
+            );
+        }
     }
 }
