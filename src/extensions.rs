@@ -9091,6 +9091,48 @@ fn check_version_constraint(version: &str, range: &str) -> bool {
     version == range
 }
 
+fn check_version_constraint(version: &str, range: &str) -> bool {
+    let range = range.trim();
+    if range == "*" || range.is_empty() {
+        return true;
+    }
+
+    let parse = |s: &str| -> Option<(u32, u32, u32)> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() < 3 { return None; }
+        let major = parts[0].parse().ok()?;
+        let minor = parts[1].parse().ok()?;
+        let patch_str = parts[2].split(['-', '+']).next()?;
+        let patch = patch_str.parse().ok()?;
+        Some((major, minor, patch))
+    };
+
+    let Some((v_major, v_minor, v_patch)) = parse(version) else {
+        return false;
+    };
+
+    if let Some(rest) = range.strip_prefix('^') {
+        let Some((r_major, _, _)) = parse(rest) else { return false; };
+        return v_major == r_major;
+    }
+
+    if let Some(rest) = range.strip_prefix('~') {
+        let Some((r_major, r_minor, _)) = parse(rest) else { return false; };
+        return v_major == r_major && v_minor == r_minor;
+    }
+
+    if let Some(rest) = range.strip_prefix(">=") {
+        let Some((r_major, r_minor, r_patch)) = parse(rest) else { return false; };
+        if v_major > r_major { return true; }
+        if v_major < r_major { return false; }
+        if v_minor > r_minor { return true; }
+        if v_minor < r_minor { return false; }
+        return v_patch >= r_patch;
+    }
+
+    version == range
+}
+
 impl ExtensionManager {
     /// Default cleanup budget for extension shutdown.
     pub const DEFAULT_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
@@ -9611,26 +9653,28 @@ impl ExtensionManager {
         guard.host_actions.clone()
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     pub fn cached_policy_prompt_decision(
         &self,
         extension_id: &str,
         capability: &str,
     ) -> Option<bool> {
-        let (dec, extension_version) = {
+        let (decision, extension_version) = {
             let guard = self.inner.lock().unwrap();
-            let dec = guard
+            let decision = guard
                 .policy_prompt_cache
                 .get(extension_id)
-                .and_then(|by_cap| by_cap.get(capability))?
-                .clone();
+                .and_then(|by_cap| by_cap.get(capability))
+                .cloned();
             let extension_version = guard
                 .extensions
                 .iter()
                 .find(|e| e.name == extension_id)
                 .map(|e| e.version.clone());
             drop(guard);
-            (dec, extension_version)
+            (decision, extension_version)
         };
+        let dec = decision?;
 
         if let Some(range) = &dec.version_range {
             if let Some(version) = extension_version {
