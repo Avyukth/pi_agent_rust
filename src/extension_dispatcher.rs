@@ -652,6 +652,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             .unwrap_or(false);
 
         if stream {
+            struct CancelGuard(Arc<AtomicBool>);
+            impl Drop for CancelGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, AtomicOrdering::SeqCst);
+                }
+            }
+
             let cmd = cmd.to_string();
             let args = args.clone();
             let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(256);
@@ -737,12 +744,6 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 }
             });
 
-            struct CancelGuard(Arc<AtomicBool>);
-            impl Drop for CancelGuard {
-                fn drop(&mut self) {
-                    self.0.store(true, AtomicOrdering::SeqCst);
-                }
-            }
             let _guard = CancelGuard(Arc::clone(&cancel));
 
             let mut sequence = 0_u64;

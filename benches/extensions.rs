@@ -618,18 +618,18 @@ fn bench_js_runtime(c: &mut Criterion) {
     group.bench_function("cold_start", |b| {
         b.iter(|| {
             block_on(async {
-                let rt = pi::extensions_js::QuickJsRuntime::new().await.unwrap();
-                rt.run_pending_jobs().await.unwrap();
+                let rt = PiJsRuntime::new().await.unwrap();
+                rt.drain_microtasks().await.unwrap();
             });
         });
     });
 
-    let rt = block_on(pi::extensions_js::QuickJsRuntime::new()).unwrap();
+    let rt = block_on(PiJsRuntime::new()).unwrap();
     group.bench_function("warm_eval_noop", |b| {
         b.iter(|| {
             block_on(async {
                 rt.eval("1 + 1;").await.unwrap();
-                rt.run_pending_jobs().await.unwrap();
+                rt.drain_microtasks().await.unwrap();
             });
         });
     });
@@ -637,7 +637,7 @@ fn bench_js_runtime(c: &mut Criterion) {
     group.bench_function("warm_run_pending_jobs_empty", |b| {
         b.iter(|| {
             block_on(async {
-                rt.run_pending_jobs().await.unwrap();
+                rt.drain_microtasks().await.unwrap();
             });
         });
     });

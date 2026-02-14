@@ -1,4 +1,4 @@
-//! QuickJS runtime scaffolding for JS-compatible extensions.
+//! QuickJS runtime bridge for JS-compatible extensions.
 //!
 //! This module implements the PiJS runtime with Promise-based hostcall bridge:
 //! - Async QuickJS runtime + context creation
