@@ -23,10 +23,9 @@ members = ["."]
 [patch.crates-io]
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "673cf66" }
 
-# Pin vergen to avoid version conflict between vergen-lib 0.1.6 and 9.x
 [build-dependencies]
-vergen-gix = { version = "=1.0.9" }
-vergen = { version = "=9.0.6" }
+vergen-gix = { version = "=9.1.0" }
+vergen = { version = "=9.1.0" }
 
 [profile.release]
 debug = 1
