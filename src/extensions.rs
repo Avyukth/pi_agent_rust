@@ -31453,7 +31453,10 @@ mod tests {
         assert_eq!(decisions[0].acknowledged_risk_level, "medium");
         assert!(decisions[0].accepted);
         assert_eq!(decisions[0].operator, "operator1");
-        assert_eq!(decisions[0].resulting_state, ExtensionTrustState::Acknowledged);
+        assert_eq!(
+            decisions[0].resulting_state,
+            ExtensionTrustState::Acknowledged
+        );
     }
 
     #[test]
@@ -31484,22 +31487,40 @@ mod tests {
     fn full_trust_lifecycle() {
         let mgr = ExtensionManager::new();
         // 1. Starts as pending.
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Pending);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Pending
+        );
         // 2. Onboard with acknowledgment.
         mgr.record_trust_onboarding("ext-lifecycle", "medium", true, "user");
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Acknowledged);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Acknowledged
+        );
         // 3. Promote to trusted.
         mgr.promote_trust("ext-lifecycle");
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Trusted);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Trusted
+        );
         // 4. Kill-switch.
         mgr.kill_switch("ext-lifecycle", "compromised", "system");
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Killed);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Killed
+        );
         // 5. Lift kill-switch.
         mgr.lift_kill_switch("ext-lifecycle", "reviewed", "admin");
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Acknowledged);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Acknowledged
+        );
         // 6. Promote again.
         mgr.promote_trust("ext-lifecycle");
-        assert_eq!(mgr.trust_state("ext-lifecycle"), ExtensionTrustState::Trusted);
+        assert_eq!(
+            mgr.trust_state("ext-lifecycle"),
+            ExtensionTrustState::Trusted
+        );
     }
 
     #[test]
@@ -31537,7 +31558,10 @@ mod tests {
     #[test]
     fn trust_state_display_impl() {
         assert_eq!(format!("{}", ExtensionTrustState::Pending), "pending");
-        assert_eq!(format!("{}", ExtensionTrustState::Acknowledged), "acknowledged");
+        assert_eq!(
+            format!("{}", ExtensionTrustState::Acknowledged),
+            "acknowledged"
+        );
         assert_eq!(format!("{}", ExtensionTrustState::Trusted), "trusted");
         assert_eq!(format!("{}", ExtensionTrustState::Killed), "killed");
     }
