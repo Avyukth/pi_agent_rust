@@ -814,16 +814,22 @@ pub enum Commands {
     /// Open configuration UI
     Config,
 
-    /// Diagnose extension compatibility and suggest fixes
+    /// Diagnose environment health and extension compatibility
     Doctor {
-        /// Extension path or directory to check
-        path: String,
+        /// Extension path to check (omit to run all environment checks)
+        path: Option<String>,
         /// Output format: text (default), json, markdown
         #[arg(long, default_value = "text")]
         format: String,
         /// Extension policy profile to check against
         #[arg(long)]
         policy: Option<String>,
+        /// Automatically fix safe issues (missing dirs, permissions)
+        #[arg(long)]
+        fix: bool,
+        /// Run specific categories: config,dirs,auth,shell,sessions,extensions
+        #[arg(long)]
+        only: Option<String>,
     },
 }
 

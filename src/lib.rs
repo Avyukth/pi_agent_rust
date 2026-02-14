@@ -46,6 +46,7 @@ pub mod conformance;
 pub mod conformance_shapes;
 pub mod connectors;
 pub mod crypto_shim;
+pub mod doctor;
 pub mod error;
 pub mod error_hints;
 pub mod extension_conformance_matrix;

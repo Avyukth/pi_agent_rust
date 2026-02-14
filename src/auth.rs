@@ -283,6 +283,13 @@ impl AuthStorage {
         }
     }
 
+    /// Return the names of all providers that have stored credentials.
+    pub fn provider_names(&self) -> Vec<String> {
+        let mut providers: Vec<String> = self.entries.keys().cloned().collect();
+        providers.sort();
+        providers
+    }
+
     /// Return stored credential status for a provider, including canonical alias fallback.
     pub fn credential_status(&self, provider: &str) -> CredentialStatus {
         let now = chrono::Utc::now().timestamp_millis();

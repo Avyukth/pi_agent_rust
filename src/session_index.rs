@@ -318,7 +318,7 @@ fn build_meta(
     })
 }
 
-fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
+pub(crate) fn build_meta_from_file(path: &Path) -> Result<SessionMeta> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("jsonl") => build_meta_from_jsonl(path),
         #[cfg(feature = "sqlite-sessions")]
@@ -448,7 +448,7 @@ fn is_session_file_path(path: &Path) -> bool {
     }
 }
 
-fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
+pub(crate) fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 

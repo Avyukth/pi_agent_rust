@@ -47,6 +47,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
     let cli = cli::Cli::parse();
@@ -91,8 +92,17 @@ fn main_impl() -> Result<()> {
                 path,
                 format,
                 policy,
+                fix,
+                only,
             } => {
-                handle_doctor(&cwd, path, format, policy.as_deref())?;
+                handle_doctor(
+                    &cwd,
+                    path.as_deref(),
+                    format,
+                    policy.as_deref(),
+                    *fix,
+                    only.as_deref(),
+                )?;
                 return Ok(());
             }
             _ => {}
@@ -823,8 +833,17 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
             path,
             format,
             policy,
+            fix,
+            only,
         } => {
-            handle_doctor(cwd, &path, &format, policy.as_deref())?;
+            handle_doctor(
+                cwd,
+                path.as_deref(),
+                &format,
+                policy.as_deref(),
+                fix,
+                only.as_deref(),
+            )?;
         }
     }
 
@@ -1395,31 +1414,54 @@ fn handle_config(cwd: &Path) {
 
 fn handle_doctor(
     cwd: &Path,
-    path: &str,
+    extension_path: Option<&str>,
     format: &str,
     policy_override: Option<&str>,
+    fix: bool,
+    only: Option<&str>,
 ) -> Result<()> {
-    use pi::extension_preflight::{PreflightAnalyzer, PreflightVerdict};
+    use pi::doctor::{CheckCategory, DoctorOptions};
 
-    let ext_path = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
+    let only_set = if let Some(raw) = only {
+        let mut parsed = std::collections::HashSet::new();
+        let mut invalid = Vec::new();
+        for part in raw.split(',') {
+            let name = part.trim();
+            if name.is_empty() {
+                continue;
+            }
+            match name.parse::<CheckCategory>() {
+                Ok(cat) => {
+                    parsed.insert(cat);
+                }
+                Err(_) => invalid.push(name.to_string()),
+            }
+        }
+        if !invalid.is_empty() {
+            bail!(
+                "Unknown --only categories: {} (valid: config, dirs, auth, shell, sessions, extensions)",
+                invalid.join(", ")
+            );
+        }
+        if parsed.is_empty() {
+            bail!(
+                "--only must include at least one category (valid: config, dirs, auth, shell, sessions, extensions)"
+            );
+        }
+        Some(parsed)
     } else {
-        cwd.join(path)
+        None
     };
 
-    if !ext_path.exists() {
-        bail!("Extension path not found: {}", ext_path.display());
-    }
+    let opts = DoctorOptions {
+        cwd,
+        extension_path,
+        policy_override,
+        fix,
+        only: only_set,
+    };
 
-    let config = Config::load()?;
-    let resolved = config.resolve_extension_policy_with_metadata(policy_override);
-    let ext_id = ext_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    let analyzer = PreflightAnalyzer::new(&resolved.policy, Some(ext_id));
-    let report = analyzer.analyze(&ext_path);
+    let report = pi::doctor::run_doctor(&opts)?;
 
     match format {
         "json" => {
@@ -1429,71 +1471,13 @@ fn handle_doctor(
             print!("{}", report.render_markdown());
         }
         _ => {
-            // Text format — human-friendly terminal output
-            let verdict_indicator = match report.verdict {
-                PreflightVerdict::Pass => "PASS",
-                PreflightVerdict::Warn => "WARN",
-                PreflightVerdict::Fail => "FAIL",
-            };
-            println!("Extension Doctor: {ext_id}");
-            println!("Path: {}", ext_path.display());
-            println!(
-                "Policy: {} ({})",
-                resolved.effective_profile, resolved.profile_source
-            );
-            println!();
-            println!(
-                "Verdict: {verdict_indicator} | Confidence: {}",
-                report.confidence
-            );
-            println!(
-                "  {} error(s), {} warning(s), {} info",
-                report.summary.errors, report.summary.warnings, report.summary.info
-            );
-            println!();
-            println!("{}", report.risk_banner);
-
-            println!();
-            if report.findings.is_empty() {
-                println!("No issues found. Extension is expected to work.");
-            } else {
-                for finding in &report.findings {
-                    let icon = match finding.severity {
-                        pi::extension_preflight::FindingSeverity::Error => "ERROR",
-                        pi::extension_preflight::FindingSeverity::Warning => "WARN ",
-                        pi::extension_preflight::FindingSeverity::Info => "INFO ",
-                    };
-                    println!("[{icon}] {}", finding.message);
-                    if let Some(file) = &finding.file {
-                        if let Some(line) = finding.line {
-                            println!("       at {file}:{line}");
-                        } else {
-                            println!("       at {file}");
-                        }
-                    }
-                    if let Some(rem) = &finding.remediation {
-                        println!("       Fix: {rem}");
-                    }
-                    println!();
-                }
-            }
-
-            if report.verdict != PreflightVerdict::Pass {
-                println!("---");
-                println!("Suggested actions:");
-                if report.summary.errors > 0 {
-                    println!("  - Review errors above and apply suggested fixes");
-                    println!("  - Try a different policy: pi doctor {path} --policy permissive");
-                }
-                if report.summary.warnings > 0 {
-                    println!("  - Warnings indicate partial support; extension may still work");
-                }
-                println!(
-                    "  - View full policy: pi --explain-extension-policy --extension-policy {}",
-                    resolved.effective_profile
-                );
-            }
+            print!("{}", report.render_text());
         }
+    }
+
+    // Exit with code 1 if any failures (useful for CI)
+    if report.overall == pi::doctor::Severity::Fail {
+        std::process::exit(1);
     }
 
     Ok(())
