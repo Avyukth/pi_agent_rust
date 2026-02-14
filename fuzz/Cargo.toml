@@ -65,3 +65,38 @@ doc = false
 name = "fuzz_message_roundtrip"
 path = "fuzz_targets/fuzz_message_roundtrip.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_tool_paths"
+path = "fuzz_targets/fuzz_tool_paths.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_grep_pattern"
+path = "fuzz_targets/fuzz_grep_pattern.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_edit_match"
+path = "fuzz_targets/fuzz_edit_match.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_provider_event"
+path = "fuzz_targets/fuzz_provider_event.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config"
+path = "fuzz_targets/fuzz_config.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_load"
+path = "fuzz_targets/fuzz_config_load.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_extension_payload"
+path = "fuzz_targets/fuzz_extension_payload.rs"
+doc = false
