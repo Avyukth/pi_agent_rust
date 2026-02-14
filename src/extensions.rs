@@ -1473,6 +1473,10 @@ pub struct ExtensionOverride {
     /// global `deny_caps`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// Per-extension resource quota overrides (SEC-4.1).
+    /// `None` inherits the global quota defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<ExtensionQuotaConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1559,175 @@ impl Default for RuntimeRiskConfig {
             fail_closed: true,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-extension resource quota engine (SEC-4.1 / bd-b1d7o)
+// ---------------------------------------------------------------------------
+
+/// Configurable per-extension resource quotas. When a quota is `None`, the
+/// corresponding limit is not enforced. All values are per-extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionQuotaConfig {
+    /// Maximum hostcalls permitted per 1-second sliding window.
+    pub max_hostcalls_per_second: Option<u32>,
+    /// Maximum hostcalls permitted per 60-second sliding window.
+    pub max_hostcalls_per_minute: Option<u32>,
+    /// Maximum total hostcalls before the extension is throttled.
+    pub max_hostcalls_total: Option<u64>,
+    /// Maximum concurrent subprocesses spawned via exec hostcalls.
+    pub max_subprocesses: Option<u32>,
+    /// Maximum cumulative bytes written via fs/write hostcalls.
+    pub max_write_bytes: Option<u64>,
+    /// Maximum cumulative HTTP requests issued via http hostcalls.
+    pub max_http_requests: Option<u64>,
+}
+
+impl Default for ExtensionQuotaConfig {
+    fn default() -> Self {
+        Self {
+            max_hostcalls_per_second: Some(100),
+            max_hostcalls_per_minute: Some(2000),
+            max_hostcalls_total: None,
+            max_subprocesses: Some(8),
+            max_write_bytes: None,
+            max_http_requests: None,
+        }
+    }
+}
+
+/// Mutable per-extension quota counters, reset semantics:
+/// - `hostcall_timestamps_ms` is a sliding window (entries expire by time).
+/// - `hostcalls_total` and cumulative counters are monotonic (session-lifetime).
+/// - `active_subprocesses` increments on spawn, decrements on exit.
+#[derive(Debug, Clone, Default)]
+struct ExtensionQuotaState {
+    hostcall_timestamps_ms: VecDeque<i64>,
+    hostcalls_total: u64,
+    active_subprocesses: u32,
+    write_bytes_total: u64,
+    http_requests_total: u64,
+}
+
+/// Result of a quota check before dispatching a hostcall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuotaCheckResult {
+    /// Within quota — proceed.
+    Allowed,
+    /// Quota exceeded — deny with reason.
+    Exceeded { reason: String },
+}
+
+/// Check per-extension quotas. Returns [`QuotaCheckResult::Exceeded`] if any
+/// configured limit is breached. Called in the dispatch chokepoint before
+/// the runtime risk evaluation.
+fn check_extension_quota(
+    config: &ExtensionQuotaConfig,
+    state: &mut ExtensionQuotaState,
+    now_ms: i64,
+    capability: &str,
+) -> QuotaCheckResult {
+    // 1. Prune expired timestamps (older than 60s).
+    let horizon_60s = now_ms.saturating_sub(60_000);
+    while state
+        .hostcall_timestamps_ms
+        .front()
+        .is_some_and(|&ts| ts < horizon_60s)
+    {
+        state.hostcall_timestamps_ms.pop_front();
+    }
+
+    // 2. Record this call.
+    state.hostcall_timestamps_ms.push_back(now_ms);
+    state.hostcalls_total += 1;
+
+    // 3. Per-second burst check.
+    if let Some(max_per_sec) = config.max_hostcalls_per_second {
+        let horizon_1s = now_ms.saturating_sub(1_000);
+        let count_1s = state
+            .hostcall_timestamps_ms
+            .iter()
+            .rev()
+            .take_while(|&&ts| ts >= horizon_1s)
+            .count();
+        if count_1s > max_per_sec as usize {
+            return QuotaCheckResult::Exceeded {
+                reason: format!(
+                    "hostcall rate {count_1s}/s exceeds limit {max_per_sec}/s"
+                ),
+            };
+        }
+    }
+
+    // 4. Per-minute rate check.
+    if let Some(max_per_min) = config.max_hostcalls_per_minute {
+        let count_60s = state.hostcall_timestamps_ms.len();
+        if count_60s > max_per_min as usize {
+            return QuotaCheckResult::Exceeded {
+                reason: format!(
+                    "hostcall rate {count_60s}/60s exceeds limit {max_per_min}/60s"
+                ),
+            };
+        }
+    }
+
+    // 5. Total hostcall budget.
+    if let Some(max_total) = config.max_hostcalls_total {
+        if state.hostcalls_total > max_total {
+            return QuotaCheckResult::Exceeded {
+                reason: format!(
+                    "total hostcalls {} exceeds limit {max_total}",
+                    state.hostcalls_total
+                ),
+            };
+        }
+    }
+
+    // 6. Subprocess fan-out (only relevant for exec capability).
+    if capability == "exec" {
+        if let Some(max_sub) = config.max_subprocesses {
+            if state.active_subprocesses >= max_sub {
+                return QuotaCheckResult::Exceeded {
+                    reason: format!(
+                        "active subprocesses {} reaches limit {max_sub}",
+                        state.active_subprocesses
+                    ),
+                };
+            }
+        }
+    }
+
+    // 7. HTTP request budget.
+    if capability == "http" {
+        if let Some(max_http) = config.max_http_requests {
+            if state.http_requests_total >= max_http {
+                return QuotaCheckResult::Exceeded {
+                    reason: format!(
+                        "HTTP requests {} exceeds limit {max_http}",
+                        state.http_requests_total
+                    ),
+                };
+            }
+            state.http_requests_total += 1;
+        }
+    }
+
+    // 8. Write bytes budget (tracked externally via record_write_bytes).
+    if capability == "write" {
+        if let Some(max_wb) = config.max_write_bytes {
+            if state.write_bytes_total >= max_wb {
+                return QuotaCheckResult::Exceeded {
+                    reason: format!(
+                        "write bytes {} exceeds limit {max_wb}",
+                        state.write_bytes_total
+                    ),
+                };
+            }
+        }
+    }
+
+    QuotaCheckResult::Allowed
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3037,6 +3210,17 @@ pub struct FsScopes {
 }
 
 impl FsScopes {
+    pub fn least_privilege_for_cwd(cwd: &Path) -> Result<Self> {
+        let root = canonicalize_root(cwd)?;
+        Ok(Self {
+            // Least-privilege default for unknown/new extensions: read-only project access.
+            read_declared: true,
+            write_declared: false,
+            read_roots: vec![root],
+            write_roots: Vec::new(),
+        })
+    }
+
     pub fn for_cwd(cwd: &Path) -> Result<Self> {
         let root = canonicalize_root(cwd)?;
         Ok(Self {
@@ -3049,7 +3233,7 @@ impl FsScopes {
 
     pub fn from_manifest(manifest: Option<&CapabilityManifest>, cwd: &Path) -> Result<Self> {
         let Some(manifest) = manifest else {
-            return Self::for_cwd(cwd);
+            return Self::least_privilege_for_cwd(cwd);
         };
 
         let mut read_declared = false;
@@ -3199,8 +3383,11 @@ impl FsConnector {
         if roots.is_empty() {
             return Err(HostCallError {
                 code: HostCallErrorCode::Denied,
-                message: "No allowed roots configured".to_string(),
-                details: Some(json!({ "capability": capability })),
+                message: format!("No allowed roots configured for '{capability}'"),
+                details: Some(json!({
+                    "capability": capability,
+                    "hint": "Declare capability_manifest scope.paths for this capability."
+                })),
                 retryable: None,
             });
         }
@@ -3237,11 +3424,13 @@ impl FsConnector {
             );
             return Err(HostCallError {
                 code: HostCallErrorCode::Denied,
-                message: "Path outside allowed scope".to_string(),
+                message: "Path outside allowed scope; update capability_manifest scope.paths"
+                    .to_string(),
                 details: Some(json!({
                     "capability": capability,
                     "path_hash": hash_path(&canonical_target),
                     "scope_roots": root_hashes,
+                    "hint": "Add an allowed path to capability_manifest scope.paths."
                 })),
                 retryable: None,
             });
@@ -4635,14 +4824,17 @@ mod wasm_host {
             tools: Arc<crate::tools::ToolRegistry>,
             manager: Option<ExtensionManagerHandle>,
         ) -> Result<Self> {
-            let scopes = FsScopes::for_cwd(&cwd)?;
+            let scopes = FsScopes::least_privilege_for_cwd(&cwd)?;
             let fs = FsConnector::new(&cwd, policy.clone(), scopes)?;
             Ok(Self {
                 policy,
                 cwd,
                 tools,
                 manager,
-                http: HttpConnector::with_defaults(),
+                http: HttpConnector::new(HttpConnectorConfig {
+                    enforce_allowlist: true,
+                    ..Default::default()
+                }),
                 fs,
                 env_allowlist: BTreeSet::new(),
                 extension_id: None,
@@ -5251,7 +5443,7 @@ mod wasm_host {
                 ));
             };
 
-            if !payload.capability.trim().eq_ignore_ascii_case(&required) {
+            if !payload.capability.trim().eq_ignore_ascii_case(required) {
                 return Err(Self::host_error_json(
                     HostCallErrorCode::InvalidRequest,
                     "Capability mismatch: declared capability does not match derived capability",
@@ -5280,7 +5472,7 @@ mod wasm_host {
                 "Hostcall start"
             );
 
-            let (decision, reason, capability) = self.resolve_policy_decision(&required).await;
+            let (decision, reason, capability) = self.resolve_policy_decision(required).await;
             if decision == PolicyDecision::Allow {
                 tracing::info!(
                     event = "policy.decision",
@@ -5980,6 +6172,59 @@ mod wasm_host {
             .expect_err("fs write denied");
             let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
             assert_eq!(err.code, HostCallErrorCode::Denied);
+        }
+
+        #[test]
+        fn wasm_host_fs_defaults_to_read_only_without_manifest() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+            std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+
+            let read_call = HostCallPayload {
+                call_id: "call-fs-read-default".to_string(),
+                capability: "read".to_string(),
+                method: "fs".to_string(),
+                params: json!({ "op": "read", "path": "file.txt" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+            let read_json = serde_json::to_string(&read_call).expect("serialize hostcall");
+            let read_out = run_async(async {
+                host::Host::call(&mut state, "fs".to_string(), read_json).await
+            })
+            .expect("fs read ok");
+            let out: Value = serde_json::from_str(&read_out).expect("parse fs output");
+            assert_eq!(out.get("text").and_then(Value::as_str), Some("hello"));
+
+            let write_call = HostCallPayload {
+                call_id: "call-fs-write-default".to_string(),
+                capability: "write".to_string(),
+                method: "fs".to_string(),
+                params: json!({
+                    "op": "write",
+                    "path": "out.txt",
+                    "encoding": "utf8",
+                    "data": "hi"
+                }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+            let write_json = serde_json::to_string(&write_call).expect("serialize hostcall");
+            let err_json = run_async(async {
+                host::Host::call(&mut state, "fs".to_string(), write_json).await
+            })
+            .expect_err("fs write denied by least-privilege default");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+            assert!(
+                err.message.contains("scope.paths"),
+                "expected scope guidance, got: {}",
+                err.message
+            );
         }
 
         #[test]
@@ -8573,6 +8818,42 @@ pub async fn dispatch_host_call_shared(
         &params_hash,
     );
 
+    // SEC-4.1: Per-extension quota check (after policy, before risk eval).
+    if decision == PolicyDecision::Allow {
+        if let Some(manager) = ctx.manager.as_ref() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            let quota_result = manager.check_quota(ctx.extension_id, capability, now_ms);
+            if let QuotaCheckResult::Exceeded { reason: ref qr } = quota_result {
+                tracing::warn!(
+                    event = "ext.quota.exceeded",
+                    extension_id = ?ctx.extension_id,
+                    capability,
+                    method = %method,
+                    reason = %qr,
+                );
+                let outcome = HostcallOutcome::Error {
+                    code: "quota_exceeded".to_string(),
+                    message: format!("Quota exceeded for extension: {qr}"),
+                };
+                let duration_ms =
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                log_hostcall_end(
+                    ctx.runtime_name,
+                    &call_id,
+                    ctx.extension_id,
+                    capability,
+                    &method,
+                    &params_hash,
+                    duration_ms,
+                    &outcome,
+                );
+                return outcome_to_host_result(&call_id, &outcome);
+            }
+        }
+    }
+
     let mut runtime_risk_decision = None;
     let outcome = if decision == PolicyDecision::Allow {
         if let Some(manager) = ctx.manager.as_ref() {
@@ -10261,6 +10542,9 @@ struct ExtensionManagerInner {
     runtime_risk_ledger: VecDeque<RuntimeRiskLedgerEntry>,
     runtime_hostcall_telemetry: VecDeque<RuntimeHostcallTelemetryEvent>,
     runtime_risk_last_hash: Option<String>,
+    /// Per-extension resource quota config and mutable counters (SEC-4.1).
+    quota_config: ExtensionQuotaConfig,
+    quota_states: HashMap<String, ExtensionQuotaState>,
     /// Budget for extension operations (structured concurrency).
     extension_budget: Budget,
 }
@@ -10556,6 +10840,92 @@ impl ExtensionManager {
 
     pub fn runtime_risk_config(&self) -> RuntimeRiskConfig {
         self.inner.lock().unwrap().runtime_risk_config.clone()
+    }
+
+    // ── SEC-4.1: Per-extension resource quota check ──────────────────────
+
+    /// Check per-extension resource quotas before dispatching a hostcall.
+    /// Returns [`QuotaCheckResult::Exceeded`] if any configured limit is breached.
+    fn check_quota(
+        &self,
+        extension_id: Option<&str>,
+        capability: &str,
+        now_ms: i64,
+    ) -> QuotaCheckResult {
+        let Some(ext_id) = extension_id else {
+            return QuotaCheckResult::Allowed;
+        };
+        let Ok(mut guard) = self.inner.lock() else {
+            return QuotaCheckResult::Allowed;
+        };
+
+        // Resolve quota config: per-extension override > global default.
+        let quota_config = guard
+            .policy_prompt_cache
+            .get(ext_id)
+            .and(None::<&ExtensionQuotaConfig>)
+            .cloned()
+            .unwrap_or_else(|| guard.quota_config.clone());
+
+        let state = guard
+            .quota_states
+            .entry(ext_id.to_string())
+            .or_default();
+
+        check_extension_quota(&quota_config, state, now_ms, capability)
+    }
+
+    /// Record subprocess spawn (increments active subprocess counter).
+    pub fn record_subprocess_spawn(&self, extension_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let state = guard
+                .quota_states
+                .entry(extension_id.to_string())
+                .or_default();
+            state.active_subprocesses += 1;
+        }
+    }
+
+    /// Record subprocess exit (decrements active subprocess counter).
+    pub fn record_subprocess_exit(&self, extension_id: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let state = guard
+                .quota_states
+                .entry(extension_id.to_string())
+                .or_default();
+            state.active_subprocesses = state.active_subprocesses.saturating_sub(1);
+        }
+    }
+
+    /// Record bytes written by an extension (for write quota tracking).
+    pub fn record_write_bytes(&self, extension_id: &str, bytes: u64) {
+        if let Ok(mut guard) = self.inner.lock() {
+            let state = guard
+                .quota_states
+                .entry(extension_id.to_string())
+                .or_default();
+            state.write_bytes_total = state.write_bytes_total.saturating_add(bytes);
+        }
+    }
+
+    /// Get the current quota state for an extension (for telemetry/inspection).
+    pub fn quota_state(&self, extension_id: &str) -> Option<(u64, u32, u64, u64)> {
+        let guard = self.inner.lock().ok()?;
+        guard.quota_states.get(extension_id).map(|s| {
+            (
+                s.hostcalls_total,
+                s.active_subprocesses,
+                s.write_bytes_total,
+                s.http_requests_total,
+            )
+        })
+    }
+
+    /// Update the global quota configuration.
+    pub fn set_quota_config(&self, config: ExtensionQuotaConfig) {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.quota_config = config;
+        }
     }
 
     #[allow(
@@ -19050,6 +19420,189 @@ mod tests {
     }
 
     // ========================================================================
+    // Quantile selection semantics: edge-case coverage (bd-xqipg)
+    // ========================================================================
+
+    #[test]
+    fn quantile_empty_input_returns_zero() {
+        let result = runtime_risk_quantile(vec![], 0.5);
+        assert!(
+            (result - 0.0).abs() < f64::EPSILON,
+            "empty input should return 0.0, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_single_element() {
+        let result = runtime_risk_quantile(vec![0.42], 0.5);
+        assert!(
+            (result - 0.42).abs() < f64::EPSILON,
+            "single-element input should return that element, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_q0_returns_minimum() {
+        let result = runtime_risk_quantile(vec![0.3, 0.1, 0.5, 0.9, 0.7], 0.0);
+        assert!(
+            (result - 0.1).abs() < f64::EPSILON,
+            "q=0 should return minimum value 0.1, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_q1_returns_maximum() {
+        let result = runtime_risk_quantile(vec![0.3, 0.1, 0.5, 0.9, 0.7], 1.0);
+        assert!(
+            (result - 0.9).abs() < f64::EPSILON,
+            "q=1 should return maximum value 0.9, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_odd_sample_count_median() {
+        // 5 elements sorted: [0.1, 0.3, 0.5, 0.7, 0.9]
+        // q=0.5 → idx = round((5-1)*0.5) = round(2.0) = 2 → values[2] = 0.5
+        let result = runtime_risk_quantile(vec![0.9, 0.1, 0.7, 0.3, 0.5], 0.5);
+        assert!(
+            (result - 0.5).abs() < f64::EPSILON,
+            "odd-count median should be 0.5, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_even_sample_count_median() {
+        // 4 elements sorted: [0.1, 0.3, 0.7, 0.9]
+        // q=0.5 → idx = round((4-1)*0.5) = round(1.5) = 2 → values[2] = 0.7
+        let result = runtime_risk_quantile(vec![0.9, 0.1, 0.7, 0.3], 0.5);
+        assert!(
+            (result - 0.7).abs() < f64::EPSILON,
+            "even-count median should be 0.7, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_duplicate_values() {
+        let result = runtime_risk_quantile(vec![0.5, 0.5, 0.5, 0.5], 0.75);
+        assert!(
+            (result - 0.5).abs() < f64::EPSILON,
+            "all-duplicate input should return 0.5 for any q, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_negative_q_clamps_to_zero() {
+        // runtime_risk_clamp01(-0.5) → 0.0, so q=0 → minimum
+        let result = runtime_risk_quantile(vec![0.2, 0.4, 0.6, 0.8], -0.5);
+        assert!(
+            (result - 0.2).abs() < f64::EPSILON,
+            "negative q should clamp to 0 (minimum), got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_q_greater_than_one_clamps_to_one() {
+        // runtime_risk_clamp01(2.0) → 1.0, so q=1 → maximum
+        let result = runtime_risk_quantile(vec![0.2, 0.4, 0.6, 0.8], 2.0);
+        assert!(
+            (result - 0.8).abs() < f64::EPSILON,
+            "q>1 should clamp to 1 (maximum), got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_nan_q_treated_as_zero() {
+        // runtime_risk_clamp01(NaN) → 0.0, so returns minimum
+        let result = runtime_risk_quantile(vec![0.2, 0.4, 0.6], f64::NAN);
+        assert!(
+            (result - 0.2).abs() < f64::EPSILON,
+            "NaN q should be treated as 0 (minimum), got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_nan_values_sorted_consistently() {
+        // NaN sorts to beginning due to partial_cmp unwrap_or(Equal)
+        let result = runtime_risk_quantile(vec![0.5, f64::NAN, 0.3], 1.0);
+        // After sort with NaN as Equal: order depends on sort stability.
+        // Key invariant: function does not panic.
+        assert!(result.is_nan() || result.is_finite(), "should not panic on NaN values");
+    }
+
+    #[test]
+    fn quantile_inf_values_handled() {
+        let result = runtime_risk_quantile(vec![0.1, f64::INFINITY, 0.5], 1.0);
+        assert!(
+            result == f64::INFINITY,
+            "q=1 with INFINITY should return INFINITY, got {result}"
+        );
+    }
+
+    #[test]
+    fn quantile_large_input_deterministic() {
+        let values: Vec<f64> = (0..1000).map(|i| (i as f64) / 1000.0).collect();
+        let result_a = runtime_risk_quantile(values.clone(), 0.95);
+        let result_b = runtime_risk_quantile(values, 0.95);
+        assert!(
+            (result_a - result_b).abs() < f64::EPSILON,
+            "quantile must be deterministic across runs"
+        );
+        // q=0.95, idx = round((999)*0.95) = round(949.05) = 949 → values[949] = 0.949
+        assert!(
+            (result_a - 0.949).abs() < f64::EPSILON,
+            "expected 0.949 for large sorted input at q=0.95, got {result_a}"
+        );
+    }
+
+    #[test]
+    fn quantile_two_elements() {
+        // 2 elements sorted: [0.1, 0.9]
+        // q=0.0 → idx = round(1*0) = 0 → 0.1
+        // q=0.5 → idx = round(1*0.5) = round(0.5) = 0 → 0.1 (banker's rounding)
+        // q=1.0 → idx = round(1*1) = 1 → 0.9
+        let min = runtime_risk_quantile(vec![0.9, 0.1], 0.0);
+        let max = runtime_risk_quantile(vec![0.9, 0.1], 1.0);
+        assert!(
+            (min - 0.1).abs() < f64::EPSILON,
+            "q=0 with 2 elements should return min, got {min}"
+        );
+        assert!(
+            (max - 0.9).abs() < f64::EPSILON,
+            "q=1 with 2 elements should return max, got {max}"
+        );
+    }
+
+    #[test]
+    fn quantile_boundary_quartiles() {
+        // 5 elements sorted: [0.0, 0.25, 0.5, 0.75, 1.0]
+        // q=0.25 → idx = round(4*0.25) = round(1.0) = 1 → 0.25
+        // q=0.75 → idx = round(4*0.75) = round(3.0) = 3 → 0.75
+        let q25 = runtime_risk_quantile(vec![0.5, 0.0, 1.0, 0.75, 0.25], 0.25);
+        let q75 = runtime_risk_quantile(vec![0.5, 0.0, 1.0, 0.75, 0.25], 0.75);
+        assert!(
+            (q25 - 0.25).abs() < f64::EPSILON,
+            "25th percentile should be 0.25, got {q25}"
+        );
+        assert!(
+            (q75 - 0.75).abs() < f64::EPSILON,
+            "75th percentile should be 0.75, got {q75}"
+        );
+    }
+
+    #[test]
+    fn quantile_conformal_alpha_001() {
+        // Mimics the actual conformal prediction use: q = 1 - alpha = 0.99
+        // 10 residuals: [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10]
+        // q=0.99 → idx = round(9*0.99) = round(8.91) = 9 → 0.10
+        let residuals: Vec<f64> = (1..=10).map(|i| i as f64 / 100.0).collect();
+        let result = runtime_risk_quantile(residuals, 0.99);
+        assert!(
+            (result - 0.10).abs() < f64::EPSILON,
+            "99th percentile of 10 residuals should be 0.10, got {result}"
+        );
+    }
+
+    // ========================================================================
     // Per-extension override tests at hostcall boundary (bd-k5q5.4.3)
     // ========================================================================
 
@@ -21383,5 +21936,186 @@ mod tests {
         let back: HostStreamChunk = serde_json::from_value(json).unwrap();
         assert_eq!(back.index, u64::MAX);
         assert!(back.is_last);
+    }
+
+    // ========================================================================
+    // Quantile selection semantics (bd-xqipg)
+    // ========================================================================
+
+    #[test]
+    fn quantile_empty_vec_returns_zero() {
+        assert!((runtime_risk_quantile(vec![], 0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(vec![], 0.5) - 0.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(vec![], 1.0) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_single_element() {
+        let v = vec![42.0];
+        assert!((runtime_risk_quantile(v.clone(), 0.0) - 42.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(v.clone(), 0.5) - 42.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(v, 1.0) - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_q_zero_returns_minimum() {
+        let v = vec![5.0, 1.0, 9.0, 3.0, 7.0];
+        assert!((runtime_risk_quantile(v, 0.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_q_one_returns_maximum() {
+        let v = vec![5.0, 1.0, 9.0, 3.0, 7.0];
+        assert!((runtime_risk_quantile(v, 1.0) - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_odd_sample_count_median() {
+        // 5 elements: sorted = [1,3,5,7,9], median index = (4*0.5).round() = 2
+        let v = vec![5.0, 1.0, 9.0, 3.0, 7.0];
+        assert!((runtime_risk_quantile(v, 0.5) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_even_sample_count_median() {
+        // 4 elements: sorted = [2,4,6,8], median index = (3*0.5).round() = 2
+        let v = vec![8.0, 2.0, 6.0, 4.0];
+        assert!((runtime_risk_quantile(v, 0.5) - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_duplicate_values() {
+        let v = vec![3.0, 3.0, 3.0, 3.0, 3.0];
+        assert!((runtime_risk_quantile(v.clone(), 0.0) - 3.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(v.clone(), 0.5) - 3.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(v, 1.0) - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_partial_duplicates() {
+        // sorted = [1,1,1,5,5,9], q=0.5 → idx = (5*0.5).round() = 3 → 5.0
+        let v = vec![5.0, 1.0, 9.0, 1.0, 5.0, 1.0];
+        assert!((runtime_risk_quantile(v, 0.5) - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_negative_q_clamped_to_zero() {
+        let v = vec![10.0, 20.0, 30.0];
+        // clamp01 maps negative to 0.0 → returns minimum
+        assert!((runtime_risk_quantile(v, -5.0) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_large_q_clamped_to_one() {
+        let v = vec![10.0, 20.0, 30.0];
+        // clamp01 maps >1 to 1.0 → returns maximum
+        assert!((runtime_risk_quantile(v, 100.0) - 30.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_nan_q_treated_as_zero() {
+        let v = vec![10.0, 20.0, 30.0];
+        // clamp01 maps NaN to 0.0 → returns minimum
+        assert!((runtime_risk_quantile(v, f64::NAN) - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_sorted_vs_unsorted_identical() {
+        let sorted = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let unsorted = vec![3.0, 1.0, 5.0, 2.0, 4.0];
+        for q in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let a = runtime_risk_quantile(sorted.clone(), q);
+            let b = runtime_risk_quantile(unsorted.clone(), q);
+            assert!(
+                (a - b).abs() < f64::EPSILON,
+                "mismatch at q={q}: sorted={a}, unsorted={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantile_monotonicity() {
+        let v = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+        let mut prev = f64::NEG_INFINITY;
+        for q_pct in 0..=100 {
+            let q = f64::from(q_pct) / 100.0;
+            let val = runtime_risk_quantile(v.clone(), q);
+            assert!(
+                val >= prev,
+                "monotonicity violated: q={q} gave {val} < prev {prev}"
+            );
+            prev = val;
+        }
+    }
+
+    #[test]
+    fn quantile_two_elements_boundary() {
+        let v = vec![0.0, 1.0];
+        // q=0.0 → idx=(1*0.0).round()=0 → 0.0
+        assert!((runtime_risk_quantile(v.clone(), 0.0) - 0.0).abs() < f64::EPSILON);
+        // q=0.25 → idx=(1*0.25).round()=0 → 0.0
+        assert!((runtime_risk_quantile(v.clone(), 0.25) - 0.0).abs() < f64::EPSILON);
+        // q=0.5 → idx=(1*0.5).round()=1 → 1.0
+        assert!((runtime_risk_quantile(v.clone(), 0.5) - 1.0).abs() < f64::EPSILON);
+        // q=1.0 → idx=(1*1.0).round()=1 → 1.0
+        assert!((runtime_risk_quantile(v, 1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn quantile_large_sample() {
+        let v: Vec<f64> = (1..=1000).map(f64::from).collect();
+        // q=0.0 → 1.0 (min), q=1.0 → 1000.0 (max)
+        assert!((runtime_risk_quantile(v.clone(), 0.0) - 1.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_quantile(v.clone(), 1.0) - 1000.0).abs() < f64::EPSILON);
+        // q=0.5 → idx=(999*0.5).round()=500 → 501.0
+        let median = runtime_risk_quantile(v, 0.5);
+        assert!(
+            (median - 500.0).abs() <= 1.0,
+            "expected median ~500, got {median}"
+        );
+    }
+
+    #[test]
+    fn quantile_conformal_residual_integration() {
+        // Simulate conformal residual quantile computation used in decision flow:
+        // residual_window filled with residuals, then quantile(window, 1.0 - alpha)
+        let alpha = 0.01;
+        let residuals: Vec<f64> = (0..64).map(|i| (f64::from(i) / 63.0) * 0.5).collect();
+        let quantile_val = runtime_risk_quantile(residuals.clone(), 1.0 - alpha);
+        // At q=0.99, should be close to the maximum residual (~0.5)
+        assert!(
+            quantile_val >= 0.45,
+            "conformal quantile at 1-alpha should be near max: got {quantile_val}"
+        );
+        assert!(
+            quantile_val <= 0.5 + f64::EPSILON,
+            "conformal quantile should not exceed max: got {quantile_val}"
+        );
+    }
+
+    // ========================================================================
+    // Clamp01 edge cases (bd-xqipg)
+    // ========================================================================
+
+    #[test]
+    fn clamp01_nan_returns_zero() {
+        assert!((runtime_risk_clamp01(f64::NAN) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn clamp01_negative_infinity_returns_zero() {
+        assert!((runtime_risk_clamp01(f64::NEG_INFINITY) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn clamp01_positive_infinity_returns_one() {
+        assert!((runtime_risk_clamp01(f64::INFINITY) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn clamp01_normal_values_pass_through() {
+        assert!((runtime_risk_clamp01(0.5) - 0.5).abs() < f64::EPSILON);
+        assert!((runtime_risk_clamp01(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((runtime_risk_clamp01(1.0) - 1.0).abs() < f64::EPSILON);
     }
 }

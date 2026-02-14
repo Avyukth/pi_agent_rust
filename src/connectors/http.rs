@@ -224,7 +224,9 @@ impl HttpConnector {
         if requires_allowlist && !Self::matches_pattern_list(host, &self.config.allowlist) {
             return Err((
                 HostCallErrorCode::Denied,
-                format!("Host '{host}' is not in allowlist"),
+                format!(
+                    "Host '{host}' is not in allowlist; declare capability_manifest scope.hosts for http capability"
+                ),
             ));
         }
 

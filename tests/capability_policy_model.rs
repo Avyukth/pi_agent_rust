@@ -492,6 +492,7 @@ fn policy_serde_roundtrip_with_overrides() {
             mode: Some(ExtensionPolicyMode::Strict),
             allow: vec!["tool".to_string()],
             deny: vec!["env".to_string()],
+            quota: None,
         },
     );
 

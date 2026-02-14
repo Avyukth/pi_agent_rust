@@ -429,6 +429,7 @@ fn workflow_escalation_per_extension_override() {
             mode: None,
             allow: vec!["exec".to_string(), "env".to_string()],
             deny: vec![],
+            quota: None,
         },
     );
 

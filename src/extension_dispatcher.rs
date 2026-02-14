@@ -8225,6 +8225,7 @@ mod tests {
                     mode: None,
                     allow: Vec::new(),
                     deny: vec!["session".to_string()],
+                    quota: None,
                 },
             );
             let policy = ExtensionPolicy {

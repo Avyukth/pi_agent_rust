@@ -1214,6 +1214,7 @@ import chokidar from "chokidar";
                 mode: None,
                 allow: vec!["exec".to_string()],
                 deny: vec![],
+                quota: None,
             },
         );
 
