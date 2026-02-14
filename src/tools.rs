@@ -108,6 +108,9 @@ pub const LS_SCAN_HARD_LIMIT: usize = 20_000;
 /// Hard limit for read tool file size (100MB) to prevent OOM.
 pub const READ_TOOL_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Maximum size for an image to be sent to the API (4.5MB).
+pub const IMAGE_MAX_BYTES: usize = 4_718_592;
+
 /// Default timeout (in seconds) for bash tool execution.
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
@@ -729,7 +732,6 @@ pub(crate) fn resize_image_if_needed(
 
     const MAX_WIDTH: u32 = 2000;
     const MAX_HEIGHT: u32 = 2000;
-    const MAX_BYTES: usize = 4_718_592; // 4.5MB (below Anthropic's 5MB limit)
     const DEFAULT_JPEG_QUALITY: u8 = 80;
     const QUALITY_STEPS: [u8; 4] = [85, 70, 55, 40];
     const SCALE_STEPS: [f64; 5] = [1.0, 0.75, 0.5, 0.35, 0.25];
@@ -792,7 +794,7 @@ pub(crate) fn resize_image_if_needed(
     let (original_width, original_height) = img.dimensions();
     let original_size = bytes.len();
 
-    if original_width <= MAX_WIDTH && original_height <= MAX_HEIGHT && original_size <= MAX_BYTES {
+    if original_width <= MAX_WIDTH && original_height <= MAX_HEIGHT && original_size <= IMAGE_MAX_BYTES {
         return Ok(ResizedImage {
             bytes: bytes.to_vec(),
             mime_type,
@@ -820,7 +822,7 @@ pub(crate) fn resize_image_if_needed(
     let mut final_width = target_width;
     let mut final_height = target_height;
 
-    if best.0.len() <= MAX_BYTES {
+    if best.0.len() <= IMAGE_MAX_BYTES {
         return Ok(ResizedImage {
             bytes: best.0,
             mime_type: best.1,
@@ -834,7 +836,7 @@ pub(crate) fn resize_image_if_needed(
 
     for quality in QUALITY_STEPS {
         best = try_both_formats(&img, target_width, target_height, quality)?;
-        if best.0.len() <= MAX_BYTES {
+        if best.0.len() <= IMAGE_MAX_BYTES {
             return Ok(ResizedImage {
                 bytes: best.0,
                 mime_type: best.1,
@@ -860,7 +862,7 @@ pub(crate) fn resize_image_if_needed(
 
         for quality in QUALITY_STEPS {
             best = try_both_formats(&img, final_width, final_height, quality)?;
-            if best.0.len() <= MAX_BYTES {
+            if best.0.len() <= IMAGE_MAX_BYTES {
                 return Ok(ResizedImage {
                     bytes: best.0,
                     mime_type: best.1,
@@ -1091,6 +1093,17 @@ impl Tool for ReadTool {
             } else {
                 ResizedImage::original(bytes.clone(), mime_type)
             };
+
+            if resized.bytes.len() > IMAGE_MAX_BYTES {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "Image is too large ({} bytes). Max allowed is {} bytes.",
+                        resized.bytes.len(),
+                        IMAGE_MAX_BYTES
+                    ),
+                ));
+            }
 
             let base64_data =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
