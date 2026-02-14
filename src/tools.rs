@@ -1690,17 +1690,6 @@ fn restore_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
-fn normalize_for_fuzzy_match_text(text: &str) -> String {
-    let trimmed = text
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let s = normalize_unicode_spaces(&trimmed);
-    let s = normalize_quotes(&s);
-    normalize_dashes(&s)
-}
-
 #[derive(Debug, Clone)]
 struct FuzzyMatchResult {
     found: bool,
@@ -1709,11 +1698,9 @@ struct FuzzyMatchResult {
     content_for_replacement: String,
 }
 
-/// Map a range in the normalized string back to the original string.
+/// Map a range in normalized content back to byte offsets in the original text.
 ///
-/// Returns (original_start_byte_idx, original_match_byte_len).
-///
-/// This avoids allocating a O(N) mapping vector by re-scanning the content.
+/// Returns `(original_start_byte_idx, original_match_byte_len)`.
 fn map_normalized_range_to_original(
     content: &str,
     norm_match_start: usize,
@@ -1723,48 +1710,29 @@ fn map_normalized_range_to_original(
     let mut orig_idx = 0;
     let mut match_start = None;
     let mut match_end = None;
-
     let norm_match_end = norm_match_start + norm_match_len;
 
-    // Process line by line to handle trailing whitespace normalization
-    // Use split_inclusive to preserve newlines for accurate byte counting
     let mut lines = content.split_inclusive('\n').peekable();
-
     while let Some(line) = lines.next() {
-        // Determine if this is the last line (which doesn't get a synthetic newline appended if it lacks one)
-        // Note: split_inclusive keeps the \n.
-        // `build_normalized_with_mapping` logic: "Add newline if not the last line"
-        // But here we are iterating actual lines.
-        // If the line ends with \n, it contributes a \n to normalized.
-        // If it doesn't (last line), it doesn't.
-        // Wait, `build_normalized_with_mapping` splits by `\n` which consumes delimiters.
-        // And adds `\n` back "if not the last line".
-        // So effectively it preserves newlines between lines.
-
         let line_content = line.strip_suffix('\n').unwrap_or(line);
         let has_newline = line.ends_with('\n');
-
         let trimmed_len = line_content.trim_end().len();
 
         for (char_offset, c) in line_content.char_indices() {
-            // Check if we reached the start/end of the match in normalized space
             if norm_idx == norm_match_start && match_start.is_none() {
                 match_start = Some(orig_idx + char_offset);
             }
             if norm_idx == norm_match_end && match_end.is_none() {
                 match_end = Some(orig_idx + char_offset);
             }
-
             if match_start.is_some() && match_end.is_some() {
                 break;
             }
 
-            // Skip trailing whitespace (chars beyond trimmed_len)
             if char_offset >= trimmed_len {
                 continue;
             }
 
-            // Normalize the character
             let normalized_char = if is_special_unicode_space(c) {
                 ' '
             } else if matches!(c, '\u{2018}' | '\u{2019}') {
@@ -1792,7 +1760,6 @@ fn map_normalized_range_to_original(
         orig_idx += line_content.len();
 
         if has_newline {
-            // Handle the newline character
             if norm_idx == norm_match_start && match_start.is_none() {
                 match_start = Some(orig_idx);
             }
@@ -1800,8 +1767,8 @@ fn map_normalized_range_to_original(
                 match_end = Some(orig_idx);
             }
 
-            norm_idx += 1; // '\n' is 1 byte
-            orig_idx += 1; // '\n' is 1 byte in original too
+            norm_idx += 1;
+            orig_idx += 1;
         }
 
         if match_start.is_some() && match_end.is_some() {
@@ -1809,25 +1776,20 @@ fn map_normalized_range_to_original(
         }
     }
 
-    // Handle edge case where match ends at the very end of content
     if norm_idx == norm_match_end && match_end.is_none() {
         match_end = Some(orig_idx);
     }
 
-    // Fallback if we couldn't find start/end (should not happen if match is valid)
     let start = match_start.unwrap_or(0);
     let end = match_end.unwrap_or(content.len());
-
     (start, end.saturating_sub(start))
 }
 
-/// Build just the normalized string without the mapping vector.
 fn build_normalized_content(content: &str) -> String {
     let mut normalized = String::with_capacity(content.len());
-    let lines: Vec<&str> = content.split('\n').collect();
-    let last_line_idx = lines.len().saturating_sub(1);
+    let mut lines = content.split('\n').peekable();
 
-    for (line_idx, line) in lines.iter().enumerate() {
+    while let Some(line) = lines.next() {
         let trimmed_len = line.trim_end().len();
         for (char_offset, c) in line.char_indices() {
             if char_offset >= trimmed_len {
@@ -1855,11 +1817,84 @@ fn build_normalized_content(content: &str) -> String {
             };
             normalized.push(normalized_char);
         }
-        if line_idx < last_line_idx {
+        if lines.peek().is_some() {
             normalized.push('\n');
         }
     }
     normalized
+}
+
+fn normalize_for_fuzzy_match_text(text: &str) -> String {
+    build_normalized_content(text)
+}
+
+struct FuzzyMatchResult {
+    found: bool,
+    index: usize,
+    match_length: usize,
+    content_for_replacement: String,
+}
+
+/// Map a byte range in normalized content back to the corresponding range
+/// in the original content. Both `normalized_index` and `normalized_len`
+/// are byte offsets into the string produced by `build_normalized_content`.
+fn map_normalized_range_to_original(
+    original: &str,
+    normalized_index: usize,
+    normalized_len: usize,
+) -> (usize, usize) {
+    // Re-normalize to build a char-by-char mapping.
+    // The normalization collapses runs of whitespace and trims trailing
+    // whitespace per line, so we walk both strings in lockstep.
+    let normalized = build_normalized_content(original);
+
+    // Find the original byte position corresponding to normalized_index.
+    // Walk the original and normalized in parallel, consuming chars.
+    let mut orig_iter = original.char_indices().peekable();
+    let mut norm_iter = normalized.char_indices().peekable();
+
+    // Advance both iterators to the normalized_index position.
+    let mut orig_start = 0;
+    while let Some(&(ni, nc)) = norm_iter.peek() {
+        if ni >= normalized_index {
+            break;
+        }
+        norm_iter.next();
+        // Advance original past any chars that were collapsed
+        while let Some(&(oi, oc)) = orig_iter.peek() {
+            orig_iter.next();
+            if oc == nc {
+                orig_start = oi + oc.len_utf8();
+                break;
+            }
+            // Skip over whitespace/chars that were collapsed in normalization.
+        }
+    }
+    // orig_start now points to the first char after the prefix. We want the
+    // start of the match, which is the current original position.
+    let match_orig_start = orig_iter
+        .peek()
+        .map_or(original.len(), |&(oi, _)| oi);
+
+    // Now advance through the matched portion.
+    let norm_end = normalized_index + normalized_len;
+    while let Some(&(ni, nc)) = norm_iter.peek() {
+        if ni >= norm_end {
+            break;
+        }
+        norm_iter.next();
+        while let Some(&(_oi, oc)) = orig_iter.peek() {
+            orig_iter.next();
+            if oc == nc {
+                break;
+            }
+        }
+    }
+    let match_orig_end = orig_iter
+        .peek()
+        .map_or(original.len(), |&(oi, _)| oi);
+
+    (match_orig_start, match_orig_end - match_orig_start)
 }
 
 fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
@@ -2644,6 +2679,7 @@ impl Tool for GrepTool {
             args.push(gi.display().to_string());
         }
 
+        args.push("--".to_string());
         args.push(input.pattern.clone());
         args.push(search_path.display().to_string());
 
@@ -3026,6 +3062,7 @@ impl Tool for FindTool {
             args.push(gi.display().to_string());
         }
 
+        args.push("--".to_string());
         args.push(input.pattern.clone());
         args.push(search_path.display().to_string());
 

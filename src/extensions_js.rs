@@ -201,6 +201,7 @@ pub fn is_env_var_allowed(key: &str) -> bool {
         "NPM_TOKEN",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
     ];
     const BLOCKED_SUFFIXES: &[&str] = &[
         "_API_KEY",
@@ -208,6 +209,7 @@ pub fn is_env_var_allowed(key: &str) -> bool {
         "_SECRET_KEY",
         "_ACCESS_KEY",
         "_PRIVATE_KEY",
+        "_KEY_ID",
         "_PASSWORD",
         "_PASSWD",
         "_CREDENTIAL",
@@ -492,8 +494,23 @@ impl<'js> PendingHostcalls<'js> {
                     "Resolving Promise with success"
                 );
                 // Convert serde_json::Value to JS Value
-                let js_value = json_to_js(ctx, value)?;
-                resolve.call::<_, ()>((js_value,))?;
+                match json_to_js(ctx, value) {
+                    Ok(js_value) => {
+                        resolve.call::<_, ()>((js_value,))?;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            event = "promise_bridge.conversion_error",
+                            call_id = %call_id,
+                            error = ?err,
+                            "Failed to convert hostcall result to JS value; rejecting promise"
+                        );
+                        let error = Object::new(ctx.clone())?;
+                        error.set("code", "CONVERSION_ERROR")?;
+                        error.set("message", format!("Failed to convert result: {err}"))?;
+                        reject.call::<_, ()>((error,))?;
+                    }
+                }
             }
             HostcallOutcome::Error { code, message } => {
                 tracing::trace!(
