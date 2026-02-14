@@ -3246,10 +3246,11 @@ fn runtime_risk_clamp01(value: f64) -> f64 {
 // SEC-3.4: Enforcement State Machine with Hysteresis
 // ---------------------------------------------------------------------------
 
-/// Enforcement states ordered by severity (Allow < Harden < Prompt < Deny <
-/// Terminate). `Prompt` sits between `Harden` and `Deny`: the action is not
-/// blocked, but the user / operator must explicitly approve continued
-/// execution.
+/// Enforcement states ordered by severity.
+///
+/// Allow < Harden < Prompt < Deny < Terminate. `Prompt` sits between
+/// `Harden` and `Deny`: the action is not blocked, but the user / operator
+/// must explicitly approve continued execution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementState {
@@ -3262,7 +3263,7 @@ pub enum EnforcementState {
 
 impl EnforcementState {
     /// Convert from a [`RuntimeRiskAction`] (which lacks `Prompt`).
-    fn from_risk_action(action: RuntimeRiskAction) -> Self {
+    const fn from_risk_action(action: RuntimeRiskAction) -> Self {
         match action {
             RuntimeRiskAction::Allow => Self::Allow,
             RuntimeRiskAction::Harden => Self::Harden,
@@ -3272,7 +3273,7 @@ impl EnforcementState {
     }
 
     /// Map back to the nearest [`RuntimeRiskAction`] (Prompt → Harden).
-    fn to_risk_action(self) -> RuntimeRiskAction {
+    const fn to_risk_action(self) -> RuntimeRiskAction {
         match self {
             Self::Allow => RuntimeRiskAction::Allow,
             Self::Harden | Self::Prompt => RuntimeRiskAction::Harden,
@@ -3446,7 +3447,7 @@ impl EnforcementStateMachine {
     }
 
     /// Create with custom bands and hysteresis.
-    pub fn with_config(
+    pub const fn with_config(
         bands: EnforcementScoreBands,
         hysteresis: EnforcementHysteresis,
     ) -> Self {
@@ -3460,12 +3461,12 @@ impl EnforcementStateMachine {
     }
 
     /// Current enforcement state.
-    pub fn state(&self) -> EnforcementState {
+    pub const fn state(&self) -> EnforcementState {
         self.state
     }
 
     /// Total evaluations processed.
-    pub fn evaluation_count(&self) -> u64 {
+    pub const fn evaluation_count(&self) -> u64 {
         self.evaluation_count
     }
 
@@ -3570,7 +3571,7 @@ impl EnforcementStateMachine {
     }
 
     /// Look up the entry threshold for a given state.
-    fn entry_threshold_for(&self, state: EnforcementState) -> f64 {
+    const fn entry_threshold_for(&self, state: EnforcementState) -> f64 {
         match state {
             EnforcementState::Allow => self.bands.allow,
             EnforcementState::Harden => self.bands.harden,
@@ -3583,8 +3584,7 @@ impl EnforcementStateMachine {
     /// Drop exactly one severity level.
     const fn one_level_down(state: EnforcementState) -> EnforcementState {
         match state {
-            EnforcementState::Allow => EnforcementState::Allow,
-            EnforcementState::Harden => EnforcementState::Allow,
+            EnforcementState::Allow | EnforcementState::Harden => EnforcementState::Allow,
             EnforcementState::Prompt => EnforcementState::Harden,
             EnforcementState::Deny => EnforcementState::Prompt,
             EnforcementState::Terminate => EnforcementState::Terminate,
