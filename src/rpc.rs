@@ -2964,13 +2964,14 @@ async fn run_bash_rpc(
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
 
-    let child_pid = Some(child.id());
     let Some(stdout) = child.stdout.take() else {
         return Err(Error::tool("bash", "Missing stdout".to_string()));
     };
     let Some(stderr) = child.stderr.take() else {
         return Err(Error::tool("bash", "Missing stderr".to_string()));
     };
+
+    let mut guard = crate::tools::ProcessGuard::new(child, true);
 
     let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
     let tx_stdout = tx.clone();
@@ -2993,11 +2994,12 @@ async fn run_bash_rpc(
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            crate::tools::kill_process_tree(child_pid);
-            let _ = child.kill();
+            if let Ok(Some(status)) = guard.kill() {
+                break status.code().unwrap_or(-1);
+            }
         }
 
-        match child.try_wait() {
+        match guard.try_wait_child() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {}
             Err(err) => {

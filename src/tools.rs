@@ -1718,8 +1718,7 @@ fn map_normalized_range_to_original(
     let mut match_end = None;
     let norm_match_end = norm_match_start + norm_match_len;
 
-    let mut lines = content.split_inclusive('\n').peekable();
-    while let Some(line) = lines.next() {
+    for line in content.split_inclusive('\n') {
         let line_content = line.strip_suffix('\n').unwrap_or(line);
         let has_newline = line.ends_with('\n');
         let trimmed_len = line_content.trim_end().len();
@@ -3523,20 +3522,20 @@ pub(crate) struct ProcessGuard {
 }
 
 impl ProcessGuard {
-    const fn new(child: std::process::Child, kill_tree: bool) -> Self {
+    pub(crate) const fn new(child: std::process::Child, kill_tree: bool) -> Self {
         Self {
             child: Some(child),
             kill_tree,
         }
     }
 
-    fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(crate) fn try_wait_child(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child
             .as_mut()
             .map_or(Ok(None), std::process::Child::try_wait)
     }
 
-    fn kill(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(crate) fn kill(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         if let Some(mut child) = self.child.take() {
             if self.kill_tree {
                 let pid = child.id();
@@ -3549,7 +3548,7 @@ impl ProcessGuard {
         Ok(None)
     }
 
-    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(crate) fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         if let Some(mut child) = self.child.take() {
             return child.wait();
         }
@@ -4224,6 +4223,47 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("unicode.txt")).unwrap();
             assert_eq!(contents, "日本語 🎉 Ñoño");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_file_permissions_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = WriteTool::new(tmp.path());
+            let path = tmp.path().join("perms.txt");
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": "check perms"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            
+            let meta = std::fs::metadata(&path).unwrap();
+            let mode = meta.permissions().mode();
+            // Check for rw-r--r-- (0o644)
+            // Note: umask might affect this, but 0o644 is the target baseline. 
+            // Often umask is 0o022, resulting in 0o644.
+            // If umask is 0o077, it would be 0o600.
+            // However, the key fix was changing from tempfile's default 0o600 to 0o644 (subject to umask).
+            // So we strictly check that it is NOT 0o600 (unless umask forces it, which is unlikely in standard test envs).
+            // Better: we explicitly set 0o644 in the code.
+            // If we run this where umask is 0, we expect 0o644.
+            // We can just check that group/other read bits are set if umask permits.
+            // But we don't know umask. 
+            // The fix was: 
+            // temp_file.as_file().set_permissions(std::fs::Permissions::from_mode(0o644));
+            // This sets the mode on the file descriptor, ignoring umask? No, set_permissions usually ignores umask.
+            // Let's assert it is exactly 0o644.
+            assert_eq!(mode & 0o777, 0o644, "Expected 0o644 permissions");
         });
     }
 
