@@ -1140,7 +1140,7 @@ impl Tool for ReadTool {
             });
         }
 
-        let text_content = String::from_utf8_lossy(&bytes).to_string();
+        let text_content = String::from_utf8_lossy(&bytes).into_owned();
 
         // Handle empty file specially - return empty content
         if text_content.is_empty() {
@@ -1209,24 +1209,26 @@ impl Tool for ReadTool {
             line_iter.take(usize::MAX)
         };
 
-        let selected_content: String = effective_iter
+        let mut selected_content = String::new();
+        for (i, line) in effective_iter
             .skip(start_line)
             .take(clamped_end_line - start_line)
             .enumerate()
-            .map(|(i, line)| {
-                let line_num = start_line + i + 1;
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                format!("{line_num:>line_num_width$}→{line}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        {
+            if i > 0 {
+                selected_content.push('\n');
+            }
+            let line_num = start_line + i + 1;
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let _ = write!(selected_content, "{line_num:>line_num_width$}→{line}");
+        }
 
         let mut truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
         // `selected_content` may be clamped to keep allocations bounded, but truncation details should
         // still report the full file line count so consumers can reason about "how much is left".
         truncation.total_lines = total_file_lines;
 
-        let mut output_text = truncation.content.clone();
+        let mut output_text = truncation.content;
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
