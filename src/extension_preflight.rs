@@ -984,18 +984,27 @@ impl SecurityRuleId {
             | Self::ProcessBinding
             | Self::ProcessDlopen
             | Self::ProtoPollution
-            | Self::RequireCacheManip => RiskTier::Critical,
+            | Self::RequireCacheManip
+            | Self::ChildProcessSpawn
+            | Self::ConstructorEscape
+            | Self::NativeModuleRequire => RiskTier::Critical,
 
             Self::HardcodedSecret
             | Self::DynamicImport
             | Self::DefinePropertyAbuse
             | Self::NetworkExfiltration
-            | Self::SensitivePathWrite => RiskTier::High,
+            | Self::SensitivePathWrite
+            | Self::GlobalMutation
+            | Self::SymlinkCreation
+            | Self::PermissionChange
+            | Self::SocketListener
+            | Self::WebAssemblyUsage => RiskTier::High,
 
             Self::ProcessEnvAccess
             | Self::TimerAbuse
             | Self::ProxyReflect
-            | Self::WithStatement => RiskTier::Medium,
+            | Self::WithStatement
+            | Self::ArgumentsCallerAccess => RiskTier::Medium,
 
             Self::DebuggerStatement | Self::ConsoleInfoLeak => RiskTier::Low,
         }
@@ -1087,14 +1096,29 @@ pub struct SecurityTierCounts {
 }
 
 /// Current rulebook version. Bump when rules are added or changed.
-pub const SECURITY_RULEBOOK_VERSION: &str = "1.0.0";
+/// v2.0.0: Added 9 rules (SEC-SPAWN-001, SEC-CONSTRUCTOR-001, SEC-NATIVEMOD-001,
+///   SEC-GLOBAL-001, SEC-SYMLINK-001, SEC-CHMOD-001, SEC-SOCKET-001,
+///   SEC-WASM-001, SEC-ARGUMENTS-001). Stabilized deterministic sort order.
+pub const SECURITY_RULEBOOK_VERSION: &str = "2.0.0";
 
 impl SecurityScanReport {
     /// Build from a list of findings.
+    ///
+    /// Findings are sorted deterministically: first by risk tier (Critical
+    /// first), then by file path, then by line number, then by rule ID name.
+    /// This guarantees identical output for identical input regardless of
+    /// scan traversal order.
     #[must_use]
     pub fn from_findings(extension_id: String, mut findings: Vec<SecurityFinding>) -> Self {
-        // Sort by tier (Critical first due to Ord derive).
-        findings.sort_by_key(|f| f.risk_tier);
+        // Deterministic sort: tier → file → line → column → rule name.
+        findings.sort_by(|a, b| {
+            a.risk_tier
+                .cmp(&b.risk_tier)
+                .then_with(|| a.file.as_deref().unwrap_or("").cmp(b.file.as_deref().unwrap_or("")))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.column.cmp(&b.column))
+                .then_with(|| a.rule_id.name().cmp(b.rule_id.name()))
+        });
 
         let mut counts = SecurityTierCounts::default();
         for f in &findings {
