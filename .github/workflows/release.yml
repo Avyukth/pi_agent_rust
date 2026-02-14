@@ -69,6 +69,17 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.plan.outputs.tag }}
 
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          set -euxo pipefail
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          tag_version="${{ needs.plan.outputs.version }}"
+          if [[ "$cargo_version" != "$tag_version" ]]; then
+            echo "::error::Version mismatch: Cargo.toml=$cargo_version, tag=$tag_version"
+            exit 1
+          fi
+          echo "Version verified: $cargo_version"
+
       - name: Run release gate
         run: |
           set -euxo pipefail
@@ -97,14 +108,21 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            exe: ""
+            asset: pi-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: pi-linux-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: pi-darwin-amd64
           - os: macos-14
             target: aarch64-apple-darwin
-            exe: ""
+            asset: pi-darwin-arm64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            exe: ".exe"
+            asset: pi-windows-amd64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     env:
       CI: "true"
       RUST_BACKTRACE: "1"
@@ -163,18 +181,49 @@ jobs:
       - name: Add target
         run: rustup target add "${{ matrix.target }}"
 
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pi_agent_rust -> target
+          key: release-${{ matrix.target }}
+
       - name: Build release binary
         run: cargo build --release --locked --bin pi --target "${{ matrix.target }}"
 
-      - name: Prepare artifacts
+      - name: Create tarball (Unix)
+        if: runner.os != 'Windows'
         run: |
           set -euxo pipefail
           mkdir -p dist
 
-          BIN_SRC="target/${{ matrix.target }}/release/pi${{ matrix.exe }}"
-          BIN_DST="dist/pi-${{ needs.plan.outputs.tag }}-${{ matrix.target }}${{ matrix.exe }}"
-          cp "$BIN_SRC" "$BIN_DST"
+          # Stage the binary and license into a clean directory for the archive
+          STAGE_DIR="pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$STAGE_DIR"
+          cp "target/${{ matrix.target }}/release/pi" "$STAGE_DIR/"
+          cp LICENSE "$STAGE_DIR/" 2>/dev/null || true
+          cp README.md "$STAGE_DIR/" 2>/dev/null || true
 
+          tar -cJf "dist/${{ matrix.asset }}.tar.xz" "$STAGE_DIR"
+          rm -rf "$STAGE_DIR"
+
+      - name: Create zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+
+          $stageDir = "pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $stageDir
+          Copy-Item "target/${{ matrix.target }}/release/pi.exe" "$stageDir/"
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$stageDir/" }
+          if (Test-Path "README.md") { Copy-Item "README.md" "$stageDir/" }
+
+          Compress-Archive -Path "$stageDir" -DestinationPath "dist/${{ matrix.asset }}.zip"
+          Remove-Item -Recurse -Force $stageDir
+
+      - name: Build manifest
+        run: |
+          set -euxo pipefail
           PI_SHA="$(git rev-parse HEAD)"
           ASUPERSYNC_SHA="$(git -C ../asupersync rev-parse HEAD)"
           RICH_RUST_SHA="$(git -C ../rich_rust rev-parse HEAD)"
@@ -182,11 +231,12 @@ jobs:
           SQLMODEL_RUST_SHA="$(git -C ../sqlmodel_rust rev-parse HEAD)"
           RUSTC="$(rustc -Vv | tr '\n' ' ' | sed 's/\"/\\\\\"/g')"
 
-          cat > "dist/build-manifest-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.json" <<EOF
+          cat > "dist/build-manifest-${{ matrix.asset }}.json" <<EOF
           {
             "tag": "${{ needs.plan.outputs.tag }}",
             "version": "${{ needs.plan.outputs.version }}",
             "target": "${{ matrix.target }}",
+            "asset": "${{ matrix.asset }}",
             "runner_os": "${{ runner.os }}",
             "pi_agent_rust": "$PI_SHA",
             "deps": {
@@ -203,24 +253,41 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
-          path: |
-            pi_agent_rust/dist/*
+          path: pi_agent_rust/dist/*
 
   release:
     name: Create GitHub Release
     needs: [plan, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
+      - name: Checkout (for install script + changelog)
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.tag }}
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
       - name: Prepare release directory
         run: |
           set -euxo pipefail
           mkdir -p release
-          find dist -maxdepth 2 -type f -print0 | xargs -0 -I{} cp {} release/
+
+          # Copy archives and manifests
+          for f in dist/*; do
+            [ -f "$f" ] && cp "$f" release/
+          done
+
+          # Include install script
+          cp pi_agent_rust/install.sh release/
+
+          ls -lah release/
 
       - name: Generate SHA256SUMS
         run: |
@@ -228,23 +295,19 @@ jobs:
           cd release
           # Stable ordering for reproducible checksums file.
           ls -1 | LC_ALL=C sort | while read -r f; do
+            [ "$f" = "SHA256SUMS" ] && continue
             sha256sum "$f"
           done > SHA256SUMS
-
-      - name: Extract release notes from CHANGELOG.md (best-effort)
-        uses: actions/checkout@v4
-        with:
-          path: pi_agent_rust
-          fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          cat SHA256SUMS
 
       - name: Build release notes
         run: |
           set -euxo pipefail
           VERSION="${{ needs.plan.outputs.version }}"
+          TAG="${{ needs.plan.outputs.tag }}"
           CHANGELOG="pi_agent_rust/CHANGELOG.md"
 
-          # Extract the section whose header contains the version (with or without 'v').
+          # Extract the section whose header contains the version.
           awk -v ver="$VERSION" '
             BEGIN{found=0}
             /^## /{
@@ -252,15 +315,47 @@ jobs:
               if($0 ~ ver){found=1}
             }
             { if(found) print }
-          ' "$CHANGELOG" > RELEASE_NOTES.md
+          ' "$CHANGELOG" > RELEASE_BODY.md 2>/dev/null || true
 
-          if [ ! -s RELEASE_NOTES.md ]; then
-            cat > RELEASE_NOTES.md <<EOF
-          Release v$VERSION
-
-          See CHANGELOG.md for details.
-          EOF
+          if [ ! -s RELEASE_BODY.md ]; then
+            echo "## $TAG" > RELEASE_BODY.md
+            echo "" >> RELEASE_BODY.md
           fi
+
+          # Append install instructions
+          cat >> RELEASE_BODY.md <<'INSTALL'
+
+          ---
+
+          ### Quick Install
+
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh | bash
+          ```
+
+          Or download a specific version:
+
+          ```bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh | bash -s -- --version VERSION_PLACEHOLDER
+          ```
+
+          ### Manual Install
+
+          Download the archive for your platform, extract, and place `pi` on your `PATH`:
+
+          | Platform | Archive |
+          |----------|---------|
+          | Linux x86_64 | `pi-linux-amd64.tar.xz` |
+          | Linux ARM64 | `pi-linux-arm64.tar.xz` |
+          | macOS x86_64 | `pi-darwin-amd64.tar.xz` |
+          | macOS ARM64 (Apple Silicon) | `pi-darwin-arm64.tar.xz` |
+          | Windows x86_64 | `pi-windows-amd64.zip` |
+
+          All archives include SHA256 checksums in `SHA256SUMS` for verification.
+          INSTALL
+
+          # Replace version placeholder
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" RELEASE_BODY.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -268,7 +363,7 @@ jobs:
           tag_name: ${{ needs.plan.outputs.tag }}
           name: ${{ needs.plan.outputs.tag }}
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
-          body_path: RELEASE_NOTES.md
+          body_path: RELEASE_BODY.md
           files: |
             release/*
         env:
