@@ -30,7 +30,7 @@ pub struct Config {
     pub enabled_models: Option<Vec<String>>,
 
     // Message Handling
-    #[serde(alias = "steeringMode")]
+    #[serde(alias = "steeringMode", alias = "queueMode")]
     pub steering_mode: Option<String>,
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
@@ -212,13 +212,16 @@ pub struct ResolvedExtensionRisk {
 #[serde(default)]
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
+    #[serde(alias = "reserveTokens")]
     pub reserve_tokens: Option<u32>,
+    #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BranchSummarySettings {
+    #[serde(alias = "reserveTokens")]
     pub reserve_tokens: Option<u32>,
 }
 
@@ -226,22 +229,29 @@ pub struct BranchSummarySettings {
 #[serde(default)]
 pub struct RetrySettings {
     pub enabled: Option<bool>,
+    #[serde(alias = "maxRetries")]
     pub max_retries: Option<u32>,
+    #[serde(alias = "baseDelayMs")]
     pub base_delay_ms: Option<u32>,
+    #[serde(alias = "maxDelayMs")]
     pub max_delay_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
+    #[serde(alias = "autoResize")]
     pub auto_resize: Option<bool>,
+    #[serde(alias = "blockImages")]
     pub block_images: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
+    #[serde(alias = "showImages")]
     pub show_images: Option<bool>,
+    #[serde(alias = "clearOnShrink")]
     pub clear_on_shrink: Option<bool>,
 }
 
@@ -548,10 +558,17 @@ impl Config {
     }
 
     pub fn terminal_clear_on_shrink(&self) -> bool {
-        self.terminal
-            .as_ref()
-            .and_then(|t| t.clear_on_shrink)
-            .unwrap_or(false)
+        self.terminal_clear_on_shrink_with_lookup(env_lookup)
+    }
+
+    fn terminal_clear_on_shrink_with_lookup<F>(&self, get_env: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(value) = self.terminal.as_ref().and_then(|t| t.clear_on_shrink) {
+            return value;
+        }
+        get_env("PI_CLEAR_ON_SHRINK").is_some_and(|value| value == "1")
     }
 
     pub fn thinking_budget(&self, level: &str) -> u32 {
@@ -1692,6 +1709,70 @@ mod tests {
         assert_eq!(config.editor_padding_x, Some(5));
         assert_eq!(config.autocomplete_max_visible, Some(15));
         assert_eq!(config.session_picker_input, Some(2));
+    }
+
+    #[test]
+    fn camel_case_nested_aliases_are_parsed() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "queueMode": "all",
+                "compaction": { "enabled": false, "reserveTokens": 1234, "keepRecentTokens": 5678 },
+                "branchSummary": { "reserveTokens": 2222 },
+                "retry": { "enabled": false, "maxRetries": 9, "baseDelayMs": 101, "maxDelayMs": 202 },
+                "images": { "autoResize": false, "blockImages": true },
+                "terminal": { "showImages": false, "clearOnShrink": true }
+            }"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert_eq!(config.steering_mode.as_deref(), Some("all"));
+        assert_eq!(config.steering_queue_mode(), QueueMode::All);
+        assert!(!config.compaction_enabled());
+        assert_eq!(config.compaction_reserve_tokens(), 1234);
+        assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+        assert_eq!(config.branch_summary_reserve_tokens(), 2222);
+        assert!(!config.retry_enabled());
+        assert_eq!(config.retry_max_retries(), 9);
+        assert_eq!(config.retry_base_delay_ms(), 101);
+        assert_eq!(config.retry_max_delay_ms(), 202);
+        assert!(!config.image_auto_resize());
+        assert!(!config.terminal_show_images());
+        assert!(config.terminal_clear_on_shrink());
+    }
+
+    #[test]
+    fn terminal_clear_on_shrink_uses_env_when_unset() {
+        let config = Config::default();
+        assert!(config.terminal_clear_on_shrink_with_lookup(|name| {
+            if name == "PI_CLEAR_ON_SHRINK" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        }));
+        assert!(!config.terminal_clear_on_shrink_with_lookup(|_| None));
+    }
+
+    #[test]
+    fn terminal_clear_on_shrink_settings_take_precedence_over_env() {
+        let config = Config {
+            terminal: Some(TerminalSettings {
+                clear_on_shrink: Some(false),
+                ..TerminalSettings::default()
+            }),
+            ..Config::default()
+        };
+        assert!(!config.terminal_clear_on_shrink_with_lookup(|name| {
+            if name == "PI_CLEAR_ON_SHRINK" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        }));
     }
 
     // ── Config serde roundtrip ─────────────────────────────────────────
