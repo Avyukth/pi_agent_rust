@@ -721,35 +721,18 @@ impl Session {
 
     #[cfg(feature = "sqlite-sessions")]
     async fn open_sqlite(path: &Path) -> Result<Self> {
-        let path = path.to_path_buf();
-        let (tx, rx) = oneshot::channel();
+        let (header, mut entries) = crate::session_sqlite::load_session(path).await?;
+        ensure_entry_ids(&mut entries);
+        let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
 
-        thread::spawn(move || {
-            let res = (|| -> Result<Self> {
-                let (header, mut entries) = futures::executor::block_on(async {
-                    crate::session_sqlite::load_session(&path).await
-                })?;
-                ensure_entry_ids(&mut entries);
-                let leaf_id = entries.iter().rev().find_map(|e| e.base_id().cloned());
-
-                Ok(Self {
-                    header,
-                    entries,
-                    path: Some(path),
-                    leaf_id,
-                    session_dir: None,
-                    store_kind: SessionStoreKind::Sqlite,
-                })
-            })();
-
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::session("Open task cancelled"))?
+        Ok(Self {
+            header,
+            entries,
+            path: Some(path.to_path_buf()),
+            leaf_id,
+            session_dir: None,
+            store_kind: SessionStoreKind::Sqlite,
+        })
     }
 
     /// Continue the most recent session.
