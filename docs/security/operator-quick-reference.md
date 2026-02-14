@@ -129,6 +129,105 @@ let trust = manager.trust_state("extension-id");
 | Avg latency | > 200ms | Auto-rollback to Shadow |
 | Min samples | 10 | No evaluation below this |
 
+## Evidence Bundle Operations
+
+```rust
+use pi::extensions::{
+    build_incident_evidence_bundle, verify_incident_evidence_bundle,
+    replay_runtime_risk_ledger_artifact,
+    IncidentBundleFilter, IncidentBundleRedactionPolicy,
+    SecurityAlertCategory, SecurityAlertSeverity,
+};
+
+// Build a bundle (scoped to an extension and time window)
+let filter = IncidentBundleFilter {
+    start_ms: Some(start), end_ms: Some(end),
+    extension_id: Some("ext-id".into()),
+    alert_categories: None,  // or Some(vec![...])
+    min_severity: None,       // or Some(SecurityAlertSeverity::Warning)
+};
+let redaction = IncidentBundleRedactionPolicy::default(); // redact all hashes
+let bundle = build_incident_evidence_bundle(
+    &ledger, &alerts, &telemetry, &exec, &secret,
+    &quota_breaches, &filter, &redaction, now_ms,
+);
+
+// Verify bundle integrity
+let report = verify_incident_evidence_bundle(&bundle);
+assert!(report.valid);
+
+// Forensic replay
+let replay = replay_runtime_risk_ledger_artifact(&ledger)?;
+```
+
+## Quota Configuration
+
+```rust
+// Per-extension quota via policy overrides
+let policy = ExtensionPolicy {
+    per_extension: HashMap::from([(
+        "ext-id".into(),
+        ExtensionOverride {
+            quota: Some(ExtensionQuotaConfig {
+                max_hostcalls_per_second: Some(10),
+                max_hostcalls_per_minute: Some(100),
+                max_hostcalls_total: Some(5000),
+                max_subprocesses: Some(2),
+                max_write_bytes: Some(10_000_000),
+                max_http_requests: Some(50),
+            }),
+            ..Default::default()
+        },
+    )]),
+    ..Default::default()
+};
+```
+
+## Exec Mediation
+
+```rust
+// Configure exec mediation
+let policy = ExtensionPolicy {
+    exec_mediation: ExecMediationPolicy {
+        enabled: true,
+        deny_threshold: ExecRiskTier::High,
+        deny_patterns: vec!["rm -rf /".into()],
+        allow_patterns: vec!["rm -rf ./node_modules".into()],
+        audit_all_classified: true,
+    },
+    ..Default::default()
+};
+```
+
+## Secret Broker
+
+```rust
+// Configure secret broker
+let policy = ExtensionPolicy {
+    secret_broker: SecretBrokerPolicy {
+        enabled: true,
+        secret_suffixes: vec!["_KEY", "_SECRET", "_TOKEN"],
+        secret_prefixes: vec!["SECRET_", "AUTH_"],
+        secret_exact: vec!["ANTHROPIC_API_KEY"],
+        disclosure_allowlist: vec!["HOME", "PATH"],
+        redaction_placeholder: "[REDACTED]".into(),
+    },
+    ..Default::default()
+};
+```
+
+## Alert Categories (SecurityAlertCategory)
+
+| Enum Variant | Meaning |
+|-------------|---------|
+| `PolicyDenial` | Denied by static capability policy |
+| `AnomalyDenial` | Denied by runtime risk scorer |
+| `ExecMediation` | Shell command blocked |
+| `SecretBroker` | Secret detected/redacted |
+| `QuotaBreach` | Quota exceeded |
+| `Quarantine` | Extension terminated |
+| `ProfileTransition` | Profile transition attempt |
+
 ## Common Operations Cheatsheet
 
 | Task | Method |
@@ -140,5 +239,7 @@ let trust = manager.trust_state("extension-id");
 | Emergency rollback | `manager.set_rollout_phase(RolloutPhase::Shadow)` |
 | Kill extension | `manager.set_kill_switch(id, true, reason)` |
 | Verify ledger | `verify_runtime_risk_ledger_artifact(&ledger)` |
-| Export evidence | `manager.runtime_risk_ledger_artifact()` |
+| Build evidence bundle | `build_incident_evidence_bundle(...)` |
+| Verify bundle | `verify_incident_evidence_bundle(&bundle)` |
+| Replay decisions | `replay_runtime_risk_ledger_artifact(&ledger)` |
 | Check FP rate | `manager.rollout_state().window_stats` |

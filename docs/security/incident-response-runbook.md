@@ -240,18 +240,145 @@ assert!(!report.valid, "corruption confirmed");
 
 ---
 
-## Evidence Collection
+## Procedure 6: Evidence Bundle Export
+
+**When to use:** After any P0-P2 incident, or when forensic evidence must be
+preserved for audit or sharing.
+
+**Step 1 -- Collect raw artifacts**
+
+```rust
+let ledger = manager.runtime_risk_ledger_artifact();
+let alerts = manager.security_alert_artifact();
+let telemetry = manager.runtime_hostcall_telemetry_artifact();
+let exec = manager.exec_mediation_artifact();
+let secret = manager.secret_broker_artifact();
+let quota_breaches = manager.quota_breach_events();
+```
+
+**Step 2 -- Define scope with a filter**
+
+```rust
+use pi::extensions::{
+    IncidentBundleFilter, SecurityAlertCategory, SecurityAlertSeverity,
+};
+
+let filter = IncidentBundleFilter {
+    start_ms: Some(incident_start_ms),   // Time window start
+    end_ms: Some(incident_end_ms),       // Time window end
+    extension_id: Some("suspect-ext".into()),  // Scope to one extension
+    alert_categories: Some(vec![         // Limit to relevant categories
+        SecurityAlertCategory::ExecMediation,
+        SecurityAlertCategory::AnomalyDenial,
+    ]),
+    min_severity: Some(SecurityAlertSeverity::Warning),
+};
+```
+
+**Step 3 -- Set redaction policy**
+
+For external sharing (redact all hashes):
+```rust
+use pi::extensions::IncidentBundleRedactionPolicy;
+
+let redaction = IncidentBundleRedactionPolicy {
+    redact_params_hash: true,
+    redact_context_hash: true,
+    redact_args_shape_hash: true,
+    redact_command_hash: true,
+    redact_name_hash: true,
+    redact_remediation: false,  // Keep human-readable remediation text
+};
+```
+
+For internal investigation (no redaction):
+```rust
+let redaction = IncidentBundleRedactionPolicy {
+    redact_params_hash: false,
+    redact_context_hash: false,
+    redact_args_shape_hash: false,
+    redact_command_hash: false,
+    redact_name_hash: false,
+    redact_remediation: false,
+};
+```
+
+**Step 4 -- Build the bundle**
+
+```rust
+use pi::extensions::build_incident_evidence_bundle;
+
+let bundle = build_incident_evidence_bundle(
+    &ledger, &alerts, &telemetry, &exec, &secret,
+    &quota_breaches, &filter, &redaction, now_ms,
+);
+```
+
+**Step 5 -- Verify integrity**
+
+```rust
+use pi::extensions::verify_incident_evidence_bundle;
+
+let report = verify_incident_evidence_bundle(&bundle);
+assert!(report.valid, "Bundle integrity check failed: {:?}", report.errors);
+assert!(report.ledger_chain_intact, "Ledger hash chain broken");
+assert_eq!(report.bundle_hash, report.recomputed_hash, "Hash mismatch");
+```
+
+**Step 6 -- Review bundle summary**
+
+```rust
+let summary = &bundle.summary;
+println!("Ledger entries: {}", summary.ledger_entry_count);
+println!("Alerts: {}", summary.alert_count);
+println!("Telemetry events: {}", summary.telemetry_event_count);
+println!("Exec mediation: {}", summary.exec_mediation_count);
+println!("Secret broker: {}", summary.secret_broker_count);
+println!("Quota breaches: {}", summary.quota_breach_count);
+println!("Distinct extensions: {}", summary.distinct_extensions);
+println!("Peak risk score: {:.3}", summary.peak_risk_score);
+println!("Deny/Terminate count: {}", summary.deny_or_terminate_count);
+println!("Ledger chain intact: {}", summary.ledger_chain_intact);
+```
+
+**Step 7 -- Forensic replay (optional)**
+
+Reconstruct the decision sequence step-by-step:
+
+```rust
+use pi::extensions::replay_runtime_risk_ledger_artifact;
+
+let replay = replay_runtime_risk_ledger_artifact(&ledger)?;
+for step in &replay.steps {
+    println!("[{}] ext={} cap={}.{} score={:.3} action={:?} state={:?}",
+        step.ts_ms, step.extension_id, step.capability, step.method,
+        step.risk_score, step.selected_action, step.derived_state);
+}
+```
+
+**Expected artifacts:**
+- `IncidentEvidenceBundle` (schema `pi.ext.incident_evidence_bundle.v1`)
+- `IncidentBundleVerificationReport` confirming `valid: true`
+- Optional `RuntimeRiskReplayArtifact` for decision reconstruction
+
+---
+
+## Evidence Collection Checklist
 
 All incidents should produce an evidence bundle containing:
 
-1. **Runtime risk ledger** — hash-chained decision history
-2. **Hostcall telemetry** — per-call feature vectors and scores
-3. **Security alerts** — alert stream filtered to incident timeframe
-4. **Rollout state snapshot** — phase, enforce flag, window stats
-5. **Extension trust state** — current trust level and kill-switch audit
+1. **Runtime risk ledger** -- hash-chained decision history
+2. **Hostcall telemetry** -- per-call feature vectors and scores
+3. **Security alerts** -- alert stream filtered to incident timeframe
+4. **Exec mediation log** -- command classifications and decisions
+5. **Secret broker log** -- redaction decisions
+6. **Quota breach events** -- resource limit violations
+7. **Rollout state snapshot** -- phase, enforce flag, window stats
+8. **Extension trust state** -- current trust level and kill-switch audit
 
-Evidence bundle integrity is verified via SHA-256 hash chain on the ledger.
-The `verify_runtime_risk_ledger_artifact()` function confirms chain validity.
+Bundle integrity is verified via SHA-256 hashing. The
+`verify_incident_evidence_bundle()` function confirms bundle hash and ledger
+chain validity.
 
 ---
 
