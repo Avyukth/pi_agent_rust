@@ -897,6 +897,82 @@ cargo test --test e2e_replay_bundle_validation -- --nocapture
 
 Operator reference: `docs/ci-operator-runbook.md`.
 
+## Onboarding anti-patterns, guardrails, and rollback protocol (bd-3uqg.9.4.4)
+
+This section is mandatory reading before merging provider metadata, factory, or adapter changes.
+
+### Anti-pattern catalog with prevention checks
+
+| Anti-pattern | Concrete example | Prevention check (must pass) |
+|---|---|---|
+| Alias drift between docs and runtime | `providers.md` says alias `open-router`, but `provider_metadata.rs` alias list was not updated | `cargo test --test provider_metadata_comprehensive alias_mapping_snapshot_is_current -- --nocapture` |
+| Partial verification coverage | New provider added with only `simple_text` cassette, no auth/error scenarios | `cargo test --test provider_native_verify <provider>_conformance:: -- --nocapture` plus required scenarios (`simple_text`, `tool_call_single`, `error_auth_401`) |
+| Non-redacted diagnostics in logs/artifacts | `Authorization` header or API key appears in JSONL or cassette output | `cargo test --test ci_artifact_retention -- --nocapture` and redaction checks in `tests/e2e_artifact_retention_triage.rs` |
+| Stale docs/runtime mapping | Setup JSON lists wrong `auth_env` or base URL after runtime change | `cargo test --test provider_native_contract docs_runtime -- --nocapture` |
+| Missing CI replayability | Failure digests exist without deterministic replay commands | `cargo test --test e2e_replay_bundles -- --nocapture` and `cargo test --test e2e_replay_bundle_validation -- --nocapture` |
+| Routing-default collision | New provider copied existing `(api, base_url)` pair unintentionally | `cargo test --test provider_metadata_comprehensive no_accidental_duplicate_routing_defaults -- --nocapture` |
+| Provider matrix/doc drift after merge | Provider works in code but matrix/evidence rows are stale | Update docs + run `cargo test --test provider_native_contract docs_runtime -- --nocapture` before merge |
+
+### Required pre-merge guardrails
+
+Run all of the following before closing a provider bead:
+
+```bash
+# Metadata + routing drift guards
+cargo test --test provider_metadata_comprehensive -- --nocapture
+cargo test --test provider_factory -- --nocapture
+
+# Docs/runtime consistency
+cargo test --test provider_native_contract docs_runtime -- --nocapture
+
+# CI artifact + replay guarantees
+cargo test --test ci_artifact_retention -- --nocapture
+cargo test --test e2e_replay_bundles -- --nocapture
+cargo test --test e2e_replay_bundle_validation -- --nocapture
+
+# Native adapter / provider-specific conformance (if applicable)
+cargo test --test provider_native_verify <provider>_conformance:: -- --nocapture
+
+# Global quality gates
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Pre-merge block rule:
+- Any redaction failure, missing replay command, or docs/runtime mismatch is a merge blocker.
+
+### Required post-merge monitoring hooks
+
+Within the first CI cycle after merge:
+1. Confirm retained artifacts exist (`summary.json`, `replay_bundle.json`, `failure_digest.json` for failures).
+2. Verify `replay_bundle.one_command_replay` executes locally from the CI artifact set.
+3. Check failure taxonomy and remediation pointers for newly failing suites.
+4. Confirm no secret leakage via artifact-retention redaction checks.
+5. Post a bead-thread note with pass/fail status and artifact paths.
+
+### Rollback protocol (actionable thresholds + handoff)
+
+Severity thresholds:
+
+| Severity | Trigger | Required action window |
+|---|---|---|
+| `SEV-1` | Secret exposure or redaction break in CI artifacts | Immediate containment and rollback in the same response window |
+| `SEV-2` | Provider route/auth break causing broad request failure with no safe workaround | Rollback decision within 30 minutes after confirmation |
+| `SEV-3` | Scoped regression with a documented workaround | Fix-forward or rollback decision within 1 business day |
+
+Rollback steps:
+1. **Classify and contain**: assign severity and stop further merges for the affected provider scope.
+2. **Preserve evidence**: archive failing `summary.json`, `replay_bundle.json`, and `failure_digest.json` paths in the bead thread.
+3. **Execute rollback**:
+   - Preferred: targeted `git revert <commit>` for the offending provider change.
+   - Alternative: temporary provider disable/path reroute with explicit follow-up bead.
+4. **Re-run gates**: re-run artifact/replay and provider verification commands to confirm recovery.
+5. **Handoff**: post a final incident note containing:
+   - root cause class,
+   - rollback commit/change reference,
+   - verification command output summary,
+   - follow-up bead IDs for permanent fix work.
+
 ## Contributor checklist (new provider or major provider update)
 
 ### Phase 1: Metadata registration
