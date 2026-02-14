@@ -360,8 +360,7 @@ fn dangerous_opt_in_audit_entry_serializes() {
         capabilities_unblocked: vec!["exec".to_string(), "env".to_string()],
     };
     let json = serde_json::to_string_pretty(&entry).expect("serialize");
-    let restored: DangerousOptInAuditEntry =
-        serde_json::from_str(&json).expect("deserialize");
+    let restored: DangerousOptInAuditEntry = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.source, "config");
     assert_eq!(restored.profile, "safe");
     assert_eq!(restored.capabilities_unblocked.len(), 2);

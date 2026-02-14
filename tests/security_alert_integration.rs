@@ -5,9 +5,9 @@
 //! export, and category/severity classification.
 
 use pi::extensions::{
-    ExtensionManager, RuntimeRiskStateLabelValue, SecurityAlert, SecurityAlertAction,
-    SecurityAlertArtifact, SecurityAlertCategory, SecurityAlertCategoryCounts,
-    SecurityAlertSeverity, SecurityAlertSeverityCounts, SECURITY_ALERT_SCHEMA_VERSION,
+    ExtensionManager, RuntimeRiskStateLabelValue, SECURITY_ALERT_SCHEMA_VERSION, SecurityAlert,
+    SecurityAlertAction, SecurityAlertArtifact, SecurityAlertCategory, SecurityAlertCategoryCounts,
+    SecurityAlertSeverity, SecurityAlertSeverityCounts,
 };
 
 // ==========================================================================

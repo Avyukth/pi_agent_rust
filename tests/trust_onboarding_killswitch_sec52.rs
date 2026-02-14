@@ -18,9 +18,9 @@ use pi::extension_preflight::{
     classify_extension_source, initial_trust_state, is_hostcall_allowed_for_trust,
 };
 use pi::extensions::{
-    ExtensionManager, ExtensionPolicy, SecurityAlert, SecurityAlertAction, SecurityAlertCategory,
-    SecurityAlertFilter, SecurityAlertSeverity, query_security_alerts,
-    SECURITY_ALERT_SCHEMA_VERSION,
+    ExtensionManager, ExtensionPolicy, SECURITY_ALERT_SCHEMA_VERSION, SecurityAlert,
+    SecurityAlertAction, SecurityAlertCategory, SecurityAlertFilter, SecurityAlertSeverity,
+    query_security_alerts,
 };
 
 // ============================================================================
@@ -45,9 +45,7 @@ fn emergency_kill_switch(
     tracker.demote(reason).expect("demotion must succeed");
     // Record a quarantine alert mirroring what the runtime would produce.
     manager.record_security_alert(SecurityAlert::from_quarantine(
-        &ext_id,
-        reason,
-        0.95, // high risk score triggering kill-switch
+        &ext_id, reason, 0.95, // high risk score triggering kill-switch
     ));
 }
 
@@ -152,14 +150,12 @@ fn kill_switch_halts_trusted_extension() {
     assert_eq!(alert.severity, SecurityAlertSeverity::Critical);
     assert_eq!(alert.action, SecurityAlertAction::Terminate);
 
-    harness.log().info_ctx(
-        "kill_switch",
-        "trusted extension halted",
-        |ctx_log| {
+    harness
+        .log()
+        .info_ctx("kill_switch", "trusted extension halted", |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-ww5br".into()));
             ctx_log.push(("final_state".into(), format!("{}", tracker.state())));
-        },
-    );
+        });
 }
 
 // ============================================================================
@@ -174,12 +170,24 @@ fn audit_trail_preserves_full_provenance() {
 
     // Simulate full lifecycle: promote twice, then kill-switch.
     tracker
-        .promote("initial review", true, Some(60), Some(InstallRecommendation::Review))
+        .promote(
+            "initial review",
+            true,
+            Some(60),
+            Some(InstallRecommendation::Review),
+        )
         .unwrap();
     tracker
-        .promote("observation complete", true, Some(80), Some(InstallRecommendation::Allow))
+        .promote(
+            "observation complete",
+            true,
+            Some(80),
+            Some(InstallRecommendation::Allow),
+        )
         .unwrap();
-    tracker.demote("emergency: data exfiltration attempt").unwrap();
+    tracker
+        .demote("emergency: data exfiltration attempt")
+        .unwrap();
 
     let history = tracker.history();
     assert_eq!(history.len(), 3);
@@ -226,14 +234,12 @@ fn audit_trail_preserves_full_provenance() {
         );
     }
 
-    harness.log().info_ctx(
-        "audit_trail",
-        "full provenance preserved",
-        |ctx_log| {
+    harness
+        .log()
+        .info_ctx("audit_trail", "full provenance preserved", |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-ww5br".into()));
             ctx_log.push(("events".into(), history.len().to_string()));
-        },
-    );
+        });
 }
 
 // ============================================================================
@@ -255,7 +261,10 @@ fn re_onboarding_after_kill_switch_requires_fresh_ack() {
         .promote("auto-recover", false, None, None)
         .unwrap_err();
     assert!(
-        matches!(err, pi::extension_preflight::TrustTransitionError::OperatorAckRequired { .. }),
+        matches!(
+            err,
+            pi::extension_preflight::TrustTransitionError::OperatorAckRequired { .. }
+        ),
         "re-promotion without ack must be rejected"
     );
     assert_eq!(tracker.state(), ExtensionTrustState::Quarantined);
@@ -326,7 +335,10 @@ fn alert_filtering_after_kill_switch() {
         "kill-switch alerts filterable",
         |ctx_log| {
             ctx_log.push(("issue_id".into(), "bd-ww5br".into()));
-            ctx_log.push(("total_alerts".into(), mgr.security_alert_count().to_string()));
+            ctx_log.push((
+                "total_alerts".into(),
+                mgr.security_alert_count().to_string(),
+            ));
             ctx_log.push(("quarantine_ext_a".into(), filtered.len().to_string()));
             ctx_log.push(("critical_total".into(), critical.len().to_string()));
         },
@@ -392,11 +404,8 @@ fn multi_extension_independent_trust_states() {
 fn kill_switch_alert_schema_and_fields() {
     let harness = TestHarness::new("kill_switch_alert_schema_and_fields");
 
-    let alert = SecurityAlert::from_quarantine(
-        "ext.schema.check",
-        "consecutive unsafe behavior",
-        0.92,
-    );
+    let alert =
+        SecurityAlert::from_quarantine("ext.schema.check", "consecutive unsafe behavior", 0.92);
 
     // Schema.
     assert_eq!(alert.schema, SECURITY_ALERT_SCHEMA_VERSION);
@@ -457,10 +466,7 @@ fn onboarding_records_risk_disclosure() {
     let event = &tracker.history()[0];
 
     // Risk disclosure is captured in the event.
-    assert_eq!(
-        event.recommendation,
-        Some(InstallRecommendation::Review)
-    );
+    assert_eq!(event.recommendation, Some(InstallRecommendation::Review));
     assert_eq!(event.risk_score, Some(45));
     assert!(event.operator_acknowledged);
 
@@ -492,7 +498,9 @@ fn kill_switch_during_onboarding_restricted_phase() {
     let mut tracker = risky_tracker("ext.midway");
 
     // Onboarding step 1: promote to Restricted.
-    tracker.promote("initial review", true, Some(60), None).unwrap();
+    tracker
+        .promote("initial review", true, Some(60), None)
+        .unwrap();
     assert_eq!(tracker.state(), ExtensionTrustState::Restricted);
 
     // During restricted observation, anomaly detected → kill-switch.
@@ -545,12 +553,8 @@ fn multiple_kill_switches_accumulate_in_audit_trail() {
     emergency_kill_switch(&mut tracker, &mgr, "incident-1");
 
     // Cycle 2: re-onboard → kill-switch again.
-    tracker
-        .promote("review-2", true, Some(70), None)
-        .unwrap();
-    tracker
-        .promote("full-2", true, Some(80), None)
-        .unwrap();
+    tracker.promote("review-2", true, Some(70), None).unwrap();
+    tracker.promote("full-2", true, Some(80), None).unwrap();
     emergency_kill_switch(&mut tracker, &mgr, "incident-2");
 
     // State is quarantined.
@@ -582,7 +586,10 @@ fn multiple_kill_switches_accumulate_in_audit_trail() {
             ctx_log.push(("issue_id".into(), "bd-ww5br".into()));
             ctx_log.push(("cycles".into(), "2".into()));
             ctx_log.push(("total_events".into(), history.len().to_string()));
-            ctx_log.push(("total_alerts".into(), mgr.security_alert_count().to_string()));
+            ctx_log.push((
+                "total_alerts".into(),
+                mgr.security_alert_count().to_string(),
+            ));
         },
     );
 }
@@ -636,7 +643,12 @@ fn kill_switch_alert_sequence_ids_monotonic() {
 fn trust_event_json_includes_all_required_fields() {
     let mut tracker = risky_tracker("ext.fields");
     tracker
-        .promote("detailed review", true, Some(55), Some(InstallRecommendation::Review))
+        .promote(
+            "detailed review",
+            true,
+            Some(55),
+            Some(InstallRecommendation::Review),
+        )
         .unwrap();
 
     let event = &tracker.history()[0];
@@ -645,17 +657,29 @@ fn trust_event_json_includes_all_required_fields() {
 
     // Required fields for SEC-5.2 audit compliance.
     assert!(v["schema"].is_string(), "schema must be present");
-    assert!(v["extension_id"].is_string(), "extension_id must be present");
+    assert!(
+        v["extension_id"].is_string(),
+        "extension_id must be present"
+    );
     assert!(v["from_state"].is_string(), "from_state must be present");
     assert!(v["to_state"].is_string(), "to_state must be present");
     assert!(v["kind"].is_string(), "kind must be present");
     assert!(v["reason"].is_string(), "reason must be present");
-    assert!(v["operator_acknowledged"].is_boolean(), "operator_acknowledged must be present");
+    assert!(
+        v["operator_acknowledged"].is_boolean(),
+        "operator_acknowledged must be present"
+    );
     assert!(v["timestamp"].is_string(), "timestamp must be present");
 
     // Optional but expected for onboarding.
-    assert!(v["risk_score"].is_number(), "risk_score must be present when provided");
-    assert!(v["recommendation"].is_string(), "recommendation must be present when provided");
+    assert!(
+        v["risk_score"].is_number(),
+        "risk_score must be present when provided"
+    );
+    assert!(
+        v["recommendation"].is_string(),
+        "recommendation must be present when provided"
+    );
 }
 
 // ============================================================================
@@ -665,7 +689,15 @@ fn trust_event_json_includes_all_required_fields() {
 #[test]
 fn hostcall_gating_covers_all_category_tiers() {
     // Registration-only: always allowed in every state.
-    let registration_caps = ["register", "tool", "slash_command", "shortcut", "flag", "event_hook", "log"];
+    let registration_caps = [
+        "register",
+        "tool",
+        "slash_command",
+        "shortcut",
+        "flag",
+        "event_hook",
+        "log",
+    ];
     for cap in &registration_caps {
         assert!(
             is_hostcall_allowed_for_trust(ExtensionTrustState::Quarantined, cap),
@@ -699,7 +731,16 @@ fn hostcall_gating_covers_all_category_tiers() {
     }
 
     // Dangerous: only trusted.
-    let dangerous_caps = ["write", "exec", "env", "http", "session_write", "fs_write", "fs_delete", "fs_mkdir"];
+    let dangerous_caps = [
+        "write",
+        "exec",
+        "env",
+        "http",
+        "session_write",
+        "fs_write",
+        "fs_delete",
+        "fs_mkdir",
+    ];
     for cap in &dangerous_caps {
         assert!(
             !is_hostcall_allowed_for_trust(ExtensionTrustState::Quarantined, cap),
