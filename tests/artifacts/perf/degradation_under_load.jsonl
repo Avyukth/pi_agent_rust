@@ -1,0 +1,1 @@
+{"data":{"collapsed_during_pressure":10,"recovery_memory_level":"Memory: 50.0MB (peak 142.0MB) [Warning]","tool_outputs":10,"visible_before_pressure":9},"event":"degradation_cycle","schema":"pi.test.perf_event.v1","test":"tui_perf_e2e_degradation_under_load"}

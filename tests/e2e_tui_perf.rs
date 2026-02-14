@@ -10,13 +10,14 @@
 //! 4. Memory pressure response (collapse + truncation)
 //!
 //! Run:
-//!   cargo test --test e2e_tui_perf -- --nocapture
-//!   PI_PERF_TELEMETRY=1 cargo test --test e2e_tui_perf -- --nocapture
+//!   cargo test --test `e2e_tui_perf` -- --nocapture
+//!   `PI_PERF_TELEMETRY=1` cargo test --test `e2e_tui_perf` -- --nocapture
 
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::similar_names,
+    clippy::too_many_lines,
     clippy::unnecessary_literal_bound
 )]
 
@@ -29,9 +30,9 @@ use common::harness::TestHarness;
 use futures::stream;
 use pi::agent::{Agent, AgentConfig};
 use pi::config::Config;
-use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
+use pi::interactive::{ConversationMessage, MessageRole, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
-use pi::model::{ContentBlock, StreamEvent, TextContent, Usage};
+use pi::model::{StreamEvent, Usage};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::resources::{ResourceCliOptions, ResourceLoader};
@@ -174,20 +175,6 @@ impl MockRssReader {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
-    let re = regex::Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("ansi regex");
-    re.replace_all(input, "").to_string()
-}
-
-fn normalize_view(input: &str) -> String {
-    let stripped = strip_ansi(input);
-    stripped
-        .lines()
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Artifact output directory for perf tests.
 fn perf_artifact_dir() -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/perf");
@@ -200,7 +187,7 @@ fn emit_perf_event(
     harness: &TestHarness,
     test_name: &str,
     event_type: &str,
-    data: serde_json::Value,
+    data: &serde_json::Value,
 ) {
     harness.log().info_ctx(event_type, test_name, |ctx| {
         for (k, v) in data.as_object().into_iter().flat_map(|m| m.iter()) {
@@ -216,7 +203,9 @@ fn generate_conversation(count: usize) -> Vec<ConversationMessage> {
         match i % 3 {
             0 => messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: format!("User message #{i}: What about the implementation of feature {i}?"),
+                content: format!(
+                    "User message #{i}: What about the implementation of feature {i}?"
+                ),
                 thinking: None,
                 collapsed: false,
             }),
@@ -258,14 +247,18 @@ fn e2e_perf_long_conversation_responsiveness() {
     let harness = TestHarness::new("e2e_perf_long_conversation_responsiveness");
     let test_name = "long_conversation_responsiveness";
 
-    harness.log().info("setup", "Generating 500-message conversation");
+    harness
+        .log()
+        .info("setup", "Generating 500-message conversation");
     let messages = generate_conversation(500);
     let mut app = build_perf_app(&harness, messages);
 
     // Measure build_conversation_content() time for full conversation
     let mut frame_times_us = Vec::with_capacity(20);
 
-    harness.log().info("measure", "Measuring frame times with 500 messages");
+    harness
+        .log()
+        .info("measure", "Measuring frame times with 500 messages");
 
     for frame_idx in 0..20 {
         let start = Instant::now();
@@ -273,17 +266,22 @@ fn e2e_perf_long_conversation_responsiveness() {
         let elapsed_us = start.elapsed().as_micros() as u64;
         frame_times_us.push(elapsed_us);
 
-        emit_perf_event(&harness, test_name, "frame", json!({
-            "frame_index": frame_idx,
-            "frame_time_us": elapsed_us,
-            "message_count": 500,
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "frame",
+            &json!({
+                "frame_index": frame_idx,
+                "frame_time_us": elapsed_us,
+                "message_count": 500,
+            }),
+        );
     }
 
     // Scroll to top
     harness.log().info("scroll", "Scrolling to top");
     for _ in 0..50 {
-        BubbleteaModel::update(&mut app, Message::new(KeyMsg::from_type(KeyType::PageUp)));
+        BubbleteaModel::update(&mut app, Message::new(KeyMsg::from_type(KeyType::PgUp)));
     }
 
     let mut scroll_frame_times = Vec::with_capacity(10);
@@ -293,17 +291,22 @@ fn e2e_perf_long_conversation_responsiveness() {
         let elapsed_us = start.elapsed().as_micros() as u64;
         scroll_frame_times.push(elapsed_us);
 
-        emit_perf_event(&harness, test_name, "scroll_frame", json!({
-            "frame_index": frame_idx,
-            "frame_time_us": elapsed_us,
-            "position": "top",
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "scroll_frame",
+            &json!({
+                "frame_index": frame_idx,
+                "frame_time_us": elapsed_us,
+                "position": "top",
+            }),
+        );
     }
 
     // Scroll back to bottom
     harness.log().info("scroll", "Scrolling to bottom");
     for _ in 0..50 {
-        BubbleteaModel::update(&mut app, Message::new(KeyMsg::from_type(KeyType::PageDown)));
+        BubbleteaModel::update(&mut app, Message::new(KeyMsg::from_type(KeyType::PgDown)));
     }
 
     for frame_idx in 0..10 {
@@ -312,11 +315,16 @@ fn e2e_perf_long_conversation_responsiveness() {
         let elapsed_us = start.elapsed().as_micros() as u64;
         scroll_frame_times.push(elapsed_us);
 
-        emit_perf_event(&harness, test_name, "scroll_frame", json!({
-            "frame_index": frame_idx + 10,
-            "frame_time_us": elapsed_us,
-            "position": "bottom",
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "scroll_frame",
+            &json!({
+                "frame_index": frame_idx + 10,
+                "frame_time_us": elapsed_us,
+                "position": "bottom",
+            }),
+        );
     }
 
     // Compute p95
@@ -330,22 +338,28 @@ fn e2e_perf_long_conversation_responsiveness() {
     let p95_frame_ms = p95_frame as f64 / 1000.0;
     let p95_scroll_ms = p95_scroll as f64 / 1000.0;
 
-    emit_perf_event(&harness, test_name, "summary", json!({
-        "p95_frame_ms": p95_frame_ms,
-        "p95_scroll_ms": p95_scroll_ms,
-        "frame_count": frame_times_us.len(),
-        "scroll_frame_count": scroll_frame_times.len(),
-        "status": if p95_frame_ms < 50.0 { "PASS" } else { "WARN" },
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "summary",
+        &json!({
+            "p95_frame_ms": p95_frame_ms,
+            "p95_scroll_ms": p95_scroll_ms,
+            "frame_count": frame_times_us.len(),
+            "scroll_frame_count": scroll_frame_times.len(),
+            "status": if p95_frame_ms < 50.0 { "PASS" } else { "WARN" },
+        }),
+    );
 
     // Write JSONL artifact
     let artifact_path = perf_artifact_dir().join("long_conversation.jsonl");
     let _ = harness.write_jsonl_logs(&artifact_path);
     harness.record_artifact("long_conversation_logs", &artifact_path);
 
-    harness
-        .log()
-        .info("verdict", format!("p95 frame: {p95_frame_ms:.1}ms, p95 scroll: {p95_scroll_ms:.1}ms"));
+    harness.log().info(
+        "verdict",
+        format!("p95 frame: {p95_frame_ms:.1}ms, p95 scroll: {p95_scroll_ms:.1}ms"),
+    );
 
     // Frame time assertion: with cache, 500-message frames should be fast.
     // Use a generous budget since CI environments vary. The cache ensures
@@ -363,7 +377,9 @@ fn e2e_perf_streaming_with_history() {
     let harness = TestHarness::new("e2e_perf_streaming_with_history");
     let test_name = "streaming_with_history";
 
-    harness.log().info("setup", "Generating 200-message history");
+    harness
+        .log()
+        .info("setup", "Generating 200-message history");
     let messages = generate_conversation(200);
     let mut app = build_perf_app(&harness, messages);
 
@@ -376,10 +392,15 @@ fn e2e_perf_streaming_with_history() {
     }
     let baseline_avg = baseline_times.iter().sum::<u64>() / baseline_times.len() as u64;
 
-    emit_perf_event(&harness, test_name, "baseline", json!({
-        "avg_frame_us": baseline_avg,
-        "message_count": 200,
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "baseline",
+        &json!({
+            "avg_frame_us": baseline_avg,
+            "message_count": 200,
+        }),
+    );
 
     // Start streaming: simulate agent starting a response
     BubbleteaModel::update(
@@ -398,21 +419,31 @@ fn e2e_perf_streaming_with_history() {
         let elapsed_us = start.elapsed().as_micros() as u64;
         streaming_times.push(elapsed_us);
 
-        emit_perf_event(&harness, test_name, "streaming_frame", json!({
-            "token_index": token_idx,
-            "frame_time_us": elapsed_us,
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "streaming_frame",
+            &json!({
+                "token_index": token_idx,
+                "frame_time_us": elapsed_us,
+            }),
+        );
     }
 
     let streaming_avg = streaming_times.iter().sum::<u64>() / streaming_times.len() as u64;
 
-    emit_perf_event(&harness, test_name, "summary", json!({
-        "baseline_avg_us": baseline_avg,
-        "streaming_avg_us": streaming_avg,
-        "history_messages": 200,
-        "tokens_streamed": 50,
-        "status": "PASS",
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "summary",
+        &json!({
+            "baseline_avg_us": baseline_avg,
+            "streaming_avg_us": streaming_avg,
+            "history_messages": 200,
+            "tokens_streamed": 50,
+            "status": "PASS",
+        }),
+    );
 
     // Write JSONL artifact
     let artifact_path = perf_artifact_dir().join("streaming_with_history.jsonl");
@@ -453,7 +484,9 @@ fn e2e_perf_degradation_under_load() {
     // then verify the frame timing infrastructure tracks budget violations correctly.
     let mut frame_times = Vec::with_capacity(20);
 
-    harness.log().info("measure", "Measuring 20 frames for budget analysis");
+    harness
+        .log()
+        .info("measure", "Measuring 20 frames for budget analysis");
     for frame_idx in 0..20 {
         let start = Instant::now();
         let _view = BubbleteaModel::view(&app);
@@ -461,11 +494,16 @@ fn e2e_perf_degradation_under_load() {
         frame_times.push(elapsed_us);
 
         let over_budget = elapsed_us > 16_667;
-        emit_perf_event(&harness, test_name, "frame", json!({
-            "frame_index": frame_idx,
-            "frame_time_us": elapsed_us,
-            "over_budget": over_budget,
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "frame",
+            &json!({
+                "frame_index": frame_idx,
+                "frame_time_us": elapsed_us,
+                "over_budget": over_budget,
+            }),
+        );
     }
 
     let total_frames = frame_times.len();
@@ -474,34 +512,44 @@ fn e2e_perf_degradation_under_load() {
 
     // Second pass: after cache is warm, frames should be faster
     let mut warm_frame_times = Vec::with_capacity(10);
-    harness.log().info("measure", "Measuring 10 warm-cache frames");
+    harness
+        .log()
+        .info("measure", "Measuring 10 warm-cache frames");
     for frame_idx in 0..10 {
         let start = Instant::now();
         let _view = BubbleteaModel::view(&app);
         let elapsed_us = start.elapsed().as_micros() as u64;
         warm_frame_times.push(elapsed_us);
 
-        emit_perf_event(&harness, test_name, "warm_frame", json!({
-            "frame_index": frame_idx,
-            "frame_time_us": elapsed_us,
-        }));
+        emit_perf_event(
+            &harness,
+            test_name,
+            "warm_frame",
+            &json!({
+                "frame_index": frame_idx,
+                "frame_time_us": elapsed_us,
+            }),
+        );
     }
 
     let warm_avg = warm_frame_times.iter().sum::<u64>() / warm_frame_times.len() as u64;
-    let cold_avg = frame_times[..5.min(frame_times.len())]
-        .iter()
-        .sum::<u64>()
+    let cold_avg = frame_times[..5.min(frame_times.len())].iter().sum::<u64>()
         / 5u64.min(frame_times.len() as u64);
 
-    emit_perf_event(&harness, test_name, "summary", json!({
-        "total_frames": total_frames,
-        "over_budget_count": over_budget_count,
-        "under_budget_count": under_budget_count,
-        "cold_avg_us": cold_avg,
-        "warm_avg_us": warm_avg,
-        "cache_speedup_ratio": if warm_avg > 0 { cold_avg as f64 / warm_avg as f64 } else { 0.0 },
-        "status": "PASS",
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "summary",
+        &json!({
+            "total_frames": total_frames,
+            "over_budget_count": over_budget_count,
+            "under_budget_count": under_budget_count,
+            "cold_avg_us": cold_avg,
+            "warm_avg_us": warm_avg,
+            "cache_speedup_ratio": if warm_avg > 0 { cold_avg as f64 / warm_avg as f64 } else { 0.0 },
+            "status": "PASS",
+        }),
+    );
 
     let artifact_path = perf_artifact_dir().join("degradation_under_load.jsonl");
     let _ = harness.write_jsonl_logs(&artifact_path);
@@ -573,11 +621,16 @@ fn e2e_perf_memory_pressure_response() {
     let summary_normal = app.memory_summary_for_test();
     let messages_before = app.conversation_messages_for_test().len();
 
-    emit_perf_event(&harness, test_name, "normal_state", json!({
-        "rss_bytes": 30_000_000,
-        "memory_summary": summary_normal,
-        "message_count": messages_before,
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "normal_state",
+        &json!({
+            "rss_bytes": 30_000_000,
+            "memory_summary": summary_normal,
+            "message_count": messages_before,
+        }),
+    );
 
     harness.log().info(
         "state",
@@ -596,12 +649,17 @@ fn e2e_perf_memory_pressure_response() {
         .filter(|m| m.collapsed)
         .count();
 
-    emit_perf_event(&harness, test_name, "pressure_state", json!({
-        "rss_bytes": 150_000_000,
-        "memory_summary": summary_pressure,
-        "message_count": messages_after_pressure.len(),
-        "collapsed_tool_outputs": collapsed_count,
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "pressure_state",
+        &json!({
+            "rss_bytes": 150_000_000,
+            "memory_summary": summary_pressure,
+            "message_count": messages_after_pressure.len(),
+            "collapsed_tool_outputs": collapsed_count,
+        }),
+    );
 
     harness.log().info(
         "state",
@@ -616,21 +674,25 @@ fn e2e_perf_memory_pressure_response() {
     app.force_memory_cycle_for_test();
 
     let summary_critical = app.memory_summary_for_test();
-    let messages_after_critical = app.conversation_messages_for_test();
+    let critical_msg_count = app.conversation_messages_for_test().len();
 
-    emit_perf_event(&harness, test_name, "critical_state", json!({
-        "rss_bytes": 250_000_000,
-        "memory_summary": summary_critical,
-        "message_count": messages_after_critical.len(),
-        "messages_truncated": messages_before as i64 - messages_after_critical.len() as i64,
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "critical_state",
+        &json!({
+            "rss_bytes": 250_000_000,
+            "memory_summary": summary_critical,
+            "message_count": critical_msg_count,
+            "messages_truncated": messages_before.saturating_sub(critical_msg_count),
+        }),
+    );
 
     harness.log().info(
         "state",
         format!(
-            "Critical: {} messages (truncated {} from {}), {summary_critical}",
-            messages_after_critical.len(),
-            messages_before.saturating_sub(messages_after_critical.len()),
+            "Critical: {critical_msg_count} messages (truncated {} from {}), {summary_critical}",
+            messages_before.saturating_sub(critical_msg_count),
             messages_before
         ),
     );
@@ -641,11 +703,16 @@ fn e2e_perf_memory_pressure_response() {
 
     let summary_recovered = app.memory_summary_for_test();
 
-    emit_perf_event(&harness, test_name, "recovered_state", json!({
-        "rss_bytes": 30_000_000,
-        "memory_summary": summary_recovered,
-        "message_count": messages_after_critical.len(),
-    }));
+    emit_perf_event(
+        &harness,
+        test_name,
+        "recovered_state",
+        &json!({
+            "rss_bytes": 30_000_000,
+            "memory_summary": summary_recovered,
+            "message_count": critical_msg_count,
+        }),
+    );
 
     // Write artifact
     let artifact_path = perf_artifact_dir().join("memory_pressure.jsonl");
@@ -661,9 +728,8 @@ fn e2e_perf_memory_pressure_response() {
 
     // Under Critical, messages should be truncated
     assert!(
-        messages_after_critical.len() <= messages_before,
-        "Critical level should truncate: got {} messages (started with {messages_before})",
-        messages_after_critical.len()
+        critical_msg_count <= messages_before,
+        "Critical level should truncate: got {critical_msg_count} messages (started with {messages_before})",
     );
 
     // After recovery, should show Normal
@@ -672,5 +738,7 @@ fn e2e_perf_memory_pressure_response() {
         "After recovery to 30MB, should show Normal level, got: {summary_recovered}"
     );
 
-    harness.log().info("verdict", "PASS: Memory pressure response verified");
+    harness
+        .log()
+        .info("verdict", "PASS: Memory pressure response verified");
 }

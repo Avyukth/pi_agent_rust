@@ -1,0 +1,1 @@
+{"data":{"messages_after_critical":31,"messages_after_pressure":50,"messages_initial":50,"session_file_unchanged":true,"tool_outputs_collapsed":10},"event":"pressure_response","schema":"pi.test.perf_event.v1","test":"tui_perf_e2e_memory_pressure_response"}
