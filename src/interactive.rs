@@ -98,15 +98,15 @@ use self::conversation::{
     split_content_blocks_for_input, tool_content_blocks_to_text, user_content_to_text,
 };
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
-#[cfg(test)]
-use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
+pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use self::file_refs::{
     file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
     parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
     unescape_dragged_path,
 };
 use self::perf::{
-    CRITICAL_KEEP_MESSAGES, FrameTimingStats, MemoryLevel, MemoryMonitor, micros_as_u64,
+    CRITICAL_KEEP_MESSAGES, FrameTimingStats, MemoryLevel, MemoryMonitor, MessageRenderCache,
+    micros_as_u64,
 };
 #[cfg(test)]
 use self::state::TOOL_AUTO_COLLAPSE_THRESHOLD;
@@ -210,6 +210,7 @@ impl PiApp {
         self.spinner =
             SpinnerModel::with_spinner(spinners::dot()).style(self.styles.accent.clone());
 
+        self.message_render_cache.invalidate_all();
         let content = self.build_conversation_content();
         let effective = self.view_effective_conversation_height().max(1);
         self.conversation_viewport.height = effective;
@@ -793,6 +794,7 @@ impl PiApp {
             );
         }
 
+        self.message_render_cache.invalidate_all();
         self.resize_conversation_viewport();
     }
 
@@ -1262,6 +1264,9 @@ pub struct PiApp {
 
     // Memory pressure monitoring (PERF-6)
     memory_monitor: MemoryMonitor,
+
+    // Per-message render cache (PERF-1)
+    message_render_cache: MessageRenderCache,
 }
 
 impl PiApp {
@@ -1462,6 +1467,7 @@ impl PiApp {
             model_selector: None,
             frame_timing: FrameTimingStats::new(),
             memory_monitor: MemoryMonitor::new_default(),
+            message_render_cache: MessageRenderCache::new(),
         };
 
         if let Some(manager) = app.extensions.clone() {

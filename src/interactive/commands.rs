@@ -869,171 +869,8 @@ impl PiApp {
                 None
             }
             SlashCommand::Model => self.handle_slash_model(args),
-            SlashCommand::Thinking => {
-                let value = args.trim();
-                if value.is_empty() {
-                    let current = self
-                        .session
-                        .try_lock()
-                        .ok()
-                        .and_then(|guard| guard.header.thinking_level.clone())
-                        .unwrap_or_else(|| ThinkingLevel::Off.to_string());
-                    self.status_message = Some(format!("Thinking level: {current}"));
-                    return None;
-                }
-
-                let level: ThinkingLevel = match value.parse() {
-                    Ok(level) => level,
-                    Err(err) => {
-                        self.status_message = Some(err);
-                        return None;
-                    }
-                };
-
-                let Ok(mut session_guard) = self.session.try_lock() else {
-                    self.status_message = Some("Session busy; try again".to_string());
-                    return None;
-                };
-                session_guard.header.thinking_level = Some(level.to_string());
-                session_guard.append_thinking_level_change(level.to_string());
-                drop(session_guard);
-                self.spawn_save_session();
-
-                if let Ok(mut agent_guard) = self.agent.try_lock() {
-                    agent_guard.stream_options_mut().thinking_level = Some(level);
-                }
-
-                self.status_message = Some(format!("Thinking level: {level}"));
-                None
-            }
-            SlashCommand::ScopedModels => {
-                let value = args.trim();
-                if value.is_empty() {
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: self.format_scoped_models_status(),
-                        thinking: None,
-                        collapsed: false,
-                    });
-                    self.scroll_to_last_match("Scoped models");
-                    return None;
-                }
-
-                if value.eq_ignore_ascii_case("clear") {
-                    let previous_patterns = self
-                        .config
-                        .enabled_models
-                        .as_deref()
-                        .unwrap_or(&[])
-                        .to_vec();
-                    self.config.enabled_models = Some(Vec::new());
-                    self.model_scope.clear();
-
-                    let global_dir = Config::global_dir();
-                    let patch = json!({ "enabled_models": [] });
-                    let cleared_msg = if previous_patterns.is_empty() {
-                        "Scoped models cleared (was: all models)".to_string()
-                    } else {
-                        format!(
-                            "Cleared {} pattern(s) (was: {})",
-                            previous_patterns.len(),
-                            previous_patterns.join(", ")
-                        )
-                    };
-                    if let Err(err) = Config::patch_settings_with_roots(
-                        SettingsScope::Project,
-                        &global_dir,
-                        &self.cwd,
-                        patch,
-                    ) {
-                        tracing::warn!("Failed to persist enabled_models: {err}");
-                        self.status_message = Some(format!("{cleared_msg} (not saved: {err})"));
-                    } else {
-                        self.status_message = Some(cleared_msg);
-                    }
-                    return None;
-                }
-
-                let patterns = parse_scoped_model_patterns(value);
-                if patterns.is_empty() {
-                    self.status_message =
-                        Some("Usage: /scoped-models [patterns|clear]".to_string());
-                    return None;
-                }
-
-                let resolved = match resolve_scoped_model_entries(&patterns, &self.available_models)
-                {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
-                        self.status_message =
-                            Some(format!("{err}\n  Example: /scoped-models gpt-4*,claude-3*"));
-                        return None;
-                    }
-                };
-
-                self.model_scope = resolved;
-                self.config.enabled_models = Some(patterns.clone());
-
-                let match_count = self.model_scope.len();
-
-                // Build a preview of matched models for the conversation pane.
-                let mut preview = String::new();
-                if match_count == 0 {
-                    let _ = writeln!(
-                        preview,
-                        "Warning: No models matched patterns: {}",
-                        patterns.join(", ")
-                    );
-                    let _ = writeln!(preview, "Ctrl+P cycling will use all available models.");
-                } else {
-                    let _ = writeln!(preview, "Matching {match_count} model(s):");
-                    let mut model_names: Vec<String> = self
-                        .model_scope
-                        .iter()
-                        .map(|e| format!("{}/{}", e.model.provider, e.model.id))
-                        .collect();
-                    model_names.sort_by_key(|s| s.to_ascii_lowercase());
-                    model_names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-                    for name in &model_names {
-                        let _ = writeln!(preview, "  {name}");
-                    }
-                }
-                let _ = writeln!(
-                    preview,
-                    "Patterns saved. Press Ctrl+P to cycle through matched models."
-                );
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: preview,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.scroll_to_bottom();
-
-                let status = if match_count == 0 {
-                    format!(
-                        "Scoped models: 0 matched for {}; cycling all available",
-                        patterns.join(", ")
-                    )
-                } else {
-                    format!("Scoped models: {match_count} matched")
-                };
-                let global_dir = Config::global_dir();
-                let patch = json!({ "enabled_models": patterns });
-                if let Err(err) = Config::patch_settings_with_roots(
-                    SettingsScope::Project,
-                    &global_dir,
-                    &self.cwd,
-                    patch,
-                ) {
-                    tracing::warn!("Failed to persist enabled_models: {err}");
-                    self.status_message = Some(format!("{status} (not saved: {err})"));
-                } else {
-                    self.status_message = Some(status);
-                }
-                None
-            }
+            SlashCommand::Thinking => self.handle_slash_thinking(args),
+            SlashCommand::ScopedModels => self.handle_slash_scoped_models(args),
             SlashCommand::Exit => Some(self.quit_cmd()),
             SlashCommand::History => {
                 self.messages.push(ConversationMessage {
@@ -1776,6 +1613,166 @@ impl PiApp {
         self.model = format!("{}/{}", next.model.provider, next.model.id);
 
         self.status_message = Some(format!("Switched model: {}", self.model));
+        None
+    }
+
+    pub(super) fn handle_slash_thinking(&mut self, args: &str) -> Option<Cmd> {
+        let value = args.trim();
+        if value.is_empty() {
+            let current = self
+                .session
+                .try_lock()
+                .ok()
+                .and_then(|guard| guard.header.thinking_level.clone())
+                .unwrap_or_else(|| ThinkingLevel::Off.to_string());
+            self.status_message = Some(format!("Thinking level: {current}"));
+            return None;
+        }
+
+        let level: ThinkingLevel = match value.parse() {
+            Ok(level) => level,
+            Err(err) => {
+                self.status_message = Some(err);
+                return None;
+            }
+        };
+
+        let Ok(mut session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return None;
+        };
+        session_guard.header.thinking_level = Some(level.to_string());
+        session_guard.append_thinking_level_change(level.to_string());
+        drop(session_guard);
+        self.spawn_save_session();
+
+        if let Ok(mut agent_guard) = self.agent.try_lock() {
+            agent_guard.stream_options_mut().thinking_level = Some(level);
+        }
+
+        self.status_message = Some(format!("Thinking level: {level}"));
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_scoped_models(&mut self, args: &str) -> Option<Cmd> {
+        let value = args.trim();
+        if value.is_empty() {
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: self.format_scoped_models_status(),
+                thinking: None,
+                collapsed: false,
+            });
+            self.scroll_to_last_match("Scoped models");
+            return None;
+        }
+
+        if value.eq_ignore_ascii_case("clear") {
+            let previous_patterns = self
+                .config
+                .enabled_models
+                .as_deref()
+                .unwrap_or(&[])
+                .to_vec();
+            self.config.enabled_models = Some(Vec::new());
+            self.model_scope.clear();
+
+            let global_dir = Config::global_dir();
+            let patch = json!({ "enabled_models": [] });
+            let cleared_msg = if previous_patterns.is_empty() {
+                "Scoped models cleared (was: all models)".to_string()
+            } else {
+                format!(
+                    "Scoped models cleared: removed {} pattern(s) (was: {})",
+                    previous_patterns.len(),
+                    previous_patterns.join(", ")
+                )
+            };
+            if let Err(err) = Config::patch_settings_with_roots(
+                SettingsScope::Project,
+                &global_dir,
+                &self.cwd,
+                patch,
+            ) {
+                tracing::warn!("Failed to persist enabled_models: {err}");
+                self.status_message = Some(format!("{cleared_msg} (not saved: {err})"));
+            } else {
+                self.status_message = Some(cleared_msg);
+            }
+            return None;
+        }
+
+        let patterns = parse_scoped_model_patterns(value);
+        if patterns.is_empty() {
+            self.status_message = Some("Usage: /scoped-models [patterns|clear]".to_string());
+            return None;
+        }
+
+        let resolved = match resolve_scoped_model_entries(&patterns, &self.available_models) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                self.status_message =
+                    Some(format!("{err}\n  Example: /scoped-models gpt-4*,claude-3*"));
+                return None;
+            }
+        };
+
+        self.model_scope = resolved;
+        self.config.enabled_models = Some(patterns.clone());
+
+        let match_count = self.model_scope.len();
+
+        // Build a preview of matched models for the conversation pane.
+        let mut preview = String::new();
+        if match_count == 0 {
+            let _ = writeln!(
+                preview,
+                "Warning: No models matched patterns: {}",
+                patterns.join(", ")
+            );
+            let _ = writeln!(preview, "Ctrl+P cycling will use all available models.");
+        } else {
+            let _ = writeln!(preview, "Matching {match_count} model(s):");
+            let mut model_names: Vec<String> = self
+                .model_scope
+                .iter()
+                .map(|e| format!("{}/{}", e.model.provider, e.model.id))
+                .collect();
+            model_names.sort_by_key(|s| s.to_ascii_lowercase());
+            model_names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            for name in &model_names {
+                let _ = writeln!(preview, "  {name}");
+            }
+        }
+        let _ = writeln!(
+            preview,
+            "Patterns saved. Press Ctrl+P to cycle through matched models."
+        );
+
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: preview,
+            thinking: None,
+            collapsed: false,
+        });
+        self.scroll_to_bottom();
+
+        let status = if match_count == 0 {
+            "Scoped models updated: 0 matched; cycling will use all available models".to_string()
+        } else {
+            format!("Scoped models updated: {match_count} matched")
+        };
+        let global_dir = Config::global_dir();
+        let patch = json!({ "enabled_models": patterns });
+        if let Err(err) =
+            Config::patch_settings_with_roots(SettingsScope::Project, &global_dir, &self.cwd, patch)
+        {
+            tracing::warn!("Failed to persist enabled_models: {err}");
+            self.status_message = Some(format!("{status} (not saved: {err})"));
+        } else {
+            self.status_message = Some(status);
+        }
         None
     }
 
