@@ -136,7 +136,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "deepinfra",
-        aliases: &[],
+        aliases: &["deep-infra"],
         auth_env_keys: &["DEEPINFRA_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -184,7 +184,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "mistral",
-        aliases: &[],
+        aliases: &["mistralai"],
         auth_env_keys: &["MISTRAL_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -232,7 +232,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "deepseek",
-        aliases: &[],
+        aliases: &["deep-seek"],
         auth_env_keys: &["DEEPSEEK_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -264,7 +264,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "togetherai",
-        aliases: &[],
+        aliases: &["together", "together-ai"],
         auth_env_keys: &["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -280,7 +280,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "perplexity",
-        aliases: &[],
+        aliases: &["pplx"],
         auth_env_keys: &["PERPLEXITY_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -296,7 +296,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "xai",
-        aliases: &[],
+        aliases: &["grok", "x-ai"],
         auth_env_keys: &["XAI_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -506,7 +506,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "huggingface",
-        aliases: &[],
+        aliases: &["hf", "hugging-face"],
         auth_env_keys: &["HF_TOKEN"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -699,7 +699,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "nvidia",
-        aliases: &[],
+        aliases: &["nim", "nvidia-nim"],
         auth_env_keys: &["NVIDIA_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1056,7 +1056,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     // ── Batch B3: Regional + coding-plan providers ──────────────────────
     ProviderMetadata {
         canonical_id: "siliconflow",
-        aliases: &[],
+        aliases: &["silicon-flow"],
         auth_env_keys: &["SILICONFLOW_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1217,7 +1217,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
     ProviderMetadata {
         canonical_id: "lmstudio",
-        aliases: &[],
+        aliases: &["lm-studio"],
         auth_env_keys: &["LMSTUDIO_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1488,6 +1488,36 @@ mod tests {
     }
 
     #[test]
+    fn metadata_resolves_ux_discoverability_aliases() {
+        // Aliases added to improve user discoverability (bd-tuh3g / bd-3uqg.14.3.4)
+        let cases: &[(&str, &str)] = &[
+            ("together", "togetherai"),
+            ("together-ai", "togetherai"),
+            ("grok", "xai"),
+            ("x-ai", "xai"),
+            ("hf", "huggingface"),
+            ("hugging-face", "huggingface"),
+            ("nim", "nvidia"),
+            ("nvidia-nim", "nvidia"),
+            ("lm-studio", "lmstudio"),
+            ("deep-seek", "deepseek"),
+            ("pplx", "perplexity"),
+            ("deep-infra", "deepinfra"),
+            ("mistralai", "mistral"),
+            ("silicon-flow", "siliconflow"),
+        ];
+        for &(alias, expected_canonical) in cases {
+            let meta =
+                provider_metadata(alias).unwrap_or_else(|| panic!("alias '{alias}' not found"));
+            assert_eq!(
+                meta.canonical_id, expected_canonical,
+                "alias '{alias}' should resolve to '{expected_canonical}', got '{}'",
+                meta.canonical_id
+            );
+        }
+    }
+
+    #[test]
     fn provider_auth_env_keys_support_aliases() {
         assert_eq!(
             provider_auth_env_keys("dashscope"),
@@ -1544,6 +1574,41 @@ mod tests {
         assert_eq!(
             provider_auth_env_keys("open-router"),
             &["OPENROUTER_API_KEY"]
+        );
+        // New UX aliases resolve to same auth keys as canonical
+        assert_eq!(
+            provider_auth_env_keys("together"),
+            &["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("grok"),
+            &["XAI_API_KEY"]
+        );
+        assert_eq!(provider_auth_env_keys("hf"), &["HF_TOKEN"]);
+        assert_eq!(provider_auth_env_keys("nim"), &["NVIDIA_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("lm-studio"),
+            &["LMSTUDIO_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("deep-seek"),
+            &["DEEPSEEK_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("pplx"),
+            &["PERPLEXITY_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("deep-infra"),
+            &["DEEPINFRA_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("mistralai"),
+            &["MISTRAL_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("silicon-flow"),
+            &["SILICONFLOW_API_KEY"]
         );
     }
 

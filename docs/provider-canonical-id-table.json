@@ -81,7 +81,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "deep-infra"
+      ],
       "auth_env_keys": [
         "DEEPINFRA_API_KEY"
       ],
@@ -128,7 +130,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "mistralai"
+      ],
       "auth_env_keys": [
         "MISTRAL_API_KEY"
       ],
@@ -181,7 +185,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "deep-seek"
+      ],
       "auth_env_keys": [
         "DEEPSEEK_API_KEY"
       ],
@@ -213,7 +219,10 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "together",
+        "together-ai"
+      ],
       "auth_env_keys": [
         "TOGETHER_API_KEY",
         "TOGETHER_AI_API_KEY"
@@ -229,7 +238,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "pplx"
+      ],
       "auth_env_keys": [
         "PERPLEXITY_API_KEY"
       ],
@@ -244,7 +255,10 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "grok",
+        "x-ai"
+      ],
       "auth_env_keys": [
         "XAI_API_KEY"
       ],
@@ -439,7 +453,10 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "hf",
+        "hugging-face"
+      ],
       "auth_env_keys": [
         "HF_TOKEN"
       ],
@@ -619,7 +636,10 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "nim",
+        "nvidia-nim"
+      ],
       "auth_env_keys": [
         "NVIDIA_API_KEY"
       ],
@@ -949,7 +969,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "silicon-flow"
+      ],
       "auth_env_keys": [
         "SILICONFLOW_API_KEY"
       ],
@@ -1099,7 +1121,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "lm-studio"
+      ],
       "auth_env_keys": [
         "LMSTUDIO_API_KEY"
       ],
@@ -1315,6 +1339,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 16,
+  "total_aliases": 30,
   "total_providers": 87
 }
