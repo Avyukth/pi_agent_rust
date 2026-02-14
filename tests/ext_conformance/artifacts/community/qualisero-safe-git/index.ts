@@ -49,7 +49,7 @@ import {
   playBeep,
   displayOSXNotification,
   speakMessage,
-} from "../../shared";
+} from "./shared";
 
 type PromptLevel = "high" | "medium" | "none";
 type Severity = "high" | "medium";

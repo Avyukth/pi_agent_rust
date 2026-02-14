@@ -12,8 +12,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 // Load HTML from file
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const SKETCH_HTML = readFileSync(join(__dirname, "sketch.html"), "utf-8");
+const extensionDir = dirname(fileURLToPath(import.meta.url));
+const SKETCH_HTML = readFileSync(join(extensionDir, "sketch.html"), "utf-8");
 
 function openBrowser(url: string): void {
 	const platform = process.platform;

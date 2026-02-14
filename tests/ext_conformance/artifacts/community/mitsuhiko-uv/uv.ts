@@ -20,8 +20,8 @@ import { createBashTool } from "@mariozechner/pi-coding-agent";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const interceptedCommandsPath = join(__dirname, "..", "intercepted-commands");
+const extensionDir = dirname(fileURLToPath(import.meta.url));
+const interceptedCommandsPath = join(extensionDir, "..", "intercepted-commands");
 
 export default function (pi: ExtensionAPI) {
   const cwd = process.cwd();

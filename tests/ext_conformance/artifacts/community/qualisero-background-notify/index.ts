@@ -38,7 +38,7 @@ import {
   SAY_MESSAGES,
   getCurrentDirName,
   replaceMessageTemplates,
-} from "../../shared";
+} from "./shared";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types & Constants
