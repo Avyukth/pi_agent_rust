@@ -795,3 +795,28 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - ❌ Full scan per edit → ✅ Scope to file
 - ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
 ````
+
+---
+
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor               # Health check
+rch workers probe --all  # Test connectivity to all 8 workers
+rch status               # Overview of current state
+rch queue                # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
