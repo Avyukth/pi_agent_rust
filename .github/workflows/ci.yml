@@ -876,6 +876,13 @@ jobs:
             -- build_evidence_bundle --nocapture --exact
         continue-on-error: true
 
+      - name: Security compatibility gate [linux] (bd-1a2cu)
+        if: always() && runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          cargo test --test security_conformance_benign -- --nocapture
+        continue-on-error: true
+
       - name: Full-suite gate [linux]
         if: always() && runner.os == 'Linux'
         run: |
@@ -904,6 +911,8 @@ jobs:
             tests/full_suite_gate/full_suite_verdict.json
             tests/full_suite_gate/full_suite_events.jsonl
             tests/full_suite_gate/full_suite_report.md
+            tests/security_compat/security_compat_dashboard.json
+            tests/security_compat/security_compat_events.jsonl
           if-no-files-found: warn
 
       - name: Reclaim disk space before coverage [linux]

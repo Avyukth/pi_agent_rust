@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-02-13T19:53:36.127Z",
+  "generated_at": "2026-02-14T12:33:07.789Z",
   "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
@@ -36,10 +36,9 @@
       "id": "ext_provider_compat",
       "name": "Extension provider compatibility matrix",
       "bead": "bd-1f42.4.6",
-      "status": "skip",
+      "status": "pass",
       "blocking": false,
       "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
-      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"
     },
     {
@@ -115,6 +114,15 @@
       "reproduce_command": "cargo test --test provider_native_contract --test e2e_provider_scenarios -- --nocapture"
     },
     {
+      "id": "sec_conformance",
+      "name": "SEC-6.4 security compatibility conformance",
+      "bead": "bd-1a2cu",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/sec_conformance_verdict.json",
+      "reproduce_command": "cargo test --test sec_compatibility_conformance -- --nocapture"
+    },
+    {
       "id": "waiver_lifecycle",
       "name": "Waiver lifecycle compliance",
       "bead": "bd-1f42.8.8.1",
@@ -126,7 +134,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-02-13T19:53:36.126Z",
+    "generated_at": "2026-02-14T12:33:07.788Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
@@ -137,14 +145,14 @@
   },
   "waivers_applied": [],
   "summary": {
-    "total_gates": 13,
-    "passed": 9,
+    "total_gates": 14,
+    "passed": 11,
     "failed": 1,
     "warned": 0,
-    "skipped": 3,
+    "skipped": 2,
     "waived": 0,
-    "blocking_pass": 5,
-    "blocking_total": 7,
+    "blocking_pass": 6,
+    "blocking_total": 8,
     "all_blocking_pass": false
   },
   "promotion_rules": {
