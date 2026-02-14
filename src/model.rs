@@ -1121,7 +1121,7 @@ mod tests {
         let events = vec![
             (
                 AssistantMessageEvent::Start {
-                    partial: sample_assistant_message(),
+                    partial: sample_assistant_message().into(),
                 },
                 "start",
             ),
@@ -1129,21 +1129,21 @@ mod tests {
                 AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: "hi".to_string(),
-                    partial: sample_assistant_message(),
+                    partial: sample_assistant_message().into(),
                 },
                 "text_delta",
             ),
             (
                 AssistantMessageEvent::Done {
                     reason: StopReason::Stop,
-                    message: sample_assistant_message(),
+                    message: sample_assistant_message().into(),
                 },
                 "done",
             ),
             (
                 AssistantMessageEvent::Error {
                     reason: StopReason::Error,
-                    error: sample_assistant_message(),
+                    error: sample_assistant_message().into(),
                 },
                 "error",
             ),
@@ -1163,7 +1163,7 @@ mod tests {
         let event = AssistantMessageEvent::TextEnd {
             content_index: 2,
             content: "final text".to_string(),
-            partial: sample_assistant_message(),
+            partial: sample_assistant_message().into(),
         };
         let json = serde_json::to_string(&event).expect("serialize");
         let parsed: AssistantMessageEvent = serde_json::from_str(&json).expect("deserialize");
@@ -1210,25 +1210,25 @@ mod tests {
         let message = sample_assistant_message();
         let events = vec![
             AssistantMessageEvent::Start {
-                partial: partial.clone(),
+                partial: partial.clone().into(),
             },
             AssistantMessageEvent::TextStart {
                 content_index: 0,
-                partial: partial.clone(),
+                partial: partial.clone().into(),
             },
             AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "he".to_string(),
-                partial: partial.clone(),
+                partial: partial.clone().into(),
             },
             AssistantMessageEvent::TextEnd {
                 content_index: 0,
                 content: "hello".to_string(),
-                partial,
+                partial: partial.into(),
             },
             AssistantMessageEvent::Done {
                 reason: StopReason::Stop,
-                message,
+                message: message.into(),
             },
         ];
 
@@ -1242,16 +1242,16 @@ mod tests {
         let message = sample_assistant_message();
         let events = vec![
             AssistantMessageEvent::Start {
-                partial: partial.clone(),
+                partial: partial.clone().into(),
             },
             AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "hi".to_string(),
-                partial,
+                partial: partial.into(),
             },
             AssistantMessageEvent::Done {
                 reason: StopReason::Stop,
-                message,
+                message: message.into(),
             },
         ];
 
