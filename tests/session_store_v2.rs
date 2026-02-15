@@ -902,15 +902,12 @@ fn build_test_jsonl(dir: &Path, entries: &[pi::session::SessionEntry]) -> std::p
     path
 }
 
-fn make_message_entry(
-    id: &str,
-    parent_id: Option<&str>,
-    text: &str,
-) -> pi::session::SessionEntry {
+fn make_message_entry(id: &str, parent_id: Option<&str>, text: &str) -> pi::session::SessionEntry {
     pi::session::SessionEntry::Message(pi::session::MessageEntry {
         base: pi::session::EntryBase::new(parent_id.map(String::from), id.to_string()),
         message: pi::session::SessionMessage::User {
-            content: pi::model::UserContent::SinglePart(text.to_string()),
+            content: pi::model::UserContent::Text(text.to_string()),
+            timestamp: None,
         },
     })
 }
@@ -983,28 +980,30 @@ fn v2_resume_loads_same_entries_as_jsonl() -> PiResult<()> {
     // Create V2 sidecar.
     pi::session::create_v2_sidecar_from_jsonl(&jsonl)?;
 
-    // Open via Session (will use V2 sidecar if detected).
-    let jsonl_str = jsonl.to_str().unwrap();
-    let (session, diag) = asupersync::test_utils::run_test(|| async {
-        pi::session::Session::open_with_diagnostics(jsonl_str)
+    // Open via Session (will use V2 sidecar if detected) and assert inside
+    // runtime harness, since run_test futures return ().
+    let jsonl_str = jsonl
+        .to_str()
+        .expect("temporary jsonl path must be valid UTF-8")
+        .to_string();
+    asupersync::test_utils::run_test(|| async move {
+        let (session, diag) = pi::session::Session::open_with_diagnostics(&jsonl_str)
             .await
-            .unwrap()
-    });
+            .expect("session open should succeed");
 
-    // Verify loaded all 5 entries.
-    assert_eq!(session.entries.len(), 5);
-    assert!(diag.skipped_entries.is_empty());
+        assert_eq!(session.entries.len(), 5);
+        assert!(diag.skipped_entries.is_empty());
+
+        let ids: Vec<String> = session
+            .entries
+            .iter()
+            .filter_map(|e| e.base_id().cloned())
+            .collect();
+        assert_eq!(ids, vec!["msg1", "msg2", "msg3", "msg4", "msg5"]);
+    });
 
     // Verify the V2 sidecar path was used (the has_v2_sidecar check).
     assert!(pi::session_store_v2::has_v2_sidecar(&jsonl));
-
-    // Verify entry IDs match.
-    let ids: Vec<_> = session
-        .entries
-        .iter()
-        .filter_map(|e| e.base_id().cloned())
-        .collect();
-    assert_eq!(ids, vec!["msg1", "msg2", "msg3", "msg4", "msg5"]);
 
     Ok(())
 }

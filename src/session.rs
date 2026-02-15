@@ -6622,4 +6622,752 @@ mod tests {
         session.set_branched_from(Some("/some/path".to_string()));
         assert!(session.header_dirty);
     }
+
+    // ====================================================================
+    // Crash-consistency and recovery tests (bd-3ar8v.2.7)
+    // ====================================================================
+
+    /// Helper: build a valid JSONL session file string with header + N entries.
+    fn build_crash_test_session_file(num_entries: usize) -> String {
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "crash-test",
+            "timestamp": "2024-06-01T00:00:00.000Z",
+            "cwd": "/tmp/test"
+        });
+        let mut lines = vec![serde_json::to_string(&header).unwrap()];
+        for i in 0..num_entries {
+            let entry = serde_json::json!({
+                "type": "message",
+                "id": format!("entry-{i}"),
+                "timestamp": "2024-06-01T00:00:00.000Z",
+                "message": {"role": "user", "content": format!("message {i}")}
+            });
+            lines.push(serde_json::to_string(&entry).unwrap());
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn crash_empty_file_returns_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("empty.jsonl");
+        std::fs::write(&file_path, "").unwrap();
+
+        let result = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        });
+        assert!(result.is_err(), "empty file should fail to open");
+    }
+
+    #[test]
+    fn crash_corrupted_header_returns_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("bad_header.jsonl");
+        std::fs::write(&file_path, "NOT VALID JSON\n").unwrap();
+
+        let result = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        });
+        assert!(result.is_err(), "corrupted header should fail");
+    }
+
+    #[test]
+    fn crash_header_only_loads_empty() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("header_only.jsonl");
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "hdr-only",
+            "timestamp": "2024-06-01T00:00:00.000Z",
+            "cwd": "/tmp/test"
+        });
+        std::fs::write(
+            &file_path,
+            format!("{}\n", serde_json::to_string(&header).unwrap()),
+        )
+        .unwrap();
+
+        let (session, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert!(session.entries.is_empty());
+        assert!(diagnostics.skipped_entries.is_empty());
+    }
+
+    #[test]
+    fn crash_truncated_last_entry_recovers_preceding() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("truncated.jsonl");
+
+        let mut content = build_crash_test_session_file(3);
+        let truncation_point = content.rfind('\n').unwrap();
+        content.truncate(truncation_point);
+        content.push_str("\n{\"type\":\"message\",\"id\":\"partial");
+
+        std::fs::write(&file_path, &content).unwrap();
+
+        let (session, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(session.entries.len(), 2);
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+    }
+
+    #[test]
+    fn crash_multiple_corrupted_entries_recovers_valid() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("multi_corrupt.jsonl");
+
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 3,
+            "id": "multi-corrupt",
+            "timestamp": "2024-06-01T00:00:00.000Z",
+            "cwd": "/tmp/test"
+        });
+
+        let valid_entry = |id: &str, text: &str| {
+            serde_json::json!({
+                "type": "message",
+                "id": id,
+                "timestamp": "2024-06-01T00:00:00.000Z",
+                "message": {"role": "user", "content": text}
+            })
+            .to_string()
+        };
+
+        let lines = [
+            serde_json::to_string(&header).unwrap(),
+            valid_entry("v1", "first"),
+            "GARBAGE LINE 1".to_string(),
+            valid_entry("v2", "second"),
+            "{incomplete json".to_string(),
+            valid_entry("v3", "third"),
+        ];
+
+        std::fs::write(&file_path, lines.join("\n")).unwrap();
+
+        let (session, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(session.entries.len(), 3, "3 valid entries survive");
+        assert_eq!(diagnostics.skipped_entries.len(), 2);
+    }
+
+    #[test]
+    fn crash_incremental_append_survives_partial_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        // Simulate crash during append: write truncated entry.
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(
+            file,
+            "\n{{\"type\":\"message\",\"id\":\"crash-entry\",\"timestamp\":\"2024-06-01"
+        )
+        .unwrap();
+        drop(file);
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(loaded.entries.len(), 2, "original entries recovered");
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+    }
+
+    #[test]
+    fn crash_full_rewrite_atomic_persist() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("original"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let original_content = std::fs::read_to_string(&path).unwrap();
+
+        session.set_model_header(Some("new-provider".to_string()), None, None);
+        session.append_message(make_test_message("second"));
+        run_async(async { session.save().await }).unwrap();
+
+        let new_content = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(original_content, new_content);
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+    }
+
+    #[test]
+    fn crash_flush_failure_restores_pending_mutations() {
+        let mut queue = AutosaveQueue::with_limit(10);
+
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Metadata);
+        assert_eq!(queue.pending_mutations, 3);
+
+        let ticket = queue
+            .begin_flush(AutosaveFlushTrigger::Periodic)
+            .expect("should have ticket");
+        assert_eq!(queue.pending_mutations, 0);
+
+        queue.finish_flush(ticket, false);
+        assert_eq!(queue.pending_mutations, 3, "mutations restored");
+        assert_eq!(queue.flush_failed, 1);
+    }
+
+    #[test]
+    fn crash_flush_failure_respects_queue_capacity() {
+        let mut queue = AutosaveQueue::with_limit(3);
+
+        for _ in 0..3 {
+            queue.enqueue_mutation(AutosaveMutationKind::Message);
+        }
+        let ticket = queue.begin_flush(AutosaveFlushTrigger::Periodic).unwrap();
+
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        assert_eq!(queue.pending_mutations, 2);
+
+        queue.finish_flush(ticket, false);
+        assert_eq!(queue.pending_mutations, 3, "capped at max");
+        assert!(queue.backpressure_events >= 2);
+    }
+
+    #[test]
+    fn crash_shutdown_strict_propagates_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.path = Some(
+            temp_dir
+                .path()
+                .join("nonexistent_dir")
+                .join("session.jsonl"),
+        );
+        session.set_autosave_durability_for_test(AutosaveDurabilityMode::Strict);
+        session.append_message(make_test_message("must save"));
+        session
+            .autosave_queue
+            .enqueue_mutation(AutosaveMutationKind::Message);
+
+        let result = run_async(async { session.flush_autosave_on_shutdown().await });
+        assert!(result.is_err(), "strict mode propagates errors");
+    }
+
+    #[test]
+    fn crash_shutdown_balanced_swallows_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.path = Some(
+            temp_dir
+                .path()
+                .join("nonexistent_dir")
+                .join("session.jsonl"),
+        );
+        session.set_autosave_durability_for_test(AutosaveDurabilityMode::Balanced);
+        session.append_message(make_test_message("best effort"));
+        session
+            .autosave_queue
+            .enqueue_mutation(AutosaveMutationKind::Message);
+
+        let result = run_async(async { session.flush_autosave_on_shutdown().await });
+        assert!(result.is_ok(), "balanced mode swallows errors");
+    }
+
+    #[test]
+    fn crash_shutdown_throughput_skips_flush() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.path = Some(
+            temp_dir
+                .path()
+                .join("nonexistent_dir")
+                .join("session.jsonl"),
+        );
+        session.set_autosave_durability_for_test(AutosaveDurabilityMode::Throughput);
+        session.append_message(make_test_message("no flush"));
+        session
+            .autosave_queue
+            .enqueue_mutation(AutosaveMutationKind::Message);
+
+        let result = run_async(async { session.flush_autosave_on_shutdown().await });
+        assert!(result.is_ok());
+        assert!(session.autosave_queue.pending_mutations > 0);
+    }
+
+    #[test]
+    fn crash_save_reload_preserves_all_entry_types() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        let id_a = session.append_message(make_test_message("msg A"));
+        session.append_model_change("provider-x".to_string(), "model-y".to_string());
+        session.append_thinking_level_change("high".to_string());
+        session.append_compaction("summary".to_string(), id_a, 500, None, None);
+        session.append_message(make_test_message("msg B"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), session.entries.len());
+    }
+
+    #[test]
+    fn crash_checkpoint_rewrite_cleans_corruption() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("initial"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        for i in 0..5 {
+            session.append_message(make_test_message(&format!("msg {i}")));
+            run_async(async { session.save().await }).unwrap();
+        }
+
+        // Corrupt an appended entry on disk.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        lines[3] = "CORRUPTED_ENTRY".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        // Force checkpoint: full rewrite replaces corrupted file with clean data.
+        session.appends_since_checkpoint = compaction_checkpoint_interval();
+        session.append_message(make_test_message("post checkpoint"));
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.appends_since_checkpoint, 0);
+
+        let (reloaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+        assert!(diagnostics.skipped_entries.is_empty());
+        assert_eq!(reloaded.entries.len(), 7);
+    }
+
+    #[test]
+    fn crash_trailing_newlines_loads_cleanly() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("trailing_nl.jsonl");
+
+        let mut content = build_crash_test_session_file(2);
+        content.push_str("\n\n\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let (session, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(file_path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(session.entries.len(), 2);
+        assert!(diagnostics.skipped_entries.is_empty());
+    }
+
+    #[test]
+    fn crash_noop_save_after_reload_is_idempotent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("hello"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+        let content_before = std::fs::read_to_string(&path).unwrap();
+
+        let mut loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        run_async(async { loaded.save().await }).unwrap();
+
+        let content_after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content_before, content_after);
+    }
+
+    #[test]
+    fn crash_corrupt_then_continue_operation() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        // Corrupt last entry.
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = content.lines().map(String::from).collect();
+        *lines.last_mut().unwrap() = "BROKEN_JSON".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let (mut recovered, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+        assert_eq!(recovered.entries.len(), 1);
+
+        // Continue: add and save.
+        recovered.path = Some(path.clone());
+        recovered.session_dir = Some(temp_dir.path().to_path_buf());
+        recovered.append_message(make_test_message("msg C"));
+        run_async(async { recovered.save().await }).unwrap();
+
+        let reloaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(reloaded.entries.len(), 2, "A and C present after recovery");
+    }
+
+    #[test]
+    fn crash_defensive_rewrite_when_persisted_exceeds_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+
+        session.persisted_entry_count = 999;
+        assert!(session.should_full_rewrite());
+
+        session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.appends_since_checkpoint, 0);
+    }
+
+    #[test]
+    fn crash_persisted_count_unchanged_on_append_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 1);
+
+        let path = session.path.clone().unwrap();
+        session.append_message(make_test_message("msg B"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        let result = run_async(async { session.save().await });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        assert!(result.is_err());
+        assert_eq!(session.persisted_entry_count, 1);
+
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 2);
+    }
+
+    #[test]
+    fn crash_queue_backpressure_at_limit() {
+        let mut queue = AutosaveQueue::with_limit(3);
+
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Metadata);
+        assert_eq!(queue.pending_mutations, 3);
+
+        queue.enqueue_mutation(AutosaveMutationKind::Label);
+        assert_eq!(queue.pending_mutations, 3, "capped");
+        assert_eq!(queue.backpressure_events, 1);
+    }
+
+    #[test]
+    fn crash_flush_failure_with_intervening_mutations() {
+        let mut queue = AutosaveQueue::with_limit(8);
+
+        for _ in 0..4 {
+            queue.enqueue_mutation(AutosaveMutationKind::Message);
+        }
+        let ticket = queue.begin_flush(AutosaveFlushTrigger::Periodic).unwrap();
+
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Metadata);
+        assert_eq!(queue.pending_mutations, 2);
+
+        // restore_budget = 8 - 2 = 6, restored = min(4, 6) = 4
+        queue.finish_flush(ticket, false);
+        assert_eq!(queue.pending_mutations, 6);
+        assert_eq!(queue.flush_failed, 1);
+    }
+
+    #[test]
+    fn crash_queue_metrics_snapshot() {
+        let mut queue = AutosaveQueue::with_limit(5);
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        queue.enqueue_mutation(AutosaveMutationKind::Metadata);
+        queue.enqueue_mutation(AutosaveMutationKind::Label);
+
+        let metrics = queue.metrics();
+        assert_eq!(metrics.pending_mutations, 3);
+        assert_eq!(metrics.max_pending_mutations, 5);
+        assert_eq!(metrics.coalesced_mutations, 2);
+        assert_eq!(metrics.flush_started, 0);
+        assert!(metrics.last_flush_duration_ms.is_none());
+    }
+
+    #[test]
+    fn crash_double_flush_is_noop() {
+        let mut queue = AutosaveQueue::with_limit(10);
+        queue.enqueue_mutation(AutosaveMutationKind::Message);
+        let ticket = queue.begin_flush(AutosaveFlushTrigger::Periodic).unwrap();
+        queue.finish_flush(ticket, true);
+
+        assert!(queue.begin_flush(AutosaveFlushTrigger::Manual).is_none());
+    }
+
+    #[test]
+    fn crash_entries_survive_failed_full_rewrite() {
+        // std::mem::take moves entries out during full rewrite.
+        // On error they must be restored.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        session.set_model_header(Some("new-provider".to_string()), None, None);
+        session.append_message(make_test_message("msg B"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = path.parent().unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        let result = run_async(async { session.save().await });
+        assert!(result.is_err());
+
+        assert_eq!(session.entries.len(), 2, "entries restored");
+        assert_eq!(session.entry_index.len(), 2);
+        assert!(session.header_dirty);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = path.parent().unwrap();
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        run_async(async { session.save().await }).unwrap();
+        assert!(!session.header_dirty);
+    }
+
+    #[test]
+    fn crash_metrics_accumulate_across_failure_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let m = session.autosave_metrics();
+        assert_eq!(m.flush_succeeded, 1);
+        assert_eq!(m.flush_failed, 0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        session.append_message(make_test_message("msg B"));
+        let _ = run_async(async { session.save().await });
+
+        let m = session.autosave_metrics();
+        assert_eq!(m.flush_failed, 1);
+        assert!(m.pending_mutations > 0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        run_async(async { session.save().await }).unwrap();
+
+        let m = session.autosave_metrics();
+        assert_eq!(m.flush_succeeded, 2);
+        assert_eq!(m.flush_failed, 1);
+        assert_eq!(m.pending_mutations, 0);
+        assert_eq!(m.flush_started, 3);
+    }
+
+    #[test]
+    fn crash_many_sequential_appends_accumulate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("initial"));
+        run_async(async { session.save().await }).unwrap();
+
+        for i in 0..10 {
+            session.append_message(make_test_message(&format!("append-{i}")));
+            run_async(async { session.save().await }).unwrap();
+        }
+
+        assert_eq!(session.persisted_entry_count, 11);
+        assert_eq!(session.appends_since_checkpoint, 10);
+
+        let path = session.path.clone().unwrap();
+        let line_count = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert_eq!(line_count, 12, "1 header + 11 entries");
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), 11);
+    }
+
+    #[test]
+    fn crash_load_unsaved_entry_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("saved A"));
+        session.append_message(make_test_message("saved B"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        session.append_message(make_test_message("unsaved C"));
+        assert_eq!(session.entries.len(), 3);
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), 2, "unsaved entry absent");
+    }
+
+    #[test]
+    fn crash_append_retry_after_transient_failure() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        session.append_message(make_test_message("msg B"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            return;
+        }
+
+        let result = run_async(async { session.save().await });
+        assert!(result.is_err());
+        assert_eq!(session.persisted_entry_count, 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        run_async(async { session.save().await }).unwrap();
+        assert_eq!(session.persisted_entry_count, 2);
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+    }
+
+    #[test]
+    fn crash_durability_mode_parsing() {
+        assert_eq!(
+            AutosaveDurabilityMode::parse("strict"),
+            Some(AutosaveDurabilityMode::Strict)
+        );
+        assert_eq!(
+            AutosaveDurabilityMode::parse("BALANCED"),
+            Some(AutosaveDurabilityMode::Balanced)
+        );
+        assert_eq!(
+            AutosaveDurabilityMode::parse("  Throughput  "),
+            Some(AutosaveDurabilityMode::Throughput)
+        );
+        assert_eq!(AutosaveDurabilityMode::parse("invalid"), None);
+        assert_eq!(AutosaveDurabilityMode::parse(""), None);
+    }
+
+    #[test]
+    fn crash_durability_resolve_precedence() {
+        assert_eq!(
+            resolve_autosave_durability_mode(Some("strict"), Some("balanced"), Some("throughput")),
+            AutosaveDurabilityMode::Strict
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, Some("throughput"), Some("strict")),
+            AutosaveDurabilityMode::Throughput
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, None, Some("strict")),
+            AutosaveDurabilityMode::Strict
+        );
+        assert_eq!(
+            resolve_autosave_durability_mode(None, None, None),
+            AutosaveDurabilityMode::Balanced
+        );
+    }
 }
