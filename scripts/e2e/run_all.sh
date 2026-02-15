@@ -3088,6 +3088,7 @@ generate_triage_diff() {
     if CURRENT_SUMMARY="$current_summary" \
         BASELINE_SUMMARY="$baseline_summary" \
         DIFF_FILE="$diff_file" \
+        PROJECT_ROOT="$PROJECT_ROOT" \
         python3 - <<'PY'
 import json
 import os
@@ -3099,6 +3100,7 @@ from pathlib import Path
 current_summary_path = Path(os.environ["CURRENT_SUMMARY"])
 baseline_summary_path = Path(os.environ["BASELINE_SUMMARY"])
 diff_file = Path(os.environ["DIFF_FILE"])
+project_root = Path(os.environ["PROJECT_ROOT"])
 
 
 def read_summary(path: Path) -> dict:
@@ -3123,6 +3125,336 @@ def build_index(summary: dict, section_key: str, name_key: str) -> dict[str, dic
         if isinstance(name, str) and name.strip():
             indexed[name] = item
     return indexed
+
+
+def resolve_path(path_value: object, *, anchor: Path) -> Path | None:
+    if not isinstance(path_value, str):
+        return None
+    candidate_text = path_value.strip()
+    if not candidate_text:
+        return None
+    candidate = Path(candidate_text)
+    if not candidate.is_absolute():
+        candidate = anchor / candidate
+    return candidate.resolve()
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def normalize_scenario_ids(raw_ids: object) -> list[str]:
+    if not isinstance(raw_ids, list):
+        return []
+    scenario_ids = sorted(
+        {
+            str(item).strip()
+            for item in raw_ids
+            if isinstance(item, str) and str(item).strip()
+        }
+    )
+    return scenario_ids
+
+
+def assertion_signature(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return None
+
+
+def load_failure_diagnostics(summary: dict, summary_path: Path) -> dict[str, dict]:
+    diagnostics_meta = summary.get("failure_diagnostics")
+    if not isinstance(diagnostics_meta, dict):
+        return {}
+
+    index_path = resolve_path(
+        diagnostics_meta.get("index_path"),
+        anchor=summary_path.parent,
+    )
+    if index_path is None:
+        return {}
+    index_payload = read_json(index_path)
+    if not isinstance(index_payload, dict):
+        return {}
+
+    entries = index_payload.get("suites")
+    if not isinstance(entries, list):
+        return {}
+
+    diagnostics: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        suite_name = entry.get("suite")
+        if not isinstance(suite_name, str) or not suite_name.strip():
+            continue
+        suite_name = suite_name.strip()
+
+        digest_path = resolve_path(entry.get("digest_path"), anchor=index_path.parent)
+        digest_payload = read_json(digest_path) if digest_path is not None else None
+
+        impacted = normalize_scenario_ids(entry.get("impacted_scenario_ids"))
+        if not impacted and isinstance(digest_payload, dict):
+            impacted = normalize_scenario_ids(digest_payload.get("impacted_scenario_ids"))
+
+        first_assertion = (
+            digest_payload.get("first_failing_assertion")
+            if isinstance(digest_payload, dict)
+            else None
+        )
+        first_assertion_sig = assertion_signature(first_assertion)
+
+        timeline_event_count = None
+        timeline_path = None
+        if isinstance(digest_payload, dict):
+            timeline_meta = digest_payload.get("timeline")
+            if isinstance(timeline_meta, dict):
+                event_count = timeline_meta.get("event_count")
+                if isinstance(event_count, int):
+                    timeline_event_count = event_count
+                timeline_path = resolve_path(
+                    timeline_meta.get("path"),
+                    anchor=digest_path.parent if digest_path is not None else summary_path.parent,
+                )
+
+        diagnostics[suite_name] = {
+            "suite": suite_name,
+            "root_cause_class": str(
+                entry.get("root_cause_class")
+                or (digest_payload or {}).get("root_cause_class")
+                or "unknown"
+            ),
+            "impacted_scenario_ids": impacted,
+            "first_failing_assertion_signature": first_assertion_sig,
+            "timeline_event_count": timeline_event_count,
+            "digest_path": str(digest_path) if digest_path is not None else None,
+            "timeline_path": str(timeline_path) if timeline_path is not None else None,
+        }
+
+    return diagnostics
+
+
+def build_category_map(diff_payload: dict) -> dict[str, str]:
+    category_map: dict[str, str] = {}
+    category_order = [
+        "regressions",
+        "new_failures",
+        "unresolved_failures",
+        "fixed",
+        "removed",
+        "added_pass",
+        "stable_pass",
+    ]
+    category_name = {
+        "regressions": "regression",
+        "new_failures": "new_failure",
+        "unresolved_failures": "unresolved_failure",
+        "fixed": "fixed",
+        "removed": "removed",
+        "added_pass": "added_pass",
+        "stable_pass": "stable_pass",
+    }
+    for category in category_order:
+        records = diff_payload.get(category, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            name = record.get("name")
+            if isinstance(name, str) and name:
+                category_map[name] = category_name.get(category, "unknown")
+    return category_map
+
+
+def build_semantic_diffs(
+    suite_categories: dict[str, str],
+    baseline_diag: dict[str, dict],
+    current_diag: dict[str, dict],
+) -> tuple[list[dict], int]:
+    all_suites = sorted(set(baseline_diag) | set(current_diag))
+    entries: list[dict] = []
+    unresolved_count = 0
+
+    for suite_name in all_suites:
+        baseline_entry = baseline_diag.get(suite_name)
+        current_entry = current_diag.get(suite_name)
+        mismatch_kinds: list[str] = []
+
+        if baseline_entry is None and current_entry is not None:
+            mismatch_kinds.append("missing_baseline_diagnostics")
+        elif baseline_entry is not None and current_entry is None:
+            mismatch_kinds.append("missing_current_diagnostics")
+        elif baseline_entry is not None and current_entry is not None:
+            if baseline_entry.get("root_cause_class") != current_entry.get("root_cause_class"):
+                mismatch_kinds.append("root_cause_class_changed")
+            if baseline_entry.get("impacted_scenario_ids") != current_entry.get(
+                "impacted_scenario_ids"
+            ):
+                mismatch_kinds.append("impacted_scenarios_changed")
+            if baseline_entry.get("first_failing_assertion_signature") != current_entry.get(
+                "first_failing_assertion_signature"
+            ):
+                mismatch_kinds.append("first_failing_assertion_changed")
+            if baseline_entry.get("timeline_event_count") != current_entry.get(
+                "timeline_event_count"
+            ):
+                mismatch_kinds.append("timeline_event_count_changed")
+
+        if not mismatch_kinds:
+            continue
+
+        category = suite_categories.get(suite_name, "unknown")
+        unresolved = category in {"regression", "new_failure", "unresolved_failure"}
+        if unresolved:
+            unresolved_count += 1
+
+        entries.append(
+            {
+                "suite": suite_name,
+                "classification": category,
+                "unresolved": unresolved,
+                "mismatch_kinds": mismatch_kinds,
+                "artifact_links": {
+                    "baseline_digest": None if baseline_entry is None else baseline_entry.get("digest_path"),
+                    "current_digest": None if current_entry is None else current_entry.get("digest_path"),
+                    "baseline_timeline": None if baseline_entry is None else baseline_entry.get("timeline_path"),
+                    "current_timeline": None if current_entry is None else current_entry.get("timeline_path"),
+                },
+                "baseline": baseline_entry,
+                "current": current_entry,
+                "recommended_command": f"cargo test --test {shlex.quote(suite_name)} -- --nocapture",
+            }
+        )
+
+    entries.sort(
+        key=lambda entry: (
+            0 if entry.get("unresolved") else 1,
+            str(entry.get("classification")),
+            str(entry.get("suite")),
+        )
+    )
+    return entries, unresolved_count
+
+
+def build_mirrored_scenario_report(
+    *,
+    scenario_rows: list[dict],
+    baseline_suite_index: dict[str, dict],
+    current_suite_index: dict[str, dict],
+    semantic_by_suite: dict[str, dict],
+) -> dict:
+    seen_suites = set(baseline_suite_index) | set(current_suite_index)
+    workflows: list[dict] = []
+    candidate_workflows = 0
+
+    for row in scenario_rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("status") != "covered":
+            continue
+
+        suite_ids = row.get("suite_ids")
+        if not isinstance(suite_ids, list):
+            continue
+        normalized_suite_ids = [
+            suite.strip()
+            for suite in suite_ids
+            if isinstance(suite, str) and suite.strip()
+        ]
+        if not normalized_suite_ids:
+            continue
+
+        candidate_workflows += 1
+        if not any(suite_name in seen_suites for suite_name in normalized_suite_ids):
+            continue
+
+        missing_in_baseline = [
+            suite_name
+            for suite_name in normalized_suite_ids
+            if suite_name not in baseline_suite_index
+        ]
+        missing_in_current = [
+            suite_name
+            for suite_name in normalized_suite_ids
+            if suite_name not in current_suite_index
+        ]
+        semantic_entries = [
+            semantic_by_suite[suite_name]
+            for suite_name in normalized_suite_ids
+            if suite_name in semantic_by_suite
+        ]
+        unresolved_semantic_suites = [
+            str(entry.get("suite"))
+            for entry in semantic_entries
+            if bool(entry.get("unresolved"))
+        ]
+
+        if missing_in_baseline or missing_in_current:
+            status = "incomplete_mirroring"
+        elif unresolved_semantic_suites:
+            status = "semantic_mismatch"
+        else:
+            status = "aligned"
+
+        workflows.append(
+            {
+                "workflow_id": row.get("workflow_id"),
+                "workflow_title": row.get("workflow_title"),
+                "status": status,
+                "suite_ids": normalized_suite_ids,
+                "replay_command": row.get("replay_command"),
+                "missing_in_baseline": missing_in_baseline,
+                "missing_in_current": missing_in_current,
+                "unresolved_semantic_suites": unresolved_semantic_suites,
+                "artifact_links": {
+                    "baseline_summary": str(baseline_summary_path),
+                    "current_summary": str(current_summary_path),
+                    "baseline_suite_logs": {
+                        suite_name: baseline_suite_index[suite_name].get("log_file")
+                        for suite_name in normalized_suite_ids
+                        if suite_name in baseline_suite_index
+                    },
+                    "current_suite_logs": {
+                        suite_name: current_suite_index[suite_name].get("log_file")
+                        for suite_name in normalized_suite_ids
+                        if suite_name in current_suite_index
+                    },
+                },
+            }
+        )
+
+    workflows.sort(key=lambda entry: str(entry.get("workflow_id") or ""))
+    evaluated_workflows = len(workflows)
+    incomplete_count = sum(
+        1 for entry in workflows if entry.get("status") == "incomplete_mirroring"
+    )
+    semantic_mismatch_count = sum(
+        1 for entry in workflows if entry.get("status") == "semantic_mismatch"
+    )
+    aligned_count = sum(1 for entry in workflows if entry.get("status") == "aligned")
+
+    return {
+        "schema": "pi.e2e.mirrored_scenarios.v1",
+        "source_matrix_path": str(project_root / "docs" / "e2e_scenario_matrix.json"),
+        "summary": {
+            "covered_workflow_candidates": candidate_workflows,
+            "evaluated_workflows": evaluated_workflows,
+            "aligned_workflows": aligned_count,
+            "semantic_mismatch_workflows": semantic_mismatch_count,
+            "incomplete_mirroring_workflows": incomplete_count,
+        },
+        "workflows": workflows,
+    }
 
 
 def classify_change(
