@@ -14,6 +14,7 @@
 #   RELEASE_GATE_MIN_PASS_RATE     Minimum conformance pass rate (default: 80)
 #   RELEASE_GATE_MAX_FAIL_COUNT    Maximum conformance failures (default: 36)
 #   RELEASE_GATE_MAX_NA_COUNT      Maximum N/A scenarios (default: 170)
+#   RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED  Set to 1 to require CERTIFIED drop-in verdict
 #   RELEASE_GATE_REQUIRE_PREFLIGHT Set to 1 to require preflight analyzer (default: 0)
 #   RELEASE_GATE_REQUIRE_QUALITY   Set to 1 to require quality pipeline pass (default: 0)
 
@@ -27,6 +28,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MIN_PASS_RATE="${RELEASE_GATE_MIN_PASS_RATE:-80}"
 MAX_FAIL_COUNT="${RELEASE_GATE_MAX_FAIL_COUNT:-36}"
 MAX_NA_COUNT="${RELEASE_GATE_MAX_NA_COUNT:-170}"
+REQUIRE_DROPIN_CERTIFIED="${RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED:-0}"
 REQUIRE_PREFLIGHT="${RELEASE_GATE_REQUIRE_PREFLIGHT:-0}"
 REQUIRE_QUALITY="${RELEASE_GATE_REQUIRE_QUALITY:-0}"
 EVIDENCE_DIR=""
@@ -228,6 +230,182 @@ else
     check_warn "traceability_matrix" "traceability_matrix.json not found"
 fi
 
+# Gate 12: Drop-in certification contract artifact
+DROPIN_CONTRACT="$PROJECT_ROOT/docs/dropin-certification-contract.json"
+if [[ -f "$DROPIN_CONTRACT" ]]; then
+    CONTRACT_CHECK=$(python3 - <<PY
+import json
+from pathlib import Path
+
+path = Path("$DROPIN_CONTRACT")
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print(f"parse_error:{exc}")
+    raise SystemExit(0)
+
+missing = []
+for key in ("schema", "hard_gates", "release_process_enforcement"):
+    if key not in data:
+        missing.append(key)
+
+contract = (
+    data.get("release_process_enforcement", {})
+    .get("verdict_artifact_contract", {})
+)
+for key in ("path", "schema", "required_fields", "blocking_rule"):
+    if key not in contract:
+        missing.append(f"release_process_enforcement.verdict_artifact_contract.{key}")
+
+if missing:
+    print("missing:" + ",".join(missing))
+    raise SystemExit(0)
+
+if data.get("schema") != "pi.dropin.certification_contract.v1":
+    print(f"schema_mismatch:{data.get('schema')}")
+    raise SystemExit(0)
+
+print("ok")
+PY
+)
+
+    case "$CONTRACT_CHECK" in
+        ok)
+            check_pass "dropin_contract" "dropin certification contract is present and well-formed"
+            ;;
+        parse_error:*)
+            check_fail "dropin_contract" "dropin certification contract JSON parse failed (${CONTRACT_CHECK#parse_error:})"
+            ;;
+        missing:*)
+            check_fail "dropin_contract" "dropin certification contract missing required fields (${CONTRACT_CHECK#missing:})"
+            ;;
+        schema_mismatch:*)
+            check_fail "dropin_contract" "unexpected contract schema (${CONTRACT_CHECK#schema_mismatch:})"
+            ;;
+        *)
+            check_fail "dropin_contract" "unexpected contract validation result: $CONTRACT_CHECK"
+            ;;
+    esac
+else
+    check_fail "dropin_contract" "docs/dropin-certification-contract.json not found"
+fi
+
+# Gate 13: Drop-in certification verdict (required for strict claim mode)
+DROPIN_VERDICT="$PROJECT_ROOT/docs/dropin-certification-verdict.json"
+DROPIN_CHECK=$(python3 - <<PY
+import json
+import os
+from pathlib import Path
+
+project_root = Path("$PROJECT_ROOT")
+contract_path = Path("$DROPIN_CONTRACT")
+verdict_path = Path("$DROPIN_VERDICT")
+strict_required = os.environ.get("REQUIRE_DROPIN_CERTIFIED", "0") == "1"
+
+if not contract_path.is_file():
+    print("fail|contract missing; cannot validate verdict")
+    raise SystemExit(0)
+
+try:
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print(f"fail|contract parse error: {exc}")
+    raise SystemExit(0)
+
+spec = (
+    contract.get("release_process_enforcement", {})
+    .get("verdict_artifact_contract", {})
+)
+required_fields = spec.get("required_fields", [])
+expected_schema = spec.get("schema", "pi.dropin.certification_verdict.v1")
+
+if not verdict_path.is_file():
+    if strict_required:
+        print("fail|missing docs/dropin-certification-verdict.json in strict drop-in mode")
+    else:
+        print("warn|docs/dropin-certification-verdict.json not present (strict drop-in mode disabled)")
+    raise SystemExit(0)
+
+try:
+    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print(f"fail|verdict parse error: {exc}")
+    raise SystemExit(0)
+
+missing_fields = [field for field in required_fields if field not in verdict]
+if missing_fields:
+    print("fail|verdict missing required fields: " + ", ".join(missing_fields))
+    raise SystemExit(0)
+
+schema = verdict.get("schema")
+if schema != expected_schema:
+    print(f"fail|verdict schema mismatch: expected {expected_schema}, got {schema}")
+    raise SystemExit(0)
+
+overall = verdict.get("overall_verdict")
+if strict_required and overall != "CERTIFIED":
+    print(f"fail|overall_verdict={overall} (expected CERTIFIED in strict mode)")
+    raise SystemExit(0)
+
+hard_gate_results = verdict.get("hard_gate_results")
+if strict_required:
+    if not isinstance(hard_gate_results, list) or not hard_gate_results:
+        print("fail|hard_gate_results missing/empty in strict mode")
+        raise SystemExit(0)
+    non_pass = []
+    for gate in hard_gate_results:
+        status = str(gate.get("status", "")).lower()
+        gate_id = gate.get("gate_id", "?")
+        if status != "pass":
+            non_pass.append(f"{gate_id}:{status or 'unknown'}")
+    if non_pass:
+        print("fail|non-pass hard gates in strict mode: " + ", ".join(non_pass))
+        raise SystemExit(0)
+
+evidence_index = verdict.get("evidence_index")
+if strict_required:
+    if not isinstance(evidence_index, list) or not evidence_index:
+        print("fail|evidence_index missing/empty in strict mode")
+        raise SystemExit(0)
+    missing_paths = []
+    for entry in evidence_index:
+        if isinstance(entry, str):
+            rel_path = entry
+        elif isinstance(entry, dict):
+            rel_path = entry.get("path")
+        else:
+            rel_path = None
+        if isinstance(rel_path, str) and rel_path:
+            if not (project_root / rel_path).exists():
+                missing_paths.append(rel_path)
+    if missing_paths:
+        print("fail|evidence_index paths missing on disk: " + ", ".join(missing_paths))
+        raise SystemExit(0)
+
+if strict_required:
+    print("pass|strict drop-in certification verdict is CERTIFIED with complete hard-gate evidence")
+else:
+    print(f"pass|drop-in certification verdict present (overall_verdict={overall})")
+PY
+)
+
+DROPIN_STATUS="${DROPIN_CHECK%%|*}"
+DROPIN_DETAIL="${DROPIN_CHECK#*|}"
+case "$DROPIN_STATUS" in
+    pass)
+        check_pass "dropin_verdict" "$DROPIN_DETAIL"
+        ;;
+    warn)
+        check_warn "dropin_verdict" "$DROPIN_DETAIL"
+        ;;
+    fail)
+        check_fail "dropin_verdict" "$DROPIN_DETAIL"
+        ;;
+    *)
+        check_fail "dropin_verdict" "unexpected drop-in verdict validation result: $DROPIN_CHECK"
+        ;;
+esac
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 
 TOTAL_CHECKS=$((PASS_COUNT + FAIL_COUNT + WARN_COUNT))
@@ -254,7 +432,8 @@ if [[ "$REPORT_JSON" -eq 1 ]]; then
   "thresholds": {
     "min_pass_rate": $MIN_PASS_RATE,
     "max_fail_count": $MAX_FAIL_COUNT,
-    "max_na_count": $MAX_NA_COUNT
+    "max_na_count": $MAX_NA_COUNT,
+    "require_dropin_certified": $REQUIRE_DROPIN_CERTIFIED
   },
   "counts": {
     "pass": $PASS_COUNT,

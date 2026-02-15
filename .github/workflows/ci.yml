@@ -509,6 +509,53 @@ jobs:
           print("All quarantine entries are within policy bounds.")
           PY
 
+      - name: Parity suite gate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          # Validate that all parity test suites are classified and will run in CI.
+          classification = Path("tests/suite_classification.toml")
+          content = classification.read_text(encoding="utf-8")
+
+          parity_suites = [
+              "json_mode_parity",
+              "cross_surface_parity",
+              "config_precedence",
+              "vcr_parity_validation",
+              "e2e_cross_provider_parity",
+          ]
+
+          missing = []
+          for suite in parity_suites:
+              if f'"{suite}"' not in content:
+                  missing.append(suite)
+
+          if missing:
+              print(f"PARITY GATE FAIL: {len(missing)} parity suite(s) not classified:", file=sys.stderr)
+              for name in missing:
+                  print(f"  - {name}", file=sys.stderr)
+              sys.exit(1)
+
+          # Validate parity evidence artifacts exist (if available from prior runs).
+          evidence_path = Path("tests/ext_conformance/reports/conformance_summary.json")
+          if evidence_path.exists():
+              summary = json.loads(evidence_path.read_text(encoding="utf-8"))
+              evidence = summary.get("evidence", {})
+              required = {"parity_logs", "smoke_logs"}
+              present = set(evidence.keys()) if isinstance(evidence, dict) else set()
+              missing_keys = required - present
+              if missing_keys:
+                  print(f"WARNING: conformance_summary.json missing evidence keys: {sorted(missing_keys)}")
+              else:
+                  print(f"Parity evidence keys present: {sorted(present & required)}")
+
+          print(f"Parity suite gate: all {len(parity_suites)} suites classified.")
+          PY
+
       - name: cargo fmt
         run: cargo fmt --check
 
@@ -1031,6 +1078,10 @@ jobs:
             lane: extension
             shard_index: 3
             shard_total: 4
+          - name: parity
+            lane: parity
+            shard_index: 0
+            shard_total: 1
           - name: security
             lane: security
             shard_index: 0
@@ -1130,6 +1181,22 @@ jobs:
               cp -f tests/ext_conformance/reports/sharded/shard_*_events.jsonl "$SHARD_ARTIFACT_DIR/sharded/" || true
               cp -f tests/ext_conformance/reports/sharded/shard_*_report.md "$SHARD_ARTIFACT_DIR/sharded/" || true
               ;;
+            parity)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --test json_mode_parity \
+                --test cross_surface_parity \
+                --test config_precedence \
+                --test vcr_parity_validation \
+                --test e2e_cross_provider_parity \
+                -- --test-threads=2 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              python3 scripts/ci/generate_parity_evidence.py \
+                --output "$SHARD_ARTIFACT_DIR/parity_evidence.json" \
+                --log "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
             security)
               TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
@@ -1145,8 +1212,13 @@ jobs:
               TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
               RUST_LOG=info \
+              cargo build --bin pi
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
               cargo test \
                 --test perf_budgets \
+                --test perf_regression \
                 --test perf_comparison \
                 --test performance_comparison \
                 -- --test-threads=1 \
