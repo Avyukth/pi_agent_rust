@@ -3774,6 +3774,88 @@ mod tests {
         recv_handle.join().expect("receiver thread should finish");
     }
 
+    #[test]
+    fn try_send_line_with_backpressure_detects_disconnect_while_waiting() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        tx.try_send("busy".to_string())
+            .expect("seed initial busy slot");
+
+        let drop_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(rx);
+        });
+
+        assert!(
+            !try_send_line_with_backpressure(&tx, "line-after-disconnect".to_string()),
+            "send should stop after receiver disconnects while channel is full"
+        );
+        drop_handle.join().expect("drop thread should finish");
+    }
+
+    #[test]
+    fn try_send_line_with_backpressure_high_volume_preserves_order_and_count() {
+        let (tx, rx) = mpsc::channel::<String>(4);
+        let lines: Vec<String> = (0..256)
+            .map(|idx| format!("line-{idx:03}: {}", "x".repeat(64)))
+            .collect();
+        let expected = lines.clone();
+
+        let recv_handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            let mut received = Vec::new();
+            while received.len() < expected.len() && Instant::now() < deadline {
+                if let Ok(msg) = rx.try_recv() {
+                    received.push(msg);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                received.len(),
+                expected.len(),
+                "should receive every line under sustained backpressure"
+            );
+            assert_eq!(received, expected, "line ordering must remain stable");
+        });
+
+        for line in lines {
+            assert!(try_send_line_with_backpressure(&tx, line));
+        }
+        drop(tx);
+        recv_handle.join().expect("receiver thread should finish");
+    }
+
+    #[test]
+    fn try_send_line_with_backpressure_preserves_partial_line_without_newline() {
+        let (tx, rx) = mpsc::channel::<String>(1);
+        tx.try_send("busy".to_string())
+            .expect("seed initial busy slot");
+
+        let partial_json = "{\"type\":\"prompt\",\"message\":\"tail-fragment-ascii\"".to_string();
+        let expected = partial_json.clone();
+
+        let recv_handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let first = rx.try_recv().expect("seeded line should be available");
+            assert_eq!(first, "busy");
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let second = loop {
+                if let Ok(line) = rx.try_recv() {
+                    break line;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "partial payload should be available"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(second, expected);
+        });
+
+        assert!(try_send_line_with_backpressure(&tx, partial_json));
+        drop(tx);
+        recv_handle.join().expect("receiver thread should finish");
+    }
+
     // -----------------------------------------------------------------------
     // RpcStateSnapshot::pending_count
     // -----------------------------------------------------------------------

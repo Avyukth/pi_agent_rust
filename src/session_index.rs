@@ -81,6 +81,8 @@ impl SessionIndex {
     fn upsert_meta(&self, meta: SessionMeta) -> Result<()> {
         self.with_lock(|conn| {
             init_schema(conn)?;
+            let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
+            let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
             conn.execute_sync(
                 "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
@@ -97,9 +99,9 @@ impl SessionIndex {
                     Value::Text(meta.id),
                     Value::Text(meta.cwd),
                     Value::Text(meta.timestamp),
-                    Value::BigInt(i64::try_from(meta.message_count).unwrap_or(i64::MAX)),
+                    Value::BigInt(message_count),
                     Value::BigInt(meta.last_modified_ms),
-                    Value::BigInt(i64::try_from(meta.size_bytes).unwrap_or(i64::MAX)),
+                    Value::BigInt(size_bytes),
                     meta.name.map_or(Value::Null, Value::Text),
                 ],
             ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
@@ -176,6 +178,8 @@ impl SessionIndex {
                 .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
 
             for meta in metas {
+                let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
+                let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
                 conn.execute_sync(
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -184,9 +188,9 @@ impl SessionIndex {
                         Value::Text(meta.id),
                         Value::Text(meta.cwd),
                         Value::Text(meta.timestamp),
-                        Value::BigInt(i64::try_from(meta.message_count).unwrap_or(i64::MAX)),
+                        Value::BigInt(message_count),
                         Value::BigInt(meta.last_modified_ms),
-                        Value::BigInt(i64::try_from(meta.size_bytes).unwrap_or(i64::MAX)),
+                        Value::BigInt(size_bytes),
                         meta.name.map_or(Value::Null, Value::Text),
                     ],
                 ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
@@ -294,6 +298,11 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
     .map_err(|e| Error::session(format!("Create meta table: {e}")))?;
 
     Ok(())
+}
+
+fn sqlite_i64_from_u64(field: &str, value: u64) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| Error::session(format!("{field} exceeds SQLite INTEGER range: {value}")))
 }
 
 fn row_to_meta(row: &sqlmodel_core::Row) -> Result<SessionMeta> {
@@ -1449,6 +1458,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn index_session_snapshot_rejects_message_count_over_i64_max() {
+        let harness = TestHarness::new("index_session_snapshot_rejects_message_count_over_i64_max");
+        let root = harness.temp_path("sessions");
+        fs::create_dir_all(root.join("project")).expect("create project dir");
+        let index = SessionIndex::for_sessions_root(&root);
+
+        let path = root.join("project").join("overflow.jsonl");
+        fs::write(&path, "").expect("write session payload");
+
+        let header = make_header("id-overflow", "cwd-overflow");
+        let err = index
+            .index_session_snapshot(&path, &header, (i64::MAX as u64) + 1, None)
+            .expect_err("out-of-range message_count should error");
+        assert!(
+            matches!(err, Error::Session(ref msg) if msg.contains("message_count exceeds SQLite INTEGER range")),
+            "expected out-of-range message_count error, got {err:?}"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
 
@@ -1549,30 +1578,37 @@ mod tests {
 
             let mut header = make_header(&id, &cwd);
             header.timestamp = timestamp.clone();
-            index
-                .index_session_snapshot(&path, &header, message_count, name.clone())
-                .expect("index snapshot");
+            let index_result =
+                index.index_session_snapshot(&path, &header, message_count, name.clone());
+            if message_count > i64::MAX as u64 {
+                prop_assert!(
+                    index_result.is_err(),
+                    "expected out-of-range message_count to fail indexing"
+                );
+            } else {
+                index_result.expect("index snapshot");
 
-            let listed = index
-                .list_sessions(Some(&cwd))
-                .expect("list sessions for cwd");
-            prop_assert_eq!(listed.len(), 1);
+                let listed = index
+                    .list_sessions(Some(&cwd))
+                    .expect("list sessions for cwd");
+                prop_assert_eq!(listed.len(), 1);
 
-            let meta = &listed[0];
-            let expected_count = message_count;
-            prop_assert_eq!(&meta.id, &id);
-            prop_assert_eq!(&meta.cwd, &cwd);
-            prop_assert_eq!(&meta.timestamp, &timestamp);
-            prop_assert_eq!(&meta.path, &path.display().to_string());
-            prop_assert_eq!(meta.message_count, expected_count);
-            prop_assert_eq!(meta.size_bytes, content.len() as u64);
-            prop_assert_eq!(&meta.name, &name);
-            prop_assert!(meta.last_modified_ms >= 0);
+                let meta = &listed[0];
+                let expected_count = message_count;
+                prop_assert_eq!(&meta.id, &id);
+                prop_assert_eq!(&meta.cwd, &cwd);
+                prop_assert_eq!(&meta.timestamp, &timestamp);
+                prop_assert_eq!(&meta.path, &path.display().to_string());
+                prop_assert_eq!(meta.message_count, expected_count);
+                prop_assert_eq!(meta.size_bytes, content.len() as u64);
+                prop_assert_eq!(&meta.name, &name);
+                prop_assert!(meta.last_modified_ms >= 0);
 
-            let other_cwd = index
-                .list_sessions(Some("definitely-not-this-cwd"))
-                .expect("list sessions for unmatched cwd");
-            prop_assert!(other_cwd.is_empty());
+                let other_cwd = index
+                    .list_sessions(Some("definitely-not-this-cwd"))
+                    .expect("list sessions for unmatched cwd");
+                prop_assert!(other_cwd.is_empty());
+            }
         }
     }
 }
