@@ -2208,6 +2208,37 @@ fn orchestrate_script_generates_env_fingerprint() {
 }
 
 #[test]
+fn orchestrate_script_generates_baseline_variance_confidence_artifact() {
+    let content = load_text(ORCHESTRATE_SCRIPT_PATH);
+
+    assert!(
+        content.contains("baseline_variance_confidence.json"),
+        "orchestrate.sh must emit baseline_variance_confidence.json"
+    );
+    assert!(
+        content.contains("pi.perf.baseline_variance_confidence.v1"),
+        "orchestrate.sh must emit pi.perf.baseline_variance_confidence.v1 schema"
+    );
+
+    let required_fields = [
+        "scenario_id",
+        "sli_id",
+        "confidence",
+        "ci95_lower_ms",
+        "ci95_upper_ms",
+        "run_id_lineage",
+        "environment_fingerprint_hash",
+    ];
+
+    for field in &required_fields {
+        assert!(
+            content.contains(field),
+            "baseline variance/confidence artifact must include field: {field}"
+        );
+    }
+}
+
+#[test]
 fn orchestrate_script_references_contract_schemas() {
     let content = load_text(ORCHESTRATE_SCRIPT_PATH);
 
@@ -2324,5 +2355,123 @@ fn orchestrate_script_has_deterministic_parallelism_default() {
         content.contains("PARALLELISM=\"${PERF_PARALLELISM:-1}\"")
             || content.contains("PARALLELISM=${PERF_PARALLELISM:-1}"),
         "orchestrate.sh must default parallelism to 1 for determinism"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section: Baseline Variance and Confidence Bands (bd-3ar8v.1.5)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CAPTURE_BASELINE_SCRIPT_PATH: &str = "scripts/perf/capture_baseline.sh";
+
+#[test]
+fn capture_baseline_script_exists() {
+    let path = std::path::Path::new(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        path.exists(),
+        "capture_baseline.sh must exist at {CAPTURE_BASELINE_SCRIPT_PATH}"
+    );
+}
+
+#[test]
+fn capture_baseline_script_emits_variance_schema() {
+    let content = load_text(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        content.contains("pi.perf.baseline_variance.v1"),
+        "capture_baseline.sh must emit schema pi.perf.baseline_variance.v1"
+    );
+}
+
+#[test]
+fn capture_baseline_script_computes_confidence_intervals() {
+    let content = load_text(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        content.contains("confidence_interval_95"),
+        "must compute 95% confidence intervals"
+    );
+    assert!(
+        content.contains("confidence_interval_99"),
+        "must compute 99% confidence intervals"
+    );
+}
+
+#[test]
+fn capture_baseline_script_computes_coefficient_of_variation() {
+    let content = load_text(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        content.contains("coefficient_of_variation"),
+        "must compute coefficient of variation"
+    );
+}
+
+#[test]
+fn capture_baseline_script_classifies_variance() {
+    let content = load_text(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        content.contains("var_class"),
+        "must classify variance levels"
+    );
+}
+
+#[test]
+fn capture_baseline_script_supports_validation_mode() {
+    let content = load_text(CAPTURE_BASELINE_SCRIPT_PATH);
+    assert!(
+        content.contains("--validate"),
+        "must support --validate mode for existing baselines"
+    );
+}
+
+#[test]
+fn baseline_variance_schema_in_evidence_instance() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let schemas = instance["schema_registry"]["schemas"]
+        .as_array()
+        .expect("must have schemas");
+    let found = schemas
+        .iter()
+        .any(|s| s["schema_id"].as_str() == Some("pi.perf.baseline_variance.v1"));
+    assert!(
+        found,
+        "pi.perf.baseline_variance.v1 must be in schema registry"
+    );
+}
+
+#[test]
+fn run_manifest_schema_in_evidence_instance() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let schemas = instance["schema_registry"]["schemas"]
+        .as_array()
+        .expect("must have schemas");
+    let found = schemas
+        .iter()
+        .any(|s| s["schema_id"].as_str() == Some("pi.perf.run_manifest.v1"));
+    assert!(
+        found,
+        "pi.perf.run_manifest.v1 must be in schema registry"
+    );
+}
+
+#[test]
+fn baseline_variance_has_schema_relationships() {
+    let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
+    let relationships = instance["schema_registry"]["schema_relationships"]
+        .as_array()
+        .expect("must have relationships");
+    let has_baseline_rel = relationships
+        .iter()
+        .any(|r| r["from_schema"].as_str() == Some("pi.perf.baseline_variance.v1"));
+    assert!(
+        has_baseline_rel,
+        "baseline_variance schema must have relationship entries"
+    );
+}
+
+#[test]
+fn orchestrate_script_includes_baseline_variance_suite() {
+    let content = load_text(ORCHESTRATE_SCRIPT_PATH);
+    assert!(
+        content.contains("perf_baseline_variance"),
+        "orchestrate.sh must include perf_baseline_variance in suite registry"
     );
 }

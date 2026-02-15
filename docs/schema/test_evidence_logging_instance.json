@@ -143,6 +143,28 @@
         "description": "Golden transcript records for deterministic replay comparison.",
         "required_fields": ["schema", "type"],
         "supersedes": null
+      },
+      {
+        "schema_id": "pi.perf.baseline_variance.v1",
+        "version": "v1",
+        "status": "canonical",
+        "domain": "benchmarks",
+        "source_files": ["scripts/perf/capture_baseline.sh", "tests/perf_baseline_variance.rs"],
+        "output_format": "json",
+        "description": "Baseline variance analysis with confidence intervals, coefficient of variation, and variance classification for truthful progress claims.",
+        "required_fields": ["schema", "version", "metrics", "summary"],
+        "supersedes": null
+      },
+      {
+        "schema_id": "pi.perf.run_manifest.v1",
+        "version": "v1",
+        "status": "canonical",
+        "domain": "benchmarks",
+        "source_files": ["scripts/perf/orchestrate.sh"],
+        "output_format": "json",
+        "description": "Run manifest for reproducible benchmark orchestration with suite results and contract references.",
+        "required_fields": ["schema", "correlation_id", "run_summary", "suite_results"],
+        "supersedes": null
       }
     ],
     "schema_relationships": [
@@ -205,6 +227,24 @@
         "to_schema": "pi.test.artifact.v1",
         "relationship": "produces",
         "join_field": "trace_id"
+      },
+      {
+        "from_schema": "pi.perf.baseline_variance.v1",
+        "to_schema": "pi.perf.budget.v1",
+        "relationship": "references",
+        "join_field": "metric_name"
+      },
+      {
+        "from_schema": "pi.perf.baseline_variance.v1",
+        "to_schema": "pi.perf.sli_ux_matrix.v1",
+        "relationship": "references",
+        "join_field": "metric_name"
+      },
+      {
+        "from_schema": "pi.perf.run_manifest.v1",
+        "to_schema": "pi.qa.evidence_contract.v1",
+        "relationship": "references",
+        "join_field": "correlation_id"
       }
     ]
   },

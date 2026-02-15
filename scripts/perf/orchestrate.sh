@@ -65,6 +65,7 @@ declare -A SUITE_TARGETS=(
   [perf_budgets]="perf_budgets"
   [perf_regression]="perf_regression"
   [perf_comparison]="perf_comparison"
+  [perf_baseline_variance]="perf_baseline_variance"
 )
 
 declare -A CRITERION_BENCHES=(
@@ -608,6 +609,235 @@ cat > "$OUTPUT_DIR/manifest.json" <<EOF
 EOF
 
 log_ok "Manifest written: manifest.json"
+
+# ─── Phase 5b: Baseline Variance/Confidence Artifact ────────────────────────
+
+log_phase "Phase 5b: Baseline Variance/Confidence"
+
+BASELINE_CONFIDENCE_PATH="$OUTPUT_DIR/results/baseline_variance_confidence.json"
+if OUTPUT_DIR="$OUTPUT_DIR" \
+  PROJECT_ROOT="$PROJECT_ROOT" \
+  CORRELATION_ID="$CORRELATION_ID" \
+  TIMESTAMP="$TIMESTAMP" \
+  BASELINE_CONFIDENCE_PATH="$BASELINE_CONFIDENCE_PATH" \
+  python3 - <<'PY'
+import hashlib
+import json
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR"])
+project_root = Path(os.environ["PROJECT_ROOT"])
+correlation_id = os.environ["CORRELATION_ID"]
+timestamp = os.environ["TIMESTAMP"]
+baseline_confidence_path = Path(os.environ["BASELINE_CONFIDENCE_PATH"])
+
+manifest_path = output_dir / "manifest.json"
+env_path = output_dir / "env_fingerprint.json"
+perf_sli_path = project_root / "docs" / "perf_sli_matrix.json"
+scenario_matrix_path = project_root / "docs" / "e2e_scenario_matrix.json"
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+manifest = load_json(manifest_path)
+env = load_json(env_path) if env_path.exists() else {}
+perf_sli = load_json(perf_sli_path)
+scenario_matrix = load_json(scenario_matrix_path)
+
+suite_results = manifest.get("suite_results", [])
+if not isinstance(suite_results, list):
+    suite_results = []
+suite_result_by_name = {
+    str(entry.get("suite", "")).strip(): entry
+    for entry in suite_results
+    if isinstance(entry, dict) and str(entry.get("suite", "")).strip()
+}
+
+scenario_rows = scenario_matrix.get("rows", [])
+if not isinstance(scenario_rows, list):
+    scenario_rows = []
+scenario_by_workflow = {
+    str(row.get("workflow_id", "")).strip(): row
+    for row in scenario_rows
+    if isinstance(row, dict) and str(row.get("workflow_id", "")).strip()
+}
+
+partition_requirements_raw = (
+    perf_sli.get("reporting_contract", {})
+    .get("scenario_partition_requirements", [])
+)
+if not isinstance(partition_requirements_raw, list):
+    partition_requirements_raw = []
+partitions_by_workflow = {}
+for row in partition_requirements_raw:
+    if not isinstance(row, dict):
+        continue
+    workflow_id = str(row.get("workflow_id", "")).strip()
+    required_partitions = row.get("required_partitions", [])
+    if not workflow_id or not isinstance(required_partitions, list):
+        continue
+    partitions = [str(p).strip() for p in required_partitions if str(p).strip()]
+    if partitions:
+        partitions_by_workflow[workflow_id] = partitions
+
+workflow_sli_mapping = perf_sli.get("workflow_sli_mapping", [])
+if not isinstance(workflow_sli_mapping, list):
+    workflow_sli_mapping = []
+
+run_id = str(manifest.get("timestamp", timestamp))
+environment_fingerprint_hash = str(env.get("config_hash", "unknown"))
+
+records = []
+
+for mapping in workflow_sli_mapping:
+    if not isinstance(mapping, dict):
+        continue
+
+    workflow_id = str(mapping.get("workflow_id", "")).strip()
+    sli_ids = mapping.get("sli_ids", [])
+    if not workflow_id or not isinstance(sli_ids, list):
+        continue
+
+    scenario_row = scenario_by_workflow.get(workflow_id, {})
+    suite_ids = scenario_row.get("suite_ids", [])
+    if not isinstance(suite_ids, list):
+        suite_ids = []
+    suite_ids = [str(suite_id).strip() for suite_id in suite_ids if str(suite_id).strip()]
+
+    sample_values = []
+    for suite_id in suite_ids:
+        suite_result = suite_result_by_name.get(suite_id)
+        if not isinstance(suite_result, dict):
+            continue
+        if str(suite_result.get("status", "")).strip().lower() != "pass":
+            continue
+        elapsed_ms = suite_result.get("elapsed_ms")
+        if isinstance(elapsed_ms, (int, float)):
+            sample_values.append(float(elapsed_ms))
+
+    sample_count = len(sample_values)
+    mean_ms = None
+    variance_ms2 = None
+    stddev_ms = None
+    ci95_lower_ms = None
+    ci95_upper_ms = None
+
+    if sample_count > 0:
+        mean_ms = sum(sample_values) / sample_count
+        if sample_count > 1:
+            variance_ms2 = sum((value - mean_ms) ** 2 for value in sample_values) / sample_count
+            stddev_ms = math.sqrt(variance_ms2)
+            half_width = 1.96 * stddev_ms / math.sqrt(sample_count)
+        else:
+            variance_ms2 = 0.0
+            stddev_ms = 0.0
+            half_width = 0.0
+        ci95_lower_ms = max(0.0, mean_ms - half_width)
+        ci95_upper_ms = mean_ms + half_width
+
+    if sample_count >= 8:
+        confidence = "high"
+    elif sample_count >= 4:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    evidence_state = "measured" if sample_count > 0 else "no_data"
+    required_partitions = partitions_by_workflow.get(workflow_id, ["realistic"])
+
+    lineage_source = {
+        "workflow_id": workflow_id,
+        "suite_ids": suite_ids,
+        "sample_values_ms": sample_values,
+        "required_partitions": required_partitions,
+    }
+    dataset_hash = hashlib.sha256(
+        json.dumps(lineage_source, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    scenario_metadata = {
+        "workflow_id": workflow_id,
+        "workflow_class": str(scenario_row.get("workflow_class", "unknown")),
+        "suite_ids": suite_ids,
+        "vcr_mode": str(scenario_row.get("vcr_mode", "unknown")),
+        "scenario_owner": str(scenario_row.get("owner", "unknown")),
+    }
+
+    for partition in required_partitions:
+        for sli_id in sli_ids:
+            canonical_sli_id = str(sli_id).strip()
+            if not canonical_sli_id:
+                continue
+            records.append(
+                {
+                    "run_id": run_id,
+                    "correlation_id": correlation_id,
+                    "scenario_id": workflow_id,
+                    "workload_partition": partition,
+                    "scenario_metadata": scenario_metadata,
+                    "sli_id": canonical_sli_id,
+                    "sample_count": sample_count,
+                    "mean_ms": mean_ms,
+                    "variance_ms2": variance_ms2,
+                    "stddev_ms": stddev_ms,
+                    "ci95_lower_ms": ci95_lower_ms,
+                    "ci95_upper_ms": ci95_upper_ms,
+                    "confidence": confidence,
+                    "evidence_state": evidence_state,
+                    "lineage": {
+                        "dataset_hash": dataset_hash,
+                        "run_id_lineage": [run_id, correlation_id],
+                        "environment_fingerprint_hash": environment_fingerprint_hash,
+                        "source_manifest_path": str(manifest_path),
+                    },
+                }
+            )
+
+confidence_counts = {"high": 0, "medium": 0, "low": 0}
+for record in records:
+    label = str(record.get("confidence", "low"))
+    confidence_counts[label] = confidence_counts.get(label, 0) + 1
+
+payload = {
+    "schema": "pi.perf.baseline_variance_confidence.v1",
+    "bead_id": "bd-3ar8v.1.5",
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "run_id": run_id,
+    "correlation_id": correlation_id,
+    "source_manifest_path": str(manifest_path),
+    "source_env_fingerprint_path": str(env_path) if env_path.exists() else None,
+    "records": records,
+    "summary": {
+        "record_count": len(records),
+        "scenario_count": len({record["scenario_id"] for record in records}),
+        "sli_count": len({record["sli_id"] for record in records}),
+        "confidence_counts": confidence_counts,
+    },
+}
+
+baseline_confidence_path.parent.mkdir(parents=True, exist_ok=True)
+baseline_confidence_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+manifest["baseline_variance_confidence"] = {
+    "schema": "pi.perf.baseline_variance_confidence.v1",
+    "path": str(baseline_confidence_path),
+    "record_count": payload["summary"]["record_count"],
+    "scenario_count": payload["summary"]["scenario_count"],
+    "sli_count": payload["summary"]["sli_count"],
+}
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+then
+  artifact_count=$((artifact_count + 1))
+  log_ok "Baseline variance/confidence written: results/baseline_variance_confidence.json"
+else
+  die "Failed to generate baseline variance/confidence artifact"
+fi
 
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
 
