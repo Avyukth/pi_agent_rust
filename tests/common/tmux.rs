@@ -183,17 +183,14 @@ impl TmuxInstance {
         let start = Instant::now();
         let mut last_pane = String::new();
         loop {
-            let pane = match self.try_capture_pane() {
-                Some(pane) => pane,
-                None => {
-                    if !self.session_exists() || start.elapsed() > timeout {
-                        return last_pane;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
+            let Some(pane) = self.try_capture_pane() else {
+                if !self.session_exists() || start.elapsed() > timeout {
+                    return last_pane;
                 }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
             };
-            last_pane = pane.clone();
+            last_pane.clone_from(&pane);
             if pane.contains(needle) {
                 return pane;
             }
@@ -210,17 +207,14 @@ impl TmuxInstance {
         let start = Instant::now();
         let mut last_pane = String::new();
         loop {
-            let pane = match self.try_capture_pane() {
-                Some(pane) => pane,
-                None => {
-                    if !self.session_exists() || start.elapsed() > timeout {
-                        return last_pane;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
+            let Some(pane) = self.try_capture_pane() else {
+                if !self.session_exists() || start.elapsed() > timeout {
+                    return last_pane;
                 }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
             };
-            last_pane = pane.clone();
+            last_pane.clone_from(&pane);
             if needles.iter().any(|needle| pane.contains(needle)) {
                 return pane;
             }
