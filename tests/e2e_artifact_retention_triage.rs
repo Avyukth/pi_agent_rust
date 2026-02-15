@@ -35,6 +35,7 @@ const SUITE_CLASSIFICATION_PATH: &str = "tests/suite_classification.toml";
 const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
 const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
+const RUN_ALL_SCRIPT_PATH: &str = "scripts/e2e/run_all.sh";
 
 fn load_text(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
@@ -263,6 +264,54 @@ fn ci_has_failure_signature_extraction() {
     assert!(
         ci.contains("signature") || ci.contains("failure"),
         "CI must extract failure signatures for triage"
+    );
+}
+
+#[test]
+fn run_all_classifies_vcr_cassette_mismatch() {
+    let runner = load_text(RUN_ALL_SCRIPT_PATH);
+    assert!(
+        runner.contains("no matching interaction found in cassette"),
+        "run_all triage classifier must detect missing cassette interaction signatures"
+    );
+    assert!(
+        runner.contains("return \"vcr_mismatch\""),
+        "run_all triage classifier must classify cassette mismatch failures as vcr_mismatch"
+    );
+}
+
+#[test]
+fn run_all_classifies_lint_failures() {
+    let runner = load_text(RUN_ALL_SCRIPT_PATH);
+    assert!(
+        runner.contains("if \"clippy\" in haystack") && runner.contains("return \"lint_failure\""),
+        "run_all triage classifier must classify clippy error signatures as lint_failure"
+    );
+}
+
+#[test]
+fn run_all_vcr_mismatch_has_actionable_remediation_hint() {
+    let runner = load_text(RUN_ALL_SCRIPT_PATH);
+    assert!(
+        runner.contains("if root_cause_class == \"vcr_mismatch\""),
+        "run_all remediation map must include vcr_mismatch branch"
+    );
+    assert!(
+        runner.contains("Re-record or refresh the affected cassette"),
+        "run_all triage remediation must provide cassette refresh guidance"
+    );
+}
+
+#[test]
+fn run_all_logs_failure_list_and_rerun_hint_events() {
+    let runner = load_text(RUN_ALL_SCRIPT_PATH);
+    assert!(
+        runner.contains("\"event_type\": \"failure_list_item\""),
+        "run_all failure parser must emit failure_list_item timeline events"
+    );
+    assert!(
+        runner.contains("\"event_type\": \"rerun_hint\""),
+        "run_all failure parser must emit rerun_hint timeline events"
     );
 }
 
@@ -569,6 +618,45 @@ fn full_suite_gate_has_artifact_paths() {
     assert!(
         gate.contains(".jsonl") || gate.contains(".json"),
         "Full suite gate must reference JSONL/JSON artifact paths"
+    );
+}
+
+#[test]
+fn full_suite_gate_enforces_coverage_threshold() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    assert!(
+        gate.contains("conformance_pass_rate"),
+        "Full suite gate must include a conformance pass-rate quality gate"
+    );
+    assert!(
+        gate.contains("if rate >= 80.0"),
+        "Full suite gate must enforce a minimum pass-rate threshold for coverage quality"
+    );
+}
+
+#[test]
+fn full_suite_gate_exposes_logging_and_flake_control_gates() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    assert!(
+        gate.contains("e2e_log_contract"),
+        "Full suite gate must include E2E log contract gate for logging completeness"
+    );
+    assert!(
+        gate.contains("waiver_lifecycle"),
+        "Full suite gate must include waiver lifecycle gate for flake/quarantine control"
+    );
+}
+
+#[test]
+fn full_suite_gate_includes_reproduce_commands_for_remediation() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    assert!(
+        gate.contains("reproduce_command"),
+        "Full suite gate must include reproduce_command metadata for remediation"
+    );
+    assert!(
+        gate.contains("cargo test --test conformance_regression_gate -- --nocapture"),
+        "Full suite gate must provide concrete reproduce commands for failing quality gates"
     );
 }
 

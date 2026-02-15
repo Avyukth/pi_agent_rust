@@ -5,7 +5,7 @@ mod common;
 
 use base64::Engine as _;
 use clap::{Parser, error::ErrorKind};
-use common::TestHarness;
+use common::{TestHarness, validate_jsonl};
 use pi::app::{
     apply_piped_stdin, build_initial_content, build_system_prompt, normalize_cli,
     prepare_initial_message, resolve_api_key, resolve_model_scope, select_model_and_thinking,
@@ -1012,4 +1012,50 @@ fn extension_registered_flags_can_be_passed_through_cli_parser() {
     assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     assert_eq!(parsed.extension_flags[1].name, "dry-run");
     assert!(parsed.extension_flags[1].value.is_none());
+}
+
+#[test]
+fn dropin174_cli_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_cli_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("parity", "DROPIN-174 CLI parity trace", |ctx| {
+            ctx.push(("requirement_id".to_string(), "DROPIN-141".to_string()));
+            ctx.push(("surface".to_string(), "cli".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "CLI command/flag/subcommand parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.dump_logs();
+    let errors = validate_jsonl(&jsonl);
+    assert!(
+        errors.is_empty(),
+        "harness log JSONL must validate: {errors:?}"
+    );
+
+    let matched = jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json log line"))
+        .filter(|value| value.get("category").and_then(serde_json::Value::as_str) == Some("parity"))
+        .any(|value| {
+            let Some(ctx) = value.get("context").and_then(serde_json::Value::as_object) else {
+                return false;
+            };
+            ctx.get("requirement_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("DROPIN-141")
+                && ctx.get("surface").and_then(serde_json::Value::as_str) == Some("cli")
+                && ctx
+                    .get("parity_requirement")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("CLI command/flag/subcommand parity")
+        });
+
+    assert!(
+        matched,
+        "expected a parity log line with DROPIN-141 cli requirement context"
+    );
 }

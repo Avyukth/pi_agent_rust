@@ -15,12 +15,20 @@ use common::TestHarness;
 use pi::agent::AgentEvent;
 use pi::extensions::{ExtensionEventName, ExtensionUiRequest, extension_event_from_agent};
 use pi::model::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, TextContent,
-    ToolCall, Usage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, ImageContent, Message, StopReason,
+    TextContent, ThinkingContent, ToolCall, Usage,
 };
 use pi::tools::ToolOutput;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+type AutoCompactionCase = (
+    Option<Value>,
+    bool,
+    bool,
+    Option<&'static str>,
+    &'static str,
+);
 
 // ============================================================================
 // Helpers
@@ -1438,7 +1446,9 @@ fn json_parity_extension_ui_set_editor_text_schema() {
     harness.log().info_ctx(
         "json_parity",
         "extension_ui set_editor_text schema ok",
-        |ctx| ctx.push(("method".to_string(), "set_editor_text".to_string())),
+        |ctx| {
+            ctx.push(("method".to_string(), "set_editor_text".to_string()));
+        },
     );
 }
 
@@ -1477,7 +1487,9 @@ fn json_parity_extension_ui_expects_response_classification() {
     harness.log().info_ctx(
         "json_parity",
         "extension_ui dialog classification ok",
-        |ctx| ctx.push(("dialog_count".to_string(), "4".to_string())),
+        |ctx| {
+            ctx.push(("dialog_count".to_string(), "4".to_string()));
+        },
     );
 }
 
@@ -2450,9 +2462,7 @@ fn json_parity_empty_text_content() {
     let json = event_to_json(&event);
 
     // Empty text is valid — pi-mono emits it for commands with no stdout.
-    let content = json["result"]["content"]
-        .as_array()
-        .expect("content array");
+    let content = json["result"]["content"].as_array().expect("content array");
     assert_eq!(content.len(), 1);
     assert_eq!(content[0]["text"], "");
     assert_eq!(content[0]["type"], "text");
@@ -2491,7 +2501,11 @@ fn json_parity_unicode_content() {
         };
         let json = event_to_json(&event);
         let content = &json["result"]["content"][0]["text"];
-        assert_eq!(content.as_str().unwrap(), *text, "unicode mismatch: {label}");
+        assert_eq!(
+            content.as_str().unwrap(),
+            *text,
+            "unicode mismatch: {label}"
+        );
 
         // Round-trip through JSON string should preserve content.
         let json_str = serde_json::to_string(&json).expect("serialize");
@@ -2503,11 +2517,11 @@ fn json_parity_unicode_content() {
         );
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "unicode content ok",
-        |ctx| ctx.push(("cases".to_string(), unicode_cases.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "unicode content ok", |ctx| {
+            ctx.push(("cases".to_string(), unicode_cases.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2565,9 +2579,7 @@ fn json_parity_tool_output_multiple_content_blocks() {
     };
     let json = event_to_json(&event);
 
-    let content = json["result"]["content"]
-        .as_array()
-        .expect("content array");
+    let content = json["result"]["content"].as_array().expect("content array");
     assert_eq!(content.len(), 3, "should have 3 content blocks");
     assert_eq!(content[0]["text"], "stdout: hello");
     assert_eq!(content[1]["text"], "stderr: warning");
@@ -2578,11 +2590,11 @@ fn json_parity_tool_output_multiple_content_blocks() {
         assert_eq!(block["type"], "text");
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "multiple content blocks ok",
-        |ctx| ctx.push(("blocks".to_string(), "3".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "multiple content blocks ok", |ctx| {
+            ctx.push(("blocks".to_string(), "3".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2605,9 +2617,7 @@ fn json_parity_tool_output_empty_content() {
     };
     let json = event_to_json(&event);
 
-    let content = json["result"]["content"]
-        .as_array()
-        .expect("content array");
+    let content = json["result"]["content"].as_array().expect("content array");
     assert!(content.is_empty(), "empty content array is valid");
 
     harness
@@ -2624,7 +2634,7 @@ fn json_parity_auto_compaction_lifecycle_matrix() {
     let harness = TestHarness::new("json_parity_auto_compaction_lifecycle_matrix");
 
     // Matrix: (result, aborted, will_retry, error_message)
-    let cases: Vec<(Option<Value>, bool, bool, Option<&str>, &str)> = vec![
+    let cases: Vec<AutoCompactionCase> = vec![
         (
             Some(json!({"summary": "ok"})),
             false,
@@ -2640,7 +2650,13 @@ fn json_parity_auto_compaction_lifecycle_matrix() {
             Some("provider timeout"),
             "retry_with_error",
         ),
-        (None, true, true, Some("aborted mid-stream"), "aborted_retry"),
+        (
+            None,
+            true,
+            true,
+            Some("aborted mid-stream"),
+            "aborted_retry",
+        ),
         (
             Some(json!({"summary": "partial"})),
             false,
@@ -2694,7 +2710,9 @@ fn json_parity_auto_compaction_lifecycle_matrix() {
     harness.log().info_ctx(
         "json_parity",
         "auto-compaction lifecycle matrix ok",
-        |ctx| ctx.push(("cases".to_string(), cases.len().to_string())),
+        |ctx| {
+            ctx.push(("cases".to_string(), cases.len().to_string()));
+        },
     );
 }
 
@@ -2736,8 +2754,9 @@ fn json_parity_auto_retry_exponential_backoff() {
 
     // Verify attempt counter.
     for (i, event) in events.iter().enumerate() {
-        assert_eq!(event["attempt"], (i + 1) as u64);
-        assert_eq!(event["maxAttempts"], max_attempts as u64);
+        let attempt_number = u64::try_from(i + 1).expect("attempt index fits into u64");
+        assert_eq!(event["attempt"], attempt_number);
+        assert_eq!(event["maxAttempts"], u64::from(max_attempts));
     }
 
     // Final retry end — success after retries.
@@ -2758,11 +2777,11 @@ fn json_parity_auto_retry_exponential_backoff() {
     assert_eq!(end_fail["success"], false);
     assert_eq!(end_fail["finalError"], "max retries exceeded");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "auto-retry exponential backoff ok",
-        |ctx| ctx.push(("max_attempts".to_string(), max_attempts.to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "auto-retry exponential backoff ok", |ctx| {
+            ctx.push(("max_attempts".to_string(), max_attempts.to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2813,11 +2832,11 @@ fn json_parity_extension_error_all_hook_names() {
         "extensionId should be absent for global errors"
     );
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension error hook names ok",
-        |ctx| ctx.push(("hooks".to_string(), hook_names.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension error hook names ok", |ctx| {
+            ctx.push(("hooks".to_string(), hook_names.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,10 +2895,7 @@ fn json_parity_ame_text_streaming_lifecycle() {
         let ame_type = json["assistantMessageEvent"]["type"]
             .as_str()
             .unwrap_or("<missing>");
-        assert_eq!(
-            ame_type, *expected_type,
-            "AME type mismatch in sequence"
-        );
+        assert_eq!(ame_type, *expected_type, "AME type mismatch in sequence");
     }
 
     // Verify text_end content matches accumulated deltas.
@@ -2897,11 +2913,11 @@ fn json_parity_ame_text_streaming_lifecycle() {
         "text_end should contain accumulated content"
     );
 
-    harness.log().info_ctx(
-        "json_parity",
-        "AME text streaming lifecycle ok",
-        |ctx| ctx.push(("events".to_string(), expected_types.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "AME text streaming lifecycle ok", |ctx| {
+            ctx.push(("events".to_string(), expected_types.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -2951,11 +2967,11 @@ fn json_parity_ame_thinking_lifecycle() {
         assert_eq!(ame_json["contentIndex"], 0);
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "AME thinking lifecycle ok",
-        |ctx| ctx.push(("events".to_string(), events.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "AME thinking lifecycle ok", |ctx| {
+            ctx.push(("events".to_string(), events.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3011,14 +3027,20 @@ fn json_parity_ame_toolcall_lifecycle() {
         message: Message::Assistant(Arc::clone(&partial)),
         assistant_message_event: Box::new(toolcall_start),
     });
-    assert_eq!(start_json["assistantMessageEvent"]["type"], "toolcall_start");
+    assert_eq!(
+        start_json["assistantMessageEvent"]["type"],
+        "toolcall_start"
+    );
     assert_eq!(start_json["assistantMessageEvent"]["contentIndex"], 1);
 
     let delta_json = event_to_json(&AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
         assistant_message_event: Box::new(toolcall_delta),
     });
-    assert_eq!(delta_json["assistantMessageEvent"]["type"], "toolcall_delta");
+    assert_eq!(
+        delta_json["assistantMessageEvent"]["type"],
+        "toolcall_delta"
+    );
     assert_eq!(
         delta_json["assistantMessageEvent"]["delta"],
         "{\"path\": \"/tmp/test.txt\"}"
@@ -3051,7 +3073,7 @@ fn json_parity_ame_error_stop_reasons() {
         let done = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
             assistant_message_event: Box::new(AssistantMessageEvent::Done {
-                reason: reason.clone(),
+                reason: *reason,
                 message: Arc::clone(&partial),
             }),
         };
@@ -3065,7 +3087,7 @@ fn json_parity_ame_error_stop_reasons() {
         let err = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
             assistant_message_event: Box::new(AssistantMessageEvent::Error {
-                reason: reason.clone(),
+                reason: *reason,
                 error: Arc::clone(&partial),
             }),
         };
@@ -3076,11 +3098,11 @@ fn json_parity_ame_error_stop_reasons() {
         );
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "AME error stop reasons ok",
-        |ctx| ctx.push(("reasons".to_string(), stop_reasons.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "AME error stop reasons ok", |ctx| {
+            ctx.push(("reasons".to_string(), stop_reasons.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3159,7 +3181,9 @@ fn json_parity_optional_fields_absent_when_none() {
     harness.log().info_ctx(
         "json_parity",
         "optional fields absent when None ok",
-        |ctx| ctx.push(("fields_checked".to_string(), "5".to_string())),
+        |ctx| {
+            ctx.push(("fields_checked".to_string(), "5".to_string()));
+        },
     );
 }
 
@@ -3170,7 +3194,6 @@ fn json_parity_optional_fields_absent_when_none() {
 #[test]
 fn json_parity_content_block_type_tags() {
     let harness = TestHarness::new("json_parity_content_block_type_tags");
-    use pi::model::{ImageContent, ThinkingContent};
 
     let blocks: Vec<(ContentBlock, &str)> = vec![
         (ContentBlock::Text(TextContent::new("hi")), "text"),
@@ -3207,11 +3230,11 @@ fn json_parity_content_block_type_tags() {
         );
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "content block type tags ok",
-        |ctx| ctx.push(("types".to_string(), blocks.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "content block type tags ok", |ctx| {
+            ctx.push(("types".to_string(), blocks.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3221,7 +3244,6 @@ fn json_parity_content_block_type_tags() {
 #[test]
 fn json_parity_assistant_message_mixed_content() {
     let harness = TestHarness::new("json_parity_assistant_message_mixed_content");
-    use pi::model::ThinkingContent;
 
     let msg = AssistantMessage {
         content: vec![
@@ -3270,11 +3292,11 @@ fn json_parity_assistant_message_mixed_content() {
     assert!(content[1].get("text_signature").is_none());
     assert!(content[2].get("thought_signature").is_none());
 
-    harness.log().info_ctx(
-        "json_parity",
-        "mixed content blocks ok",
-        |ctx| ctx.push(("blocks".to_string(), "3".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "mixed content blocks ok", |ctx| {
+            ctx.push(("blocks".to_string(), "3".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3428,11 +3450,11 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         );
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "full lifecycle with tool turn ok",
-        |ctx| ctx.push(("events".to_string(), jsons.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "full lifecycle with tool turn ok", |ctx| {
+            ctx.push(("events".to_string(), jsons.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3510,11 +3532,11 @@ fn json_parity_lifecycle_with_retry() {
     assert!(retry_start_idx < retry_end_idx);
     assert!(retry_end_idx < turn_start_idx);
 
-    harness.log().info_ctx(
-        "json_parity",
-        "lifecycle with retry ok",
-        |ctx| ctx.push(("events".to_string(), jsons.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "lifecycle with retry ok", |ctx| {
+            ctx.push(("events".to_string(), jsons.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3604,11 +3626,11 @@ fn json_parity_lifecycle_with_compaction() {
     assert_eq!(comp_end["result"]["tokensBefore"], 95000);
     assert_eq!(comp_end["result"]["tokensAfter"], 25000);
 
-    harness.log().info_ctx(
-        "json_parity",
-        "lifecycle with compaction ok",
-        |ctx| ctx.push(("events".to_string(), jsons.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "lifecycle with compaction ok", |ctx| {
+            ctx.push(("events".to_string(), jsons.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3629,7 +3651,8 @@ fn json_parity_turn_index_monotonic() {
         events.push(AgentEvent::TurnStart {
             session_id: sid.to_string(),
             turn_index: turn,
-            timestamp: 1_700_000_000 + i64::from(turn as u32),
+            timestamp: 1_700_000_000
+                + i64::from(u32::try_from(turn).expect("turn index fits into u32")),
         });
         events.push(AgentEvent::TurnEnd {
             session_id: sid.to_string(),
@@ -3669,11 +3692,11 @@ fn json_parity_turn_index_monotonic() {
         .collect();
     assert_eq!(start_indices, end_indices, "turn indices must match");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "turn index monotonic ok",
-        |ctx| ctx.push(("turns".to_string(), "5".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "turn index monotonic ok", |ctx| {
+            ctx.push(("turns".to_string(), "5".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3757,11 +3780,11 @@ fn json_parity_turn_end_multiple_tool_results() {
     let results = json["toolResults"].as_array().expect("toolResults array");
     assert_eq!(results.len(), 3, "should have 3 tool results");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "turn_end multiple tool results ok",
-        |ctx| ctx.push(("count".to_string(), "3".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "turn_end multiple tool results ok", |ctx| {
+            ctx.push(("count".to_string(), "3".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3797,11 +3820,11 @@ fn json_parity_agent_end_message_ordering() {
         assert_eq!(text, format!("message {i}"));
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "agent_end message ordering ok",
-        |ctx| ctx.push(("count".to_string(), "5".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "agent_end message ordering ok", |ctx| {
+            ctx.push(("count".to_string(), "5".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3921,7 +3944,9 @@ fn json_parity_extension_event_payload_all_forwarded() {
     harness.log().info_ctx(
         "json_parity",
         "extension event payload all forwarded ok",
-        |ctx| ctx.push(("events".to_string(), events.len().to_string())),
+        |ctx| {
+            ctx.push(("events".to_string(), events.len().to_string()));
+        },
     );
 }
 
@@ -3957,11 +3982,11 @@ fn json_parity_session_header_defaults() {
         assert!(ver.is_number());
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "session header defaults ok",
-        |ctx| ctx.push(("fields".to_string(), "checked".to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "session header defaults ok", |ctx| {
+            ctx.push(("fields".to_string(), "checked".to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -3975,27 +4000,21 @@ fn json_parity_tool_details_edge_cases() {
     let detail_cases: Vec<(Option<Value>, &str)> = vec![
         (None, "null"),
         (Some(json!({})), "empty_object"),
-        (
-            Some(json!({"exitCode": 0, "stdout": "ok"})),
-            "bash_success",
-        ),
+        (Some(json!({"exitCode": 0, "stdout": "ok"})), "bash_success"),
         (
             Some(json!({"exitCode": 1, "stderr": "not found"})),
             "bash_failure",
         ),
         (Some(json!({"size": 0, "lineCount": 0})), "empty_file"),
         (
-            Some(json!({"size": 1048576, "lineCount": 50000})),
+            Some(json!({"size": 1_048_576, "lineCount": 50_000})),
             "large_file",
         ),
         (
             Some(json!({"matchCount": 42, "fileCount": 7})),
             "grep_result",
         ),
-        (
-            Some(json!({"linesChanged": 5, "hunks": 2})),
-            "edit_result",
-        ),
+        (Some(json!({"linesChanged": 5, "hunks": 2})), "edit_result"),
     ];
 
     for (details, label) in &detail_cases {
@@ -4020,19 +4039,16 @@ fn json_parity_tool_details_edge_cases() {
                 );
             }
             Some(expected) => {
-                assert_eq!(
-                    &result["details"], expected,
-                    "details mismatch: {label}"
-                );
+                assert_eq!(&result["details"], expected, "details mismatch: {label}");
             }
         }
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "tool details edge cases ok",
-        |ctx| ctx.push(("cases".to_string(), detail_cases.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "tool details edge cases ok", |ctx| {
+            ctx.push(("cases".to_string(), detail_cases.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -4114,11 +4130,11 @@ fn json_parity_multi_tool_turn() {
     let unique: std::collections::HashSet<&&str> = ids.iter().collect();
     assert_eq!(ids.len(), unique.len(), "toolCallIds must be unique");
 
-    harness.log().info_ctx(
-        "json_parity",
-        "multi-tool turn ok",
-        |ctx| ctx.push(("tools".to_string(), tools.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "multi-tool turn ok", |ctx| {
+            ctx.push(("tools".to_string(), tools.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -4128,7 +4144,6 @@ fn json_parity_multi_tool_turn() {
 #[test]
 fn json_parity_thinking_content_camel_case() {
     let harness = TestHarness::new("json_parity_thinking_content_camel_case");
-    use pi::model::ThinkingContent;
 
     let tc = ThinkingContent {
         thinking: "deep thought".to_string(),
@@ -4160,7 +4175,6 @@ fn json_parity_thinking_content_camel_case() {
 #[test]
 fn json_parity_image_content_camel_case() {
     let harness = TestHarness::new("json_parity_image_content_camel_case");
-    use pi::model::ImageContent;
 
     let img = ImageContent {
         data: "iVBORw0KGgoAAAANS".to_string(),
@@ -4230,10 +4244,7 @@ fn json_parity_special_chars_in_tool_args() {
         ("null_byte", json!({"data": "before\x00after"})),
         ("tab", json!({"tsv": "col1\tcol2\tcol3"})),
         ("newline", json!({"multiline": "line1\nline2\nline3"})),
-        (
-            "control_chars",
-            json!({"raw": "\x01\x02\x03\x1b[31m"}),
-        ),
+        ("control_chars", json!({"raw": "\x01\x02\x03\x1b[31m"})),
     ];
 
     for (label, args) in &special_cases {
@@ -4253,11 +4264,11 @@ fn json_parity_special_chars_in_tool_args() {
         assert_eq!(parsed["args"], *args, "round-trip mismatch: {label}");
     }
 
-    harness.log().info_ctx(
-        "json_parity",
-        "special chars in tool args ok",
-        |ctx| ctx.push(("cases".to_string(), special_cases.len().to_string())),
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "special chars in tool args ok", |ctx| {
+            ctx.push(("cases".to_string(), special_cases.len().to_string()));
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -4284,11 +4295,9 @@ fn json_parity_extension_ui_null_payload_fields() {
     assert!(event["notifyType"].is_null());
     assert!(event["extra"].is_null());
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension UI null payload fields ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension UI null payload fields ok", |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -4305,11 +4314,9 @@ fn json_parity_extension_ui_array_payload() {
     // Array payloads cannot be flattened → stored under "payload" key.
     assert_eq!(event["payload"], json!(["item1", "item2"]));
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension UI array payload ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension UI array payload ok", |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -4329,9 +4336,7 @@ fn json_parity_extension_ui_numeric_payload() {
     let event_bool = req_bool.to_rpc_event();
     assert_eq!(event_bool["payload"], true);
 
-    harness.log().info_ctx(
-        "json_parity",
-        "extension UI numeric payload ok",
-        |_| {},
-    );
+    harness
+        .log()
+        .info_ctx("json_parity", "extension UI numeric payload ok", |_| {});
 }

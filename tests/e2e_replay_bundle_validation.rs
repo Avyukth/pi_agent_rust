@@ -125,6 +125,27 @@ fn run_all_emits_semantic_mirrored_diff_sections() {
     }
 }
 
+/// Verify that triage diff generation enforces deterministic ordering for
+/// machine-readable output consumed by CI gates.
+#[test]
+fn run_all_enforces_deterministic_triage_diff_ordering() {
+    let script = load_run_all_script();
+
+    assert!(
+        script.contains("all_names = sorted(set(baseline_index) | set(current_index))"),
+        "triage diff should sort merged section keys for deterministic ordering"
+    );
+    assert!(
+        script
+            .contains("workflows.sort(key=lambda entry: str(entry.get(\"workflow_id\") or \"\"))"),
+        "mirrored scenario workflows should be sorted by workflow_id"
+    );
+    assert!(
+        script.contains("diagnostics.sort("),
+        "ranked diagnostics should be sorted deterministically"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 2: Failure diagnostics infrastructure
 // ═══════════════════════════════════════════════════════════════════════════

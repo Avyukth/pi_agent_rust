@@ -3,7 +3,7 @@
 mod common;
 
 use asupersync::runtime::RuntimeBuilder;
-use common::TestHarness;
+use common::{TestHarness, validate_jsonl};
 use pi::Error;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
 use pi::session::{
@@ -1078,4 +1078,50 @@ fn save_preserves_message_timestamps() {
             panic!("Expected Message entry");
         }
     });
+}
+
+#[test]
+fn dropin174_session_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_session_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("parity", "DROPIN-174 session parity trace", |ctx| {
+            ctx.push(("requirement_id".to_string(), "DROPIN-143".to_string()));
+            ctx.push(("surface".to_string(), "session".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Session/branch/compaction behavior parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.dump_logs();
+    let errors = validate_jsonl(&jsonl);
+    assert!(
+        errors.is_empty(),
+        "harness log JSONL must validate: {errors:?}"
+    );
+
+    let matched = jsonl
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json log line"))
+        .filter(|value| value.get("category").and_then(serde_json::Value::as_str) == Some("parity"))
+        .any(|value| {
+            let Some(ctx) = value.get("context").and_then(serde_json::Value::as_object) else {
+                return false;
+            };
+            ctx.get("requirement_id")
+                .and_then(serde_json::Value::as_str)
+                == Some("DROPIN-143")
+                && ctx.get("surface").and_then(serde_json::Value::as_str) == Some("session")
+                && ctx
+                    .get("parity_requirement")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Session/branch/compaction behavior parity")
+        });
+
+    assert!(
+        matched,
+        "expected a parity log line with DROPIN-143 session requirement context"
+    );
 }

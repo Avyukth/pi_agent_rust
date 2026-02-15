@@ -25,6 +25,7 @@ files = [
     "compaction_bug",
     "config_edge_cases",
     "config_precedence",
+    "cross_surface_parity",
     "e2e_artifact_retention_triage",
     "e2e_replay_bundle_validation",
     "error_types",
@@ -59,6 +60,7 @@ files = [
     "incident_evidence_bundle_sec53",
     "install_time_security_scanner",
     "interactive_commands_unit",
+    "json_mode_parity",
     "ledger_calibration_sec35",
     "policy_profile_hardening",
     "risk_scorer_golden_fixtures",
@@ -74,6 +76,8 @@ files = [
     "validate_e2e_artifact_schema",
     "vcr_parity_validation",
     "edit_empty_string_repro",
+    "sdk_api",
+    "sdk_unit",
 ]
 
 [suite.vcr]
@@ -137,6 +141,7 @@ files = [
     "extensions_repair_events",
     "extensions_reliability",
     "extensions_stress",
+    "graduated_rollout_integration_sec72",
     "adversarial_extensions",
     "exec_mediation_integration",
     "extension_lockfile_provenance",
@@ -191,6 +196,7 @@ files = [
     "session_connector_conformance",
     "session_index_tests",
     "session_picker",
+    "sdk_integration",
     "session_sqlite",
     "sse_strict_compliance",
     "streaming_hostcall",
@@ -207,6 +213,7 @@ files = [
     "e2e_auto_repair",
     "e2e_cli",
     "e2e_cross_provider_parity",
+    "e2e_golden_corpus",
     "e2e_extension_registration",
     "e2e_failure_injection_recovery",
     "e2e_golden_path",
