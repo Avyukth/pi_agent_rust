@@ -3653,6 +3653,56 @@ regression_count = len(unit_regressions) + len(suite_regressions)
 new_failure_count = len(unit_new_failures) + len(suite_new_failures)
 unresolved_count = len(unit_unresolved) + len(suite_unresolved)
 fixed_count = len(unit_diff["fixed"]) + len(suite_diff["fixed"])
+suite_categories = build_category_map(suite_diff)
+baseline_suite_index = build_index(baseline_summary, "suites", "suite")
+current_suite_index = build_index(current_summary, "suites", "suite")
+baseline_diag = load_failure_diagnostics(baseline_summary, baseline_summary_path)
+current_diag = load_failure_diagnostics(current_summary, current_summary_path)
+semantic_diffs, unresolved_semantic_count = build_semantic_diffs(
+    suite_categories=suite_categories,
+    baseline_diag=baseline_diag,
+    current_diag=current_diag,
+)
+semantic_by_suite = {
+    str(entry["suite"]): entry
+    for entry in semantic_diffs
+    if isinstance(entry, dict) and isinstance(entry.get("suite"), str)
+}
+
+scenario_matrix_path = project_root / "docs" / "e2e_scenario_matrix.json"
+scenario_rows: list[dict] = []
+scenario_matrix_payload = read_json(scenario_matrix_path)
+if isinstance(scenario_matrix_payload, dict):
+    rows = scenario_matrix_payload.get("rows")
+    if isinstance(rows, list):
+        scenario_rows = [row for row in rows if isinstance(row, dict)]
+
+mirrored_scenarios = build_mirrored_scenario_report(
+    scenario_rows=scenario_rows,
+    baseline_suite_index=baseline_suite_index,
+    current_suite_index=current_suite_index,
+    semantic_by_suite=semantic_by_suite,
+)
+mirrored_summary = (
+    mirrored_scenarios.get("summary", {})
+    if isinstance(mirrored_scenarios, dict)
+    else {}
+)
+mirrored_semantic_mismatch_workflow_count = (
+    mirrored_summary.get("semantic_mismatch_workflows", 0)
+    if isinstance(mirrored_summary.get("semantic_mismatch_workflows", 0), int)
+    else 0
+)
+mirrored_incomplete_workflow_count = (
+    mirrored_summary.get("incomplete_mirroring_workflows", 0)
+    if isinstance(mirrored_summary.get("incomplete_mirroring_workflows", 0), int)
+    else 0
+)
+mirrored_evaluated_workflow_count = (
+    mirrored_summary.get("evaluated_workflows", 0)
+    if isinstance(mirrored_summary.get("evaluated_workflows", 0), int)
+    else 0
+)
 
 recommended_commands = {
     "runner_repro_command": build_runner_command(triage_unit_focus, triage_suite_focus)
@@ -3675,10 +3725,29 @@ for item in ranked_diagnostics:
     seen_commands.add(command)
     ranked_repro_commands.append(command)
 recommended_commands["ranked_repro_commands"] = ranked_repro_commands
+semantic_focus_commands: list[str] = []
+seen_semantic_commands: set[str] = set()
+for entry in semantic_diffs:
+    if not isinstance(entry, dict):
+        continue
+    if not bool(entry.get("unresolved")):
+        continue
+    command = entry.get("recommended_command")
+    if not isinstance(command, str) or not command:
+        continue
+    if command in seen_semantic_commands:
+        continue
+    seen_semantic_commands.add(command)
+    semantic_focus_commands.append(command)
+recommended_commands["semantic_focus_commands"] = semantic_focus_commands
 
 status = "regression" if (regression_count > 0 or new_failure_count > 0) else "stable"
 if status == "stable" and unresolved_count > 0:
     status = "known_failures_only"
+if status in {"stable", "known_failures_only"} and unresolved_semantic_count > 0:
+    status = "semantic_mismatch"
+if status == "stable" and mirrored_incomplete_workflow_count > 0:
+    status = "incomplete_mirroring"
 
 payload = {
     "schema": "pi.e2e.triage_diff.v1",
@@ -3695,6 +3764,10 @@ payload = {
         "fixed_count": fixed_count,
         "unit_regression_count": len(unit_regressions),
         "suite_regression_count": len(suite_regressions),
+        "semantic_mismatch_count": unresolved_semantic_count,
+        "mirrored_evaluated_workflow_count": mirrored_evaluated_workflow_count,
+        "mirrored_semantic_mismatch_workflow_count": mirrored_semantic_mismatch_workflow_count,
+        "mirrored_incomplete_workflow_count": mirrored_incomplete_workflow_count,
     },
     "unit_targets": unit_diff,
     "suites": suite_diff,
@@ -3702,6 +3775,12 @@ payload = {
         "unit_targets": triage_unit_focus,
         "suites": triage_suite_focus,
     },
+    "semantic_diffs": {
+        "schema": "pi.e2e.semantic_diff.v1",
+        "unresolved_count": unresolved_semantic_count,
+        "entries": semantic_diffs,
+    },
+    "mirrored_scenarios": mirrored_scenarios,
     "ranked_diagnostics": ranked_diagnostics,
     "recommended_commands": recommended_commands,
 }
@@ -3718,7 +3797,12 @@ current_summary["triage_diff"] = {
     "new_failure_count": new_failure_count,
     "unresolved_failure_count": unresolved_count,
     "fixed_count": fixed_count,
+    "semantic_mismatch_count": unresolved_semantic_count,
+    "mirrored_evaluated_workflow_count": mirrored_evaluated_workflow_count,
+    "mirrored_semantic_mismatch_workflow_count": mirrored_semantic_mismatch_workflow_count,
+    "mirrored_incomplete_workflow_count": mirrored_incomplete_workflow_count,
     "top_ranked_diagnostics": ranked_diagnostics[:5],
+    "top_semantic_diffs": semantic_diffs[:5],
 }
 current_summary_path.write_text(json.dumps(current_summary, indent=2) + "\n", encoding="utf-8")
 
@@ -3729,8 +3813,18 @@ print(
     "- Summary: regressions="
     f"{regression_count}, new_failures={new_failure_count}, unresolved={unresolved_count}, fixed={fixed_count}"
 )
+print(
+    "- Semantic: mismatches="
+    f"{unresolved_semantic_count}, mirrored_workflows={mirrored_evaluated_workflow_count}, "
+    f"mirrored_semantic_mismatches={mirrored_semantic_mismatch_workflow_count}, "
+    f"mirrored_incomplete={mirrored_incomplete_workflow_count}"
+)
 if recommended_commands["runner_repro_command"]:
     print(f"- Repro runner: {recommended_commands['runner_repro_command']}")
+if recommended_commands["semantic_focus_commands"]:
+    print("- Semantic repro focus:")
+    for command in recommended_commands["semantic_focus_commands"][:5]:
+        print(f"  - {command}")
 if ranked_diagnostics:
     print("- Ranked diagnostics:")
     for item in ranked_diagnostics[:5]:

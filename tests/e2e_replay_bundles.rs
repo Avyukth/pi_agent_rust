@@ -708,6 +708,11 @@ fn triage_diff_includes_replay_metadata() {
     let has_runner_repro = content.contains("runner_repro_command");
     let has_target_commands = content.contains("target_commands");
     let has_ranked_repro = content.contains("ranked_repro_commands");
+    let has_semantic_diffs = content.contains("semantic_diffs");
+    let has_mirrored_scenarios = content.contains("mirrored_scenarios");
+    let has_semantic_schema = content.contains("pi.e2e.semantic_diff.v1");
+    let has_mirrored_schema = content.contains("pi.e2e.mirrored_scenarios.v1");
+    let has_semantic_focus = content.contains("semantic_focus_commands");
 
     eprintln!(
         "  runner_repro_command: {}",
@@ -733,6 +738,46 @@ fn triage_diff_includes_replay_metadata() {
             "MISSING"
         }
     );
+    eprintln!(
+        "  semantic_diffs: {}",
+        if has_semantic_diffs {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  mirrored_scenarios: {}",
+        if has_mirrored_scenarios {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  semantic_diff schema: {}",
+        if has_semantic_schema {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  mirrored_scenarios schema: {}",
+        if has_mirrored_schema {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
+    eprintln!(
+        "  semantic_focus_commands: {}",
+        if has_semantic_focus {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
 
     assert!(
         has_runner_repro,
@@ -745,6 +790,26 @@ fn triage_diff_includes_replay_metadata() {
     assert!(
         has_ranked_repro,
         "triage_diff must include ranked_repro_commands"
+    );
+    assert!(
+        has_semantic_diffs,
+        "triage_diff must include semantic_diffs"
+    );
+    assert!(
+        has_mirrored_scenarios,
+        "triage_diff must include mirrored_scenarios"
+    );
+    assert!(
+        has_semantic_schema,
+        "triage_diff semantic_diffs must declare pi.e2e.semantic_diff.v1 schema"
+    );
+    assert!(
+        has_mirrored_schema,
+        "triage_diff mirrored_scenarios must declare pi.e2e.mirrored_scenarios.v1 schema"
+    );
+    assert!(
+        has_semantic_focus,
+        "triage_diff must include semantic_focus_commands"
     );
 
     // Verify triage_diff is written to summary.json

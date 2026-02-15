@@ -105,6 +105,26 @@ fn run_all_supports_diff_from_flag() {
     );
 }
 
+/// Verify that differential runner output includes semantic and mirrored
+/// scenario evidence sections suitable for CI gating.
+#[test]
+fn run_all_emits_semantic_mirrored_diff_sections() {
+    let script = load_run_all_script();
+    let required_markers = [
+        "semantic_diffs",
+        "mirrored_scenarios",
+        "semantic_focus_commands",
+        "pi.e2e.semantic_diff.v1",
+        "pi.e2e.mirrored_scenarios.v1",
+    ];
+    for marker in &required_markers {
+        assert!(
+            script.contains(marker),
+            "run_all.sh differential output missing marker: {marker}"
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 2: Failure diagnostics infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
