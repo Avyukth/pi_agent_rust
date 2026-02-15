@@ -138,6 +138,50 @@ Report files are written to `fuzz/reports/p2_validation_*.json` and include:
 - per-target status (`pass`/`fail`/`crashed`), exit code, duration, corpus growth, artifact growth
 - summary counters for pass/fail/crash totals and aggregate timings
 
+## FUZZ-V3 Unified Orchestration (`bd-cz006`)
+
+Use the master orchestrator when you want a single command that runs both phases,
+emits a JSONL event stream, and writes a unified summary report.
+
+```bash
+# Full pipeline: P1 + P2 (60s per fuzz target)
+./scripts/fuzz_e2e.sh
+
+# Quick mode: P1 + short P2 smoke (10s, defaults to fuzz_smoke target)
+./scripts/fuzz_e2e.sh --quick
+
+# Deep mode: P1 + long P2 burn-in (1800s per target)
+./scripts/fuzz_e2e.sh --deep
+
+# Regenerate unified report/events from latest P1/P2 reports
+./scripts/fuzz_e2e.sh --report
+```
+
+Useful options:
+- `--p1-min-cases=N` override P1 aggregate case threshold
+- `--p2-time=SECONDS` override P2 per-target budget
+- `--target=NAME` restrict P2 target set (repeatable)
+- `--no-rch` / `--require-rch` forward execution policy to phase scripts
+- `--output=PATH` and `--events=PATH` customize output file locations
+
+Generated artifacts (default paths):
+- `fuzz/reports/fuzz_e2e_*.json` unified pipeline report
+- `fuzz/reports/fuzz_e2e_*.jsonl` per-step event log (`pipeline_start`, phase start/end, report generation, pipeline end)
+- `fuzz/reports/fuzz_e2e_*.log` operator-facing execution log
+
+Unified report structure includes:
+- `phases.P1_proptest` (embedded P1 report)
+- `phases.P2_libfuzzer` (embedded P2 report)
+- `phase_runs` metadata (phase exit/time/report paths)
+- summarized verdict fields (`overall_status`, totals, `exit_code`)
+
+Master script exit codes:
+- `0`: all phases pass
+- `1`: P1 failures
+- `2`: P2 crashes/failures
+- `3`: both P1 and P2 failures
+- `4`: P2 build/infrastructure failure
+
 ## Seed Corpus Management
 
 General rule: each corpus should contain diverse valid inputs plus known edge/failure shapes.
@@ -166,29 +210,106 @@ When adding seeds:
 3. Preserve provenance in filenames where possible (`provider_case_event`, `fixture_case`, etc.).
 4. Re-run at least a short smoke fuzz pass for affected targets.
 
-## Crash Triage Workflow
+## Crash Corpus Management
 
-When a target crashes, `cargo-fuzz` writes a reproducer under `fuzz/artifacts/<target>/`.
+Crash lifecycle is managed by `scripts/fuzz_crash_manage.sh` and follows a structured pipeline:
 
-1. Reproduce deterministically:
-
-```bash
-rch exec -- cargo fuzz run <target> fuzz/artifacts/<target>/crash-... 
+```
+artifacts/<target>/crash-*  ──triage──>  crashes/<target>/<cat>-NNN.bin  ──regress──>  regression/<target>/<cat>-NNN.bin
+  (transient, gitignored)                 (committed, tracked)                          (committed, regression)
 ```
 
-2. Minimize corpus/crash input:
+### Directory Layout
+
+- `fuzz/artifacts/<target>/`: Raw crash inputs from libFuzzer (gitignored, transient)
+- `fuzz/crashes/<target>/`: Minimized, categorized crashes with JSON metadata (committed)
+- `fuzz/regression/<target>/`: Fixed crashes preserved as regression inputs (committed)
+
+### Crash Categories
+
+| Category | Description |
+|----------|-------------|
+| `oom` | Memory exhaustion from unbounded allocation |
+| `stack-overflow` | Deep recursion without limit |
+| `panic-unwrap` | `.unwrap()` on `None`/`Err` |
+| `panic-index` | Array/slice index out of bounds |
+| `panic-assertion` | `assert!` or `debug_assert!` failure |
+| `timeout` | Infinite loop or catastrophic backtracking |
+| `logic-error` | Incorrect behavior found by harness assertions |
+| `unknown` | Uncategorized or pending investigation |
+
+### Crash Triage Workflow
+
+1. **Discover**: Run fuzzer, check for new artifacts:
 
 ```bash
-rch exec -- cargo fuzz cmin <target>
+./scripts/fuzz_crash_manage.sh triage
 ```
 
-3. Fix root cause in source code.
-4. Add regression coverage:
+2. **Reproduce**: Confirm the crash is deterministic:
 
-- add or keep minimized crash input in corpus when appropriate
-- add unit/integration test if the behavior maps to a stable contract
+```bash
+rch exec -- cargo fuzz run <target> fuzz/artifacts/<target>/crash-<hash>
+```
 
-5. Re-run smoke fuzzing for that target.
+3. **Minimize**: Reduce crash input to minimal reproducer:
+
+```bash
+./scripts/fuzz_crash_manage.sh minimize <target> fuzz/artifacts/<target>/crash-<hash>
+```
+
+4. **Categorize and store**: Move to tracked crashes with metadata:
+
+```bash
+./scripts/fuzz_crash_manage.sh store <target> fuzz/artifacts/<target>/crash-<hash> \
+    --category=panic-unwrap --description="Description of the crash"
+```
+
+5. **Fix**: Address root cause in source code.
+
+6. **Regression**: Move fixed crash to regression corpus:
+
+```bash
+./scripts/fuzz_crash_manage.sh regress <target> panic-unwrap-001.bin --bead=bd-XXXX
+```
+
+7. **Verify**: Re-run smoke fuzzing and confirm no regression:
+
+```bash
+rch exec -- cargo fuzz run <target> -- -max_total_time=60
+```
+
+### Crash Report
+
+Generate a summary of all crashes (open and resolved):
+
+```bash
+# Human-readable
+./scripts/fuzz_crash_manage.sh report
+
+# Machine-readable JSON (pi.fuzz.crash_report.v1)
+./scripts/fuzz_crash_manage.sh report --format=json
+```
+
+### Metadata Sidecar Format
+
+Each stored crash has a `.json` sidecar with schema `pi.fuzz.crash_metadata.v1`:
+
+```json
+{
+  "schema": "pi.fuzz.crash_metadata.v1",
+  "target": "fuzz_sse_parser",
+  "category": "panic-unwrap",
+  "original_artifact": "crash-28de6b...",
+  "stored_as": "panic-unwrap-001.bin",
+  "description": "SSE parser crash on malformed input",
+  "stored_at": "2026-02-15T03:45:53Z",
+  "size_bytes": 185,
+  "status": "open"
+}
+```
+
+When resolved via `regress`, the metadata gains `resolved_at` and `bead` fields.
 
 ## Multi-Agent Coordination
 

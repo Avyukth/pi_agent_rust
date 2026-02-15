@@ -59,6 +59,56 @@ run_cmd() {
     fi
 }
 
+resolve_target_triple() {
+    local host_triple=""
+    host_triple="$(rustc -vV 2>/dev/null | awk '/^host: / { print $2; exit }')"
+    if [ -n "$host_triple" ]; then
+        echo "$host_triple"
+    else
+        echo "x86_64-unknown-linux-gnu"
+    fi
+}
+
+resolve_target_binary() {
+    local bin_name="$1"
+    local primary="$FUZZ_BIN_DIR/$bin_name"
+    local fallback=""
+
+    if [ -x "$primary" ]; then
+        echo "$primary"
+        return 0
+    fi
+
+    fallback="$(find "$CARGO_TARGET_DIR" -type f -path "*/release/$bin_name" -perm -u+x 2>/dev/null | head -n 1)"
+    if [ -n "$fallback" ] && [ -x "$fallback" ]; then
+        echo "$fallback"
+        return 0
+    fi
+
+    return 1
+}
+
+choose_target_root() {
+    local local_root="$PROJECT_ROOT/.tmp/${USER:-agent}"
+    local shm_root="/dev/shm/pi_agent_rust/${USER:-agent}"
+    local min_shm_free_kb="${FUZZ_VALIDATE_MIN_SHM_KB:-8388608}" # 8 GiB default
+    local shm_free_kb=""
+
+    if ! is_positive_int "$min_shm_free_kb"; then
+        min_shm_free_kb=8388608
+    fi
+
+    if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+        shm_free_kb="$(df -Pk /dev/shm 2>/dev/null | awk 'NR==2 {print $4}')"
+        if is_positive_int "$shm_free_kb" && [ "$shm_free_kb" -ge "$min_shm_free_kb" ]; then
+            echo "$shm_root"
+            return
+        fi
+    fi
+
+    echo "$local_root"
+}
+
 # -------------------------------------------------------------------
 # Parse arguments
 # -------------------------------------------------------------------
@@ -152,11 +202,7 @@ echo ""
 cd "$FUZZ_DIR"
 
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    if [ -d /dev/shm ] && [ -w /dev/shm ]; then
-        TARGET_ROOT="/dev/shm/pi_agent_rust/${USER:-agent}"
-    else
-        TARGET_ROOT="$PROJECT_ROOT/.tmp/${USER:-agent}"
-    fi
+    TARGET_ROOT="$(choose_target_root)"
     export CARGO_TARGET_DIR="$TARGET_ROOT/fuzz_validate_${STAMP}_$$/target"
 fi
 
@@ -219,10 +265,17 @@ EOFJSON
     exit 1
 fi
 
+TARGET_TRIPLE="$(resolve_target_triple)"
+FUZZ_BIN_DIR="$CARGO_TARGET_DIR/$TARGET_TRIPLE/release"
+
+echo "Target triple: $TARGET_TRIPLE"
+echo "Fuzz binary directory: $FUZZ_BIN_DIR"
+echo ""
+
 # -------------------------------------------------------------------
 # Step 2: List/filter fuzz targets
 # -------------------------------------------------------------------
-mapfile -t ALL_TARGETS < <(run_cmd cargo fuzz list 2>/dev/null | sed '/^[[:space:]]*$/d')
+mapfile -t ALL_TARGETS < <(cargo fuzz list 2>/dev/null | sed '/^[[:space:]]*$/d')
 
 if [ "${#ALL_TARGETS[@]}" -eq 0 ]; then
     echo "No fuzz targets found." >&2
@@ -286,11 +339,18 @@ for target in "${TARGETS[@]}"; do
     SEED_CORPUS="$INITIAL_CORPUS"
 
     RUN_START_NS=$(date +%s%N)
-    run_cmd cargo fuzz run "$target" \
-        -- -max_total_time="$MAX_TIME" \
-        -artifact_prefix="$ARTIFACT_DIR/" \
-        2>&1 | tee "$TARGET_LOG"
-    TARGET_EXIT=${PIPESTATUS[0]}
+    TARGET_BIN=""
+    if TARGET_BIN="$(resolve_target_binary "$target")"; then
+        "$TARGET_BIN" \
+            -max_total_time="$MAX_TIME" \
+            -artifact_prefix="$ARTIFACT_DIR/" \
+            "$CORPUS_DIR" \
+            2>&1 | tee "$TARGET_LOG"
+        TARGET_EXIT=${PIPESTATUS[0]}
+    else
+        echo "Missing executable for target '$target' under $CARGO_TARGET_DIR" | tee "$TARGET_LOG"
+        TARGET_EXIT=127
+    fi
     RUN_END_NS=$(date +%s%N)
     RUN_TIME_MS=$(( (RUN_END_NS - RUN_START_NS) / 1000000 ))
     TOTAL_RUN_TIME_MS=$((TOTAL_RUN_TIME_MS + RUN_TIME_MS))
