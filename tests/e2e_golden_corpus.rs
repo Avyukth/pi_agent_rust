@@ -607,6 +607,11 @@ fn golden_corpus_error_cases() {
     run_surface_fixtures("error_cases");
 }
 
+#[test]
+fn golden_corpus_rpc_mode() {
+    run_surface_fixtures("rpc_mode");
+}
+
 /// @file expansion requires runtime cassette construction (dynamic body).
 /// Run with `--ignored` to include.
 #[test]
@@ -627,6 +632,7 @@ fn golden_corpus_manifest_coverage() {
         "print_stdin",
         "json_mode",
         "json_mode_stdin",
+        "rpc_mode",
         "error_cases",
     ];
 
