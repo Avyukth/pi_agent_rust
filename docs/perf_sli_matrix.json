@@ -1,0 +1,291 @@
+{
+  "schema": "pi.perf.sli_matrix.v1",
+  "bead_id": "bd-3ar8v.1.6",
+  "updated_at": "2026-02-15",
+  "source_inputs": [
+    "BENCHMARKS.md",
+    "docs/e2e_scenario_matrix.json",
+    "docs/testing-policy.md",
+    ".beads/issues.jsonl"
+  ],
+  "metric_hierarchy": {
+    "primary": [
+      "sli_e2e_turn_latency_p95_ms",
+      "sli_time_to_first_token_p95_ms",
+      "sli_resume_ready_p95_ms"
+    ],
+    "secondary": [
+      "sli_stream_tail_stability_ratio_p99_over_p50",
+      "sli_tool_roundtrip_p95_ms",
+      "sli_extension_action_p95_ms",
+      "sli_failure_recovery_success_rate"
+    ],
+    "policy": "E2E and user-visible latency SLIs are release-deciding. Micro-benchmarks and component counters are supporting diagnostics only."
+  },
+  "sli_catalog": [
+    {
+      "sli_id": "sli_e2e_turn_latency_p95_ms",
+      "name": "End-to-end turn latency (p95)",
+      "kind": "latency_ms",
+      "thresholds": {
+        "target_lte": 2200,
+        "warning_lte": 3200,
+        "critical_gt": 3200
+      },
+      "user_interpretation": {
+        "target": "Typical coding turns feel fast and uninterrupted.",
+        "warning": "Users notice occasional sluggish turns.",
+        "critical": "Turns feel slow and break flow."
+      }
+    },
+    {
+      "sli_id": "sli_time_to_first_token_p95_ms",
+      "name": "Interactive time-to-first-token (p95)",
+      "kind": "latency_ms",
+      "thresholds": {
+        "target_lte": 1200,
+        "warning_lte": 2000,
+        "critical_gt": 2000
+      },
+      "user_interpretation": {
+        "target": "Assistant appears quickly after submit.",
+        "warning": "Response feels delayed but usable.",
+        "critical": "UI feels stalled before output starts."
+      }
+    },
+    {
+      "sli_id": "sli_resume_ready_p95_ms",
+      "name": "Session resume ready latency (p95)",
+      "kind": "latency_ms",
+      "thresholds": {
+        "target_lte": 450,
+        "warning_lte": 900,
+        "critical_gt": 900
+      },
+      "user_interpretation": {
+        "target": "Resume is effectively instant.",
+        "warning": "Resume is noticeable but acceptable.",
+        "critical": "Resume causes repeated workflow interruption."
+      }
+    },
+    {
+      "sli_id": "sli_stream_tail_stability_ratio_p99_over_p50",
+      "name": "Streaming tail stability (p99/p50 ratio)",
+      "kind": "ratio",
+      "thresholds": {
+        "target_lte": 3.0,
+        "warning_lte": 4.5,
+        "critical_gt": 4.5
+      },
+      "user_interpretation": {
+        "target": "Streaming pace is steady and predictable.",
+        "warning": "Intermittent stutter appears on long outputs.",
+        "critical": "Streaming jitter is obvious and disruptive."
+      }
+    },
+    {
+      "sli_id": "sli_tool_roundtrip_p95_ms",
+      "name": "Built-in tool roundtrip latency (p95)",
+      "kind": "latency_ms",
+      "thresholds": {
+        "target_lte": 350,
+        "warning_lte": 700,
+        "critical_gt": 700
+      },
+      "user_interpretation": {
+        "target": "Tool actions feel immediate.",
+        "warning": "Tool calls feel a bit heavy.",
+        "critical": "Tool calls noticeably block momentum."
+      }
+    },
+    {
+      "sli_id": "sli_extension_action_p95_ms",
+      "name": "Extension action latency (p95)",
+      "kind": "latency_ms",
+      "thresholds": {
+        "target_lte": 450,
+        "warning_lte": 900,
+        "critical_gt": 900
+      },
+      "user_interpretation": {
+        "target": "Extensions feel integrated and responsive.",
+        "warning": "Extension actions feel delayed.",
+        "critical": "Extension operations feel unreliable/slow."
+      }
+    },
+    {
+      "sli_id": "sli_failure_recovery_success_rate",
+      "name": "Failure/recovery success rate",
+      "kind": "percent",
+      "thresholds": {
+        "target_gte": 99.0,
+        "warning_gte": 97.0,
+        "critical_lt": 97.0
+      },
+      "user_interpretation": {
+        "target": "Interruptions and retries recover reliably.",
+        "warning": "Recovery usually works but needs occasional manual intervention.",
+        "critical": "Recovery failures are frequent and user-visible."
+      }
+    }
+  ],
+  "benchmark_partitions": {
+    "realistic_long_session": [
+      "realistic_100k",
+      "realistic_200k",
+      "realistic_500k",
+      "realistic_1m",
+      "realistic_5m"
+    ],
+    "matched_state": [
+      "matched_state_100k",
+      "matched_state_200k",
+      "matched_state_500k",
+      "matched_state_1m",
+      "matched_state_5m"
+    ]
+  },
+  "scenario_sli_matrix": [
+    {
+      "scenario_id": "wf-cli-onboarding-and-slash-commands",
+      "sli_ids": [
+        "sli_time_to_first_token_p95_ms",
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "user_outcome": "First-run and slash-command control loops feel responsive."
+    },
+    {
+      "scenario_id": "wf-agent-loop-and-tool-roundtrip",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms",
+        "sli_tool_roundtrip_p95_ms",
+        "sli_stream_tail_stability_ratio_p99_over_p50"
+      ],
+      "user_outcome": "Normal coding turns and built-in tools stay fast and stable."
+    },
+    {
+      "scenario_id": "wf-provider-streaming-and-deterministic-parity",
+      "sli_ids": [
+        "sli_time_to_first_token_p95_ms",
+        "sli_stream_tail_stability_ratio_p99_over_p50",
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "user_outcome": "Streaming begins quickly and remains smooth across providers."
+    },
+    {
+      "scenario_id": "wf-extension-registration-and-ts-loading",
+      "sli_ids": [
+        "sli_extension_action_p95_ms",
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "user_outcome": "Extension enable/load path remains practical for daily use."
+    },
+    {
+      "scenario_id": "wf-session-control-persistence-recovery",
+      "sli_ids": [
+        "sli_resume_ready_p95_ms",
+        "sli_failure_recovery_success_rate"
+      ],
+      "user_outcome": "Resume and session control operations recover reliably."
+    },
+    {
+      "scenario_id": "wf-rpc-endpoint-integration",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms",
+        "sli_time_to_first_token_p95_ms"
+      ],
+      "user_outcome": "IDE and automation RPC flows stay responsive."
+    },
+    {
+      "scenario_id": "wf-tui-interactive-journeys",
+      "sli_ids": [
+        "sli_time_to_first_token_p95_ms",
+        "sli_stream_tail_stability_ratio_p99_over_p50",
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "user_outcome": "Interactive terminal journeys remain fluid."
+    },
+    {
+      "scenario_id": "wf-library-runtime-integration",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms",
+        "sli_resume_ready_p95_ms"
+      ],
+      "user_outcome": "Embedded/SDK integration keeps low-latency behavior."
+    },
+    {
+      "scenario_id": "wf-preflight-policy-and-auto-repair",
+      "sli_ids": [
+        "sli_extension_action_p95_ms",
+        "sli_failure_recovery_success_rate"
+      ],
+      "user_outcome": "Policy checks and auto-repair do not create UX stalls."
+    },
+    {
+      "scenario_id": "wf-live-provider-parity-and-auth",
+      "sli_ids": [
+        "sli_time_to_first_token_p95_ms",
+        "sli_e2e_turn_latency_p95_ms",
+        "sli_failure_recovery_success_rate"
+      ],
+      "user_outcome": "Live auth/provider paths remain responsive and recoverable."
+    },
+    {
+      "scenario_id": "wf-failure-injection-and-recovery-pack",
+      "sli_ids": [
+        "sli_failure_recovery_success_rate",
+        "sli_resume_ready_p95_ms"
+      ],
+      "user_outcome": "Faults recover without repeated user intervention."
+    },
+    {
+      "scenario_id": "wf-interruption-resume-replay-pack",
+      "sli_ids": [
+        "sli_failure_recovery_success_rate",
+        "sli_resume_ready_p95_ms",
+        "sli_stream_tail_stability_ratio_p99_over_p50"
+      ],
+      "user_outcome": "Interrupt-resume-replay workflows preserve responsiveness."
+    }
+  ],
+  "downstream_consumers": [
+    {
+      "bead_id": "bd-3ar8v.1.5",
+      "contract": "Baseline variance/confidence output must be keyed by sli_id and scenario_id."
+    },
+    {
+      "bead_id": "bd-3ar8v.2.11",
+      "contract": "Durability-mode UX validation must report pass/warn/fail per mapped SLI."
+    },
+    {
+      "bead_id": "bd-3ar8v.3.11",
+      "contract": "Resume/fork/export UX validation must consume resume and recovery SLIs."
+    },
+    {
+      "bead_id": "bd-3ar8v.6.7",
+      "contract": "User diagnostics workflow must map troubleshooting guidance to breached SLI IDs."
+    }
+  ],
+  "ci_enforcement": {
+    "result_status_values": [
+      "pass",
+      "warn",
+      "fail"
+    ],
+    "required_result_fields": [
+      "run_id",
+      "scenario_id",
+      "sli_id",
+      "value",
+      "status",
+      "confidence",
+      "evidence_ref"
+    ],
+    "fail_closed_conditions": [
+      "missing_required_result_field",
+      "scenario_without_sli_mapping",
+      "sli_without_thresholds",
+      "missing_or_stale_evidence"
+    ]
+  }
+}

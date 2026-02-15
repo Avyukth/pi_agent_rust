@@ -161,7 +161,205 @@
       "scenario_id",
       "correlation_id"
     ],
+    "scenario_sli_matrix": [
+      {
+        "partition": "matched-state",
+        "phase_validation_beads": [
+          "bd-3ar8v.1.5",
+          "bd-3ar8v.2.11"
+        ],
+        "scenario_id": "cold_start",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "First interaction after startup feels responsive."
+      },
+      {
+        "partition": "matched-state",
+        "phase_validation_beads": [
+          "bd-3ar8v.1.5",
+          "bd-3ar8v.2.11"
+        ],
+        "scenario_id": "warm_start",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Steady-state turn latency remains consistently snappy."
+      },
+      {
+        "partition": "matched-state",
+        "phase_validation_beads": [
+          "bd-3ar8v.2.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "tool_call",
+        "sli_ids": [
+          "tool_roundtrip_p95_ms",
+          "interactive_turn_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Tool-assisted coding loop stays fluid."
+      },
+      {
+        "partition": "matched-state",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "event_dispatch",
+        "sli_ids": [
+          "extension_dispatch_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Extension events execute without perceptible stalls."
+      },
+      {
+        "partition": "realistic",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "realistic/session_100000",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+      },
+      {
+        "partition": "realistic",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "realistic/session_200000",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+      },
+      {
+        "partition": "realistic",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "realistic/session_500000",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+      },
+      {
+        "partition": "realistic",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "realistic/session_1000000",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+      },
+      {
+        "partition": "realistic",
+        "phase_validation_beads": [
+          "bd-3ar8v.3.11",
+          "bd-3ar8v.6.7"
+        ],
+        "scenario_id": "realistic/session_5000000",
+        "sli_ids": [
+          "interactive_turn_p95_ms",
+          "resume_session_p95_ms",
+          "tail_stability_p99_over_p50_ratio"
+        ],
+        "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+      }
+    ],
     "schema": "pi.bench.protocol.v1",
+    "user_perceived_sli_catalog": [
+      {
+        "label": "Interactive turn latency (P95)",
+        "objective": {
+          "comparator": "<=",
+          "threshold": 1200
+        },
+        "sli_id": "interactive_turn_p95_ms",
+        "unit": "ms",
+        "ux_interpretation": {
+          "critical": "Workflow feels blocked; conversation rhythm breaks.",
+          "degraded": "Noticeable lag in turn-to-turn iteration speed.",
+          "good": "Feels responsive for normal coding dialogue."
+        }
+      },
+      {
+        "label": "Session resume latency (P95)",
+        "objective": {
+          "comparator": "<=",
+          "threshold": 1800
+        },
+        "sli_id": "resume_session_p95_ms",
+        "unit": "ms",
+        "ux_interpretation": {
+          "critical": "Resume delays materially slow task pickup.",
+          "degraded": "Resume feels sluggish but still tolerable.",
+          "good": "Project/session restore feels immediate after launch."
+        }
+      },
+      {
+        "label": "Extension hostcall dispatch latency (P95)",
+        "objective": {
+          "comparator": "<=",
+          "threshold": 350
+        },
+        "sli_id": "extension_dispatch_p95_ms",
+        "unit": "ms",
+        "ux_interpretation": {
+          "critical": "Extension UX appears stalled or unreliable.",
+          "degraded": "Extension interactions feel sticky/intermittent.",
+          "good": "Extension-backed actions feel near-instant."
+        }
+      },
+      {
+        "label": "Tool-call roundtrip latency (P95)",
+        "objective": {
+          "comparator": "<=",
+          "threshold": 900
+        },
+        "sli_id": "tool_roundtrip_p95_ms",
+        "unit": "ms",
+        "ux_interpretation": {
+          "critical": "Tool usage becomes a bottleneck.",
+          "degraded": "Tool feedback loop slows coding momentum.",
+          "good": "Tool invocation and result handoff feel tight."
+        }
+      },
+      {
+        "label": "Tail stability (P99/P50 ratio)",
+        "objective": {
+          "comparator": "<=",
+          "threshold": 4.0
+        },
+        "sli_id": "tail_stability_p99_over_p50_ratio",
+        "unit": "ratio",
+        "ux_interpretation": {
+          "critical": "Frequent latency spikes disrupt workflow trust.",
+          "degraded": "Intermittent long-tail pauses are noticeable.",
+          "good": "Latency is predictable with low surprise spikes."
+        }
+      }
+    ],
     "version": "1.0.0"
   },
   "schema": "pi.bench.schema_registry.v1",

@@ -78,19 +78,32 @@ Same structure as `pi.ext.rust_bench.v1` with:
 | `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |
 | `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |
 
+| `user_perceived_sli_catalog` | object[] | Versioned user-facing SLI targets with UX interpretation guidance |
+| `scenario_sli_matrix` | object[] | Canonical mapping from benchmark scenarios to user-perceived SLIs and consuming validation beads |
+
+## User-Perceived SLI Catalog
+
+| SLI ID | Unit | Target | UX Guidance |
+|---|---|---|---|
+| `interactive_turn_p95_ms` | `ms` | `<= 1200` | Feels responsive for normal coding dialogue. |
+| `resume_session_p95_ms` | `ms` | `<= 1800` | Project/session restore feels immediate after launch. |
+| `extension_dispatch_p95_ms` | `ms` | `<= 350` | Extension-backed actions feel near-instant. |
+| `tool_roundtrip_p95_ms` | `ms` | `<= 900` | Tool invocation and result handoff feel tight. |
+| `tail_stability_p99_over_p50_ratio` | `ratio` | `<= 4.0` | Latency is predictable with low surprise spikes. |
+
 ## Protocol Matrix
 
-| Partition | Scenario ID | Replay Input |
-|---|---|---|
-| `matched-state` | `cold_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` |
-| `matched-state` | `warm_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` |
-| `matched-state` | `tool_call` | `{"extension_fixture_set":["hello","pirate","diff"],"iterations":500}` |
-| `matched-state` | `event_dispatch` | `{"event_name":"before_agent_start","iterations":500}` |
-| `realistic` | `realistic/session_100000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_100000.jsonl"}` |
-| `realistic` | `realistic/session_200000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_200000.jsonl"}` |
-| `realistic` | `realistic/session_500000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_500000.jsonl"}` |
-| `realistic` | `realistic/session_1000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_1000000.jsonl"}` |
-| `realistic` | `realistic/session_5000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_5000000.jsonl"}` |
+| Partition | Scenario ID | Replay Input | SLI IDs | UX Outcome |
+|---|---|---|---|---|
+| `matched-state` | `cold_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | First interaction after startup feels responsive. |
+| `matched-state` | `warm_start` | `{"extension_fixture_set":["hello","pirate","diff"],"runs":5}` | `interactive_turn_p95_ms, tail_stability_p99_over_p50_ratio` | Steady-state turn latency remains consistently snappy. |
+| `matched-state` | `tool_call` | `{"extension_fixture_set":["hello","pirate","diff"],"iterations":500}` | `tool_roundtrip_p95_ms, interactive_turn_p95_ms, tail_stability_p99_over_p50_ratio` | Tool-assisted coding loop stays fluid. |
+| `matched-state` | `event_dispatch` | `{"event_name":"before_agent_start","iterations":500}` | `extension_dispatch_p95_ms, tail_stability_p99_over_p50_ratio` | Extension events execute without perceptible stalls. |
+| `realistic` | `realistic/session_100000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_100000.jsonl"}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | Large-session operations remain usable for humans under realistic transcript load. |
+| `realistic` | `realistic/session_200000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_200000.jsonl"}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | Large-session operations remain usable for humans under realistic transcript load. |
+| `realistic` | `realistic/session_500000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_500000.jsonl"}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | Large-session operations remain usable for humans under realistic transcript load. |
+| `realistic` | `realistic/session_1000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_1000000.jsonl"}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | Large-session operations remain usable for humans under realistic transcript load. |
+| `realistic` | `realistic/session_5000000` | `{"mode":"replay","seed":7,"transcript_fixture":"tests/artifacts/perf/session_5000000.jsonl"}` | `interactive_turn_p95_ms, resume_session_p95_ms, tail_stability_p99_over_p50_ratio` | Large-session operations remain usable for humans under realistic transcript load. |
 
 ## Determinism Requirements
 

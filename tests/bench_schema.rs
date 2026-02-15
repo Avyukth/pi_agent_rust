@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -169,6 +170,13 @@ const CONFIDENCE_HIGH: &str = "high";
 const CONFIDENCE_MEDIUM: &str = "medium";
 const CONFIDENCE_LOW: &str = "low";
 const REALISTIC_SESSION_SIZES: &[u64] = &[100_000, 200_000, 500_000, 1_000_000, 5_000_000];
+const USER_PERCEIVED_SLI_IDS: &[&str] = &[
+    "interactive_turn_p95_ms",
+    "resume_session_p95_ms",
+    "extension_dispatch_p95_ms",
+    "tool_roundtrip_p95_ms",
+    "tail_stability_p99_over_p50_ratio",
+];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -214,6 +222,105 @@ fn canonical_protocol_contract() -> Value {
         })
         .collect::<Vec<_>>();
 
+    let user_perceived_sli_catalog = vec![
+        json!({
+            "sli_id": "interactive_turn_p95_ms",
+            "label": "Interactive turn latency (P95)",
+            "unit": "ms",
+            "objective": { "comparator": "<=", "threshold": 1200 },
+            "ux_interpretation": {
+                "good": "Feels responsive for normal coding dialogue.",
+                "degraded": "Noticeable lag in turn-to-turn iteration speed.",
+                "critical": "Workflow feels blocked; conversation rhythm breaks."
+            }
+        }),
+        json!({
+            "sli_id": "resume_session_p95_ms",
+            "label": "Session resume latency (P95)",
+            "unit": "ms",
+            "objective": { "comparator": "<=", "threshold": 1800 },
+            "ux_interpretation": {
+                "good": "Project/session restore feels immediate after launch.",
+                "degraded": "Resume feels sluggish but still tolerable.",
+                "critical": "Resume delays materially slow task pickup."
+            }
+        }),
+        json!({
+            "sli_id": "extension_dispatch_p95_ms",
+            "label": "Extension hostcall dispatch latency (P95)",
+            "unit": "ms",
+            "objective": { "comparator": "<=", "threshold": 350 },
+            "ux_interpretation": {
+                "good": "Extension-backed actions feel near-instant.",
+                "degraded": "Extension interactions feel sticky/intermittent.",
+                "critical": "Extension UX appears stalled or unreliable."
+            }
+        }),
+        json!({
+            "sli_id": "tool_roundtrip_p95_ms",
+            "label": "Tool-call roundtrip latency (P95)",
+            "unit": "ms",
+            "objective": { "comparator": "<=", "threshold": 900 },
+            "ux_interpretation": {
+                "good": "Tool invocation and result handoff feel tight.",
+                "degraded": "Tool feedback loop slows coding momentum.",
+                "critical": "Tool usage becomes a bottleneck."
+            }
+        }),
+        json!({
+            "sli_id": "tail_stability_p99_over_p50_ratio",
+            "label": "Tail stability (P99/P50 ratio)",
+            "unit": "ratio",
+            "objective": { "comparator": "<=", "threshold": 4.0 },
+            "ux_interpretation": {
+                "good": "Latency is predictable with low surprise spikes.",
+                "degraded": "Intermittent long-tail pauses are noticeable.",
+                "critical": "Frequent latency spikes disrupt workflow trust."
+            }
+        }),
+    ];
+
+    let mut scenario_sli_matrix = vec![
+        json!({
+            "partition": PARTITION_MATCHED_STATE,
+            "scenario_id": "cold_start",
+            "sli_ids": ["interactive_turn_p95_ms", "resume_session_p95_ms", "tail_stability_p99_over_p50_ratio"],
+            "phase_validation_beads": ["bd-3ar8v.1.5", "bd-3ar8v.2.11"],
+            "ux_outcome": "First interaction after startup feels responsive."
+        }),
+        json!({
+            "partition": PARTITION_MATCHED_STATE,
+            "scenario_id": "warm_start",
+            "sli_ids": ["interactive_turn_p95_ms", "tail_stability_p99_over_p50_ratio"],
+            "phase_validation_beads": ["bd-3ar8v.1.5", "bd-3ar8v.2.11"],
+            "ux_outcome": "Steady-state turn latency remains consistently snappy."
+        }),
+        json!({
+            "partition": PARTITION_MATCHED_STATE,
+            "scenario_id": "tool_call",
+            "sli_ids": ["tool_roundtrip_p95_ms", "interactive_turn_p95_ms", "tail_stability_p99_over_p50_ratio"],
+            "phase_validation_beads": ["bd-3ar8v.2.11", "bd-3ar8v.6.7"],
+            "ux_outcome": "Tool-assisted coding loop stays fluid."
+        }),
+        json!({
+            "partition": PARTITION_MATCHED_STATE,
+            "scenario_id": "event_dispatch",
+            "sli_ids": ["extension_dispatch_p95_ms", "tail_stability_p99_over_p50_ratio"],
+            "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
+            "ux_outcome": "Extension events execute without perceptible stalls."
+        }),
+    ];
+
+    scenario_sli_matrix.extend(REALISTIC_SESSION_SIZES.iter().map(|messages| {
+        json!({
+            "partition": PARTITION_REALISTIC,
+            "scenario_id": format!("realistic/session_{messages}"),
+            "sli_ids": ["interactive_turn_p95_ms", "resume_session_p95_ms", "tail_stability_p99_over_p50_ratio"],
+            "phase_validation_beads": ["bd-3ar8v.3.11", "bd-3ar8v.6.7"],
+            "ux_outcome": "Large-session operations remain usable for humans under realistic transcript load."
+        })
+    }));
+
     json!({
         "schema": BENCH_PROTOCOL_SCHEMA,
         "version": BENCH_PROTOCOL_VERSION,
@@ -249,6 +356,8 @@ fn canonical_protocol_contract() -> Value {
             "evidence_class": [EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED],
             "confidence": [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW],
         },
+        "user_perceived_sli_catalog": user_perceived_sli_catalog,
+        "scenario_sli_matrix": scenario_sli_matrix,
     })
 }
 
@@ -503,6 +612,100 @@ fn protocol_contract_labels_evidence_and_confidence() {
 }
 
 #[test]
+fn protocol_contract_exposes_user_perceived_sli_matrix() {
+    let contract = canonical_protocol_contract();
+    let catalog = contract["user_perceived_sli_catalog"]
+        .as_array()
+        .expect("user_perceived_sli_catalog array");
+    assert_eq!(
+        catalog.len(),
+        USER_PERCEIVED_SLI_IDS.len(),
+        "expected fixed user-perceived SLI catalog cardinality"
+    );
+
+    let catalog_ids = catalog
+        .iter()
+        .map(|entry| {
+            entry
+                .get("sli_id")
+                .and_then(Value::as_str)
+                .expect("catalog entries must expose sli_id")
+                .to_string()
+        })
+        .collect::<HashSet<_>>();
+    for expected in USER_PERCEIVED_SLI_IDS {
+        assert!(
+            catalog_ids.contains(*expected),
+            "missing canonical SLI id {expected}"
+        );
+    }
+
+    let matrix = contract["scenario_sli_matrix"]
+        .as_array()
+        .expect("scenario_sli_matrix array");
+
+    let mut expected_scenarios = ["cold_start", "warm_start", "tool_call", "event_dispatch"]
+        .into_iter()
+        .map(std::string::ToString::to_string)
+        .collect::<HashSet<_>>();
+    expected_scenarios.extend(
+        REALISTIC_SESSION_SIZES
+            .iter()
+            .map(|messages| format!("realistic/session_{messages}")),
+    );
+
+    assert_eq!(
+        matrix.len(),
+        expected_scenarios.len(),
+        "scenario_sli_matrix must cover every canonical benchmark scenario"
+    );
+
+    let mut seen_scenarios = HashSet::new();
+    for row in matrix {
+        let scenario_id = row
+            .get("scenario_id")
+            .and_then(Value::as_str)
+            .expect("matrix row must contain scenario_id");
+        seen_scenarios.insert(scenario_id.to_string());
+
+        let sli_ids = row
+            .get("sli_ids")
+            .and_then(Value::as_array)
+            .expect("matrix row must contain sli_ids array");
+        assert!(
+            !sli_ids.is_empty(),
+            "matrix row {scenario_id} has empty sli_ids"
+        );
+        for sli_id in sli_ids {
+            let sli_id = sli_id
+                .as_str()
+                .expect("sli_ids values must be strings in scenario_sli_matrix");
+            assert!(
+                catalog_ids.contains(sli_id),
+                "scenario {scenario_id} references unknown SLI {sli_id}"
+            );
+        }
+
+        let phase_beads = row
+            .get("phase_validation_beads")
+            .and_then(Value::as_array)
+            .expect("matrix row must contain phase_validation_beads");
+        assert!(
+            phase_beads.iter().all(|id| {
+                id.as_str()
+                    .is_some_and(|bead_id| bead_id.starts_with("bd-3ar8v."))
+            }),
+            "matrix row {scenario_id} has invalid phase_validation_beads"
+        );
+    }
+
+    assert_eq!(
+        seen_scenarios, expected_scenarios,
+        "scenario_sli_matrix scenarios must exactly match protocol scenarios"
+    );
+}
+
+#[test]
 fn protocol_record_validator_accepts_golden_fixture() {
     let golden = json!({
         "schema": "pi.ext.rust_bench.v1",
@@ -666,6 +869,21 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
             .filter_map(Value::as_u64)
             .collect();
     assert_eq!(size_values, REALISTIC_SESSION_SIZES);
+
+    let required_fields: Vec<&str> = benchmark_protocol["required"]
+        .as_array()
+        .expect("benchmark_protocol.required array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        required_fields.contains(&"user_perceived_sli_catalog"),
+        "benchmark protocol schema must require user_perceived_sli_catalog"
+    );
+    assert!(
+        required_fields.contains(&"scenario_sli_matrix"),
+        "benchmark protocol schema must require scenario_sli_matrix"
+    );
 }
 
 #[test]
@@ -979,19 +1197,76 @@ fn generate_schema_doc() {
     md.push_str(
         "| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |\n\n",
     );
+    md.push_str(
+        "| `user_perceived_sli_catalog` | object[] | Versioned user-facing SLI targets with UX interpretation guidance |\n",
+    );
+    md.push_str(
+        "| `scenario_sli_matrix` | object[] | Canonical mapping from benchmark scenarios to user-perceived SLIs and consuming validation beads |\n\n",
+    );
+
+    md.push_str("## User-Perceived SLI Catalog\n\n");
+    md.push_str("| SLI ID | Unit | Target | UX Guidance |\n");
+    md.push_str("|---|---|---|---|\n");
+    for entry in protocol_contract["user_perceived_sli_catalog"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+    {
+        let sli_id = entry["sli_id"].as_str().unwrap_or("unknown");
+        let unit = entry["unit"].as_str().unwrap_or("unknown");
+        let comparator = entry["objective"]["comparator"].as_str().unwrap_or("?");
+        let threshold = entry["objective"]["threshold"].to_string();
+        let guidance = entry["ux_interpretation"]["good"]
+            .as_str()
+            .unwrap_or("no guidance");
+        let _ = writeln!(
+            md,
+            "| `{sli_id}` | `{unit}` | `{comparator} {threshold}` | {guidance} |"
+        );
+    }
+    md.push('\n');
 
     md.push_str("## Protocol Matrix\n\n");
-    md.push_str("| Partition | Scenario ID | Replay Input |\n");
-    md.push_str("|---|---|---|\n");
+    md.push_str("| Partition | Scenario ID | Replay Input | SLI IDs | UX Outcome |\n");
+    md.push_str("|---|---|---|---|---|\n");
+
+    let empty_matrix = Vec::new();
+    let scenario_sli_matrix = protocol_contract["scenario_sli_matrix"]
+        .as_array()
+        .unwrap_or(&empty_matrix);
+
+    let lookup_matrix = |scenario_id: &str| -> (String, String) {
+        let Some(row) = scenario_sli_matrix
+            .iter()
+            .find(|row| row["scenario_id"].as_str() == Some(scenario_id))
+        else {
+            return ("(missing)".to_string(), "No UX mapping".to_string());
+        };
+        let sli_ids = row["sli_ids"]
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "(missing)".to_string());
+        let ux_outcome = row["ux_outcome"]
+            .as_str()
+            .unwrap_or("No UX outcome specified")
+            .to_string();
+        (sli_ids, ux_outcome)
+    };
+
     for scenario in protocol_contract["matched_state_scenarios"]
         .as_array()
         .unwrap_or(&Vec::new())
     {
         let scenario_name = scenario["scenario"].as_str().unwrap_or("unknown");
         let replay = scenario["replay_input"].to_string();
+        let (sli_ids, ux_outcome) = lookup_matrix(scenario_name);
         let _ = writeln!(
             md,
-            "| `{PARTITION_MATCHED_STATE}` | `{scenario_name}` | `{replay}` |"
+            "| `{PARTITION_MATCHED_STATE}` | `{scenario_name}` | `{replay}` | `{sli_ids}` | {ux_outcome} |"
         );
     }
     for scenario in protocol_contract["realistic_replay_inputs"]
@@ -1000,9 +1275,10 @@ fn generate_schema_doc() {
     {
         let scenario_id = scenario["scenario_id"].as_str().unwrap_or("unknown");
         let replay = scenario["replay_input"].to_string();
+        let (sli_ids, ux_outcome) = lookup_matrix(scenario_id);
         let _ = writeln!(
             md,
-            "| `{PARTITION_REALISTIC}` | `{scenario_id}` | `{replay}` |"
+            "| `{PARTITION_REALISTIC}` | `{scenario_id}` | `{replay}` | `{sli_ids}` | {ux_outcome} |"
         );
     }
     md.push('\n');

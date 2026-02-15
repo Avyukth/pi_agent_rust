@@ -20,6 +20,7 @@ The contract binds three things together:
 | Evidence contract bundle | `pi.qa.evidence_contract.v1` | `docs/evidence-contract-schema.json` |
 | Per-suite failure digest | `pi.e2e.failure_digest.v1` | `docs/evidence-contract-schema.json` |
 | Replay bundle | `pi.e2e.replay_bundle.v1` | `tests/e2e_replay_bundles.rs` + run artifacts |
+| User-perceived SLI + UX matrix | `pi.perf.sli_ux_matrix.v1` | `docs/perf_sli_matrix.json` |
 
 ### Correlation Model
 
@@ -45,7 +46,7 @@ For every failed suite entry in evidence artifacts:
 |-------|--------------------------|
 | `unit` | Must preserve schema-valid JSONL logging when test harness logging is used |
 | `vcr` | Must preserve deterministic replay + schema-valid log/artifact records |
-| `e2e` | Must emit evidence/replay/failure-digest artifacts that satisfy the schema set above |
+| `e2e` | Must emit evidence/replay/failure-digest artifacts that satisfy the schema set above, and each workflow must map to one or more user-facing SLIs via `docs/perf_sli_matrix.json` |
 
 ## Suites
 
@@ -123,8 +124,12 @@ test file prefixed with `e2e_`.
 
 Canonical scenario coverage mapping for this suite lives in:
 
-- `docs/e2e_scenario_matrix.json` (schema `pi.e2e.scenario_matrix.v1`)
+- `docs/e2e_scenario_matrix.json` (schema `pi.e2e.scenario_matrix.v2`)
+- `docs/perf_sli_matrix.json` (schema `pi.perf.sli_ux_matrix.v1`)
 - Drift and schema enforcement: `python3 scripts/check_traceability_matrix.py`
+
+PERF-3X phase-validation and diagnostics flows must consume SLI outputs keyed by
+`scenario_id` + `sli_id`; micro-benchmark-only summaries are insufficient.
 
 ### Live Provider Credential + Replay Policy (bd-1f42.2.7)
 

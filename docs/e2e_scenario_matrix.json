@@ -7,6 +7,7 @@
     "scripts/e2e/run_all.sh",
     "docs/testing-policy.md"
   ],
+  "ux_sli_matrix_ref": "docs/perf_sli_matrix.json",
   "ci_policy": {
     "consumed_by": [
       "scripts/check_traceability_matrix.py",
@@ -64,6 +65,10 @@
         "tests/e2e_cli.rs",
         "tests/e2e_golden_path.rs"
       ],
+      "sli_ids": [
+        "sli.cli.first_response_ms",
+        "sli.provider.first_token_ms"
+      ],
       "expected_artifacts": [
         "output.log",
         "result.json",
@@ -94,6 +99,10 @@
       "test_paths": [
         "tests/e2e_agent_loop.rs",
         "tests/e2e_tools.rs"
+      ],
+      "sli_ids": [
+        "sli.agent.turn_completion_ms",
+        "sli.cli.first_response_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -126,6 +135,10 @@
         "tests/e2e_provider_scenarios.rs",
         "tests/e2e_provider_streaming.rs"
       ],
+      "sli_ids": [
+        "sli.provider.first_token_ms",
+        "sli.provider.stream_jitter_p95_ms"
+      ],
       "expected_artifacts": [
         "output.log",
         "result.json",
@@ -156,6 +169,10 @@
       "test_paths": [
         "tests/e2e_extension_registration.rs",
         "tests/e2e_ts_extension_loading.rs"
+      ],
+      "sli_ids": [
+        "sli.extension.action_latency_ms",
+        "sli.agent.turn_completion_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -188,6 +205,10 @@
         "tests/e2e_message_session_control.rs",
         "tests/e2e_session_persistence.rs"
       ],
+      "sli_ids": [
+        "sli.session.resume_ready_ms",
+        "sli.recovery.time_to_stable_ms"
+      ],
       "expected_artifacts": [
         "output.log",
         "result.json",
@@ -216,6 +237,10 @@
       ],
       "test_paths": [
         "tests/e2e_rpc.rs"
+      ],
+      "sli_ids": [
+        "sli.rpc.roundtrip_ms",
+        "sli.agent.turn_completion_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -246,6 +271,10 @@
       "test_paths": [
         "tests/e2e_tui.rs"
       ],
+      "sli_ids": [
+        "sli.tui.input_to_render_ms",
+        "sli.provider.first_token_ms"
+      ],
       "expected_artifacts": [
         "output.log",
         "result.json",
@@ -274,6 +303,10 @@
       ],
       "test_paths": [
         "tests/e2e_library_integration.rs"
+      ],
+      "sli_ids": [
+        "sli.tui.input_to_render_ms",
+        "sli.extension.action_latency_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -305,6 +338,10 @@
       "test_paths": [
         "tests/e2e_workflow_preflight.rs",
         "tests/e2e_auto_repair.rs"
+      ],
+      "sli_ids": [
+        "sli.policy.preflight_decision_ms",
+        "sli.recovery.time_to_stable_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -356,6 +393,10 @@
         "tests/e2e_cross_provider_parity.rs",
         "tests/provider_live_verify.rs"
       ],
+      "sli_ids": [
+        "sli.live.auth_success_rate_pct",
+        "sli.provider.first_token_ms"
+      ],
       "expected_artifacts": [
         "output.log",
         "result.json",
@@ -387,6 +428,10 @@
       "test_paths": [
         "tests/e2e_failure_injection_recovery.rs",
         "tests/e2e_high_risk_workflows.rs"
+      ],
+      "sli_ids": [
+        "sli.recovery.time_to_stable_ms",
+        "sli.provider.stream_jitter_p95_ms"
       ],
       "expected_artifacts": [
         "output.log",
@@ -421,6 +466,10 @@
       ],
       "test_paths": [
         "tests/e2e_interruption_resume_replay.rs"
+      ],
+      "sli_ids": [
+        "sli.resume.replay_integrity_pct",
+        "sli.session.resume_ready_ms"
       ],
       "expected_artifacts": [
         "output.log",

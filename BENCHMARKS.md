@@ -2,6 +2,15 @@
 
 > **Purpose:** Track and validate performance budgets for pi_agent_rust.
 
+## User-Perceived SLI Contract
+
+Phase-0 canonical UX/SLI contract lives in `docs/perf_sli_matrix.json` (`schema: pi.perf.sli_matrix.v1`).
+
+- Primary release-deciding metrics are user-visible E2E/responsiveness SLIs.
+- Micro-benchmarks in this file are diagnostic/supporting metrics.
+- Scenario-to-SLI mapping is keyed by `docs/e2e_scenario_matrix.json` workflow IDs.
+- Downstream PERF-3X validation beads must consume SLI results directly from the contract artifact.
+
 ## Quick Start
 
 ```bash
