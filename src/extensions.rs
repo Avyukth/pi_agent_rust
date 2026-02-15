@@ -24615,6 +24615,42 @@ mod tests {
             ]
         }
 
+        /// Generate malformed OAuth objects for provider registration fuzzing.
+        fn malformed_oauth_object() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                // Missing required fields.
+                Just(json!({})),
+                Just(json!({"authUrl": "https://auth.example.com/authorize"})),
+                Just(json!({"tokenUrl": "https://auth.example.com/token"})),
+                Just(json!({"clientId": "client-123"})),
+                // Wrong field types.
+                Just(
+                    json!({"authUrl": 123, "tokenUrl": "https://auth.example.com/token", "clientId": "client-123"})
+                ),
+                Just(
+                    json!({"authUrl": "https://auth.example.com/authorize", "tokenUrl": false, "clientId": "client-123"})
+                ),
+                Just(
+                    json!({"authUrl": "https://auth.example.com/authorize", "tokenUrl": "https://auth.example.com/token", "clientId": null})
+                ),
+                // Arrays/objects where strings are expected.
+                Just(
+                    json!({"authUrl": ["https://auth.example.com/authorize"], "tokenUrl": "https://auth.example.com/token", "clientId": "client-123"})
+                ),
+                Just(
+                    json!({"authUrl": "https://auth.example.com/authorize", "tokenUrl": {"href": "https://auth.example.com/token"}, "clientId": "client-123"})
+                ),
+                // Non-array scopes and wrong redirect type.
+                Just(json!({
+                    "authUrl": "https://auth.example.com/authorize",
+                    "tokenUrl": "https://auth.example.com/token",
+                    "clientId": "client-123",
+                    "scopes": "read write",
+                    "redirectUri": 42
+                })),
+            ]
+        }
+
         /// Generate a large JSON payload for stress testing.
         fn large_json_payload(size: usize) -> impl Strategy<Value = Value> {
             prop::collection::vec("[a-zA-Z0-9]{1,10}", size..size + 1).prop_map(|items| {
@@ -24653,6 +24689,62 @@ mod tests {
                     let _outcome = dispatch_hostcall_events(
                         "prop-call", &manager, &tools, "registerProvider", payload,
                     ).await;
+                });
+            }
+
+            /// Malformed OAuth objects must not panic and must not produce oauth_config.
+            #[test]
+            fn register_provider_malformed_oauth_is_ignored(
+                provider_id in "[a-z][a-z0-9\\-]{0,24}",
+                oauth in malformed_oauth_object()
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let outcome = dispatch_hostcall_events(
+                        "prop-call",
+                        &manager,
+                        &tools,
+                        "registerProvider",
+                        json!({
+                            "id": provider_id,
+                            "api": "openai-completions",
+                            "baseUrl": "https://api.example.com/v1",
+                            "oauth": oauth,
+                            "models": [{ "id": "oauth-model", "name": "OAuth Model" }]
+                        }),
+                    )
+                    .await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Success(_)),
+                        "registerProvider should accept malformed oauth payload shape without panic"
+                    );
+
+                    let entries = manager.extension_model_entries();
+                    assert_eq!(entries.len(), 1, "expected exactly one model entry");
+                    let has_required_oauth_strings = oauth
+                        .get("authUrl")
+                        .and_then(Value::as_str)
+                        .is_some()
+                        && oauth
+                            .get("tokenUrl")
+                            .and_then(Value::as_str)
+                            .is_some()
+                        && oauth
+                            .get("clientId")
+                            .and_then(Value::as_str)
+                            .is_some();
+                    if has_required_oauth_strings {
+                        assert!(
+                            entries[0].oauth_config.is_some(),
+                            "oauth_config should be extracted when required oauth fields are strings"
+                        );
+                    } else {
+                        assert!(
+                            entries[0].oauth_config.is_none(),
+                            "oauth_config should be omitted when required oauth fields are malformed"
+                        );
+                    }
                 });
             }
 
@@ -24884,6 +24976,48 @@ mod tests {
             ]
         }
 
+        /// Strategy for capability mismatch bypass attempts.
+        fn capability_mismatch_case_strategy() -> impl Strategy<Value = (String, String, Value)> {
+            prop_oneof![
+                // tool(read) requires read, but declared exec
+                Just((
+                    "tool".to_string(),
+                    "exec".to_string(),
+                    json!({ "name": "read", "input": { "path": "README.md" } }),
+                )),
+                // fs(read) requires read, but declared write
+                Just((
+                    "fs".to_string(),
+                    "write".to_string(),
+                    json!({ "op": "read", "path": "README.md" }),
+                )),
+                // exec requires exec, but declared read
+                Just((
+                    "exec".to_string(),
+                    "read".to_string(),
+                    json!({ "cmd": "echo", "args": ["hello"] }),
+                )),
+                // session requires session, but declared ui
+                Just((
+                    "session".to_string(),
+                    "ui".to_string(),
+                    json!({ "op": "get_state" }),
+                )),
+                // ui requires ui, but declared events
+                Just((
+                    "ui".to_string(),
+                    "events".to_string(),
+                    json!({ "op": "notify", "title": "hi" }),
+                )),
+                // events requires events, but declared session
+                Just((
+                    "events".to_string(),
+                    "session".to_string(),
+                    json!({ "op": "sendMessage", "message": { "customType": "x", "content": "y" } }),
+                )),
+            ]
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 256,
@@ -25008,6 +25142,58 @@ mod tests {
                     assert!(
                         result.is_error,
                         "per-extension deny should reject, got is_error=false"
+                    );
+                });
+            }
+
+            /// Capability bypass: declared capability mismatch must be rejected as invalid_request.
+            #[test]
+            fn capability_mismatch_rejected_as_invalid_request(
+                (method, declared_capability, params) in capability_mismatch_case_strategy(),
+                call_suffix in "[a-z0-9]{1,12}",
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let tools = crate::tools::ToolRegistry::new(&[], dir.path(), None);
+                    let http = crate::connectors::http::HttpConnector::with_defaults();
+                    let policy = ExtensionPolicy {
+                        mode: ExtensionPolicyMode::Permissive,
+                        max_memory_mb: 256,
+                        default_caps: Vec::new(),
+                        deny_caps: Vec::new(),
+                        ..Default::default()
+                    };
+                    let ctx = HostCallContext {
+                        runtime_name: "prop-test",
+                        extension_id: Some("ext.prop"),
+                        tools: &tools,
+                        http: &http,
+                        manager: None,
+                        policy: &policy,
+                        js_runtime: None,
+                        interceptor: None,
+                    };
+                    let call = HostCallPayload {
+                        call_id: format!("cap-mismatch-{call_suffix}"),
+                        capability: declared_capability,
+                        method,
+                        params,
+                        timeout_ms: Some(5_000),
+                        cancel_token: None,
+                        context: None,
+                    };
+                    let result = dispatch_host_call_shared(&ctx, call).await;
+                    assert!(result.is_error, "capability mismatch must be rejected");
+                    let err = result.error.expect("error payload should exist");
+                    assert_eq!(
+                        err.code,
+                        HostCallErrorCode::InvalidRequest,
+                        "capability mismatch must map to invalid_request"
+                    );
+                    assert!(
+                        err.message.contains("mismatch"),
+                        "error message should describe mismatch, got: {}",
+                        err.message
                     );
                 });
             }
@@ -25191,6 +25377,74 @@ mod tests {
                 let (got_prov, got_model) = session.get_model().await;
                 assert_eq!(got_prov.as_deref(), Some("prov-19"));
                 assert_eq!(got_model.as_deref(), Some("model-19"));
+            });
+        }
+
+        /// True parallel dispatch: spawn multiple hostcalls onto one runtime and one manager.
+        #[test]
+        fn concurrent_dispatch_parallel_tasks_same_manager_safe() {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let handle = runtime.handle();
+
+            runtime.block_on(async move {
+                let manager = ExtensionManager::new();
+                let session = Arc::new(MockSession::new());
+                manager.set_session(session);
+                let actions = Arc::new(MockHostActions::new());
+                manager.set_host_actions(actions);
+                let tools = Arc::new(crate::tools::ToolRegistry::new(&[], Path::new("."), None));
+
+                let mut joins = Vec::new();
+                for idx in 0..12 {
+                    let manager_cloned = manager.clone();
+                    let tools_cloned = Arc::clone(&tools);
+                    joins.push(handle.spawn(async move {
+                        let event_payload = if idx % 2 == 0 {
+                            json!({
+                                "provider": format!("provider-{idx}"),
+                                "modelId": format!("model-{idx}")
+                            })
+                        } else {
+                            json!({
+                                "thinkingLevel": if idx % 3 == 0 { "high" } else { "medium" }
+                            })
+                        };
+                        let event_op = if idx % 2 == 0 {
+                            "setModel"
+                        } else {
+                            "setThinkingLevel"
+                        };
+                        let _event = dispatch_hostcall_events(
+                            &format!("parallel-event-{idx}"),
+                            &manager_cloned,
+                            &tools_cloned,
+                            event_op,
+                            event_payload,
+                        )
+                        .await;
+                        let _session = dispatch_hostcall_session(
+                            &format!("parallel-session-{idx}"),
+                            &manager_cloned,
+                            "set_name",
+                            json!({ "name": format!("parallel-{idx}") }),
+                        )
+                        .await;
+                    }));
+                }
+
+                for join in joins {
+                    join.await;
+                }
+
+                let final_name =
+                    dispatch_hostcall_session("parallel-final", &manager, "get_name", json!({}))
+                        .await;
+                assert!(
+                    matches!(final_name, HostcallOutcome::Success(_)),
+                    "final get_name should succeed after concurrent writes, got: {final_name:?}"
+                );
             });
         }
 
