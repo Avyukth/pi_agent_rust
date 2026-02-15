@@ -1095,12 +1095,20 @@ def classify_root_cause(message: str, raw_log: str) -> str:
     haystack = f"{message}\n{raw_log}".lower()
     if "timed out" in haystack or "timeout" in haystack:
         return "timeout"
+    if (
+        "no matching interaction found in cassette" in haystack
+        or "vcr cassette missing or invalid" in haystack
+        or "match criteria: method + url + body + body_text" in haystack
+    ):
+        return "vcr_mismatch"
     if "assertion" in haystack or "assert_eq!" in haystack or "assert_ne!" in haystack:
         return "assertion_failure"
     if "permission denied" in haystack:
         return "permission_denied"
     if "connection refused" in haystack or "connection reset" in haystack:
         return "network_io"
+    if "clippy" in haystack and "error:" in haystack:
+        return "lint_failure"
     if "not found" in haystack and ("file" in haystack or "path" in haystack):
         return "missing_file"
     if "panicked at" in haystack or "panic" in haystack:
@@ -1111,12 +1119,19 @@ def classify_root_cause(message: str, raw_log: str) -> str:
 def remediation_summary(root_cause_class: str) -> str:
     if root_cause_class == "timeout":
         return "Inspect stalled operations and timeout thresholds; use timeline gaps to isolate hung steps."
+    if root_cause_class == "vcr_mismatch":
+        return (
+            "Re-record or refresh the affected cassette, and verify dynamic prompt context "
+            "(cwd/project instructions/timestamps) remains stable for playback matching."
+        )
     if root_cause_class == "assertion_failure":
         return "Inspect assertion preconditions and fixture state for the first failing scenario."
     if root_cause_class == "permission_denied":
         return "Verify executable permissions, filesystem ACLs, and sandbox constraints in the failing path."
     if root_cause_class == "network_io":
         return "Inspect network mocks/endpoints and retry/error handling around the failing scenario."
+    if root_cause_class == "lint_failure":
+        return "Run clippy on the failing target and resolve the first emitted lint error before rerunning suites."
     if root_cause_class == "missing_file":
         return "Verify fixture/materialization steps and path wiring before test execution."
     if root_cause_class == "panic":
