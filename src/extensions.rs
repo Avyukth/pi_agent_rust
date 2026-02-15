@@ -24739,6 +24739,9 @@ mod tests {
             }
 
             /// Test session `set_model` round-trip with arbitrary provider/model.
+            /// When either provider or `model_id` is empty, the handler returns an
+            /// error and does NOT update the session, so we only assert the
+            /// round-trip when both are non-empty.
             #[test]
             fn session_set_model_roundtrip(
                 provider in "\\PC{0,30}",
@@ -24748,13 +24751,21 @@ mod tests {
                     let manager = ExtensionManager::new();
                     let session = Arc::new(MockSession::new());
                     manager.set_session(session.clone());
-                    let _outcome = dispatch_hostcall_session(
+                    let outcome = dispatch_hostcall_session(
                         "prop-call", &manager, "set_model",
                         json!({"provider": provider, "modelId": model_id}),
                     ).await;
-                    let (got_provider, got_model) = session.get_model().await;
-                    assert_eq!(got_provider.as_deref(), Some(provider.as_str()));
-                    assert_eq!(got_model.as_deref(), Some(model_id.as_str()));
+                    if provider.is_empty() || model_id.is_empty() {
+                        // Handler validates that both are non-empty.
+                        assert!(
+                            matches!(outcome, HostcallOutcome::Error { .. }),
+                            "set_model with empty provider/model should error"
+                        );
+                    } else {
+                        let (got_provider, got_model) = session.get_model().await;
+                        assert_eq!(got_provider.as_deref(), Some(provider.as_str()));
+                        assert_eq!(got_model.as_deref(), Some(model_id.as_str()));
+                    }
                 });
             }
 
@@ -24851,6 +24862,425 @@ mod tests {
                         matches!(outcome, HostcallOutcome::Error { .. }),
                         "registerProvider with api={api:?} should error, got: {outcome:?}"
                     );
+                }
+            });
+        }
+
+        // ------------------------------------------------------------------
+        // FUZZ-P1.9 Phase 2: Capability bypass + concurrent dispatch tests
+        // ------------------------------------------------------------------
+
+        /// Strategy for methods that require specific capabilities.
+        fn capability_method_strategy() -> impl Strategy<Value = (String, String)> {
+            prop_oneof![
+                Just(("session".to_string(), "session".to_string())),
+                Just(("events".to_string(), "events".to_string())),
+                Just(("ui".to_string(), "ui".to_string())),
+                Just(("tool".to_string(), "tool".to_string())),
+                Just(("exec".to_string(), "exec".to_string())),
+                Just(("http".to_string(), "http".to_string())),
+                Just(("log".to_string(), "log".to_string())),
+                Just(("fs".to_string(), "read".to_string())),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 256,
+                max_shrink_iters: 0,
+                .. ProptestConfig::default()
+            })]
+
+            /// Capability bypass: deny-all policy must reject all capability-gated calls.
+            #[test]
+            fn capability_deny_all_rejects_gated_calls(
+                (method, _expected_cap) in capability_method_strategy(),
+                payload in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let tools = crate::tools::ToolRegistry::new(&[], dir.path(), None);
+                    let http = crate::connectors::http::HttpConnector::with_defaults();
+                    let policy = ExtensionPolicy {
+                        mode: ExtensionPolicyMode::Strict,
+                        max_memory_mb: 256,
+                        default_caps: Vec::new(),
+                        deny_caps: vec![
+                            "read".to_string(),
+                            "write".to_string(),
+                            "exec".to_string(),
+                            "http".to_string(),
+                            "tool".to_string(),
+                            "session".to_string(),
+                            "ui".to_string(),
+                            "events".to_string(),
+                            "log".to_string(),
+                            "env".to_string(),
+                        ],
+                        ..Default::default()
+                    };
+                    let ctx = HostCallContext {
+                        runtime_name: "prop-test",
+                        extension_id: Some("ext.prop"),
+                        tools: &tools,
+                        http: &http,
+                        manager: None,
+                        policy: &policy,
+                        js_runtime: None,
+                        interceptor: None,
+                    };
+                    let call = HostCallPayload {
+                        call_id: "cap-bypass-test".to_string(),
+                        capability: String::new(),
+                        method,
+                        params: payload,
+                        timeout_ms: Some(5000),
+                        cancel_token: None,
+                        context: None,
+                    };
+                    let result = dispatch_host_call_shared(&ctx, call).await;
+                    assert!(
+                        result.is_error,
+                        "deny-all policy should reject call, got is_error=false"
+                    );
+                });
+            }
+
+            /// Capability bypass: per-extension deny overrides global allow.
+            #[test]
+            fn capability_per_extension_deny_overrides_allow(
+                (method, _expected_cap) in capability_method_strategy(),
+                payload in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let tools = crate::tools::ToolRegistry::new(&[], dir.path(), None);
+                    let http = crate::connectors::http::HttpConnector::with_defaults();
+                    let mut per_ext = std::collections::HashMap::new();
+                    per_ext.insert(
+                        "ext.untrusted".to_string(),
+                        ExtensionOverride {
+                            mode: None,
+                            allow: Vec::new(),
+                            deny: vec![
+                                "session".to_string(),
+                                "events".to_string(),
+                                "ui".to_string(),
+                                "tool".to_string(),
+                                "exec".to_string(),
+                                "http".to_string(),
+                                "log".to_string(),
+                                "read".to_string(),
+                                "write".to_string(),
+                                "env".to_string(),
+                            ],
+                            quota: None,
+                        },
+                    );
+                    let policy = ExtensionPolicy {
+                        mode: ExtensionPolicyMode::Permissive,
+                        max_memory_mb: 256,
+                        default_caps: Vec::new(),
+                        deny_caps: Vec::new(),
+                        per_extension: per_ext,
+                        ..Default::default()
+                    };
+                    let ctx = HostCallContext {
+                        runtime_name: "prop-test",
+                        extension_id: Some("ext.untrusted"),
+                        tools: &tools,
+                        http: &http,
+                        manager: None,
+                        policy: &policy,
+                        js_runtime: None,
+                        interceptor: None,
+                    };
+                    let call = HostCallPayload {
+                        call_id: "per-ext-deny".to_string(),
+                        capability: String::new(),
+                        method,
+                        params: payload,
+                        timeout_ms: Some(5000),
+                        cancel_token: None,
+                        context: None,
+                    };
+                    let result = dispatch_host_call_shared(&ctx, call).await;
+                    assert!(
+                        result.is_error,
+                        "per-extension deny should reject, got is_error=false"
+                    );
+                });
+            }
+
+            /// Concurrent dispatch: multiple rapid dispatches to same manager must not panic.
+            #[test]
+            fn concurrent_dispatch_same_manager_safe(
+                ops in prop::collection::vec(op_strategy(), 3..8),
+                payloads in prop::collection::vec(json_value(), 3..8),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let actions = Arc::new(MockHostActions::new());
+                    manager.set_host_actions(actions);
+                    let count = ops.len().min(payloads.len());
+                    for i in 0..count {
+                        let _outcome = dispatch_hostcall_events(
+                            &format!("concurrent-{i}"),
+                            &manager,
+                            &tools,
+                            &ops[i],
+                            payloads[i].clone(),
+                        )
+                        .await;
+                    }
+                    // Also dispatch session ops in the same run.
+                    for i in 0..count {
+                        let _outcome = dispatch_hostcall_session(
+                            &format!("concurrent-session-{i}"),
+                            &manager,
+                            &ops[i],
+                            payloads[i].clone(),
+                        )
+                        .await;
+                    }
+                });
+            }
+
+            /// Tool registration: malformed extension tool definitions must not panic.
+            #[test]
+            fn extension_tool_def_malformed_never_panics(
+                name in "\\PC{0,50}",
+                description in "\\PC{0,200}",
+                schema in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    // Register an extension with a malformed tool definition.
+                    let tool_def = json!({
+                        "name": name,
+                        "description": description,
+                        "inputSchema": schema,
+                    });
+                    let payload = RegisterPayload {
+                        name: "prop-test-ext".to_string(),
+                        version: "0.1.0".to_string(),
+                        api_version: "1".to_string(),
+                        capabilities: Vec::new(),
+                        capability_manifest: None,
+                        tools: vec![tool_def],
+                        slash_commands: Vec::new(),
+                        shortcuts: Vec::new(),
+                        flags: Vec::new(),
+                        event_hooks: Vec::new(),
+                    };
+                    manager.register(payload);
+                    // Verify tool defs are retrievable and getAllTools doesn't panic.
+                    let _defs = manager.extension_tool_defs();
+                    let _outcome = dispatch_hostcall_events(
+                        "tool-def-test",
+                        &manager,
+                        &tools,
+                        "getAllTools",
+                        json!({}),
+                    )
+                    .await;
+                });
+            }
+        }
+
+        /// Capability bypass: verify that all known capability methods
+        /// are properly denied under deny-all policy (non-proptest variant
+        /// for deterministic coverage).
+        #[test]
+        fn capability_deny_all_covers_all_methods() {
+            asupersync::test_utils::run_test(|| async move {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let tools = crate::tools::ToolRegistry::new(&[], dir.path(), None);
+                let http = crate::connectors::http::HttpConnector::with_defaults();
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Strict,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: vec![
+                        "read".to_string(),
+                        "write".to_string(),
+                        "exec".to_string(),
+                        "http".to_string(),
+                        "tool".to_string(),
+                        "session".to_string(),
+                        "ui".to_string(),
+                        "events".to_string(),
+                        "log".to_string(),
+                        "env".to_string(),
+                    ],
+                    ..Default::default()
+                };
+                for method in [
+                    "session", "events", "ui", "tool", "exec", "http", "log", "env",
+                ] {
+                    let ctx = HostCallContext {
+                        runtime_name: "prop-test",
+                        extension_id: Some("ext.test"),
+                        tools: &tools,
+                        http: &http,
+                        manager: None,
+                        policy: &policy,
+                        js_runtime: None,
+                        interceptor: None,
+                    };
+                    let call = HostCallPayload {
+                        call_id: format!("deny-{method}"),
+                        capability: String::new(),
+                        method: method.to_string(),
+                        params: json!({"op": "test"}),
+                        timeout_ms: Some(5000),
+                        cancel_token: None,
+                        context: None,
+                    };
+                    let result = dispatch_host_call_shared(&ctx, call).await;
+                    assert!(
+                        result.is_error,
+                        "deny-all policy should reject method={method}, got is_error=false"
+                    );
+                }
+            });
+        }
+
+        /// Concurrent session state: set/get model and name interleaved
+        /// across multiple dispatches preserves consistency.
+        #[test]
+        fn concurrent_session_state_interleaved() {
+            asupersync::test_utils::run_test(|| async move {
+                let manager = ExtensionManager::new();
+                let session = Arc::new(MockSession::new());
+                manager.set_session(session.clone());
+
+                // Interleave model and name updates.
+                for i in 0..20 {
+                    let _out = dispatch_hostcall_session(
+                        "interleave",
+                        &manager,
+                        "set_name",
+                        json!({"name": format!("session-{i}")}),
+                    )
+                    .await;
+                    let _out = dispatch_hostcall_session(
+                        "interleave",
+                        &manager,
+                        "set_model",
+                        json!({"provider": format!("prov-{i}"), "modelId": format!("model-{i}")}),
+                    )
+                    .await;
+                }
+
+                // Final state should reflect last update.
+                let name_out = dispatch_hostcall_session(
+                    "interleave",
+                    &manager,
+                    "get_name",
+                    json!({}),
+                )
+                .await;
+                if let HostcallOutcome::Success(value) = name_out {
+                    assert_eq!(
+                        value.as_str(),
+                        Some("session-19"),
+                        "final session name should be session-19"
+                    );
+                }
+
+                let (got_prov, got_model) = session.get_model().await;
+                assert_eq!(got_prov.as_deref(), Some("prov-19"));
+                assert_eq!(got_model.as_deref(), Some("model-19"));
+            });
+        }
+
+        /// Session hostcall operations exercise a real SessionHandle, not MockSession.
+        #[test]
+        fn session_ops_with_real_session_handle_roundtrip() {
+            asupersync::test_utils::run_test(|| async move {
+                let manager = ExtensionManager::new();
+                let session = Arc::new(crate::session::SessionHandle(Arc::new(
+                    asupersync::sync::Mutex::new(crate::session::Session::create()),
+                )));
+                manager.set_session(session.clone());
+
+                let set_name = dispatch_hostcall_session(
+                    "real-session",
+                    &manager,
+                    "set_name",
+                    json!({ "name": "real-session-name" }),
+                )
+                .await;
+                assert!(
+                    matches!(set_name, HostcallOutcome::Success(_)),
+                    "set_name should succeed, got: {set_name:?}"
+                );
+
+                let get_name =
+                    dispatch_hostcall_session("real-session", &manager, "get_name", json!({}))
+                        .await;
+                if let HostcallOutcome::Success(value) = get_name {
+                    assert_eq!(value.as_str(), Some("real-session-name"));
+                } else {
+                    panic!("get_name should succeed, got: {get_name:?}");
+                }
+
+                let set_model = dispatch_hostcall_session(
+                    "real-session",
+                    &manager,
+                    "set_model",
+                    json!({ "provider": "prov-real", "modelId": "model-real" }),
+                )
+                .await;
+                assert!(
+                    matches!(set_model, HostcallOutcome::Success(_)),
+                    "set_model should succeed, got: {set_model:?}"
+                );
+
+                let get_model =
+                    dispatch_hostcall_session("real-session", &manager, "get_model", json!({}))
+                        .await;
+                if let HostcallOutcome::Success(value) = get_model {
+                    assert_eq!(value.get("provider").and_then(Value::as_str), Some("prov-real"));
+                    assert_eq!(value.get("modelId").and_then(Value::as_str), Some("model-real"));
+                } else {
+                    panic!("get_model should succeed, got: {get_model:?}");
+                }
+
+                let append_entry = dispatch_hostcall_session(
+                    "real-session",
+                    &manager,
+                    "append_entry",
+                    json!({
+                        "customType": "marker",
+                        "data": { "kind": "real-session-check", "value": 42 }
+                    }),
+                )
+                .await;
+                assert!(
+                    matches!(append_entry, HostcallOutcome::Success(_)),
+                    "append_entry should succeed, got: {append_entry:?}"
+                );
+
+                let state =
+                    dispatch_hostcall_session("real-session", &manager, "get_state", json!({}))
+                        .await;
+                if let HostcallOutcome::Success(value) = state {
+                    assert_eq!(
+                        value.get("sessionName").and_then(Value::as_str),
+                        Some("real-session-name")
+                    );
+                    assert_eq!(
+                        value.get("thinkingLevel").and_then(Value::as_str),
+                        Some("off")
+                    );
+                } else {
+                    panic!("get_state should succeed, got: {state:?}");
                 }
             });
         }
