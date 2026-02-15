@@ -61,7 +61,7 @@ fn bench_truncate_head(c: &mut Criterion) {
             |b, content| {
                 b.iter(|| {
                     pi::tools::truncate_head(
-                        black_box(content),
+                        black_box(content).clone(),
                         pi::tools::DEFAULT_MAX_LINES,
                         pi::tools::DEFAULT_MAX_BYTES,
                     )
@@ -85,7 +85,7 @@ fn bench_truncate_tail(c: &mut Criterion) {
             |b, content| {
                 b.iter(|| {
                     pi::tools::truncate_tail(
-                        black_box(content),
+                        black_box(content).clone(),
                         pi::tools::DEFAULT_MAX_LINES,
                         pi::tools::DEFAULT_MAX_BYTES,
                     )
@@ -93,6 +93,39 @@ fn bench_truncate_tail(c: &mut Criterion) {
             },
         );
     }
+
+    group.finish();
+}
+
+/// Benchmarks the no-truncation fast path: content fits within limits, so the
+/// owned String is moved directly into the result (zero-copy).
+fn bench_truncate_no_truncation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("truncation");
+
+    // 500 lines × 80 chars = ~40.5KB — under both DEFAULT_MAX_LINES (2000)
+    // and DEFAULT_MAX_BYTES (50KB).
+    let content = build_lines(500, 80);
+    group.throughput(Throughput::Bytes(content.len() as u64));
+
+    group.bench_function("head_no_trunc_500", |b| {
+        b.iter(|| {
+            pi::tools::truncate_head(
+                black_box(&content).clone(),
+                pi::tools::DEFAULT_MAX_LINES,
+                pi::tools::DEFAULT_MAX_BYTES,
+            )
+        });
+    });
+
+    group.bench_function("tail_no_trunc_500", |b| {
+        b.iter(|| {
+            pi::tools::truncate_tail(
+                black_box(&content).clone(),
+                pi::tools::DEFAULT_MAX_LINES,
+                pi::tools::DEFAULT_MAX_BYTES,
+            )
+        });
+    });
 
     group.finish();
 }
@@ -249,6 +282,7 @@ criterion_group!(
     benches,
     bench_truncate_head,
     bench_truncate_tail,
+    bench_truncate_no_truncation,
     bench_sse_parsing,
     bench_sse_stream,
     bench_streaming_arc,
