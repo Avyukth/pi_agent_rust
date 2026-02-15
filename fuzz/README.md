@@ -93,6 +93,10 @@ is available. Override behavior explicitly when needed:
 ./scripts/validate_fuzz_p2.sh --no-rch
 ```
 
+When `CARGO_TARGET_DIR`/`TMPDIR` are not already set, the script auto-assigns
+an isolated per-run target/temp directory (preferring `/dev/shm`) to reduce
+Cargo lock contention in multi-agent sessions.
+
 Report files are written to `fuzz/reports/p2_validation_*.json` and include:
 - build status/exit code/time and build log path
 - per-target status (`pass`/`fail`/`crashed`), exit code, duration, corpus growth, artifact growth

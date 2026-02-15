@@ -151,6 +151,25 @@ echo ""
 
 cd "$FUZZ_DIR"
 
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+    if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+        TARGET_ROOT="/dev/shm/pi_agent_rust/${USER:-agent}"
+    else
+        TARGET_ROOT="$PROJECT_ROOT/.tmp/${USER:-agent}"
+    fi
+    export CARGO_TARGET_DIR="$TARGET_ROOT/fuzz_validate_${STAMP}_$$/target"
+fi
+
+if [ -z "${TMPDIR:-}" ]; then
+    export TMPDIR="$(dirname "$CARGO_TARGET_DIR")/tmp"
+fi
+
+mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+
+echo "CARGO_TARGET_DIR: $CARGO_TARGET_DIR"
+echo "TMPDIR: $TMPDIR"
+echo ""
+
 # -------------------------------------------------------------------
 # Step 1: Build all fuzz targets
 # -------------------------------------------------------------------
