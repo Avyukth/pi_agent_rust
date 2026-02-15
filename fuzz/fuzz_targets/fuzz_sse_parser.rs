@@ -28,14 +28,20 @@ fuzz_target!(|data: &[u8]| {
     }
     let flush_char = parser_char.flush();
 
-    // --- Strategy 3: Feed in random-sized chunks (split at midpoint) ---
-    if data.len() >= 2 {
-        let mid = data.len() / 2;
-        let part1 = String::from_utf8_lossy(&data[..mid]);
-        let part2 = String::from_utf8_lossy(&data[mid..]);
+    // --- Strategy 3: Feed in two chunks split at a valid char boundary ---
+    // We split the already-converted string (not raw bytes) to avoid
+    // from_utf8_lossy producing different replacement chars at split points.
+    if input.len() >= 2 {
+        let mid = input.len() / 2;
+        // Find a valid char boundary at or after midpoint
+        let mut split_at = mid;
+        while !input.is_char_boundary(split_at) && split_at < input.len() {
+            split_at += 1;
+        }
+        let (part1, part2) = input.split_at(split_at);
         let mut parser_split = SseParser::new();
-        let mut events_split: Vec<_> = parser_split.feed(&part1);
-        events_split.extend(parser_split.feed(&part2));
+        let mut events_split: Vec<_> = parser_split.feed(part1);
+        events_split.extend(parser_split.feed(part2));
         let flush_split = parser_split.flush();
 
         // Chunking invariant: whole == split
