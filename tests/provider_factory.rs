@@ -15,7 +15,10 @@ use pi::provider::{
 use pi::provider_metadata::{
     canonical_provider_id, provider_auth_env_keys, provider_routing_defaults,
 };
-use pi::providers::{create_provider, normalize_openai_base, normalize_openai_responses_base};
+use pi::providers::{
+    create_provider, normalize_cohere_base, normalize_openai_base, normalize_openai_responses_base,
+};
+use proptest::prelude::*;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -296,6 +299,30 @@ const SPECIAL_ROUTING_CASES: [(&str, &str, &str, bool); 3] = [
     ),
 ];
 
+fn provider_base_strategy() -> impl Strategy<Value = String> {
+    (
+        prop::sample::select(vec!["https", "http"]),
+        "[a-z][a-z0-9]{2,12}",
+        "[a-z][a-z0-9]{2,12}",
+        prop::sample::select(vec![
+            "",
+            "/v1",
+            "/v1/",
+            "/v1/chat/completions",
+            "/v1/chat/completions/",
+            "/v1/responses",
+            "/v1/responses/",
+            "/v2",
+            "/v2/",
+            "/v2/chat",
+            "/v2/chat/",
+        ]),
+    )
+        .prop_map(|(scheme, left, right, suffix)| {
+            format!("{scheme}://{left}.{right}.example{suffix}")
+        })
+}
+
 #[test]
 fn normalize_openai_base_appends_for_plain_host() {
     let harness = TestHarness::new("normalize_openai_base_appends_for_plain_host");
@@ -396,6 +423,32 @@ fn normalize_openai_responses_base_trims_trailing_slash() {
         });
     let normalized = normalize_openai_responses_base(input);
     assert_eq!(normalized, expected);
+}
+
+proptest! {
+    #[test]
+    fn normalize_openai_base_property_invariants(base in provider_base_strategy()) {
+        let normalized = normalize_openai_base(&base);
+        prop_assert!(normalized.ends_with("/chat/completions"));
+        prop_assert!(!normalized.ends_with('/'));
+        prop_assert_eq!(normalize_openai_base(&normalized), normalized);
+    }
+
+    #[test]
+    fn normalize_openai_responses_base_property_invariants(base in provider_base_strategy()) {
+        let normalized = normalize_openai_responses_base(&base);
+        prop_assert!(normalized.ends_with("/responses"));
+        prop_assert!(!normalized.ends_with('/'));
+        prop_assert_eq!(normalize_openai_responses_base(&normalized), normalized);
+    }
+
+    #[test]
+    fn normalize_cohere_base_property_invariants(base in provider_base_strategy()) {
+        let normalized = normalize_cohere_base(&base);
+        prop_assert!(normalized.ends_with("/chat"));
+        prop_assert!(!normalized.ends_with('/'));
+        prop_assert_eq!(normalize_cohere_base(&normalized), normalized);
+    }
 }
 
 #[test]

@@ -6,6 +6,7 @@ use pi::session_store_v2::{
     MigrationEvent, MigrationVerification, SessionStoreV2, frame_to_session_entry,
     session_entry_to_frame_args,
 };
+use proptest::prelude::*;
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -1034,6 +1035,78 @@ fn has_v2_sidecar_detection() -> PiResult<()> {
 
     assert!(pi::session_store_v2::has_v2_sidecar(&jsonl_path));
     Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+    #[test]
+    fn proptest_v2_sidecar_path_preserves_parent_and_stem(
+        parent_parts in prop::collection::vec("[A-Za-z0-9_-]{1,12}", 1..4),
+        stem in "[A-Za-z0-9_-]{1,24}",
+        ext in prop_oneof![Just(String::new()), "[A-Za-z0-9_-]{1,8}".prop_map(|s| format!(".{s}"))],
+    ) {
+        let mut jsonl = Path::new("/tmp").to_path_buf();
+        for part in parent_parts {
+            jsonl.push(part);
+        }
+        jsonl.push(format!("{stem}{ext}"));
+
+        let sidecar = pi::session_store_v2::v2_sidecar_path(&jsonl);
+        let expected_name = format!("{stem}.v2");
+        prop_assert_eq!(sidecar.parent(), jsonl.parent());
+        prop_assert_eq!(
+            sidecar.file_name().and_then(|name| name.to_str()),
+            Some(expected_name.as_str())
+        );
+        prop_assert_eq!(pi::session_store_v2::v2_sidecar_path(&jsonl), sidecar);
+    }
+
+    #[test]
+    fn proptest_v2_sidecar_path_is_extension_agnostic(
+        parent_parts in prop::collection::vec("[A-Za-z0-9_-]{1,12}", 1..4),
+        stem in "[A-Za-z0-9_-]{1,24}",
+        ext1 in prop_oneof![Just(String::new()), "[A-Za-z0-9_-]{1,8}".prop_map(|s| format!(".{s}"))],
+        ext2 in prop_oneof![Just(String::new()), "[A-Za-z0-9_-]{1,8}".prop_map(|s| format!(".{s}"))],
+    ) {
+        let mut base = Path::new("/tmp").to_path_buf();
+        for part in parent_parts {
+            base.push(part);
+        }
+
+        let path_a = base.join(format!("{stem}{ext1}"));
+        let path_b = base.join(format!("{stem}{ext2}"));
+        prop_assert_eq!(
+            pi::session_store_v2::v2_sidecar_path(&path_a),
+            pi::session_store_v2::v2_sidecar_path(&path_b)
+        );
+    }
+
+    #[test]
+    fn proptest_has_v2_sidecar_matches_manifest_or_index_invariant(
+        create_manifest in any::<bool>(),
+        create_index in any::<bool>(),
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let jsonl = dir.path().join("session.jsonl");
+        fs::write(&jsonl, "{}\n").expect("write jsonl");
+
+        let sidecar_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+        if create_manifest {
+            fs::create_dir_all(&sidecar_root).expect("create sidecar root");
+            fs::write(sidecar_root.join("manifest.json"), "{}\n").expect("write manifest");
+        }
+        if create_index {
+            let index_dir = sidecar_root.join("index");
+            fs::create_dir_all(&index_dir).expect("create index dir");
+            fs::write(index_dir.join("offsets.jsonl"), "{}\n").expect("write offsets");
+        }
+
+        prop_assert_eq!(
+            pi::session_store_v2::has_v2_sidecar(&jsonl),
+            create_manifest || create_index
+        );
+    }
 }
 
 // ── Rebuild index from scratch ──────────────────────────────────────────

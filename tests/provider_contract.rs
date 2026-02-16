@@ -69,6 +69,14 @@ fn tool_context() -> Context {
     }
 }
 
+fn context_with_tools(tools: Vec<ToolDef>) -> Context {
+    Context {
+        system_prompt: Some("You are a coding assistant.".to_string()),
+        messages: vec![user_text("Validate tool schema wiring.")],
+        tools,
+    }
+}
+
 fn default_options() -> StreamOptions {
     StreamOptions {
         api_key: Some("vcr-playback".to_string()),
@@ -766,4 +774,167 @@ fn contract_provider_api_types_are_distinct() {
         unique.len(),
         "native providers must have distinct API types: {apis:?}"
     );
+}
+
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone)]
+    struct ToolSeed {
+        name: String,
+        description: String,
+        parameters: Value,
+    }
+
+    fn schema_type_strategy() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("string"),
+            Just("number"),
+            Just("integer"),
+            Just("boolean")
+        ]
+    }
+
+    fn tool_seed_strategy() -> impl Strategy<Value = ToolSeed> {
+        (
+            "[a-z][a-z0-9_]{0,20}",
+            "[a-zA-Z0-9][a-zA-Z0-9 _-]{0,47}",
+            "[a-z][a-z0-9_]{0,20}",
+            schema_type_strategy(),
+            "[a-zA-Z0-9 _-]{0,40}",
+        )
+            .prop_map(|(name, description, field_name, field_type, field_desc)| {
+                let required_field = field_name.clone();
+                ToolSeed {
+                    name,
+                    description,
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {
+                            field_name: {
+                                "type": field_type,
+                                "description": field_desc
+                            }
+                        },
+                        "required": [required_field]
+                    }),
+                }
+            })
+    }
+
+    fn tool_seeds_strategy() -> impl Strategy<Value = Vec<ToolSeed>> {
+        prop::collection::vec(tool_seed_strategy(), 1..6).prop_filter(
+            "tool names must be unique",
+            |seeds| {
+                let mut seen = HashSet::new();
+                seeds.iter().all(|seed| seen.insert(seed.name.clone()))
+            },
+        )
+    }
+
+    fn to_tool_defs(seeds: &[ToolSeed]) -> Vec<ToolDef> {
+        seeds
+            .iter()
+            .map(|seed| ToolDef {
+                name: seed.name.clone(),
+                description: seed.description.clone(),
+                parameters: seed.parameters.clone(),
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn openai_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
+            let provider = OpenAIProvider::new("gpt-4o");
+            let defs = to_tool_defs(&seeds);
+            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let payload = serde_json::to_value(&req).expect("serialize OpenAI request");
+            let tools = payload["tools"].as_array().expect("tools array");
+
+            prop_assert_eq!(tools.len(), defs.len());
+            for (tool, expected) in tools.iter().zip(defs.iter()) {
+                prop_assert_eq!(tool.get("type").and_then(Value::as_str), Some("function"));
+                let function = tool.get("function").expect("function wrapper");
+                prop_assert_eq!(
+                    function.get("name").and_then(Value::as_str),
+                    Some(expected.name.as_str())
+                );
+                prop_assert_eq!(
+                    function.get("description").and_then(Value::as_str),
+                    Some(expected.description.as_str())
+                );
+                prop_assert_eq!(function.get("parameters"), Some(&expected.parameters));
+            }
+        }
+
+        #[test]
+        fn cohere_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
+            let provider = CohereProvider::new("command-r-plus");
+            let defs = to_tool_defs(&seeds);
+            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let payload = serde_json::to_value(&req).expect("serialize Cohere request");
+            let tools = payload["tools"].as_array().expect("tools array");
+
+            prop_assert_eq!(tools.len(), defs.len());
+            for (tool, expected) in tools.iter().zip(defs.iter()) {
+                prop_assert_eq!(tool.get("type").and_then(Value::as_str), Some("function"));
+                let function = tool.get("function").expect("function wrapper");
+                prop_assert_eq!(
+                    function.get("name").and_then(Value::as_str),
+                    Some(expected.name.as_str())
+                );
+                prop_assert_eq!(
+                    function.get("description").and_then(Value::as_str),
+                    Some(expected.description.as_str())
+                );
+                prop_assert_eq!(function.get("parameters"), Some(&expected.parameters));
+            }
+        }
+
+        #[test]
+        fn anthropic_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
+            let provider = AnthropicProvider::new("claude-sonnet-4-5");
+            let defs = to_tool_defs(&seeds);
+            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let payload = serde_json::to_value(&req).expect("serialize Anthropic request");
+            let tools = payload["tools"].as_array().expect("tools array");
+
+            prop_assert_eq!(tools.len(), defs.len());
+            for (tool, expected) in tools.iter().zip(defs.iter()) {
+                prop_assert_eq!(tool.get("name").and_then(Value::as_str), Some(expected.name.as_str()));
+                prop_assert_eq!(
+                    tool.get("description").and_then(Value::as_str),
+                    Some(expected.description.as_str())
+                );
+                prop_assert_eq!(tool.get("input_schema"), Some(&expected.parameters));
+            }
+        }
+
+        #[test]
+        fn gemini_tool_schema_round_trips_generated_defs(seeds in tool_seeds_strategy()) {
+            let provider = GeminiProvider::new("gemini-1.5-flash");
+            let defs = to_tool_defs(&seeds);
+            let req = provider.build_request(&context_with_tools(defs.clone()), &default_options());
+            let payload = serde_json::to_value(&req).expect("serialize Gemini request");
+            let declarations = payload["tools"][0]["functionDeclarations"]
+                .as_array()
+                .expect("functionDeclarations array");
+
+            prop_assert_eq!(declarations.len(), defs.len());
+            for (declaration, expected) in declarations.iter().zip(defs.iter()) {
+                prop_assert_eq!(
+                    declaration.get("name").and_then(Value::as_str),
+                    Some(expected.name.as_str())
+                );
+                prop_assert_eq!(
+                    declaration.get("description").and_then(Value::as_str),
+                    Some(expected.description.as_str())
+                );
+                prop_assert_eq!(declaration.get("parameters"), Some(&expected.parameters));
+            }
+        }
+    }
 }

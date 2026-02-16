@@ -379,6 +379,19 @@ fn first_existing_path(paths: &[PathBuf]) -> Option<PathBuf> {
     paths.iter().find(|p| p.exists()).cloned()
 }
 
+fn is_positive_finite_metric(value: Option<f64>) -> bool {
+    value.is_some_and(|v| v.is_finite() && v > 0.0)
+}
+
+fn metric_state(value: Option<f64>) -> &'static str {
+    match value {
+        Some(v) if v.is_finite() && v > 0.0 => "valid",
+        Some(v) if !v.is_finite() => "non_finite",
+        Some(_) => "non_positive",
+        None => "missing_or_non_numeric",
+    }
+}
+
 fn evaluate_required_e2e_ratio_contract(
     root: &Path,
     max_age_hours: f64,
@@ -427,29 +440,34 @@ fn evaluate_required_e2e_ratio_contract(
         })
     });
 
-    let absolute_present = full_e2e
+    let absolute_value = full_e2e
         .and_then(|row| row.pointer("/absolute_metrics/value"))
-        .and_then(Value::as_f64)
-        .is_some();
-    let node_ratio_present = full_e2e
+        .and_then(Value::as_f64);
+    let node_ratio_value = full_e2e
         .and_then(|row| row.pointer("/relative_metrics/rust_vs_node_ratio"))
-        .and_then(Value::as_f64)
-        .is_some();
-    let bun_ratio_present = full_e2e
+        .and_then(Value::as_f64);
+    let bun_ratio_value = full_e2e
         .and_then(|row| row.pointer("/relative_metrics/rust_vs_bun_ratio"))
-        .and_then(Value::as_f64)
-        .is_some();
+        .and_then(Value::as_f64);
 
-    if !absolute_present || !node_ratio_present || !bun_ratio_present {
+    let absolute_valid = is_positive_finite_metric(absolute_value);
+    let node_ratio_valid = is_positive_finite_metric(node_ratio_value);
+    let bun_ratio_valid = is_positive_finite_metric(bun_ratio_value);
+
+    if !absolute_valid || !node_ratio_valid || !bun_ratio_valid {
         failures.push(DataContractFailure {
             contract_id: "missing_required_e2e_or_ratio_outputs".to_string(),
             budget_name: None,
             detail: format!(
-                "full_e2e_long_session evidence missing required values (absolute_present={absolute_present}, rust_vs_node_ratio={node_ratio_present}, rust_vs_bun_ratio={bun_ratio_present}) in {}",
+                "full_e2e_long_session evidence has invalid required values (absolute_metrics.value={}, rust_vs_node_ratio={}, rust_vs_bun_ratio={}) in {}",
+                metric_state(absolute_value),
+                metric_state(node_ratio_value),
+                metric_state(bun_ratio_value),
                 path.display()
             ),
-            remediation: "Emit full_e2e_long_session absolute latency and Rust-vs-Node/Bun ratios."
-                .to_string(),
+            remediation:
+                "Emit full_e2e_long_session absolute latency and Rust-vs-Node/Bun ratios as finite positive numbers."
+                    .to_string(),
         });
     }
 
@@ -1335,6 +1353,21 @@ fn artifact_contract_flags_stale_evidence() {
 }
 
 fn write_stratification_artifact(path: &Path, invalidity_reasons: &[&str], include_full_e2e: bool) {
+    let full_e2e_layer = include_full_e2e.then(|| {
+        json!({
+            "layer_id": "full_e2e_long_session",
+            "absolute_metrics": {"value": 120.0},
+            "relative_metrics": {"rust_vs_node_ratio": 1.8, "rust_vs_bun_ratio": 1.5}
+        })
+    });
+    write_stratification_artifact_with_full_e2e_layer(path, invalidity_reasons, full_e2e_layer);
+}
+
+fn write_stratification_artifact_with_full_e2e_layer(
+    path: &Path,
+    invalidity_reasons: &[&str],
+    full_e2e_layer: Option<Value>,
+) {
     let mut layers = vec![
         json!({
             "layer_id": "cold_load_init",
@@ -1347,12 +1380,8 @@ fn write_stratification_artifact(path: &Path, invalidity_reasons: &[&str], inclu
             "relative_metrics": {"rust_vs_node_ratio": 2.0, "rust_vs_bun_ratio": 1.6}
         }),
     ];
-    if include_full_e2e {
-        layers.push(json!({
-            "layer_id": "full_e2e_long_session",
-            "absolute_metrics": {"value": 120.0},
-            "relative_metrics": {"rust_vs_node_ratio": 1.8, "rust_vs_bun_ratio": 1.5}
-        }));
+    if let Some(layer) = full_e2e_layer {
+        layers.push(layer);
     }
 
     let payload = json!({
@@ -1403,5 +1432,57 @@ fn required_e2e_ratio_contract_flags_microbench_only_claim() {
             .iter()
             .any(|failure| failure.contract_id == "microbench_only_claim"),
         "expected microbench_only_claim failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn required_e2e_ratio_contract_fails_when_full_e2e_values_non_positive() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf");
+    std::fs::create_dir_all(&perf_dir).expect("create perf dir");
+    let artifact = perf_dir.join("extension_benchmark_stratification.json");
+    let invalid_full_e2e = json!({
+        "layer_id": "full_e2e_long_session",
+        "absolute_metrics": {"value": 0.0},
+        "relative_metrics": {"rust_vs_node_ratio": -1.0, "rust_vs_bun_ratio": 1.5}
+    });
+    write_stratification_artifact_with_full_e2e_layer(
+        &artifact,
+        &[],
+        Some(invalid_full_e2e),
+    );
+
+    let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contract_id == "missing_required_e2e_or_ratio_outputs"),
+        "expected missing_required_e2e_or_ratio_outputs failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn required_e2e_ratio_contract_fails_when_full_e2e_values_non_numeric() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf");
+    std::fs::create_dir_all(&perf_dir).expect("create perf dir");
+    let artifact = perf_dir.join("extension_benchmark_stratification.json");
+    let invalid_full_e2e = json!({
+        "layer_id": "full_e2e_long_session",
+        "absolute_metrics": {"value": "n/a"},
+        "relative_metrics": {"rust_vs_node_ratio": 1.8, "rust_vs_bun_ratio": null}
+    });
+    write_stratification_artifact_with_full_e2e_layer(
+        &artifact,
+        &[],
+        Some(invalid_full_e2e),
+    );
+
+    let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
+    assert!(
+        failures
+            .iter()
+            .any(|failure| failure.contract_id == "missing_required_e2e_or_ratio_outputs"),
+        "expected missing_required_e2e_or_ratio_outputs failure, got: {failures:?}",
     );
 }

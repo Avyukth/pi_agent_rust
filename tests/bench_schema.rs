@@ -792,6 +792,20 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     if schema != PHASE1_MATRIX_SCHEMA {
         return Err(format!("unexpected schema: {schema}"));
     }
+    let run_id = record
+        .get("run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "run_id must be a string".to_string())?;
+    if run_id.trim().is_empty() {
+        return Err("run_id must be non-empty".to_string());
+    }
+    let correlation_id = record
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "correlation_id must be a string".to_string())?;
+    if correlation_id.trim().is_empty() {
+        return Err("correlation_id must be non-empty".to_string());
+    }
 
     let matrix_requirements = record
         .get("matrix_requirements")
@@ -1099,6 +1113,24 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         .ok_or_else(|| "lineage.run_id_lineage must be an array".to_string())?;
     if run_id_lineage.len() < 2 {
         return Err("lineage.run_id_lineage must include run_id + correlation_id".to_string());
+    }
+    let lineage_run_id = run_id_lineage
+        .first()
+        .and_then(Value::as_str)
+        .ok_or_else(|| "lineage.run_id_lineage[0] must be run_id string".to_string())?;
+    if lineage_run_id != run_id {
+        return Err(format!(
+            "lineage.run_id_lineage[0] ({lineage_run_id}) must match run_id ({run_id})"
+        ));
+    }
+    let lineage_correlation_id = run_id_lineage
+        .get(1)
+        .and_then(Value::as_str)
+        .ok_or_else(|| "lineage.run_id_lineage[1] must be correlation_id string".to_string())?;
+    if lineage_correlation_id != correlation_id {
+        return Err(format!(
+            "lineage.run_id_lineage[1] ({lineage_correlation_id}) must match correlation_id ({correlation_id})"
+        ));
     }
 
     Ok(())
@@ -2127,6 +2159,30 @@ fn phase1_matrix_validator_rejects_cell_partition_not_in_requirements() {
     assert!(
         err.contains("workload_partition 'experimental'"),
         "expected unknown partition failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_empty_run_id() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["run_id"] = json!(" ");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("run_id must be non-empty"),
+        "expected non-empty run_id failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_lineage_mismatch_with_top_level_ids() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["lineage"]["run_id_lineage"][0] = json!("other-run");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("must match run_id"),
+        "expected lineage/run_id mismatch failure, got: {err}"
     );
 }
 
