@@ -14,6 +14,7 @@
 | `pi.perf.budget_summary.v1` | Aggregate budget summary with pass/fail counts |
 | `pi.ext.conformance_report.v2` | Per-extension conformance report event |
 | `pi.ext.conformance_summary.v2` | Aggregate conformance summary with per-tier breakdowns |
+| `pi.perf.extension_benchmark_stratification.v1` | Layered extension benchmark artifact linking cold-load, per-call, and full E2E evidence with claim-integrity guards |
 
 ## Environment Fingerprint
 

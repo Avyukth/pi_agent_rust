@@ -413,6 +413,10 @@
     {
       "description": "Aggregate conformance summary with per-tier breakdowns",
       "name": "pi.ext.conformance_summary.v2"
+    },
+    {
+      "description": "Layered extension benchmark artifact linking cold-load, per-call, and full E2E evidence with claim-integrity guards",
+      "name": "pi.perf.extension_benchmark_stratification.v1"
     }
   ]
 }
