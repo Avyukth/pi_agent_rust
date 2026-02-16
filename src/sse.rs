@@ -40,6 +40,8 @@ pub struct SseParser {
     has_data: bool,
     /// Whether we've already stripped the BOM from the first feed.
     bom_checked: bool,
+    /// Number of bytes in `buffer` that have already been scanned for newlines.
+    scanned_len: usize,
 }
 
 impl SseParser {
@@ -109,6 +111,7 @@ impl SseParser {
     #[inline]
     fn process_source<F>(
         source: &str,
+        scan_start: usize,
         bom_checked: &mut bool,
         current: &mut SseEvent,
         has_data: &mut bool,
@@ -119,18 +122,22 @@ impl SseParser {
     {
         let bytes = source.as_bytes();
         let mut start = 0usize;
+        let mut search_pos = scan_start;
 
         // Strip UTF-8 BOM from the beginning of the stream (SSE spec compliance).
         if !*bom_checked && !source.is_empty() {
             *bom_checked = true;
             if source.starts_with('\u{FEFF}') {
                 start = 3;
+                if search_pos < 3 {
+                    search_pos = 3;
+                }
             }
         }
 
         // Use memchr2 to find either \r or \n
-        while let Some(rel_pos) = memchr::memchr2(b'\r', b'\n', &bytes[start..]) {
-            let pos = start + rel_pos;
+        while let Some(rel_pos) = memchr::memchr2(b'\r', b'\n', &bytes[search_pos..]) {
+            let pos = search_pos + rel_pos;
             let b = bytes[pos];
 
             let line_end;
@@ -159,6 +166,7 @@ impl SseParser {
 
             let line = &source[start..line_end];
             start = next_start;
+            search_pos = next_start;
 
             if line.is_empty() {
                 // Blank line = event boundary
@@ -190,9 +198,9 @@ impl SseParser {
     {
         if self.buffer.is_empty() {
             // Fast path: process data directly without copying to buffer.
-            // Only buffer the unconsumed tail (incomplete line at end).
             let consumed = Self::process_source(
                 data,
+                0,
                 &mut self.bom_checked,
                 &mut self.current,
                 &mut self.has_data,
@@ -200,22 +208,31 @@ impl SseParser {
             );
             if consumed < data.len() {
                 self.buffer.push_str(&data[consumed..]);
+                self.scanned_len = self.buffer.len();
+            } else {
+                self.scanned_len = 0;
             }
         } else {
             // Slow path: combine with existing buffered data, then process.
             self.buffer.push_str(data);
-            let mut buffer = std::mem::take(&mut self.buffer);
+            // Re-scan from the last safe point (minus 1 to handle split CRLF).
+            let scan_start = self.scanned_len.saturating_sub(1);
             let consumed = Self::process_source(
-                &buffer,
+                &self.buffer,
+                scan_start,
                 &mut self.bom_checked,
                 &mut self.current,
                 &mut self.has_data,
                 &mut emit,
             );
             if consumed > 0 {
-                buffer.drain(..consumed);
+                self.buffer.drain(..consumed);
+                // After draining, the remaining buffer is the tail which we just scanned.
+                self.scanned_len = self.buffer.len();
+            } else {
+                // Nothing consumed, buffer grew. The entire buffer has been scanned.
+                self.scanned_len = self.buffer.len();
             }
-            self.buffer = buffer;
         }
     }
 
