@@ -282,6 +282,7 @@ pub async fn run(
     out_tx: std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_request();
+    let session_handle = Arc::clone(&session.session);
     let session = Arc::new(Mutex::new(session));
     let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
     let is_streaming = Arc::new(AtomicBool::new(false));
@@ -661,11 +662,7 @@ pub async fn run(
                     RpcStateSnapshot::from(&*state)
                 };
                 let data = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
                     session_state(
@@ -681,11 +678,7 @@ pub async fn run(
 
             "get_session_stats" => {
                 let data = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
                     session_stats(&inner_session)
@@ -695,11 +688,7 @@ pub async fn run(
 
             "get_messages" => {
                 let messages = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
                     inner_session
@@ -1053,11 +1042,7 @@ pub async fn run(
 
             "get_last_assistant_text" => {
                 let text = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                    let inner_session = session_handle.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
                     last_assistant_text(&inner_session)

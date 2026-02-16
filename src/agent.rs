@@ -362,7 +362,7 @@ impl AbortSignal {
         self.inner.aborted.load(Ordering::SeqCst)
     }
 
-    async fn wait(&self) {
+    pub async fn wait(&self) {
         if self.is_aborted() {
             return;
         }
