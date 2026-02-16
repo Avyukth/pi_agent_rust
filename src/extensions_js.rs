@@ -15209,7 +15209,11 @@ function __pi_make_hostcall(nativeFn) {
     return function(...args) {
         return new Promise((resolve, reject) => {
             const call_id = nativeFn(...args);
-            __pi_pending_hostcalls.set(call_id, { resolve, reject });
+            __pi_pending_hostcalls.set(call_id, {
+                resolve,
+                reject,
+                extensionId: __pi_current_extension_id
+            });
         });
     };
 }
@@ -15217,7 +15221,12 @@ function __pi_make_hostcall(nativeFn) {
 function __pi_make_streaming_hostcall(nativeFn, ...args) {
     const call_id = nativeFn(...args);
     const stream = new __pi_HostcallStream(call_id);
-    __pi_pending_hostcalls.set(call_id, { stream, resolve: () => {}, reject: () => {} });
+    __pi_pending_hostcalls.set(call_id, {
+        stream,
+        resolve: () => {},
+        reject: () => {},
+        extensionId: __pi_current_extension_id
+    });
     return stream;
 }
 
