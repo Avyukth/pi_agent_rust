@@ -339,7 +339,7 @@ impl BeadCoverageLink {
             return Err("bead_id must not be empty".to_string());
         }
 
-        let test_files = validate_coverage_path_set(test_files, "test_files")?;
+        let test_files = validate_required_coverage_path_set(test_files, "test_files")?;
 
         Ok(Self {
             schema: BEAD_COVERAGE_SCHEMA_V1,
@@ -362,7 +362,7 @@ impl BeadCoverageLink {
 
     /// Validate that all evidence paths are repo-relative and traversal-safe.
     pub fn validate_path_hygiene(&self) -> Result<(), String> {
-        let _ = validate_coverage_path_set(&self.test_files, "test_files")?;
+        let _ = validate_required_coverage_path_set(&self.test_files, "test_files")?;
         let _ = validate_coverage_path_set(&self.log_artifacts, "log_artifacts")?;
         Ok(())
     }
@@ -391,6 +391,16 @@ fn validate_coverage_path_set(paths: &[String], field_name: &str) -> Result<Vec<
     Ok(normalized)
 }
 
+fn validate_required_coverage_path_set(
+    paths: &[String],
+    field_name: &str,
+) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Err(format!("{field_name} must contain at least one path"));
+    }
+    validate_coverage_path_set(paths, field_name)
+}
+
 fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<String, String> {
     let candidate = path.trim();
     if candidate.is_empty() {
@@ -398,6 +408,11 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
     }
 
     let normalized = normalize_coverage_path(candidate);
+    if normalized.is_empty() || normalized == "." {
+        return Err(format!(
+            "{field_name}[{index}] must resolve to a repo-relative file path, got: {candidate}"
+        ));
+    }
     let parsed = Path::new(&normalized);
     if parsed.is_absolute()
         || looks_like_windows_absolute_path(&normalized)
@@ -2884,6 +2899,51 @@ mod tests {
         let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
             .expect_err("windows absolute test-file path must fail closed");
         assert!(err.contains("repo-relative"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_empty_test_files() {
+        let test_files: Vec<String> = Vec::new();
+        let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect_err("empty test_files must fail closed");
+        assert!(err.contains("at least one"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_validate_path_hygiene_rejects_empty_test_files() {
+        let link = BeadCoverageLink {
+            schema: BEAD_COVERAGE_SCHEMA_V1,
+            bead_id: "bd-3ar8v.6.11".to_string(),
+            test_files: Vec::new(),
+            log_artifacts: Vec::new(),
+            evidence_type: EvidenceType::Unit,
+        };
+        let err = link
+            .validate_path_hygiene()
+            .expect_err("empty test_files must fail closed");
+        assert!(err.contains("at least one"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_dot_path_after_normalization() {
+        let test_files = vec!["./".to_string()];
+        let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect_err("dot-path normalization to empty path must fail closed");
+        assert!(
+            err.contains("repo-relative file path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_single_dot_path() {
+        let test_files = vec![".".to_string()];
+        let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect_err("single-dot path must fail closed");
+        assert!(
+            err.contains("repo-relative file path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

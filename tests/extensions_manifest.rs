@@ -634,3 +634,86 @@ fn required_capability_for_host_call_maps_tool_to_capability() {
         None
     );
 }
+
+#[test]
+fn required_capability_for_host_call_maps_events_op_aliases_to_events() {
+    assert_eq!(
+        required_capability_for_host_call(&host_call(
+            "events",
+            json!({ "op": "get_active_tools" })
+        ))
+        .as_deref(),
+        Some("events")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call("events", json!({ "method": "set-model" })))
+            .as_deref(),
+        Some("events")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call(
+            "events",
+            json!({ "name": "register command" })
+        ))
+        .as_deref(),
+        Some("events")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call(" EVENTS ", json!({ "op": " list_flags " })))
+            .as_deref(),
+        Some("events")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call("events", json!({ "op": "append.entry" })))
+            .as_deref(),
+        Some("events")
+    );
+}
+
+#[test]
+fn required_capability_for_host_call_maps_session_op_aliases_to_session() {
+    assert_eq!(
+        required_capability_for_host_call(&host_call("session", json!({ "op": "get_model" })))
+            .as_deref(),
+        Some("session")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call(
+            "session",
+            json!({ "method": "set-thinking_level" })
+        ))
+        .as_deref(),
+        Some("session")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call("session", json!({ "name": "set label" })))
+            .as_deref(),
+        Some("session")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call(" SESSION ", json!({ "op": " get-file " })))
+            .as_deref(),
+        Some("session")
+    );
+}
+
+#[test]
+fn required_capability_for_host_call_unsupported_event_session_ops_do_not_escalate() {
+    // Unsupported op values should never escalate out of the declared method capability class.
+    assert_eq!(
+        required_capability_for_host_call(&host_call("events", json!({ "op": "launch_shell" })))
+            .as_deref(),
+        Some("events")
+    );
+    assert_eq!(
+        required_capability_for_host_call(&host_call("session", json!({ "op": "exec" })))
+            .as_deref(),
+        Some("session")
+    );
+
+    // Unknown method still fails closed.
+    assert_eq!(
+        required_capability_for_host_call(&host_call("mystery", json!({ "op": "exec" }))),
+        None
+    );
+}

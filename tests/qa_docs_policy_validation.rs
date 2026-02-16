@@ -2348,6 +2348,64 @@ fn evidence_logging_instance_bead_coverage_contract_is_complete() {
     assert!(types.len() >= 4, "must allow at least 4 evidence types");
 }
 
+fn canonical_perf3x_bead_segments(bead_id: &str) -> Option<Vec<u64>> {
+    let suffix = bead_id.strip_prefix("bd-3ar8v.")?;
+    if suffix.is_empty() {
+        return None;
+    }
+    suffix
+        .split('.')
+        .map(|segment| {
+            if segment.is_empty() {
+                return None;
+            }
+            segment.parse::<u64>().ok()
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+fn validate_critical_perf3x_bead_entries(entries: &[Value]) -> Result<HashSet<String>, String> {
+    let mut declared = HashSet::new();
+    let mut previous_segments: Option<Vec<u64>> = None;
+    let mut previous_bead_id: Option<String> = None;
+
+    for (index, entry) in entries.iter().enumerate() {
+        let bead_id = entry
+            .as_str()
+            .ok_or_else(|| format!("critical_perf3x_beads[{index}] must be a string"))?
+            .trim();
+        if !bead_id.starts_with("bd-3ar8v.") {
+            return Err(format!(
+                "critical_perf3x_beads[{index}] must be a PERF-3X bead id, got: {bead_id}"
+            ));
+        }
+
+        let bead_segments = canonical_perf3x_bead_segments(bead_id).ok_or_else(|| {
+            format!(
+                "critical_perf3x_beads[{index}] must be canonical numeric PERF-3X id: {bead_id}"
+            )
+        })?;
+        if let Some(previous) = previous_segments.as_ref() {
+            if bead_segments < *previous {
+                let previous_bead = previous_bead_id.as_deref().unwrap_or("<unknown>");
+                return Err(format!(
+                    "critical_perf3x_beads must be sorted by canonical bead id order: index {index} '{bead_id}' appears after '{previous_bead}'"
+                ));
+            }
+        }
+        previous_segments = Some(bead_segments);
+        previous_bead_id = Some(bead_id.to_string());
+
+        if !declared.insert(bead_id.to_string()) {
+            return Err(format!(
+                "critical_perf3x_beads must not contain duplicates, saw: {bead_id}"
+            ));
+        }
+    }
+
+    Ok(declared)
+}
+
 #[test]
 fn evidence_logging_instance_bead_coverage_policy_declares_critical_perf3x_beads() {
     let instance = load_json(EVIDENCE_LOGGING_INSTANCE_PATH);
@@ -2355,21 +2413,8 @@ fn evidence_logging_instance_bead_coverage_policy_declares_critical_perf3x_beads
         .as_array()
         .expect("must have critical_perf3x_beads array");
 
-    let mut declared = HashSet::new();
-    for (index, entry) in critical.iter().enumerate() {
-        let bead_id = entry
-            .as_str()
-            .unwrap_or_else(|| panic!("critical_perf3x_beads[{index}] must be a string"))
-            .trim();
-        assert!(
-            bead_id.starts_with("bd-3ar8v."),
-            "critical_perf3x_beads[{index}] must be a PERF-3X bead id, got: {bead_id}"
-        );
-        assert!(
-            declared.insert(bead_id.to_string()),
-            "critical_perf3x_beads must not contain duplicates, saw: {bead_id}"
-        );
-    }
+    let declared = validate_critical_perf3x_bead_entries(critical)
+        .expect("critical_perf3x_beads should be valid and deterministically ordered");
 
     for required in EVIDENCE_LOGGING_CRITICAL_PERF3X_BEADS {
         assert!(
@@ -2377,6 +2422,21 @@ fn evidence_logging_instance_bead_coverage_policy_declares_critical_perf3x_beads
             "critical_perf3x_beads must include required bead: {required}"
         );
     }
+}
+
+#[test]
+fn evidence_logging_instance_critical_perf3x_beads_fail_closed_when_unsorted() {
+    let unsorted = vec![
+        Value::String("bd-3ar8v.4.10".to_string()),
+        Value::String("bd-3ar8v.2.8".to_string()),
+    ];
+
+    let err = validate_critical_perf3x_bead_entries(&unsorted)
+        .expect_err("unsorted critical_perf3x_beads must fail closed");
+    assert!(
+        err.contains("sorted by canonical bead id order"),
+        "unexpected error for unsorted critical bead list: {err}"
+    );
 }
 
 #[test]

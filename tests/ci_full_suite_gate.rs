@@ -523,6 +523,14 @@ fn is_canonical_perf3x_bead_id(bead: &str) -> bool {
         .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
 }
 
+fn canonical_perf3x_bead_segments(bead: &str) -> Option<Vec<u64>> {
+    let suffix = bead.strip_prefix("bd-3ar8v.")?;
+    suffix
+        .split('.')
+        .map(|segment| segment.parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()
+}
+
 fn validate_cross_category_evidence_uniqueness(
     row_idx: usize,
     unit_evidence: &[String],
@@ -567,6 +575,8 @@ fn validate_perf3x_bead_coverage_contract(
     }
 
     let mut seen_beads = HashSet::new();
+    let mut previous_bead_segments: Option<Vec<u64>> = None;
+    let mut previous_bead_id: Option<String> = None;
     let mut parsed = Vec::with_capacity(rows.len());
     for (row_idx, row) in rows.iter().enumerate() {
         let bead = row
@@ -580,6 +590,19 @@ fn validate_perf3x_bead_coverage_contract(
                 "coverage_rows[{row_idx}] has invalid PERF-3X bead id: {bead}"
             ));
         }
+        let bead_segments = canonical_perf3x_bead_segments(&bead).ok_or_else(|| {
+            format!("coverage_rows[{row_idx}] has unparsable PERF-3X bead id segments: {bead}")
+        })?;
+        if let Some(previous_segments) = previous_bead_segments.as_ref() {
+            if bead_segments < *previous_segments {
+                let previous_bead = previous_bead_id.as_deref().unwrap_or("<unknown>");
+                return Err(format!(
+                    "coverage_rows must be sorted by canonical bead id order: row {row_idx} bead '{bead}' appears after '{previous_bead}'"
+                ));
+            }
+        }
+        previous_bead_segments = Some(bead_segments);
+        previous_bead_id = Some(bead.clone());
         if !seen_beads.insert(bead.clone()) {
             return Err(format!("duplicate bead in coverage_rows: {bead}"));
         }
@@ -2257,6 +2280,23 @@ fn perf3x_bead_coverage_contract_fails_closed_on_missing_critical_bead() {
     assert!(
         err.contains("bd-3ar8v.3.8"),
         "error should identify missing bead id, got: {err}"
+    );
+}
+
+#[test]
+fn perf3x_bead_coverage_contract_fails_closed_on_misordered_rows() {
+    let mut contract = perf3x_bead_coverage_contract();
+    let rows = contract
+        .get_mut("coverage_rows")
+        .and_then(Value::as_array_mut)
+        .expect("coverage_rows must exist");
+    rows.swap(0, 1);
+
+    let err =
+        validate_perf3x_bead_coverage_contract(&contract).expect_err("misordered rows must fail");
+    assert!(
+        err.contains("must be sorted by canonical bead id order"),
+        "error should mention ordering requirement, got: {err}"
     );
 }
 

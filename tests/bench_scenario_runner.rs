@@ -39,11 +39,8 @@ const BENCH_EXTENSIONS: &[&str] = &["hello", "pirate", "diff"];
 const BENCH_PROTOCOL_SCHEMA: &str = "pi.bench.protocol.v1";
 const BENCH_PROTOCOL_VERSION: &str = "1.0.0";
 const PARTITION_MATCHED_STATE: &str = "matched-state";
-const PARTITION_REALISTIC: &str = "realistic";
 const EVIDENCE_CLASS_MEASURED: &str = "measured";
-const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
-const CONFIDENCE_MEDIUM: &str = "medium";
 
 /// Iterations for cold/warm start scenarios.
 const LOAD_RUNS: usize = 5;
@@ -53,91 +50,6 @@ const DISPATCH_ITERATIONS: u32 = 500;
 
 /// Sentinel tool name for benchmark reporting.
 const BENCH_REPORT_TOOL: &str = "__bench_report";
-
-#[derive(Clone, Copy)]
-struct SessionMatrixSeedRow {
-    session_messages: u64,
-    open_ms: f64,
-    append_ms: f64,
-    save_ms: f64,
-    index_ms: f64,
-}
-
-const MATCHED_STATE_MATRIX_SEED: &[SessionMatrixSeedRow] = &[
-    SessionMatrixSeedRow {
-        session_messages: 100_000,
-        open_ms: 48.0,
-        append_ms: 36.0,
-        save_ms: 22.0,
-        index_ms: 11.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 200_000,
-        open_ms: 62.0,
-        append_ms: 45.0,
-        save_ms: 29.0,
-        index_ms: 13.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 500_000,
-        open_ms: 91.0,
-        append_ms: 68.0,
-        save_ms: 43.0,
-        index_ms: 18.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 1_000_000,
-        open_ms: 136.0,
-        append_ms: 101.0,
-        save_ms: 64.0,
-        index_ms: 24.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 5_000_000,
-        open_ms: 212.0,
-        append_ms: 158.0,
-        save_ms: 97.0,
-        index_ms: 35.0,
-    },
-];
-
-const REALISTIC_MATRIX_SEED: &[SessionMatrixSeedRow] = &[
-    SessionMatrixSeedRow {
-        session_messages: 100_000,
-        open_ms: 44.0,
-        append_ms: 32.0,
-        save_ms: 19.0,
-        index_ms: 10.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 200_000,
-        open_ms: 57.0,
-        append_ms: 41.0,
-        save_ms: 25.0,
-        index_ms: 12.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 500_000,
-        open_ms: 84.0,
-        append_ms: 61.0,
-        save_ms: 37.0,
-        index_ms: 16.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 1_000_000,
-        open_ms: 124.0,
-        append_ms: 90.0,
-        save_ms: 54.0,
-        index_ms: 21.0,
-    },
-    SessionMatrixSeedRow {
-        session_messages: 5_000_000,
-        open_ms: 198.0,
-        append_ms: 146.0,
-        save_ms: 88.0,
-        index_ms: 33.0,
-    },
-];
 
 // ─── Environment Fingerprint ────────────────────────────────────────────────
 
