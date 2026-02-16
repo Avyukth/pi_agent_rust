@@ -11002,4 +11002,151 @@ mod tests {
             }
         });
     }
+
+    // ── Property tests ──
+
+    mod proptest_dispatcher {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn shannon_entropy_nonnegative(bytes in prop::collection::vec(any::<u8>(), 0..200)) {
+                let entropy = shannon_entropy_bytes(&bytes);
+                assert!(
+                    entropy >= 0.0,
+                    "entropy must be non-negative, got {entropy}"
+                );
+            }
+
+            #[test]
+            fn shannon_entropy_bounded_by_log2_256(
+                bytes in prop::collection::vec(any::<u8>(), 1..200),
+            ) {
+                let entropy = shannon_entropy_bytes(&bytes);
+                assert!(
+                    entropy <= 8.0 + f64::EPSILON,
+                    "entropy must be <= 8.0 (log2(256)), got {entropy}"
+                );
+            }
+
+            #[test]
+            fn shannon_entropy_empty_is_zero(_dummy in Just(())) {
+                assert!(
+                    (shannon_entropy_bytes(&[]) - 0.0).abs() < f64::EPSILON,
+                    "entropy of empty input must be 0.0"
+                );
+            }
+
+            #[test]
+            fn shannon_entropy_single_byte_is_zero(byte in any::<u8>()) {
+                let entropy = shannon_entropy_bytes(&[byte]);
+                assert!(
+                    entropy.abs() < f64::EPSILON,
+                    "entropy of single byte must be 0.0, got {entropy}"
+                );
+            }
+
+            #[test]
+            fn shannon_entropy_uniform_is_maximal(
+                len in 256..512usize,
+            ) {
+                // Construct input with every byte value appearing equally
+                let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+                let entropy = shannon_entropy_bytes(&bytes);
+                // Should be close to 8.0 (log2(256))
+                assert!(
+                    entropy > 7.9,
+                    "uniform distribution entropy should be near 8.0, got {entropy}"
+                );
+            }
+
+            #[test]
+            fn llc_miss_proxy_bounded(
+                total_depth in 0..10_000usize,
+                overflow_depth in 0..10_000usize,
+                rejected_total in 0..100_000u64,
+            ) {
+                let proxy = llc_miss_proxy(total_depth, overflow_depth, rejected_total);
+                assert!(
+                    (0.0..=1.0).contains(&proxy),
+                    "llc_miss_proxy must be in [0.0, 1.0], got {proxy}"
+                );
+            }
+
+            #[test]
+            fn llc_miss_proxy_zero_on_empty(_dummy in Just(())) {
+                let proxy = llc_miss_proxy(0, 0, 0);
+                assert!(
+                    proxy.abs() < f64::EPSILON,
+                    "llc_miss_proxy(0, 0, 0) must be 0.0"
+                );
+            }
+
+            #[test]
+            fn normalized_shadow_op_idempotent(op in "[a-zA-Z_]{1,20}") {
+                let once = normalized_shadow_op(&op);
+                let twice = normalized_shadow_op(&once);
+                assert!(
+                    once == twice,
+                    "normalized_shadow_op must be idempotent: '{once}' vs '{twice}'"
+                );
+            }
+
+            #[test]
+            fn normalized_shadow_op_case_insensitive(op in "[a-zA-Z]{1,20}") {
+                let lower = normalized_shadow_op(&op.to_lowercase());
+                let upper = normalized_shadow_op(&op.to_uppercase());
+                assert!(
+                    lower == upper,
+                    "normalized_shadow_op must be case-insensitive: '{lower}' vs '{upper}'"
+                );
+            }
+
+            #[test]
+            fn shadow_safe_session_op_case_insensitive(
+                op in prop::sample::select(vec![
+                    "getState".to_string(),
+                    "GETSTATE".to_string(),
+                    "get_state".to_string(),
+                    "GET_STATE".to_string(),
+                    "getMessages".to_string(),
+                    "GET_MESSAGES".to_string(),
+                ]),
+            ) {
+                assert!(
+                    shadow_safe_session_op(&op),
+                    "'{op}' should be recognized as safe session op"
+                );
+            }
+
+            #[test]
+            fn shadow_safe_tool_case_insensitive(
+                name in prop::sample::select(vec![
+                    "Read".to_string(),
+                    "READ".to_string(),
+                    "read".to_string(),
+                    "Grep".to_string(),
+                    "GREP".to_string(),
+                ]),
+            ) {
+                assert!(
+                    shadow_safe_tool(&name),
+                    "'{name}' should be safe tool"
+                );
+            }
+
+            #[test]
+            fn usize_to_f64_monotonic(a in 0..u32::MAX as usize, b in 0..u32::MAX as usize) {
+                let fa = usize_to_f64(a);
+                let fb = usize_to_f64(b);
+                if a <= b {
+                    assert!(
+                        fa <= fb,
+                        "usize_to_f64 must be monotonic: {a} → {fa}, {b} → {fb}"
+                    );
+                }
+            }
+        }
+    }
 }

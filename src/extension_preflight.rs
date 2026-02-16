@@ -4191,4 +4191,150 @@ const c = arguments.callee;
         let report = scan("/* WebAssembly.compile(bytes); */");
         assert!(!has_rule(&report, SecurityRuleId::WebAssemblyUsage));
     }
+
+    // ── Property tests ──
+
+    mod proptest_preflight {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn eval_call_no_false_positive_on_method_calls(
+                prefix in "[a-zA-Z]{1,10}",
+                suffix in "[a-zA-Z0-9(), ]{0,20}",
+            ) {
+                // Method calls like `obj.eval(...)` should NOT be detected
+                let text = format!("{prefix}.eval({suffix})");
+                assert!(
+                    !contains_eval_call(&text),
+                    "method call should not trigger eval detection: {text}"
+                );
+            }
+
+            #[test]
+            fn eval_call_no_false_positive_on_identifier_suffix(
+                prefix in "[a-zA-Z]{1,10}",
+            ) {
+                // Identifiers ending in "eval" like "retrieval(" should not match
+                let text = format!("{prefix}eval(x)");
+                // Only "eval(" at word boundary should match
+                let expected = !prefix.as_bytes().last().unwrap().is_ascii_alphanumeric();
+                assert!(
+                    contains_eval_call(&text) == expected,
+                    "eval detection mismatch for '{text}': expected {expected}"
+                );
+            }
+
+            #[test]
+            fn dynamic_import_never_triggers_on_static_imports(
+                module in "[a-z@/.-]{1,30}",
+            ) {
+                let text = format!("import {{ foo }} from '{module}';");
+                assert!(
+                    !contains_dynamic_import(&text),
+                    "static import should not trigger: {text}"
+                );
+            }
+
+            #[test]
+            fn dynamic_import_detects_import_call(
+                module in "[a-z@/.-]{1,20}",
+            ) {
+                let text = format!("const m = import('{module}');");
+                assert!(
+                    contains_dynamic_import(&text),
+                    "dynamic import should be detected: {text}"
+                );
+            }
+
+            #[test]
+            fn extract_quoted_string_roundtrips_double(
+                content in "[a-zA-Z0-9 _.-]{0,50}",
+            ) {
+                let input = format!("\"{content}\" rest");
+                let extracted = extract_quoted_string(&input);
+                assert!(
+                    extracted == Some(content.clone()),
+                    "expected Some(\"{content}\"), got {extracted:?}"
+                );
+            }
+
+            #[test]
+            fn extract_quoted_string_roundtrips_single(
+                content in "[a-zA-Z0-9 _.-]{0,50}",
+            ) {
+                let input = format!("'{content}' rest");
+                let extracted = extract_quoted_string(&input);
+                assert!(
+                    extracted == Some(content.clone()),
+                    "expected Some('{content}'), got {extracted:?}"
+                );
+            }
+
+            #[test]
+            fn extract_quoted_string_none_for_unquoted(
+                text in "[a-zA-Z0-9]{1,20}",
+            ) {
+                assert!(
+                    extract_quoted_string(&text).is_none(),
+                    "unquoted text should return None: {text}"
+                );
+            }
+
+            #[test]
+            fn is_debugger_statement_deterministic(
+                text in "[ \t]{0,5}debugger[; \t]{0,5}",
+            ) {
+                let r1 = is_debugger_statement(&text);
+                let r2 = is_debugger_statement(&text);
+                assert!(r1 == r2, "is_debugger_statement must be deterministic");
+            }
+
+            #[test]
+            fn timer_abuse_only_triggers_below_10(interval in 0..100u64) {
+                let text = format!("setInterval(fn, {interval});");
+                let result = contains_timer_abuse(&text);
+                if interval < 10 {
+                    assert!(result, "interval {interval} < 10 should trigger");
+                } else {
+                    assert!(!result, "interval {interval} >= 10 should not trigger");
+                }
+            }
+
+            #[test]
+            fn hardcoded_secret_detects_known_token_prefixes(
+                prefix in prop::sample::select(vec![
+                    "sk-ant-".to_string(),
+                    "ghp_".to_string(),
+                    "gho_".to_string(),
+                    "glpat-".to_string(),
+                    "xoxb-".to_string(),
+                ]),
+                suffix in "[a-zA-Z0-9]{10,20}",
+            ) {
+                let text = format!("const token = \"{prefix}{suffix}\";");
+                assert!(
+                    contains_hardcoded_secret(&text),
+                    "token prefix '{prefix}' should be detected: {text}"
+                );
+            }
+
+            #[test]
+            fn hardcoded_secret_ignores_env_lookups(
+                keyword in prop::sample::select(vec![
+                    "api_key".to_string(),
+                    "password".to_string(),
+                    "secret_key".to_string(),
+                    "auth_token".to_string(),
+                ]),
+            ) {
+                let text = format!("process.env.{keyword}");
+                assert!(
+                    !contains_hardcoded_secret(&text),
+                    "env lookup should not be flagged: {text}"
+                );
+            }
+        }
+    }
 }
