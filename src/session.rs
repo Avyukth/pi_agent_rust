@@ -567,6 +567,12 @@ pub struct Session {
     header_dirty: bool,
     /// Incremental appends since last full rewrite (checkpoint counter).
     appends_since_checkpoint: u64,
+    /// Sidecar root when session was loaded from V2 storage.
+    v2_sidecar_root: Option<PathBuf>,
+    /// True when current in-memory entries are a partial hydration view from V2.
+    v2_partial_hydration: bool,
+    /// Resume mode used when loading from V2 sidecar.
+    v2_resume_mode: Option<V2OpenMode>,
 }
 
 /// Result of planning a `/fork` operation from a specific user message.
@@ -914,6 +920,9 @@ impl Session {
             persisted_entry_count: 0,
             header_dirty: false,
             appends_since_checkpoint: 0,
+            v2_sidecar_root: None,
+            v2_partial_hydration: false,
+            v2_resume_mode: None,
         }
     }
 
@@ -949,6 +958,9 @@ impl Session {
             persisted_entry_count: 0,
             header_dirty: false,
             appends_since_checkpoint: 0,
+            v2_sidecar_root: None,
+            v2_partial_hydration: false,
+            v2_resume_mode: None,
         }
     }
 
@@ -1060,6 +1072,9 @@ impl Session {
                 persisted_entry_count: entry_count,
                 header_dirty: false,
                 appends_since_checkpoint: 0,
+                v2_sidecar_root: None,
+                v2_partial_hydration: false,
+                v2_resume_mode: None,
             },
             diagnostics,
         ))
@@ -1121,6 +1136,9 @@ impl Session {
             persisted_entry_count: entry_count,
             header_dirty: false,
             appends_since_checkpoint: 0,
+            v2_sidecar_root: None,
+            v2_partial_hydration: false,
+            v2_resume_mode: None,
         })
     }
 
@@ -1262,6 +1280,66 @@ impl Session {
         self.autosave_durability = mode;
     }
 
+    /// Ensure a lazily hydrated V2 session is fully hydrated before persisting.
+    ///
+    /// Partial V2 hydration intentionally loads only a subset of entries for fast
+    /// resume. Before any save path that could trigger a full JSONL rewrite, we
+    /// must rehydrate all V2 entries to preserve non-active branches.
+    fn ensure_full_v2_hydration_before_save(&mut self) -> Result<()> {
+        if !self.v2_partial_hydration {
+            return Ok(());
+        }
+
+        let Some(v2_root) = self.v2_sidecar_root.clone() else {
+            tracing::warn!(
+                "session marked as partially hydrated from V2 but sidecar root is unavailable; disabling partial flag"
+            );
+            self.v2_partial_hydration = false;
+            return Ok(());
+        };
+
+        let pending_start = self.persisted_entry_count.min(self.entries.len());
+        let pending_entries = self.entries[pending_start..].to_vec();
+        let previous_mode = self.v2_resume_mode;
+
+        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+        let (fully_hydrated, diagnostics) =
+            Session::open_from_v2(&store, self.header.clone(), V2OpenMode::Full)?;
+        if !diagnostics.skipped_entries.is_empty() || !diagnostics.orphaned_parent_links.is_empty()
+        {
+            tracing::warn!(
+                skipped_entries = diagnostics.skipped_entries.len(),
+                orphaned_parent_links = diagnostics.orphaned_parent_links.len(),
+                "full V2 rehydration before save emitted diagnostics"
+            );
+        }
+
+        let persisted_entry_count = fully_hydrated.entries.len();
+        let mut merged_entries = fully_hydrated.entries;
+        merged_entries.extend(pending_entries);
+
+        let finalized = finalize_loaded_entries(&mut merged_entries);
+        self.entries = merged_entries;
+        self.leaf_id = finalized.leaf_id;
+        self.entry_ids = finalized.entry_ids;
+        self.is_linear = finalized.is_linear;
+        self.entry_index = finalized.entry_index;
+        self.cached_message_count = finalized.message_count;
+        self.cached_name = finalized.name;
+        self.persisted_entry_count = persisted_entry_count;
+        self.v2_partial_hydration = false;
+        self.v2_resume_mode = Some(V2OpenMode::Full);
+
+        tracing::debug!(
+            previous_mode = ?previous_mode,
+            persisted_entry_count,
+            pending_entries = self.entries.len().saturating_sub(persisted_entry_count),
+            "fully rehydrated V2 session before save"
+        );
+
+        Ok(())
+    }
+
     /// Returns `true` when a full rewrite is required instead of incremental append.
     fn should_full_rewrite(&self) -> bool {
         // First save — no file exists yet.
@@ -1289,6 +1367,7 @@ impl Session {
     /// Save the session to disk.
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
+        self.ensure_full_v2_hydration_before_save()?;
         self.ensure_entry_ids();
 
         let store_kind = match self
@@ -3364,6 +3443,9 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             persisted_entry_count: entry_count,
             header_dirty: false,
             appends_since_checkpoint: 0,
+            v2_sidecar_root: None,
+            v2_partial_hydration: false,
+            v2_resume_mode: None,
         },
         diagnostics,
     ))
@@ -3441,6 +3523,9 @@ fn open_from_v2_store_blocking(jsonl_path: PathBuf) -> Result<(Session, SessionO
     // 4. Load entries using the selected mode.
     let (mut session, diagnostics) = Session::open_from_v2(&store, header, mode)?;
     session.path = Some(jsonl_path);
+    session.v2_sidecar_root = Some(v2_root);
+    session.v2_partial_hydration = !matches!(mode, V2OpenMode::Full);
+    session.v2_resume_mode = Some(mode);
     Ok((session, diagnostics))
 }
 
@@ -3947,6 +4032,64 @@ mod tests {
         assert_eq!(mode, V2OpenMode::Full);
         assert_eq!(reason, "default_full");
         assert_eq!(threshold, 500);
+    }
+
+    #[test]
+    fn v2_partial_hydration_rehydrates_before_header_rewrite_save() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("lazy_hydration_branching.jsonl");
+
+        // Build a branching session:
+        // root -> a -> b
+        //           \-> c (active leaf)
+        let mut seed = Session::create();
+        seed.path = Some(path.clone());
+        let _id_root = seed.append_message(make_test_message("root"));
+        let id_a = seed.append_message(make_test_message("a"));
+        let id_b = seed.append_message(make_test_message("main-branch"));
+        assert!(seed.create_branch_from(&id_a));
+        let id_c = seed.append_message(make_test_message("side-branch"));
+        run_async(async { seed.save().await }).unwrap();
+
+        // Build sidecar and reopen in ActivePath mode.
+        create_v2_sidecar_from_jsonl(&path).unwrap();
+        let v2_root = crate::session_store_v2::v2_sidecar_path(&path);
+        let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024).unwrap();
+        let (mut loaded, _) =
+            Session::open_from_v2(&store, seed.header.clone(), V2OpenMode::ActivePath).unwrap();
+        loaded.path = Some(path.clone());
+        loaded.v2_sidecar_root = Some(v2_root);
+        loaded.v2_partial_hydration = true;
+        loaded.v2_resume_mode = Some(V2OpenMode::ActivePath);
+
+        let active_ids: Vec<String> = loaded
+            .entries
+            .iter()
+            .filter_map(|entry| entry.base().id.clone())
+            .collect();
+        assert!(
+            !active_ids.contains(&id_b),
+            "active path intentionally excludes non-leaf sibling branch"
+        );
+        assert!(active_ids.contains(&id_c));
+
+        // Force full rewrite path (header dirty). Save must rehydrate first so b survives.
+        loaded.set_model_header(Some("provider-updated".to_string()), None, None);
+        run_async(async { loaded.save().await }).unwrap();
+
+        let (reopened, _) =
+            run_async(async { Session::open_jsonl_with_diagnostics(&path).await }).unwrap();
+        let reopened_ids: Vec<String> = reopened
+            .entries
+            .iter()
+            .filter_map(|entry| entry.base().id.clone())
+            .collect();
+        assert!(
+            reopened_ids.contains(&id_b),
+            "non-active branch entry must survive full rewrite after lazy hydration"
+        );
+        assert!(reopened_ids.contains(&id_c));
+        assert_eq!(reopened_ids.len(), 4);
     }
 
     #[test]

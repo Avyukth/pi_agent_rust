@@ -308,6 +308,52 @@ fn bench_dispatch_decision(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_snapshot_lookup(c: &mut Criterion) {
+    let mut policy = pi::extensions::ExtensionPolicy::default();
+    policy.default_caps.push("read".to_string());
+    policy.default_caps.push("write".to_string());
+    policy.default_caps.push("http".to_string());
+    policy.deny_caps.push("exec".to_string());
+
+    let mut ext_overrides = pi::extensions::ExtensionOverride::default();
+    ext_overrides.allow.push("exec".to_string());
+    policy
+        .per_extension
+        .insert("ext.special".to_string(), ext_overrides);
+
+    let snapshot = pi::extensions::PolicySnapshot::compile(&policy);
+
+    let mut group = c.benchmark_group("ext_snapshot");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("lookup_global_known", |b| {
+        b.iter(|| black_box(snapshot.lookup(black_box("read"), None)));
+    });
+
+    group.bench_function("lookup_per_ext_known", |b| {
+        b.iter(|| black_box(snapshot.lookup(black_box("exec"), Some("ext.special"))));
+    });
+
+    group.bench_function("lookup_unknown_cap", |b| {
+        b.iter(|| black_box(snapshot.lookup(black_box("custom_xyz"), None)));
+    });
+
+    group.bench_function("lookup_unknown_ext_fallback", |b| {
+        b.iter(|| black_box(snapshot.lookup(black_box("read"), Some("ext.unknown"))));
+    });
+
+    // Compare: direct evaluate_for for same operations
+    group.bench_function("evaluate_for_baseline", |b| {
+        b.iter(|| black_box(policy.evaluate_for(black_box("read"), None)));
+    });
+
+    group.bench_function("compile", |b| {
+        b.iter(|| black_box(pi::extensions::PolicySnapshot::compile(black_box(&policy))));
+    });
+
+    group.finish();
+}
+
 fn bench_protocol_parse_and_validate(c: &mut Criterion) {
     let host_call_small = format!(
         r#"{{"id":"msg-1","version":"{}","type":"host_call","payload":{{"call_id":"call-1","capability":"read","method":"tool","params":{{"name":"read"}}}}}}"#,
@@ -1175,6 +1221,7 @@ criterion_group!(
         bench_extension_policy,
         bench_required_capability_for_host_call,
         bench_dispatch_decision,
+        bench_snapshot_lookup,
         bench_protocol_parse_and_validate,
         bench_protocol_dispatch,
         bench_extension_load_init,

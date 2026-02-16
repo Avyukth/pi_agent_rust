@@ -11665,7 +11665,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Create a new PiJS runtime with a custom clock and runtime config.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn with_clock_and_config(clock: C, mut config: PiJsRuntimeConfig) -> Result<Self> {
         // Inject target architecture so JS process.arch can read it
         #[cfg(target_arch = "x86_64")]

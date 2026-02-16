@@ -6890,14 +6890,14 @@ mod policy_snapshot_tests {
 
     fn make_policy_with_per_extension() -> ExtensionPolicy {
         let mut policy = ExtensionPolicy::default();
-        policy.default_caps.insert("read".to_string());
-        policy.default_caps.insert("write".to_string());
-        policy.default_caps.insert("http".to_string());
-        policy.deny_caps.insert("exec".to_string());
+        policy.default_caps.push("read".to_string());
+        policy.default_caps.push("write".to_string());
+        policy.default_caps.push("http".to_string());
+        policy.deny_caps.push("exec".to_string());
 
-        let mut ext_overrides = PerExtensionPolicy::default();
-        ext_overrides.allow.insert("exec".to_string());
-        ext_overrides.deny.insert("write".to_string());
+        let mut ext_overrides = ExtensionOverride::default();
+        ext_overrides.allow.push("exec".to_string());
+        ext_overrides.deny.push("write".to_string());
         policy
             .per_extension
             .insert("ext.special".to_string(), ext_overrides);
@@ -6914,7 +6914,8 @@ mod policy_snapshot_tests {
             let direct = policy.evaluate_for(cap.as_str(), None);
             let via_snapshot = snapshot.lookup(cap.as_str(), None);
             assert_eq!(
-                direct.decision, via_snapshot.decision,
+                direct.decision,
+                via_snapshot.decision,
                 "global decision mismatch for capability '{}'",
                 cap.as_str()
             );
@@ -6930,7 +6931,8 @@ mod policy_snapshot_tests {
             let direct = policy.evaluate_for(cap.as_str(), Some("ext.special"));
             let via_snapshot = snapshot.lookup(cap.as_str(), Some("ext.special"));
             assert_eq!(
-                direct.decision, via_snapshot.decision,
+                direct.decision,
+                via_snapshot.decision,
                 "per-extension decision mismatch for '{}' on ext.special",
                 cap.as_str()
             );
@@ -6946,7 +6948,8 @@ mod policy_snapshot_tests {
             let global = snapshot.lookup(cap.as_str(), None);
             let unknown_ext = snapshot.lookup(cap.as_str(), Some("ext.unknown"));
             assert_eq!(
-                global.decision, unknown_ext.decision,
+                global.decision,
+                unknown_ext.decision,
                 "unknown extension should fall back to global for '{}'",
                 cap.as_str()
             );
@@ -6966,7 +6969,7 @@ mod policy_snapshot_tests {
     #[test]
     fn snapshot_permissive_mode_allows_all() {
         let mut policy = ExtensionPolicy::default();
-        policy.mode = PolicyMode::Permissive;
+        policy.mode = ExtensionPolicyMode::Permissive;
         let snapshot = PolicySnapshot::compile(&policy);
 
         for cap in ALL_CAPABILITIES {
@@ -19620,6 +19623,17 @@ impl ExtensionManager {
             guard.active_tools = active_tools;
             guard.providers = all_providers;
             guard.flags = all_flags;
+            // Rebuild hook_bitmap from the freshly-loaded extensions so that
+            // dispatch_tool_result / dispatch_event can find registered hooks.
+            guard.hook_bitmap.clear();
+            let hooks: Vec<String> = guard
+                .extensions
+                .iter()
+                .flat_map(|ext| ext.event_hooks.iter().cloned())
+                .collect();
+            for hook in hooks {
+                guard.hook_bitmap.insert(hook);
+            }
             let active_extension_ids = guard
                 .extensions
                 .iter()
