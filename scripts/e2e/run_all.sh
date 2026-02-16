@@ -6660,6 +6660,13 @@ required_fail_closed_conditions = [
 
 required_scenarios: list[str] = []
 required_partition_tags: list[str] = ["matched-state", "realistic"]
+required_realistic_session_shapes: list[str] = [
+    "realistic_100k",
+    "realistic_200k",
+    "realistic_500k",
+    "realistic_1m",
+    "realistic_5m",
+]
 required_scenario_metadata_fields: list[str] = [
     "workflow_id",
     "workflow_class",
@@ -6758,6 +6765,25 @@ if isinstance(perf_sli_matrix, dict):
         fail_msg="reporting_contract must be an object",
         strict=True,
     )
+    benchmark_partitions = perf_sli_matrix.get("benchmark_partitions")
+    require_condition(
+        "claim_integrity.benchmark_partitions_object",
+        path=perf_sli_matrix_path,
+        ok=isinstance(benchmark_partitions, dict),
+        ok_msg="benchmark_partitions object exists",
+        fail_msg="benchmark_partitions must be an object",
+        strict=True,
+    )
+    if isinstance(benchmark_partitions, dict):
+        realistic_shapes_raw = benchmark_partitions.get("realistic_long_session")
+        if isinstance(realistic_shapes_raw, list):
+            normalized = [
+                str(value).strip()
+                for value in realistic_shapes_raw
+                if str(value).strip()
+            ]
+            if normalized:
+                required_realistic_session_shapes = normalized
     if isinstance(reporting_contract, dict):
         required_scenarios_raw = reporting_contract.get("required_scenarios")
         if isinstance(required_scenarios_raw, list):
@@ -6873,11 +6899,18 @@ evidence_missing_or_stale_reasons: list[str] = []
 missing_required_result_field_reasons: list[str] = []
 missing_workload_partition_tag_reasons: list[str] = []
 missing_scenario_metadata_reasons: list[str] = []
+missing_realistic_session_shape_reasons: list[str] = []
 invalid_evidence_class_reasons: list[str] = []
 invalid_confidence_label_reasons: list[str] = []
 missing_absolute_or_relative_reasons: list[str] = []
 microbench_only_claim_reasons: list[str] = []
 global_claim_partition_reasons: list[str] = []
+scenario_partition_coverage: dict[str, set[str]] = {}
+observed_realistic_session_shapes: set[str] = set()
+missing_realistic_session_shapes: list[str] = []
+scenario_cell_status_payload: dict | None = None
+scenario_cell_status_json_path: Path | None = None
+scenario_cell_status_markdown_path: Path | None = None
 
 expected_claim_correlation_id = summary_correlation_id or environment_correlation_id
 freshness_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -7204,7 +7237,6 @@ if isinstance(baseline_confidence, dict) and perf_baseline_confidence_path is no
         strict=claim_integrity_required,
     )
 
-    scenario_partition_coverage: dict[str, set[str]] = {}
     minimal_required_fields = [
         "run_id",
         "correlation_id",
@@ -7250,6 +7282,7 @@ if isinstance(baseline_confidence, dict) and perf_baseline_confidence_path is no
             )
 
         metadata = record.get("scenario_metadata")
+        realistic_session_shape = ""
         if not isinstance(metadata, dict):
             missing_scenario_metadata_reasons.append(
                 f"records[{index}] scenario_metadata must be object"
@@ -7264,6 +7297,23 @@ if isinstance(baseline_confidence, dict) and perf_baseline_confidence_path is no
                 missing_scenario_metadata_reasons.append(
                     f"records[{index}] scenario_metadata missing {missing_metadata_fields}"
                 )
+            if workload_partition == "realistic":
+                realistic_session_shape = str(
+                    metadata.get("realistic_session_shape", "")
+                ).strip()
+                if not realistic_session_shape:
+                    missing_realistic_session_shape_reasons.append(
+                        f"records[{index}] scenario_metadata missing "
+                        "realistic_session_shape for realistic partition"
+                    )
+                elif (
+                    required_realistic_session_shapes
+                    and realistic_session_shape not in required_realistic_session_shapes
+                ):
+                    missing_realistic_session_shape_reasons.append(
+                        f"records[{index}] scenario_metadata.realistic_session_shape "
+                        f"{realistic_session_shape!r} not in {required_realistic_session_shapes}"
+                    )
 
         confidence_label = str(record.get("confidence", "")).strip()
         if confidence_label and confidence_label not in allowed_confidence:
@@ -7279,6 +7329,8 @@ if isinstance(baseline_confidence, dict) and perf_baseline_confidence_path is no
 
         if scenario_id and workload_partition:
             scenario_partition_coverage.setdefault(scenario_id, set()).add(workload_partition)
+        if workload_partition == "realistic" and realistic_session_shape:
+            observed_realistic_session_shapes.add(realistic_session_shape)
 
     for scenario in required_scenarios:
         present_partitions = scenario_partition_coverage.get(scenario, set())
@@ -7289,6 +7341,149 @@ if isinstance(baseline_confidence, dict) and perf_baseline_confidence_path is no
             global_claim_partition_reasons.append(
                 f"scenario {scenario} missing partition coverage: {missing_tags}"
             )
+
+    if required_realistic_session_shapes:
+        missing_realistic_session_shapes = [
+            shape
+            for shape in required_realistic_session_shapes
+            if shape not in observed_realistic_session_shapes
+        ]
+        if missing_realistic_session_shapes:
+            missing_realistic_session_shape_reasons.append(
+                "missing required realistic_session_shape coverage: "
+                f"{missing_realistic_session_shapes}"
+            )
+
+if claim_integrity_gate_active:
+    matrix_scenarios: list[str] = (
+        sorted(required_scenarios)
+        if required_scenarios
+        else sorted(scenario_partition_coverage.keys())
+    )
+    matrix_partitions: list[str] = (
+        list(required_partition_tags)
+        if required_partition_tags
+        else sorted(
+            {
+                partition
+                for partitions in scenario_partition_coverage.values()
+                for partition in partitions
+            }
+        )
+    )
+    if not matrix_partitions:
+        matrix_partitions = ["matched-state", "realistic"]
+
+    realistic_shape_summary = {
+        "required": list(required_realistic_session_shapes),
+        "present": sorted(observed_realistic_session_shapes),
+        "missing": list(missing_realistic_session_shapes),
+        "overall_status": "pass" if not missing_realistic_session_shapes else "fail",
+    }
+
+    cells: list[dict] = []
+    passing_cells = 0
+    failing_cells = 0
+
+    for scenario_id in matrix_scenarios:
+        present_partitions = scenario_partition_coverage.get(scenario_id, set())
+        for partition in matrix_partitions:
+            passed = partition in present_partitions
+            if passed:
+                passing_cells += 1
+            else:
+                failing_cells += 1
+            cells.append(
+                {
+                    "scenario_id": scenario_id,
+                    "workload_partition": partition,
+                    "status": "pass" if passed else "fail",
+                    "present_in_records": passed,
+                    "source": "pi.perf.baseline_variance_confidence.v1.records",
+                    "reason": (
+                        "coverage present in baseline confidence records"
+                        if passed
+                        else "missing required scenario/partition record"
+                    ),
+                }
+            )
+
+    scenario_cell_status_payload = {
+        "schema": "pi.claim_integrity.scenario_cell_status.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": expected_claim_correlation_id,
+        "artifact_dir": str(artifact_dir),
+        "required_scenarios": matrix_scenarios,
+        "required_partitions": matrix_partitions,
+        "summary": {
+            "total_cells": len(cells),
+            "passing_cells": passing_cells,
+            "failing_cells": failing_cells,
+            "overall_status": "pass" if failing_cells == 0 else "fail",
+            "realistic_session_shape_coverage": realistic_shape_summary,
+        },
+        "cells": cells,
+    }
+
+    scenario_cell_status_json_path = artifact_dir / "claim_integrity_scenario_cell_status.json"
+    scenario_cell_status_json_path.write_text(
+        json.dumps(scenario_cell_status_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    scenario_cell_status_markdown_path = (
+        artifact_dir / "claim_integrity_scenario_cell_status.md"
+    )
+    md_lines = [
+        "# Claim-Integrity Scenario Cell Status",
+        "",
+        f"- Schema: `{scenario_cell_status_payload['schema']}`",
+        f"- Correlation ID: `{expected_claim_correlation_id}`",
+        f"- Total cells: `{len(cells)}`",
+        f"- Passing cells: `{passing_cells}`",
+        f"- Failing cells: `{failing_cells}`",
+        (
+            "- Realistic session-shape status: "
+            f"`{realistic_shape_summary['overall_status']}`"
+        ),
+        (
+            "- Required realistic session shapes: "
+            f"`{', '.join(realistic_shape_summary['required'])}`"
+        ),
+        (
+            "- Present realistic session shapes: "
+            f"`{', '.join(realistic_shape_summary['present']) or 'none'}`"
+        ),
+        (
+            "- Missing realistic session shapes: "
+            f"`{', '.join(realistic_shape_summary['missing']) or 'none'}`"
+        ),
+        "",
+        "| Scenario | Partition | Status | Reason |",
+        "| --- | --- | --- | --- |",
+    ]
+    for cell in cells:
+        icon = "PASS" if cell["status"] == "pass" else "FAIL"
+        md_lines.append(
+            f"| `{cell['scenario_id']}` | `{cell['workload_partition']}` | {icon} | {cell['reason']} |"
+        )
+    scenario_cell_status_markdown_path.write_text(
+        "\n".join(md_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    add_check(
+        "claim_integrity.scenario_cell_status_json",
+        scenario_cell_status_json_path,
+        True,
+        f"scenario-cell status JSON written: {scenario_cell_status_json_path}",
+    )
+    add_check(
+        "claim_integrity.scenario_cell_status_markdown",
+        scenario_cell_status_markdown_path,
+        True,
+        f"scenario-cell status markdown written: {scenario_cell_status_markdown_path}",
+    )
 
 if claim_integrity_gate_active:
     require_condition(
@@ -7349,6 +7544,24 @@ if claim_integrity_gate_active:
         remediation=(
             "Populate scenario_metadata with workflow_id/workflow_class/suite_ids/"
             "vcr_mode/scenario_owner for each perf evidence row."
+        ),
+    )
+    require_condition(
+        "claim_integrity.realistic_session_shape_coverage",
+        path=perf_sli_matrix_path,
+        ok=not missing_realistic_session_shape_reasons,
+        ok_msg=(
+            "realistic partition rows include realistic_session_shape metadata "
+            "for required matrix tiers"
+        ),
+        fail_msg=(
+            "missing/invalid realistic_session_shape coverage detected: "
+            f"{missing_realistic_session_shape_reasons}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set scenario_metadata.realistic_session_shape on realistic rows and "
+            "cover benchmark_partitions.realistic_long_session tiers."
         ),
     )
     require_condition(
@@ -7658,6 +7871,22 @@ contract_payload = {
     "errors": errors,
     "warnings": warnings,
     "remediation_hints": sorted(remediation_hints),
+    "claim_integrity_scenario_cells": (
+        {
+            "schema": "pi.claim_integrity.scenario_cell_status.v1",
+            "path": str(scenario_cell_status_json_path),
+            "markdown_path": str(scenario_cell_status_markdown_path)
+            if scenario_cell_status_markdown_path is not None
+            else None,
+            "summary": (
+                scenario_cell_status_payload.get("summary", {})
+                if isinstance(scenario_cell_status_payload, dict)
+                else {}
+            ),
+        }
+        if scenario_cell_status_json_path is not None
+        else None
+    ),
 }
 contract_file.parent.mkdir(parents=True, exist_ok=True)
 contract_file.write_text(json.dumps(contract_payload, indent=2) + "\n", encoding="utf-8")
@@ -7672,6 +7901,17 @@ if isinstance(summary, dict):
         "error_count": len(errors),
         "warning_count": len(warnings),
     }
+    if scenario_cell_status_json_path is not None and isinstance(
+        scenario_cell_status_payload, dict
+    ):
+        summary["claim_integrity_scenario_cells"] = {
+            "schema": "pi.claim_integrity.scenario_cell_status.v1",
+            "path": str(scenario_cell_status_json_path),
+            "markdown_path": str(scenario_cell_status_markdown_path)
+            if scenario_cell_status_markdown_path is not None
+            else None,
+            "summary": scenario_cell_status_payload.get("summary", {}),
+        }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 if errors:

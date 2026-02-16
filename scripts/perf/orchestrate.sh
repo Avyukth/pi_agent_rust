@@ -647,7 +647,8 @@ cat > "$OUTPUT_DIR/manifest.json" <<EOF
     "sli_matrix": "pi.perf.sli_ux_matrix.v1",
     "pgo_pipeline": "pi.perf.pgo_pipeline_summary.v1",
     "extension_stratification": "pi.perf.extension_benchmark_stratification.v1",
-    "cross_env_variance_diagnosis": "pi.perf.cross_env_variance_diagnosis.v1"
+    "cross_env_variance_diagnosis": "pi.perf.cross_env_variance_diagnosis.v1",
+    "phase1_matrix_validation": "pi.perf.phase1_matrix_validation.v1"
   },
   "output_dir": "$OUTPUT_DIR"
 }
@@ -1577,6 +1578,537 @@ PY
   fi
 else
   log_step "Skipping cross-env diagnosis (set PERF_CROSS_ENV_BASELINES to enable)"
+fi
+
+# ─── Phase 5f: Phase-1 matrix validation ────────────────────────────────────
+
+log_phase "Phase 5f: Phase-1 Matrix Validation"
+
+PHASE1_MATRIX_PATH="$OUTPUT_DIR/results/phase1_matrix_validation.json"
+if OUTPUT_DIR="$OUTPUT_DIR" \
+  PROJECT_ROOT="$PROJECT_ROOT" \
+  CORRELATION_ID="$CORRELATION_ID" \
+  TIMESTAMP="$TIMESTAMP" \
+  PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
+  python3 - <<'PY'
+import json
+import os
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR"])
+project_root = Path(os.environ["PROJECT_ROOT"])
+correlation_id = os.environ["CORRELATION_ID"]
+timestamp = os.environ["TIMESTAMP"]
+phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
+
+manifest_path = output_dir / "manifest.json"
+scenario_runner_path = output_dir / "results" / "scenario_runner.jsonl"
+stratification_path = output_dir / "results" / "extension_benchmark_stratification.json"
+baseline_path = output_dir / "results" / "baseline_variance_confidence.json"
+perf_sli_path = project_root / "docs" / "perf_sli_matrix.json"
+fault_injection_script = project_root / "scripts" / "e2e" / "run_persistence_fault_injection.sh"
+fault_injection_root = (
+    project_root / "tests" / "e2e_results" / "persistence-fault-injection"
+)
+
+
+def load_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_jsonl(path: Path):
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def parse_float(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        match = re.search(r"-?\d+(?:\.\d+)?", value)
+        if match:
+            return float(match.group(0))
+    return None
+
+
+def parse_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip().replace("_", "")
+        if not value:
+            return None
+        match = re.search(r"\d+", value)
+        if match:
+            return int(match.group(0))
+    return None
+
+
+def normalize_partition(value):
+    text = str(value or "").strip().lower()
+    text = text.replace("_", "-")
+    if text in {"matched-state", "matchedstate"}:
+        return "matched-state"
+    if text == "realistic":
+        return "realistic"
+    return text
+
+
+def parse_session_size(scenario_id, replay_input):
+    if isinstance(replay_input, dict):
+        direct = parse_int(replay_input.get("session_messages"))
+        if direct is not None:
+            return direct
+    if not scenario_id:
+        return None
+    match = re.search(r"session[_/-]?(\d+)", scenario_id)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def suite_status(name, suite_map):
+    row = suite_map.get(name)
+    if not isinstance(row, dict):
+        return "missing"
+    status = str(row.get("status", "")).strip().lower()
+    return status if status else "missing"
+
+
+manifest = load_json(manifest_path)
+run_id = str(manifest.get("timestamp", timestamp))
+
+suite_results = manifest.get("suite_results", [])
+if not isinstance(suite_results, list):
+    suite_results = []
+suite_result_by_name = {
+    str(row.get("suite", "")).strip(): row
+    for row in suite_results
+    if isinstance(row, dict) and str(row.get("suite", "")).strip()
+}
+
+perf_sli = load_json(perf_sli_path) if perf_sli_path.exists() else {}
+required_partitions = (
+    perf_sli.get("reporting_contract", {}).get("required_partition_tags", [])
+)
+if not isinstance(required_partitions, list):
+    required_partitions = []
+required_partitions = [
+    normalize_partition(tag) for tag in required_partitions if normalize_partition(tag)
+]
+if not required_partitions:
+    required_partitions = ["matched-state", "realistic"]
+
+benchmark_partitions = perf_sli.get("benchmark_partitions", {})
+required_sizes = []
+if isinstance(benchmark_partitions, dict):
+    realistic_ids = benchmark_partitions.get("realistic_long_session", [])
+    if isinstance(realistic_ids, list):
+        for item in realistic_ids:
+            parsed = parse_session_size(str(item), {})
+            if parsed is not None and parsed not in required_sizes:
+                required_sizes.append(parsed)
+if not required_sizes:
+    required_sizes = [100_000, 200_000, 500_000, 1_000_000, 5_000_000]
+
+scenario_runner_records = load_jsonl(scenario_runner_path)
+stage_records = {}
+for index, record in enumerate(scenario_runner_records):
+    if not isinstance(record, dict):
+        continue
+    partition = normalize_partition(
+        record.get("partition") or record.get("workload_partition")
+    )
+    metadata = record.get("scenario_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    replay_input = metadata.get("replay_input")
+    if not isinstance(replay_input, dict):
+        replay_input = {}
+    scenario_id = str(
+        metadata.get("scenario_id")
+        or record.get("scenario_id")
+        or record.get("scenario")
+        or ""
+    ).strip()
+    session_messages = parse_session_size(scenario_id, replay_input)
+
+    if partition not in required_partitions or session_messages not in required_sizes:
+        continue
+
+    key = (partition, session_messages)
+    if key in stage_records:
+        continue
+
+    open_ms = parse_float(record.get("open_ms"))
+    append_ms = parse_float(record.get("append_ms"))
+    save_ms = parse_float(record.get("save_ms"))
+    index_ms = parse_float(record.get("index_ms"))
+    if index_ms is None:
+        index_ms = parse_float(record.get("session_index_ms"))
+    wall_clock_ms = parse_float(record.get("total_ms"))
+    if wall_clock_ms is None:
+        wall_clock_ms = parse_float(record.get("elapsed_ms"))
+
+    stage_records[key] = {
+        "scenario_id": scenario_id
+        if scenario_id
+        else f"{partition}/session_{session_messages}",
+        "open_ms": open_ms,
+        "append_ms": append_ms,
+        "save_ms": save_ms,
+        "index_ms": index_ms,
+        "wall_clock_ms": wall_clock_ms,
+        "source_record_index": index,
+    }
+
+stratification = load_json(stratification_path) if stratification_path.exists() else {}
+layers = stratification.get("layers", [])
+if not isinstance(layers, list):
+    layers = []
+layer_by_id = {
+    str(layer.get("layer_id", "")).strip(): layer
+    for layer in layers
+    if isinstance(layer, dict) and str(layer.get("layer_id", "")).strip()
+}
+
+def layer_absolute(layer_id):
+    layer = layer_by_id.get(layer_id, {})
+    if not isinstance(layer, dict):
+        return None
+    metrics = layer.get("absolute_metrics", {})
+    if not isinstance(metrics, dict):
+        return None
+    return parse_float(metrics.get("value"))
+
+
+def layer_relative(layer_id, field):
+    layer = layer_by_id.get(layer_id, {})
+    if not isinstance(layer, dict):
+        return None
+    metrics = layer.get("relative_metrics", {})
+    if not isinstance(metrics, dict):
+        return None
+    return parse_float(metrics.get(field))
+
+
+primary_wall_clock_ms = layer_absolute("full_e2e_long_session")
+primary_rust_vs_node_ratio = layer_relative(
+    "full_e2e_long_session", "rust_vs_node_ratio"
+)
+primary_rust_vs_bun_ratio = layer_relative("full_e2e_long_session", "rust_vs_bun_ratio")
+cold_load_ms = layer_absolute("cold_load_init")
+per_call_us = layer_absolute("per_call_dispatch_micro")
+
+cells = []
+operation_stage_coverage = {
+    "open_ms": 0,
+    "append_ms": 0,
+    "save_ms": 0,
+    "index_ms": 0,
+}
+covered_cells = 0
+cells_with_complete_stage_breakdown = 0
+
+for partition in required_partitions:
+    for session_messages in required_sizes:
+        key = (partition, session_messages)
+        source = stage_records.get(key, {})
+
+        stage_attribution = {
+            "open_ms": source.get("open_ms"),
+            "append_ms": source.get("append_ms"),
+            "save_ms": source.get("save_ms"),
+            "index_ms": source.get("index_ms"),
+        }
+        for metric, value in stage_attribution.items():
+            if value is not None:
+                operation_stage_coverage[metric] += 1
+
+        required_stage_keys = ["open_ms", "append_ms", "save_ms"]
+        missing_stage_keys = [
+            metric for metric in required_stage_keys if stage_attribution.get(metric) is None
+        ]
+        if not missing_stage_keys:
+            cells_with_complete_stage_breakdown += 1
+
+        total_stage_ms = sum(
+            value for value in stage_attribution.values() if value is not None
+        )
+        if all(value is None for value in stage_attribution.values()):
+            total_stage_ms = None
+
+        cell_wall_clock = source.get("wall_clock_ms")
+        if cell_wall_clock is None:
+            cell_wall_clock = primary_wall_clock_ms
+
+        missing_reasons = []
+        if not source:
+            missing_reasons.append("missing_matrix_source_record")
+        if missing_stage_keys:
+            missing_reasons.append(
+                "missing_stage_metrics:" + ",".join(sorted(missing_stage_keys))
+            )
+        if cell_wall_clock is None:
+            missing_reasons.append("missing_primary_wall_clock")
+        if primary_rust_vs_node_ratio is None or primary_rust_vs_bun_ratio is None:
+            missing_reasons.append("missing_primary_relative_ratios")
+
+        if source:
+            covered_cells += 1
+
+        cells.append(
+            {
+                "workload_partition": partition,
+                "session_messages": session_messages,
+                "scenario_id": source.get("scenario_id")
+                or f"{partition}/session_{session_messages}",
+                "status": "pass" if not missing_reasons else "fail",
+                "missing_reasons": sorted(set(missing_reasons)),
+                "stage_attribution": {
+                    **stage_attribution,
+                    "total_stage_ms": total_stage_ms,
+                },
+                "primary_e2e": {
+                    "wall_clock_ms": cell_wall_clock,
+                    "rust_vs_node_ratio": primary_rust_vs_node_ratio,
+                    "rust_vs_bun_ratio": primary_rust_vs_bun_ratio,
+                },
+                "microbench_context": {
+                    "cold_load_ms": cold_load_ms,
+                    "per_call_us": per_call_us,
+                },
+                "lineage": {
+                    "source_record_index": source.get("source_record_index"),
+                    "source_artifacts": [
+                        str(path)
+                        for path in (
+                            scenario_runner_path,
+                            stratification_path,
+                            baseline_path,
+                        )
+                        if path.exists()
+                    ],
+                },
+            }
+        )
+
+missing_cells = [
+    {
+        "workload_partition": cell["workload_partition"],
+        "session_messages": cell["session_messages"],
+        "reasons": cell["missing_reasons"],
+    }
+    for cell in cells
+    if "missing_matrix_source_record" in cell.get("missing_reasons", [])
+]
+
+suite_logs = {}
+for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
+    suite_dir = output_dir / "results" / suite_name
+    suite_logs[suite_name] = {
+        "stdout": str(suite_dir / "stdout.log"),
+        "stderr": str(suite_dir / "stderr.log"),
+        "result": str(suite_dir / "result.json"),
+        "status": suite_status(suite_name, suite_result_by_name),
+        "present": suite_dir.exists(),
+    }
+
+fault_injection_candidates = []
+if fault_injection_root.exists():
+    fault_injection_candidates = sorted(fault_injection_root.glob("*/summary.json"))
+fault_injection_summary_path = (
+    fault_injection_candidates[-1] if fault_injection_candidates else None
+)
+fault_injection_status = "missing"
+fault_injection_summary = {}
+if fault_injection_summary_path and fault_injection_summary_path.exists():
+    try:
+        fault_injection_summary = load_json(fault_injection_summary_path)
+    except Exception:
+        fault_injection_summary = {}
+    status_text = str(fault_injection_summary.get("overall_status", "")).strip().lower()
+    if status_text in {"pass", "ok", "passed", "success"}:
+        fault_injection_status = "pass"
+    elif status_text:
+        fault_injection_status = "fail"
+    elif fault_injection_summary:
+        fault_injection_status = "pass"
+
+memory_status = suite_status("perf_budgets", suite_result_by_name)
+if memory_status == "pass":
+    memory_status = "pass"
+elif memory_status == "fail":
+    memory_status = "fail"
+else:
+    memory_status = "missing"
+
+correctness_status = suite_status("perf_regression", suite_result_by_name)
+if correctness_status == "pass":
+    correctness_status = "pass"
+elif correctness_status == "fail":
+    correctness_status = "fail"
+else:
+    correctness_status = "missing"
+
+security_status = fault_injection_status
+
+primary_outcome_missing = []
+if primary_wall_clock_ms is None:
+    primary_outcome_missing.append("missing_e2e_wall_clock_ms")
+if primary_rust_vs_node_ratio is None:
+    primary_outcome_missing.append("missing_rust_vs_node_ratio")
+if primary_rust_vs_bun_ratio is None:
+    primary_outcome_missing.append("missing_rust_vs_bun_ratio")
+
+primary_status = "pass" if not primary_outcome_missing else "fail"
+
+regression_guard_failures = []
+for guard_name, status in (
+    ("memory", memory_status),
+    ("correctness", correctness_status),
+    ("security", security_status),
+):
+    if status == "fail":
+        regression_guard_failures.append(f"{guard_name}_regression")
+    elif status == "missing":
+        regression_guard_failures.append(f"{guard_name}_regression_unverified")
+
+required_cell_count = len(required_partitions) * len(required_sizes)
+phase5_ready = (
+    primary_status == "pass"
+    and cells_with_complete_stage_breakdown == required_cell_count
+    and len(missing_cells) == 0
+    and not any(status != "pass" for status in (memory_status, correctness_status, security_status))
+)
+
+payload = {
+    "schema": "pi.perf.phase1_matrix_validation.v1",
+    "bead_id": "bd-3ar8v.2.8",
+    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "run_id": run_id,
+    "correlation_id": correlation_id,
+    "matrix_requirements": {
+        "required_partition_tags": required_partitions,
+        "required_session_message_sizes": required_sizes,
+        "required_cell_count": required_cell_count,
+    },
+    "matrix_cells": cells,
+    "stage_summary": {
+        "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
+        "operation_stage_coverage": operation_stage_coverage,
+        "cells_with_complete_stage_breakdown": cells_with_complete_stage_breakdown,
+        "cells_missing_stage_breakdown": required_cell_count
+        - cells_with_complete_stage_breakdown,
+        "covered_cells": covered_cells,
+        "missing_cells": missing_cells,
+    },
+    "primary_outcomes": {
+        "status": primary_status,
+        "wall_clock_ms": primary_wall_clock_ms,
+        "rust_vs_node_ratio": primary_rust_vs_node_ratio,
+        "rust_vs_bun_ratio": primary_rust_vs_bun_ratio,
+        "missing_reasons": primary_outcome_missing,
+        "ordering_policy": "primary_e2e_before_microbench",
+    },
+    "regression_guards": {
+        "memory": memory_status,
+        "correctness": correctness_status,
+        "security": security_status,
+        "failure_or_gap_reasons": sorted(set(regression_guard_failures)),
+    },
+    "evidence_links": {
+        "phase1_unit_and_fault_injection": {
+            "suite_logs": suite_logs,
+            "fault_injection_script": str(fault_injection_script),
+            "fault_injection_summary_path": (
+                str(fault_injection_summary_path)
+                if fault_injection_summary_path is not None
+                else None
+            ),
+        },
+        "required_artifacts": {
+            "scenario_runner": str(scenario_runner_path),
+            "stratification": str(stratification_path),
+            "baseline_variance_confidence": str(baseline_path),
+        },
+    },
+    "consumption_contract": {
+        "downstream_beads": [
+            "bd-3ar8v.2.12",
+            "bd-3ar8v.6.1",
+            "bd-3ar8v.6.2",
+            "bd-3ar8v.6.6",
+            "bd-3ar8v.6.11",
+        ],
+        "artifact_ready_for_phase5": phase5_ready,
+        "fail_closed_conditions": [
+            "missing_matrix_source_record",
+            "missing_stage_metrics",
+            "missing_primary_wall_clock",
+            "missing_primary_relative_ratios",
+            "memory_regression",
+            "correctness_regression",
+            "security_regression",
+        ],
+    },
+    "lineage": {
+        "run_id_lineage": [run_id, correlation_id],
+        "source_manifest_path": str(manifest_path),
+        "source_scenario_runner_path": (
+            str(scenario_runner_path) if scenario_runner_path.exists() else None
+        ),
+        "source_stratification_path": (
+            str(stratification_path) if stratification_path.exists() else None
+        ),
+        "source_baseline_confidence_path": (
+            str(baseline_path) if baseline_path.exists() else None
+        ),
+        "source_perf_sli_contract_path": (
+            str(perf_sli_path) if perf_sli_path.exists() else None
+        ),
+    },
+}
+
+phase1_matrix_path.parent.mkdir(parents=True, exist_ok=True)
+phase1_matrix_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+manifest["phase1_matrix_validation"] = {
+    "schema": "pi.perf.phase1_matrix_validation.v1",
+    "path": str(phase1_matrix_path),
+    "required_cell_count": required_cell_count,
+    "covered_cell_count": covered_cells,
+    "cells_with_complete_stage_breakdown": cells_with_complete_stage_breakdown,
+    "artifact_ready_for_phase5": phase5_ready,
+}
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+then
+  artifact_count=$((artifact_count + 1))
+  log_ok "Phase-1 matrix validation written: results/phase1_matrix_validation.json"
+else
+  die "Failed to generate phase-1 matrix validation artifact"
 fi
 
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
