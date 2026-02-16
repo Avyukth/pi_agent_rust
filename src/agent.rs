@@ -639,9 +639,9 @@ impl Agent {
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
         };
-        on_event(agent_start_event.clone());
         self.dispatch_extension_lifecycle_event(&agent_start_event)
             .await;
+        on_event(agent_start_event);
 
         for prompt in prompts {
             self.messages.push(prompt.clone());
@@ -666,9 +666,9 @@ impl Agent {
                     turn_index: current_turn_index,
                     timestamp: Utc::now().timestamp_millis(),
                 };
-                on_event(turn_start_event.clone());
                 self.dispatch_extension_lifecycle_event(&turn_start_event)
                     .await;
+                on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
                     self.messages.push(message.clone());
@@ -698,12 +698,12 @@ impl Agent {
                         message,
                         tool_results: Vec::new(),
                     };
-                    on_event(turn_end_event.clone());
                     self.dispatch_extension_lifecycle_event(&turn_end_event)
                         .await;
+                    on_event(turn_end_event);
                     let agent_end_event = AgentEvent::AgentEnd {
                         session_id: session_id.clone(),
-                        messages: new_messages.clone(),
+                        messages: std::mem::take(&mut new_messages),
                         error: Some(
                             abort_message
                                 .error_message
@@ -711,9 +711,9 @@ impl Agent {
                                 .unwrap_or_else(|| "Aborted".to_string()),
                         ),
                     };
-                    on_event(agent_end_event.clone());
                     self.dispatch_extension_lifecycle_event(&agent_end_event)
                         .await;
+                    on_event(agent_end_event);
                     return Ok(abort_message);
                 }
 
@@ -725,12 +725,12 @@ impl Agent {
                     Err(err) => {
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
-                            messages: new_messages.clone(),
+                            messages: std::mem::take(&mut new_messages),
                             error: Some(err.to_string()),
                         };
-                        on_event(agent_end_event.clone());
                         self.dispatch_extension_lifecycle_event(&agent_end_event)
                             .await;
+                        on_event(agent_end_event);
                         return Err(err);
                     }
                 };
@@ -749,17 +749,17 @@ impl Agent {
                         message: assistant_event_message.clone(),
                         tool_results: Vec::new(),
                     };
-                    on_event(turn_end_event.clone());
                     self.dispatch_extension_lifecycle_event(&turn_end_event)
                         .await;
+                    on_event(turn_end_event);
                     let agent_end_event = AgentEvent::AgentEnd {
                         session_id: session_id.clone(),
-                        messages: new_messages.clone(),
+                        messages: std::mem::take(&mut new_messages),
                         error: assistant_message.error_message.clone(),
                     };
-                    on_event(agent_end_event.clone());
                     self.dispatch_extension_lifecycle_event(&agent_end_event)
                         .await;
+                    on_event(agent_end_event);
                     return Ok(assistant_message);
                 }
 
@@ -784,18 +784,18 @@ impl Agent {
                             message: assistant_event_message.clone(),
                             tool_results: Vec::new(),
                         };
-                        on_event(turn_end_event.clone());
                         self.dispatch_extension_lifecycle_event(&turn_end_event)
                             .await;
+                        on_event(turn_end_event);
 
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
-                            messages: new_messages.clone(),
+                            messages: std::mem::take(&mut new_messages),
                             error: Some(error_message),
                         };
-                        on_event(agent_end_event.clone());
                         self.dispatch_extension_lifecycle_event(&agent_end_event)
                             .await;
+                        on_event(agent_end_event);
 
                         return Ok(stop_message);
                     }
@@ -813,12 +813,12 @@ impl Agent {
                         Err(err) => {
                             let agent_end_event = AgentEvent::AgentEnd {
                                 session_id: session_id.clone(),
-                                messages: new_messages.clone(),
+                                messages: std::mem::take(&mut new_messages),
                                 error: Some(err.to_string()),
                             };
-                            on_event(agent_end_event.clone());
                             self.dispatch_extension_lifecycle_event(&agent_end_event)
                                 .await;
+                            on_event(agent_end_event);
                             return Err(err);
                         }
                     };
@@ -838,9 +838,9 @@ impl Agent {
                     message: assistant_event_message.clone(),
                     tool_results: tool_messages,
                 };
-                on_event(turn_end_event.clone());
                 self.dispatch_extension_lifecycle_event(&turn_end_event)
                     .await;
+                on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
 
@@ -866,12 +866,12 @@ impl Agent {
 
         let agent_end_event = AgentEvent::AgentEnd {
             session_id: session_id.clone(),
-            messages: new_messages.clone(),
+            messages: new_messages,
             error: None,
         };
-        on_event(agent_end_event.clone());
         self.dispatch_extension_lifecycle_event(&agent_end_event)
             .await;
+        on_event(agent_end_event);
         Ok(final_message)
     }
 
