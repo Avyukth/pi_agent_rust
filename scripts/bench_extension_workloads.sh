@@ -29,6 +29,7 @@ BENCH_PGO_PROFILE_DATA="${BENCH_PGO_PROFILE_DATA:-$BENCH_PGO_PROFILE_DIR/pijs_wo
 BENCH_PGO_TRAIN_ITERATIONS="${BENCH_PGO_TRAIN_ITERATIONS:-200}"
 BENCH_PGO_TRAIN_TOOL_CALLS="${BENCH_PGO_TRAIN_TOOL_CALLS:-10}"
 BENCH_PGO_EVENTS_JSONL="${BENCH_PGO_EVENTS_JSONL:-$OUT_DIR/pgo_pipeline_events.jsonl}"
+BENCH_ALLOCATOR_SUMMARY_JSON="${BENCH_ALLOCATOR_SUMMARY_JSON:-$OUT_DIR/allocator_strategy_summary.json}"
 
 mkdir -p "$OUT_DIR"
 : > "$JSONL_OUT"
@@ -271,6 +272,170 @@ pathlib.Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding
 PYEOF
 }
 
+emit_allocator_strategy_summary() {
+  python3 - "$OUT_DIR" "$JSONL_OUT" "$BENCH_CARGO_PROFILE" "$BENCH_ALLOCATORS_CSV" "$BENCH_ALLOCATOR_FALLBACK" "$BENCH_ALLOCATOR_SUMMARY_JSON" "$BENCH_PGO_EVENTS_JSONL" <<'PYEOF'
+import datetime
+import glob
+import json
+import math
+import os
+import pathlib
+import re
+import sys
+
+(
+    out_dir,
+    jsonl_path,
+    build_profile,
+    allocators_csv,
+    fallback_policy,
+    out_path,
+    events_path,
+) = sys.argv[1:]
+
+pattern = re.compile(
+    r"hyperfine_pijs_workload_(?P<iterations>\d+)x(?P<tool_calls>\d+)_(?P<profile>[^_]+)_(?P<requested>[^_]+)(?:_(?P<variant>.+?))?_effective-(?P<effective>[^.]+)\.json$"
+)
+
+matrix = []
+for path in sorted(glob.glob(os.path.join(out_dir, "hyperfine_pijs_workload_*_effective-*.json"))):
+    name = os.path.basename(path)
+    match = pattern.match(name)
+    if match is None:
+        continue
+    try:
+        payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        continue
+
+    results = payload.get("results") or []
+    mean_value = None
+    if results:
+        raw_mean = results[0].get("mean")
+        if isinstance(raw_mean, (int, float)) and math.isfinite(float(raw_mean)):
+            mean_value = float(raw_mean)
+
+    matrix.append(
+        {
+            "path": path,
+            "iterations": int(match.group("iterations")),
+            "tool_calls_per_iteration": int(match.group("tool_calls")),
+            "build_profile": match.group("profile"),
+            "allocator_requested": match.group("requested"),
+            "allocator_effective": match.group("effective"),
+            "variant": match.group("variant") or "default",
+            "mean_seconds": mean_value,
+        }
+    )
+
+baseline_rows = [
+    row
+    for row in matrix
+    if row["variant"] in {"default", "baseline"}
+    and isinstance(row["mean_seconds"], (int, float))
+]
+if not baseline_rows:
+    baseline_rows = [row for row in matrix if isinstance(row["mean_seconds"], (int, float))]
+
+allocator_stats = {}
+for row in baseline_rows:
+    allocator_stats.setdefault(row["allocator_effective"], []).append(row["mean_seconds"])
+
+aggregates = {}
+for allocator_name, values in sorted(allocator_stats.items()):
+    aggregates[allocator_name] = {
+        "samples": len(values),
+        "mean_seconds": sum(values) / len(values),
+        "min_seconds": min(values),
+        "max_seconds": max(values),
+    }
+
+recommended_allocator = None
+if aggregates:
+    recommended_allocator = min(
+        aggregates.items(), key=lambda item: item[1]["mean_seconds"]
+    )[0]
+
+relative_deltas = {}
+if "system" in aggregates and "jemalloc" in aggregates:
+    system_mean = aggregates["system"]["mean_seconds"]
+    jemalloc_mean = aggregates["jemalloc"]["mean_seconds"]
+    if system_mean > 0:
+        relative_deltas["jemalloc_vs_system_speedup_pct"] = (
+            (system_mean - jemalloc_mean) / system_mean
+        ) * 100.0
+    if jemalloc_mean > 0:
+        relative_deltas["system_vs_jemalloc_speedup_pct"] = (
+            (jemalloc_mean - system_mean) / jemalloc_mean
+        ) * 100.0
+
+rss_pattern = re.compile(r"rss_(?P<allocator>[a-zA-Z0-9_-]+)_kib(?:_[^.]*)?\.txt$")
+rss_samples = {}
+for path in sorted(glob.glob(os.path.join(out_dir, "rss_*_kib*.txt"))):
+    name = os.path.basename(path)
+    match = rss_pattern.match(name)
+    if match is None:
+        continue
+    allocator_name = match.group("allocator")
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    value_match = re.search(r"\d+", text)
+    if value_match is None:
+        continue
+    rss_samples.setdefault(allocator_name, []).append(int(value_match.group(0)))
+
+rss_kib_by_allocator = {}
+for allocator_name, values in sorted(rss_samples.items()):
+    rss_kib_by_allocator[allocator_name] = {
+        "samples": len(values),
+        "min_rss_kib": min(values),
+        "max_rss_kib": max(values),
+    }
+
+if "system" in rss_kib_by_allocator and "jemalloc" in rss_kib_by_allocator:
+    system_rss = rss_kib_by_allocator["system"]["max_rss_kib"]
+    jemalloc_rss = rss_kib_by_allocator["jemalloc"]["max_rss_kib"]
+    if system_rss > 0:
+        relative_deltas["jemalloc_vs_system_max_rss_reduction_pct"] = (
+            (system_rss - jemalloc_rss) / system_rss
+        ) * 100.0
+
+observed_fallback_reasons = []
+events_file = pathlib.Path(events_path)
+if events_file.exists():
+    for line in events_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        reason = event.get("fallback_reason")
+        if isinstance(reason, str) and reason and reason not in observed_fallback_reasons:
+            observed_fallback_reasons.append(reason)
+
+payload = {
+    "schema": "pi.perf.allocator_strategy_summary.v1",
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "build_profile": build_profile,
+    "allocator_requests": [
+        token.strip() for token in allocators_csv.split(",") if token.strip()
+    ],
+    "allocator_fallback_policy": fallback_policy,
+    "recommended_allocator": recommended_allocator,
+    "allocator_stats": aggregates,
+    "relative_deltas": relative_deltas,
+    "rss_kib_by_allocator": rss_kib_by_allocator,
+    "observed_fallback_reasons": observed_fallback_reasons,
+    "hyperfine_matrix": matrix,
+    "jsonl_path": jsonl_path,
+    "events_path": events_path,
+}
+
+pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+pathlib.Path(out_path).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PYEOF
+}
+
 IFS=',' read -r -a TOOL_CALLS_SET <<< "$TOOL_CALLS_CSV"
 IFS=',' read -r -a ALLOCATOR_SET <<< "$BENCH_ALLOCATORS_CSV"
 
@@ -446,6 +611,8 @@ for ALLOCATOR_REQUEST in "${ALLOCATOR_SET[@]}"; do
   fi
 done
 
+emit_allocator_strategy_summary
+
 echo "Wrote artifacts:"
 echo "  - profile=$BENCH_CARGO_PROFILE"
 echo "  - allocators=$BENCH_ALLOCATORS_CSV"
@@ -453,6 +620,7 @@ echo "  - pgo_mode=$BENCH_PGO_MODE"
 echo "  - pgo_profile_data=$BENCH_PGO_PROFILE_DATA"
 echo "  - $JSONL_OUT"
 echo "  - $BENCH_PGO_EVENTS_JSONL"
+echo "  - $BENCH_ALLOCATOR_SUMMARY_JSON"
 echo "  - $OUT_DIR/hyperfine_pijs_workload_${ITERATIONS}x*_${BENCH_CARGO_PROFILE}_*_effective-*.json"
 if [[ "$BENCH_PGO_MODE" == "compare" ]]; then
   echo "  - $OUT_DIR/pgo_delta_${ITERATIONS}x*_${BENCH_CARGO_PROFILE}_*_effective-*.json"

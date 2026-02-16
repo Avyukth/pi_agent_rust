@@ -36,6 +36,7 @@
 #   BENCH_QUICK               Forwarded to perf_bench_harness (1 = fewer iterations)
 #   BENCH_ITERATIONS          Override iteration count for bench harness
 #   PERF_REGRESSION_FULL      Forwarded to perf_regression (1 = full mode)
+#   PI_PERF_STRICT            Set to 1 to fail CI-enforced budgets on NO_DATA (auto-set for ci/full profiles)
 
 set -euo pipefail
 
@@ -257,6 +258,7 @@ resolve_suites() {
       if [[ "$SKIP_CRITERION" != "1" ]]; then
         SELECTED_SUITES+=("${!CRITERION_BENCHES[@]}")
       fi
+      export PI_PERF_STRICT=1
       ;;
     quick)
       # Fast subset: schema validation + budgets only, no criterion
@@ -268,6 +270,7 @@ resolve_suites() {
       # CI: all test suites, skip heavy criterion benches
       SELECTED_SUITES=("${!SUITE_TARGETS[@]}")
       SKIP_CRITERION=1
+      export PI_PERF_STRICT=1
       ;;
     *)
       die "Unknown profile: $PROFILE (available: full, quick, ci)"
