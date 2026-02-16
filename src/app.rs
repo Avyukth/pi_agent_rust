@@ -1103,4 +1103,153 @@ mod tests {
         let clamped = model_entry.clamp_thinking_level(model::ThinkingLevel::XHigh);
         assert_eq!(clamped, model::ThinkingLevel::XHigh);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // ====================================================================
+        // parse_models_arg
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn parse_models_no_empty_strings(s in "([a-z0-9*-]{0,5},?){0,6}") {
+                let result = parse_models_arg(&s);
+                for m in &result {
+                    assert!(!m.is_empty(), "parse_models_arg produced empty string from {s:?}");
+                }
+            }
+
+            #[test]
+            fn parse_models_whitespace_trimmed(m1 in "[a-z]{1,8}", m2 in "[a-z]{1,8}") {
+                let with_spaces = format!("  {m1}  ,  {m2}  ");
+                let result = parse_models_arg(&with_spaces);
+                assert_eq!(result, vec![m1, m2]);
+            }
+
+            #[test]
+            fn parse_models_round_trip(models in prop::collection::vec("[a-z0-9-]{1,10}", 1..6)) {
+                let joined = models.join(",");
+                let result = parse_models_arg(&joined);
+                assert_eq!(result, models);
+            }
+
+            #[test]
+            fn parse_models_empty_csv(s in "[ ,]*") {
+                let result = parse_models_arg(&s);
+                assert!(result.is_empty(), "whitespace/commas-only should yield empty vec");
+            }
+        }
+
+        // ====================================================================
+        // split_provider_model_spec
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn split_spec_first_slash(pre in "[a-z]{1,8}", mid in "[a-z]{1,8}", post in "[a-z]{1,8}") {
+                let input = format!("{pre}/{mid}/{post}");
+                let (p, m) = split_provider_model_spec(&input).unwrap();
+                assert_eq!(p, pre.as_str());
+                assert_eq!(m, format!("{mid}/{post}"));
+            }
+
+            #[test]
+            fn split_spec_trims_whitespace(p in "[a-z]{1,6}", m in "[a-z]{1,6}") {
+                let input = format!("  {p}  /  {m}  ");
+                let (prov, model) = split_provider_model_spec(&input).unwrap();
+                assert_eq!(prov, p.as_str());
+                assert_eq!(model, m.as_str());
+            }
+
+            #[test]
+            fn split_spec_rejects_empty_halves(valid in "[a-z]{1,8}") {
+                assert!(split_provider_model_spec(&format!("{valid}/")).is_none());
+                assert!(split_provider_model_spec(&format!("/{valid}")).is_none());
+            }
+
+            #[test]
+            fn split_spec_none_without_slash(s in "[a-z0-9]{1,12}") {
+                assert!(split_provider_model_spec(&s).is_none());
+            }
+        }
+
+        // ====================================================================
+        // is_alias
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn is_alias_latest_suffix(prefix in "[a-z]{1,10}") {
+                assert!(is_alias(&format!("{prefix}-latest")));
+            }
+
+            #[test]
+            fn is_alias_eight_digits_not_alias(prefix in "[a-z]{1,8}", d in "[0-9]{8}") {
+                let id = format!("{prefix}-{d}");
+                assert!(!is_alias(&id), "{id} should not be alias (8-digit suffix)");
+            }
+
+            #[test]
+            fn is_alias_non_eight_digit_suffix(prefix in "[a-z]{1,6}", suffix in "[a-z0-9]{1,7}") {
+                let id = format!("{prefix}-{suffix}");
+                // Only 8 pure-digit suffixes are non-alias
+                if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    assert!(!is_alias(&id));
+                } else {
+                    assert!(is_alias(&id));
+                }
+            }
+
+            #[test]
+            fn is_alias_no_hyphen(id in "[a-z0-9]{1,12}") {
+                if !id.contains('-') {
+                    assert!(is_alias(&id));
+                }
+            }
+
+            #[test]
+            fn is_alias_non_ascii_no_panic(id in ".{1,20}") {
+                let _ = is_alias(&id); // must not panic
+            }
+        }
+
+        // ====================================================================
+        // models_equal
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn models_equal_reflexive(provider in "[a-z]{1,6}", id in "[a-z0-9-]{1,10}") {
+                let m = test_model_entry(&id, &provider, true);
+                assert!(models_equal(&m, &m));
+            }
+
+            #[test]
+            fn models_equal_symmetric(provider in "[a-z]{1,6}", id in "[a-z0-9-]{1,10}") {
+                let a = test_model_entry(&id, &provider, true);
+                let b = test_model_entry(&id, &provider, false);
+                assert_eq!(models_equal(&a, &b), models_equal(&b, &a));
+            }
+
+            #[test]
+            fn models_equal_different_providers(id in "[a-z]{1,8}", p1 in "[a-z]{1,5}", p2 in "[a-z]{1,5}") {
+                if p1 != p2 {
+                    let a = test_model_entry(&id, &p1, true);
+                    let b = test_model_entry(&id, &p2, true);
+                    assert!(!models_equal(&a, &b));
+                }
+            }
+
+            #[test]
+            fn models_equal_different_ids(id1 in "[a-z]{1,6}", id2 in "[a-z]{1,6}", prov in "[a-z]{1,5}") {
+                if id1 != id2 {
+                    let a = test_model_entry(&id1, &prov, true);
+                    let b = test_model_entry(&id2, &prov, true);
+                    assert!(!models_equal(&a, &b));
+                }
+            }
+        }
+    }
 }

@@ -1339,3 +1339,164 @@ fn crc32c_upper(data: &[u8]) -> String {
     let _ = write!(&mut out, "{crc:08X}");
     out
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    // ====================================================================
+    // chain_hash_step
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn chain_hash_output_is_64_hex(
+            a in "[0-9a-f]{64}",
+            b in "[0-9a-f]{64}",
+        ) {
+            let result = chain_hash_step(&a, &b);
+            assert_eq!(result.len(), 64);
+            assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        #[test]
+        fn chain_hash_deterministic(
+            a in "[0-9a-f]{64}",
+            b in "[0-9a-f]{64}",
+        ) {
+            assert_eq!(chain_hash_step(&a, &b), chain_hash_step(&a, &b));
+        }
+
+        #[test]
+        fn chain_hash_non_commutative(
+            a in "[0-9a-f]{64}",
+            b in "[0-9a-f]{64}",
+        ) {
+            if a != b {
+                assert_ne!(chain_hash_step(&a, &b), chain_hash_step(&b, &a));
+            }
+        }
+
+        #[test]
+        fn chain_hash_genesis_differs_from_step(payload in "[0-9a-f]{64}") {
+            let step1 = chain_hash_step(GENESIS_CHAIN_HASH, &payload);
+            assert_ne!(step1, GENESIS_CHAIN_HASH);
+        }
+    }
+
+    // ====================================================================
+    // crc32c_upper
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn crc32c_output_is_8_uppercase_hex(data in prop::collection::vec(any::<u8>(), 0..500)) {
+            let result = crc32c_upper(&data);
+            assert_eq!(result.len(), 8);
+            assert!(result.chars().all(|c| matches!(c, '0'..='9' | 'A'..='F')));
+        }
+
+        #[test]
+        fn crc32c_deterministic(data in prop::collection::vec(any::<u8>(), 0..500)) {
+            assert_eq!(crc32c_upper(&data), crc32c_upper(&data));
+        }
+
+        #[test]
+        fn crc32c_single_bit_sensitivity(byte in any::<u8>()) {
+            let a = crc32c_upper(&[byte]);
+            let b = crc32c_upper(&[byte ^ 1]);
+            if byte != byte ^ 1 {
+                assert_ne!(a, b, "flipping LSB should change CRC");
+            }
+        }
+    }
+
+    // ====================================================================
+    // payload_hash_and_size
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn payload_hash_is_64_hex(s in "[a-z]{0,50}") {
+            let val = json!(s);
+            let (hash, _size) = payload_hash_and_size(&val).unwrap();
+            assert_eq!(hash.len(), 64);
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+
+        #[test]
+        fn payload_size_matches_serialization(s in "[a-z]{0,50}") {
+            let val = json!(s);
+            let (_, size) = payload_hash_and_size(&val).unwrap();
+            let expected = serde_json::to_vec(&val).unwrap().len() as u64;
+            assert_eq!(size, expected);
+        }
+
+        #[test]
+        fn payload_hash_deterministic(n in 0i64..10000) {
+            let val = json!(n);
+            let (h1, s1) = payload_hash_and_size(&val).unwrap();
+            let (h2, s2) = payload_hash_and_size(&val).unwrap();
+            assert_eq!(h1, h2);
+            assert_eq!(s1, s2);
+        }
+    }
+
+    // ====================================================================
+    // line_length_u64
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn line_length_is_len_plus_one(data in prop::collection::vec(any::<u8>(), 0..1000)) {
+            let result = line_length_u64(&data).unwrap();
+            assert_eq!(result, data.len() as u64 + 1);
+        }
+
+        #[test]
+        fn line_length_never_zero(data in prop::collection::vec(any::<u8>(), 0..100)) {
+            let result = line_length_u64(&data).unwrap();
+            assert!(result >= 1);
+        }
+    }
+
+    // ====================================================================
+    // v2_sidecar_path
+    // ====================================================================
+
+    proptest! {
+        #[test]
+        fn sidecar_path_ends_with_v2(stem in "[a-z]{1,10}") {
+            let input = PathBuf::from(format!("/tmp/{stem}.jsonl"));
+            let result = v2_sidecar_path(&input);
+            let name = result.file_name().unwrap().to_str().unwrap();
+            assert!(name.ends_with(".v2"), "expected .v2 suffix, got {name}");
+        }
+
+        #[test]
+        fn sidecar_path_preserves_parent(stem in "[a-z]{1,10}", dir in "[a-z]{1,8}") {
+            let input = PathBuf::from(format!("/tmp/{dir}/{stem}.jsonl"));
+            let result = v2_sidecar_path(&input);
+            assert_eq!(
+                result.parent().unwrap(),
+                Path::new(&format!("/tmp/{dir}"))
+            );
+        }
+
+        #[test]
+        fn sidecar_path_deterministic(stem in "[a-z]{1,10}") {
+            let input = PathBuf::from(format!("/sessions/{stem}.jsonl"));
+            assert_eq!(v2_sidecar_path(&input), v2_sidecar_path(&input));
+        }
+
+        #[test]
+        fn sidecar_path_contains_stem(stem in "[a-z]{1,10}") {
+            let input = PathBuf::from(format!("/tmp/{stem}.jsonl"));
+            let result = v2_sidecar_path(&input);
+            let name = result.file_name().unwrap().to_str().unwrap();
+            assert_eq!(name, format!("{stem}.v2"));
+        }
+    }
+}

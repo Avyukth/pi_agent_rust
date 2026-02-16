@@ -631,4 +631,159 @@ mod tests {
         assert!((parsed.input - 3.0).abs() < f64::EPSILON);
         assert!((parsed.cache_read - 0.3).abs() < f64::EPSILON);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_model(rate: f64) -> Model {
+            Model {
+                id: "m".to_string(),
+                name: "m".to_string(),
+                api: "anthropic-messages".to_string(),
+                provider: "test".to_string(),
+                base_url: String::new(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: rate,
+                    output: rate,
+                    cache_read: rate,
+                    cache_write: rate,
+                },
+                context_window: 128_000,
+                max_tokens: 8192,
+                headers: HashMap::new(),
+            }
+        }
+
+        // ====================================================================
+        // calculate_cost
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn cost_zero_tokens_is_zero(rate in 0.0f64..1000.0) {
+                let m = arb_model(rate);
+                let cost = m.calculate_cost(0, 0, 0, 0);
+                assert!((cost).abs() < f64::EPSILON);
+            }
+
+            #[test]
+            fn cost_non_negative(
+                rate in 0.0f64..100.0,
+                input in 0u64..10_000_000,
+                output in 0u64..10_000_000,
+                cr in 0u64..10_000_000,
+                cw in 0u64..10_000_000,
+            ) {
+                let m = arb_model(rate);
+                assert!(m.calculate_cost(input, output, cr, cw) >= 0.0);
+            }
+
+            #[test]
+            fn cost_linearity(
+                rate in 0.001f64..50.0,
+                tokens in 1u64..1_000_000,
+            ) {
+                let m = arb_model(rate);
+                let single = m.calculate_cost(tokens, 0, 0, 0);
+                let double = m.calculate_cost(tokens * 2, 0, 0, 0);
+                assert!((double - single * 2.0).abs() < 1e-6,
+                    "doubling tokens should double cost: single={single}, double={double}");
+            }
+
+            #[test]
+            fn cost_additivity(
+                rate in 0.001f64..50.0,
+                input in 0u64..1_000_000,
+                output in 0u64..1_000_000,
+            ) {
+                let m = arb_model(rate);
+                let combined = m.calculate_cost(input, output, 0, 0);
+                let separate = m.calculate_cost(input, 0, 0, 0)
+                    + m.calculate_cost(0, output, 0, 0);
+                assert!((combined - separate).abs() < 1e-10,
+                    "cost should be additive: combined={combined}, separate={separate}");
+            }
+        }
+
+        // ====================================================================
+        // Api FromStr + Display round-trip
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn api_custom_round_trip(s in "[a-z][a-z0-9-]{0,20}") {
+                let known = [
+                    "anthropic-messages", "openai-completions", "openai-responses",
+                    "azure-openai-responses", "bedrock-converse-stream",
+                    "google-generative-ai", "google-gemini-cli", "google-vertex",
+                ];
+                if !known.contains(&s.as_str()) {
+                    let parsed: Api = s.parse().unwrap();
+                    assert_eq!(parsed.to_string(), s);
+                }
+            }
+
+            #[test]
+            fn api_never_panics(s in ".*") {
+                let _ = s.parse::<Api>(); // must not panic
+            }
+
+            #[test]
+            fn api_empty_always_rejected(ws in "[ \t]*") {
+                if ws.is_empty() {
+                    assert!(ws.parse::<Api>().is_err());
+                }
+            }
+        }
+
+        // ====================================================================
+        // KnownProvider FromStr + Display round-trip
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn provider_custom_round_trip(s in "[a-z][a-z0-9-]{0,20}") {
+                let known = [
+                    "anthropic", "openai", "google", "google-vertex",
+                    "amazon-bedrock", "azure-openai", "azure",
+                    "azure-cognitive-services", "github-copilot", "xai",
+                    "groq", "cerebras", "openrouter", "mistral",
+                ];
+                if !known.contains(&s.as_str()) {
+                    let parsed: KnownProvider = s.parse().unwrap();
+                    assert_eq!(parsed.to_string(), s);
+                }
+            }
+
+            #[test]
+            fn provider_never_panics(s in ".*") {
+                let _ = s.parse::<KnownProvider>(); // must not panic
+            }
+        }
+
+        // ====================================================================
+        // ModelCost serde round-trip
+        // ====================================================================
+
+        proptest! {
+            #[test]
+            fn model_cost_serde_round_trip(
+                input in 0.0f64..1000.0,
+                output in 0.0f64..1000.0,
+                cr in 0.0f64..1000.0,
+                cw in 0.0f64..1000.0,
+            ) {
+                let cost = ModelCost { input, output, cache_read: cr, cache_write: cw };
+                let json = serde_json::to_string(&cost).unwrap();
+                let parsed: ModelCost = serde_json::from_str(&json).unwrap();
+                assert!((parsed.input - input).abs() < 1e-10);
+                assert!((parsed.output - output).abs() < 1e-10);
+                assert!((parsed.cache_read - cr).abs() < 1e-10);
+                assert!((parsed.cache_write - cw).abs() < 1e-10);
+            }
+        }
+    }
 }
