@@ -1542,7 +1542,8 @@ fn binary_size_candidate_builder_dedups_release_profile() {
 fn binary_size_candidate_builder_dedups_override_matching_release() {
     let target_dir = Path::new("/tmp/pi-agent-target");
     let release = target_dir.join("release/pi");
-    let candidates = build_binary_size_candidate_paths(target_dir, Some(release.clone()), "release");
+    let candidates =
+        build_binary_size_candidate_paths(target_dir, Some(release.clone()), "release");
     assert_eq!(candidates, vec![release, target_dir.join("perf/pi")]);
 }
 

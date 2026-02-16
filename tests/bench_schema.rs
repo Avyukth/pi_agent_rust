@@ -1266,8 +1266,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             })?;
         if &reason_set != observed_reason_set {
             return Err(format!(
-                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons {:?} must equal matrix cell missing_reasons {:?}",
-                reason_set, observed_reason_set
+                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons {reason_set:?} must equal matrix cell missing_reasons {observed_reason_set:?}",
             ));
         }
     }
