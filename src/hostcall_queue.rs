@@ -4,7 +4,7 @@
 //! exceeds ring capacity, requests spill into a bounded overflow deque to
 //! preserve FIFO ordering across the two lanes.
 
-use crate::hostcall_s3_fifo::S3FifoFallbackReason;
+pub use crate::hostcall_s3_fifo::S3FifoFallbackReason;
 use crossbeam_queue::ArrayQueue;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -1070,6 +1070,55 @@ mod tests {
         let telemetry = policy.snapshot();
         assert_eq!(telemetry.mode, BravoBiasMode::Balanced);
         assert!(telemetry.rollbacks >= 1);
+        assert!(telemetry.transitions >= 3);
+    }
+
+    #[test]
+    fn bravo_writer_recovery_refreshes_on_repeated_starvation_then_exits_cleanly() {
+        let mut config = deterministic_config();
+        config.writer_recovery_windows = 3;
+        let mut policy = BravoContentionState::new(config);
+
+        let _ = policy.observe(sample(85, 15, 100, 400, 0));
+        let first_starvation = policy.observe(sample(80, 20, 100, 9_000, 3));
+        assert_eq!(first_starvation.previous_mode, BravoBiasMode::ReadBiased);
+        assert_eq!(first_starvation.next_mode, BravoBiasMode::WriterRecovery);
+        assert!(first_starvation.rollback_triggered);
+        assert_eq!(
+            first_starvation.signature,
+            ContentionSignature::WriterStarvationRisk
+        );
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 3);
+
+        let second_starvation = policy.observe(sample(75, 25, 100, 8_500, 2));
+        assert_eq!(
+            second_starvation.previous_mode,
+            BravoBiasMode::WriterRecovery
+        );
+        assert_eq!(second_starvation.next_mode, BravoBiasMode::WriterRecovery);
+        assert!(!second_starvation.switched);
+        assert!(!second_starvation.rollback_triggered);
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 3);
+
+        let _ = policy.observe(sample(45, 55, 150, 450, 0));
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 2);
+        let _ = policy.observe(sample(45, 55, 150, 450, 0));
+        assert_eq!(policy.snapshot().writer_recovery_remaining, 1);
+
+        let exit = policy.observe(sample(45, 55, 150, 450, 0));
+        assert_eq!(exit.previous_mode, BravoBiasMode::WriterRecovery);
+        assert_eq!(exit.next_mode, BravoBiasMode::Balanced);
+        assert!(exit.switched);
+        assert!(!exit.rollback_triggered);
+
+        let telemetry = policy.snapshot();
+        assert_eq!(telemetry.mode, BravoBiasMode::Balanced);
+        assert_eq!(telemetry.writer_recovery_remaining, 0);
+        assert_eq!(
+            telemetry.last_signature,
+            ContentionSignature::MixedContention
+        );
+        assert_eq!(telemetry.rollbacks, 1);
         assert!(telemetry.transitions >= 3);
     }
 

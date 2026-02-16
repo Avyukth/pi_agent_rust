@@ -631,6 +631,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fallback_reason_transitions_low_signal_to_fairness_after_clear() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            live_capacity: 2,
+            small_capacity: 1,
+            ghost_capacity: 4,
+            max_entries_per_owner: 1,
+            fallback_window: 3,
+            min_ghost_hits_in_window: 1,
+            max_budget_rejections_in_window: 1,
+        });
+
+        // First epoch: no ghost hits across a full window -> low-signal fallback.
+        let _ = policy.access("ext-a", "ls-live-1".to_string());
+        let _ = policy.access("ext-b", "ls-ghost-seed".to_string());
+        let _ = policy.access("ext-a", "ls-live-2".to_string());
+
+        let low_signal_reason = Some(S3FifoFallbackReason::SignalQualityInsufficient);
+        assert_eq!(policy.telemetry().fallback_reason, low_signal_reason);
+        let low_signal_bypass = policy.access("ext-z", "ls-bypass".to_string());
+        assert_eq!(low_signal_bypass.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(low_signal_bypass.fallback_reason, low_signal_reason);
+
+        policy.clear_fallback();
+        assert_eq!(policy.telemetry().fallback_reason, None);
+
+        // Second epoch: one ghost-hit rejection + two direct rejections -> fairness fallback.
+        let first = policy.access("ext-a", "ls-live-1".to_string());
+        assert_eq!(first.kind, S3FifoDecisionKind::RejectFairnessBudget);
+        assert!(first.ghost_hit);
+        let _ = policy.access("ext-a", "fair-rej-1".to_string());
+        let _ = policy.access("ext-a", "fair-rej-2".to_string());
+
+        let fairness_reason = Some(S3FifoFallbackReason::FairnessInstability);
+        assert_eq!(policy.telemetry().fallback_reason, fairness_reason);
+        let fairness_bypass = policy.access("ext-z", "fair-bypass".to_string());
+        assert_eq!(fairness_bypass.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(fairness_bypass.fallback_reason, fairness_reason);
+    }
+
+    #[test]
+    fn fallback_reason_transitions_fairness_to_low_signal_after_clear() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            live_capacity: 2,
+            small_capacity: 1,
+            ghost_capacity: 4,
+            max_entries_per_owner: 1,
+            fallback_window: 3,
+            min_ghost_hits_in_window: 1,
+            max_budget_rejections_in_window: 0,
+        });
+
+        // First epoch: produce one ghost-hit budget rejection -> fairness fallback.
+        let _ = policy.access("ext-b", "ff-ghost-seed".to_string());
+        let _ = policy.access("ext-a", "ff-live".to_string());
+        let trigger = policy.access("ext-a", "ff-ghost-seed".to_string());
+        assert_eq!(trigger.kind, S3FifoDecisionKind::RejectFairnessBudget);
+        assert!(trigger.ghost_hit);
+
+        let fairness_reason = Some(S3FifoFallbackReason::FairnessInstability);
+        assert_eq!(policy.telemetry().fallback_reason, fairness_reason);
+        let fairness_bypass = policy.access("ext-z", "ff-bypass".to_string());
+        assert_eq!(fairness_bypass.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(fairness_bypass.fallback_reason, fairness_reason);
+
+        policy.clear_fallback();
+        assert_eq!(policy.telemetry().fallback_reason, None);
+
+        // Second epoch: no ghost hits across window -> low-signal fallback.
+        let _ = policy.access("ext-c", "ff-low-1".to_string());
+        let _ = policy.access("ext-d", "ff-low-2".to_string());
+        let _ = policy.access("ext-e", "ff-low-3".to_string());
+
+        let low_signal_reason = Some(S3FifoFallbackReason::SignalQualityInsufficient);
+        assert_eq!(policy.telemetry().fallback_reason, low_signal_reason);
+        let low_signal_bypass = policy.access("ext-z", "ff-low-bypass".to_string());
+        assert_eq!(low_signal_bypass.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(low_signal_bypass.fallback_reason, low_signal_reason);
+    }
+
     // ── Additional public API coverage ──
 
     #[test]
@@ -765,6 +845,39 @@ mod tests {
     }
 
     #[test]
+    fn push_ghost_reinsertion_updates_recency_without_duplicates() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            ghost_capacity: 2,
+            ..config()
+        });
+
+        policy.push_ghost("k1".to_string());
+        policy.push_ghost("k2".to_string());
+        assert_eq!(
+            policy.ghost.iter().cloned().collect::<Vec<_>>(),
+            vec!["k1".to_string(), "k2".to_string()]
+        );
+        assert_eq!(policy.ghost.len(), policy.ghost_set.len());
+
+        // Re-inserting an existing ghost key should move it to the newest slot,
+        // not duplicate it.
+        policy.push_ghost("k1".to_string());
+        assert_eq!(
+            policy.ghost.iter().cloned().collect::<Vec<_>>(),
+            vec!["k2".to_string(), "k1".to_string()]
+        );
+        assert_eq!(policy.ghost.len(), policy.ghost_set.len());
+
+        // Capacity enforcement still applies after recency updates.
+        policy.push_ghost("k3".to_string());
+        assert_eq!(
+            policy.ghost.iter().cloned().collect::<Vec<_>>(),
+            vec!["k1".to_string(), "k3".to_string()]
+        );
+        assert_eq!(policy.ghost.len(), policy.ghost_set.len());
+    }
+
+    #[test]
     fn capacity_enforcement_evicts_to_stay_within_live_capacity() {
         let mut policy = S3FifoPolicy::new(S3FifoConfig {
             live_capacity: 3,
@@ -832,6 +945,63 @@ mod tests {
 
         let decision = policy.access("ext-a", "k4".to_string());
         assert_ne!(decision.kind, S3FifoDecisionKind::FallbackBypass);
+    }
+
+    #[test]
+    fn clear_fallback_clears_signal_window_and_preserves_counters() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            max_entries_per_owner: 1,
+            fallback_window: 3,
+            min_ghost_hits_in_window: 0,
+            max_budget_rejections_in_window: 1,
+            ..config()
+        });
+
+        // Trigger fairness fallback from repeated budget rejections.
+        let _ = policy.access("ext-a", "k1".to_string());
+        let _ = policy.access("ext-a", "k2".to_string());
+        let _ = policy.access("ext-a", "k3".to_string());
+        assert_eq!(
+            policy.telemetry().fallback_reason,
+            Some(S3FifoFallbackReason::FairnessInstability)
+        );
+        assert_eq!(policy.recent_signals.len(), 3);
+
+        let before_clear = policy.telemetry();
+        policy.clear_fallback();
+
+        assert_eq!(policy.telemetry().fallback_reason, None);
+        assert!(
+            policy.recent_signals.is_empty(),
+            "clear_fallback should reset signal history"
+        );
+
+        let after_clear = policy.telemetry();
+        assert_eq!(after_clear.admissions_total, before_clear.admissions_total);
+        assert_eq!(after_clear.promotions_total, before_clear.promotions_total);
+        assert_eq!(after_clear.ghost_hits_total, before_clear.ghost_hits_total);
+        assert_eq!(
+            after_clear.budget_rejections_total,
+            before_clear.budget_rejections_total
+        );
+
+        // Normal decisions should resume immediately after reset.
+        let admitted = policy.access("ext-b", "post-clear-admit".to_string());
+        assert_eq!(admitted.kind, S3FifoDecisionKind::AdmitSmall);
+        assert_eq!(policy.telemetry().fallback_reason, None);
+        assert_eq!(policy.recent_signals.len(), 1);
+
+        // Fallback can be re-triggered deterministically as a new window fills.
+        let reject_1 = policy.access("ext-a", "post-clear-reject-1".to_string());
+        assert_eq!(reject_1.kind, S3FifoDecisionKind::RejectFairnessBudget);
+        assert_eq!(policy.telemetry().fallback_reason, None);
+
+        let reject_2 = policy.access("ext-a", "post-clear-reject-2".to_string());
+        assert_eq!(reject_2.kind, S3FifoDecisionKind::RejectFairnessBudget);
+        assert_eq!(
+            policy.telemetry().fallback_reason,
+            Some(S3FifoFallbackReason::FairnessInstability)
+        );
     }
 
     // ── Property tests ──
