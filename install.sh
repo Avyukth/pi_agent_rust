@@ -134,7 +134,7 @@ err() {
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ] && [ -t 1 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     # Keep status text off stdout so callers can safely capture command output.
@@ -917,7 +917,8 @@ verify_sigstore_bundle() {
     bundle_url="${artifact_base}.sigstore.json"
   fi
 
-  local bundle_file="$TMP/$(basename "${bundle_url%%\?*}")"
+  local bundle_file
+  bundle_file="$TMP/$(basename "${bundle_url%%\?*}")"
   if ! curl -fsSL "$bundle_url" -o "$bundle_file"; then
     SIGSTORE_STATUS="skipped (bundle unavailable)"
     warn "Sigstore bundle not found; skipping signature verification"

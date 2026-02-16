@@ -16468,11 +16468,16 @@ if (typeof globalThis.setTimeout !== 'function') {
     globalThis.setTimeout = (callback, delay, ...args) => {
         const ms = Number(delay || 0);
         const timer_id = __pi_set_timeout_native(ms <= 0 ? 0 : Math.floor(ms));
+        const captured_id = __pi_current_extension_id;
         __pi_register_timer(timer_id, () => {
+            const prev = __pi_current_extension_id;
+            __pi_current_extension_id = captured_id;
             try {
                 callback(...args);
             } catch (e) {
                 console.error('setTimeout callback error:', e);
+            } finally {
+                __pi_current_extension_id = prev;
             }
         });
         return timer_id;
@@ -16496,12 +16501,17 @@ if (typeof globalThis.setInterval !== 'function') {
     globalThis.setInterval = (callback, delay, ...args) => {
         const ms = Math.max(0, Number(delay || 0));
         const id = ++__pi_interval_id;
+        const captured_id = __pi_current_extension_id;
         const run = () => {
             if (!__pi_intervals.has(id)) return;
+            const prev = __pi_current_extension_id;
+            __pi_current_extension_id = captured_id;
             try {
                 callback(...args);
             } catch (e) {
                 console.error('setInterval callback error:', e);
+            } finally {
+                __pi_current_extension_id = prev;
             }
             if (__pi_intervals.has(id)) {
                 __pi_intervals.set(id, globalThis.setTimeout(run, ms));
