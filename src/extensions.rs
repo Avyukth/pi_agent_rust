@@ -13,6 +13,7 @@ use crate::extensions_js::{
     PiJsRuntimeConfig, js_to_json, json_to_js,
 };
 use crate::hostcall_amac::AmacBatchExecutor;
+use crate::hostcall_trace_jit::{GuardContext, TraceJitCompiler};
 use crate::hostcall_rewrite::{
     HostcallRewriteEngine, HostcallRewritePlan, HostcallRewritePlanKind,
 };

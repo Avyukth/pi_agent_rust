@@ -75,6 +75,7 @@ pub mod hostcall_amac;
 pub mod hostcall_queue;
 pub mod hostcall_rewrite;
 pub mod hostcall_superinstructions;
+pub mod hostcall_trace_jit;
 pub mod http;
 pub mod http_shim;
 pub mod interactive;
