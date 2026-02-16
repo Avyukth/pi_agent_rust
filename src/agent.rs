@@ -1420,10 +1420,8 @@ impl Agent {
                 break;
             }
 
-            let is_read_only = self
-                .tools
-                .get(&tool_call.name)
-                .map_or(false, |t| t.is_read_only());
+            let is_read_only =
+                matches!(self.tools.get(&tool_call.name), Some(tool) if tool.is_read_only());
 
             if is_read_only {
                 pending_parallel.push((index, tool_call.clone()));
