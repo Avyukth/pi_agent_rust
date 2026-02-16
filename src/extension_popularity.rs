@@ -869,4 +869,202 @@ mod tests {
         let b = a.clone();
         assert_eq!(a, b);
     }
+
+    mod proptest_extension_popularity {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `github_repo_candidate_from_url` never panics on arbitrary input.
+            #[test]
+            fn github_url_never_panics(s in "(?s).{0,200}") {
+                let _ = github_repo_candidate_from_url(&s);
+            }
+
+            /// Valid `https://github.com/owner/repo` URLs always parse to `Repo`.
+            #[test]
+            fn valid_github_url_parses_to_repo(
+                owner in "[a-zA-Z0-9][a-zA-Z0-9_-]{0,20}",
+                repo in "[a-zA-Z0-9][a-zA-Z0-9_-]{0,20}"
+            ) {
+                let url = format!("https://github.com/{owner}/{repo}");
+                let result = github_repo_candidate_from_url(&url);
+                assert!(
+                    matches!(result, Some(GitHubRepoCandidate::Repo(_))),
+                    "expected Repo for {url}, got {result:?}"
+                );
+            }
+
+            /// `.git` suffix is stripped — with and without `.git` parse identically.
+            #[test]
+            fn git_suffix_stripped(
+                owner in "[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}",
+                repo in "[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}"
+            ) {
+                let with_git = format!("https://github.com/{owner}/{repo}.git");
+                let without_git = format!("https://github.com/{owner}/{repo}");
+                assert_eq!(
+                    github_repo_candidate_from_url(&with_git),
+                    github_repo_candidate_from_url(&without_git)
+                );
+            }
+
+            /// Whitespace-padded URLs parse identically to trimmed.
+            #[test]
+            fn whitespace_padded_url(
+                owner in "[a-zA-Z0-9]{1,10}",
+                repo in "[a-zA-Z0-9]{1,10}",
+                spaces in "[ \\t]{0,5}"
+            ) {
+                let clean = format!("https://github.com/{owner}/{repo}");
+                let padded = format!("{spaces}{clean}{spaces}");
+                assert_eq!(
+                    github_repo_candidate_from_url(&clean),
+                    github_repo_candidate_from_url(&padded)
+                );
+            }
+
+            /// Empty/whitespace input returns `None`.
+            #[test]
+            fn empty_input_returns_none(ws in "[ \\t\\n]{0,10}") {
+                assert!(github_repo_candidate_from_url(&ws).is_none());
+            }
+
+            /// Non-github.com URLs return `None`.
+            #[test]
+            fn non_github_returns_none(
+                host in "[a-z]{3,10}\\.(com|org|io)",
+                path in "[a-z]{1,10}/[a-z]{1,10}"
+            ) {
+                // Skip if we accidentally generated github.com
+                let url = format!("https://{host}/{path}");
+                if host != "github.com" {
+                    assert!(github_repo_candidate_from_url(&url).is_none());
+                }
+            }
+
+            /// `full_name` always has format `owner/repo`.
+            #[test]
+            fn full_name_format(
+                owner in "[a-zA-Z0-9]{1,15}",
+                repo in "[a-zA-Z0-9]{1,15}"
+            ) {
+                let r = GitHubRepoRef {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                };
+                let full = r.full_name();
+                assert_eq!(full, format!("{owner}/{repo}"));
+                assert!(full.contains('/'));
+            }
+
+            /// `github_repo_guesses_from_slug` never panics.
+            #[test]
+            fn slug_guesses_never_panics(s in ".{0,100}") {
+                let _ = github_repo_guesses_from_slug(&s);
+            }
+
+            /// Slug guesses all have non-empty owner and repo.
+            #[test]
+            fn slug_guesses_fields_nonempty(slug in "[a-zA-Z0-9_-]{1,30}") {
+                for guess in github_repo_guesses_from_slug(&slug) {
+                    assert!(!guess.owner.is_empty());
+                    assert!(!guess.repo.is_empty());
+                }
+            }
+
+            /// Slugs without hyphens produce no guesses.
+            #[test]
+            fn slug_no_hyphen_empty(slug in "[a-zA-Z0-9]{1,20}") {
+                assert!(
+                    github_repo_guesses_from_slug(&slug).is_empty(),
+                    "expected no guesses for hyphenless slug: {slug}"
+                );
+            }
+
+            /// `parse_github_repo_response` preserves numeric fields.
+            #[test]
+            fn github_response_preserves_values(
+                stars in 0u64..10_000_000,
+                forks in 0u64..1_000_000,
+                issues in 0u64..100_000
+            ) {
+                let json = format!(
+                    r#"{{"full_name":"o/r","stargazers_count":{stars},"forks_count":{forks},"open_issues_count":{issues}}}"#
+                );
+                let m = parse_github_repo_response(&json).unwrap();
+                assert_eq!(m.stars, stars);
+                assert_eq!(m.forks, forks);
+                assert_eq!(m.open_issues, issues);
+            }
+
+            /// `parse_github_repo_response` fails on invalid JSON.
+            #[test]
+            fn github_response_invalid_json(s in "[a-z]{5,20}") {
+                assert!(parse_github_repo_response(&s).is_err());
+            }
+
+            /// `parse_npm_downloads_response` returns `None` when error field is present.
+            #[test]
+            fn npm_downloads_error_returns_none(msg in "[a-z ]{1,30}") {
+                let json = format!(r#"{{"error":"{msg}","downloads":42}}"#);
+                assert_eq!(parse_npm_downloads_response(&json).unwrap(), None);
+            }
+
+            /// `parse_npm_downloads_response` preserves download count.
+            #[test]
+            fn npm_downloads_value_preserved(n in 0u64..100_000_000) {
+                let json = format!(r#"{{"downloads":{n}}}"#);
+                assert_eq!(parse_npm_downloads_response(&json).unwrap(), Some(n));
+            }
+
+            /// `parse_npm_downloads_response` fails on invalid JSON.
+            #[test]
+            fn npm_downloads_invalid_json(s in "[a-z]{5,20}") {
+                assert!(parse_npm_downloads_response(&s).is_err());
+            }
+
+            /// `parse_npm_registry_response` extracts repository URL from string form.
+            #[test]
+            fn npm_registry_string_repo_url(url in "https://[a-z]{3,10}\\.com/[a-z]{1,10}") {
+                let json = format!(r#"{{"repository":"{url}"}}"#);
+                let meta = parse_npm_registry_response(&json).unwrap();
+                assert_eq!(meta.repository_url.as_deref(), Some(url.as_str()));
+            }
+
+            /// `parse_npm_registry_response` extracts repository URL from object form.
+            #[test]
+            fn npm_registry_object_repo_url(url in "https://[a-z]{3,10}\\.com/[a-z]{1,10}") {
+                let json = format!(r#"{{"repository":{{"type":"git","url":"{url}"}}}}"#);
+                let meta = parse_npm_registry_response(&json).unwrap();
+                assert_eq!(meta.repository_url.as_deref(), Some(url.as_str()));
+            }
+
+            /// `parse_npm_registry_response` fails on invalid JSON.
+            #[test]
+            fn npm_registry_invalid_json(s in "[a-z]{5,20}") {
+                assert!(parse_npm_registry_response(&s).is_err());
+            }
+
+            /// `PopularityEvidence` serde roundtrip.
+            #[test]
+            fn popularity_evidence_serde_roundtrip(
+                stars in prop::option::of(0u64..1_000_000),
+                forks in prop::option::of(0u64..100_000),
+                weekly in prop::option::of(0u64..10_000_000)
+            ) {
+                let ev = PopularityEvidence {
+                    github_stars: stars,
+                    github_forks: forks,
+                    npm_downloads_weekly: weekly,
+                    ..PopularityEvidence::default()
+                };
+                let json = serde_json::to_string(&ev).unwrap();
+                let back: PopularityEvidence = serde_json::from_str(&json).unwrap();
+                assert_eq!(back.github_stars, stars);
+                assert_eq!(back.github_forks, forks);
+                assert_eq!(back.npm_downloads_weekly, weekly);
+            }
+        }
+    }
 }

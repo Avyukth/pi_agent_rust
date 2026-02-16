@@ -1110,4 +1110,189 @@ mod tests {
         assert_eq!(back.verdicts.len(), 1);
         assert_eq!(back.verdicts[0].security_findings.len(), 1);
     }
+
+    mod proptest_extension_license {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// All known licenses (excludes Custom).
+        fn all_known_licenses() -> Vec<License> {
+            vec![
+                License::Mit,
+                License::Apache2,
+                License::Isc,
+                License::Bsd2,
+                License::Bsd3,
+                License::Mpl2,
+                License::Gpl2,
+                License::Gpl3,
+                License::Agpl3,
+                License::Lgpl21,
+                License::Unlicense,
+                License::Cc0,
+                License::Unknown,
+            ]
+        }
+
+        proptest! {
+            /// `detect_license_from_content` never panics on arbitrary input.
+            #[test]
+            fn detect_content_never_panics(s in "(?s).{0,500}") {
+                let _ = detect_license_from_content(&s);
+            }
+
+            /// `detect_license_from_spdx` never panics on arbitrary input.
+            #[test]
+            fn detect_spdx_never_panics(s in ".*") {
+                let _ = detect_license_from_spdx(&s);
+            }
+
+            /// SPDX identifiers of known licenses roundtrip through `detect_license_from_spdx`.
+            #[test]
+            fn known_license_spdx_roundtrip(idx in 0..13usize) {
+                let license = &all_known_licenses()[idx];
+                let spdx = license.spdx();
+                let back = detect_license_from_spdx(spdx);
+                assert_eq!(*license, back, "roundtrip failed for {spdx}");
+            }
+
+            /// `detect_license_from_spdx` is case-insensitive.
+            #[test]
+            fn spdx_case_insensitive(idx in 0..13usize) {
+                let license = &all_known_licenses()[idx];
+                let spdx = license.spdx();
+                let upper = detect_license_from_spdx(&spdx.to_uppercase());
+                let lower = detect_license_from_spdx(&spdx.to_lowercase());
+                assert_eq!(upper, lower, "case mismatch for {spdx}");
+            }
+
+            /// All SPDX strings are non-empty and have no leading/trailing whitespace.
+            #[test]
+            fn spdx_strings_are_clean(idx in 0..13usize) {
+                let licenses = all_known_licenses();
+                let spdx = licenses[idx].spdx();
+                assert!(!spdx.is_empty());
+                assert_eq!(spdx, spdx.trim());
+            }
+
+            /// `License::to_string()` equals `License::spdx()`.
+            #[test]
+            fn display_equals_spdx(idx in 0..13usize) {
+                let license = &all_known_licenses()[idx];
+                assert_eq!(license.to_string(), license.spdx());
+            }
+
+            /// `redistributable` never panics and covers all known licenses.
+            #[test]
+            fn redistributable_never_panics(idx in 0..13usize) {
+                let license = &all_known_licenses()[idx];
+                let _ = redistributable(license);
+            }
+
+            /// `Custom` licenses always map to `Redistributable::Unknown`.
+            #[test]
+            fn custom_always_unknown(s in "[a-zA-Z0-9 -]{1,50}") {
+                let license = License::Custom(s);
+                assert_eq!(redistributable(&license), Redistributable::Unknown);
+            }
+
+            /// Permissive licenses all map to `Redistributable::Yes`.
+            #[test]
+            fn permissive_licenses_redistributable(idx in prop::sample::select(vec![0usize, 2, 3, 4, 10, 11])) {
+                let license = &all_known_licenses()[idx];
+                assert_eq!(redistributable(license), Redistributable::Yes);
+            }
+
+            /// `scan_security` never panics on arbitrary input.
+            #[test]
+            fn scan_security_never_panics(s in "(?s).{0,500}") {
+                let _ = scan_security(&s);
+            }
+
+            /// When a known security pattern is present, `scan_security` finds it.
+            #[test]
+            fn scan_security_finds_known_patterns(
+                idx in 0..SECURITY_PATTERNS.len(),
+                prefix in "[a-zA-Z ]{0,20}",
+                suffix in "[a-zA-Z ]{0,20}"
+            ) {
+                let (pattern, _, _) = SECURITY_PATTERNS[idx];
+                let content = format!("{prefix}{pattern}{suffix}");
+                let findings = scan_security(&content);
+                assert!(
+                    findings.iter().any(|f| f.pattern == pattern),
+                    "pattern '{pattern}' not found in findings"
+                );
+            }
+
+            /// `screen_extensions` verdict count invariant: sum of categories = total.
+            #[test]
+            fn screen_report_count_invariant(
+                n in 0..20usize,
+                task in "[a-z]{5,10}"
+            ) {
+                let inputs: Vec<ScreeningInput> = (0..n)
+                    .map(|i| ScreeningInput {
+                        canonical_id: format!("ext-{i}"),
+                        known_license: if i % 3 == 0 { Some("MIT".to_string()) } else { None },
+                        source_tier: None,
+                    })
+                    .collect();
+                let report = screen_extensions(&inputs, &task);
+                assert_eq!(report.stats.total_screened, n);
+                assert_eq!(
+                    report.stats.pass + report.stats.pass_with_warnings
+                        + report.stats.excluded + report.stats.needs_review,
+                    n
+                );
+            }
+
+            /// `screen_extensions` verdicts are sorted by `canonical_id`.
+            #[test]
+            fn screen_report_sorted(n in 0..20usize) {
+                let inputs: Vec<ScreeningInput> = (0..n)
+                    .map(|i| ScreeningInput {
+                        canonical_id: format!("ext-{}", n - i),
+                        known_license: Some("MIT".to_string()),
+                        source_tier: None,
+                    })
+                    .collect();
+                let report = screen_extensions(&inputs, "test");
+                for w in report.verdicts.windows(2) {
+                    assert!(w[0].canonical_id <= w[1].canonical_id);
+                }
+            }
+
+            /// `screen_extensions` preserves task ID.
+            #[test]
+            fn screen_report_task_preserved(task in "[a-z0-9]{1,20}") {
+                let report = screen_extensions(&[], &task);
+                assert_eq!(report.task, task);
+            }
+
+            /// License serde roundtrip for all known variants.
+            #[test]
+            fn license_serde_roundtrip(idx in 0..13usize) {
+                let license = all_known_licenses()[idx].clone();
+                let json = serde_json::to_string(&license).unwrap();
+                let back: License = serde_json::from_str(&json).unwrap();
+                assert_eq!(license, back);
+            }
+
+            /// `Redistributable` serde roundtrip.
+            #[test]
+            fn redistributable_serde_roundtrip(idx in 0..4usize) {
+                let variants = [
+                    Redistributable::Yes,
+                    Redistributable::Copyleft,
+                    Redistributable::Unknown,
+                    Redistributable::No,
+                ];
+                let v = variants[idx];
+                let json = serde_json::to_string(&v).unwrap();
+                let back: Redistributable = serde_json::from_str(&json).unwrap();
+                assert_eq!(v, back);
+            }
+        }
+    }
 }
