@@ -616,6 +616,8 @@ jobs:
           echo "PERF_EVIDENCE_DIR=${PERF_EVIDENCE_DIR}" >> "$GITHUB_ENV"
           echo "PERF_BASELINE_CONFIDENCE_JSON=${PERF_EVIDENCE_DIR}/results/baseline_variance_confidence.json" >> "$GITHUB_ENV"
           echo "PERF_EXTENSION_STRATIFICATION_JSON=${PERF_EVIDENCE_DIR}/results/extension_benchmark_stratification.json" >> "$GITHUB_ENV"
+          echo "PERF_SCENARIO_CELL_STATUS_JSON=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.json" >> "$GITHUB_ENV"
+          echo "PERF_SCENARIO_CELL_STATUS_MD=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.md" >> "$GITHUB_ENV"
 
       - name: Generate perf claim-integrity evidence bundle [linux]
         if: runner.os == 'Linux'
@@ -638,6 +640,66 @@ jobs:
           PERF_BASELINE_CONFIDENCE_JSON="$PERF_BASELINE_CONFIDENCE_JSON" \
           PERF_EXTENSION_STRATIFICATION_JSON="$PERF_EXTENSION_STRATIFICATION_JSON" \
           ./scripts/e2e/run_all.sh --profile ci
+
+      - name: Publish scenario-cell gate status [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          json_path = Path(os.environ["PERF_SCENARIO_CELL_STATUS_JSON"])
+          md_path = Path(os.environ["PERF_SCENARIO_CELL_STATUS_MD"])
+          if not json_path.is_file():
+              print(f"missing scenario-cell status JSON: {json_path}", file=sys.stderr)
+              sys.exit(1)
+
+          payload = json.loads(json_path.read_text(encoding="utf-8"))
+          summary = payload.get("summary", {})
+          total = int(summary.get("total_cells", 0))
+          passing = int(summary.get("passing_cells", 0))
+          failing = int(summary.get("failing_cells", 0))
+
+          print(
+              "Scenario-cell claim-integrity status: "
+              f"total={total}, passing={passing}, failing={failing}"
+          )
+          if failing > 0:
+              print(
+                  "Scenario-cell failures detected; run_all gate should already fail in strict mode.",
+                  file=sys.stderr,
+              )
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as handle:
+                  handle.write("\n## Scenario Cell Gate Status\n\n")
+                  handle.write(
+                      f"- Total cells: `{total}`\n- Passing: `{passing}`\n- Failing: `{failing}`\n\n"
+                  )
+                  if md_path.is_file():
+                      markdown = md_path.read_text(encoding="utf-8")
+                      handle.write(markdown)
+                      if not markdown.endswith("\n"):
+                          handle.write("\n")
+                  else:
+                      handle.write(
+                          f"_Detailed markdown artifact not found at `{md_path}`._\n"
+                      )
+          PY
+
+      - name: Upload scenario-cell gate artifacts [linux]
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-cell-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pi_agent_rust/${{ env.PERF_SCENARIO_CELL_STATUS_JSON }}
+            pi_agent_rust/${{ env.PERF_SCENARIO_CELL_STATUS_MD }}
+          if-no-files-found: warn
 
       - name: CI gate promotion (strict/rollback) [linux]
         if: runner.os == 'Linux'
