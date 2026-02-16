@@ -94,6 +94,35 @@ fn ghost_hit_reentry_admits_from_ghost() {
 }
 
 #[test]
+fn ghost_hit_budget_rejection_uses_ghost_tier_and_counts_both_signals() {
+    let mut policy = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 3,
+        small_capacity: 1,
+        ghost_capacity: 4,
+        max_entries_per_owner: 1,
+        fallback_window: 32,
+        min_ghost_hits_in_window: 0,
+        max_budget_rejections_in_window: 32,
+    });
+
+    let seed = policy.access("ext-a", "k1".to_string());
+    assert_eq!(seed.kind, S3FifoDecisionKind::AdmitSmall);
+
+    let _ = policy.access("ext-b", "k2".to_string());
+    let budget_holder = policy.access("ext-a", "k3".to_string());
+    assert_eq!(budget_holder.kind, S3FifoDecisionKind::AdmitSmall);
+
+    let ghost_reject = policy.access("ext-a", "k1".to_string());
+    assert_eq!(ghost_reject.kind, S3FifoDecisionKind::RejectFairnessBudget);
+    assert!(ghost_reject.ghost_hit);
+    assert_eq!(ghost_reject.tier, S3FifoTier::Ghost);
+
+    let telemetry = policy.telemetry();
+    assert_eq!(telemetry.ghost_hits_total, 1);
+    assert_eq!(telemetry.budget_rejections_total, 1);
+}
+
+#[test]
 fn ghost_hit_counter_tracks_repeated_reentries_exactly() {
     let mut policy = S3FifoPolicy::new(S3FifoConfig {
         live_capacity: 2,
@@ -345,5 +374,154 @@ fn clear_fallback_resets_window_and_delays_fairness_retrigger() {
     assert_eq!(
         policy.telemetry().fallback_reason,
         Some(S3FifoFallbackReason::FairnessInstability)
+    );
+}
+
+#[test]
+fn clear_fallback_preserves_cumulative_counters_and_future_accumulation() {
+    let mut policy = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 3,
+        small_capacity: 1,
+        ghost_capacity: 4,
+        max_entries_per_owner: 1,
+        fallback_window: 4,
+        min_ghost_hits_in_window: 0,
+        max_budget_rejections_in_window: 1,
+    });
+
+    let _ = policy.access("ext-a", "k1".to_string());
+    let _ = policy.access("ext-b", "k2".to_string());
+    let _ = policy.access("ext-a", "k3".to_string());
+
+    let ghost_reject = policy.access("ext-a", "k1".to_string());
+    assert_eq!(ghost_reject.kind, S3FifoDecisionKind::RejectFairnessBudget);
+    assert!(ghost_reject.ghost_hit);
+
+    let fallback_trigger = policy.access("ext-a", "k4".to_string());
+    assert_eq!(
+        fallback_trigger.kind,
+        S3FifoDecisionKind::RejectFairnessBudget
+    );
+    assert_eq!(
+        policy.telemetry().fallback_reason,
+        Some(S3FifoFallbackReason::FairnessInstability)
+    );
+
+    let before_clear = policy.telemetry();
+    assert_eq!(before_clear.ghost_hits_total, 1);
+    assert_eq!(before_clear.budget_rejections_total, 2);
+
+    let bypass = policy.access("ext-a", "while-fallback".to_string());
+    assert_eq!(bypass.kind, S3FifoDecisionKind::FallbackBypass);
+    let after_bypass = policy.telemetry();
+    assert_eq!(after_bypass.ghost_hits_total, before_clear.ghost_hits_total);
+    assert_eq!(
+        after_bypass.budget_rejections_total,
+        before_clear.budget_rejections_total
+    );
+
+    policy.clear_fallback();
+    let after_clear = policy.telemetry();
+    assert!(after_clear.fallback_reason.is_none());
+    assert_eq!(after_clear.ghost_hits_total, before_clear.ghost_hits_total);
+    assert_eq!(
+        after_clear.budget_rejections_total,
+        before_clear.budget_rejections_total
+    );
+
+    let post_clear_reject = policy.access("ext-a", "k5".to_string());
+    assert_eq!(
+        post_clear_reject.kind,
+        S3FifoDecisionKind::RejectFairnessBudget
+    );
+    let after_reject = policy.telemetry();
+    assert_eq!(
+        after_reject.budget_rejections_total,
+        before_clear.budget_rejections_total + 1
+    );
+    assert_eq!(after_reject.ghost_hits_total, before_clear.ghost_hits_total);
+}
+
+#[test]
+fn latched_low_signal_fallback_reason_does_not_flip_under_budget_pressure() {
+    let mut policy = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 8,
+        small_capacity: 4,
+        ghost_capacity: 8,
+        max_entries_per_owner: 1,
+        fallback_window: 3,
+        min_ghost_hits_in_window: 3,
+        max_budget_rejections_in_window: 0,
+    });
+
+    let _ = policy.access("ext-a", "ls-1".to_string());
+    let _ = policy.access("ext-b", "ls-2".to_string());
+    let _ = policy.access("ext-c", "ls-3".to_string());
+
+    let expected_reason = Some(S3FifoFallbackReason::SignalQualityInsufficient);
+    assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+    let baseline = policy.telemetry();
+
+    for key in ["budget-1", "budget-2", "budget-3"] {
+        let decision = policy.access("ext-hot", key.to_string());
+        assert_eq!(decision.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(decision.tier, S3FifoTier::Fallback);
+        assert_eq!(decision.fallback_reason, expected_reason);
+    }
+
+    let after = policy.telemetry();
+    assert_eq!(after.fallback_reason, expected_reason);
+    assert_eq!(
+        after.budget_rejections_total, baseline.budget_rejections_total,
+        "bypass while latched must not advance fairness counters"
+    );
+    assert_eq!(
+        after.ghost_hits_total, baseline.ghost_hits_total,
+        "bypass while latched must not fabricate ghost-hit signal"
+    );
+}
+
+#[test]
+fn latched_fairness_fallback_reason_does_not_flip_under_low_signal_sequence() {
+    let mut policy = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 2,
+        small_capacity: 1,
+        ghost_capacity: 8,
+        max_entries_per_owner: 1,
+        fallback_window: 3,
+        min_ghost_hits_in_window: 1,
+        max_budget_rejections_in_window: 0,
+    });
+
+    let _ = policy.access("ext-b", "ghost-seed".to_string());
+    let _ = policy.access("ext-hot", "fair-live".to_string());
+    let trigger = policy.access("ext-hot", "ghost-seed".to_string());
+    assert_eq!(trigger.kind, S3FifoDecisionKind::RejectFairnessBudget);
+    assert!(trigger.ghost_hit);
+
+    let expected_reason = Some(S3FifoFallbackReason::FairnessInstability);
+    assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+    let baseline = policy.telemetry();
+
+    for (owner, key) in [
+        ("ext-a", "cold-1"),
+        ("ext-b", "cold-2"),
+        ("ext-c", "cold-3"),
+    ] {
+        let decision = policy.access(owner, key.to_string());
+        assert_eq!(decision.kind, S3FifoDecisionKind::FallbackBypass);
+        assert_eq!(decision.tier, S3FifoTier::Fallback);
+        assert_eq!(decision.fallback_reason, expected_reason);
+    }
+
+    let after = policy.telemetry();
+    assert_eq!(after.fallback_reason, expected_reason);
+    assert_eq!(
+        after.budget_rejections_total, baseline.budget_rejections_total,
+        "latched fallback should keep fairness counter stable during bypass"
+    );
+    assert_eq!(
+        after.ghost_hits_total, baseline.ghost_hits_total,
+        "latched fallback should keep ghost-hit counter stable during bypass"
     );
 }

@@ -18,8 +18,9 @@ use pi::extensions::{
     ExecMediationLedgerEntry, ExtensionManager, ExtensionPolicy, ExtensionPolicyMode,
     HostCallContext, HostCallPayload, INCIDENT_EVIDENCE_BUNDLE_SCHEMA_VERSION,
     IncidentBundleFilter, IncidentBundleRedactionPolicy, IncidentEvidenceBundle, RuntimeRiskConfig,
-    SecretBrokerLedgerEntry, SecurityAlert, build_incident_evidence_bundle,
-    dispatch_host_call_shared, verify_incident_evidence_bundle,
+    SecretBrokerLedgerEntry, SecurityAlert, SecurityAlertCategory, SecurityAlertFilter,
+    SecurityAlertSeverity, build_incident_evidence_bundle, dispatch_host_call_shared,
+    query_security_alerts, verify_incident_evidence_bundle,
 };
 use pi::tools::ToolRegistry;
 use serde_json::json;
@@ -334,6 +335,224 @@ fn summary_counts_match_sub_artifacts() {
                 bundle.summary.ledger_entry_count.to_string(),
             ));
         });
+}
+
+#[test]
+fn alert_summary_counts_and_severity_filters_are_consistent() {
+    let harness = TestHarness::new("alert_summary_counts_and_severity_filters_are_consistent");
+    let (_, _, manager, _) = setup(&harness, default_risk_config());
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.alerts",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.alerts",
+        "rm -rf /tmp/demo",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.alerts",
+        "API_TOKEN",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.alerts",
+        "critical anomaly",
+        0.99,
+    ));
+
+    let bundle = build_bundle(&manager);
+    let alerts = &bundle.security_alerts;
+
+    assert_eq!(alerts.alert_count, alerts.alerts.len());
+    assert_eq!(bundle.summary.alert_count, alerts.alert_count);
+
+    let category_total = alerts.category_counts.policy_denial
+        + alerts.category_counts.anomaly_denial
+        + alerts.category_counts.exec_mediation
+        + alerts.category_counts.secret_broker
+        + alerts.category_counts.quota_breach
+        + alerts.category_counts.quarantine
+        + alerts.category_counts.profile_transition;
+    assert_eq!(category_total, alerts.alert_count);
+
+    let severity_total = alerts.severity_counts.info
+        + alerts.severity_counts.warning
+        + alerts.severity_counts.error
+        + alerts.severity_counts.critical;
+    assert_eq!(severity_total, alerts.alert_count);
+
+    let any_severity = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Info),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+    let warning_or_higher = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Warning),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+    let error_or_higher = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Error),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+    let critical_only = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Critical),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+
+    assert_eq!(any_severity.len(), alerts.alert_count);
+    assert!(any_severity.len() >= warning_or_higher.len());
+    assert!(warning_or_higher.len() >= error_or_higher.len());
+    assert!(error_or_higher.len() >= critical_only.len());
+    assert_eq!(critical_only.len(), alerts.severity_counts.critical);
+    assert_eq!(
+        error_or_higher.len(),
+        alerts.severity_counts.error + alerts.severity_counts.critical
+    );
+
+    harness.log().info_ctx(
+        "alert_consistency",
+        "alert summary counts and severity filters are consistent",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.2".into()));
+            ctx_log.push(("alert_count".into(), alerts.alert_count.to_string()));
+        },
+    );
+}
+
+#[test]
+fn query_security_alerts_after_ts_and_category_filters_are_deterministic() {
+    let harness = TestHarness::new("query_security_alerts_after_ts_and_category_filters");
+    let (_, _, manager, _) = setup(&harness, default_risk_config());
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.filter",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.filter",
+        "rm -rf /tmp/demo",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.filter",
+        "API_TOKEN",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.filter",
+        "critical anomaly",
+        0.99,
+    ));
+
+    let artifact = manager.security_alert_artifact();
+    let min_ts = artifact
+        .alerts
+        .iter()
+        .map(|alert| alert.ts_ms)
+        .min()
+        .expect("alerts exist");
+    let max_ts = artifact
+        .alerts
+        .iter()
+        .map(|alert| alert.ts_ms)
+        .max()
+        .expect("alerts exist");
+
+    let query = |min_severity, category, after_ts_ms| {
+        query_security_alerts(
+            &manager,
+            &SecurityAlertFilter {
+                min_severity,
+                category,
+                extension_id: None,
+                after_ts_ms,
+            },
+        )
+    };
+    let all_via_before_min = query(None, None, Some(min_ts.saturating_sub(1)));
+    assert_eq!(all_via_before_min.len(), artifact.alert_count);
+
+    let at_max_inclusive = query(None, None, Some(max_ts));
+    let expected_at_max = artifact
+        .alerts
+        .iter()
+        .filter(|alert| alert.ts_ms == max_ts)
+        .count();
+    assert_eq!(
+        at_max_inclusive.len(),
+        expected_at_max,
+        "after_ts at max must include alerts at that exact timestamp"
+    );
+
+    if let Some(after_max) = max_ts.checked_add(1) {
+        let none_after_max = query(None, None, Some(after_max));
+        assert!(
+            none_after_max.is_empty(),
+            "after_ts greater than max timestamp should yield none"
+        );
+    }
+
+    let critical_quarantine = query(
+        Some(SecurityAlertSeverity::Critical),
+        Some(SecurityAlertCategory::Quarantine),
+        None,
+    );
+    assert_eq!(
+        critical_quarantine.len(),
+        artifact.category_counts.quarantine,
+        "critical+quarantine intersection count mismatch"
+    );
+    assert!(critical_quarantine.iter().all(|alert| {
+        alert.category == SecurityAlertCategory::Quarantine
+            && alert.severity == SecurityAlertSeverity::Critical
+    }));
+
+    let error_quarantine = query(
+        Some(SecurityAlertSeverity::Error),
+        Some(SecurityAlertCategory::Quarantine),
+        None,
+    );
+    assert_eq!(
+        error_quarantine.len(),
+        critical_quarantine.len(),
+        "widening severity to error for quarantine-only filter should not change count"
+    );
+
+    harness.log().info_ctx(
+        "alert_filter_determinism",
+        "query_security_alerts after_ts/category behavior is deterministic",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.3".into()));
+            ctx_log.push(("alert_count".into(), artifact.alert_count.to_string()));
+        },
+    );
 }
 
 // ============================================================================

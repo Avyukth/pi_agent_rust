@@ -1,7 +1,29 @@
 use loom::sync::atomic::{AtomicBool, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
-use pi::hostcall_queue::{HostcallQueueMode, HostcallRequestQueue};
+use pi::hostcall_queue::{
+    BravoBiasMode, ContentionSample, ContentionSignature, HostcallQueueMode, HostcallRequestQueue,
+};
+
+fn starvation_sample() -> ContentionSample {
+    ContentionSample {
+        read_acquires: 80,
+        write_acquires: 20,
+        read_wait_p95_us: 120,
+        write_wait_p95_us: 9_000,
+        write_timeouts: 3,
+    }
+}
+
+fn mixed_sample() -> ContentionSample {
+    ContentionSample {
+        read_acquires: 45,
+        write_acquires: 55,
+        read_wait_p95_us: 150,
+        write_wait_p95_us: 450,
+        write_timeouts: 0,
+    }
+}
 
 #[test]
 fn loom_epoch_pin_blocks_reclamation_until_release() {
@@ -120,5 +142,79 @@ fn loom_repeated_safe_fallback_switch_is_idempotent() {
         let snapshot = queue.lock().expect("lock queue").snapshot();
         assert_eq!(snapshot.reclamation_mode, HostcallQueueMode::SafeFallback);
         assert_eq!(snapshot.fallback_transitions, 1);
+    });
+}
+
+#[test]
+fn loom_bravo_writer_recovery_is_bounded_under_concurrent_starvation() {
+    loom::model(|| {
+        let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
+            4,
+            4,
+            HostcallQueueMode::SafeFallback,
+        )));
+
+        let queue_a = Arc::clone(&queue);
+        let starvation_a = thread::spawn(move || {
+            let mut queue = queue_a.lock().expect("lock queue");
+            let _ = queue.observe_contention_window(starvation_sample());
+        });
+
+        let queue_b = Arc::clone(&queue);
+        let starvation_b = thread::spawn(move || {
+            let mut queue = queue_b.lock().expect("lock queue");
+            let _ = queue.observe_contention_window(starvation_sample());
+        });
+
+        starvation_a.join().expect("starvation_a join");
+        starvation_b.join().expect("starvation_b join");
+
+        let snapshot = queue.lock().expect("lock queue").snapshot();
+        assert_eq!(snapshot.bravo_mode, BravoBiasMode::WriterRecovery);
+        assert_eq!(
+            snapshot.bravo_last_signature,
+            ContentionSignature::WriterStarvationRisk
+        );
+        assert!(
+            snapshot.bravo_writer_recovery_remaining <= 2,
+            "writer recovery window should stay bounded by config default (2)"
+        );
+        assert!(
+            snapshot.bravo_rollbacks >= 1,
+            "starvation must trigger at least one rollback"
+        );
+    });
+}
+
+#[test]
+fn loom_bravo_writer_recovery_returns_to_balanced_without_stale_counters() {
+    loom::model(|| {
+        let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
+            4,
+            4,
+            HostcallQueueMode::SafeFallback,
+        )));
+
+        let queue_for_starvation = Arc::clone(&queue);
+        let starvation_thread = thread::spawn(move || {
+            let mut queue = queue_for_starvation.lock().expect("lock queue");
+            let _ = queue.observe_contention_window(starvation_sample());
+        });
+        starvation_thread.join().expect("starvation thread join");
+
+        {
+            let mut queue = queue.lock().expect("lock queue");
+            for _ in 0..4 {
+                let _ = queue.observe_contention_window(mixed_sample());
+            }
+        }
+
+        let snapshot = queue.lock().expect("lock queue").snapshot();
+        assert_eq!(snapshot.bravo_mode, BravoBiasMode::Balanced);
+        assert_eq!(snapshot.bravo_writer_recovery_remaining, 0);
+        assert_eq!(
+            snapshot.bravo_last_signature,
+            ContentionSignature::MixedContention
+        );
     });
 }

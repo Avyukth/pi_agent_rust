@@ -1120,6 +1120,118 @@ fn scenario_alert_category_coverage() {
     );
 }
 
+#[test]
+fn scenario_alert_artifact_counts_and_severity_filters_are_consistent() {
+    let harness = TestHarness::new("scenario_alert_artifact_consistency");
+    let manager = ExtensionManager::new();
+    manager.set_runtime_risk_config(default_risk_config());
+
+    emit_scenario_event(
+        &harness,
+        "alert_artifact_consistency",
+        "start",
+        "ext.consistency",
+        "none",
+        "setup",
+        0.0,
+        &[],
+    );
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.consistency",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.consistency",
+        "rm -rf /tmp/demo",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.consistency",
+        "API_TOKEN",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.consistency",
+        "critical anomaly",
+        0.98,
+    ));
+
+    let artifact = manager.security_alert_artifact();
+    assert_eq!(artifact.alert_count, artifact.alerts.len());
+
+    let category_total = artifact.category_counts.policy_denial
+        + artifact.category_counts.anomaly_denial
+        + artifact.category_counts.exec_mediation
+        + artifact.category_counts.secret_broker
+        + artifact.category_counts.quota_breach
+        + artifact.category_counts.quarantine
+        + artifact.category_counts.profile_transition;
+    assert_eq!(category_total, artifact.alert_count);
+
+    let severity_total = artifact.severity_counts.info
+        + artifact.severity_counts.warning
+        + artifact.severity_counts.error
+        + artifact.severity_counts.critical;
+    assert_eq!(severity_total, artifact.alert_count);
+
+    let critical_only = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Critical),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+    assert!(
+        critical_only
+            .iter()
+            .all(|alert| alert.severity == SecurityAlertSeverity::Critical),
+        "critical filter must return only critical alerts"
+    );
+    assert_eq!(critical_only.len(), artifact.severity_counts.critical);
+
+    let error_or_higher = query_security_alerts(
+        &manager,
+        &SecurityAlertFilter {
+            min_severity: Some(SecurityAlertSeverity::Error),
+            category: None,
+            extension_id: None,
+            after_ts_ms: None,
+        },
+    );
+    assert!(
+        error_or_higher.iter().all(|alert| {
+            matches!(
+                alert.severity,
+                SecurityAlertSeverity::Error | SecurityAlertSeverity::Critical
+            )
+        }),
+        "error filter must include only error/critical alerts"
+    );
+    assert_eq!(
+        error_or_higher.len(),
+        artifact.severity_counts.error + artifact.severity_counts.critical
+    );
+    assert!(critical_only.len() <= error_or_higher.len());
+    assert!(error_or_higher.len() <= artifact.alert_count);
+
+    emit_scenario_event(
+        &harness,
+        "alert_artifact_consistency",
+        "verify",
+        "ext.consistency",
+        "none",
+        "pass",
+        0.0,
+        &["severity_and_count_invariants"],
+    );
+}
+
 // ============================================================================
 // Scenario 9: Secret broker integration — redaction in incident bundle
 // ============================================================================

@@ -666,6 +666,63 @@ fn filter_alerts_by_min_severity() {
     assert_eq!(bundle.summary.alert_count, 2); // Error + Critical
 }
 
+#[test]
+fn combined_alert_filters_apply_category_and_min_severity_intersection() {
+    let alerts = alert_artifact(vec![
+        make_alert(
+            1000,
+            "ext-a",
+            SecurityAlertCategory::PolicyDenial,
+            SecurityAlertSeverity::Warning,
+        ),
+        make_alert(
+            2000,
+            "ext-a",
+            SecurityAlertCategory::PolicyDenial,
+            SecurityAlertSeverity::Error,
+        ),
+        make_alert(
+            3000,
+            "ext-a",
+            SecurityAlertCategory::AnomalyDenial,
+            SecurityAlertSeverity::Critical,
+        ),
+        make_alert(
+            4000,
+            "ext-a",
+            SecurityAlertCategory::Quarantine,
+            SecurityAlertSeverity::Critical,
+        ),
+    ]);
+
+    let filter = IncidentBundleFilter {
+        alert_categories: Some(vec![
+            SecurityAlertCategory::PolicyDenial,
+            SecurityAlertCategory::Quarantine,
+        ]),
+        min_severity: Some(SecurityAlertSeverity::Error),
+        ..Default::default()
+    };
+
+    let bundle = build_incident_evidence_bundle(
+        &ledger_artifact(vec![]),
+        &alerts,
+        &telemetry_artifact(vec![]),
+        &exec_artifact(vec![]),
+        &secret_artifact(vec![]),
+        &[],
+        &filter,
+        &IncidentBundleRedactionPolicy::default(),
+        100_000,
+    );
+
+    assert_eq!(bundle.summary.alert_count, 2);
+    assert_eq!(bundle.security_alerts.severity_counts.error, 1);
+    assert_eq!(bundle.security_alerts.severity_counts.critical, 1);
+    assert_eq!(bundle.security_alerts.category_counts.policy_denial, 1);
+    assert_eq!(bundle.security_alerts.category_counts.quarantine, 1);
+}
+
 // ---- 7. Redaction ----
 
 #[test]
@@ -954,6 +1011,92 @@ fn filtered_bundle_only_includes_filtered_ledger_entries() {
         assert_eq!(replay.entry_count, 2);
         assert!(replay.steps.iter().all(|s| s.extension_id == "ext-a"));
     }
+}
+
+#[test]
+fn extension_filter_non_contiguous_chain_disables_replay() {
+    let ledger = ledger_artifact(vec![
+        make_ledger_entry(1000, "ext-a", 0.2),
+        make_ledger_entry(2000, "ext-b", 0.5),
+        make_ledger_entry(3000, "ext-a", 0.8),
+    ]);
+
+    let filter = IncidentBundleFilter {
+        extension_id: Some("ext-a".to_string()),
+        ..Default::default()
+    };
+
+    let bundle = build_incident_evidence_bundle(
+        &ledger,
+        &alert_artifact(vec![]),
+        &telemetry_artifact(vec![]),
+        &exec_artifact(vec![]),
+        &secret_artifact(vec![]),
+        &[],
+        &filter,
+        &IncidentBundleRedactionPolicy::default(),
+        100_000,
+    );
+
+    assert_eq!(bundle.risk_ledger.entries.len(), 2);
+    assert!(!bundle.summary.ledger_chain_intact);
+    assert!(bundle.risk_replay.is_none());
+}
+
+#[test]
+fn zero_match_extension_filter_yields_empty_replay_and_valid_bundle() {
+    let ledger = ledger_artifact(vec![
+        make_ledger_entry(1000, "ext-a", 0.2),
+        make_ledger_entry(2000, "ext-b", 0.5),
+    ]);
+    let alerts = alert_artifact(vec![make_alert(
+        1500,
+        "ext-a",
+        SecurityAlertCategory::PolicyDenial,
+        SecurityAlertSeverity::Warning,
+    )]);
+    let telem = telemetry_artifact(vec![make_telemetry(1600, "ext-b")]);
+    let exec = exec_artifact(vec![make_exec_entry(1700, "ext-a")]);
+    let secret = secret_artifact(vec![make_secret_entry(1800, "ext-b")]);
+    let quotas = vec![make_quota(1900, "ext-a")];
+
+    let filter = IncidentBundleFilter {
+        extension_id: Some("ext-z".to_string()),
+        ..Default::default()
+    };
+
+    let bundle = build_incident_evidence_bundle(
+        &ledger,
+        &alerts,
+        &telem,
+        &exec,
+        &secret,
+        &quotas,
+        &filter,
+        &IncidentBundleRedactionPolicy::default(),
+        100_000,
+    );
+
+    assert_eq!(bundle.summary.ledger_entry_count, 0);
+    assert_eq!(bundle.summary.alert_count, 0);
+    assert_eq!(bundle.summary.telemetry_event_count, 0);
+    assert_eq!(bundle.summary.exec_mediation_count, 0);
+    assert_eq!(bundle.summary.secret_broker_count, 0);
+    assert_eq!(bundle.summary.quota_breach_count, 0);
+    assert_eq!(bundle.summary.distinct_extensions, 0);
+    assert!(bundle.summary.ledger_chain_intact);
+
+    let replay = bundle
+        .risk_replay
+        .as_ref()
+        .expect("empty filtered ledgers should still yield a valid empty replay");
+    assert_eq!(replay.entry_count, 0);
+    assert!(replay.steps.is_empty());
+    assert!(replay.tail_ledger_hash.is_none());
+
+    let report = verify_incident_evidence_bundle(&bundle);
+    assert!(report.valid);
+    assert!(report.errors.is_empty());
 }
 
 // ---- 10. JSON round-trip stability ----
