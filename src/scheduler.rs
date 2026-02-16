@@ -3369,4 +3369,182 @@ mod tests {
         assert_eq!(json["recommended_numa_node"], 1);
         assert_eq!(json["enforcement"], "strict");
     }
+
+    // ── Property tests ──
+
+    mod proptest_scheduler {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn seq_next_is_monotonic(start in 0..u64::MAX - 100) {
+                let s = Seq(start);
+                let n = s.next();
+                assert!(n >= s, "Seq::next must be monotonically non-decreasing");
+                assert!(
+                    n.value() == start + 1 || start == u64::MAX,
+                    "Seq::next must increment by 1 unless saturated"
+                );
+            }
+
+            #[test]
+            fn seq_next_saturates(start in u64::MAX - 5..=u64::MAX) {
+                let s = Seq(start);
+                let n = s.next();
+                assert!(n.value() <= u64::MAX, "must not overflow");
+                assert!(n >= s, "must be monotonic even at saturation boundary");
+            }
+
+            #[test]
+            fn timer_entry_ordering_consistent_with_min_heap(
+                id_a in 0..1000u64,
+                id_b in 0..1000u64,
+                deadline_a in 0..10000u64,
+                deadline_b in 0..10000u64,
+                seq_a in 0..1000u64,
+                seq_b in 0..1000u64,
+            ) {
+                let ta = TimerEntry::new(id_a, deadline_a, Seq(seq_a));
+                let tb = TimerEntry::new(id_b, deadline_b, Seq(seq_b));
+                // Reversed ordering: earlier deadline = GREATER (for BinaryHeap min-heap)
+                if deadline_a < deadline_b {
+                    assert!(ta > tb, "earlier deadline must sort greater (min-heap)");
+                } else if deadline_a > deadline_b {
+                    assert!(ta < tb, "later deadline must sort less (min-heap)");
+                } else if seq_a < seq_b {
+                    assert!(ta > tb, "same deadline, earlier seq must sort greater");
+                } else if seq_a > seq_b {
+                    assert!(ta < tb, "same deadline, later seq must sort less");
+                } else {
+                    assert!(ta == tb, "same deadline+seq must be equal");
+                }
+            }
+
+            #[test]
+            fn stable_hash_is_deterministic(input in "[a-z0-9_.-]{1,64}") {
+                let h1 = ReactorMesh::stable_hash(&input);
+                let h2 = ReactorMesh::stable_hash(&input);
+                assert!(h1 == h2, "stable_hash must be deterministic");
+            }
+
+            #[test]
+            fn hash_route_returns_valid_shard(
+                shard_count in 1..32usize,
+                call_id in "[a-z0-9]{1,20}",
+            ) {
+                let config = ReactorMeshConfig {
+                    shard_count,
+                    lane_capacity: 16,
+                    topology: None,
+                };
+                let mesh = ReactorMesh::new(config);
+                let shard = mesh.hash_route(&call_id);
+                assert!(
+                    shard < mesh.shard_count(),
+                    "hash_route returned {shard} >= shard_count {}",
+                    mesh.shard_count(),
+                );
+            }
+
+            #[test]
+            fn rr_route_returns_valid_shard(
+                shard_count in 1..32usize,
+                iterations in 1..100usize,
+            ) {
+                let config = ReactorMeshConfig {
+                    shard_count,
+                    lane_capacity: 16,
+                    topology: None,
+                };
+                let mut mesh = ReactorMesh::new(config);
+                for _ in 0..iterations {
+                    let shard = mesh.rr_route();
+                    assert!(
+                        shard < mesh.shard_count(),
+                        "rr_route returned {shard} >= shard_count {}",
+                        mesh.shard_count(),
+                    );
+                }
+            }
+
+            #[test]
+            fn drain_global_order_is_sorted(
+                shard_count in 1..8usize,
+                lane_capacity in 2..16usize,
+                enqueues in 1..30usize,
+            ) {
+                let config = ReactorMeshConfig {
+                    shard_count,
+                    lane_capacity,
+                    topology: None,
+                };
+                let mut mesh = ReactorMesh::new(config);
+                let mut success_count = 0usize;
+                for i in 0..enqueues {
+                    let call_id = format!("call_{i}");
+                    let outcome = HostcallOutcome::Success(serde_json::Value::Null);
+                    if mesh.enqueue_hostcall_complete(call_id, outcome).is_ok() {
+                        success_count += 1;
+                    }
+                }
+                let drained = mesh.drain_global_order(success_count);
+                // Verify ascending global_seq
+                for pair in drained.windows(2) {
+                    assert!(
+                        pair[0].global_seq < pair[1].global_seq,
+                        "drain_global_order must emit ascending seq: {:?} vs {:?}",
+                        pair[0].global_seq,
+                        pair[1].global_seq,
+                    );
+                }
+            }
+
+            #[test]
+            fn mesh_total_depth_bounded_by_capacity(
+                shard_count in 1..8usize,
+                lane_capacity in 1..16usize,
+                enqueues in 0..100usize,
+            ) {
+                let config = ReactorMeshConfig {
+                    shard_count,
+                    lane_capacity,
+                    topology: None,
+                };
+                let mut mesh = ReactorMesh::new(config);
+                for i in 0..enqueues {
+                    let call_id = format!("call_{i}");
+                    let outcome = HostcallOutcome::Success(serde_json::Value::Null);
+                    let _ = mesh.enqueue_hostcall_complete(call_id, outcome);
+                }
+                let max_total = shard_count * lane_capacity;
+                assert!(
+                    mesh.total_depth() <= max_total,
+                    "total_depth {} exceeds max possible {}",
+                    mesh.total_depth(),
+                    max_total,
+                );
+            }
+
+            #[test]
+            fn scheduler_timer_cancel_idempotent(
+                timer_count in 1..10usize,
+                cancel_idx in 0..10usize,
+            ) {
+                let clock = DeterministicClock::new(0);
+                let mut sched = Scheduler::with_clock(clock);
+                let mut timer_ids = Vec::new();
+                for i in 0..timer_count {
+                    timer_ids.push(sched.set_timeout(u64::try_from(i + 1).unwrap() * 100));
+                }
+                if cancel_idx < timer_ids.len() {
+                    let tid = timer_ids[cancel_idx];
+                    let first = sched.clear_timeout(tid);
+                    let second = sched.clear_timeout(tid);
+                    assert!(first, "first cancel should succeed");
+                    assert!(!second, "second cancel should return false");
+                }
+            }
+        }
+    }
 }

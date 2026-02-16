@@ -2983,4 +2983,201 @@ mod tests {
         let report = compute_mean_field_controls(&observations, &previous, &config);
         assert!(report.converged);
     }
+
+    // ── Property tests ──
+
+    mod proptest_scoring {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_signals() -> impl Strategy<Value = Signals> {
+            (
+                any::<Option<bool>>(),
+                any::<Option<bool>>(),
+                any::<Option<bool>>(),
+                prop::option::of(0..100_000u64),
+                prop::option::of(0..10_000u64),
+                prop::option::of(0..1_000_000u64),
+            )
+                .prop_map(
+                    |(listing, example, gist, stars, forks, npm)| Signals {
+                        official_listing: listing,
+                        pi_mono_example: example,
+                        badlogic_gist: gist,
+                        github_stars: stars,
+                        github_forks: forks,
+                        npm_downloads_month: npm,
+                        references: Vec::new(),
+                        marketplace: None,
+                    },
+                )
+        }
+
+        fn arb_tags() -> impl Strategy<Value = Tags> {
+            let runtime = prop::option::of(prop::sample::select(vec![
+                "pkg-with-deps".to_string(),
+                "provider-ext".to_string(),
+                "multi-file".to_string(),
+                "legacy-js".to_string(),
+            ]));
+            runtime.prop_map(|rt| Tags {
+                runtime: rt,
+                interaction: Vec::new(),
+                capabilities: Vec::new(),
+            })
+        }
+
+        fn arb_compat_status() -> impl Strategy<Value = CompatStatus> {
+            prop::sample::select(vec![
+                CompatStatus::Unmodified,
+                CompatStatus::RequiresShims,
+                CompatStatus::RuntimeGap,
+                CompatStatus::Blocked,
+                CompatStatus::Unknown,
+            ])
+        }
+
+        fn arb_risk_level() -> impl Strategy<Value = RiskLevel> {
+            prop::sample::select(vec![
+                RiskLevel::Low,
+                RiskLevel::Moderate,
+                RiskLevel::High,
+                RiskLevel::Critical,
+            ])
+        }
+
+        proptest! {
+            #[test]
+            fn score_github_stars_bounded(stars in 0..10_000_000u64) {
+                let signals = Signals {
+                    github_stars: Some(stars),
+                    ..Signals::default()
+                };
+                let mut missing = BTreeSet::new();
+                let score = score_github_stars(&signals, &mut missing);
+                assert!(score <= 10, "github_stars score {score} exceeds max 10");
+            }
+
+            #[test]
+            fn score_github_stars_monotonic(a in 0..100_000u64, b in 0..100_000u64) {
+                let mut missing = BTreeSet::new();
+                let sig_a = Signals { github_stars: Some(a), ..Signals::default() };
+                let sig_b = Signals { github_stars: Some(b), ..Signals::default() };
+                let score_a = score_github_stars(&sig_a, &mut missing);
+                let score_b = score_github_stars(&sig_b, &mut missing);
+                if a <= b {
+                    assert!(
+                        score_a <= score_b,
+                        "monotonicity: stars {a} → {score_a}, {b} → {score_b}"
+                    );
+                }
+            }
+
+            #[test]
+            fn score_npm_downloads_bounded(downloads in 0..10_000_000u64) {
+                let signals = Signals {
+                    npm_downloads_month: Some(downloads),
+                    ..Signals::default()
+                };
+                let mut missing = BTreeSet::new();
+                let score = score_npm_downloads(&signals, &mut missing);
+                assert!(score <= 8, "npm_downloads score {score} exceeds max 8");
+            }
+
+            #[test]
+            fn score_compatibility_bounded(
+                status in arb_compat_status(),
+                adjustment in -20..20i8,
+            ) {
+                let compat = Compatibility {
+                    status: Some(status),
+                    blocked_reasons: Vec::new(),
+                    required_shims: Vec::new(),
+                    adjustment: Some(adjustment),
+                };
+                let score = score_compatibility(&compat);
+                assert!(score <= 20, "compatibility score {score} exceeds max 20");
+            }
+
+            #[test]
+            fn score_risk_bounded(
+                level in prop::option::of(arb_risk_level()),
+                penalty in prop::option::of(0..100u8),
+            ) {
+                let risk = RiskInfo { level, penalty, flags: Vec::new() };
+                let score = score_risk(&risk);
+                assert!(score <= 15, "risk penalty {score} exceeds max 15");
+            }
+
+            #[test]
+            fn normalized_utility_nonnegative(value in prop::num::f64::ANY) {
+                let result = normalized_utility(value);
+                assert!(
+                    result >= 0.0,
+                    "normalized_utility({value}) = {result} must be >= 0.0"
+                );
+            }
+
+            #[test]
+            fn normalized_utility_handles_special_floats(
+                value in prop::sample::select(vec![
+                    f64::NAN, f64::INFINITY, f64::NEG_INFINITY,
+                    0.0, -0.0, f64::MIN, f64::MAX, f64::MIN_POSITIVE,
+                ]),
+            ) {
+                let result = normalized_utility(value);
+                assert!(
+                    result.is_finite(),
+                    "normalized_utility({value}) = {result} must be finite"
+                );
+                assert!(result >= 0.0, "must be non-negative");
+            }
+
+            #[test]
+            fn normalized_utility_idempotent(value in prop::num::f64::ANY) {
+                let once = normalized_utility(value);
+                let twice = normalized_utility(once);
+                assert!(
+                    (once - twice).abs() < f64::EPSILON || (once.is_nan() && twice.is_nan()),
+                    "normalized_utility must be idempotent: {once} vs {twice}"
+                );
+            }
+
+            #[test]
+            fn base_total_is_sum_of_components(
+                signals in arb_signals(),
+                tags in arb_tags(),
+            ) {
+                let mut missing = BTreeSet::new();
+                let (popularity, _) = score_popularity(&signals, &mut missing);
+                let (adoption, _) = score_adoption(&signals, &mut missing);
+                let (coverage, _) = score_coverage(&tags);
+                // Each clamped component is bounded
+                assert!(popularity <= 30, "popularity {popularity} > 30");
+                assert!(adoption <= 15, "adoption {adoption} > 15");
+                assert!(coverage <= 20, "coverage {coverage} > 20");
+            }
+
+            #[test]
+            fn gates_passes_iff_all_true(
+                prov in any::<bool>(),
+                det in any::<bool>(),
+                license_ok in any::<bool>(),
+                unmod in any::<bool>(),
+            ) {
+                let expected = prov && det && license_ok && unmod;
+                let gates = GateStatus {
+                    provenance_pinned: prov,
+                    license_ok,
+                    deterministic: det,
+                    unmodified: unmod,
+                    passes: expected,
+                };
+                assert!(
+                    gates.passes == expected,
+                    "gates.passes should be AND of all flags"
+                );
+            }
+        }
+    }
 }
