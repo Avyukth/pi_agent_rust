@@ -9561,6 +9561,16 @@ fn reset_hostcall_superinstruction_state_for_tests() {
     }
 }
 
+/// Guard that serializes tests which touch the global superinstruction state.
+/// Acquire via `superinstruction_test_lock()` at the start of each such test.
+#[cfg(test)]
+fn superinstruction_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostcallMarshallingTelemetry {
     path: String,
@@ -35697,6 +35707,7 @@ mod tests {
 
     #[test]
     fn hostcall_marshalling_fast_hash_matches_generic_for_hot_opcodes() {
+        let _guard = superinstruction_test_lock();
         reset_hostcall_superinstruction_state_for_tests();
         let tool_params = json!({
             "name": "read",
@@ -35747,6 +35758,7 @@ mod tests {
 
     #[test]
     fn hostcall_marshalling_shape_miss_reports_rewrite_fallback() {
+        let _guard = superinstruction_test_lock();
         reset_hostcall_superinstruction_state_for_tests();
         let params = json!({
             "name": "read",
@@ -35778,6 +35790,7 @@ mod tests {
 
     #[test]
     fn hostcall_marshalling_superinstruction_hits_after_trace_warmup() {
+        let _guard = superinstruction_test_lock();
         reset_hostcall_superinstruction_state_for_tests();
 
         let get_name = json!({ "op": "get_name" });
@@ -35819,6 +35832,7 @@ mod tests {
 
     #[test]
     fn runtime_hostcall_telemetry_records_marshalling_fallback_reason_and_counter() {
+        let _guard = superinstruction_test_lock();
         reset_hostcall_superinstruction_state_for_tests();
         let dir = tempdir().expect("tempdir");
         let file = dir.path().join("lane_telemetry_fallback.txt");
