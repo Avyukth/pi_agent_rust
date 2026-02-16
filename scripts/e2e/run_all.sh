@@ -7642,12 +7642,13 @@ if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_
         strict=claim_integrity_required,
         remediation=(
             "Update scripts/perf/orchestrate.sh to emit primary_outcomes with "
-            "wall_clock_ms, rust_vs_node_ratio, rust_vs_bun_ratio, and "
-            "ordering_policy."
+            "status, wall_clock_ms, rust_vs_node_ratio, rust_vs_bun_ratio, "
+            "and ordering_policy."
         ),
     )
 
     required_primary_outcome_fields = [
+        "status",
         "wall_clock_ms",
         "rust_vs_node_ratio",
         "rust_vs_bun_ratio",
@@ -7672,14 +7673,45 @@ if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_
         ),
         strict=claim_integrity_required,
         remediation=(
-            "Emit all primary_outcomes fields (wall_clock_ms, rust_vs_node_ratio, "
-            "rust_vs_bun_ratio, ordering_policy) in scripts/perf/orchestrate.sh."
+            "Emit all primary_outcomes fields (status, wall_clock_ms, "
+            "rust_vs_node_ratio, rust_vs_bun_ratio, ordering_policy) in "
+            "scripts/perf/orchestrate.sh."
         ),
     )
     if missing_primary_outcome_fields and claim_integrity_gate_active:
         evidence_missing_or_stale_reasons.append(
             "phase-1 matrix validation primary_outcomes missing required fields: "
             f"{missing_primary_outcome_fields}"
+        )
+
+    primary_outcome_status = str(
+        (
+            primary_outcomes_obj.get("status")
+            if isinstance(primary_outcomes_obj, dict)
+            else ""
+        )
+        or ""
+    ).strip().lower()
+    primary_outcome_status_ok = primary_outcome_status in {"pass", "fail"}
+    require_condition(
+        "claim_integrity.phase1_matrix_primary_outcomes_status_valid",
+        path=perf_phase1_matrix_validation_path,
+        ok=primary_outcome_status_ok,
+        ok_msg="phase-1 matrix validation primary_outcomes.status is pass/fail",
+        fail_msg=(
+            "phase-1 matrix validation primary_outcomes.status invalid: "
+            f"{primary_outcome_status!r}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Set phase1_matrix_validation.primary_outcomes.status to "
+            "'pass' or 'fail' in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if not primary_outcome_status_ok and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation primary_outcomes.status must be "
+            "'pass' or 'fail'"
         )
 
     invalid_primary_metric_fields: list[str] = []
@@ -7743,6 +7775,50 @@ if isinstance(phase1_matrix_validation, dict) and perf_phase1_matrix_validation_
 
     matrix_cells = phase1_matrix_validation.get("matrix_cells")
     matrix_cells_list = matrix_cells if isinstance(matrix_cells, list) else []
+    invalid_matrix_cell_primary_e2e: list[str] = []
+    for index, cell in enumerate(matrix_cells_list):
+        if not isinstance(cell, dict):
+            invalid_matrix_cell_primary_e2e.append(f"cell[{index}] is not an object")
+            continue
+        primary_e2e = cell.get("primary_e2e")
+        primary_e2e_obj = primary_e2e if isinstance(primary_e2e, dict) else None
+        invalid_fields: list[str] = []
+        for field in ("wall_clock_ms", "rust_vs_node_ratio", "rust_vs_bun_ratio"):
+            metric_value = parse_positive_metric_value(
+                primary_e2e_obj.get(field) if isinstance(primary_e2e_obj, dict) else None
+            )
+            if metric_value is None:
+                invalid_fields.append(field)
+        if invalid_fields:
+            invalid_matrix_cell_primary_e2e.append(
+                f"cell[{index}] primary_e2e missing/invalid {invalid_fields}"
+            )
+    invalid_matrix_cell_primary_e2e_excerpt = (
+        invalid_matrix_cell_primary_e2e[:8]
+        + (["..."] if len(invalid_matrix_cell_primary_e2e) > 8 else [])
+    )
+    require_condition(
+        "claim_integrity.phase1_matrix_cells_primary_e2e_metrics_present",
+        path=perf_phase1_matrix_validation_path,
+        ok=not invalid_matrix_cell_primary_e2e,
+        ok_msg="phase-1 matrix validation matrix_cells include positive primary_e2e metrics",
+        fail_msg=(
+            "phase-1 matrix validation matrix_cells include missing/invalid "
+            f"primary_e2e metrics: {invalid_matrix_cell_primary_e2e_excerpt}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Ensure each phase1_matrix_validation.matrix_cells[*].primary_e2e "
+            "contains positive wall_clock_ms, rust_vs_node_ratio, and "
+            "rust_vs_bun_ratio values in scripts/perf/orchestrate.sh."
+        ),
+    )
+    if invalid_matrix_cell_primary_e2e and claim_integrity_gate_active:
+        evidence_missing_or_stale_reasons.append(
+            "phase-1 matrix validation matrix_cells include missing/invalid "
+            "primary_e2e metrics"
+        )
+
     if required_realistic_session_shapes and not matrix_cells_list:
         missing_realistic_session_shape_reasons.append(
             "phase-1 matrix validation missing matrix_cells data for realistic tier coverage"

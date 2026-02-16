@@ -470,7 +470,7 @@
         },
         "coverage_policy": {
           "type": "object",
-          "required": ["min_evidence_per_bead", "allowed_evidence_types", "audit_frequency"],
+          "required": ["min_evidence_per_bead", "allowed_evidence_types", "audit_frequency", "critical_perf3x_beads"],
           "additionalProperties": false,
           "properties": {
             "min_evidence_per_bead": {
@@ -488,6 +488,16 @@
               "type": "string",
               "enum": ["per_commit", "per_phase", "per_release"],
               "description": "How often bead coverage is audited."
+            },
+            "critical_perf3x_beads": {
+              "type": "array",
+              "description": "Critical PERF-3X bead IDs that must be represented by the coverage audit.",
+              "items": {
+                "type": "string",
+                "pattern": "^bd-3ar8v\\."
+              },
+              "minItems": 1,
+              "uniqueItems": true
             }
           },
           "description": "Policy governing minimum evidence requirements per bead."

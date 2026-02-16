@@ -418,7 +418,16 @@
     "coverage_policy": {
       "min_evidence_per_bead": 1,
       "allowed_evidence_types": ["unit", "vcr", "e2e", "bench", "regression", "design_doc"],
-      "audit_frequency": "per_phase"
+      "audit_frequency": "per_phase",
+      "critical_perf3x_beads": [
+        "bd-3ar8v.2.8",
+        "bd-3ar8v.3.8",
+        "bd-3ar8v.4.7",
+        "bd-3ar8v.4.8",
+        "bd-3ar8v.4.9",
+        "bd-3ar8v.4.10",
+        "bd-3ar8v.6.11"
+      ]
     }
   }
 }
