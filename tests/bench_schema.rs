@@ -2078,6 +2078,30 @@ fn phase1_matrix_validator_rejects_non_positive_primary_outcomes_ratio() {
 }
 
 #[test]
+fn phase1_matrix_validator_rejects_null_pass_cell_primary_e2e_metric() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][0]["primary_e2e"]["rust_vs_node_ratio"] = Value::Null;
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("matrix cell primary_e2e.rust_vs_node_ratio"),
+        "expected pass-cell null metric failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_null_pass_primary_outcomes_metric() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["primary_outcomes"]["wall_clock_ms"] = Value::Null;
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("primary_outcomes.wall_clock_ms"),
+        "expected pass primary_outcomes null metric failure, got: {err}"
+    );
+}
+
+#[test]
 fn phase1_matrix_validator_rejects_non_numeric_fail_cell_primary_e2e_metric() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_cells"][0]["status"] = json!("fail");
@@ -2087,6 +2111,19 @@ fn phase1_matrix_validator_rejects_non_numeric_fail_cell_primary_e2e_metric() {
     assert!(
         err.contains("matrix cell primary_e2e.rust_vs_node_ratio"),
         "expected fail-cell primary_e2e type failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_non_positive_fail_cell_primary_e2e_metric() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][0]["status"] = json!("fail");
+    malformed["matrix_cells"][0]["primary_e2e"]["rust_vs_bun_ratio"] = json!(0.0);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("matrix cell primary_e2e.rust_vs_bun_ratio"),
+        "expected fail-cell non-positive metric failure, got: {err}"
     );
 }
 
@@ -2101,6 +2138,20 @@ fn phase1_matrix_validator_rejects_non_numeric_fail_primary_outcomes_metric() {
     assert!(
         err.contains("primary_outcomes.wall_clock_ms"),
         "expected fail primary_outcomes type failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_non_positive_fail_primary_outcomes_metric() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["primary_outcomes"]["status"] = json!("fail");
+    malformed["primary_outcomes"]["rust_vs_node_ratio"] = json!(0.0);
+    malformed["consumption_contract"]["artifact_ready_for_phase5"] = json!(false);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("primary_outcomes.rust_vs_node_ratio"),
+        "expected fail primary_outcomes non-positive metric failure, got: {err}"
     );
 }
 
