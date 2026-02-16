@@ -239,7 +239,10 @@ mod tests {
     fn rewrite_decision_cost_delta_correct_sign() {
         let engine = HostcallRewriteEngine::new(true);
         let decision = engine.select_plan(BASELINE, &[FAST_FUSION]);
-        assert!(decision.expected_cost_delta > 0, "positive delta means improvement");
+        assert!(
+            decision.expected_cost_delta > 0,
+            "positive delta means improvement"
+        );
         assert_eq!(
             decision.expected_cost_delta,
             i64::from(BASELINE.estimated_cost) - i64::from(FAST_FUSION.estimated_cost)
