@@ -131,12 +131,14 @@ fn voi_selects_candidates_within_budget() {
     // medium: 15/25 = 0.6, cheap: 10/20 = 0.5, expensive: 5/30 = 0.167
     // medium (25ms) fits, cheap (25ms) cumulative=50 fits, expensive (30ms) cumulative>50
     assert!(plan.used_overhead_ms <= 50);
-    let selected_ids: Vec<&str> = plan.selected.iter().map(|s| s.id.as_str()).collect();
     assert!(
-        selected_ids.contains(&"medium"),
+        plan.selected.iter().any(|selected| selected.id == "medium"),
         "medium should be selected"
     );
-    assert!(selected_ids.contains(&"cheap"), "cheap should be selected");
+    assert!(
+        plan.selected.iter().any(|selected| selected.id == "cheap"),
+        "cheap should be selected"
+    );
 
     // Expensive should be budget-exceeded
     let has_budget_exceeded_expensive = plan
@@ -192,9 +194,8 @@ fn voi_skips_stale_candidates() {
 
     let plan = plan_voi_candidates(&[stale_c, fresh_c], fixed_now(), &config);
 
-    let selected_ids: Vec<&str> = plan.selected.iter().map(|s| s.id.as_str()).collect();
-    assert!(selected_ids.contains(&"fresh"));
-    assert!(!selected_ids.contains(&"stale"));
+    assert!(plan.selected.iter().any(|selected| selected.id == "fresh"));
+    assert!(!plan.selected.iter().any(|selected| selected.id == "stale"));
 
     let has_stale_skipped = plan
         .skipped
@@ -243,9 +244,8 @@ fn voi_skips_below_utility_floor() {
 
     let plan = plan_voi_candidates(&[low, high], fixed_now(), &config);
 
-    let selected_ids: Vec<&str> = plan.selected.iter().map(|s| s.id.as_str()).collect();
-    assert!(selected_ids.contains(&"high"));
-    assert!(!selected_ids.contains(&"low"));
+    assert!(plan.selected.iter().any(|selected| selected.id == "high"));
+    assert!(!plan.selected.iter().any(|selected| selected.id == "low"));
 
     let has_utility_skipped_low = plan
         .skipped
@@ -341,10 +341,9 @@ fn voi_negative_utility_treated_as_zero() {
 
     // Negative utility is normalized to 0.0, which equals the floor — should still pass.
     // Both should be selected since normalized(-5) = 0.0 >= 0.0.
-    let selected_ids: Vec<&str> = plan.selected.iter().map(|s| s.id.as_str()).collect();
-    assert!(selected_ids.contains(&"pos"));
+    assert!(plan.selected.iter().any(|selected| selected.id == "pos"));
     // neg normalized to 0.0 which is >= min 0.0, so it should also be selected
-    assert!(selected_ids.contains(&"neg"));
+    assert!(plan.selected.iter().any(|selected| selected.id == "neg"));
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -455,17 +454,17 @@ fn meanfield_routing_weight_stays_within_bounds() {
     for ctrl in &report.controls {
         assert!(
             ctrl.routing_weight >= config.min_routing_weight,
-            "shard {} routing {} < min {}",
-            ctrl.shard_id,
-            ctrl.routing_weight,
-            config.min_routing_weight
+            "shard {shard_id} routing {routing_weight} < min {min_routing_weight}",
+            shard_id = ctrl.shard_id,
+            routing_weight = ctrl.routing_weight,
+            min_routing_weight = config.min_routing_weight
         );
         assert!(
             ctrl.routing_weight <= config.max_routing_weight,
-            "shard {} routing {} > max {}",
-            ctrl.shard_id,
-            ctrl.routing_weight,
-            config.max_routing_weight
+            "shard {shard_id} routing {routing_weight} > max {max_routing_weight}",
+            shard_id = ctrl.shard_id,
+            routing_weight = ctrl.routing_weight,
+            max_routing_weight = config.max_routing_weight
         );
     }
 }
@@ -485,17 +484,17 @@ fn meanfield_batch_budget_stays_within_bounds() {
     for ctrl in &report.controls {
         assert!(
             ctrl.batch_budget >= config.min_batch_budget,
-            "shard {} batch {} < min {}",
-            ctrl.shard_id,
-            ctrl.batch_budget,
-            config.min_batch_budget
+            "shard {shard_id} batch {batch_budget} < min {min_batch_budget}",
+            shard_id = ctrl.shard_id,
+            batch_budget = ctrl.batch_budget,
+            min_batch_budget = config.min_batch_budget
         );
         assert!(
             ctrl.batch_budget <= config.max_batch_budget,
-            "shard {} batch {} > max {}",
-            ctrl.shard_id,
-            ctrl.batch_budget,
-            config.max_batch_budget
+            "shard {shard_id} batch {batch_budget} > max {max_batch_budget}",
+            shard_id = ctrl.shard_id,
+            batch_budget = ctrl.batch_budget,
+            max_batch_budget = config.max_batch_budget
         );
     }
 }
@@ -511,17 +510,17 @@ fn meanfield_help_factor_stays_within_bounds() {
     for ctrl in &report.controls {
         assert!(
             ctrl.help_factor >= config.min_help_factor,
-            "shard {} help {} < min {}",
-            ctrl.shard_id,
-            ctrl.help_factor,
-            config.min_help_factor
+            "shard {shard_id} help {help_factor} < min {min_help_factor}",
+            shard_id = ctrl.shard_id,
+            help_factor = ctrl.help_factor,
+            min_help_factor = config.min_help_factor
         );
         assert!(
             ctrl.help_factor <= config.max_help_factor,
-            "shard {} help {} > max {}",
-            ctrl.shard_id,
-            ctrl.help_factor,
-            config.max_help_factor
+            "shard {shard_id} help {help_factor} > max {max_help_factor}",
+            shard_id = ctrl.shard_id,
+            help_factor = ctrl.help_factor,
+            max_help_factor = config.max_help_factor
         );
     }
 }
@@ -537,17 +536,17 @@ fn meanfield_backoff_factor_stays_within_bounds() {
     for ctrl in &report.controls {
         assert!(
             ctrl.backoff_factor >= config.min_backoff_factor,
-            "shard {} backoff {} < min {}",
-            ctrl.shard_id,
-            ctrl.backoff_factor,
-            config.min_backoff_factor
+            "shard {shard_id} backoff {backoff_factor} < min {min_backoff_factor}",
+            shard_id = ctrl.shard_id,
+            backoff_factor = ctrl.backoff_factor,
+            min_backoff_factor = config.min_backoff_factor
         );
         assert!(
             ctrl.backoff_factor <= config.max_backoff_factor,
-            "shard {} backoff {} > max {}",
-            ctrl.shard_id,
-            ctrl.backoff_factor,
-            config.max_backoff_factor
+            "shard {shard_id} backoff {backoff_factor} > max {max_backoff_factor}",
+            shard_id = ctrl.shard_id,
+            backoff_factor = ctrl.backoff_factor,
+            max_backoff_factor = config.max_backoff_factor
         );
     }
 }
@@ -627,9 +626,9 @@ fn meanfield_stability_margin_nonnegative() {
     for ctrl in &report.controls {
         assert!(
             ctrl.stability_margin >= 0.0,
-            "shard {} stability margin {} must be >= 0",
-            ctrl.shard_id,
-            ctrl.stability_margin
+            "shard {shard_id} stability margin {stability_margin} must be >= 0",
+            shard_id = ctrl.shard_id,
+            stability_margin = ctrl.stability_margin
         );
     }
 }
@@ -710,12 +709,14 @@ fn meanfield_controls_sorted_by_shard_id() {
 
     let report = compute_mean_field_controls(&obs, &[], &config);
 
-    let shard_ids: Vec<&str> = report
-        .controls
-        .iter()
-        .map(|c| c.shard_id.as_str())
-        .collect();
-    assert_eq!(shard_ids, vec!["alpha", "mu", "zeta"]);
+    assert!(
+        report
+            .controls
+            .iter()
+            .map(|control| control.shard_id.as_str())
+            .eq(["alpha", "mu", "zeta"]),
+        "controls should be sorted by shard_id"
+    );
 }
 
 #[test]
