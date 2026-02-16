@@ -152,28 +152,23 @@ run_with_spinner() {
 
 pi_ascii_logo() {
   cat <<'ASCII'
-██████╗ ██╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗
-██╔══██╗██║    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝
-██████╔╝██║    ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║
-██╔═══╝ ██║    ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║
-██║     ██║███╗██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║
-╚═╝     ╚═╝╚══╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝
-
-                                          /\
-                                         ( /   @ @    ()
-                                          \  __| |__  /
-                                           -/   "   \-
-                                          /-|       |-\
-                                         / /-\     /-\ \
-                                          / /-`---'-\\ \
-                                            /         \
-
-██████╗ ██╗   ██╗███████╗████████╗
-██╔══██╗██║   ██║██╔════╝╚══██╔══╝
-██████╔╝██║   ██║███████╗   ██║
-██╔══██╗██║   ██║╚════██║   ██║
-██║  ██║╚██████╔╝███████║   ██║
-╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝
+                                                                 
+                                                                 
+   ██████╗ ██╗     █████╗  ██████╗ ███████╗███╗   ██╗████████╗   
+   ██╔══██╗██║    ██╔══██╗██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝   
+   ██████╔╝██║    ███████║██║  ███╗█████╗  ██╔██╗ ██║   ██║      
+   ██╔═══╝ ██║    ██╔══██║██║   ██║██╔══╝  ██║╚██╗██║   ██║      
+   ██║     ██║    ██║  ██║╚██████╔╝███████╗██║ ╚████║   ██║      
+   ╚═╝     ╚═╝    ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝      
+                                                                 
+                                             /\                  
+                                            ( /   @ @    ()      
+      ██████╗ ██╗   ██╗███████╗████████╗     \  __| |__  /       
+      ██╔══██╗██║   ██║██╔════╝╚══██╔══╝      -/   "   \-        
+      ██████╔╝██║   ██║███████╗   ██║        /-|       |-\       
+      ██╔══██╗██║   ██║╚════██║   ██║       / /-\     /-\ \      
+      ██║  ██║╚██████╔╝███████║   ██║        / /-`---'-\\ \      
+      ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝          /         \        
 ASCII
 }
 
@@ -195,7 +190,7 @@ pi_ascii_logo_normalized() {
 
 pi_ascii_logo_gum() {
   local logo="$1"
-  local palette=(45 51 39 33 69 75)
+  local palette=(51 45 39 33 81 75)
   local line=""
   local idx=0
   local styled=""
@@ -215,7 +210,7 @@ pi_ascii_logo_gum() {
 
 pi_ascii_logo_ansi() {
   local logo="$1"
-  local palette=(45 51 39 33 69 75)
+  local palette=(51 45 39 33 81 75)
   local line=""
   local idx=0
   while IFS= read -r line; do
@@ -423,23 +418,23 @@ show_header() {
       --padding "1 3" \
       --margin "1 0" \
       "$styled_logo" \
-      "$(gum style --foreground 42 --bold 'Pi Agent Rust Installer')" \
-      "$(gum style --foreground 81 "Install target version: ${header_version}")" \
-      "$(gum style --foreground 250 'Based on Pi Agent by Mario Zechner')" \
-      "$(gum style --foreground 250 'Rust version by Jeffrey Emanuel')" \
-      "$(gum style --foreground 250 'Fast Rust-native coding agent installer')" \
-      "$(gum style --foreground 214 'Checksum verification by default | Optional Sigstore/cosign')" \
-      "$(gum style --foreground 244 "Repository: ${OWNER}/${REPO}")"
+      "$(gum style --foreground 51 --bold 'Pi Agent Rust Installer')" \
+      "$(gum style --foreground 45 --bold "Install target version: ${header_version}")" \
+      "$(gum style --foreground 117 'Based on Pi Agent by Mario Zechner')" \
+      "$(gum style --foreground 123 'Rust version by Jeffrey Emanuel')" \
+      "$(gum style --foreground 81 'Fast Rust-native coding agent installer')" \
+      "$(gum style --foreground 75 'Checksum verification by default | Optional Sigstore/cosign')" \
+      "$(gum style --foreground 111 "Repository: ${OWNER}/${REPO}")"
   else
     echo ""
     pi_ascii_logo_ansi "$logo"
-    echo -e "\033[1;38;5;46mPi Agent Rust Installer\033[0m"
-    echo -e "\033[1;38;5;81mInstall target version: ${header_version}\033[0m"
-    echo -e "\033[0;38;5;250mBased on Pi Agent by Mario Zechner\033[0m"
-    echo -e "\033[0;38;5;250mRust version by Jeffrey Emanuel\033[0m"
-    echo -e "\033[0;38;5;250mFast Rust-native coding agent installer\033[0m"
-    echo -e "\033[0;38;5;214mChecksum verification by default | Optional Sigstore/cosign\033[0m"
-    echo -e "\033[0;38;5;244mRepository: ${OWNER}/${REPO}\033[0m"
+    echo -e "\033[1;38;5;51mPi Agent Rust Installer\033[0m"
+    echo -e "\033[1;38;5;45mInstall target version: ${header_version}\033[0m"
+    echo -e "\033[0;38;5;117mBased on Pi Agent by Mario Zechner\033[0m"
+    echo -e "\033[0;38;5;123mRust version by Jeffrey Emanuel\033[0m"
+    echo -e "\033[0;38;5;81mFast Rust-native coding agent installer\033[0m"
+    echo -e "\033[0;38;5;75mChecksum verification by default | Optional Sigstore/cosign\033[0m"
+    echo -e "\033[0;38;5;111mRepository: ${OWNER}/${REPO}\033[0m"
     echo ""
   fi
 }
