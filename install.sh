@@ -171,7 +171,7 @@ Options:
   --verify               Run `pi --version` after install
   --no-verify            Skip checksum + signature verification
   --offline              Skip network preflight check
-  --completions SHELL    Install shell completions for auto|bash|zsh|fish
+  --completions SHELL    Install shell completions for auto|off|bash|zsh|fish
   --no-completions       Skip shell completion installation
   --yes, -y              Non-interactive yes to prompts
   --adopt                Auto-adopt Rust as canonical `pi` when TS pi is detected
@@ -187,10 +187,20 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)
+      if [ $# -lt 2 ]; then
+        err "Option --version requires a value"
+        usage
+        exit 1
+      fi
       VERSION="$2"
       shift 2
       ;;
     --dest)
+      if [ $# -lt 2 ]; then
+        err "Option --dest requires a value"
+        usage
+        exit 1
+      fi
       DEST="$2"
       DEST_EXPLICIT=1
       shift 2
@@ -206,18 +216,38 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --artifact-url)
+      if [ $# -lt 2 ]; then
+        err "Option --artifact-url requires a value"
+        usage
+        exit 1
+      fi
       ARTIFACT_URL="$2"
       shift 2
       ;;
     --checksum)
+      if [ $# -lt 2 ]; then
+        err "Option --checksum requires a value"
+        usage
+        exit 1
+      fi
       CHECKSUM="$2"
       shift 2
       ;;
     --checksum-url)
+      if [ $# -lt 2 ]; then
+        err "Option --checksum-url requires a value"
+        usage
+        exit 1
+      fi
       CHECKSUM_URL="$2"
       shift 2
       ;;
     --sigstore-bundle-url)
+      if [ $# -lt 2 ]; then
+        err "Option --sigstore-bundle-url requires a value"
+        usage
+        exit 1
+      fi
       SIGSTORE_BUNDLE_URL="$2"
       shift 2
       ;;
@@ -238,6 +268,11 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --completions)
+      if [ $# -lt 2 ]; then
+        err "Option --completions requires a value"
+        usage
+        exit 1
+      fi
       COMPLETIONS_MODE="$2"
       shift 2
       ;;
@@ -258,6 +293,11 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --legacy-alias)
+      if [ $# -lt 2 ]; then
+        err "Option --legacy-alias requires a value"
+        usage
+        exit 1
+      fi
       LEGACY_ALIAS_NAME="$2"
       shift 2
       ;;

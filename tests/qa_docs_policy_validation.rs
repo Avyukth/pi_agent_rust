@@ -1606,6 +1606,20 @@ fn full_suite_gate_contains_canonical_coverage_row_ordering_guards() {
 }
 
 #[test]
+fn full_suite_gate_contains_normalized_duplicate_path_fail_closed_guards() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        "perf3x_bead_coverage_contract_fails_closed_on_normalized_duplicate_dot_slash_variant",
+        "perf3x_bead_coverage_contract_fails_closed_on_normalized_duplicate_backslash_variant",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must include normalized duplicate-path guard token: {token}"
+        );
+    }
+}
+
+#[test]
 fn ci_workflow_has_failure_output_guidance() {
     let ci = load_text(CI_WORKFLOW_PATH);
     // CI should produce structured output on failure
