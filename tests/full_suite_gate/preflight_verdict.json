@@ -1,20 +1,11 @@
 {
   "schema": "pi.ci.preflight_lane.v1",
   "lane": "preflight",
-  "generated_at": "2026-02-14T12:33:07.788Z",
-  "verdict": "fail",
+  "generated_at": "2026-02-16T11:00:43.203Z",
+  "verdict": "pass",
   "policy": "Preflight lane: evaluate blocking gates only, fail-fast on first failure. Waived gates are skipped with audit trail.",
-  "gates_evaluated": 3,
-  "first_failure": {
-    "id": "cross_platform",
-    "name": "Cross-platform matrix validation",
-    "bead": "bd-1f42.6.7",
-    "status": "fail",
-    "blocking": true,
-    "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
-    "detail": "Not all required platform checks passed",
-    "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
-  },
+  "gates_evaluated": 8,
+  "first_failure": null,
   "blocking_gates": [
     {
       "id": "non_mock_unit",
@@ -39,20 +30,63 @@
       "id": "cross_platform",
       "name": "Cross-platform matrix validation",
       "bead": "bd-1f42.6.7",
-      "status": "fail",
+      "status": "pass",
       "blocking": true,
       "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
-      "detail": "Not all required platform checks passed",
       "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
+    },
+    {
+      "id": "conformance_regression",
+      "name": "Conformance regression gate",
+      "bead": "bd-1f42.4",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
+      "reproduce_command": "cargo test --test conformance_regression_gate -- --nocapture"
+    },
+    {
+      "id": "conformance_pass_rate",
+      "name": "Conformance pass rate >= 80%",
+      "bead": "bd-1f42.4",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
+      "reproduce_command": "cargo test --test conformance_report -- --nocapture"
+    },
+    {
+      "id": "suite_classification",
+      "name": "Suite classification guard",
+      "bead": "bd-1f42.6.1",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/suite_classification.toml"
+    },
+    {
+      "id": "sec_conformance",
+      "name": "SEC-6.4 security compatibility conformance",
+      "bead": "bd-1a2cu",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/sec_conformance_verdict.json",
+      "reproduce_command": "cargo test --test sec_compatibility_conformance -- --nocapture"
+    },
+    {
+      "id": "waiver_lifecycle",
+      "name": "Waiver lifecycle compliance",
+      "bead": "bd-1f42.8.8.1",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/waiver_audit.json",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- waiver_lifecycle_audit --nocapture --exact"
     }
   ],
   "waivers_applied": [],
   "summary": {
-    "blocking_pass": 1,
-    "blocking_fail": 1,
+    "blocking_pass": 7,
+    "blocking_fail": 0,
     "blocking_skip": 1,
     "blocking_waived": 0,
     "blocking_total": 8,
-    "fail_fast_triggered": true
+    "fail_fast_triggered": false
   }
 }

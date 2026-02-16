@@ -1,6 +1,6 @@
 {
   "schema": "pi.ci.full_suite_gate.v1",
-  "generated_at": "2026-02-15T04:38:27.141Z",
+  "generated_at": "2026-02-16T11:00:43.203Z",
   "verdict": "fail",
   "policy": "Full-suite gate: all blocking gates must pass for release. Non-blocking gates produce warnings but do not block.",
   "gates": [
@@ -44,20 +44,18 @@
       "id": "evidence_bundle",
       "name": "Unified evidence bundle",
       "bead": "bd-1f42.6.8",
-      "status": "skip",
+      "status": "pass",
       "blocking": false,
       "artifact_path": "tests/evidence_bundle/index.json",
-      "detail": "Artifact not found: tests/evidence_bundle/index.json",
       "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
     },
     {
       "id": "cross_platform",
       "name": "Cross-platform matrix validation",
       "bead": "bd-1f42.6.7",
-      "status": "fail",
+      "status": "pass",
       "blocking": true,
       "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
-      "detail": "Not all required platform checks passed",
       "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
     },
     {
@@ -133,11 +131,11 @@
   ],
   "summary": {
     "total_gates": 14,
-    "passed": 11,
-    "failed": 1,
+    "passed": 13,
+    "failed": 0,
     "warned": 0,
-    "skipped": 2,
-    "blocking_pass": 6,
+    "skipped": 1,
+    "blocking_pass": 7,
     "blocking_total": 8,
     "all_blocking_pass": false
   }
