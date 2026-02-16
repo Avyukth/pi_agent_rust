@@ -1107,6 +1107,52 @@ proptest! {
             create_manifest || create_index
         );
     }
+
+    #[test]
+    fn proptest_linear_appends_keep_index_and_head_consistent(
+        count in 1usize..64,
+        threshold in 256_u64..4096_u64,
+    ) {
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionStoreV2::create(dir.path(), threshold).expect("create store");
+        let ids = append_linear_entries(&mut store, count).expect("append entries");
+        let index = store.read_index().expect("read index");
+
+        prop_assert_eq!(index.len(), count);
+        for (offset, row) in index.iter().enumerate() {
+            let expected_seq = u64::try_from(offset + 1).expect("sequence fits in u64");
+            prop_assert_eq!(row.entry_seq, expected_seq);
+            prop_assert_eq!(row.entry_id.as_str(), ids[offset].as_str());
+        }
+
+        let expected_count = u64::try_from(count).expect("count fits in u64");
+        let head = store.head().expect("head");
+        prop_assert_eq!(head.entry_seq, expected_count);
+        prop_assert_eq!(head.entry_id.as_str(), ids[count - 1].as_str());
+        store.validate_integrity().expect("integrity");
+    }
+
+    #[test]
+    fn proptest_reopen_preserves_chain_hash_and_ids(
+        count in 1usize..48,
+        threshold in 256_u64..4096_u64,
+    ) {
+        let dir = tempdir().expect("tempdir");
+
+        let (expected_ids, expected_chain_hash) = {
+            let mut store = SessionStoreV2::create(dir.path(), threshold).expect("create store");
+            let ids = append_linear_entries(&mut store, count).expect("append entries");
+            store.validate_integrity().expect("integrity");
+            (ids, store.chain_hash().to_string())
+        };
+
+        let reopened = SessionStoreV2::create(dir.path(), threshold).expect("reopen store");
+        prop_assert_eq!(reopened.chain_hash(), expected_chain_hash.as_str());
+        prop_assert_eq!(
+            frame_ids(&reopened.read_all_entries().expect("read all entries")),
+            expected_ids
+        );
+    }
 }
 
 // ── Rebuild index from scratch ──────────────────────────────────────────

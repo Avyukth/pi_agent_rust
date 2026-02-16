@@ -397,10 +397,12 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
         return Err(format!("{field_name}[{index}] must not be empty"));
     }
 
-    let parsed = Path::new(candidate);
+    let normalized = normalize_coverage_path(candidate);
+    let parsed = Path::new(&normalized);
     if parsed.is_absolute()
-        || looks_like_windows_absolute_path(candidate)
+        || looks_like_windows_absolute_path(&normalized)
         || candidate.starts_with("\\\\")
+        || normalized.starts_with("//")
     {
         return Err(format!(
             "{field_name}[{index}] must be repo-relative, got: {candidate}"
@@ -416,7 +418,18 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
         ));
     }
 
-    Ok(candidate.to_string())
+    Ok(normalized)
+}
+
+fn normalize_coverage_path(candidate: &str) -> String {
+    let mut normalized = candidate.replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+    normalized
 }
 
 fn looks_like_windows_absolute_path(path: &str) -> bool {
@@ -1140,8 +1153,27 @@ fn redact_context(context: &mut [(String, String)]) {
     }
 }
 
+/// Keys that contain a redaction-key substring but are known-safe API
+/// parameters (e.g. `max_tokens`, `inputTokens`, `totalTokenCount`).
+/// Keys that contain a redaction-key substring but are known-safe API
+/// parameters (token counts, budget configs, etc.).
+const SAFE_TOKEN_KEYS: [&str; 9] = [
+    "max_tokens",
+    "budget_tokens",
+    "inputtokens",
+    "outputtokens",
+    "totaltokens",
+    "candidatestokencount",
+    "prompttokencount",
+    "totaltokencount",
+    "cachedcontenttokencount",
+];
+
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
+    if SAFE_TOKEN_KEYS.iter().any(|safe| key == *safe) {
+        return false;
+    }
     REDACTION_KEYS.iter().any(|needle| key.contains(needle))
 }
 
@@ -2909,5 +2941,36 @@ mod tests {
             .validate_path_hygiene()
             .expect_err("duplicate normalized log artifacts must fail closed");
         assert!(err.contains("duplicates"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_duplicate_test_files_with_separator_variants() {
+        let test_files = vec![
+            "./tests\\ci_full_suite_gate.rs".to_string(),
+            "tests/ci_full_suite_gate.rs".to_string(),
+        ];
+        let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect_err("separator/./ variants must fail closed as duplicates");
+        assert!(err.contains("duplicates"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_validate_path_hygiene_rejects_windows_parent_traversal_log_artifact() {
+        let test_files = vec!["tests/ci_full_suite_gate.rs".to_string()];
+        let mut link = BeadCoverageLink::new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit);
+        link.log_artifacts = vec!["tests\\..\\secrets\\leak.jsonl".to_string()];
+
+        let err = link
+            .validate_path_hygiene()
+            .expect_err("windows-style parent traversal must fail closed");
+        assert!(err.contains(".."), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_normalizes_repo_relative_paths() {
+        let test_files = vec!["./tests\\ci_full_suite_gate.rs".to_string()];
+        let link = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect("normalized repo-relative path should be accepted");
+        assert_eq!(link.test_files, vec!["tests/ci_full_suite_gate.rs"]);
     }
 }

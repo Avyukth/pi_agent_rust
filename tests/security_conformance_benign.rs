@@ -604,6 +604,10 @@ fn compat_dashboard_schema_valid() {
         eprintln!("  SKIP: Dashboard not found. Run generate_compat_dashboard_artifact first.");
         return;
     };
+    if text.trim().is_empty() {
+        eprintln!("  SKIP: Dashboard file is empty. Run generate_compat_dashboard_artifact first.");
+        return;
+    }
     let val: serde_json::Value = serde_json::from_str(&text).expect("parse dashboard");
 
     assert_eq!(

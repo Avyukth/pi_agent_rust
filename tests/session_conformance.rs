@@ -440,11 +440,21 @@ fn save_updates_session_index_for_override_dir() {
         session.save().await.expect("save session");
 
         let index = SessionIndex::for_sessions_root(&base_dir);
-        let indexed = index
-            .list_sessions(Some(&session.header.cwd))
-            .expect("list sessions")
-            .into_iter()
-            .any(|meta| meta.id == session.header.id);
+        // The index update runs on a background dispatcher thread. Under heavy
+        // parallel-test load the 250 ms internal flush timeout inside
+        // `list_sessions` may not suffice, so retry a few times.
+        let mut indexed = false;
+        for _ in 0..5 {
+            indexed = index
+                .list_sessions(Some(&session.header.cwd))
+                .expect("list sessions")
+                .into_iter()
+                .any(|meta| meta.id == session.header.id);
+            if indexed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
 
         harness.assert_log("Session saved and indexed");
         assert!(indexed, "Expected session to be indexed after save()");

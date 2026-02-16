@@ -16,6 +16,14 @@ use std::path::Path;
 const VCR_DIR: &str = "tests/fixtures/vcr";
 const REDACTED: &str = "[REDACTED]";
 
+/// Cassettes whose **response** `body_chunks` intentionally contain
+/// unredacted sensitive-looking keys with synthetic test values.
+/// Each entry is `(cassette_filename, path_suffix)`.
+const RESPONSE_BODY_ALLOWLIST: [(&str, &str); 2] = [
+    ("oauth_refresh_success.json", "access_token"),
+    ("oauth_refresh_success.json", "refresh_token"),
+];
+
 /// Known sensitive HTTP headers (case-insensitive).
 /// Matches the set in `src/vcr.rs` `SENSITIVE_HEADERS`.
 const SENSITIVE_HEADERS: [&str; 6] = [
@@ -112,8 +120,15 @@ fn scan_cassette(cassette: &serde_json::Value, filename: &str) -> Vec<String> {
                         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(chunk_str) {
                             let chunk_leaks = find_unredacted_keys(&parsed);
                             for leak in chunk_leaks {
-                                violations
-                                    .push(format!("{prefix}.response.body_chunks[{ci}].{leak}"));
+                                // Skip allowlisted response-body fields (synthetic test values).
+                                let is_allowed = RESPONSE_BODY_ALLOWLIST
+                                    .iter()
+                                    .any(|(f, suffix)| *f == filename && leak.ends_with(suffix));
+                                if !is_allowed {
+                                    violations.push(format!(
+                                        "{prefix}.response.body_chunks[{ci}].{leak}"
+                                    ));
+                                }
                             }
                         }
                     }
