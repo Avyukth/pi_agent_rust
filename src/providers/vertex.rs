@@ -178,7 +178,7 @@ impl VertexProvider {
     #[allow(clippy::unused_self)]
     pub fn build_gemini_request(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> GeminiRequest {
         let contents = Self::build_contents(context);
@@ -221,9 +221,9 @@ impl VertexProvider {
     }
 
     /// Build the contents array from context messages.
-    fn build_contents(context: &Context) -> Vec<GeminiContent> {
+    fn build_contents(context: &Context<'_>) -> Vec<GeminiContent> {
         let mut contents = Vec::new();
-        for message in &context.messages {
+        for message in context.messages.iter() {
             contents.extend(gemini::convert_message_to_gemini(message));
         }
         contents
@@ -247,7 +247,7 @@ impl Provider for VertexProvider {
     #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         // Resolve auth: Bearer token for Vertex AI.

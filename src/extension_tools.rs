@@ -509,7 +509,7 @@ mod tests {
 
         async fn stream(
             &self,
-            context: &Context,
+            context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,

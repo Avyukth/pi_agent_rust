@@ -134,7 +134,7 @@ impl GitLabProvider {
     }
 
     /// Build a GitLab Chat request from the agent context.
-    pub fn build_request(context: &Context) -> GitLabChatRequest {
+    pub fn build_request(context: &Context<'_>) -> GitLabChatRequest {
         // Extract the last user message as the primary content.
         let mut content = String::new();
         let mut additional_context = Vec::new();
@@ -252,7 +252,7 @@ impl Provider for GitLabProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = Self::build_request(context);

@@ -135,7 +135,7 @@ impl OpenAIProvider {
     }
 
     /// Build the request body for the OpenAI API.
-    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> OpenAIRequest {
+    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> OpenAIRequest {
         let system_role = self
             .compat
             .as_ref()
@@ -189,7 +189,7 @@ impl OpenAIProvider {
 
     fn build_request_json(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<serde_json::Value> {
         let request = self.build_request(context, options);
@@ -230,7 +230,7 @@ impl OpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended using the given role name.
-    fn build_messages_with_role(context: &Context, system_role: &str) -> Vec<OpenAIMessage> {
+    fn build_messages_with_role(context: &Context<'_>, system_role: &str) -> Vec<OpenAIMessage> {
         let mut messages = Vec::new();
 
         // Add system prompt as first message
@@ -244,7 +244,7 @@ impl OpenAIProvider {
         }
 
         // Convert conversation messages
-        for message in &context.messages {
+        for message in context.messages.iter() {
             messages.extend(convert_message_to_openai(message));
         }
 
@@ -269,7 +269,7 @@ impl Provider for OpenAIProvider {
     #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let has_authorization_header = options

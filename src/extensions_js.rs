@@ -431,8 +431,9 @@ pub(crate) fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Valu
         return Ok(serde_json::Value::String(s));
     }
     if let Some(arr) = value.as_array() {
-        let mut result = Vec::new();
-        for i in 0..arr.len() {
+        let len = arr.len();
+        let mut result = Vec::with_capacity(len);
+        for i in 0..len {
             let v: Value<'_> = arr.get(i)?;
             result.push(js_to_json(&v)?);
         }
@@ -5342,11 +5343,11 @@ fn load_compiled_module_source(
         name,
     );
 
-    // 1. Check in-memory cache.
-    if let Some(cached) = state.compiled_sources.get(name).cloned() {
+    // 1. Check in-memory cache — Arc clone is O(1) atomic increment.
+    if let Some(cached) = state.compiled_sources.get(name) {
         if cached.cache_key == cache_key {
             state.module_cache_counters.hits = state.module_cache_counters.hits.saturating_add(1);
-            return Ok(cached.source);
+            return Ok(cached.source.to_vec());
         }
 
         state.module_cache_counters.invalidations =
@@ -5360,14 +5361,15 @@ fn load_compiled_module_source(
     {
         state.module_cache_counters.disk_hits =
             state.module_cache_counters.disk_hits.saturating_add(1);
+        let source: Arc<[u8]> = disk_cached.into();
         state.compiled_sources.insert(
             name.to_string(),
             CompiledModuleCacheEntry {
                 cache_key,
-                source: disk_cached.clone(),
+                source: Arc::clone(&source),
             },
         );
-        return Ok(disk_cached);
+        return Ok(source.to_vec());
     }
 
     // 3. Compile from source (SWC transpile + CJS->ESM rewrite).
@@ -5377,11 +5379,12 @@ fn load_compiled_module_source(
         &state.dynamic_virtual_modules,
         name,
     )?;
+    let source: Arc<[u8]> = compiled.into();
     state.compiled_sources.insert(
         name.to_string(),
         CompiledModuleCacheEntry {
             cache_key: cache_key.clone(),
-            source: compiled.clone(),
+            source: Arc::clone(&source),
         },
     );
 
@@ -5389,10 +5392,10 @@ fn load_compiled_module_source(
     if let Some(cache_key_str) = cache_key.as_deref()
         && let Some(cache_dir) = state.disk_cache_dir.as_deref()
     {
-        store_to_disk_cache(cache_dir, cache_key_str, &compiled);
+        store_to_disk_cache(cache_dir, cache_key_str, &source);
     }
 
-    Ok(compiled)
+    Ok(source.to_vec())
 }
 
 // ============================================================================

@@ -17,6 +17,7 @@ use crate::session::{SessionEntry, SessionMessage, session_message_to_model};
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -597,8 +598,9 @@ async fn complete_simple(
         messages: vec![Message::User(UserMessage {
             content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(prompt_text))]),
             timestamp: chrono::Utc::now().timestamp_millis(),
-        })],
-        tools: Vec::new(),
+        })]
+        .into(),
+        tools: Vec::new().into(),
     };
 
     let options = StreamOptions {

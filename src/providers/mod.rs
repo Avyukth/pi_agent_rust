@@ -400,7 +400,7 @@ impl ExtensionStreamSimpleProvider {
         })
     }
 
-    fn build_js_context(context: &Context) -> Value {
+    fn build_js_context(context: &Context<'_>) -> Value {
         let mut map = serde_json::Map::new();
         if let Some(system_prompt) = &context.system_prompt {
             map.insert(
@@ -587,7 +587,7 @@ impl Provider for ExtensionStreamSimpleProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let model = Self::build_js_model(&self.model);

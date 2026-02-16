@@ -19724,8 +19724,8 @@ impl ExtensionManagerHandle {
 struct CachedEventContext {
     /// The generation at which this cache was built.
     generation: u64,
-    /// The pre-built context payload.
-    payload: Value,
+    /// The pre-built context payload (Arc-wrapped for cheap cache hits).
+    payload: Arc<Value>,
 }
 
 #[derive(Default)]
@@ -23288,11 +23288,15 @@ impl ExtensionManager {
         let timeout_ms = self.effective_timeout(timeout_ms);
         let event_name = event.to_string();
 
-        // --- Fast path: O(1) hook bitmap check instead of iterating all extensions ---
-        let (runtime, has_hook) = {
+        // --- Fast path: O(1) hook bitmap check via snapshot (no mutex) ---
+        let snap = self.read_snapshot();
+        let has_hook = snap.hook_bitmap.contains(&event_name);
+        drop(snap);
+        let runtime = if has_hook {
             let guard = self.inner.lock().unwrap();
-            let has_hook = guard.hook_bitmap.contains(&event_name);
-            (guard.js_runtime.clone(), has_hook)
+            guard.js_runtime.clone()
+        } else {
+            None
         };
 
         #[cfg(feature = "wasm-host")]
@@ -23462,27 +23466,33 @@ impl ExtensionManager {
 
         let timeout_ms = self.effective_timeout(EXTENSION_EVENT_TIMEOUT_MS);
 
-        // Filter to events with hooks and build payloads.
-        let (runtime, filtered_events) = {
-            let guard = self.inner.lock().unwrap();
-            let runtime = guard.js_runtime.clone();
-            let mut filtered = Vec::with_capacity(events.len());
-            for (event, data) in &events {
-                let event_name = event.to_string();
-                if guard.hook_bitmap.contains(&event_name) {
-                    let event_payload = match data {
-                        None => json!({ "type": event_name }),
-                        Some(Value::Object(map)) => {
-                            let mut map = map.clone();
-                            map.insert("type".into(), Value::String(event_name.clone()));
-                            Value::Object(map)
-                        }
-                        Some(other) => json!({ "type": event_name, "data": other }),
-                    };
-                    filtered.push((event_name, event_payload));
-                }
+        // Filter to events with hooks using snapshot (no mutex) for hook check.
+        let snap = self.read_snapshot();
+        let mut filtered = Vec::with_capacity(events.len());
+        for (event, data) in &events {
+            let event_name = event.to_string();
+            if snap.hook_bitmap.contains(&event_name) {
+                let event_payload = match data {
+                    None => json!({ "type": event_name }),
+                    Some(Value::Object(map)) => {
+                        let mut map = map.clone();
+                        map.insert("type".into(), Value::String(event_name.clone()));
+                        Value::Object(map)
+                    }
+                    Some(other) => json!({ "type": event_name, "data": other }),
+                };
+                filtered.push((event_name, event_payload));
             }
-            (runtime, filtered)
+        }
+        drop(snap);
+        let filtered_events = filtered;
+
+        // Only lock mutex for js_runtime if there are events to dispatch.
+        let runtime = if filtered_events.is_empty() {
+            None
+        } else {
+            let guard = self.inner.lock().unwrap();
+            guard.js_runtime.clone()
         };
 
         if filtered_events.is_empty() {

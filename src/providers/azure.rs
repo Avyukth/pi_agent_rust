@@ -126,7 +126,7 @@ impl AzureOpenAIProvider {
 
     /// Build the request body for Azure OpenAI (same format as OpenAI).
     #[allow(clippy::unused_self)]
-    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> AzureRequest {
+    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> AzureRequest {
         let messages = self.build_messages(context);
 
         let tools: Option<Vec<AzureTool>> = if context.tools.is_empty() {
@@ -148,7 +148,7 @@ impl AzureOpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended.
-    fn build_messages(&self, context: &Context) -> Vec<AzureMessage> {
+    fn build_messages(&self, context: &Context<'_>) -> Vec<AzureMessage> {
         let mut messages = Vec::new();
         let system_role = self
             .compat
@@ -167,7 +167,7 @@ impl AzureOpenAIProvider {
         }
 
         // Convert conversation messages
-        for message in &context.messages {
+        for message in context.messages.iter() {
             messages.extend(convert_message_to_azure(message));
         }
 
@@ -191,7 +191,7 @@ impl Provider for AzureOpenAIProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let auth_value = options

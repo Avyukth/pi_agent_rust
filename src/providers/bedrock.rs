@@ -214,7 +214,7 @@ impl BedrockProvider {
         Ok(url)
     }
 
-    pub fn build_request(context: &Context, options: &StreamOptions) -> BedrockConverseRequest {
+    pub fn build_request(context: &Context<'_>, options: &StreamOptions) -> BedrockConverseRequest {
         let mut system = Vec::new();
         if let Some(system_prompt) = context
             .system_prompt
@@ -228,7 +228,7 @@ impl BedrockProvider {
         }
 
         let mut messages = Vec::new();
-        for message in &context.messages {
+        for message in context.messages.iter() {
             if let Some(converted) = convert_message(message) {
                 messages.push(converted);
             }
@@ -371,7 +371,7 @@ impl Provider for BedrockProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = Self::build_request(context, options);

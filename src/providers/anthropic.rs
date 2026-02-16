@@ -74,7 +74,11 @@ impl AnthropicProvider {
     }
 
     /// Build the request body for the Anthropic API.
-    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> AnthropicRequest {
+    pub fn build_request(
+        &self,
+        context: &Context<'_>,
+        options: &StreamOptions,
+    ) -> AnthropicRequest {
         let messages = context
             .messages
             .iter()
@@ -152,7 +156,7 @@ impl Provider for AnthropicProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let auth_value = options

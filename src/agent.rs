@@ -1945,7 +1945,7 @@ mod extensions_integration_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -2040,7 +2040,7 @@ mod extensions_integration_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3067,7 +3067,7 @@ mod abort_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3111,7 +3111,7 @@ mod abort_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3166,7 +3166,7 @@ mod abort_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3216,7 +3216,7 @@ mod abort_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3715,7 +3715,7 @@ mod turn_event_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -3816,7 +3816,7 @@ mod turn_event_tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
@@ -5055,7 +5055,7 @@ mod tests {
 
         async fn stream(
             &self,
-            _context: &Context,
+            _context: &Context<'_>,
             _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,

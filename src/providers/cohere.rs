@@ -75,7 +75,7 @@ impl CohereProvider {
         self
     }
 
-    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> CohereRequest {
+    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> CohereRequest {
         let messages = build_cohere_messages(context);
 
         let tools: Option<Vec<CohereTool>> = if context.tools.is_empty() {
@@ -112,7 +112,7 @@ impl Provider for CohereProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let has_authorization_header = options
@@ -613,7 +613,7 @@ fn convert_tool_to_cohere(tool: &ToolDef) -> CohereTool {
     }
 }
 
-fn build_cohere_messages(context: &Context) -> Vec<CohereMessage> {
+fn build_cohere_messages(context: &Context<'_>) -> Vec<CohereMessage> {
     let mut out = Vec::new();
 
     if let Some(system) = &context.system_prompt {
@@ -622,7 +622,7 @@ fn build_cohere_messages(context: &Context) -> Vec<CohereMessage> {
         });
     }
 
-    for message in &context.messages {
+    for message in context.messages.iter() {
         match message {
             Message::User(user) => out.push(CohereMessage::User {
                 content: extract_text_user_content(&user.content),

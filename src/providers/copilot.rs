@@ -230,7 +230,7 @@ impl Provider for CopilotProvider {
     #[allow(clippy::too_many_lines)]
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         // Get a valid session token.

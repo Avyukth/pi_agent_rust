@@ -80,7 +80,7 @@ impl GeminiProvider {
 
     /// Build the request body for the Gemini API.
     #[allow(clippy::unused_self)]
-    pub fn build_request(&self, context: &Context, options: &StreamOptions) -> GeminiRequest {
+    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
         let system_instruction = context.system_prompt.as_ref().map(|s| GeminiContent {
             role: None,
@@ -117,10 +117,10 @@ impl GeminiProvider {
     }
 
     /// Build the contents array from context messages.
-    fn build_contents(context: &Context) -> Vec<GeminiContent> {
+    fn build_contents(context: &Context<'_>) -> Vec<GeminiContent> {
         let mut contents = Vec::new();
 
-        for message in &context.messages {
+        for message in context.messages.iter() {
             contents.extend(convert_message_to_gemini(message));
         }
 
@@ -144,7 +144,7 @@ impl Provider for GeminiProvider {
 
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let auth_value = options
