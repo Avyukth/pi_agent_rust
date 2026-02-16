@@ -210,6 +210,7 @@ test_help_lists_installer_flags() {
   assert_output_contains "$dir" "--checksum HEX"
   assert_output_contains "$dir" "--sigstore-bundle-url URL"
   assert_output_contains "$dir" "--completions SHELL"
+  assert_output_contains "$dir" "--no-agent-skills"
 }
 
 test_invalid_completions_value_fails() {
@@ -237,6 +238,133 @@ test_missing_option_value_fails() {
   run_installer "$dir" --version
   assert_exit_code "$dir" 1
   assert_output_contains "$dir" "Option --version requires a value"
+}
+
+test_missing_option_value_when_next_arg_is_flag_fails() {
+  local dir
+  dir="$(case_dir "missing-option-value-next-flag")"
+  write_existing_pi_stub "$dir"
+  run_installer "$dir" --version --no-gum
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Option --version requires a value"
+}
+
+test_custom_artifact_download_failure_does_not_source_fallback_without_version() {
+  local dir missing_artifact
+  dir="$(case_dir "custom-artifact-no-version-fallback")"
+  write_existing_pi_stub "$dir"
+  missing_artifact="${dir}/fixtures/missing-pi"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --dest "${dir}/dest" \
+    --artifact-url "file://${missing_artifact}" \
+    --no-completions
+
+  assert_exit_code "$dir" 1
+  assert_output_contains "$dir" "Custom artifact download failed; cannot fall back to source without a release tag"
+  assert_output_contains "$dir" "Pass --version vX.Y.Z with --artifact-url, or use --from-source directly"
+}
+
+test_agent_skills_install_by_default() {
+  local dir artifact artifact_url checksum claude_skill codex_skill
+  dir="$(case_dir "agent-skills-default")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions
+
+  claude_skill="${dir}/home/.claude/skills/pi-agent-rust/SKILL.md"
+  codex_skill="${dir}/home/.codex/skills/pi-agent-rust/SKILL.md"
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    installed (claude,codex)"
+  [ -f "$claude_skill" ] || { echo "missing Claude skill: $claude_skill" >&2; return 1; }
+  [ -f "$codex_skill" ] || { echo "missing Codex skill: $codex_skill" >&2; return 1; }
+  grep -Fq "pi_agent_rust installer managed skill" "$claude_skill" || {
+    echo "missing managed marker in Claude skill" >&2
+    return 1
+  }
+  grep -Fq "pi_agent_rust installer managed skill" "$codex_skill" || {
+    echo "missing managed marker in Codex skill" >&2
+    return 1
+  }
+}
+
+test_no_agent_skills_opt_out() {
+  local dir artifact artifact_url checksum
+  dir="$(case_dir "agent-skills-opt-out")"
+  write_existing_pi_stub "$dir"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-agent-skills \
+    --no-completions
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    skipped (--no-agent-skills)"
+  if [ -e "${dir}/home/.claude/skills/pi-agent-rust/SKILL.md" ]; then
+    echo "Claude skill should not be installed when --no-agent-skills is used" >&2
+    return 1
+  fi
+  if [ -e "${dir}/home/.codex/skills/pi-agent-rust/SKILL.md" ]; then
+    echo "Codex skill should not be installed when --no-agent-skills is used" >&2
+    return 1
+  fi
+}
+
+test_existing_custom_skill_dirs_are_not_overwritten() {
+  local dir artifact artifact_url checksum
+  dir="$(case_dir "agent-skills-custom-preserve")"
+  write_existing_pi_stub "$dir"
+
+  mkdir -p "${dir}/home/.claude/skills/pi-agent-rust"
+  mkdir -p "${dir}/home/.codex/skills/pi-agent-rust"
+  printf 'custom\n' > "${dir}/home/.claude/skills/pi-agent-rust/NOT_A_SKILL.txt"
+  printf 'custom\n' > "${dir}/home/.codex/skills/pi-agent-rust/NOT_A_SKILL.txt"
+
+  artifact="${dir}/fixtures/pi-fixture"
+  write_artifact_binary "$artifact" "unsupported"
+  artifact_url="file://${artifact}"
+  checksum="$(sha256_file "$artifact")"
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions
+
+  assert_exit_code "$dir" 0
+  assert_output_contains "$dir" "Skills:    skipped (existing custom skill)"
+  [ -f "${dir}/home/.claude/skills/pi-agent-rust/NOT_A_SKILL.txt" ] || {
+    echo "Claude custom skill dir should be preserved" >&2
+    return 1
+  }
+  [ -f "${dir}/home/.codex/skills/pi-agent-rust/NOT_A_SKILL.txt" ] || {
+    echo "Codex custom skill dir should be preserved" >&2
+    return 1
+  }
 }
 
 test_checksum_inline_success() {
@@ -481,6 +609,11 @@ main() {
   run_test test_invalid_completions_value_fails
   run_test test_unknown_option_fails
   run_test test_missing_option_value_fails
+  run_test test_missing_option_value_when_next_arg_is_flag_fails
+  run_test test_custom_artifact_download_failure_does_not_source_fallback_without_version
+  run_test test_agent_skills_install_by_default
+  run_test test_no_agent_skills_opt_out
+  run_test test_existing_custom_skill_dirs_are_not_overwritten
   run_test test_checksum_inline_success
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard

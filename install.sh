@@ -34,6 +34,7 @@ VERIFY=0
 NO_VERIFY=0
 FORCE_INSTALL=0
 OFFLINE="${PI_INSTALLER_OFFLINE:-0}"
+AGENT_SKILLS_ENABLED="${AGENT_SKILLS_ENABLED:-1}"
 
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -71,6 +72,12 @@ LEGACY_MOVED_TO=""
 
 PATH_MARKER="# pi-agent-rust installer PATH"
 PATH_UPDATED_FILES=""
+
+AGENT_SKILL_NAME="pi-agent-rust"
+AGENT_SKILL_STATUS="pending"
+AGENT_SKILL_CLAUDE_PATH=""
+AGENT_SKILL_CODEX_PATH=""
+AGENT_SKILL_MARKER="pi_agent_rust installer managed skill"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/pi-agent-rust"
 STATE_FILE="$STATE_DIR/install-state.env"
@@ -145,12 +152,44 @@ run_with_spinner() {
 
 pi_ascii_logo() {
   cat <<'ASCII'
- ____  _   ____            _
-|  _ \(_) |  _ \ _   _ ___| |_
-| |_) | | | |_) | | | / __| __|
-|  __/| | |  _ <| |_| \__ \ |_
-|_|   |_| |_| \_\\__,_|___/\__|
+ ____   ___      ____            _     ____            _
+|  _ \ |_ _|    |  _ \ _   _ ___| |_  |  _ \ _   _ ___| |_
+| |_) | | |_____| |_) | | | / __| __| | |_) | | | / __| __|
+|  __/  | |_____|  _ <| |_| \__ \ |_  |  _ <| |_| \__ \ |_
+|_|    |___|    |_| \_\\__,_|___/\__| |_| \_\\__,_|___/\__|
 ASCII
+}
+
+pi_ascii_logo_gum() {
+  local logo="$1"
+  local palette=(45 51 39 33 69 75)
+  local line=""
+  local idx=0
+  local styled=""
+  while IFS= read -r line; do
+    local color="${palette[$((idx % ${#palette[@]}))]}"
+    local rendered
+    rendered="$(gum style --foreground "$color" --bold "$line")"
+    if [ -z "$styled" ]; then
+      styled="$rendered"
+    else
+      styled="${styled}"$'\n'"$rendered"
+    fi
+    idx=$((idx + 1))
+  done <<< "$logo"
+  printf '%s\n' "$styled"
+}
+
+pi_ascii_logo_ansi() {
+  local logo="$1"
+  local palette=(45 51 39 33 69 75)
+  local line=""
+  local idx=0
+  while IFS= read -r line; do
+    local color="${palette[$((idx % ${#palette[@]}))]}"
+    printf '\033[1;38;5;%sm%s\033[0m\n' "$color" "$line"
+    idx=$((idx + 1))
+  done <<< "$logo"
 }
 
 usage() {
@@ -173,6 +212,7 @@ Options:
   --offline              Skip network preflight check
   --completions SHELL    Install shell completions for auto|off|bash|zsh|fish
   --no-completions       Skip shell completion installation
+  --no-agent-skills      Skip installing AI agent skill files for Claude/Codex
   --yes, -y              Non-interactive yes to prompts
   --adopt                Auto-adopt Rust as canonical `pi` when TS pi is detected
   --keep-existing-pi     Do not replace existing `pi`; install as `pi-rust`
@@ -187,7 +227,7 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --version)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --version requires a value"
         usage
         exit 1
@@ -196,7 +236,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --dest)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --dest requires a value"
         usage
         exit 1
@@ -216,7 +256,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --artifact-url)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --artifact-url requires a value"
         usage
         exit 1
@@ -225,7 +265,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --checksum)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --checksum requires a value"
         usage
         exit 1
@@ -234,7 +274,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --checksum-url)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --checksum-url requires a value"
         usage
         exit 1
@@ -243,7 +283,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --sigstore-bundle-url)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --sigstore-bundle-url requires a value"
         usage
         exit 1
@@ -268,7 +308,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --completions)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --completions requires a value"
         usage
         exit 1
@@ -278,6 +318,10 @@ while [ $# -gt 0 ]; do
       ;;
     --no-completions)
       COMPLETIONS_MODE="off"
+      shift
+      ;;
+    --no-agent-skills)
+      AGENT_SKILLS_ENABLED=0
       shift
       ;;
     --yes|-y)
@@ -293,7 +337,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --legacy-alias)
-      if [ $# -lt 2 ]; then
+      if [ $# -lt 2 ] || [[ "$2" == -* ]]; then
         err "Option --legacy-alias requires a value"
         usage
         exit 1
@@ -331,21 +375,25 @@ show_header() {
   logo="$(pi_ascii_logo)"
 
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    local styled_logo
+    styled_logo="$(pi_ascii_logo_gum "$logo")"
     gum style \
       --border double \
-      --border-foreground 51 \
-      --padding "1 2" \
+      --border-foreground 45 \
+      --padding "1 3" \
       --margin "1 0" \
-      "$(gum style --foreground 51 --bold "$logo")" \
+      "$styled_logo" \
       "$(gum style --foreground 42 --bold 'Pi Rust Installer')" \
-      "$(gum style --foreground 245 'High-performance coding agent CLI')" \
-      "$(gum style --foreground 244 'Install + verify + TypeScript migration helper')"
+      "$(gum style --foreground 250 'Fast Rust-native coding agent installer')" \
+      "$(gum style --foreground 214 'Checksum verification by default | Optional Sigstore/cosign')" \
+      "$(gum style --foreground 244 "Repository: ${OWNER}/${REPO}")"
   else
     echo ""
-    printf '\033[1;36m%s\033[0m\n' "$logo"
-    echo -e "\033[1;32mPi Rust Installer\033[0m"
-    echo -e "\033[0;37mHigh-performance coding agent CLI\033[0m"
-    echo -e "\033[0;90mInstall + verify + TypeScript migration helper\033[0m"
+    pi_ascii_logo_ansi "$logo"
+    echo -e "\033[1;38;5;46mPi Rust Installer\033[0m"
+    echo -e "\033[0;38;5;250mFast Rust-native coding agent installer\033[0m"
+    echo -e "\033[0;38;5;214mChecksum verification by default | Optional Sigstore/cosign\033[0m"
+    echo -e "\033[0;38;5;244mRepository: ${OWNER}/${REPO}\033[0m"
     echo ""
   fi
 }
@@ -592,6 +640,15 @@ preflight_checks() {
 }
 
 validate_options() {
+  case "$AGENT_SKILLS_ENABLED" in
+    0|1)
+      ;;
+    *)
+      warn "Invalid AGENT_SKILLS_ENABLED value '$AGENT_SKILLS_ENABLED'; defaulting to 1"
+      AGENT_SKILLS_ENABLED=1
+      ;;
+  esac
+
   case "$COMPLETIONS_MODE" in
     auto|off|bash|zsh|fish)
       ;;
@@ -1120,8 +1177,8 @@ download_release_binary() {
 
 build_from_source() {
   local src_dir="$TMP/src"
-  git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir"
-  (cd "$src_dir" && cargo build --release --locked --bin pi)
+  git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2
+  (cd "$src_dir" && cargo build --release --locked --bin pi >&2)
 
   local built_bin="$src_dir/target/release/pi${EXE_EXT}"
   if [ ! -x "$built_bin" ]; then
@@ -1370,6 +1427,271 @@ maybe_install_completions() {
   install_completions_for_shell "$shell_name" || true
 }
 
+is_installer_managed_skill_file() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  grep -Fq "$AGENT_SKILL_MARKER" "$file" 2>/dev/null
+}
+
+pi_agent_skill_inline_content() {
+  cat <<'SKILL'
+---
+name: pi-agent-rust
+description: >-
+  Operates pi_agent_rust CLI, providers, sessions, extensions, and installer workflows.
+  Use when working in pi_agent_rust repos, debugging provider/tool/session behavior,
+  or validating install/uninstall and migration paths.
+---
+
+<!-- pi_agent_rust installer managed skill -->
+
+# Pi Agent Rust
+
+## Quick Start
+
+```bash
+# Heavy builds/checks should be offloaded when available
+rch exec -- cargo check --all-targets
+rch exec -- cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+
+# Installer regression harness
+bash tests/installer_regression.sh
+```
+
+Set isolated build temp dirs in multi-agent environments:
+
+```bash
+export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust/${USER:-agent}"
+export TMPDIR="/data/tmp/pi_agent_rust/${USER:-agent}/tmp"
+mkdir -p "$TMPDIR"
+```
+
+## Core Workflow
+
+- Read `AGENTS.md` first for project rules.
+- Keep edits minimal and in-place; avoid file proliferation.
+- Use `rg` for text search and `ast-grep` for structural matching.
+- Prefer `rch exec -- <cargo ...>` for heavy compilation/test commands.
+- Run targeted tests first, then broaden.
+
+## High-Value Commands
+
+```bash
+# Installer + shell harness
+bash tests/installer_regression.sh
+bash -n install.sh
+bash -n uninstall.sh
+shellcheck -x install.sh uninstall.sh tests/installer_regression.sh
+
+# Common Rust gates
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+
+# Focused test slices
+cargo test conformance
+cargo test provider_streaming
+cargo test tools
+```
+
+## Critical Files
+
+- `src/main.rs`: CLI entry + mode dispatch.
+- `src/agent.rs`: agent loop + tool iteration boundaries.
+- `src/providers/`: backend provider implementations.
+- `src/tools.rs`: built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`).
+- `src/session.rs`: JSONL session persistence.
+- `src/session_index.rs`: session index + metadata cache.
+- `install.sh` / `uninstall.sh`: install lifecycle and migration behavior.
+
+## Installer-Specific Expectations
+
+- Default behavior should remain non-destructive and idempotent.
+- Status/progress text should go to stderr when stdout is used as a data channel.
+- Custom artifact and checksum/signature branches must fail clearly and predictably.
+- Keep installer summary lines concise and machine-readable enough for logs.
+
+## Done Criteria
+
+- Code compiles/checks cleanly for changed surfaces.
+- Relevant tests pass (especially installer harness when install/uninstall logic changes).
+- New flags/options are reflected in `README.md`.
+- Behavior is explicit on failure paths; avoid silent fallback surprises.
+SKILL
+}
+
+install_skill_to_destination() {
+  local destination="$1"
+  local source_kind="$2"
+  local source_path="$3"
+
+  local existing_skill="$destination/SKILL.md"
+  if [ -e "$destination" ] && [ ! -f "$existing_skill" ]; then
+    warn "Skipping existing skill directory without SKILL.md at $destination"
+    return 2
+  fi
+  if [ -f "$existing_skill" ] && ! is_installer_managed_skill_file "$existing_skill"; then
+    warn "Skipping existing non-installer-managed skill at $destination"
+    return 2
+  fi
+
+  rm -rf "$destination" 2>/dev/null || true
+  if ! mkdir -p "$destination" 2>/dev/null; then
+    warn "Failed to create skill directory: $destination"
+    return 1
+  fi
+
+  case "$source_kind" in
+    dir)
+      if ! cp -R "$source_path/." "$destination/" 2>/dev/null; then
+        warn "Failed to install bundled skill into $destination"
+        return 1
+      fi
+      ;;
+    file)
+      if ! cp "$source_path" "$destination/SKILL.md" 2>/dev/null; then
+        warn "Failed to install skill file into $destination"
+        return 1
+      fi
+      ;;
+    *)
+      warn "Unknown skill source kind: $source_kind"
+      return 1
+      ;;
+  esac
+
+  if [ -f "$destination/SKILL.md" ] && ! is_installer_managed_skill_file "$destination/SKILL.md"; then
+    printf '\n<!-- %s -->\n' "$AGENT_SKILL_MARKER" >> "$destination/SKILL.md"
+  fi
+
+  return 0
+}
+
+install_agent_skills() {
+  if [ "$AGENT_SKILLS_ENABLED" -eq 0 ]; then
+    AGENT_SKILL_STATUS="skipped (--no-agent-skills)"
+    return 0
+  fi
+
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  AGENT_SKILL_CLAUDE_PATH="$HOME/.claude/skills/${AGENT_SKILL_NAME}"
+  AGENT_SKILL_CODEX_PATH="${codex_home}/skills/${AGENT_SKILL_NAME}"
+
+  local source_kind="file"
+  local source_path=""
+  local source_desc="inline"
+  local bundled_dir=""
+
+  local script_dir=""
+  local script_dir_candidate=""
+  if script_dir_candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"; then
+    script_dir="$script_dir_candidate"
+  fi
+  for candidate in "$PWD/.claude/skills/${AGENT_SKILL_NAME}" "$script_dir/.claude/skills/${AGENT_SKILL_NAME}"; do
+    if [ -f "$candidate/SKILL.md" ]; then
+      bundled_dir="$candidate"
+      break
+    fi
+  done
+
+  local temp_skill=""
+  if [ -n "$bundled_dir" ]; then
+    source_kind="dir"
+    source_path="$bundled_dir"
+    source_desc="bundled"
+  else
+    if command -v curl >/dev/null 2>&1; then
+      local refs=()
+      if [ -n "$VERSION" ] && [ "$VERSION" != "custom-artifact" ]; then
+        refs+=("$VERSION")
+      fi
+      refs+=("main")
+      local prev_ref=""
+      local ref=""
+      for ref in "${refs[@]}"; do
+        if [ -n "$prev_ref" ] && [ "$ref" = "$prev_ref" ]; then
+          continue
+        fi
+        prev_ref="$ref"
+        local skill_url="https://raw.githubusercontent.com/${OWNER}/${REPO}/${ref}/.claude/skills/${AGENT_SKILL_NAME}/SKILL.md"
+        local downloaded
+        downloaded="$(mktemp 2>/dev/null || true)"
+        if [ -z "$downloaded" ]; then
+          break
+        fi
+        if curl -fsSL "$skill_url" -o "$downloaded" >/dev/null 2>&1; then
+          temp_skill="$downloaded"
+          source_path="$downloaded"
+          source_desc="github:${ref}"
+          break
+        fi
+        rm -f "$downloaded" 2>/dev/null || true
+      done
+    fi
+
+    if [ -z "$source_path" ]; then
+      local inline_skill
+      inline_skill="$(mktemp 2>/dev/null || true)"
+      if [ -z "$inline_skill" ]; then
+        AGENT_SKILL_STATUS="failed (temp file error)"
+        warn "Failed to prepare inline agent skill file"
+        return 0
+      fi
+      pi_agent_skill_inline_content > "$inline_skill"
+      temp_skill="$inline_skill"
+      source_path="$inline_skill"
+      source_desc="inline"
+    fi
+  fi
+
+  local installed_claude=0
+  local installed_codex=0
+  local skipped_custom=0
+
+  if install_skill_to_destination "$AGENT_SKILL_CLAUDE_PATH" "$source_kind" "$source_path"; then
+    installed_claude=1
+  else
+    if [ "$?" -eq 2 ]; then
+      skipped_custom=$((skipped_custom + 1))
+    fi
+  fi
+
+  if install_skill_to_destination "$AGENT_SKILL_CODEX_PATH" "$source_kind" "$source_path"; then
+    installed_codex=1
+  else
+    if [ "$?" -eq 2 ]; then
+      skipped_custom=$((skipped_custom + 1))
+    fi
+  fi
+
+  if [ -n "$temp_skill" ] && [ -f "$temp_skill" ]; then
+    rm -f "$temp_skill" 2>/dev/null || true
+  fi
+
+  if [ "$installed_claude" -eq 1 ] && [ "$installed_codex" -eq 1 ]; then
+    AGENT_SKILL_STATUS="installed (claude,codex)"
+    ok "Installed ${AGENT_SKILL_NAME} skill for Claude and Codex (${source_desc})"
+    return 0
+  fi
+  if [ "$installed_claude" -eq 1 ] && [ "$installed_codex" -eq 0 ]; then
+    AGENT_SKILL_STATUS="installed (claude only)"
+    warn "Installed ${AGENT_SKILL_NAME} skill for Claude only (${source_desc})"
+    return 0
+  fi
+  if [ "$installed_claude" -eq 0 ] && [ "$installed_codex" -eq 1 ]; then
+    AGENT_SKILL_STATUS="installed (codex only)"
+    warn "Installed ${AGENT_SKILL_NAME} skill for Codex only (${source_desc})"
+    return 0
+  fi
+
+  if [ "$skipped_custom" -ge 1 ]; then
+    AGENT_SKILL_STATUS="skipped (existing custom skill)"
+  else
+    AGENT_SKILL_STATUS="failed (unable to write skill files)"
+  fi
+}
+
 load_existing_state() {
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
@@ -1390,6 +1712,9 @@ write_state() {
     printf 'PIAR_CHECKSUM_STATUS=%q\n' "$CHECKSUM_STATUS"
     printf 'PIAR_SIGSTORE_STATUS=%q\n' "$SIGSTORE_STATUS"
     printf 'PIAR_COMPLETIONS_STATUS=%q\n' "$COMPLETIONS_STATUS"
+    printf 'PIAR_AGENT_SKILL_STATUS=%q\n' "$AGENT_SKILL_STATUS"
+    printf 'PIAR_AGENT_SKILL_CLAUDE_PATH=%q\n' "$AGENT_SKILL_CLAUDE_PATH"
+    printf 'PIAR_AGENT_SKILL_CODEX_PATH=%q\n' "$AGENT_SKILL_CODEX_PATH"
     printf 'PIAR_ADOPTED_TYPESCRIPT=%q\n' "$ADOPT_TS"
     printf 'PIAR_LEGACY_ALIAS_PATH=%q\n' "$LEGACY_ALIAS_PATH"
     printf 'PIAR_LEGACY_TARGET_PATH=%q\n' "$LEGACY_TARGET_PATH"
@@ -1433,6 +1758,13 @@ print_summary() {
   lines+=("Checksum:  $CHECKSUM_STATUS")
   lines+=("Signature: $SIGSTORE_STATUS")
   lines+=("Shell:     $COMPLETIONS_STATUS")
+  lines+=("Skills:    $AGENT_SKILL_STATUS")
+  if [ -n "$AGENT_SKILL_CLAUDE_PATH" ] && [ -f "$AGENT_SKILL_CLAUDE_PATH/SKILL.md" ]; then
+    lines+=("Claude:    $AGENT_SKILL_CLAUDE_PATH")
+  fi
+  if [ -n "$AGENT_SKILL_CODEX_PATH" ] && [ -f "$AGENT_SKILL_CODEX_PATH/SKILL.md" ]; then
+    lines+=("Codex:     $AGENT_SKILL_CODEX_PATH")
+  fi
 
   if [ "$ADOPT_TS" -eq 1 ]; then
     if [ "$ADOPT_CANONICAL" -eq 1 ]; then
@@ -1508,6 +1840,8 @@ main() {
     fi
     maybe_add_path
     maybe_install_completions
+    install_agent_skills
+    write_state
     print_summary
     return 0
   fi
@@ -1537,6 +1871,11 @@ main() {
         err "Release signature verification failed; aborting install"
         exit 1
       fi
+      if [ -n "$ARTIFACT_URL" ] && [ "$VERSION" = "custom-artifact" ]; then
+        err "Custom artifact download failed; cannot fall back to source without a release tag"
+        err "Pass --version vX.Y.Z with --artifact-url, or use --from-source directly"
+        exit 1
+      fi
       warn "Release download failed; falling back to source build"
       FROM_SOURCE=1
       INSTALL_SOURCE="source (release fallback)"
@@ -1558,6 +1897,7 @@ main() {
 
   maybe_add_path
   maybe_install_completions
+  install_agent_skills
   write_state
   INSTALL_COMMITTED=1
   print_summary

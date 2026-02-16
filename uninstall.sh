@@ -25,7 +25,13 @@ PIAR_LEGACY_ALIAS_PATH=""
 PIAR_LEGACY_MOVED_FROM=""
 PIAR_LEGACY_MOVED_TO=""
 PIAR_PATH_MARKER=""
+PIAR_AGENT_SKILL_STATUS=""
+PIAR_AGENT_SKILL_CLAUDE_PATH=""
+PIAR_AGENT_SKILL_CODEX_PATH=""
 RESTORE_CONFLICT=0
+
+AGENT_SKILL_NAME="pi-agent-rust"
+AGENT_SKILL_MARKER="pi_agent_rust installer managed skill"
 
 HAS_GUM=0
 if command -v gum >/dev/null 2>&1 && [ -t 1 ]; then
@@ -214,6 +220,12 @@ is_managed_alias() {
   grep -q "pi_agent_rust installer managed alias" "$path" 2>/dev/null
 }
 
+is_managed_skill_file() {
+  local path="$1"
+  [ -f "$path" ] || return 1
+  grep -q "$AGENT_SKILL_MARKER" "$path" 2>/dev/null
+}
+
 remove_file_if_exists() {
   local path="$1"
   if [ -e "$path" ] || [ -L "$path" ]; then
@@ -327,6 +339,30 @@ remove_legacy_alias() {
   fi
 }
 
+remove_installed_skills() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}"
+  local claude_dir="${PIAR_AGENT_SKILL_CLAUDE_PATH:-$HOME/.claude/skills/${AGENT_SKILL_NAME}}"
+  local codex_dir="${PIAR_AGENT_SKILL_CODEX_PATH:-${codex_home}/skills/${AGENT_SKILL_NAME}}"
+
+  local dir=""
+  for dir in "$claude_dir" "$codex_dir"; do
+    [ -n "$dir" ] || continue
+    local skill_file="$dir/SKILL.md"
+    [ -f "$skill_file" ] || continue
+    if ! is_managed_skill_file "$skill_file"; then
+      warn "Skipping non-managed skill directory: $dir"
+      continue
+    fi
+
+    rm -rf "$dir" 2>/dev/null || true
+    if [ ! -e "$dir" ]; then
+      ok "Removed installer-managed skill: $dir"
+    else
+      warn "Failed to remove installer-managed skill: $dir"
+    fi
+  done
+}
+
 remove_state() {
   if [ "$RESTORE_CONFLICT" -eq 1 ]; then
     warn "Keeping installer state due restore conflict. Resolve and rerun uninstall."
@@ -352,6 +388,12 @@ plan_summary() {
   fi
   if [ -n "$PIAR_LEGACY_ALIAS_PATH" ]; then
     lines+=("Legacy alias: $PIAR_LEGACY_ALIAS_PATH")
+  fi
+  if [ -n "$PIAR_AGENT_SKILL_CLAUDE_PATH" ] || [ -n "$PIAR_AGENT_SKILL_CODEX_PATH" ]; then
+    lines+=("Agent skills: remove installer-managed Claude/Codex skill dirs")
+  fi
+  if [ -n "$PIAR_AGENT_SKILL_STATUS" ]; then
+    lines+=("Recorded skill status: $PIAR_AGENT_SKILL_STATUS")
   fi
   if [ "${PIAR_ADOPTED_TYPESCRIPT:-0}" = "1" ] && [ "$NO_RESTORE_LEGACY" -eq 0 ]; then
     lines+=("Restore TS pi: ${PIAR_LEGACY_MOVED_TO:-<none>} -> ${PIAR_LEGACY_MOVED_FROM:-<none>}")
@@ -392,6 +434,7 @@ main() {
 
   remove_installed_binary
   remove_legacy_alias
+  remove_installed_skills
   restore_moved_typescript_pi
   remove_path_entries
   remove_state
