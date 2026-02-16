@@ -2842,14 +2842,18 @@ impl From<Message> for SessionMessage {
             Message::Assistant(assistant) => Self::Assistant {
                 message: Arc::try_unwrap(assistant).unwrap_or_else(|a| (*a).clone()),
             },
-            Message::ToolResult(result) => Self::ToolResult {
-                tool_call_id: result.tool_call_id,
-                tool_name: result.tool_name,
-                content: result.content,
-                details: result.details,
-                is_error: result.is_error,
-                timestamp: Some(result.timestamp),
-            },
+            Message::ToolResult(result) => {
+                let result =
+                    Arc::try_unwrap(result).unwrap_or_else(|a| (*a).clone());
+                Self::ToolResult {
+                    tool_call_id: result.tool_call_id,
+                    tool_name: result.tool_name,
+                    content: result.content,
+                    details: result.details,
+                    is_error: result.is_error,
+                    timestamp: Some(result.timestamp),
+                }
+            }
             Message::Custom(custom) => Self::Custom {
                 custom_type: custom.custom_type,
                 content: custom.content,
@@ -2967,7 +2971,7 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             details,
             is_error,
             timestamp,
-        } => Some(Message::ToolResult(ToolResultMessage {
+        } => Some(Message::tool_result(ToolResultMessage {
             tool_call_id: tool_call_id.clone(),
             tool_name: tool_name.clone(),
             content: content.clone(),

@@ -233,7 +233,7 @@ fn test_assistant_message_with_error() {
 fn test_tool_result_message_round_trip() {
     let harness = TestHarness::new("tool_result_message_round_trip");
 
-    let msg = Message::ToolResult(ToolResultMessage {
+    let msg = Message::tool_result(ToolResultMessage {
         tool_call_id: "call_123".to_string(),
         tool_name: "read".to_string(),
         content: vec![ContentBlock::Text(TextContent::new("File contents here"))],
@@ -272,7 +272,7 @@ fn test_tool_result_message_round_trip() {
 fn test_tool_result_error() {
     let harness = TestHarness::new("tool_result_error");
 
-    let msg = Message::ToolResult(ToolResultMessage {
+    let msg = Message::tool_result(ToolResultMessage {
         tool_call_id: "call_456".to_string(),
         tool_name: "bash".to_string(),
         content: vec![ContentBlock::Text(TextContent::new(
@@ -300,7 +300,7 @@ fn test_tool_result_error() {
 fn test_tool_result_details_omitted_when_none() {
     let harness = TestHarness::new("tool_result_details_omitted_when_none");
 
-    let msg = Message::ToolResult(ToolResultMessage {
+    let msg = Message::tool_result(ToolResultMessage {
         tool_call_id: "call_no_details".to_string(),
         tool_name: "ls".to_string(),
         content: vec![ContentBlock::Text(TextContent::new("ok"))],
@@ -1161,7 +1161,7 @@ fn test_multiple_tool_results() {
 
     // Simulate multiple tool results in sequence
     let results = [
-        Message::ToolResult(ToolResultMessage {
+        Message::tool_result(ToolResultMessage {
             tool_call_id: "call_1".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("fn main() {}"))],
@@ -1169,7 +1169,7 @@ fn test_multiple_tool_results() {
             is_error: false,
             timestamp: 1_700_000_001,
         }),
-        Message::ToolResult(ToolResultMessage {
+        Message::tool_result(ToolResultMessage {
             tool_call_id: "call_2".to_string(),
             tool_name: "grep".to_string(),
             content: vec![ContentBlock::Text(TextContent::new(

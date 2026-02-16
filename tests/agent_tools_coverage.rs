@@ -315,7 +315,7 @@ impl Provider for MixedToolCallProvider {
                 .messages
                 .iter()
                 .filter_map(|m| match m {
-                    Message::ToolResult(r) => Some(r),
+                    Message::ToolResult(r) => Some(r.as_ref()),
                     _ => None,
                 })
                 .collect();
@@ -1048,7 +1048,7 @@ impl Provider for FailingToolProvider {
                 .messages
                 .iter()
                 .filter_map(|m| match m {
-                    Message::ToolResult(r) => Some(r),
+                    Message::ToolResult(r) => Some(r.as_ref()),
                     _ => None,
                 })
                 .collect();

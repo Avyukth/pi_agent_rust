@@ -1045,7 +1045,7 @@ fn abort_during_tool_execution_preserves_completed_tools() {
         let tool_results: Vec<&ToolResultMessage> = messages
             .iter()
             .filter_map(|m| match m {
-                Message::ToolResult(r) => Some(r),
+                Message::ToolResult(r) => Some(r.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1674,7 +1674,7 @@ fn tool_call_followed_by_normal_completion() {
             .messages()
             .iter()
             .filter_map(|m| match m {
-                Message::ToolResult(r) => Some(r),
+                Message::ToolResult(r) => Some(r.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1944,7 +1944,7 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
             .messages()
             .iter()
             .filter_map(|m| match m {
-                Message::ToolResult(result) => Some(result),
+                Message::ToolResult(result) => Some(result.as_ref()),
                 _ => None,
             })
             .collect();

@@ -97,7 +97,7 @@ impl ScriptedProvider {
             .messages
             .iter()
             .filter_map(|message| match message {
-                Message::ToolResult(result) => Some(result),
+                Message::ToolResult(result) => Some(result.as_ref()),
                 _ => None,
             })
             .collect()

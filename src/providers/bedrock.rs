@@ -980,7 +980,7 @@ mod tests {
                     error_message: None,
                     timestamp: 0,
                 }),
-                Message::ToolResult(ToolResultMessage {
+                Message::tool_result(ToolResultMessage {
                     tool_call_id: "tool_1".to_string(),
                     tool_name: "search".to_string(),
                     content: vec![ContentBlock::Text(TextContent {

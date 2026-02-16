@@ -44,6 +44,7 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -395,6 +396,9 @@ pub struct Agent {
 
     /// Internal queue for steering/follow-up messages.
     message_queue: MessageQueue,
+
+    /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
+    cached_tool_defs: Option<Vec<ToolDef>>,
 }
 
 impl Agent {
@@ -409,6 +413,7 @@ impl Agent {
             steering_fetcher: None,
             follow_up_fetcher: None,
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
+            cached_tool_defs: None,
         }
     }
 
@@ -454,6 +459,7 @@ impl Agent {
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
         self.tools.extend(tools);
+        self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
     /// Queue a steering message (delivered after tool completion).
@@ -489,9 +495,13 @@ impl Agent {
         &mut self.config.stream_options
     }
 
-    /// Build tool definitions for the API.
-    fn build_tool_defs(&self) -> Vec<ToolDef> {
-        self.tools
+    /// Build tool definitions for the API, caching results across turns.
+    fn build_tool_defs(&mut self) -> Vec<ToolDef> {
+        if let Some(cached) = &self.cached_tool_defs {
+            return cached.clone();
+        }
+        let defs: Vec<ToolDef> = self
+            .tools
             .tools()
             .iter()
             .map(|t| ToolDef {
@@ -499,14 +509,16 @@ impl Agent {
                 description: t.description().to_string(),
                 parameters: t.parameters(),
             })
-            .collect()
+            .collect();
+        self.cached_tool_defs = Some(defs.clone());
+        defs
     }
 
     /// Build context for a completion request.
-    fn build_context(&self) -> Context {
-        let mut messages = self.messages.clone();
-        if self.config.block_images {
-            let stats = filter_images_for_provider(&mut messages);
+    fn build_context(&mut self) -> Context<'_> {
+        let messages: Cow<'_, [Message]> = if self.config.block_images {
+            let mut msgs = self.messages.clone();
+            let stats = filter_images_for_provider(&mut msgs);
             if stats.removed_images > 0 {
                 tracing::debug!(
                     filtered_images = stats.removed_images,
@@ -514,12 +526,31 @@ impl Agent {
                     "Filtered image content from outbound provider context (images.block_images=true)"
                 );
             }
+            Cow::Owned(msgs)
+        } else {
+            Cow::Borrowed(self.messages.as_slice())
+        };
+
+        // Borrow cached tool defs if available; otherwise build + cache + borrow.
+        if self.cached_tool_defs.is_none() {
+            let defs: Vec<ToolDef> = self
+                .tools
+                .tools()
+                .iter()
+                .map(|t| ToolDef {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters(),
+                })
+                .collect();
+            self.cached_tool_defs = Some(defs);
         }
+        let tools = Cow::Borrowed(self.cached_tool_defs.as_deref().unwrap());
 
         Context {
             system_prompt: self.config.system_prompt.clone(),
             messages,
-            tools: self.build_tool_defs(),
+            tools,
         }
     }
 
@@ -644,12 +675,13 @@ impl Agent {
         on_event(agent_start_event);
 
         for prompt in prompts {
-            self.messages.push(prompt.clone());
-            new_messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
             });
-            on_event(AgentEvent::MessageEnd { message: prompt });
+            self.messages.push(prompt.clone());
+            let end_msg = prompt.clone();
+            new_messages.push(prompt); // move, no clone
+            on_event(AgentEvent::MessageEnd { message: end_msg });
         }
 
         // Delivery boundary: start of turn (steering messages queued while idle).
@@ -671,12 +703,13 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
-                    self.messages.push(message.clone());
-                    new_messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
                     });
-                    on_event(AgentEvent::MessageEnd { message });
+                    self.messages.push(message.clone());
+                    let end_msg = message.clone();
+                    new_messages.push(message); // move, no clone
+                    on_event(AgentEvent::MessageEnd { message: end_msg });
                 }
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -734,13 +767,16 @@ impl Agent {
                         return Err(err);
                     }
                 };
-                last_assistant = Some(assistant_message.clone());
+                // Wrap in Arc once; share via Arc::clone (O(1)) instead of deep
+                // cloning the full AssistantMessage for every consumer.
+                let assistant_arc = Arc::new(assistant_message);
+                last_assistant = Some((*assistant_arc).clone());
 
-                let assistant_event_message = Message::assistant(assistant_message.clone());
+                let assistant_event_message = Message::Assistant(Arc::clone(&assistant_arc));
                 new_messages.push(assistant_event_message.clone());
 
                 if matches!(
-                    assistant_message.stop_reason,
+                    assistant_arc.stop_reason,
                     StopReason::Error | StopReason::Aborted
                 ) {
                     let turn_end_event = AgentEvent::TurnEnd {
@@ -755,18 +791,18 @@ impl Agent {
                     let agent_end_event = AgentEvent::AgentEnd {
                         session_id: session_id.clone(),
                         messages: std::mem::take(&mut new_messages),
-                        error: assistant_message.error_message.clone(),
+                        error: assistant_arc.error_message.clone(),
                     };
                     self.dispatch_extension_lifecycle_event(&agent_end_event)
                         .await;
                     on_event(agent_end_event);
-                    return Ok(assistant_message);
+                    return Ok(Arc::unwrap_or_clone(assistant_arc));
                 }
 
-                let tool_calls = extract_tool_calls(&assistant_message.content);
+                let tool_calls = extract_tool_calls(&assistant_arc.content);
                 has_more_tool_calls = !tool_calls.is_empty();
 
-                let mut tool_results: Vec<ToolResultMessage> = Vec::new();
+                let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
                 if has_more_tool_calls {
                     iterations += 1;
                     if iterations > self.config.max_tool_iterations {
@@ -774,7 +810,7 @@ impl Agent {
                             "Maximum tool iterations ({}) exceeded",
                             self.config.max_tool_iterations
                         );
-                        let mut stop_message = assistant_message.clone();
+                        let mut stop_message = (*assistant_arc).clone();
                         stop_message.stop_reason = StopReason::Error;
                         stop_message.error_message = Some(error_message.clone());
 
@@ -828,8 +864,7 @@ impl Agent {
 
                 let tool_messages = tool_results
                     .iter()
-                    .cloned()
-                    .map(Message::ToolResult)
+                    .map(|r| Message::ToolResult(Arc::clone(r)))
                     .collect::<Vec<_>>();
 
                 let turn_end_event = AgentEvent::TurnEnd {
@@ -933,11 +968,10 @@ impl Agent {
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
         // Build context and stream completion
+        let provider = Arc::clone(&self.provider);
+        let stream_options = self.config.stream_options.clone();
         let context = self.build_context();
-        let mut stream = self
-            .provider
-            .stream(&context, &self.config.stream_options)
-            .await?;
+        let mut stream = provider.stream(&context, &stream_options).await?;
 
         let mut added_partial = false;
         // Track whether we've already emitted `MessageStart` for this streaming response.
@@ -1391,47 +1425,43 @@ impl Agent {
                 tool_execution.await
             };
 
-            // Emit a final update so UIs can render tool output even if the tool
-            // doesn't stream incremental updates.
-            on_event(AgentEvent::ToolExecutionUpdate {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                args: tool_call.arguments.clone(),
-                partial_result: output.clone(),
-            });
-
-            // Decompose output: clone content/details for End event, move originals
-            // into ToolResultMessage to avoid an extra full-struct clone.
-            let end_result = ToolOutput {
-                content: output.content.clone(),
-                details: output.details.clone(),
-                is_error: output.is_error,
-            };
-            on_event(AgentEvent::ToolExecutionEnd {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                result: end_result,
-                is_error,
-            });
-
-            let tool_result = ToolResultMessage {
+            // Move content into Arc first, then clone from Arc for events.
+            let tool_result = Arc::new(ToolResultMessage {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
                 content: output.content,
                 details: output.details,
                 is_error,
                 timestamp: Utc::now().timestamp_millis(),
+            });
+
+            // Build event output by cloning from the Arc (one clone of content).
+            let event_output = ToolOutput {
+                content: tool_result.content.clone(),
+                details: tool_result.details.clone(),
+                is_error: tool_result.is_error,
             };
+            on_event(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+                partial_result: event_output.clone(),
+            });
+            on_event(AgentEvent::ToolExecutionEnd {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                result: event_output,
+                is_error,
+            });
 
-            self.messages.push(Message::ToolResult(tool_result.clone()));
-            new_messages.push(Message::ToolResult(tool_result.clone()));
-
+            let msg = Message::ToolResult(Arc::clone(&tool_result));
+            self.messages.push(msg.clone());
             on_event(AgentEvent::MessageStart {
-                message: Message::ToolResult(tool_result.clone()),
+                message: msg.clone(),
             });
-            on_event(AgentEvent::MessageEnd {
-                message: Message::ToolResult(tool_result.clone()),
-            });
+            let end_msg = msg.clone();
+            new_messages.push(msg); // move, no clone
+            on_event(AgentEvent::MessageEnd { message: end_msg });
 
             results.push(tool_result);
 
@@ -1604,7 +1634,7 @@ impl Agent {
         tool_call: &ToolCall,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         new_messages: &mut Vec<Message>,
-    ) -> ToolResultMessage {
+    ) -> Arc<ToolResultMessage> {
         let output = ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(
                 "Skipped due to queued user message.",
@@ -1631,24 +1661,23 @@ impl Agent {
             is_error: true,
         });
 
-        let tool_result = ToolResultMessage {
+        let tool_result = Arc::new(ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             content: output.content,
             details: output.details,
             is_error: true,
             timestamp: Utc::now().timestamp_millis(),
-        };
+        });
 
-        self.messages.push(Message::ToolResult(tool_result.clone()));
-        new_messages.push(Message::ToolResult(tool_result.clone()));
+        let msg = Message::ToolResult(Arc::clone(&tool_result));
+        self.messages.push(msg.clone());
+        new_messages.push(msg.clone());
 
         on_event(AgentEvent::MessageStart {
-            message: Message::ToolResult(tool_result.clone()),
+            message: msg.clone(),
         });
-        on_event(AgentEvent::MessageEnd {
-            message: Message::ToolResult(tool_result.clone()),
-        });
+        on_event(AgentEvent::MessageEnd { message: msg });
 
         tool_result
     }
@@ -1659,7 +1688,7 @@ impl Agent {
 // ============================================================================
 
 struct ToolExecutionOutcome {
-    tool_results: Vec<ToolResultMessage>,
+    tool_results: Vec<Arc<ToolResultMessage>>,
     steering_messages: Option<Vec<Message>>,
 }
 
@@ -3990,11 +4019,13 @@ mod turn_event_tests {
                 panic!("missing first turn tool results");
             };
             assert_eq!(first_turn_tool_results.len(), 1);
-            assert!(matches!(
-                first_turn_tool_results.first(),
-                Some(Message::ToolResult(ToolResultMessage { tool_name, is_error, .. }))
-                    if tool_name == "echo_tool" && !*is_error
-            ));
+            let first_result = first_turn_tool_results.first().unwrap();
+            if let Message::ToolResult(tr) = first_result {
+                assert_eq!(tr.tool_name, "echo_tool");
+                assert!(!tr.is_error);
+            } else {
+                panic!("expected ToolResult message");
+            }
             drop(events);
         });
     }
@@ -4888,7 +4919,9 @@ fn filter_images_from_message(message: &mut Message) -> usize {
             let assistant = Arc::make_mut(assistant);
             filter_image_blocks(&mut assistant.content)
         }
-        Message::ToolResult(tool_result) => filter_image_blocks(&mut tool_result.content),
+        Message::ToolResult(tool_result) => {
+            filter_image_blocks(&mut Arc::make_mut(tool_result).content)
+        }
         Message::Custom(_) => 0,
     }
 }
@@ -5115,7 +5148,7 @@ mod tests {
                 error_message: None,
                 timestamp: 0,
             })),
-            Message::ToolResult(ToolResultMessage {
+            Message::tool_result(ToolResultMessage {
                 tool_call_id: "tc1".to_string(),
                 tool_name: "read".to_string(),
                 content: vec![

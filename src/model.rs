@@ -26,7 +26,11 @@ pub enum Message {
     /// copy-on-write when the refcount is 1.
     Assistant(Arc<AssistantMessage>),
     /// Tool result produced by the host after executing a tool call.
-    ToolResult(ToolResultMessage),
+    ///
+    /// Wrapped in [`Arc`] for cheap cloning – tool results often contain large
+    /// file contents from the `read` tool and are cloned multiple times during
+    /// event dispatch and session persistence.
+    ToolResult(Arc<ToolResultMessage>),
     /// Host/extension-defined message type.
     Custom(CustomMessage),
 }
@@ -94,6 +98,11 @@ impl Message {
     /// Convenience constructor: wraps an [`AssistantMessage`] in [`Arc`].
     pub fn assistant(msg: AssistantMessage) -> Self {
         Self::Assistant(Arc::new(msg))
+    }
+
+    /// Convenience constructor: wraps a [`ToolResultMessage`] in [`Arc`].
+    pub fn tool_result(msg: ToolResultMessage) -> Self {
+        Self::ToolResult(Arc::new(msg))
     }
 }
 
@@ -722,7 +731,7 @@ mod tests {
 
     #[test]
     fn message_tool_result_roundtrip() {
-        let msg = Message::ToolResult(ToolResultMessage {
+        let msg = Message::tool_result(ToolResultMessage {
             tool_call_id: "call_1".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],
@@ -1566,7 +1575,7 @@ mod tests {
             (user_content_strategy(), any::<i64>())
                 .prop_map(|(content, timestamp)| Message::User(UserMessage { content, timestamp })),
             assistant_message_strategy().prop_map(|m| Message::Assistant(Arc::new(m))),
-            tool_result_message_strategy().prop_map(Message::ToolResult),
+            tool_result_message_strategy().prop_map(|m| Message::ToolResult(Arc::new(m))),
             custom_message_strategy().prop_map(Message::Custom),
         ]
     }

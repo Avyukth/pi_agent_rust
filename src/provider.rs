@@ -13,6 +13,7 @@ use crate::model::{Message, ThinkingLevel};
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
 
@@ -41,7 +42,7 @@ pub trait Provider: Send + Sync {
     /// stop promptly when the request is cancelled.
     async fn stream(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         options: &StreamOptions,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>;
 }
@@ -54,14 +55,44 @@ pub trait Provider: Send + Sync {
 ///
 /// The agent loop builds a `Context` from the current session state and tool registry, then hands
 /// it to a [`Provider`] implementation to perform provider-specific request encoding.
-#[derive(Debug, Clone, Default)]
-pub struct Context {
+///
+/// Uses [`Cow`] for `messages` and `tools` to avoid deep-cloning the full conversation history on
+/// every turn when no mutation is needed (the common case).
+#[derive(Debug, Clone)]
+pub struct Context<'a> {
     /// Provider-specific system prompt content.
     pub system_prompt: Option<String>,
     /// Conversation history (user/assistant/tool results).
-    pub messages: Vec<Message>,
+    pub messages: Cow<'a, [Message]>,
     /// Tool definitions available to the model for this request.
-    pub tools: Vec<ToolDef>,
+    pub tools: Cow<'a, [ToolDef]>,
+}
+
+impl Default for Context<'_> {
+    fn default() -> Self {
+        Self {
+            system_prompt: None,
+            messages: Cow::Owned(Vec::new()),
+            tools: Cow::Owned(Vec::new()),
+        }
+    }
+}
+
+impl Context<'_> {
+    /// Create a `Context` with fully-owned data (no borrowing).
+    ///
+    /// Convenient for tests and one-off callers that already have owned vectors.
+    pub fn owned(
+        system_prompt: Option<String>,
+        messages: Vec<Message>,
+        tools: Vec<ToolDef>,
+    ) -> Context<'static> {
+        Context {
+            system_prompt,
+            messages: Cow::Owned(messages),
+            tools: Cow::Owned(tools),
+        }
+    }
 }
 
 // ============================================================================

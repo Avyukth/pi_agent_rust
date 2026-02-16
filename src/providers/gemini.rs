@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_convert_tool_result_success() {
-        let message = Message::ToolResult(crate::model::ToolResultMessage {
+        let message = Message::tool_result(crate::model::ToolResultMessage {
             tool_call_id: "call_123".to_string(),
             tool_name: "read".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("file contents here"))],
@@ -1170,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_convert_tool_result_error() {
-        let message = Message::ToolResult(crate::model::ToolResultMessage {
+        let message = Message::tool_result(crate::model::ToolResultMessage {
             tool_call_id: "call_456".to_string(),
             tool_name: "bash".to_string(),
             content: vec![ContentBlock::Text(TextContent::new("command not found"))],
@@ -1306,7 +1306,7 @@ mod tests {
                     error_message: None,
                     timestamp: 1,
                 }),
-                Message::ToolResult(crate::model::ToolResultMessage {
+                Message::tool_result(crate::model::ToolResultMessage {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "read".to_string(),
                     content: vec![ContentBlock::Text(TextContent::new("file contents"))],

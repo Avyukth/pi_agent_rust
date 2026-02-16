@@ -479,7 +479,7 @@ pub(crate) fn tool_result_message(
     content: &str,
     is_error: bool,
 ) -> Message {
-    Message::ToolResult(ToolResultMessage {
+    Message::ToolResult(std::sync::Arc::new(ToolResultMessage {
         tool_call_id: tool_call_id.to_string(),
         tool_name: tool_name.to_string(),
         content: vec![ContentBlock::Text(pi::model::TextContent::new(
@@ -488,7 +488,7 @@ pub(crate) fn tool_result_message(
         details: None,
         is_error,
         timestamp: 0,
-    })
+    }))
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {

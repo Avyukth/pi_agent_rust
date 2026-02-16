@@ -1487,7 +1487,7 @@ mod tests {
                     error_message: None,
                     timestamp: 1,
                 }),
-                Message::ToolResult(crate::model::ToolResultMessage {
+                Message::tool_result(crate::model::ToolResultMessage {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "read".to_string(),
                     content: vec![ContentBlock::Text(TextContent::new("file contents"))],
