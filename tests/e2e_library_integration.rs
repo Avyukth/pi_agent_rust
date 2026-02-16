@@ -7,8 +7,9 @@ mod common;
 
 use common::TestHarness;
 use pi::extensions::{ExtensionManager, ExtensionRegion};
-use pi::theme::Theme;
+use pi::theme::{Theme, looks_like_theme_path};
 use pi::tui::PiConsole;
+use proptest::prelude::*;
 use std::fmt::Write;
 use std::time::Duration;
 
@@ -426,6 +427,58 @@ fn theme_round_trip_serialization() {
         assert_eq!(roundtripped.colors.accent, theme.colors.accent);
         assert_eq!(roundtripped.syntax.keyword, theme.syntax.keyword);
         assert_eq!(roundtripped.ui.border, theme.ui.border);
+    }
+}
+
+proptest! {
+    #[test]
+    fn prop_theme_path_detects_json_suffix(
+        stem in "[A-Za-z0-9_-]{1,24}",
+        left_ws in "[ \\t]{0,2}",
+        right_ws in "[ \\t]{0,2}",
+    ) {
+        let spec = format!("{left_ws}{stem}.json{right_ws}");
+        prop_assert!(looks_like_theme_path(&spec));
+    }
+
+    #[test]
+    fn prop_theme_path_detects_directory_separators(
+        left in "[A-Za-z0-9_-]{1,12}",
+        right in "[A-Za-z0-9_-]{1,12}",
+        use_backslash in any::<bool>(),
+    ) {
+        let separator = if use_backslash { "\\" } else { "/" };
+        let spec = format!("{left}{separator}{right}");
+        prop_assert!(looks_like_theme_path(&spec));
+    }
+
+    #[test]
+    fn prop_plain_theme_names_are_not_treated_as_paths(
+        name in "[A-Za-z][A-Za-z0-9_-]{0,31}",
+        left_ws in "[ \\t]{0,2}",
+        right_ws in "[ \\t]{0,2}",
+    ) {
+        let spec = format!("{left_ws}{name}{right_ws}");
+        prop_assert!(!looks_like_theme_path(&spec));
+    }
+
+    #[test]
+    fn prop_builtin_theme_serde_and_glamour_mapping(which in 0u8..=2u8) {
+        let theme = match which {
+            0 => Theme::dark(),
+            1 => Theme::light(),
+            _ => Theme::solarized(),
+        };
+
+        let json = serde_json::to_string(&theme).unwrap();
+        let parsed: Theme = serde_json::from_str(&json).unwrap();
+        let config = parsed.glamour_style_config();
+
+        prop_assert_eq!(parsed.name, theme.name);
+        prop_assert_eq!(parsed.colors.background, theme.colors.background);
+        prop_assert_eq!(config.document.style.color.as_deref(), Some(parsed.colors.foreground.as_str()));
+        prop_assert_eq!(config.link.color.as_deref(), Some(parsed.colors.accent.as_str()));
+        prop_assert_eq!(config.code.style.color.as_deref(), Some(parsed.syntax.string.as_str()));
     }
 }
 

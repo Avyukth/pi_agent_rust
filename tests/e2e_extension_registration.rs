@@ -713,8 +713,12 @@ fn e2e_multiple_extensions_loaded() {
     let harness = common::TestHarness::new("e2e_multiple_extensions_loaded");
     let cwd = harness.temp_dir().to_path_buf();
 
+    // Place each extension in its own directory (not a shared "extensions/"
+    // directory) so that `discover_extensions_dir_entries` does not
+    // auto-bundle sibling files under a single extension_id, which would
+    // cause a command-name collision when the second spec is loaded.
     let ext_a_path = harness.create_file(
-        "extensions/ext_a.mjs",
+        "ext_a/ext_a.mjs",
         br#"
 export default function init(pi) {
   pi.registerCommand("from-a", {
@@ -725,7 +729,7 @@ export default function init(pi) {
 "#,
     );
     let ext_b_path = harness.create_file(
-        "extensions/ext_b.mjs",
+        "ext_b/ext_b.mjs",
         br#"
 export default function init(pi) {
   pi.registerCommand("from-b", {
@@ -740,8 +744,8 @@ export default function init(pi) {
 }
 "#,
     );
-    harness.record_artifact("extensions/ext_a.mjs", &ext_a_path);
-    harness.record_artifact("extensions/ext_b.mjs", &ext_b_path);
+    harness.record_artifact("ext_a/ext_a.mjs", &ext_a_path);
+    harness.record_artifact("ext_b/ext_b.mjs", &ext_b_path);
 
     let spec_a = JsExtensionLoadSpec::from_entry_path(&ext_a_path).expect("spec a");
     let spec_b = JsExtensionLoadSpec::from_entry_path(&ext_b_path).expect("spec b");

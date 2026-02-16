@@ -15,6 +15,7 @@
 
 use pi::extension_popularity::CandidatePool;
 use pi::extension_validation::*;
+use proptest::prelude::*;
 use std::fs;
 
 // ====================================================================
@@ -975,4 +976,91 @@ fn multiple_npm_packages_from_same_repo_merge() {
     let aliases = &matching[0].aliases;
     assert!(aliases.contains(&"npm:@oh-my-pi/lsp".to_string()));
     assert!(aliases.contains(&"npm:@oh-my-pi/exa".to_string()));
+}
+
+// ====================================================================
+// Property tests
+// ====================================================================
+
+proptest! {
+    #[test]
+    fn prop_canonical_id_from_npm_trims_and_lowercases(
+        raw in "[A-Za-z0-9@/_. -]{1,64}"
+    ) {
+        let canonical = canonical_id_from_npm(&raw);
+        let expected_suffix = raw.trim().to_lowercase();
+        prop_assert!(canonical.starts_with("npm:"));
+        prop_assert_eq!(canonical, format!("npm:{expected_suffix}"));
+    }
+
+    #[test]
+    fn prop_normalize_github_repo_strips_dot_git_and_whitespace(
+        owner in "[A-Za-z0-9._-]{1,16}",
+        repo in "[A-Za-z0-9._-]{1,16}",
+        with_dot_git in any::<bool>(),
+        with_padding in any::<bool>(),
+    ) {
+        let mut input = format!("{owner}/{repo}");
+        if with_dot_git {
+            input.push_str(".git");
+        }
+        if with_padding {
+            input = format!("  {input}  ");
+        }
+
+        let normalized = normalize_github_repo(&input);
+        let expected = format!("{}/{}", owner.to_lowercase(), repo.to_lowercase());
+        let has_dot_git_suffix = normalized.ends_with(".git");
+        prop_assert_eq!(normalized, expected);
+        prop_assert!(!has_dot_git_suffix);
+    }
+
+    #[test]
+    fn prop_classify_true_extension_when_import_plus_export_or_registration(
+        has_export_default in any::<bool>(),
+        registrations in proptest::collection::vec("[A-Za-z]{1,12}", 0..4),
+    ) {
+        prop_assume!(has_export_default || !registrations.is_empty());
+        let evidence = ValidationEvidence {
+            has_api_import: true,
+            has_export_default,
+            registrations,
+            sources: vec!["prop".to_string()],
+            reason: "property".to_string(),
+        };
+        prop_assert_eq!(classify_from_evidence(&evidence), ValidationStatus::TrueExtension);
+    }
+
+    #[test]
+    fn prop_classify_unknown_requires_no_signals(_dummy in any::<u8>()) {
+        let evidence = ValidationEvidence {
+            has_api_import: false,
+            has_export_default: false,
+            registrations: Vec::new(),
+            sources: vec!["prop".to_string()],
+            reason: "property".to_string(),
+        };
+        prop_assert_eq!(classify_from_evidence(&evidence), ValidationStatus::Unknown);
+    }
+
+    #[test]
+    fn prop_classify_source_content_registration_signal_promotes_true_extension(
+        method in prop_oneof![
+            Just("registerTool"),
+            Just("registerCommand"),
+            Just("registerProvider"),
+            Just("registerShortcut"),
+            Just("registerFlag"),
+            Just("registerMessageRenderer"),
+        ],
+    ) {
+        let content = format!(
+            "import type {{ ExtensionAPI }} from \"@mariozechner/pi-coding-agent\";\n\
+             const api: ExtensionAPI = {{}} as ExtensionAPI;\n\
+             api.{method}({{}});\n"
+        );
+        let (status, evidence) = classify_source_content(&content);
+        prop_assert_eq!(status, ValidationStatus::TrueExtension);
+        prop_assert!(evidence.registrations.iter().any(|entry| entry == method));
+    }
 }
