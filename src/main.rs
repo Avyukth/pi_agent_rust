@@ -727,8 +727,8 @@ async fn run(
         let pre_ext_policy = config
             .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
             .policy;
-        let pre_repair_policy = config
-            .resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
+        let pre_repair_policy =
+            config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
         let effective_repair = if pre_repair_policy.source == "default" {
             pi::extensions::RepairPolicyMode::AutoStrict
         } else {
@@ -741,8 +741,7 @@ async fn run(
         let resolved_risk = config.resolve_extension_risk_with_metadata();
         pre_mgr.set_runtime_risk_config(resolved_risk.settings);
 
-        let memory_limit =
-            (pre_ext_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
+        let memory_limit = (pre_ext_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
         let cwd_str = cwd.display().to_string();
         let mgr_for_boot = pre_mgr.clone();
         let tools_for_boot = Arc::clone(&pre_tools);
@@ -1106,7 +1105,10 @@ async fn run(
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth.clone());
 
-    if mode == "rpc" {
+    // Clone session handle for shutdown flush (ensures autosave queue is drained).
+    let session_handle = Arc::clone(&agent_session.session);
+
+    let result = if mode == "rpc" {
         let available_models = model_registry.get_available();
         let rpc_scoped_models = selection
             .scoped_models
@@ -1116,7 +1118,7 @@ async fn run(
                 thinking_level: sm.thinking_level,
             })
             .collect::<Vec<_>>();
-        return run_rpc_mode(
+        run_rpc_mode(
             agent_session,
             resources,
             config.clone(),
@@ -1125,10 +1127,8 @@ async fn run(
             auth.clone(),
             runtime_handle.clone(),
         )
-        .await;
-    }
-
-    if is_interactive {
+        .await
+    } else if is_interactive {
         let model_scope = selection
             .scoped_models
             .iter()
@@ -1136,7 +1136,7 @@ async fn run(
             .collect::<Vec<_>>();
         let available_models = model_registry.get_available();
 
-        return run_interactive_mode(
+        run_interactive_mode(
             agent_session,
             initial,
             messages,
@@ -1150,19 +1150,29 @@ async fn run(
             cwd.clone(),
             runtime_handle.clone(),
         )
-        .await;
+        .await
+    } else {
+        run_print_mode(
+            &mut agent_session,
+            &mode,
+            initial,
+            messages,
+            &resources,
+            runtime_handle.clone(),
+            &config,
+        )
+        .await
+    };
+
+    // Best-effort autosave flush on shutdown.
+    let cx = pi::agent_cx::AgentCx::for_request();
+    if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
+        if let Err(e) = guard.flush_autosave_on_shutdown().await {
+            eprintln!("Warning: Failed to flush session autosave: {e}");
+        }
     }
 
-    run_print_mode(
-        &mut agent_session,
-        &mode,
-        initial,
-        messages,
-        &resources,
-        runtime_handle.clone(),
-        &config,
-    )
-    .await
+    result
 }
 
 async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {

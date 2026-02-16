@@ -959,11 +959,14 @@ impl SessionStoreV2 {
                                 .set_len(byte_offset)?;
                             break;
                         }
-                        return Err(Error::session(format!(
-                            "failed to parse segment frame while rebuilding index {}:{}: {err}",
-                            seg_path.display(),
-                            line_number
-                        )));
+                        tracing::warn!(
+                            segment = %seg_path.display(),
+                            line_number,
+                            error = %err,
+                            "Skipping corrupt segment frame during index rebuild"
+                        );
+                        byte_offset = byte_offset.saturating_add(line_len);
+                        continue;
                     }
                 };
 

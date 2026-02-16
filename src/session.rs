@@ -24,6 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -528,7 +529,7 @@ impl AutosaveQueue {
 // ============================================================================
 
 /// A session manages conversation state and persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Session {
     /// Session header
     pub header: SessionHeader,
@@ -562,7 +563,9 @@ pub struct Session {
 
     // -- Incremental append state --
     /// Number of entries already persisted to disk (high-water mark).
-    persisted_entry_count: usize,
+    /// Uses Arc<AtomicUsize> to allow atomic updates from detached background threads,
+    /// ensuring state consistency even if the save future is dropped/cancelled.
+    persisted_entry_count: Arc<AtomicUsize>,
     /// True when header was modified since last save (forces full rewrite).
     header_dirty: bool,
     /// Incremental appends since last full rewrite (checkpoint counter).
@@ -573,6 +576,37 @@ pub struct Session {
     v2_partial_hydration: bool,
     /// Resume mode used when loading from V2 sidecar.
     v2_resume_mode: Option<V2OpenMode>,
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            entries: self.entries.clone(),
+            path: self.path.clone(),
+            leaf_id: self.leaf_id.clone(),
+            session_dir: self.session_dir.clone(),
+            store_kind: self.store_kind,
+            entry_ids: self.entry_ids.clone(),
+            is_linear: self.is_linear,
+            entry_index: self.entry_index.clone(),
+            cached_message_count: self.cached_message_count,
+            cached_name: self.cached_name.clone(),
+            autosave_queue: self.autosave_queue.clone(),
+            autosave_durability: self.autosave_durability,
+            // Deep copy the atomic value to preserve value semantics for clones.
+            // If we just cloned the Arc, a save on the clone would increment the
+            // counter on the original, desynchronizing it from its own entries.
+            persisted_entry_count: Arc::new(AtomicUsize::new(
+                self.persisted_entry_count.load(Ordering::SeqCst),
+            )),
+            header_dirty: self.header_dirty,
+            appends_since_checkpoint: self.appends_since_checkpoint,
+            v2_sidecar_root: self.v2_sidecar_root.clone(),
+            v2_partial_hydration: self.v2_partial_hydration,
+            v2_resume_mode: self.v2_resume_mode,
+        }
+    }
 }
 
 /// Result of planning a `/fork` operation from a specific user message.
@@ -941,7 +975,7 @@ impl Session {
             cached_name: None,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
-            persisted_entry_count: 0,
+            persisted_entry_count: Arc::new(AtomicUsize::new(0)),
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -979,7 +1013,7 @@ impl Session {
             cached_name: None,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
-            persisted_entry_count: 0,
+            persisted_entry_count: Arc::new(AtomicUsize::new(0)),
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -1112,7 +1146,7 @@ impl Session {
                 cached_name: finalized.name,
                 autosave_queue: AutosaveQueue::new(),
                 autosave_durability: AutosaveDurabilityMode::from_env(),
-                persisted_entry_count: entry_count,
+                persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
                 header_dirty: false,
                 appends_since_checkpoint: 0,
                 v2_sidecar_root: None,
@@ -1176,7 +1210,7 @@ impl Session {
             cached_name: finalized.name,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
-            persisted_entry_count: entry_count,
+            persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -1341,7 +1375,7 @@ impl Session {
             return Ok(());
         };
 
-        let pending_start = self.persisted_entry_count.min(self.entries.len());
+        let pending_start = self.persisted_entry_count.load(Ordering::SeqCst).min(self.entries.len());
         let pending_entries = self.entries[pending_start..].to_vec();
         let previous_mode = self.v2_resume_mode;
 
@@ -1369,7 +1403,7 @@ impl Session {
         self.entry_index = finalized.entry_index;
         self.cached_message_count = finalized.message_count;
         self.cached_name = finalized.name;
-        self.persisted_entry_count = persisted_entry_count;
+        self.persisted_entry_count.store(persisted_entry_count, Ordering::SeqCst);
         self.v2_partial_hydration = false;
         self.v2_resume_mode = Some(V2OpenMode::Full);
 
@@ -1386,7 +1420,7 @@ impl Session {
     /// Returns `true` when a full rewrite is required instead of incremental append.
     fn should_full_rewrite(&self) -> bool {
         // First save — no file exists yet.
-        if self.persisted_entry_count == 0 {
+        if self.persisted_entry_count.load(Ordering::SeqCst) == 0 {
             return true;
         }
         // Header was modified since last save.
@@ -1398,11 +1432,11 @@ impl Session {
             return true;
         }
         // Defensive: if persisted count somehow exceeds entries, force full rewrite.
-        if self.persisted_entry_count > self.entries.len() {
+        if self.persisted_entry_count.load(Ordering::SeqCst) > self.entries.len() {
             return true;
         }
         // Any new entry is a Compaction (dead entries before marker need rewriting).
-        self.entries[self.persisted_entry_count..]
+        self.entries[self.persisted_entry_count.load(Ordering::SeqCst)..]
             .iter()
             .any(|e| matches!(e, SessionEntry::Compaction(_)))
     }
@@ -1543,7 +1577,7 @@ impl Session {
                         Ok(entries) => {
                             self.entries = entries;
                             self.rebuild_all_caches();
-                            self.persisted_entry_count = self.entries.len();
+                            self.persisted_entry_count.store(self.entries.len(), Ordering::SeqCst);
                             self.header_dirty = false;
                             self.appends_since_checkpoint = 0;
                             Ok(())
@@ -1556,7 +1590,7 @@ impl Session {
                     }?;
                 } else {
                     // === Incremental append path ===
-                    let new_start = self.persisted_entry_count;
+                    let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
                         // Pre-serialize new entries on the main thread (typically 1-3 entries).
                         let mut serialized_bytes = Vec::new();
@@ -1603,7 +1637,7 @@ impl Session {
                             .map_err(|_| crate::Error::session("Append task cancelled"))?;
 
                         if result.is_ok() {
-                            self.persisted_entry_count = new_count;
+                            self.persisted_entry_count.store(new_count, Ordering::SeqCst);
                             self.appends_since_checkpoint += 1;
                         }
                         result?;
@@ -1620,12 +1654,12 @@ impl Session {
                     // === Full rewrite path (first save, header change, compaction, checkpoint) ===
                     crate::session_sqlite::save_session(&path_clone, &self.header, &self.entries)
                         .await?;
-                    self.persisted_entry_count = self.entries.len();
+                    self.persisted_entry_count.store(self.entries.len(), Ordering::SeqCst);
                     self.header_dirty = false;
                     self.appends_since_checkpoint = 0;
                 } else {
                     // === Incremental append path ===
-                    let new_start = self.persisted_entry_count;
+                    let new_start = self.persisted_entry_count.load(Ordering::SeqCst);
                     if new_start < self.entries.len() {
                         crate::session_sqlite::append_entries(
                             &path_clone,
@@ -1635,7 +1669,7 @@ impl Session {
                             session_name.as_deref(),
                         )
                         .await?;
-                        self.persisted_entry_count = self.entries.len();
+                        self.persisted_entry_count.store(self.entries.len(), Ordering::SeqCst);
                         self.appends_since_checkpoint += 1;
                     }
                     // No new entries → no-op, nothing to write.
@@ -3512,7 +3546,7 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             cached_name: finalized.name,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
-            persisted_entry_count: entry_count,
+            persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
             header_dirty: false,
             appends_since_checkpoint: 0,
             v2_sidecar_root: None,
@@ -7090,7 +7124,7 @@ mod tests {
         session.append_message(make_test_message("msg B"));
         run_async(async { session.save().await }).unwrap();
 
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
         assert_eq!(session.appends_since_checkpoint, 0);
 
         let path = session.path.clone().unwrap();
@@ -7102,7 +7136,7 @@ mod tests {
         session.append_message(make_test_message("msg C"));
         run_async(async { session.save().await }).unwrap();
 
-        assert_eq!(session.persisted_entry_count, 3);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 3);
         assert_eq!(session.appends_since_checkpoint, 1);
 
         let lines_after_second = std::fs::read_to_string(&path).unwrap().lines().count();
@@ -7118,7 +7152,7 @@ mod tests {
 
         session.append_message(make_test_message("msg A"));
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
         assert!(!session.header_dirty);
 
         // Modify header.
@@ -7129,7 +7163,7 @@ mod tests {
         run_async(async { session.save().await }).unwrap();
 
         // Full rewrite resets all counters.
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
         assert!(!session.header_dirty);
         assert_eq!(session.appends_since_checkpoint, 0);
 
@@ -7153,7 +7187,7 @@ mod tests {
 
         let id_a = session.append_message(make_test_message("msg A"));
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         // Append a compaction entry — should force full rewrite.
         session.append_compaction("summary".to_string(), id_a, 100, None, None);
@@ -7162,7 +7196,7 @@ mod tests {
         run_async(async { session.save().await }).unwrap();
 
         // Full rewrite: counters reset.
-        assert_eq!(session.persisted_entry_count, 3);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 3);
         assert_eq!(session.appends_since_checkpoint, 0);
     }
 
@@ -7186,7 +7220,7 @@ mod tests {
 
         // Full rewrite resets counters.
         assert_eq!(session.appends_since_checkpoint, 0);
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -7244,7 +7278,7 @@ mod tests {
         let loaded =
             run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
 
-        assert_eq!(loaded.persisted_entry_count, 3);
+        assert_eq!(loaded.persisted_entry_count.load(Ordering::SeqCst), 3);
         assert!(!loaded.header_dirty);
         assert_eq!(loaded.appends_since_checkpoint, 0);
     }
@@ -7272,7 +7306,7 @@ mod tests {
             mtime_before, mtime_after,
             "file should not be modified on no-op save"
         );
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -7740,12 +7774,12 @@ mod tests {
         session.append_message(make_test_message("msg A"));
         run_async(async { session.save().await }).unwrap();
 
-        session.persisted_entry_count = 999;
+        session.persisted_entry_count.store(999, Ordering::SeqCst);
         assert!(session.should_full_rewrite());
 
         session.append_message(make_test_message("msg B"));
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
         assert_eq!(session.appends_since_checkpoint, 0);
     }
 
@@ -7757,7 +7791,7 @@ mod tests {
 
         session.append_message(make_test_message("msg A"));
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         let path = session.path.clone().unwrap();
         session.append_message(make_test_message("msg B"));
@@ -7781,10 +7815,10 @@ mod tests {
         }
 
         assert!(result.is_err());
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -7948,7 +7982,7 @@ mod tests {
             run_async(async { session.save().await }).unwrap();
         }
 
-        assert_eq!(session.persisted_entry_count, 11);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 11);
         assert_eq!(session.appends_since_checkpoint, 10);
 
         let path = session.path.clone().unwrap();
@@ -7980,6 +8014,31 @@ mod tests {
     }
 
     #[test]
+    fn test_clone_has_independent_persisted_entry_count() {
+        let mut session = Session::create();
+        // Set initial count
+        session.persisted_entry_count.store(10, Ordering::SeqCst);
+
+        // Clone the session
+        let mut clone = session.clone();
+
+        // Verify clone sees initial value
+        assert_eq!(clone.persisted_entry_count.load(Ordering::SeqCst), 10);
+
+        // Update original
+        session.persisted_entry_count.store(20, Ordering::SeqCst);
+
+        // Verify clone is UNCHANGED (independent atomic)
+        assert_eq!(clone.persisted_entry_count.load(Ordering::SeqCst), 10);
+
+        // Update clone
+        clone.persisted_entry_count.store(30, Ordering::SeqCst);
+
+        // Verify original is UNCHANGED
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 20);
+    }
+
+    #[test]
     fn crash_append_retry_after_transient_failure() {
         let temp_dir = tempfile::tempdir().unwrap();
         let mut session = Session::create();
@@ -8003,7 +8062,7 @@ mod tests {
 
         let result = run_async(async { session.save().await });
         assert!(result.is_err());
-        assert_eq!(session.persisted_entry_count, 1);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         #[cfg(unix)]
         {
@@ -8012,7 +8071,7 @@ mod tests {
         }
 
         run_async(async { session.save().await }).unwrap();
-        assert_eq!(session.persisted_entry_count, 2);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);
 
         let loaded =
             run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
