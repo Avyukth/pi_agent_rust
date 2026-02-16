@@ -815,14 +815,15 @@ impl PiApp {
             }
 
             let cx = Cx::for_request();
-            let mut agent_guard = match agent.lock(&cx).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
-                    return;
-                }
-            };
+            let mut agent_guard =
+                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        return;
+                    }
+                };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -911,14 +912,15 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
-            let mut session_guard = match session.lock(&cx).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
-                    return;
-                }
-            };
+            let mut session_guard =
+                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
@@ -1097,14 +1099,15 @@ impl PiApp {
             }
 
             let cx = Cx::for_request();
-            let mut agent_guard = match agent.lock(&cx).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
-                    return;
-                }
-            };
+            let mut agent_guard =
+                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        return;
+                    }
+                };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -1276,14 +1279,15 @@ impl PiApp {
                 agent_guard.messages()[previous_len..].to_vec();
             drop(agent_guard);
 
-            let mut session_guard = match session.lock(&cx).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
-                    return;
-                }
-            };
+            let mut session_guard =
+                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
             for message in new_messages {
                 session_guard.append_model_message(message);
             }

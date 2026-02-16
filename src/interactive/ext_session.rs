@@ -75,7 +75,8 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         let _ = message.trigger_turn;
         self.append_to_session(custom_message.clone()).await?;
 
-        if let Ok(mut agent_guard) = self.agent.try_lock() {
+        let cx = Cx::for_request();
+        if let Ok(mut agent_guard) = self.agent.lock(&cx).await {
             agent_guard.add_message(custom_message.clone());
         }
 

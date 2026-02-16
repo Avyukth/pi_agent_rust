@@ -93,39 +93,39 @@ fi
 
 log() {
   [ "$QUIET" -eq 1 ] && return 0
-  echo -e "$*"
+  echo -e "$*" >&2
 }
 
 info() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 39 "→ $*"
+    gum style --foreground 39 "→ $*" >&2
   else
-    echo -e "\033[0;34m→\033[0m $*"
+    echo -e "\033[0;34m→\033[0m $*" >&2
   fi
 }
 
 ok() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 42 "✓ $*"
+    gum style --foreground 42 "✓ $*" >&2
   else
-    echo -e "\033[0;32m✓\033[0m $*"
+    echo -e "\033[0;32m✓\033[0m $*" >&2
   fi
 }
 
 warn() {
   [ "$QUIET" -eq 1 ] && return 0
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 214 "⚠ $*"
+    gum style --foreground 214 "⚠ $*" >&2
   else
-    echo -e "\033[1;33m⚠\033[0m $*"
+    echo -e "\033[1;33m⚠\033[0m $*" >&2
   fi
 }
 
 err() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "✗ $*"
+    gum style --foreground 196 "✗ $*" >&2
   else
     echo -e "\033[0;31m✗\033[0m $*" >&2
   fi
@@ -137,9 +137,20 @@ run_with_spinner() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
-    info "$title"
+    # Keep status text off stdout so callers can safely capture command output.
+    info "$title" >&2
     "$@"
   fi
+}
+
+pi_ascii_logo() {
+  cat <<'ASCII'
+ ____  _   ____            _
+|  _ \(_) |  _ \ _   _ ___| |_
+| |_) | | | |_) | | | / __| __|
+|  __/| | |  _ <| |_| \__ \ |_
+|_|   |_| |_| \_\\__,_|___/\__|
+ASCII
 }
 
 usage() {
@@ -160,7 +171,7 @@ Options:
   --verify               Run `pi --version` after install
   --no-verify            Skip checksum + signature verification
   --offline              Skip network preflight check
-  --completions SHELL    Install shell completions for bash|zsh|fish
+  --completions SHELL    Install shell completions for auto|bash|zsh|fish
   --no-completions       Skip shell completion installation
   --yes, -y              Non-interactive yes to prompts
   --adopt                Auto-adopt Rust as canonical `pi` when TS pi is detected
@@ -276,18 +287,25 @@ done
 
 show_header() {
   [ "$QUIET" -eq 1 ] && return 0
+  local logo
+  logo="$(pi_ascii_logo)"
+
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style \
-      --border normal \
-      --border-foreground 39 \
-      --padding "0 1" \
+      --border double \
+      --border-foreground 51 \
+      --padding "1 2" \
       --margin "1 0" \
-      "$(gum style --foreground 42 --bold 'pi installer')" \
-      "$(gum style --foreground 245 'Rust CLI install + TS migration assistant')"
+      "$(gum style --foreground 51 --bold "$logo")" \
+      "$(gum style --foreground 42 --bold 'Pi Rust Installer')" \
+      "$(gum style --foreground 245 'High-performance coding agent CLI')" \
+      "$(gum style --foreground 244 'Install + verify + TypeScript migration helper')"
   else
     echo ""
-    echo -e "\033[1;32mpi installer\033[0m"
-    echo -e "\033[0;90mRust CLI install + TS migration assistant\033[0m"
+    printf '\033[1;36m%s\033[0m\n' "$logo"
+    echo -e "\033[1;32mPi Rust Installer\033[0m"
+    echo -e "\033[0;37mHigh-performance coding agent CLI\033[0m"
+    echo -e "\033[0;90mInstall + verify + TypeScript migration helper\033[0m"
     echo ""
   fi
 }
@@ -550,6 +568,15 @@ validate_options() {
   if [ "$NO_VERIFY" -eq 1 ] && { [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ] || [ -n "$SIGSTORE_BUNDLE_URL" ]; }; then
     warn "--no-verify set; checksum/signature override flags are ignored"
   fi
+
+  if [ -n "$CHECKSUM" ] && [[ ! "$CHECKSUM" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    err "--checksum must be a 64-character hex SHA256 digest"
+    exit 1
+  fi
+
+  if [ -n "$CHECKSUM" ] && [ -n "$CHECKSUM_URL" ]; then
+    warn "Both --checksum and --checksum-url provided; --checksum takes precedence"
+  fi
 }
 
 check_dependencies() {
@@ -785,21 +812,27 @@ verify_download_checksum() {
 
   local checksum_file="$TMP/checksum.txt"
   local expected=""
+  local checksum_source_kind="release-manifest"
 
   if [ -n "$CHECKSUM" ]; then
     expected="$CHECKSUM"
+    checksum_source_kind="inline"
   elif [ -n "$CHECKSUM_URL" ]; then
     if ! curl -fsSL "$CHECKSUM_URL" -o "$checksum_file"; then
       err "Failed to download checksum file: $CHECKSUM_URL"
       return 4
     fi
+    checksum_source_kind="custom-url"
   elif [ -n "$ARTIFACT_URL" ]; then
-    local derived_checksum_url="${artifact_url}.sha256"
+    local artifact_base="${artifact_url%%\?*}"
+    artifact_base="${artifact_base%%#*}"
+    local derived_checksum_url="${artifact_base}.sha256"
     if ! curl -fsSL "$derived_checksum_url" -o "$checksum_file"; then
       err "Failed to download checksum file: $derived_checksum_url"
       err "Provide --checksum or --checksum-url for custom artifact installs"
       return 4
     fi
+    checksum_source_kind="artifact-derived"
   else
     if ! curl -fsSL "$SHA_URL" -o "$checksum_file"; then
       err "Failed to download checksum manifest: $SHA_URL"
@@ -819,9 +852,17 @@ verify_download_checksum() {
         }
       }
     ' "$checksum_file")
+
     if [ -z "$expected" ]; then
-      expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+      if [ "$checksum_source_kind" != "release-manifest" ]; then
+        local checksum_count
+        checksum_count=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { c += 1 } END { print c + 0 }' "$checksum_file")
+        if [ "$checksum_count" -eq 1 ]; then
+          expected=$(awk '$1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$checksum_file")
+        fi
+      fi
     fi
+
     if [ -z "$expected" ]; then
       CHECKSUM_STATUS="failed (missing checksum entry)"
       return 2
@@ -871,7 +912,9 @@ verify_sigstore_bundle() {
 
   local bundle_url="$SIGSTORE_BUNDLE_URL"
   if [ -z "$bundle_url" ]; then
-    bundle_url="${artifact_url}.sigstore.json"
+    local artifact_base="${artifact_url%%\?*}"
+    artifact_base="${artifact_base%%#*}"
+    bundle_url="${artifact_base}.sigstore.json"
   fi
 
   local bundle_file="$TMP/$(basename "${bundle_url%%\?*}")"
@@ -1247,14 +1290,22 @@ install_completions_for_shell() {
   fi
 
   local completion_output
-  completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null || true)
+  if ! completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null); then
+    COMPLETIONS_STATUS="failed (completion generation error)"
+    warn "Failed to generate $shell_name completions"
+    return 1
+  fi
   if [ -z "$completion_output" ]; then
     COMPLETIONS_STATUS="failed (completion generation error)"
     warn "Failed to generate $shell_name completions"
     return 1
   fi
 
-  printf '%s\n' "$completion_output" > "$target"
+  if ! printf '%s\n' "$completion_output" > "$target"; then
+    COMPLETIONS_STATUS="failed (write error)"
+    warn "Failed to write $shell_name completions to $target"
+    return 1
+  fi
   ok "Installed $shell_name completions to $target"
   COMPLETIONS_STATUS="installed ($shell_name)"
   return 0
@@ -1366,10 +1417,13 @@ print_summary() {
       gum style --foreground 245 "Uninstall: curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/uninstall.sh | bash"
     } | gum style --border normal --border-foreground 42 --padding "1 2"
   else
-    echo -e "\033[1;32mpi installed successfully\033[0m"
+    echo -e "\033[0;36m+------------------------------------------------------------------+\033[0m"
+    echo -e "\033[1;32m| Pi Rust installed successfully                                   |\033[0m"
+    echo -e "\033[0;36m+------------------------------------------------------------------+\033[0m"
     for line in "${lines[@]}"; do
-      echo -e "  \033[0;90m$line\033[0m"
+      echo -e "  \033[0;37m$line\033[0m"
     done
+    echo ""
     echo -e "  \033[0;90mUninstall: curl -fsSL https://raw.githubusercontent.com/${OWNER}/${REPO}/main/uninstall.sh | bash\033[0m"
   fi
 }
