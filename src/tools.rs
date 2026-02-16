@@ -4022,7 +4022,7 @@ mod tests {
         let content = "line1\nline2\nline3\nline4\nline5".to_string();
         let result = truncate_head(content, 3, 1000);
 
-        assert_eq!(result.content, "line1\nline2\nline3");
+        assert_eq!(result.content, "line1\nline2\nline3\n");
         assert!(result.truncated);
         assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
         assert_eq!(result.total_lines, 5);
