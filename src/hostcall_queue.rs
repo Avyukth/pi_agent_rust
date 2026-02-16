@@ -1018,6 +1018,16 @@ mod tests {
         }
     }
 
+    fn drive_signal_quality_fallback(queue: &mut HostcallRequestQueue<TenantRequest>, seed: u8) {
+        for offset in 0..96_u8 {
+            let _ = queue.push_back(TenantRequest {
+                tenant: None,
+                value: seed.wrapping_add(offset),
+            });
+            let _ = queue.drain_all();
+        }
+    }
+
     #[test]
     fn hostcall_queue_mode_parsing_supports_ebr_and_fallback() {
         assert_eq!(
@@ -1664,6 +1674,115 @@ mod tests {
         assert_eq!(snapshot.max_depth_seen, 0);
         assert_eq!(snapshot.overflow_enqueued_total, 0);
         assert_eq!(snapshot.overflow_rejected_total, 0);
+    }
+
+    #[test]
+    fn queue_clear_resets_s3fifo_fallback_and_counters() {
+        let mut queue = HostcallRequestQueue::with_mode(1, 3, HostcallQueueMode::SafeFallback);
+
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 0
+            }),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 1
+            }),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 2
+            }),
+            HostcallQueueEnqueueResult::Rejected { .. }
+        ));
+
+        let _ = queue.drain_all();
+
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 3
+            }),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 4
+            }),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(TenantRequest {
+                tenant: Some("ext.reset"),
+                value: 5
+            }),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+
+        drive_signal_quality_fallback(&mut queue, 6);
+
+        let before_clear = queue.snapshot();
+        assert_eq!(before_clear.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            before_clear.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
+        );
+        assert_eq!(before_clear.s3fifo_fallback_transitions, 1);
+        assert!(before_clear.s3fifo_ghost_hits_total >= 1);
+        assert!(before_clear.s3fifo_fairness_rejected_total >= 1);
+        assert!(before_clear.s3fifo_signal_samples >= 1);
+
+        queue.clear();
+
+        let cleared = queue.snapshot();
+        assert_eq!(cleared.s3fifo_mode, S3FifoMode::Active);
+        assert_eq!(cleared.s3fifo_fallback_reason, None);
+        assert_eq!(cleared.s3fifo_ghost_depth, 0);
+        assert_eq!(cleared.s3fifo_ghost_hits_total, 0);
+        assert_eq!(cleared.s3fifo_fairness_rejected_total, 0);
+        assert_eq!(cleared.s3fifo_signal_samples, 0);
+        assert_eq!(cleared.s3fifo_signalless_streak, 0);
+        assert_eq!(cleared.s3fifo_fallback_transitions, 0);
+        assert_eq!(cleared.s3fifo_active_tenants, 0);
+    }
+
+    #[test]
+    fn queue_clear_allows_s3fifo_fallback_to_retrigger_from_clean_state() {
+        let mut queue = HostcallRequestQueue::with_mode(1, 2, HostcallQueueMode::SafeFallback);
+
+        drive_signal_quality_fallback(&mut queue, 0);
+
+        let first = queue.snapshot();
+        assert_eq!(first.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            first.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
+        );
+        assert_eq!(first.s3fifo_fallback_transitions, 1);
+
+        queue.clear();
+
+        let after_clear = queue.snapshot();
+        assert_eq!(after_clear.s3fifo_mode, S3FifoMode::Active);
+        assert_eq!(after_clear.s3fifo_fallback_reason, None);
+        assert_eq!(after_clear.s3fifo_fallback_transitions, 0);
+
+        drive_signal_quality_fallback(&mut queue, 120);
+
+        let retriggered = queue.snapshot();
+        assert_eq!(retriggered.s3fifo_mode, S3FifoMode::ConservativeFifo);
+        assert_eq!(
+            retriggered.s3fifo_fallback_reason,
+            Some(S3FifoFallbackReason::SignalQualityInsufficient)
+        );
+        assert_eq!(retriggered.s3fifo_fallback_transitions, 1);
     }
 
     #[test]

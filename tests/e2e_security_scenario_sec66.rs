@@ -301,6 +301,45 @@ fn assert_empty_scoped_bundle_is_fail_closed(bundle: &IncidentEvidenceBundle) {
     );
 }
 
+fn emit_bundle_filter_parity_success(
+    harness: &TestHarness,
+    scoped_bundle: &IncidentEvidenceBundle,
+    empty_bundle: &IncidentEvidenceBundle,
+) {
+    emit_scenario_event(
+        harness,
+        "bundle_filter_parity",
+        "verify",
+        "ext.alpha",
+        "none",
+        "pass",
+        0.0,
+        &["composed_filter_parity", "zero_match_fail_closed"],
+    );
+
+    harness.log().info_ctx(
+        "scenario_result",
+        "incident bundle composed-filter invariants verified",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.7".into()));
+            ctx_log.push(("scenario".into(), "bundle_filter_parity".into()));
+            ctx_log.push(("result".into(), "pass".into()));
+            ctx_log.push((
+                "scoped_alert_count".into(),
+                scoped_bundle.summary.alert_count.to_string(),
+            ));
+            ctx_log.push((
+                "scoped_ledger_count".into(),
+                scoped_bundle.summary.ledger_entry_count.to_string(),
+            ));
+            ctx_log.push((
+                "empty_alert_count".into(),
+                empty_bundle.summary.alert_count.to_string(),
+            ));
+        },
+    );
+}
+
 /// Emergency kill-switch helper: demote trust + record quarantine alert.
 fn emergency_kill_switch(
     tracker: &mut ExtensionTrustTracker,
@@ -1850,36 +1889,5 @@ fn scenario_incident_bundle_composed_filters_fail_closed() {
         "empty scoped bundle must still be integrity-valid"
     );
 
-    emit_scenario_event(
-        &harness,
-        "bundle_filter_parity",
-        "verify",
-        "ext.alpha",
-        "none",
-        "pass",
-        0.0,
-        &["composed_filter_parity", "zero_match_fail_closed"],
-    );
-
-    harness.log().info_ctx(
-        "scenario_result",
-        "incident bundle composed-filter invariants verified",
-        |ctx_log| {
-            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.7".into()));
-            ctx_log.push(("scenario".into(), "bundle_filter_parity".into()));
-            ctx_log.push(("result".into(), "pass".into()));
-            ctx_log.push((
-                "scoped_alert_count".into(),
-                scoped_bundle.summary.alert_count.to_string(),
-            ));
-            ctx_log.push((
-                "scoped_ledger_count".into(),
-                scoped_bundle.summary.ledger_entry_count.to_string(),
-            ));
-            ctx_log.push((
-                "empty_alert_count".into(),
-                empty_bundle.summary.alert_count.to_string(),
-            ));
-        },
-    );
+    emit_bundle_filter_parity_success(&harness, &scoped_bundle, &empty_bundle);
 }

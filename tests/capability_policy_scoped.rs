@@ -932,7 +932,129 @@ mod method_capability_mapping {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 8. Dispatch validation edge cases
+// 8. Events/session typed-op alias mapping invariants
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod typed_method_alias_mapping {
+    use super::*;
+
+    fn alias_call(method: &str, params: serde_json::Value) -> HostCallPayload {
+        make_call("typed-alias", method, method, params)
+    }
+
+    #[test]
+    fn events_aliases_across_op_method_name_keys_map_to_events() {
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "events",
+                json!({ "op": " get_active_tools " })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "events",
+                json!({ "method": "set-model" })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "events",
+                json!({ "name": "register command" })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                " EVENTS ",
+                json!({ "op": "append.entry" })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+    }
+
+    #[test]
+    fn session_aliases_across_op_method_name_keys_map_to_session() {
+        assert_eq!(
+            required_capability_for_host_call(&alias_call("session", json!({ "op": "get_model" })))
+                .as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "session",
+                json!({ "method": "set-thinking_level" })
+            ))
+            .as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "session",
+                json!({ "name": "set label" })
+            ))
+            .as_deref(),
+            Some("session")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                " SESSION ",
+                json!({ "op": " get-file " })
+            ))
+            .as_deref(),
+            Some("session")
+        );
+    }
+
+    #[test]
+    fn typed_alias_matching_is_ascii_folded_and_punctuation_insensitive() {
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "events",
+                json!({ "op": " LiSt.FlAgS " })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "session",
+                json!({ "op": " SET_thinking-level " })
+            ))
+            .as_deref(),
+            Some("session")
+        );
+    }
+
+    #[test]
+    fn unsupported_event_session_ops_do_not_escalate_and_unknown_method_fails_closed() {
+        assert_eq!(
+            required_capability_for_host_call(&alias_call(
+                "events",
+                json!({ "op": "launch_shell" })
+            ))
+            .as_deref(),
+            Some("events")
+        );
+        assert_eq!(
+            required_capability_for_host_call(&alias_call("session", json!({ "op": "exec" })))
+                .as_deref(),
+            Some("session")
+        );
+        assert!(
+            required_capability_for_host_call(&alias_call("mystery", json!({ "op": "get_model" })))
+                .is_none()
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 9. Dispatch validation edge cases
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod dispatch_validation {
