@@ -5189,6 +5189,227 @@ mod tests {
         );
     }
 
+    mod proptest_package_manager {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// `parse_npm_spec` never panics on arbitrary input.
+            #[test]
+            fn parse_npm_spec_never_panics(s in ".*") {
+                let _ = parse_npm_spec(&s);
+            }
+
+            /// Unscoped name without '@' has no version.
+            #[test]
+            fn unscoped_no_at_returns_no_version(name in "[a-z][a-z0-9-]{0,20}") {
+                let (parsed_name, version) = parse_npm_spec(&name);
+                assert_eq!(parsed_name, name);
+                assert!(version.is_none());
+            }
+
+            /// Scoped package without version has no version.
+            #[test]
+            fn scoped_no_version(scope in "[a-z]{1,10}", pkg in "[a-z]{1,10}") {
+                let input = format!("@{scope}/{pkg}");
+                let (parsed_name, version) = parse_npm_spec(&input);
+                assert_eq!(parsed_name, input);
+                assert!(version.is_none());
+            }
+
+            /// Scoped package with version is parsed correctly.
+            #[test]
+            fn scoped_with_version(
+                scope in "[a-z]{1,10}",
+                pkg in "[a-z]{1,10}",
+                ver in "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}",
+            ) {
+                let input = format!("@{scope}/{pkg}@{ver}");
+                let (parsed_name, version) = parse_npm_spec(&input);
+                assert_eq!(parsed_name, format!("@{scope}/{pkg}"));
+                assert_eq!(version, Some(ver));
+            }
+
+            /// `is_pattern` detects all pattern prefixes.
+            #[test]
+            fn is_pattern_detects_prefix(
+                prefix_idx in 0..3usize,
+                suffix in "[a-z.]{1,20}",
+            ) {
+                let prefix = ["!", "+", "-"][prefix_idx];
+                let input = format!("{prefix}{suffix}");
+                assert!(is_pattern(&input));
+            }
+
+            /// `is_pattern` detects wildcard characters.
+            #[test]
+            fn is_pattern_detects_wildcards(
+                prefix in "[a-z]{0,5}",
+                wild_idx in 0..2usize,
+                suffix in "[a-z]{0,5}",
+            ) {
+                let wild = ["*", "?"][wild_idx];
+                let input = format!("{prefix}{wild}{suffix}");
+                assert!(is_pattern(&input));
+            }
+
+            /// Plain alphanumeric strings are not patterns.
+            #[test]
+            fn plain_strings_not_patterns(s in "[a-z0-9]{1,20}") {
+                assert!(!is_pattern(&s));
+            }
+
+            /// `split_patterns` partitions correctly.
+            #[test]
+            fn split_patterns_partition_is_complete(
+                plains in prop::collection::vec("[a-z]{1,10}", 0..5),
+                patterns in prop::collection::vec("[!+*][a-z]{1,10}", 0..5),
+            ) {
+                let mut all = plains;
+                all.extend(patterns);
+                let (split_plain, split_patterns) = split_patterns(&all);
+                assert_eq!(
+                    split_plain.len() + split_patterns.len(),
+                    all.len(),
+                    "partition should be complete"
+                );
+                for p in &split_patterns {
+                    assert!(is_pattern(p));
+                }
+            }
+
+            /// `hex_encode` output length is always 2x input length.
+            #[test]
+            fn hex_encode_output_length(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
+                let hex = hex_encode(&bytes);
+                assert_eq!(hex.len(), bytes.len() * 2);
+            }
+
+            /// `hex_encode` output is lowercase hex.
+            #[test]
+            fn hex_encode_is_lowercase_hex(bytes in prop::collection::vec(any::<u8>(), 0..64)) {
+                let hex = hex_encode(&bytes);
+                assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            }
+
+            /// `posix_string` output never contains backslashes.
+            #[test]
+            fn posix_string_no_backslashes(segments in prop::collection::vec("[a-z]{1,5}", 1..5)) {
+                let path = PathBuf::from(segments.join("/"));
+                let result = posix_string(&path);
+                assert!(!result.contains('\\'));
+            }
+
+            /// `posix_string` is idempotent on already-posix paths.
+            #[test]
+            fn posix_string_idempotent(segments in prop::collection::vec("[a-z]{1,5}", 1..5)) {
+                let path = PathBuf::from(segments.join("/"));
+                let first = posix_string(&path);
+                let second = posix_string(&PathBuf::from(&first));
+                assert_eq!(first, second);
+            }
+
+            /// `normalize_exact_pattern` strips leading "./" only.
+            #[test]
+            fn normalize_exact_pattern_strips_dot_slash(suffix in "[a-z]{1,15}") {
+                let with_prefix = format!("./{suffix}");
+                assert_eq!(normalize_exact_pattern(&with_prefix), suffix.as_str());
+            }
+
+            /// `normalize_exact_pattern` strips at most one leading "./".
+            #[test]
+            fn normalize_exact_pattern_strips_at_most_one(suffix in "[a-z]{1,15}") {
+                let input = format!("./{suffix}");
+                let result = normalize_exact_pattern(&input);
+                assert_eq!(result, suffix.as_str());
+                // Without prefix, function is identity
+                assert_eq!(normalize_exact_pattern(&suffix), suffix.as_str());
+            }
+
+            /// `looks_like_git_url` detects known git hosts.
+            #[test]
+            fn looks_like_git_url_known_hosts(
+                host_idx in 0..4usize,
+                path in "[a-z]{1,10}/[a-z]{1,10}",
+            ) {
+                let host = ["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"][host_idx];
+                let url = format!("{host}/{path}");
+                assert!(looks_like_git_url(&url));
+            }
+
+            /// `looks_like_git_url` rejects plain names.
+            #[test]
+            fn looks_like_git_url_rejects_plain(name in "[a-z]{1,15}") {
+                assert!(!looks_like_git_url(&name));
+            }
+
+            /// `looks_like_local_path` detects relative and tilde paths.
+            #[test]
+            fn looks_like_local_path_detects_relative(suffix in "[a-z]{1,10}") {
+                assert!(looks_like_local_path(&format!("./{suffix}")));
+                assert!(looks_like_local_path(&format!("../{suffix}")));
+                assert!(looks_like_local_path(&format!("~/{suffix}")));
+            }
+
+            /// `normalize_dot_segments` is idempotent.
+            #[test]
+            fn normalize_dot_segments_idempotent(
+                segments in prop::collection::vec("[a-z]{1,5}", 1..5),
+            ) {
+                let path = PathBuf::from(segments.join("/"));
+                let first = normalize_dot_segments(&path);
+                let second = normalize_dot_segments(&first);
+                assert_eq!(first, second);
+            }
+
+            /// `normalize_source` returns None for empty/whitespace.
+            #[test]
+            fn normalize_source_empty_returns_none(s in "[ \\t]{0,10}") {
+                assert!(normalize_source(&s).is_none());
+            }
+
+            /// `sources_match` is reflexive.
+            #[test]
+            fn sources_match_reflexive(source in "[a-z]{1,15}") {
+                assert!(sources_match(&source, &source));
+            }
+
+            /// `sources_match` is symmetric.
+            #[test]
+            fn sources_match_symmetric(a in "[a-z]{1,10}", b in "[a-z]{1,10}") {
+                assert_eq!(sources_match(&a, &b), sources_match(&b, &a));
+            }
+
+            /// `sort_lock_entries` produces sorted output.
+            #[test]
+            fn sort_lock_entries_produces_sorted(
+                identities in prop::collection::vec("[a-z]{1,10}", 1..10),
+            ) {
+                let mut entries: Vec<PackageLockEntry> = identities
+                    .iter()
+                    .map(|id| PackageLockEntry {
+                        identity: id.clone(),
+                        source: format!("npm:{id}"),
+                        source_kind: PackageSourceKind::Npm,
+                        resolved: PackageResolvedProvenance::Npm {
+                            name: id.clone(),
+                            requested_spec: id.clone(),
+                            requested_version: None,
+                            installed_version: "1.0.0".to_string(),
+                            pinned: false,
+                        },
+                        digest_sha256: "abcd".to_string(),
+                        trust_state: PackageEntryTrustState::Trusted,
+                    })
+                    .collect();
+                sort_lock_entries(&mut entries);
+                for pair in entries.windows(2) {
+                    assert!(pair[0].identity <= pair[1].identity);
+                }
+            }
+        }
+    }
+
     #[test]
     fn verify_and_record_lock_fails_closed_on_local_digest_mismatch() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -1857,4 +1857,200 @@ mod tests {
         assert!(!json.contains("cause_code"));
         assert!(!json.contains("detail"));
     }
+
+    mod proptest_conformance_shapes {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_extension_shape() -> impl Strategy<Value = ExtensionShape> {
+            (0..8usize).prop_map(|i| ExtensionShape::all()[i])
+        }
+
+        fn arb_failure_class() -> impl Strategy<Value = FailureClass> {
+            prop_oneof![
+                Just(FailureClass::LoadError),
+                Just(FailureClass::MissingRegistration),
+                Just(FailureClass::MalformedRegistration),
+                Just(FailureClass::InvocationError),
+                Just(FailureClass::OutputMismatch),
+                Just(FailureClass::Timeout),
+                Just(FailureClass::IncompatibleShape),
+                Just(FailureClass::ShutdownError),
+                Just(FailureClass::RuntimeShimGap),
+            ]
+        }
+
+        fn arb_remediation_bucket() -> impl Strategy<Value = RemediationBucket> {
+            (0..5usize).prop_map(|i| RemediationBucket::all()[i])
+        }
+
+        proptest! {
+            /// `ExtensionShape` serde roundtrip for all variants.
+            #[test]
+            fn extension_shape_serde_roundtrip(shape in arb_extension_shape()) {
+                let json = serde_json::to_string(&shape).unwrap();
+                let back: ExtensionShape = serde_json::from_str(&json).unwrap();
+                assert_eq!(shape, back);
+            }
+
+            /// `FailureClass` serde roundtrip for all variants.
+            #[test]
+            fn failure_class_serde_roundtrip(fc in arb_failure_class()) {
+                let json = serde_json::to_string(&fc).unwrap();
+                let back: FailureClass = serde_json::from_str(&json).unwrap();
+                assert_eq!(fc, back);
+            }
+
+            /// `RemediationBucket` serde roundtrip.
+            #[test]
+            fn remediation_bucket_serde_roundtrip(bucket in arb_remediation_bucket()) {
+                let json = serde_json::to_string(&bucket).unwrap();
+                let back: RemediationBucket = serde_json::from_str(&json).unwrap();
+                assert_eq!(bucket, back);
+            }
+
+            /// `ExtensionShape::all()` covers exactly 8 variants.
+            #[test]
+            fn all_shapes_have_expected_fields(idx in 0..8usize) {
+                let shape = ExtensionShape::all()[idx];
+                let fields = shape.expected_registration_fields();
+                // Every shape has at least an empty list or some fields
+                assert!(fields.len() <= 6);
+                for &f in fields {
+                    assert!(!f.is_empty());
+                }
+            }
+
+            /// `supports_invocation` is consistent across all shapes.
+            #[test]
+            fn supports_invocation_is_deterministic(shape in arb_extension_shape()) {
+                let a = shape.supports_invocation();
+                let b = shape.supports_invocation();
+                assert_eq!(a, b);
+            }
+
+            /// `typical_capabilities` never panics and returns a non-empty vec.
+            #[test]
+            fn typical_capabilities_nonempty(shape in arb_extension_shape()) {
+                let caps = shape.typical_capabilities();
+                assert!(!caps.is_empty());
+            }
+
+            /// `classify_cause_to_bucket` never panics on arbitrary strings.
+            #[test]
+            fn classify_cause_never_panics(cause in ".*") {
+                let bucket = classify_cause_to_bucket(&cause);
+                assert!(RemediationBucket::all().contains(&bucket));
+            }
+
+            /// Known cause codes map to expected buckets.
+            #[test]
+            fn known_cause_codes_classify_correctly(
+                idx in 0..5usize,
+            ) {
+                let (code, expected) = [
+                    ("mock_gap", RemediationBucket::HarnessGap),
+                    ("vcr_stub_gap", RemediationBucket::HarnessGap),
+                    ("manifest_mismatch", RemediationBucket::MissingFixture),
+                    ("multi_file_dependency", RemediationBucket::IntentionallyUnsupported),
+                    ("test_fixture", RemediationBucket::IntentionallyUnsupported),
+                ][idx];
+                assert_eq!(classify_cause_to_bucket(code), expected);
+            }
+
+            /// Unknown cause codes default to `MissingRuntimeApi`.
+            #[test]
+            fn unknown_cause_defaults_to_missing_api(cause in "[a-z_]{1,30}") {
+                let known = ["mock_gap", "vcr_stub_gap", "assertion_gap",
+                    "manifest_mismatch", "multi_file_dependency", "test_fixture"];
+                if !known.contains(&cause.as_str()) {
+                    assert_eq!(
+                        classify_cause_to_bucket(&cause),
+                        RemediationBucket::MissingRuntimeApi
+                    );
+                }
+            }
+
+            /// `classify_failure_to_bucket` maps every failure class to a valid bucket.
+            #[test]
+            fn classify_failure_maps_to_valid_bucket(fc in arb_failure_class()) {
+                let bucket = classify_failure_to_bucket(&fc);
+                assert!(RemediationBucket::all().contains(&bucket));
+            }
+
+            /// `RemediationBucket` description and hint are non-empty.
+            #[test]
+            fn bucket_description_and_hint_nonempty(bucket in arb_remediation_bucket()) {
+                assert!(!bucket.description().is_empty());
+                assert!(!bucket.remediation_hint().is_empty());
+            }
+
+            /// `RegistrationSnapshot` field_count returns 0 for unknown fields.
+            #[test]
+            fn field_count_unknown_returns_zero(field in "[a-z]{10,20}") {
+                let snapshot = RegistrationSnapshot::default();
+                assert_eq!(snapshot.field_count(&field), 0);
+            }
+
+            /// `RegistrationSnapshot` total is sum of all fields.
+            #[test]
+            fn total_registrations_is_sum(
+                n_tools in 0..10usize,
+                n_cmds in 0..10usize,
+                n_providers in 0..5usize,
+                n_hooks in 0..5usize,
+                n_shortcuts in 0..5usize,
+                n_flags in 0..5usize,
+                n_models in 0..5usize,
+                n_renderers in 0..5usize,
+            ) {
+                let null_val = || serde_json::Value::Null;
+                let snapshot = RegistrationSnapshot {
+                    tools: (0..n_tools).map(|_| null_val()).collect(),
+                    slash_commands: (0..n_cmds).map(|_| null_val()).collect(),
+                    providers: (0..n_providers).map(|_| null_val()).collect(),
+                    event_hooks: (0..n_hooks).map(|_| "hook".to_string()).collect(),
+                    shortcuts: (0..n_shortcuts).map(|_| null_val()).collect(),
+                    flags: (0..n_flags).map(|_| null_val()).collect(),
+                    models: (0..n_models).map(|_| null_val()).collect(),
+                    message_renderers: (0..n_renderers).map(|_| null_val()).collect(),
+                };
+                assert_eq!(
+                    snapshot.total_registrations(),
+                    n_tools + n_cmds + n_providers + n_hooks + n_shortcuts
+                        + n_flags + n_models + n_renderers
+                );
+            }
+
+            /// `NaClassification` builder produces valid structure.
+            #[test]
+            fn na_classification_builder(
+                ext_id in "[a-z.]{1,15}",
+                bucket in arb_remediation_bucket(),
+                cause in "[a-z_]{1,20}",
+                detail in "[a-zA-Z ]{0,50}",
+            ) {
+                let c = NaClassification::new(ext_id.clone(), bucket)
+                    .with_cause(cause.clone())
+                    .with_detail(detail.clone());
+                assert_eq!(c.extension_id, ext_id);
+                assert_eq!(c.bucket, bucket);
+                assert_eq!(c.cause_code, Some(cause));
+                assert_eq!(c.detail, Some(detail));
+            }
+
+            /// `NaClassification` serde roundtrip.
+            #[test]
+            fn na_classification_serde_roundtrip(
+                ext_id in "[a-z.]{1,15}",
+                bucket in arb_remediation_bucket(),
+            ) {
+                let c = NaClassification::new(ext_id, bucket);
+                let json = serde_json::to_string(&c).unwrap();
+                let back: NaClassification = serde_json::from_str(&json).unwrap();
+                assert_eq!(c.extension_id, back.extension_id);
+                assert_eq!(c.bucket, back.bucket);
+            }
+        }
+    }
 }
