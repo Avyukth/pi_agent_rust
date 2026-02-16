@@ -16,6 +16,7 @@ use crate::provider_metadata::{
 };
 use crate::vcr::{VCR_ENV_MODE, VcrRecorder};
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::stream;
 use futures::stream::Stream;
 use serde_json::Value;
@@ -564,7 +565,7 @@ impl ExtensionStreamSimpleProvider {
             stop_reason: StopReason::default(),
             usage: Usage::default(),
             error_message: None,
-            timestamp: 0,
+            timestamp: Utc::now().timestamp_millis(),
         }
     }
 }
