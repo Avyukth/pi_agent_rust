@@ -401,8 +401,158 @@ pub(crate) fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Valu
     Ok(serde_json::Value::Null)
 }
 
+const HOSTCALL_FAST_RING_CAPACITY: usize = 256;
+const HOSTCALL_OVERFLOW_CAPACITY: usize = 2_048;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostcallQueueEnqueueResult {
+    FastPath { depth: usize },
+    OverflowPath { depth: usize, overflow_depth: usize },
+    Rejected { depth: usize, overflow_depth: usize },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostcallQueueTelemetry {
+    pub fast_depth: usize,
+    pub overflow_depth: usize,
+    pub total_depth: usize,
+    pub max_depth_seen: usize,
+    pub overflow_enqueued_total: u64,
+    pub overflow_rejected_total: u64,
+    pub fast_capacity: usize,
+    pub overflow_capacity: usize,
+}
+
 /// Queue of hostcall requests waiting to be processed by the host.
-pub type HostcallQueue = Rc<RefCell<VecDeque<HostcallRequest>>>;
+///
+/// Fast path is a lock-free fixed-capacity ring. If the ring is saturated,
+/// requests spill into a bounded overflow deque. When both are saturated, new
+/// requests are rejected and completed with an overload error.
+#[derive(Debug)]
+pub struct HostcallRequestQueue {
+    fast_slots: Vec<Option<HostcallRequest>>,
+    fast_head: usize,
+    fast_tail: usize,
+    fast_len: usize,
+    overflow: VecDeque<HostcallRequest>,
+    overflow_enqueued_total: u64,
+    overflow_rejected_total: u64,
+    max_depth_seen: usize,
+    overflow_capacity: usize,
+}
+
+impl HostcallRequestQueue {
+    pub fn with_capacities(fast_capacity: usize, overflow_capacity: usize) -> Self {
+        let fast_capacity = fast_capacity.max(1);
+        let overflow_capacity = overflow_capacity.max(1);
+        Self {
+            fast_slots: std::iter::repeat_with(|| None)
+                .take(fast_capacity)
+                .collect(),
+            fast_head: 0,
+            fast_tail: 0,
+            fast_len: 0,
+            overflow: VecDeque::new(),
+            overflow_enqueued_total: 0,
+            overflow_rejected_total: 0,
+            max_depth_seen: 0,
+            overflow_capacity,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.fast_len + self.overflow.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fast_len == 0 && self.overflow.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        for slot in &mut self.fast_slots {
+            *slot = None;
+        }
+        self.fast_head = 0;
+        self.fast_tail = 0;
+        self.fast_len = 0;
+        self.overflow.clear();
+        self.overflow_enqueued_total = 0;
+        self.overflow_rejected_total = 0;
+        self.max_depth_seen = 0;
+    }
+
+    pub fn push_back(&mut self, request: HostcallRequest) -> HostcallQueueEnqueueResult {
+        let fast_capacity = self.fast_slots.len();
+
+        // Preserve FIFO across lanes by pinning to overflow once spill begins.
+        if self.overflow.is_empty() && self.fast_len < fast_capacity {
+            self.fast_slots[self.fast_tail] = Some(request);
+            self.fast_tail = (self.fast_tail + 1) % fast_capacity;
+            self.fast_len += 1;
+            let depth = self.len();
+            self.max_depth_seen = self.max_depth_seen.max(depth);
+            return HostcallQueueEnqueueResult::FastPath { depth };
+        }
+
+        if self.overflow.len() < self.overflow_capacity {
+            self.overflow.push_back(request);
+            self.overflow_enqueued_total = self.overflow_enqueued_total.saturating_add(1);
+            let depth = self.len();
+            let overflow_depth = self.overflow.len();
+            self.max_depth_seen = self.max_depth_seen.max(depth);
+            return HostcallQueueEnqueueResult::OverflowPath {
+                depth,
+                overflow_depth,
+            };
+        }
+
+        self.overflow_rejected_total = self.overflow_rejected_total.saturating_add(1);
+        HostcallQueueEnqueueResult::Rejected {
+            depth: self.len(),
+            overflow_depth: self.overflow.len(),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<HostcallRequest> {
+        if self.fast_len > 0 {
+            let slot = &mut self.fast_slots[self.fast_head];
+            let request = slot.take();
+            self.fast_head = (self.fast_head + 1) % self.fast_slots.len();
+            self.fast_len -= 1;
+            return request;
+        }
+        self.overflow.pop_front()
+    }
+
+    pub fn drain_all(&mut self) -> VecDeque<HostcallRequest> {
+        let mut drained = VecDeque::with_capacity(self.len());
+        while let Some(request) = self.pop_front() {
+            drained.push_back(request);
+        }
+        drained
+    }
+
+    pub fn snapshot(&self) -> HostcallQueueTelemetry {
+        HostcallQueueTelemetry {
+            fast_depth: self.fast_len,
+            overflow_depth: self.overflow.len(),
+            total_depth: self.len(),
+            max_depth_seen: self.max_depth_seen,
+            overflow_enqueued_total: self.overflow_enqueued_total,
+            overflow_rejected_total: self.overflow_rejected_total,
+            fast_capacity: self.fast_slots.len(),
+            overflow_capacity: self.overflow_capacity,
+        }
+    }
+}
+
+impl Default for HostcallRequestQueue {
+    fn default() -> Self {
+        Self::with_capacities(HOSTCALL_FAST_RING_CAPACITY, HOSTCALL_OVERFLOW_CAPACITY)
+    }
+}
+
+pub type HostcallQueue = Rc<RefCell<HostcallRequestQueue>>;
 
 // ============================================================================
 // Deterministic PiJS Event Loop Scheduler (bd-8mm)
@@ -2378,6 +2528,14 @@ pub struct PiJsRuntimeLimits {
     pub interrupt_budget: Option<u64>,
     /// Default timeout (ms) for hostcalls issued via `pi.*`.
     pub hostcall_timeout_ms: Option<u64>,
+    /// Fast-path ring capacity for JS->host hostcall handoff.
+    ///
+    /// `0` means use the runtime default.
+    pub hostcall_fast_queue_capacity: usize,
+    /// Overflow capacity once the fast-path ring is saturated.
+    ///
+    /// `0` means use the runtime default.
+    pub hostcall_overflow_queue_capacity: usize,
 }
 
 /// Controls how the auto-repair pipeline behaves at extension load time.
@@ -4454,6 +4612,7 @@ struct HostcallTracker {
     pending: HashSet<String>,
     call_to_timer: HashMap<String, u64>,
     timer_to_call: HashMap<u64, String>,
+    enqueued_at_ms: HashMap<String, u64>,
 }
 
 enum HostcallCompletion {
@@ -4469,10 +4628,12 @@ impl HostcallTracker {
         self.pending.clear();
         self.call_to_timer.clear();
         self.timer_to_call.clear();
+        self.enqueued_at_ms.clear();
     }
 
-    fn register(&mut self, call_id: String, timer_id: Option<u64>) {
+    fn register(&mut self, call_id: String, timer_id: Option<u64>, enqueued_at_ms: u64) {
         self.pending.insert(call_id.clone());
+        self.enqueued_at_ms.insert(call_id.clone(), enqueued_at_ms);
         if let Some(timer_id) = timer_id {
             self.call_to_timer.insert(call_id.clone(), timer_id);
             self.timer_to_call.insert(timer_id, call_id);
@@ -4487,12 +4648,20 @@ impl HostcallTracker {
         self.pending.contains(call_id)
     }
 
+    fn queue_wait_ms(&self, call_id: &str, now_ms: u64) -> Option<u64> {
+        self.enqueued_at_ms
+            .get(call_id)
+            .copied()
+            .map(|enqueued| now_ms.saturating_sub(enqueued))
+    }
+
     fn on_complete(&mut self, call_id: &str) -> HostcallCompletion {
         if !self.pending.remove(call_id) {
             return HostcallCompletion::Unknown;
         }
 
         let timer_id = self.call_to_timer.remove(call_id);
+        self.enqueued_at_ms.remove(call_id);
         if let Some(timer_id) = timer_id {
             self.timer_to_call.remove(&timer_id);
         }
@@ -4503,10 +4672,77 @@ impl HostcallTracker {
     fn take_timed_out_call(&mut self, timer_id: u64) -> Option<String> {
         let call_id = self.timer_to_call.remove(&timer_id)?;
         self.call_to_timer.remove(&call_id);
+        self.enqueued_at_ms.remove(&call_id);
         if !self.pending.remove(&call_id) {
             return None;
         }
         Some(call_id)
+    }
+}
+
+fn enqueue_hostcall_request_with_backpressure<C: SchedulerClock>(
+    queue: &HostcallQueue,
+    tracker: &Rc<RefCell<HostcallTracker>>,
+    scheduler: &Rc<RefCell<Scheduler<C>>>,
+    request: HostcallRequest,
+) {
+    let call_id = request.call_id.clone();
+    let trace_id = request.trace_id;
+    let extension_id = request.extension_id.clone();
+    match queue.borrow_mut().push_back(request) {
+        HostcallQueueEnqueueResult::FastPath { depth } => {
+            tracing::trace!(
+                event = "pijs.hostcall.queue.fast_path",
+                call_id = %call_id,
+                trace_id,
+                extension_id = ?extension_id,
+                depth,
+                "Hostcall queued on fast-path ring"
+            );
+        }
+        HostcallQueueEnqueueResult::OverflowPath {
+            depth,
+            overflow_depth,
+        } => {
+            tracing::debug!(
+                event = "pijs.hostcall.queue.overflow_path",
+                call_id = %call_id,
+                trace_id,
+                extension_id = ?extension_id,
+                depth,
+                overflow_depth,
+                "Hostcall spilled to overflow queue"
+            );
+        }
+        HostcallQueueEnqueueResult::Rejected {
+            depth,
+            overflow_depth,
+        } => {
+            let completion = tracker.borrow_mut().on_complete(&call_id);
+            if let HostcallCompletion::Delivered { timer_id } = completion {
+                if let Some(timer_id) = timer_id {
+                    let _ = scheduler.borrow_mut().clear_timeout(timer_id);
+                }
+                scheduler.borrow_mut().enqueue_hostcall_complete(
+                    call_id.clone(),
+                    HostcallOutcome::Error {
+                        code: "overloaded".to_string(),
+                        message: format!(
+                            "Hostcall queue overloaded (depth={depth}, overflow_depth={overflow_depth})"
+                        ),
+                    },
+                );
+            }
+            tracing::warn!(
+                event = "pijs.hostcall.queue.rejected",
+                call_id = %call_id,
+                trace_id,
+                extension_id = ?extension_id,
+                depth,
+                overflow_depth,
+                "Hostcall rejected by queue backpressure policy"
+            );
+        }
     }
 }
 
@@ -11502,7 +11738,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .map_err(|err| map_js_error(&err))?;
 
         let scheduler = Rc::new(RefCell::new(Scheduler::with_clock(clock)));
-        let hostcall_queue: HostcallQueue = Rc::new(RefCell::new(VecDeque::new()));
+        let fast_queue_capacity = if config.limits.hostcall_fast_queue_capacity == 0 {
+            HOSTCALL_FAST_RING_CAPACITY
+        } else {
+            config.limits.hostcall_fast_queue_capacity
+        };
+        let overflow_queue_capacity = if config.limits.hostcall_overflow_queue_capacity == 0 {
+            HOSTCALL_OVERFLOW_CAPACITY
+        } else {
+            config.limits.hostcall_overflow_queue_capacity
+        };
+        let hostcall_queue: HostcallQueue = Rc::new(RefCell::new(
+            HostcallRequestQueue::with_capacities(fast_queue_capacity, overflow_queue_capacity),
+        ));
         let hostcall_tracker = Rc::new(RefCell::new(HostcallTracker::default()));
         let hostcalls_total = Arc::new(AtomicU64::new(0));
         let hostcalls_timed_out = Arc::new(AtomicU64::new(0));
@@ -11853,7 +12101,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Returns the requests that need to be processed by the host.
     /// After processing, call `complete_hostcall()` for each.
     pub fn drain_hostcall_requests(&self) -> VecDeque<HostcallRequest> {
-        std::mem::take(&mut *self.hostcall_queue.borrow_mut())
+        self.hostcall_queue.borrow_mut().drain_all()
     }
 
     /// Drain pending QuickJS jobs (Promise microtasks) until fixpoint.
@@ -11869,6 +12117,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Peek at pending hostcall requests without draining.
     pub fn pending_hostcall_count(&self) -> usize {
         self.hostcall_tracker.borrow().pending_count()
+    }
+
+    /// Snapshot queue depth/backpressure counters for diagnostics.
+    pub fn hostcall_queue_telemetry(&self) -> HostcallQueueTelemetry {
+        self.hostcall_queue.borrow().snapshot()
+    }
+
+    /// Queue wait (enqueue -> dispatch start) in milliseconds for a pending hostcall.
+    pub fn hostcall_queue_wait_ms(&self, call_id: &str) -> Option<u64> {
+        let now_ms = self.scheduler.borrow().now_ms();
+        self.hostcall_tracker
+            .borrow()
+            .queue_wait_ms(call_id, now_ms)
     }
 
     /// Check whether a given hostcall is still pending.
@@ -11924,6 +12185,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.scheduler
             .borrow_mut()
             .enqueue_hostcall_complete(call_id.into(), outcome);
+    }
+
+    /// Enqueue multiple hostcall completions in one scheduler borrow.
+    pub fn complete_hostcalls_batch<I>(&self, completions: I)
+    where
+        I: IntoIterator<Item = (String, HostcallOutcome)>,
+    {
+        self.scheduler
+            .borrow_mut()
+            .enqueue_hostcall_completions(completions);
     }
 
     /// Enqueue an inbound event to be delivered on next tick.
@@ -12314,10 +12585,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12332,7 +12606,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12385,10 +12661,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12403,7 +12682,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12423,10 +12704,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12441,7 +12725,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12464,10 +12750,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12482,7 +12771,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12505,10 +12796,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12523,7 +12817,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12546,10 +12842,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12564,7 +12863,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12584,10 +12885,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
                             let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
-                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), timer_id, enqueued_at_ms);
                             let extension_id: Option<String> = ctx
                                 .globals()
                                 .get::<_, Option<String>>("__pi_current_extension_id")
@@ -12602,7 +12906,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id,
                                 extension_id,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(call_id)
                         }
                     }),
@@ -12667,6 +12973,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let queue = hostcall_queue.clone();
                         let tracker = hostcall_tracker.clone();
+                        let scheduler = Rc::clone(&scheduler);
                         move |_ctx: Ctx<'_>, code: i32| -> rquickjs::Result<()> {
                             tracing::info!(
                                 event = "pijs.process.exit",
@@ -12674,7 +12981,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "process.exit requested"
                             );
                             let call_id = format!("call-{}", generate_call_id());
-                            tracker.borrow_mut().register(call_id.clone(), None);
+                            let enqueued_at_ms = scheduler.borrow().now_ms();
+                            tracker
+                                .borrow_mut()
+                                .register(call_id.clone(), None, enqueued_at_ms);
                             let request = HostcallRequest {
                                 call_id,
                                 kind: HostcallKind::Events {
@@ -12684,7 +12994,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 trace_id: 0,
                                 extension_id: None,
                             };
-                            queue.borrow_mut().push_back(request);
+                            enqueue_hostcall_request_with_backpressure(
+                                &queue, &tracker, &scheduler, request,
+                            );
                             Ok(())
                         }
                     }),
@@ -16522,6 +16834,83 @@ mod tests {
     }
 
     #[test]
+    fn hostcall_request_queue_spills_to_overflow_with_stable_order() {
+        fn req(id: usize) -> HostcallRequest {
+            HostcallRequest {
+                call_id: format!("call-{id}"),
+                kind: HostcallKind::Log,
+                payload: serde_json::json!({ "n": id }),
+                trace_id: u64::try_from(id).unwrap_or(u64::MAX),
+                extension_id: Some("ext.queue".to_string()),
+            }
+        }
+
+        let mut queue = HostcallRequestQueue::with_capacities(2, 4);
+        assert!(matches!(
+            queue.push_back(req(0)),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(req(1)),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(req(2)),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.fast_depth, 2);
+        assert_eq!(snapshot.overflow_depth, 1);
+        assert_eq!(snapshot.total_depth, 3);
+        assert_eq!(snapshot.overflow_enqueued_total, 1);
+
+        let drained = queue.drain_all();
+        let drained_ids: Vec<_> = drained.into_iter().map(|item| item.call_id).collect();
+        assert_eq!(
+            drained_ids,
+            vec![
+                "call-0".to_string(),
+                "call-1".to_string(),
+                "call-2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn hostcall_request_queue_rejects_when_overflow_capacity_reached() {
+        fn req(id: usize) -> HostcallRequest {
+            HostcallRequest {
+                call_id: format!("reject-{id}"),
+                kind: HostcallKind::Log,
+                payload: serde_json::json!({ "n": id }),
+                trace_id: u64::try_from(id).unwrap_or(u64::MAX),
+                extension_id: None,
+            }
+        }
+
+        let mut queue = HostcallRequestQueue::with_capacities(1, 1);
+        assert!(matches!(
+            queue.push_back(req(0)),
+            HostcallQueueEnqueueResult::FastPath { .. }
+        ));
+        assert!(matches!(
+            queue.push_back(req(1)),
+            HostcallQueueEnqueueResult::OverflowPath { .. }
+        ));
+        let reject = queue.push_back(req(2));
+        assert!(matches!(
+            reject,
+            HostcallQueueEnqueueResult::Rejected { .. }
+        ));
+
+        let snapshot = queue.snapshot();
+        assert_eq!(snapshot.total_depth, 2);
+        assert_eq!(snapshot.overflow_depth, 1);
+        assert_eq!(snapshot.overflow_rejected_total, 1);
+    }
+
+    #[test]
     fn timers_order_by_deadline_then_schedule_seq() {
         let clock = Arc::new(ManualClock::new(0));
         let mut loop_state = PiEventLoop::new(ClockHandle::new(clock.clone()));
@@ -16955,7 +17344,7 @@ mod tests {
             runtime
                 .hostcall_tracker
                 .borrow_mut()
-                .register("call-1".to_string(), Some(42));
+                .register("call-1".to_string(), Some(42), 0);
             runtime
                 .hostcalls_total
                 .store(11, std::sync::atomic::Ordering::SeqCst);

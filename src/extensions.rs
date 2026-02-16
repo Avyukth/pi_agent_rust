@@ -203,12 +203,9 @@ pub(crate) fn sha256_to_hex(digest: &[u8]) -> String {
 pub(crate) fn hostcall_params_hash(method: &str, params: &Value) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    // {"method": ..., "params": ...} — keys already sorted alphabetically.
-    hasher.update(br#"{"method":"#);
-    hash_json_escaped_str(method, &mut hasher);
-    hasher.update(br#","params":"#);
-    hash_canonical_json(params, &mut hasher);
-    hasher.update(b"}");
+    hash_hostcall_envelope(method, br#","params":"#, &mut hasher, |h| {
+        hash_canonical_json(params, h);
+    });
     sha256_to_hex(hasher.finalize().as_slice())
 }
 
@@ -256,14 +253,26 @@ fn hash_canonical_shape(value: &Value, hasher: &mut sha2::Sha256) {
 fn hostcall_params_shape_hash(method: &str, params: &Value) -> String {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    // Canonical form: {"method": ..., "params_shape": shape_only(params)}
-    // Keys "method" and "params_shape" are already alphabetically sorted.
-    hasher.update(br#"{"method":"#);
-    hash_json_escaped_str(method, &mut hasher);
-    hasher.update(br#","params_shape":"#);
-    hash_canonical_shape(params, &mut hasher);
-    hasher.update(b"}");
+    hash_hostcall_envelope(method, br#","params_shape":"#, &mut hasher, |h| {
+        hash_canonical_shape(params, h);
+    });
     sha256_to_hex(hasher.finalize().as_slice())
+}
+
+/// Hash the canonical `{"method": ..., "<payload_key>": ...}` envelope using
+/// the exact byte layout expected by historical hostcall hash artifacts.
+fn hash_hostcall_envelope(
+    method: &str,
+    payload_key_prefix: &[u8],
+    hasher: &mut sha2::Sha256,
+    payload_writer: impl FnOnce(&mut sha2::Sha256),
+) {
+    use sha2::Digest as _;
+    hasher.update(br#"{"method":"#);
+    hash_json_escaped_str(method, hasher);
+    hasher.update(payload_key_prefix);
+    payload_writer(hasher);
+    hasher.update(b"}");
 }
 
 pub const PROTOCOL_VERSION: &str = "1.0";
@@ -1544,7 +1553,26 @@ impl Capability {
     pub const fn dangerous_list() -> &'static [Self] {
         &[Self::Exec, Self::Env]
     }
+
+    /// Ordinal index for array-based snapshot lookups.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Read => 0,
+            Self::Write => 1,
+            Self::Http => 2,
+            Self::Events => 3,
+            Self::Session => 4,
+            Self::Ui => 5,
+            Self::Exec => 6,
+            Self::Env => 7,
+            Self::Tool => 8,
+            Self::Log => 9,
+        }
+    }
 }
+
+/// Number of known capabilities (must match [`ALL_CAPABILITIES`] length).
+pub const NUM_CAPABILITIES: usize = 10;
 
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3304,6 +3332,18 @@ pub struct RuntimeHostcallTelemetryEvent {
     /// Lane dispatch share of total call latency in basis points (0..=10000).
     #[serde(default)]
     pub lane_latency_share_bps: u64,
+    /// Marshalling path identifier (`interned_opcode_arena_v1`, `canonical_*`).
+    #[serde(default = "runtime_hostcall_marshalling_path_default")]
+    pub marshalling_path: String,
+    /// Time spent in marshalling/hashing stage before dispatch.
+    #[serde(default)]
+    pub marshalling_latency_us: u64,
+    /// Fallback reason when marshalling exits the fast opcode path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marshalling_fallback_reason: Option<String>,
+    /// Per-extension running count of marshalling fast-path fallbacks.
+    #[serde(default)]
+    pub marshalling_fallback_count: u64,
     pub outcome: String,
     pub outcome_error_code: Option<String>,
     pub selected_action: RuntimeRiskActionValue,
@@ -3322,6 +3362,10 @@ pub struct RuntimeHostcallTelemetryEvent {
 
 fn runtime_hostcall_lane_default() -> String {
     "unknown".to_string()
+}
+
+fn runtime_hostcall_marshalling_path_default() -> String {
+    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
 }
 
 impl Default for RuntimeHostcallTelemetryEvent {
@@ -3347,6 +3391,10 @@ impl Default for RuntimeHostcallTelemetryEvent {
             lane_matrix_key: "unknown|fallback|unknown".to_string(),
             lane_dispatch_latency_ms: 0,
             lane_latency_share_bps: 0,
+            marshalling_path: runtime_hostcall_marshalling_path_default(),
+            marshalling_latency_us: 0,
+            marshalling_fallback_reason: None,
+            marshalling_fallback_count: 0,
             outcome: "success".to_string(),
             outcome_error_code: None,
             selected_action: RuntimeRiskActionValue::Allow,
@@ -6720,6 +6768,257 @@ impl ExtensionPolicy {
     }
 }
 
+// ============================================================================
+// PolicySnapshot — O(1) precomputed capability authorization
+// ============================================================================
+
+/// A single precomputed policy decision for a known capability.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotEntry {
+    decision: PolicyDecision,
+    /// Static reason string (avoids allocation on the hot path).
+    reason: &'static str,
+}
+
+impl Default for SnapshotEntry {
+    fn default() -> Self {
+        Self {
+            decision: PolicyDecision::Deny,
+            reason: "not_computed",
+        }
+    }
+}
+
+/// Precomputed per-extension capability decision table for O(1) hostcall
+/// authorization. Built once from an [`ExtensionPolicy`] at dispatcher
+/// creation time; all subsequent lookups are constant-time array reads.
+///
+/// For unknown capabilities not in [`ALL_CAPABILITIES`], falls back to the
+/// original `evaluate_for()` path.
+#[derive(Debug, Clone)]
+pub struct PolicySnapshot {
+    /// Decisions for known capabilities evaluated without extension context.
+    global: [SnapshotEntry; NUM_CAPABILITIES],
+    /// Per-extension decisions keyed by extension ID.
+    per_extension: HashMap<String, [SnapshotEntry; NUM_CAPABILITIES]>,
+    /// The original policy for fallback on unknown capabilities.
+    fallback: ExtensionPolicy,
+}
+
+impl PolicySnapshot {
+    /// Compile a snapshot from the given policy.
+    ///
+    /// Precomputes decisions for every known capability in both the global
+    /// context and each per-extension override.
+    pub fn compile(policy: &ExtensionPolicy) -> Self {
+        let global = Self::compute_decisions(policy, None);
+
+        let per_extension: HashMap<String, [SnapshotEntry; NUM_CAPABILITIES]> = policy
+            .per_extension
+            .keys()
+            .map(|ext_id| {
+                let decisions = Self::compute_decisions(policy, Some(ext_id.as_str()));
+                (ext_id.clone(), decisions)
+            })
+            .collect();
+
+        Self {
+            global,
+            per_extension,
+            fallback: policy.clone(),
+        }
+    }
+
+    /// O(1) capability lookup. Returns a [`PolicyCheck`] for the given
+    /// capability and optional extension context.
+    ///
+    /// Known capabilities (read, write, http, etc.) are resolved from the
+    /// precomputed table. Unknown capabilities fall back to `evaluate_for()`.
+    pub fn lookup(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
+        if let Some(cap) = Capability::parse(capability) {
+            let idx = cap.index();
+            let entry = extension_id
+                .and_then(|id| self.per_extension.get(id))
+                .map_or(&self.global[idx], |arr| &arr[idx]);
+            PolicyCheck {
+                decision: entry.decision,
+                capability: capability.to_string(),
+                reason: entry.reason.to_string(),
+            }
+        } else {
+            // Unknown capability — fall back to full evaluation.
+            self.fallback.evaluate_for(capability, extension_id)
+        }
+    }
+
+    /// Build the decision array for all known capabilities.
+    fn compute_decisions(
+        policy: &ExtensionPolicy,
+        extension_id: Option<&str>,
+    ) -> [SnapshotEntry; NUM_CAPABILITIES] {
+        let mut decisions = [SnapshotEntry::default(); NUM_CAPABILITIES];
+        for cap in ALL_CAPABILITIES {
+            let check = policy.evaluate_for(cap.as_str(), extension_id);
+            decisions[cap.index()] = SnapshotEntry {
+                decision: check.decision,
+                reason: Self::intern_reason(&check.reason),
+            };
+        }
+        decisions
+    }
+
+    /// Map dynamic reason strings to static equivalents to avoid per-lookup
+    /// allocations. Unknown reasons get a generic fallback.
+    fn intern_reason(reason: &str) -> &'static str {
+        match reason {
+            "default_caps" => "default_caps",
+            "deny_caps" => "deny_caps",
+            "extension_deny" => "extension_deny",
+            "extension_allow" => "extension_allow",
+            "not_in_default_caps" => "not_in_default_caps",
+            "prompt_required" => "prompt_required",
+            "permissive" => "permissive",
+            "empty_capability" => "empty_capability",
+            _ => "precomputed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_snapshot_tests {
+    use super::*;
+
+    fn make_policy_with_per_extension() -> ExtensionPolicy {
+        let mut policy = ExtensionPolicy::default();
+        policy.default_caps.insert("read".to_string());
+        policy.default_caps.insert("write".to_string());
+        policy.default_caps.insert("http".to_string());
+        policy.deny_caps.insert("exec".to_string());
+
+        let mut ext_overrides = PerExtensionPolicy::default();
+        ext_overrides.allow.insert("exec".to_string());
+        ext_overrides.deny.insert("write".to_string());
+        policy
+            .per_extension
+            .insert("ext.special".to_string(), ext_overrides);
+
+        policy
+    }
+
+    #[test]
+    fn snapshot_matches_evaluate_for_all_known_capabilities() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        for cap in ALL_CAPABILITIES {
+            let direct = policy.evaluate_for(cap.as_str(), None);
+            let via_snapshot = snapshot.lookup(cap.as_str(), None);
+            assert_eq!(
+                direct.decision, via_snapshot.decision,
+                "global decision mismatch for capability '{}'",
+                cap.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_matches_per_extension_overrides() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        for cap in ALL_CAPABILITIES {
+            let direct = policy.evaluate_for(cap.as_str(), Some("ext.special"));
+            let via_snapshot = snapshot.lookup(cap.as_str(), Some("ext.special"));
+            assert_eq!(
+                direct.decision, via_snapshot.decision,
+                "per-extension decision mismatch for '{}' on ext.special",
+                cap.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_unknown_extension_falls_back_to_global() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        for cap in ALL_CAPABILITIES {
+            let global = snapshot.lookup(cap.as_str(), None);
+            let unknown_ext = snapshot.lookup(cap.as_str(), Some("ext.unknown"));
+            assert_eq!(
+                global.decision, unknown_ext.decision,
+                "unknown extension should fall back to global for '{}'",
+                cap.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_unknown_capability_falls_back_to_evaluate_for() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        let direct = policy.evaluate_for("custom_cap_xyz", None);
+        let via_snapshot = snapshot.lookup("custom_cap_xyz", None);
+        assert_eq!(direct.decision, via_snapshot.decision);
+    }
+
+    #[test]
+    fn snapshot_permissive_mode_allows_all() {
+        let mut policy = ExtensionPolicy::default();
+        policy.mode = PolicyMode::Permissive;
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        for cap in ALL_CAPABILITIES {
+            let check = snapshot.lookup(cap.as_str(), None);
+            assert_eq!(
+                check.decision,
+                PolicyDecision::Allow,
+                "permissive mode should allow '{}'",
+                cap.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_deny_overrides_default_caps() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        // "exec" is in deny_caps
+        let check = snapshot.lookup("exec", None);
+        assert_eq!(check.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn snapshot_per_extension_deny_overrides_global_allow() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        // "write" is in default_caps (allowed globally)
+        let global = snapshot.lookup("write", None);
+        assert_eq!(global.decision, PolicyDecision::Allow);
+
+        // but ext.special denies "write"
+        let ext = snapshot.lookup("write", Some("ext.special"));
+        assert_eq!(ext.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn snapshot_per_extension_allow_overrides_global_deny() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        // "exec" is in deny_caps (denied globally)
+        let global = snapshot.lookup("exec", None);
+        assert_eq!(global.decision, PolicyDecision::Deny);
+
+        // but ext.special allows "exec"
+        let ext = snapshot.lookup("exec", Some("ext.special"));
+        assert_eq!(ext.decision, PolicyDecision::Allow);
+    }
+}
+
 fn required_capability_for_host_call_static_legacy(call: &HostCallPayload) -> Option<&'static str> {
     let method = call.method.trim();
     if method.is_empty() {
@@ -7909,6 +8208,218 @@ struct HostcallLaneExecution {
     dispatch_latency_ms: u64,
 }
 
+const HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC: &str = "canonical_generic_v1";
+const HOSTCALL_MARSHALLING_PATH_FAST_OPCODE: &str = "interned_opcode_arena_v1";
+const HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK: &str = "canonical_fallback_v1";
+const HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS: &str = "opcode_payload_shape_miss";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostcallMarshallingTelemetry {
+    path: String,
+    latency_us: u64,
+    fallback_reason: Option<String>,
+    fallback_count: u64,
+}
+
+impl Default for HostcallMarshallingTelemetry {
+    fn default() -> Self {
+        Self {
+            path: HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string(),
+            latency_us: 0,
+            fallback_reason: None,
+            fallback_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostcallMarshallingArtifacts {
+    params_hash: String,
+    args_shape_hash: String,
+    telemetry: HostcallMarshallingTelemetry,
+}
+
+/// Borrowed arena view for hot hostcall marshalling paths.
+///
+/// The arena keeps references into the existing payload so fast opcode lanes
+/// can hash canonical envelopes without cloning or reconstructing top-level
+/// parameter objects.
+struct HostcallPayloadArena<'a> {
+    method: &'a str,
+    params: &'a Value,
+    opcode: Option<CommonHostcallOpcode>,
+}
+
+impl<'a> HostcallPayloadArena<'a> {
+    fn new(method: &'a str, params: &'a Value, opcode: Option<CommonHostcallOpcode>) -> Self {
+        Self {
+            method,
+            params,
+            opcode,
+        }
+    }
+
+    fn marshal(&self) -> HostcallMarshallingArtifacts {
+        let started = Instant::now();
+        if let Some(opcode) = self.opcode
+            && let Some((params_hash, args_shape_hash)) = self.hash_fast_opcode(opcode)
+        {
+            return HostcallMarshallingArtifacts {
+                params_hash,
+                args_shape_hash,
+                telemetry: HostcallMarshallingTelemetry {
+                    path: HOSTCALL_MARSHALLING_PATH_FAST_OPCODE.to_string(),
+                    latency_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    fallback_reason: None,
+                    fallback_count: 0,
+                },
+            };
+        }
+
+        HostcallMarshallingArtifacts {
+            params_hash: hostcall_params_hash(self.method, self.params),
+            args_shape_hash: hostcall_params_shape_hash(self.method, self.params),
+            telemetry: HostcallMarshallingTelemetry {
+                path: if self.opcode.is_some() {
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK.to_string()
+                } else {
+                    HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC.to_string()
+                },
+                latency_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                fallback_reason: self
+                    .opcode
+                    .map(|_| HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS.to_string()),
+                fallback_count: 0,
+            },
+        }
+    }
+
+    fn hash_fast_opcode(&self, opcode: CommonHostcallOpcode) -> Option<(String, String)> {
+        if let Some(tool_name) = hostcall_tool_opcode_name(opcode) {
+            return self.hash_fast_tool_payload(tool_name);
+        }
+        if let Some(op_value) = hostcall_opcode_param_op(opcode) {
+            return self.hash_fast_op_only_payload(op_value);
+        }
+        None
+    }
+
+    fn hash_fast_tool_payload(&self, expected_name: &str) -> Option<(String, String)> {
+        let map = self.params.as_object()?;
+        if map.len() != 2 {
+            return None;
+        }
+        let name = map.get("name").and_then(Value::as_str)?;
+        if !token_eq_ascii_folded(name, expected_name) {
+            return None;
+        }
+        let input = map.get("input")?;
+
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
+            h.update(b"{");
+            hash_json_escaped_str("input", h);
+            h.update(b":");
+            hash_canonical_json(input, h);
+            h.update(b",");
+            hash_json_escaped_str("name", h);
+            h.update(b":");
+            hash_json_escaped_str(expected_name, h);
+            h.update(b"}");
+        });
+        let params_hash = sha256_to_hex(hasher.finalize().as_slice());
+
+        let mut shape_hasher = sha2::Sha256::new();
+        hash_hostcall_envelope(
+            self.method,
+            br#","params_shape":"#,
+            &mut shape_hasher,
+            |h| {
+                h.update(b"{");
+                hash_json_escaped_str("input", h);
+                h.update(b":");
+                hash_canonical_shape(input, h);
+                h.update(b",");
+                hash_json_escaped_str("name", h);
+                h.update(b":");
+                h.update(br#""string""#);
+                h.update(b"}");
+            },
+        );
+        let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
+        Some((params_hash, args_shape_hash))
+    }
+
+    fn hash_fast_op_only_payload(&self, expected_op: &str) -> Option<(String, String)> {
+        let map = self.params.as_object()?;
+        if map.len() != 1 {
+            return None;
+        }
+        let op = map.get("op").and_then(Value::as_str)?;
+        if !token_eq_ascii_folded(op, expected_op) {
+            return None;
+        }
+
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hash_hostcall_envelope(self.method, br#","params":"#, &mut hasher, |h| {
+            h.update(b"{");
+            hash_json_escaped_str("op", h);
+            h.update(b":");
+            hash_json_escaped_str(expected_op, h);
+            h.update(b"}");
+        });
+        let params_hash = sha256_to_hex(hasher.finalize().as_slice());
+
+        let mut shape_hasher = sha2::Sha256::new();
+        hash_hostcall_envelope(
+            self.method,
+            br#","params_shape":"#,
+            &mut shape_hasher,
+            |h| {
+                h.update(b"{");
+                hash_json_escaped_str("op", h);
+                h.update(b":");
+                h.update(br#""string""#);
+                h.update(b"}");
+            },
+        );
+        let args_shape_hash = sha256_to_hex(shape_hasher.finalize().as_slice());
+        Some((params_hash, args_shape_hash))
+    }
+}
+
+const fn hostcall_tool_opcode_name(opcode: CommonHostcallOpcode) -> Option<&'static str> {
+    match opcode {
+        CommonHostcallOpcode::ToolRead => Some("read"),
+        CommonHostcallOpcode::ToolWrite => Some("write"),
+        CommonHostcallOpcode::ToolEdit => Some("edit"),
+        CommonHostcallOpcode::ToolBash => Some("bash"),
+        _ => None,
+    }
+}
+
+const fn hostcall_opcode_param_op(opcode: CommonHostcallOpcode) -> Option<&'static str> {
+    match opcode {
+        CommonHostcallOpcode::SessionGetState => Some("get_state"),
+        CommonHostcallOpcode::SessionGetMessages => Some("get_messages"),
+        CommonHostcallOpcode::SessionGetEntries => Some("get_entries"),
+        CommonHostcallOpcode::SessionGetBranch => Some("get_branch"),
+        CommonHostcallOpcode::SessionGetFile => Some("get_file"),
+        CommonHostcallOpcode::SessionGetName => Some("get_name"),
+        CommonHostcallOpcode::SessionGetModel => Some("get_model"),
+        CommonHostcallOpcode::SessionGetThinkingLevel => Some("get_thinking_level"),
+        CommonHostcallOpcode::EventsGetActiveTools => Some("get_active_tools"),
+        CommonHostcallOpcode::EventsGetAllTools => Some("get_all_tools"),
+        CommonHostcallOpcode::EventsList => Some("list"),
+        CommonHostcallOpcode::EventsGetModel => Some("get_model"),
+        CommonHostcallOpcode::EventsGetThinkingLevel => Some("get_thinking_level"),
+        CommonHostcallOpcode::EventsListFlags => Some("list_flags"),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Shared Hostcall Dispatch (bd-1uy.1.3)
 // ============================================================================
@@ -8050,13 +8561,44 @@ const fn host_call_error_code_str(code: HostCallErrorCode) -> &'static str {
     }
 }
 
-fn normalize_opcode_token(value: &str) -> String {
-    value
+fn token_eq_ascii_folded(left: &str, right: &str) -> bool {
+    let mut left_iter = left
         .trim()
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
+        .bytes()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|b| b.to_ascii_lowercase());
+    let mut right_iter = right
+        .trim()
+        .bytes()
+        .filter(|b| b.is_ascii_alphanumeric())
+        .map(|b| b.to_ascii_lowercase());
+    loop {
+        match (left_iter.next(), right_iter.next()) {
+            (Some(left_b), Some(right_b)) if left_b == right_b => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostcallMethodAtom {
+    Tool,
+    Session,
+    Events,
+    Unknown,
+}
+
+fn intern_hostcall_method_atom(method: &str) -> HostcallMethodAtom {
+    if token_eq_ascii_folded(method, "tool") {
+        HostcallMethodAtom::Tool
+    } else if token_eq_ascii_folded(method, "session") {
+        HostcallMethodAtom::Session
+    } else if token_eq_ascii_folded(method, "events") {
+        HostcallMethodAtom::Events
+    } else {
+        HostcallMethodAtom::Unknown
+    }
 }
 
 fn hostcall_param_op(params: &Value) -> Option<&str> {
@@ -8104,59 +8646,93 @@ fn parse_common_hostcall_opcode_code(code: &str) -> Option<CommonHostcallOpcode>
     }
 }
 
+fn parse_tool_opcode_atom(name: &str) -> Option<CommonHostcallOpcode> {
+    if token_eq_ascii_folded(name, "read") {
+        Some(CommonHostcallOpcode::ToolRead)
+    } else if token_eq_ascii_folded(name, "write") {
+        Some(CommonHostcallOpcode::ToolWrite)
+    } else if token_eq_ascii_folded(name, "edit") {
+        Some(CommonHostcallOpcode::ToolEdit)
+    } else if token_eq_ascii_folded(name, "bash") {
+        Some(CommonHostcallOpcode::ToolBash)
+    } else {
+        None
+    }
+}
+
+fn parse_session_opcode_atom(op: &str) -> Option<CommonHostcallOpcode> {
+    if token_eq_ascii_folded(op, "getstate") {
+        Some(CommonHostcallOpcode::SessionGetState)
+    } else if token_eq_ascii_folded(op, "getmessages") {
+        Some(CommonHostcallOpcode::SessionGetMessages)
+    } else if token_eq_ascii_folded(op, "getentries") {
+        Some(CommonHostcallOpcode::SessionGetEntries)
+    } else if token_eq_ascii_folded(op, "getbranch") {
+        Some(CommonHostcallOpcode::SessionGetBranch)
+    } else if token_eq_ascii_folded(op, "getfile") {
+        Some(CommonHostcallOpcode::SessionGetFile)
+    } else if token_eq_ascii_folded(op, "getname") {
+        Some(CommonHostcallOpcode::SessionGetName)
+    } else if token_eq_ascii_folded(op, "setname") {
+        Some(CommonHostcallOpcode::SessionSetName)
+    } else if token_eq_ascii_folded(op, "getmodel") {
+        Some(CommonHostcallOpcode::SessionGetModel)
+    } else if token_eq_ascii_folded(op, "setmodel") {
+        Some(CommonHostcallOpcode::SessionSetModel)
+    } else if token_eq_ascii_folded(op, "getthinkinglevel") {
+        Some(CommonHostcallOpcode::SessionGetThinkingLevel)
+    } else if token_eq_ascii_folded(op, "setthinkinglevel") {
+        Some(CommonHostcallOpcode::SessionSetThinkingLevel)
+    } else if token_eq_ascii_folded(op, "setlabel") {
+        Some(CommonHostcallOpcode::SessionSetLabel)
+    } else {
+        None
+    }
+}
+
+fn parse_events_opcode_atom(op: &str) -> Option<CommonHostcallOpcode> {
+    if token_eq_ascii_folded(op, "getactivetools") {
+        Some(CommonHostcallOpcode::EventsGetActiveTools)
+    } else if token_eq_ascii_folded(op, "getalltools") {
+        Some(CommonHostcallOpcode::EventsGetAllTools)
+    } else if token_eq_ascii_folded(op, "setactivetools") {
+        Some(CommonHostcallOpcode::EventsSetActiveTools)
+    } else if token_eq_ascii_folded(op, "emit") {
+        Some(CommonHostcallOpcode::EventsEmit)
+    } else if token_eq_ascii_folded(op, "list") {
+        Some(CommonHostcallOpcode::EventsList)
+    } else if token_eq_ascii_folded(op, "getmodel") {
+        Some(CommonHostcallOpcode::EventsGetModel)
+    } else if token_eq_ascii_folded(op, "setmodel") {
+        Some(CommonHostcallOpcode::EventsSetModel)
+    } else if token_eq_ascii_folded(op, "getthinkinglevel") {
+        Some(CommonHostcallOpcode::EventsGetThinkingLevel)
+    } else if token_eq_ascii_folded(op, "setthinkinglevel") {
+        Some(CommonHostcallOpcode::EventsSetThinkingLevel)
+    } else if token_eq_ascii_folded(op, "getflag") {
+        Some(CommonHostcallOpcode::EventsGetFlag)
+    } else if token_eq_ascii_folded(op, "listflags") {
+        Some(CommonHostcallOpcode::EventsListFlags)
+    } else if token_eq_ascii_folded(op, "appendentry") {
+        Some(CommonHostcallOpcode::EventsAppendEntry)
+    } else if token_eq_ascii_folded(op, "registercommand") {
+        Some(CommonHostcallOpcode::EventsRegisterCommand)
+    } else {
+        None
+    }
+}
+
 fn derive_common_hostcall_opcode(method: &str, params: &Value) -> Option<CommonHostcallOpcode> {
-    match normalize_opcode_token(method).as_str() {
-        "tool" => {
-            let name = params
-                .get("name")
-                .and_then(Value::as_str)
-                .map(normalize_opcode_token)?;
-            match name.as_str() {
-                "read" => Some(CommonHostcallOpcode::ToolRead),
-                "write" => Some(CommonHostcallOpcode::ToolWrite),
-                "edit" => Some(CommonHostcallOpcode::ToolEdit),
-                "bash" => Some(CommonHostcallOpcode::ToolBash),
-                _ => None,
-            }
+    match intern_hostcall_method_atom(method) {
+        HostcallMethodAtom::Tool => params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(parse_tool_opcode_atom),
+        HostcallMethodAtom::Session => {
+            hostcall_param_op(params).and_then(parse_session_opcode_atom)
         }
-        "session" => {
-            let op = hostcall_param_op(params).map(normalize_opcode_token)?;
-            match op.as_str() {
-                "getstate" => Some(CommonHostcallOpcode::SessionGetState),
-                "getmessages" => Some(CommonHostcallOpcode::SessionGetMessages),
-                "getentries" => Some(CommonHostcallOpcode::SessionGetEntries),
-                "getbranch" => Some(CommonHostcallOpcode::SessionGetBranch),
-                "getfile" => Some(CommonHostcallOpcode::SessionGetFile),
-                "getname" => Some(CommonHostcallOpcode::SessionGetName),
-                "setname" => Some(CommonHostcallOpcode::SessionSetName),
-                "getmodel" => Some(CommonHostcallOpcode::SessionGetModel),
-                "setmodel" => Some(CommonHostcallOpcode::SessionSetModel),
-                "getthinkinglevel" => Some(CommonHostcallOpcode::SessionGetThinkingLevel),
-                "setthinkinglevel" => Some(CommonHostcallOpcode::SessionSetThinkingLevel),
-                "setlabel" => Some(CommonHostcallOpcode::SessionSetLabel),
-                _ => None,
-            }
-        }
-        "events" => {
-            let op = hostcall_param_op(params).map(normalize_opcode_token)?;
-            match op.as_str() {
-                "getactivetools" => Some(CommonHostcallOpcode::EventsGetActiveTools),
-                "getalltools" => Some(CommonHostcallOpcode::EventsGetAllTools),
-                "setactivetools" => Some(CommonHostcallOpcode::EventsSetActiveTools),
-                "emit" => Some(CommonHostcallOpcode::EventsEmit),
-                "list" => Some(CommonHostcallOpcode::EventsList),
-                "getmodel" => Some(CommonHostcallOpcode::EventsGetModel),
-                "setmodel" => Some(CommonHostcallOpcode::EventsSetModel),
-                "getthinkinglevel" => Some(CommonHostcallOpcode::EventsGetThinkingLevel),
-                "setthinkinglevel" => Some(CommonHostcallOpcode::EventsSetThinkingLevel),
-                "getflag" => Some(CommonHostcallOpcode::EventsGetFlag),
-                "listflags" => Some(CommonHostcallOpcode::EventsListFlags),
-                "appendentry" => Some(CommonHostcallOpcode::EventsAppendEntry),
-                "registercommand" => Some(CommonHostcallOpcode::EventsRegisterCommand),
-                _ => None,
-            }
-        }
-        _ => None,
+        HostcallMethodAtom::Events => hostcall_param_op(params).and_then(parse_events_opcode_atom),
+        HostcallMethodAtom::Unknown => None,
     }
 }
 
@@ -13920,6 +14496,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
         host: &JsRuntimeHost,
         mut pending: std::collections::VecDeque<HostcallRequest>,
     ) {
+        let mut completions = Vec::with_capacity(pending.len());
         while let Some(req) = pending.pop_front() {
             let call_id = req.call_id.clone();
             if !runtime.is_hostcall_pending(&call_id) {
@@ -13930,8 +14507,30 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
                 );
                 continue;
             }
+            let extension_id = req.extension_id.clone();
+            let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
+            let dispatch_started = Instant::now();
             let outcome = dispatch_hostcall_with_runtime(Some(runtime), host, req).await;
-            runtime.complete_hostcall(call_id, outcome);
+            let execution_ms =
+                u64::try_from(dispatch_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let outcome_code = match &outcome {
+                HostcallOutcome::Success(_) => "success",
+                HostcallOutcome::StreamChunk { .. } => "stream",
+                HostcallOutcome::Error { code, .. } => code.as_str(),
+            };
+            tracing::debug!(
+                event = "pijs.hostcall.dispatch_timing",
+                call_id = %call_id,
+                extension_id = ?extension_id,
+                queue_wait_ms,
+                execution_ms,
+                outcome_code = %outcome_code,
+                "Hostcall dispatch timing"
+            );
+            completions.push((call_id, outcome));
+        }
+        if !completions.is_empty() {
+            runtime.complete_hostcalls_batch(completions);
         }
     }
 
@@ -14151,6 +14750,7 @@ fn log_hostcall_end(
     params_hash: &str,
     duration_ms: u64,
     lane_execution: Option<&HostcallLaneExecution>,
+    marshalling: &HostcallMarshallingTelemetry,
     outcome: &HostcallOutcome,
 ) {
     let (is_error, error_code) = match outcome {
@@ -14167,6 +14767,10 @@ fn log_hostcall_end(
         .checked_div(duration_ms)
         .unwrap_or(0)
         .min(10_000);
+    let marshalling_path = marshalling.path.as_str();
+    let marshalling_latency_us = marshalling.latency_us;
+    let marshalling_fallback_reason = marshalling.fallback_reason.as_deref();
+    let marshalling_fallback_count = marshalling.fallback_count;
 
     if is_error {
         tracing::warn!(
@@ -14184,6 +14788,10 @@ fn log_hostcall_end(
             lane_matrix_key = lane_matrix_key,
             lane_dispatch_latency_ms,
             lane_latency_share_bps,
+            marshalling_path = marshalling_path,
+            marshalling_latency_us,
+            marshalling_fallback_reason = marshalling_fallback_reason,
+            marshalling_fallback_count,
             error_code = error_code,
             "Hostcall end (error)"
         );
@@ -14203,6 +14811,10 @@ fn log_hostcall_end(
             lane_matrix_key = lane_matrix_key,
             lane_dispatch_latency_ms,
             lane_latency_share_bps,
+            marshalling_path = marshalling_path,
+            marshalling_latency_us,
+            marshalling_fallback_reason = marshalling_fallback_reason,
+            marshalling_fallback_count,
             "Hostcall end (success)"
         );
     }
@@ -14249,9 +14861,26 @@ pub async fn dispatch_host_call_shared(
 
     let call_id = call.call_id.clone();
     let method = call.method.clone();
-    let capability = required_capability_for_host_call_static(&call).unwrap_or("internal");
-    let params_hash = hostcall_params_hash(&method, &call.params);
-    let args_shape_hash = hostcall_params_shape_hash(&method, &call.params);
+    let opcode_hint = match resolve_hostcall_opcode(&call) {
+        Ok(HostcallOpcodeResolution::FastPath { opcode, .. }) => Some(opcode),
+        _ => None,
+    };
+    let capability = opcode_hint
+        .map(|opcode| opcode.required_capability())
+        .or_else(|| required_capability_for_host_call_static_legacy(&call))
+        .unwrap_or("internal");
+    let HostcallMarshallingArtifacts {
+        params_hash,
+        args_shape_hash,
+        mut telemetry,
+    } = HostcallPayloadArena::new(&method, &call.params, opcode_hint).marshal();
+    if let Some(manager) = ctx.manager.as_ref() {
+        telemetry.fallback_count = manager.record_hostcall_marshalling_fallback_count(
+            ctx.extension_id,
+            telemetry.fallback_reason.as_deref(),
+        );
+    }
+    let marshalling_telemetry = telemetry;
     let resource_target_class = runtime_hostcall_resource_target_class(&method, &call.params);
     let policy_profile = runtime_hostcall_policy_profile(ctx.policy.mode);
     let started_at = Instant::now();
@@ -14338,6 +14967,7 @@ pub async fn dispatch_host_call_shared(
                     &params_hash,
                     duration_ms,
                     None,
+                    &marshalling_telemetry,
                     &outcome,
                 );
                 return outcome_to_host_result(&call_id, &outcome);
@@ -14583,6 +15213,7 @@ pub async fn dispatch_host_call_shared(
         &params_hash,
         duration_ms,
         lane_execution.as_ref(),
+        &marshalling_telemetry,
         &outcome,
     );
 
@@ -14601,6 +15232,7 @@ pub async fn dispatch_host_call_shared(
             outcome_error_code,
             duration_ms,
             lane_execution.as_ref(),
+            &marshalling_telemetry,
         );
     }
 
@@ -14861,6 +15493,144 @@ async fn dispatch_shared_allowed(
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_hostcall_session_fast_ref(
+    manager: &ExtensionManager,
+    op: &str,
+    params: &Value,
+) -> HostcallOutcome {
+    let Some(session) = manager.session_handle() else {
+        return HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: "No session configured".to_string(),
+        };
+    };
+
+    let op_norm = op.trim().to_ascii_lowercase();
+    let result = match op_norm.as_str() {
+        "get_state" | "getstate" => Ok(session.get_state().await),
+        "get_messages" | "getmessages" => serde_json::to_value(session.get_messages().await)
+            .map_err(|err| Error::extension(format!("Serialize messages: {err}"))),
+        "get_entries" | "getentries" => serde_json::to_value(session.get_entries().await)
+            .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
+        "get_branch" | "getbranch" => serde_json::to_value(session.get_branch().await)
+            .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
+        "get_file" | "getfile" => {
+            let state = session.get_state().await;
+            let file = state
+                .get("sessionFile")
+                .or_else(|| state.get("session_file"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(file)
+        }
+        "get_name" | "getname" => {
+            let state = session.get_state().await;
+            let name = state
+                .get("sessionName")
+                .or_else(|| state.get("session_name"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(name)
+        }
+        "set_name" | "setname" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            session.set_name(name).await.map(|()| Value::Null)
+        }
+        "set_model" | "setmodel" => {
+            let provider = params
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model_id = params
+                .get("modelId")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("model_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if provider.is_empty() || model_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setModel: provider and modelId are required".to_string(),
+                };
+            }
+            session
+                .set_model(provider, model_id)
+                .await
+                .map(|()| Value::Bool(true))
+        }
+        "get_model" | "getmodel" => {
+            let (provider, model_id) = session.get_model().await;
+            Ok(serde_json::json!({
+                "provider": provider,
+                "modelId": model_id,
+            }))
+        }
+        "set_thinking_level" | "setthinkinglevel" => {
+            let level = params
+                .get("level")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("thinkingLevel").and_then(Value::as_str))
+                .or_else(|| params.get("thinking_level").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if level.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setThinkingLevel: level is required".to_string(),
+                };
+            }
+            session
+                .set_thinking_level(level)
+                .await
+                .map(|()| Value::Null)
+        }
+        "get_thinking_level" | "getthinkinglevel" => {
+            let level = session.get_thinking_level().await;
+            Ok(level.map_or(Value::Null, Value::String))
+        }
+        "set_label" | "setlabel" => {
+            let target_id = params
+                .get("targetId")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("target_id").and_then(Value::as_str))
+                .or_else(|| params.get("entryId").and_then(Value::as_str))
+                .or_else(|| params.get("entry_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if target_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setLabel: targetId is required".to_string(),
+                };
+            }
+            let label = params
+                .get("label")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            session
+                .set_label(target_id, label)
+                .await
+                .map(|()| Value::Null)
+        }
+        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
+    };
+
+    match result {
+        Ok(value) => HostcallOutcome::Success(value),
+        Err(err) => HostcallOutcome::Error {
+            code: err.hostcall_error_code().to_string(),
+            message: err.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn dispatch_shared_allowed_fast(
     ctx: &HostCallContext<'_>,
     call: &HostCallPayload,
@@ -14890,13 +15660,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_name",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_name", &call.params).await
         }
         CommonHostcallOpcode::SessionSetName => {
             let Some(ref manager) = ctx.manager else {
@@ -14905,13 +15669,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "set_name",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "set_name", &call.params).await
         }
         CommonHostcallOpcode::SessionGetModel => {
             let Some(ref manager) = ctx.manager else {
@@ -14920,13 +15678,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_model",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_model", &call.params).await
         }
         CommonHostcallOpcode::SessionSetModel => {
             let Some(ref manager) = ctx.manager else {
@@ -14935,13 +15687,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "set_model",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "set_model", &call.params).await
         }
         CommonHostcallOpcode::SessionGetThinkingLevel => {
             let Some(ref manager) = ctx.manager else {
@@ -14950,13 +15696,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_thinking_level",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_thinking_level", &call.params).await
         }
         CommonHostcallOpcode::SessionSetThinkingLevel => {
             let Some(ref manager) = ctx.manager else {
@@ -14965,13 +15705,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "set_thinking_level",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "set_thinking_level", &call.params).await
         }
         CommonHostcallOpcode::SessionSetLabel => {
             let Some(ref manager) = ctx.manager else {
@@ -14980,13 +15714,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "set_label",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "set_label", &call.params).await
         }
         CommonHostcallOpcode::EventsGetActiveTools => {
             let Some(ref manager) = ctx.manager else {
@@ -15076,13 +15804,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_state",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_state", &call.params).await
         }
         CommonHostcallOpcode::SessionGetMessages => {
             let Some(ref manager) = ctx.manager else {
@@ -15091,13 +15813,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_messages",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_messages", &call.params).await
         }
         CommonHostcallOpcode::SessionGetEntries => {
             let Some(ref manager) = ctx.manager else {
@@ -15106,13 +15822,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_entries",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_entries", &call.params).await
         }
         CommonHostcallOpcode::SessionGetBranch => {
             let Some(ref manager) = ctx.manager else {
@@ -15121,13 +15831,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_branch",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_branch", &call.params).await
         }
         CommonHostcallOpcode::SessionGetFile => {
             let Some(ref manager) = ctx.manager else {
@@ -15136,13 +15840,7 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_session(
-                &call.call_id,
-                manager,
-                "get_file",
-                params_without_key(&call.params, "op"),
-            )
-            .await
+            dispatch_hostcall_session_fast_ref(manager, "get_file", &call.params).await
         }
         // --- New fast-lane events operations (bd-3ar8v.4.12) ---
         CommonHostcallOpcode::EventsGetModel => {
@@ -16867,6 +17565,7 @@ struct ExtensionManagerInner {
     runtime_risk_states: HashMap<String, RuntimeRiskState>,
     runtime_risk_ledger: VecDeque<RuntimeRiskLedgerEntry>,
     runtime_hostcall_telemetry: VecDeque<RuntimeHostcallTelemetryEvent>,
+    hostcall_marshalling_fallback_counts: HashMap<String, u64>,
     runtime_risk_last_hash: Option<String>,
     /// Per-extension resource quota config and mutable counters (SEC-4.1).
     quota_config: ExtensionQuotaConfig,
@@ -17154,6 +17853,23 @@ impl ExtensionManager {
 
     fn runtime_risk_extension_key(extension_id: Option<&str>) -> String {
         extension_id.unwrap_or("<unknown>").to_string()
+    }
+
+    fn record_hostcall_marshalling_fallback_count(
+        &self,
+        extension_id: Option<&str>,
+        fallback_reason: Option<&str>,
+    ) -> u64 {
+        let ext_key = Self::runtime_risk_extension_key(extension_id);
+        let mut guard = self.inner.lock().unwrap();
+        let entry = guard
+            .hostcall_marshalling_fallback_counts
+            .entry(ext_key)
+            .or_insert(0);
+        if fallback_reason.is_some() {
+            *entry = entry.saturating_add(1);
+        }
+        *entry
     }
 
     fn runtime_risk_push_ledger(
@@ -17728,6 +18444,7 @@ impl ExtensionManager {
         outcome_error_code: Option<&str>,
         duration_ms: u64,
         lane_execution: Option<&HostcallLaneExecution>,
+        marshalling: &HostcallMarshallingTelemetry,
     ) {
         let mut guard = self.inner.lock().unwrap();
         if !guard.runtime_risk_config.enabled {
@@ -17857,6 +18574,10 @@ impl ExtensionManager {
                 lane_matrix_key,
                 lane_dispatch_latency_ms,
                 lane_latency_share_bps,
+                marshalling_path: marshalling.path.clone(),
+                marshalling_latency_us: marshalling.latency_us,
+                marshalling_fallback_reason: marshalling.fallback_reason.clone(),
+                marshalling_fallback_count: marshalling.fallback_count,
                 outcome: if is_error {
                     "error".to_string()
                 } else {
@@ -30568,6 +31289,130 @@ mod tests {
         assert_eq!(entry.lane_matrix_key, "tool|fallback|filesystem");
         assert!(entry.lane_dispatch_latency_ms <= entry.latency_ms);
         assert!(entry.lane_latency_share_bps <= 10_000);
+        assert_eq!(
+            entry.marshalling_path,
+            HOSTCALL_MARSHALLING_PATH_FAST_OPCODE
+        );
+        assert!(entry.marshalling_fallback_reason.is_none());
+        assert_eq!(entry.marshalling_fallback_count, 0);
+    }
+
+    #[test]
+    fn hostcall_marshalling_fast_hash_matches_generic_for_hot_opcodes() {
+        let tool_params = json!({
+            "name": "read",
+            "input": {
+                "path": "a.txt",
+                "offset": 0,
+                "limit": 10
+            }
+        });
+        let session_params = json!({ "op": "get_name" });
+        let events_params = json!({ "op": "list_flags" });
+
+        let cases = [
+            ("tool", &tool_params, Some(CommonHostcallOpcode::ToolRead)),
+            (
+                "session",
+                &session_params,
+                Some(CommonHostcallOpcode::SessionGetName),
+            ),
+            (
+                "events",
+                &events_params,
+                Some(CommonHostcallOpcode::EventsListFlags),
+            ),
+        ];
+
+        for (method, params, opcode) in cases {
+            let artifacts = HostcallPayloadArena::new(method, params, opcode).marshal();
+            assert_eq!(artifacts.params_hash, hostcall_params_hash(method, params));
+            assert_eq!(
+                artifacts.args_shape_hash,
+                hostcall_params_shape_hash(method, params)
+            );
+            assert_eq!(
+                artifacts.telemetry.path,
+                HOSTCALL_MARSHALLING_PATH_FAST_OPCODE
+            );
+            assert!(artifacts.telemetry.fallback_reason.is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_hostcall_telemetry_records_marshalling_fallback_reason_and_counter() {
+        let dir = tempdir().expect("tempdir");
+        let file = dir.path().join("lane_telemetry_fallback.txt");
+        std::fs::write(&file, "lane-telemetry-fallback").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let manager = ExtensionManager::new();
+        manager.set_runtime_risk_config(RuntimeRiskConfig {
+            enabled: true,
+            enforce: false,
+            alpha: 0.01,
+            window_size: 64,
+            ledger_limit: 256,
+            decision_timeout_ms: 200,
+            fail_closed: true,
+        });
+
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.telemetry.fallback"),
+            tools: &tools,
+            http: &http,
+            manager: Some(manager.clone()),
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let mut first_payload =
+            typed_tool_read_payload("lane-telemetry-fallback-1", file.to_str().expect("utf-8"));
+        let params = first_payload
+            .params
+            .as_object_mut()
+            .expect("tool params must be object");
+        params.insert("extra".to_string(), json!(true));
+        let first_result =
+            run_async(async { dispatch_host_call_shared(&ctx, first_payload).await });
+        assert!(!first_result.is_error, "first dispatch should succeed");
+        let first_entry = manager
+            .runtime_hostcall_telemetry_artifact()
+            .entries
+            .last()
+            .cloned()
+            .expect("first telemetry entry");
+        assert_eq!(
+            first_entry.marshalling_fallback_reason.as_deref(),
+            Some(HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS)
+        );
+        assert_eq!(
+            first_entry.marshalling_path,
+            HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+        );
+        assert_eq!(first_entry.marshalling_fallback_count, 1);
+
+        let mut second_payload =
+            typed_tool_read_payload("lane-telemetry-fallback-2", file.to_str().expect("utf-8"));
+        let params = second_payload
+            .params
+            .as_object_mut()
+            .expect("tool params must be object");
+        params.insert("extra".to_string(), json!(false));
+        let second_result =
+            run_async(async { dispatch_host_call_shared(&ctx, second_payload).await });
+        assert!(!second_result.is_error, "second dispatch should succeed");
+        let second_entry = manager
+            .runtime_hostcall_telemetry_artifact()
+            .entries
+            .last()
+            .cloned()
+            .expect("second telemetry entry");
+        assert_eq!(second_entry.marshalling_fallback_count, 2);
     }
 
     #[test]
@@ -34811,6 +35656,7 @@ mod tests {
                 None,
                 1,
                 None,
+                &HostcallMarshallingTelemetry::default(),
             );
             if decision
                 .triggers
@@ -34865,6 +35711,7 @@ mod tests {
             None,
             1,
             None,
+            &HostcallMarshallingTelemetry::default(),
         );
         // If first call was Harden, second exec call should trigger escalation
         if matches!(d1.action, RuntimeRiskAction::Harden) {
@@ -34968,6 +35815,7 @@ mod tests {
             None,
             1,
             None,
+            &HostcallMarshallingTelemetry::default(),
         );
         // Second call: dangerous exec → transition from safe to dangerous
         let d2 = manager
@@ -35033,6 +35881,7 @@ mod tests {
                     None,
                     1,
                     None,
+                    &HostcallMarshallingTelemetry::default(),
                 );
                 run_triggers.push(decision.triggers.clone());
             }

@@ -27,7 +27,7 @@ use crate::extensions::{
     DangerousCommandClass, ExecMediationResult, ExtensionBody, ExtensionMessage, ExtensionPolicy,
     ExtensionSession, ExtensionUiRequest, ExtensionUiResponse, HostCallError, HostCallErrorCode,
     HostCallPayload, HostResultPayload, HostStreamChunk, PROTOCOL_VERSION, PolicyDecision,
-    PolicyProfile, classify_ui_hostcall_error, evaluate_exec_mediation,
+    PolicyProfile, PolicySnapshot, classify_ui_hostcall_error, evaluate_exec_mediation,
     required_capability_for_host_call_static, ui_response_value_for_op,
 };
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
@@ -50,6 +50,8 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     cwd: PathBuf,
     /// Capability policy governing which hostcalls are allowed.
     policy: ExtensionPolicy,
+    /// Precomputed O(1) capability decision table.
+    snapshot: PolicySnapshot,
 }
 
 fn protocol_hostcall_op(params: &Value) -> Option<&str> {
@@ -294,6 +296,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cwd: PathBuf,
         policy: ExtensionPolicy,
     ) -> Self {
+        let snapshot = PolicySnapshot::compile(&policy);
         Self {
             runtime,
             tool_registry,
@@ -302,6 +305,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             ui_handler,
             cwd,
             policy,
+            snapshot,
         }
     }
 
@@ -320,8 +324,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         Box::pin(async move {
             let cap = request.required_capability();
             let check = self
-                .policy
-                .evaluate_for(&cap, request.extension_id.as_deref());
+                .snapshot
+                .lookup(&cap, request.extension_id.as_deref());
             if check.decision != PolicyDecision::Allow {
                 let outcome = HostcallOutcome::Error {
                     code: "denied".to_string(),
@@ -422,7 +426,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn dispatch_protocol_host_call(&self, payload: &HostCallPayload) -> HostcallOutcome {
         if let Some(cap) = required_capability_for_host_call_static(payload) {
-            let check = self.policy.evaluate_for(cap, None);
+            let check = self.snapshot.lookup(cap, None);
             if check.decision != PolicyDecision::Allow {
                 return HostcallOutcome::Error {
                     code: "denied".to_string(),

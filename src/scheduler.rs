@@ -377,6 +377,16 @@ impl<C: Clock> Scheduler<C> {
         self.macrotask_queue.push(Reverse(task));
     }
 
+    /// Enqueue multiple hostcall completions in one scheduler mutation pass.
+    pub fn enqueue_hostcall_completions<I>(&mut self, completions: I)
+    where
+        I: IntoIterator<Item = (String, HostcallOutcome)>,
+    {
+        for (call_id, outcome) in completions {
+            self.enqueue_hostcall_complete(call_id, outcome);
+        }
+    }
+
     /// Convenience: enqueue a stream chunk for a hostcall.
     pub fn enqueue_stream_chunk(
         &mut self,
