@@ -1420,10 +1420,10 @@ impl Agent {
                 break;
             }
 
-            let is_read_only = matches!(
-                tool_call.name.as_str(),
-                "read" | "grep" | "find" | "ls"
-            );
+            let is_read_only = self
+                .tools
+                .get(&tool_call.name)
+                .map_or(false, |t| t.is_read_only());
 
             if is_read_only {
                 pending_parallel.push((index, tool_call.clone()));
@@ -1514,79 +1514,30 @@ impl Agent {
 
         // Phase 3: Process results sequentially and handle skips.
         for (index, tool_call) in tool_calls.iter().enumerate() {
-            // Check if we have a result. If not, it means we aborted or skipped.
-            let (output, is_error) = tool_outputs[index].take().unwrap_or_else(|| {
-                // If we don't have a result, it was skipped/aborted.
-                // We must return a placeholder.
-                (
-                    ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new("Tool execution aborted"))],
-                        details: None,
-                        is_error: true,
-                    },
-                    true,
-                )
-            });
+            // Extract the result, tracking whether the tool actually executed.
+            // If `tool_outputs[index]` is `Some`, `execute_tool` ran and already
+            // emitted its own Update/End events. If `None`, the tool was
+            // skipped/aborted and we must emit placeholder events here (Phase 1
+            // already emitted Start for all tools).
+            let (output, is_error, was_executed) =
+                if let Some((out, err)) = tool_outputs[index].take() {
+                    (out, err, true)
+                } else {
+                    (
+                        ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(
+                                "Tool execution aborted",
+                            ))],
+                            details: None,
+                            is_error: true,
+                        },
+                        true,
+                        false,
+                    )
+                };
 
-            let tool_result = Arc::new(ToolResultMessage {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                content: output.content,
-                details: output.details,
-                is_error,
-                timestamp: Utc::now().timestamp_millis(),
-            });
-
-            // Re-emit events only for the completion (start was already emitted).
-            // Actually, execute_tool emits update events.
-            // But if we generated the placeholder here (abort case), we need to emit update/end?
-            // Yes, standard flow expects End event.
-            // If it ran (execute_tool), it emitted events.
-            // If it didn't run (placeholder), we must emit End event here.
-            
-            // How to know if `execute_tool` ran?
-            // If `tool_outputs[index]` was Some, it ran.
-            // But we just `take()`'d it.
-            // Wait, `execute_tool` (called in loop) takes `on_event` and emits events.
-            // So if it ran, events are done.
-            // If it didn't run (we made placeholder), we need to emit events?
-            // Yes, Phase 1 emitted Start. We need End.
-            
-            // We can infer if it ran by checking if `is_error` is true and content is "Tool execution aborted" AND we constructed it here.
-            // But `execute_tool` might also return error.
-            
-            // Better: `tool_outputs` tells us if it ran.
-            // We consumed it.
-            // Let's refine the logic.
-            
-            // We need to know if we need to emit the End event for the placeholder.
-            // The `tool_outputs` vector contained `Some` if it ran.
-            // If it was `None`, we created the placeholder.
-            // So we can track `was_executed`.
-            
-            // Wait, I can't track it easily because I just destructured it.
-            // Let's restructure:
-            
-            let (output, is_error, was_executed) = if let Some((out, err)) = tool_outputs[index].take() {
-                (out, err, true)
-            } else {
-                 (
-                    ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new(
-                            "Tool execution aborted",
-                        ))],
-                        details: None,
-                        is_error: true,
-                    },
-                    true,
-                    false
-                )
-            };
-
-            if was_executed {
-                // Events already emitted by execute_tool
-            } else {
-                // Emit missing events for aborted tools
+            if !was_executed {
+                // Emit missing events for aborted/skipped tools.
                 let event_output = ToolOutput {
                     content: output.content.clone(),
                     details: output.details.clone(),
@@ -1606,9 +1557,15 @@ impl Agent {
                 });
             }
 
-            // ... Message updates ...
-            
-            // (Standard message append logic...)
+            let tool_result = Arc::new(ToolResultMessage {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                content: output.content,
+                details: output.details,
+                is_error,
+                timestamp: Utc::now().timestamp_millis(),
+            });
+
             let msg = Message::ToolResult(Arc::clone(&tool_result));
             self.messages.push(msg.clone());
             on_event(AgentEvent::MessageStart {
@@ -1808,11 +1765,8 @@ impl Agent {
             is_error: true,
         };
 
-        on_event(AgentEvent::ToolExecutionStart {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            args: tool_call.arguments.clone(),
-        });
+        // Note: Phase 1 already emitted ToolExecutionStart for all tools,
+        // so we only emit Update and End here.
         on_event(AgentEvent::ToolExecutionUpdate {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),

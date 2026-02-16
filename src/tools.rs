@@ -56,6 +56,13 @@ pub trait Tool: Send + Sync {
         input: serde_json::Value,
         on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput>;
+
+    /// Whether the tool is read-only and safe to execute in parallel with other read-only tools.
+    ///
+    /// Defaults to `false` (safe/sequential).
+    fn is_read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Tool execution output.
@@ -1101,6 +1108,10 @@ impl Tool for ReadTool {
             },
             "required": ["path"]
         })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2698,6 +2709,10 @@ impl Tool for GrepTool {
         })
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -3102,6 +3117,10 @@ impl Tool for FindTool {
         })
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
@@ -3393,6 +3412,10 @@ impl Tool for LsTool {
                 }
             }
         })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
     }
 
     async fn execute(
