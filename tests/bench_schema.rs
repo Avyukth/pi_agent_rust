@@ -3551,6 +3551,46 @@ fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
         has_missing_index_reason,
         "matrix_cells must record missing_stage_metrics:index_ms when index attribution is absent"
     );
+    let missing_cells = matrix["stage_summary"]["missing_cells"]
+        .as_array()
+        .expect("stage_summary.missing_cells array");
+    let observed_missing_index_keys: HashSet<(String, u64)> = matrix_cells
+        .iter()
+        .filter(|cell| {
+            cell["stage_attribution"]["index_ms"].is_null()
+                && cell["missing_reasons"].as_array().is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == Some("missing_stage_metrics:index_ms"))
+                })
+        })
+        .filter_map(|cell| {
+            Some((
+                cell.get("workload_partition")?.as_str()?.to_string(),
+                cell.get("session_messages")?.as_u64()?,
+            ))
+        })
+        .collect();
+    let summary_missing_index_keys: HashSet<(String, u64)> = missing_cells
+        .iter()
+        .filter(|cell| {
+            cell["reasons"].as_array().is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason.as_str() == Some("missing_stage_metrics:index_ms"))
+            })
+        })
+        .filter_map(|cell| {
+            Some((
+                cell.get("workload_partition")?.as_str()?.to_string(),
+                cell.get("session_messages")?.as_u64()?,
+            ))
+        })
+        .collect();
+    assert_eq!(
+        summary_missing_index_keys, observed_missing_index_keys,
+        "stage_summary.missing_cells must include the same partition-size keys that matrix_cells mark with missing_stage_metrics:index_ms"
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
