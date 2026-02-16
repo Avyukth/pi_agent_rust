@@ -654,6 +654,194 @@ mod tests {
         assert_eq!(telemetry.queue_depth_budget_remaining, 0);
     }
 
+    // ── Additional public API coverage ──
+
+    #[test]
+    fn dispatch_lane_as_str_all_variants() {
+        assert_eq!(HostcallDispatchLane::Fast.as_str(), "fast");
+        assert_eq!(HostcallDispatchLane::IoUring.as_str(), "io_uring");
+        assert_eq!(HostcallDispatchLane::Compat.as_str(), "compat");
+    }
+
+    #[test]
+    fn io_hint_is_io_heavy_only_for_io_heavy_variant() {
+        assert!(HostcallIoHint::IoHeavy.is_io_heavy());
+        assert!(!HostcallIoHint::Unknown.is_io_heavy());
+        assert!(!HostcallIoHint::CpuBound.is_io_heavy());
+    }
+
+    #[test]
+    fn conservative_config_defaults() {
+        let config = IoUringLanePolicyConfig::conservative();
+        assert!(!config.enabled);
+        assert!(!config.ring_available);
+        assert_eq!(config.max_queue_depth, 256);
+        assert!(config.allow_filesystem);
+        assert!(config.allow_network);
+        // Default impl delegates to conservative
+        assert_eq!(IoUringLanePolicyConfig::default(), config);
+    }
+
+    #[test]
+    fn allow_for_capability_only_filesystem_and_network() {
+        let config = IoUringLanePolicyConfig {
+            enabled: true,
+            ring_available: true,
+            max_queue_depth: 8,
+            allow_filesystem: true,
+            allow_network: false,
+        };
+        assert!(config.allow_for_capability(HostcallCapabilityClass::Filesystem));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Network));
+        // All other classes always false
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Execution));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Session));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Events));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Environment));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Tool));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Ui));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Telemetry));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Unknown));
+    }
+
+    #[test]
+    fn decision_constructors_produce_expected_lanes() {
+        let uring = IoUringLaneDecision::io_uring();
+        assert_eq!(uring.lane, HostcallDispatchLane::IoUring);
+        assert!(uring.fallback_reason.is_none());
+        assert!(uring.fallback_code().is_none());
+
+        let compat = IoUringLaneDecision::compat(IoUringFallbackReason::CompatKillSwitch);
+        assert_eq!(compat.lane, HostcallDispatchLane::Compat);
+        assert_eq!(
+            compat.fallback_reason,
+            Some(IoUringFallbackReason::CompatKillSwitch)
+        );
+        assert_eq!(compat.fallback_code(), Some("forced_compat_kill_switch"));
+
+        let fast = IoUringLaneDecision::fast(IoUringFallbackReason::IoUringDisabled);
+        assert_eq!(fast.lane, HostcallDispatchLane::Fast);
+        assert_eq!(
+            fast.fallback_reason,
+            Some(IoUringFallbackReason::IoUringDisabled)
+        );
+        assert_eq!(fast.fallback_code(), Some("io_uring_disabled"));
+    }
+
+    #[test]
+    fn capability_class_from_all_aliases() {
+        // Filesystem aliases
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("write"),
+            HostcallCapabilityClass::Filesystem
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("filesystem"),
+            HostcallCapabilityClass::Filesystem
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("fs"),
+            HostcallCapabilityClass::Filesystem
+        );
+        // Network aliases
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("network"),
+            HostcallCapabilityClass::Network
+        );
+        // Execution
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("exec"),
+            HostcallCapabilityClass::Execution
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("execution"),
+            HostcallCapabilityClass::Execution
+        );
+        // Environment
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("env"),
+            HostcallCapabilityClass::Environment
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("environment"),
+            HostcallCapabilityClass::Environment
+        );
+        // Events
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("events"),
+            HostcallCapabilityClass::Events
+        );
+        // Tool
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("tool"),
+            HostcallCapabilityClass::Tool
+        );
+        // UI
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("ui"),
+            HostcallCapabilityClass::Ui
+        );
+        // Telemetry
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("log"),
+            HostcallCapabilityClass::Telemetry
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("telemetry"),
+            HostcallCapabilityClass::Telemetry
+        );
+        // Case insensitivity
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("READ"),
+            HostcallCapabilityClass::Filesystem
+        );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("  HTTP  "),
+            HostcallCapabilityClass::Network
+        );
+    }
+
+    #[test]
+    fn fallback_reason_as_code_all_variants() {
+        assert_eq!(
+            IoUringFallbackReason::CompatKillSwitch.as_code(),
+            "forced_compat_kill_switch"
+        );
+        assert_eq!(
+            IoUringFallbackReason::IoUringDisabled.as_code(),
+            "io_uring_disabled"
+        );
+        assert_eq!(
+            IoUringFallbackReason::IoUringUnavailable.as_code(),
+            "io_uring_unavailable"
+        );
+        assert_eq!(
+            IoUringFallbackReason::MissingIoHint.as_code(),
+            "io_hint_missing"
+        );
+        assert_eq!(
+            IoUringFallbackReason::UnsupportedCapability.as_code(),
+            "io_uring_capability_not_supported"
+        );
+        assert_eq!(
+            IoUringFallbackReason::QueueDepthBudgetExceeded.as_code(),
+            "io_uring_queue_depth_budget_exceeded"
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip_decision_and_lane() {
+        let decision = IoUringLaneDecision::io_uring();
+        let json = serde_json::to_string(&decision).expect("serialize");
+        let back: IoUringLaneDecision = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, decision);
+
+        let compat = IoUringLaneDecision::compat(IoUringFallbackReason::CompatKillSwitch);
+        let json2 = serde_json::to_string(&compat).expect("serialize");
+        let back2: IoUringLaneDecision = serde_json::from_str(&json2).expect("deserialize");
+        assert_eq!(back2, compat);
+    }
+
     #[test]
     fn decide_with_telemetry_matches_core_decision() {
         let config = enabled_config();

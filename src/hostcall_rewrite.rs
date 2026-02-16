@@ -33,15 +33,17 @@ impl HostcallRewriteEngine {
 
     #[must_use]
     pub fn from_env() -> Self {
-        let enabled = std::env::var("PI_HOSTCALL_EGRAPH_REWRITE")
-            .ok()
-            .as_deref()
-            .is_none_or(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "disabled"
-                )
-            });
+        Self::from_opt(std::env::var("PI_HOSTCALL_EGRAPH_REWRITE").ok().as_deref())
+    }
+
+    #[must_use]
+    pub fn from_opt(value: Option<&str>) -> Self {
+        let enabled = value.is_none_or(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "disabled"
+            )
+        });
         Self::new(enabled)
     }
 
@@ -233,6 +235,33 @@ mod tests {
             HostcallRewritePlanKind::BaselineCanonical,
             HostcallRewritePlanKind::FastOpcodeFusion
         );
+    }
+
+    #[test]
+    fn from_env_returns_valid_engine() {
+        // Smoke test: from_env() should not panic regardless of env state
+        let engine = HostcallRewriteEngine::from_env();
+        let _ = engine.enabled();
+    }
+
+    #[test]
+    fn from_opt_disabled_by_known_off_values() {
+        for value in ["0", "false", "off", "disabled", "FALSE", "OFF", "Disabled"] {
+            let engine = HostcallRewriteEngine::from_opt(Some(value));
+            assert!(!engine.enabled(), "should be disabled for '{value}'");
+        }
+    }
+
+    #[test]
+    fn from_opt_enabled_for_other_values_and_none() {
+        // None (env var unset) → enabled
+        assert!(HostcallRewriteEngine::from_opt(None).enabled());
+
+        // Any non-disabled value → enabled
+        for value in ["1", "true", "on", "yes", "anything_else"] {
+            let engine = HostcallRewriteEngine::from_opt(Some(value));
+            assert!(engine.enabled(), "should be enabled for '{value}'");
+        }
     }
 
     #[test]
