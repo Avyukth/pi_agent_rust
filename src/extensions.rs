@@ -36330,6 +36330,36 @@ mod tests {
                 }),
             ),
             (
+                "http-object",
+                HostcallRequest {
+                    call_id: "call-hash-http-object".to_string(),
+                    kind: HostcallKind::Http,
+                    payload: json!({
+                        "url": "https://example.com",
+                        "method": "POST",
+                        "timeout": 1500
+                    }),
+                    trace_id: 4,
+                    extension_id: None,
+                },
+                json!({
+                    "url": "https://example.com",
+                    "method": "POST",
+                    "timeout": 1500
+                }),
+            ),
+            (
+                "http-non-object",
+                HostcallRequest {
+                    call_id: "call-hash-http-non-object".to_string(),
+                    kind: HostcallKind::Http,
+                    payload: json!("https://example.com/health"),
+                    trace_id: 5,
+                    extension_id: None,
+                },
+                json!("https://example.com/health"),
+            ),
+            (
                 "session",
                 HostcallRequest {
                     call_id: "call-hash-session".to_string(),
@@ -36337,7 +36367,7 @@ mod tests {
                         op: "set_model".to_string(),
                     },
                     payload: json!({ "provider": "openai", "modelId": "gpt-4o-mini" }),
-                    trace_id: 4,
+                    trace_id: 6,
                     extension_id: None,
                 },
                 json!({
@@ -36354,7 +36384,7 @@ mod tests {
                         op: "set_status".to_string(),
                     },
                     payload: json!("thinking"),
-                    trace_id: 5,
+                    trace_id: 7,
                     extension_id: None,
                 },
                 json!({
@@ -36370,7 +36400,7 @@ mod tests {
                         op: "emit".to_string(),
                     },
                     payload: json!(42),
-                    trace_id: 6,
+                    trace_id: 8,
                     extension_id: None,
                 },
                 json!({
@@ -36388,7 +36418,7 @@ mod tests {
                         "event": "unit.test",
                         "message": "hello"
                     }),
-                    trace_id: 7,
+                    trace_id: 9,
                     extension_id: None,
                 },
                 json!({
