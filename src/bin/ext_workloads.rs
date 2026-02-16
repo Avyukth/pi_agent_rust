@@ -2372,6 +2372,7 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
         "stage_totals_us",
         "hotspot_matrix",
         "voi_scheduler",
+        "scenario_breakdown",
         "downstream_consumers",
     ];
     for field in required_top {
@@ -2408,6 +2409,76 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
             return Err(Error::extension(format!(
                 "hotspot matrix artifacts missing field: {field}"
             )));
+        }
+    }
+
+    let Some(scenario_breakdown) = matrix.get("scenario_breakdown").and_then(Value::as_array)
+    else {
+        return Err(Error::extension(
+            "scenario_breakdown must be an array".to_string(),
+        ));
+    };
+    for (idx, row) in scenario_breakdown.iter().enumerate() {
+        let Some(row_obj) = row.as_object() else {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} must be an object"
+            )));
+        };
+        for field in [
+            "scenario",
+            "extension",
+            "samples",
+            "per_call_us",
+            "total_us",
+            "weights",
+        ] {
+            if row_obj.get(field).is_none() {
+                return Err(Error::extension(format!(
+                    "scenario_breakdown row {idx} missing field: {field}"
+                )));
+            }
+        }
+        if row_obj.get("scenario").and_then(Value::as_str).is_none() {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field scenario must be a string"
+            )));
+        }
+        if row_obj.get("extension").and_then(Value::as_str).is_none() {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field extension must be a string"
+            )));
+        }
+        if row_obj.get("samples").and_then(Value::as_u64).is_none() {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field samples must be an integer"
+            )));
+        }
+        if row_obj.get("per_call_us").and_then(Value::as_f64).is_none() {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field per_call_us must be a number"
+            )));
+        }
+        if row_obj.get("total_us").and_then(Value::as_f64).is_none() {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field total_us must be a number"
+            )));
+        }
+        let Some(weights) = row_obj.get("weights").and_then(Value::as_object) else {
+            return Err(Error::extension(format!(
+                "scenario_breakdown row {idx} field weights must be an object"
+            )));
+        };
+        for field in ["marshal", "queue", "schedule", "policy", "execute", "io"] {
+            let Some(weight) = weights.get(field).and_then(Value::as_f64) else {
+                return Err(Error::extension(format!(
+                    "scenario_breakdown row {idx} weight {field} must be a number"
+                )));
+            };
+            if !weight.is_finite() {
+                return Err(Error::extension(format!(
+                    "scenario_breakdown row {idx} weight {field} must be finite"
+                )));
+            }
         }
     }
 
@@ -2930,6 +3001,53 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("voi_scheduler selected_plan 0 missing field: recommended_probe"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_missing_scenario_breakdown_extension() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        matrix
+            .pointer_mut("/scenario_breakdown/0")
+            .and_then(Value::as_object_mut)
+            .expect("scenario_breakdown[0] object")
+            .remove("extension");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("scenario_breakdown row 0 missing field: extension"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_non_integer_scenario_breakdown_samples() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/scenario_breakdown/0/samples")
+            .expect("scenario_breakdown[0].samples") = json!("1000");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("scenario_breakdown row 0 field samples must be an integer"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn hotspot_matrix_schema_rejects_non_numeric_scenario_breakdown_weight() {
+        let mut matrix = hotspot_matrix_schema_fixture();
+        *matrix
+            .pointer_mut("/scenario_breakdown/0/weights/schedule")
+            .expect("scenario_breakdown[0].weights.schedule") = json!("slow");
+
+        let err = validate_hotspot_matrix_schema(&matrix).expect_err("expected schema failure");
+        assert!(
+            err.to_string()
+                .contains("scenario_breakdown row 0 weight schedule must be a number"),
             "unexpected error: {err}"
         );
     }

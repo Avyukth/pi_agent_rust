@@ -2914,6 +2914,18 @@ mod tests {
     }
 
     #[test]
+    fn policy_snapshot_version_changes_on_material_policy_delta() {
+        let policy_base = ExtensionPolicy::from_profile(PolicyProfile::Standard);
+        let mut policy_delta = policy_base.clone();
+        policy_delta.deny_caps.push("http".to_string());
+
+        assert_ne!(
+            policy_snapshot_version(&policy_base),
+            policy_snapshot_version(&policy_delta)
+        );
+    }
+
+    #[test]
     fn policy_lookup_path_marks_known_vs_fallback_capabilities() {
         assert_eq!(policy_lookup_path("read"), "policy_snapshot_table");
         assert_eq!(policy_lookup_path("READ"), "policy_snapshot_table");
@@ -2921,6 +2933,25 @@ mod tests {
             policy_lookup_path("non_standard_custom_capability"),
             "policy_snapshot_fallback"
         );
+    }
+
+    #[test]
+    fn policy_snapshot_lookup_swaps_decision_across_profile_change() {
+        let safe_policy = ExtensionPolicy::from_profile(PolicyProfile::Safe);
+        let permissive_policy = ExtensionPolicy::from_profile(PolicyProfile::Permissive);
+
+        let safe_snapshot = PolicySnapshot::compile(&safe_policy);
+        let permissive_snapshot = PolicySnapshot::compile(&permissive_policy);
+
+        let safe_first = safe_snapshot.lookup("exec", Some("ext.swap"));
+        let safe_second = safe_snapshot.lookup("EXEC", Some("ext.swap"));
+        assert_eq!(safe_first.decision, PolicyDecision::Deny);
+        assert_eq!(safe_first.decision, safe_second.decision);
+
+        let permissive_first = permissive_snapshot.lookup("exec", Some("ext.swap"));
+        let permissive_second = permissive_snapshot.lookup("EXEC", Some("ext.swap"));
+        assert_eq!(permissive_first.decision, PolicyDecision::Allow);
+        assert_eq!(permissive_first.decision, permissive_second.decision);
     }
 
     struct NullSession;

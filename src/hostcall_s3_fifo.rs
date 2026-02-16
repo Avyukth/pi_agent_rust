@@ -572,6 +572,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fallback_latches_until_clear_and_reason_stays_stable() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            min_ghost_hits_in_window: 3,
+            fallback_window: 3,
+            ..config()
+        });
+
+        // Trigger low-signal fallback (no ghost hits across a full window).
+        let _ = policy.access("ext-a", "k1".to_string());
+        let _ = policy.access("ext-a", "k2".to_string());
+        let _ = policy.access("ext-a", "k3".to_string());
+
+        let expected_reason = Some(S3FifoFallbackReason::SignalQualityInsufficient);
+        assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+
+        // Once fallback is active, every decision should remain a bypass with the same reason
+        // until `clear_fallback` is explicitly invoked.
+        for key in ["k4", "k5", "k6"] {
+            let decision = policy.access("ext-b", key.to_string());
+            assert_eq!(decision.kind, S3FifoDecisionKind::FallbackBypass);
+            assert_eq!(decision.tier, S3FifoTier::Fallback);
+            assert_eq!(decision.fallback_reason, expected_reason);
+            assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+        }
+
+        policy.clear_fallback();
+        assert_eq!(policy.telemetry().fallback_reason, None);
+
+        let post_clear = policy.access("ext-b", "k7".to_string());
+        assert_ne!(post_clear.kind, S3FifoDecisionKind::FallbackBypass);
+    }
+
+    #[test]
+    fn fairness_fallback_reports_same_reason_during_repeated_bypass() {
+        let mut policy = S3FifoPolicy::new(S3FifoConfig {
+            max_entries_per_owner: 1,
+            fallback_window: 3,
+            min_ghost_hits_in_window: 0,
+            max_budget_rejections_in_window: 1,
+            ..config()
+        });
+
+        // Trigger fairness-instability fallback via repeated budget rejections.
+        let _ = policy.access("ext-a", "k1".to_string());
+        let _ = policy.access("ext-a", "k2".to_string());
+        let _ = policy.access("ext-a", "k3".to_string());
+
+        let expected_reason = Some(S3FifoFallbackReason::FairnessInstability);
+        assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+
+        for key in ["k4", "k5"] {
+            let decision = policy.access("ext-c", key.to_string());
+            assert_eq!(decision.kind, S3FifoDecisionKind::FallbackBypass);
+            assert_eq!(decision.fallback_reason, expected_reason);
+            assert_eq!(policy.telemetry().fallback_reason, expected_reason);
+        }
+    }
+
     // ── Additional public API coverage ──
 
     #[test]

@@ -2030,6 +2030,70 @@ export default function init(pi) {
         );
     }
 
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn normalize_openai_base_is_idempotent_and_targets_chat_completions(
+                base in "[A-Za-z0-9:/._-]{1,96}"
+            ) {
+                let normalized = normalize_openai_base(&base);
+                prop_assert!(normalized.ends_with("/chat/completions"));
+                prop_assert_eq!(normalize_openai_base(&normalized), normalized);
+            }
+
+            #[test]
+            fn normalize_openai_responses_base_is_idempotent_and_targets_responses(
+                base in "[A-Za-z0-9:/._-]{1,96}"
+            ) {
+                let normalized = normalize_openai_responses_base(&base);
+                prop_assert!(normalized.ends_with("/responses"));
+                prop_assert_eq!(normalize_openai_responses_base(&normalized), normalized);
+            }
+
+            #[test]
+            fn normalize_cohere_base_is_idempotent_and_targets_chat(
+                base in "[A-Za-z0-9:/._-]{1,96}"
+            ) {
+                let normalized = normalize_cohere_base(&base);
+                prop_assert!(normalized.ends_with("/chat"));
+                prop_assert_eq!(normalize_cohere_base(&normalized), normalized);
+            }
+
+            #[test]
+            fn normalize_openai_base_rewrites_responses_suffix(
+                host in "[a-z0-9-]{1,32}",
+                trailing_slashes in 0usize..4
+            ) {
+                let base = format!(
+                    "https://{host}.example/v1/responses{}",
+                    "/".repeat(trailing_slashes)
+                );
+                prop_assert_eq!(
+                    normalize_openai_base(&base),
+                    format!("https://{host}.example/v1/chat/completions")
+                );
+            }
+
+            #[test]
+            fn normalize_openai_responses_base_rewrites_chat_completions_suffix(
+                host in "[a-z0-9-]{1,32}",
+                trailing_slashes in 0usize..4
+            ) {
+                let base = format!(
+                    "https://{host}.example/v1/chat/completions{}",
+                    "/".repeat(trailing_slashes)
+                );
+                prop_assert_eq!(
+                    normalize_openai_responses_base(&base),
+                    format!("https://{host}.example/v1/responses")
+                );
+            }
+        }
+    }
+
     // ── bd-3uqg.2.4: Compat override propagation ─────────────────────
 
     use crate::models::CompatConfig;

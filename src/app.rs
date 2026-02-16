@@ -1209,6 +1209,29 @@ mod tests {
                 prop_assert_eq!(cli.provider, expected_provider);
                 prop_assert_eq!(cli.no_session, expected_no_session);
             }
+
+            #[test]
+            fn normalize_cli_is_idempotent(
+                provider in prop::option::of("[A-Za-z0-9_-]{1,20}"),
+                print in any::<bool>(),
+                initial_no_session in any::<bool>(),
+            ) {
+                let mut cli = cli::Cli::parse_from(["pi"]);
+                cli.provider = provider;
+                cli.print = print;
+                cli.no_session = initial_no_session;
+
+                normalize_cli(&mut cli);
+                let provider_once = cli.provider.clone();
+                let no_session_once = cli.no_session;
+                let print_once = cli.print;
+
+                normalize_cli(&mut cli);
+
+                prop_assert_eq!(cli.provider, provider_once);
+                prop_assert_eq!(cli.no_session, no_session_once);
+                prop_assert_eq!(cli.print, print_once);
+            }
         }
 
         // ====================================================================
