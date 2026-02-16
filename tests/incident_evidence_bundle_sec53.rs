@@ -555,6 +555,277 @@ fn query_security_alerts_after_ts_and_category_filters_are_deterministic() {
     );
 }
 
+#[test]
+fn query_security_alerts_extension_id_filters_are_deterministic() {
+    let harness = TestHarness::new("query_security_alerts_extension_id_filters");
+    let (_, _, manager, _) = setup(&harness, default_risk_config());
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.filter",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.filter",
+        "critical anomaly",
+        0.99,
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.other",
+        "SERVICE_TOKEN",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.other",
+        "rm -rf /tmp/other",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+
+    let artifact = manager.security_alert_artifact();
+    let query = |min_severity, category, extension_id| {
+        query_security_alerts(
+            &manager,
+            &SecurityAlertFilter {
+                min_severity,
+                category,
+                extension_id,
+                after_ts_ms: None,
+            },
+        )
+    };
+
+    let ext_filter_only = query(None, None, Some("ext.filter".to_string()));
+    let expected_ext_filter_count = artifact
+        .alerts
+        .iter()
+        .filter(|alert| alert.extension_id == "ext.filter")
+        .count();
+    assert_eq!(ext_filter_only.len(), expected_ext_filter_count);
+    assert!(
+        ext_filter_only
+            .iter()
+            .all(|alert| alert.extension_id == "ext.filter")
+    );
+
+    let unknown_extension = query(None, None, Some("ext.unknown".to_string()));
+    assert!(
+        unknown_extension.is_empty(),
+        "unknown extension_id should produce empty filtered result"
+    );
+
+    let filter_quarantine_critical = query(
+        Some(SecurityAlertSeverity::Critical),
+        Some(SecurityAlertCategory::Quarantine),
+        Some("ext.filter".to_string()),
+    );
+    let expected_intersection = artifact
+        .alerts
+        .iter()
+        .filter(|alert| {
+            alert.extension_id == "ext.filter"
+                && alert.category == SecurityAlertCategory::Quarantine
+                && alert.severity == SecurityAlertSeverity::Critical
+        })
+        .count();
+    assert_eq!(filter_quarantine_critical.len(), expected_intersection);
+
+    let other_quarantine = query(
+        Some(SecurityAlertSeverity::Error),
+        Some(SecurityAlertCategory::Quarantine),
+        Some("ext.other".to_string()),
+    );
+    assert!(
+        other_quarantine.is_empty(),
+        "ext.other has no quarantine alerts in fixture"
+    );
+
+    harness.log().info_ctx(
+        "extension_id_filter_determinism",
+        "query_security_alerts extension_id filtering is deterministic",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.6".into()));
+            ctx_log.push(("alert_count".into(), artifact.alert_count.to_string()));
+        },
+    );
+}
+
+#[test]
+fn query_security_alerts_after_ts_plus_extension_id_filters_are_deterministic() {
+    let harness = TestHarness::new("query_security_alerts_after_ts_plus_extension_id");
+    let (_, _, manager, _) = setup(&harness, default_risk_config());
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.alpha",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.beta",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.alpha",
+        "rm -rf /tmp/alpha",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.alpha",
+        "critical anomaly",
+        0.99,
+    ));
+
+    let artifact = manager.security_alert_artifact();
+    let query = |extension_id, after_ts_ms| {
+        query_security_alerts(
+            &manager,
+            &SecurityAlertFilter {
+                min_severity: None,
+                category: None,
+                extension_id,
+                after_ts_ms,
+            },
+        )
+    };
+
+    let ext_alpha_all = query(Some("ext.alpha".to_string()), None);
+    assert!(
+        ext_alpha_all
+            .iter()
+            .all(|alert| alert.extension_id == "ext.alpha")
+    );
+
+    let mut alpha_timestamps = artifact
+        .alerts
+        .iter()
+        .filter(|alert| alert.extension_id == "ext.alpha")
+        .map(|alert| alert.ts_ms)
+        .collect::<Vec<_>>();
+    alpha_timestamps.sort_unstable();
+    alpha_timestamps.dedup();
+
+    let mut previous_len = ext_alpha_all.len();
+    for ts in alpha_timestamps.iter().copied() {
+        let filtered = query(Some("ext.alpha".to_string()), Some(ts));
+        assert!(
+            filtered.len() <= previous_len,
+            "raising after_ts_ms within an extension subset must be monotonic non-increasing"
+        );
+        assert!(
+            filtered
+                .iter()
+                .all(|alert| alert.extension_id == "ext.alpha" && alert.ts_ms >= ts)
+        );
+        previous_len = filtered.len();
+    }
+
+    if let Some(max_alpha_ts) = alpha_timestamps.iter().copied().max() {
+        let after_max = query(Some("ext.alpha".to_string()), max_alpha_ts.checked_add(1));
+        assert!(
+            after_max.is_empty(),
+            "after_ts past extension subset max timestamp should be empty"
+        );
+    }
+
+    let unknown_extension = query(
+        Some("ext.unknown".to_string()),
+        alpha_timestamps.first().copied(),
+    );
+    assert!(
+        unknown_extension.is_empty(),
+        "unknown extension_id must remain empty regardless of after_ts_ms"
+    );
+
+    harness.log().info_ctx(
+        "after_ts_extension_filter_determinism",
+        "query_security_alerts after_ts + extension_id behavior is deterministic",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.10".into()));
+            ctx_log.push(("alert_count".into(), artifact.alert_count.to_string()));
+        },
+    );
+}
+
+#[test]
+fn query_security_alerts_preserve_filtered_order_and_repeatability() {
+    let harness = TestHarness::new("query_security_alerts_preserve_order");
+    let (_, _, manager, _) = setup(&harness, default_risk_config());
+
+    manager.record_security_alert(SecurityAlert::from_policy_denial(
+        "ext.alpha",
+        "exec",
+        "spawn",
+        "policy denied",
+        "deny_caps",
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.beta",
+        "SERVICE_TOKEN",
+    ));
+    manager.record_security_alert(SecurityAlert::from_exec_mediation(
+        "ext.alpha",
+        "rm -rf /tmp/alpha",
+        Some("recursive_delete"),
+        "dangerous command",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.beta",
+        "critical anomaly",
+        0.97,
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.alpha",
+        "critical anomaly",
+        0.99,
+    ));
+
+    let artifact = manager.security_alert_artifact();
+    let filter = SecurityAlertFilter {
+        min_severity: Some(SecurityAlertSeverity::Error),
+        category: None,
+        extension_id: Some("ext.alpha".to_string()),
+        after_ts_ms: None,
+    };
+
+    let expected_projection = artifact
+        .alerts
+        .iter()
+        .filter(|alert| {
+            alert.extension_id == "ext.alpha" && alert.severity >= SecurityAlertSeverity::Error
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let first = query_security_alerts(&manager, &filter);
+    let second = query_security_alerts(&manager, &filter);
+
+    assert_eq!(
+        first, expected_projection,
+        "query result must preserve artifact order for filtered subset"
+    );
+    assert_eq!(second, first, "identical filters must return stable order");
+    assert!(
+        first
+            .windows(2)
+            .all(|pair| pair[0].sequence_id < pair[1].sequence_id)
+    );
+
+    harness.log().info_ctx(
+        "query_order_determinism",
+        "query_security_alerts preserves filtered order and repeatability",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.12".into()));
+            ctx_log.push(("alert_count".into(), artifact.alert_count.to_string()));
+        },
+    );
+}
+
 // ============================================================================
 // Test 5: Forensic replay included in bundle
 // ============================================================================

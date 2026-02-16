@@ -1099,6 +1099,116 @@ fn zero_match_extension_filter_yields_empty_replay_and_valid_bundle() {
     assert!(report.errors.is_empty());
 }
 
+#[test]
+fn composed_filters_keep_replay_and_alert_order_deterministic() {
+    let ledger = ledger_artifact(vec![
+        make_ledger_entry(1000, "ext-a", 0.2),
+        make_ledger_entry(2000, "ext-a", 0.6),
+        make_ledger_entry(3000, "ext-a", 0.8),
+        make_ledger_entry(4000, "ext-b", 0.4),
+    ]);
+    let alerts = alert_artifact(vec![
+        make_alert(
+            1100,
+            "ext-a",
+            SecurityAlertCategory::PolicyDenial,
+            SecurityAlertSeverity::Error,
+        ),
+        make_alert(
+            1200,
+            "ext-a",
+            SecurityAlertCategory::AnomalyDenial,
+            SecurityAlertSeverity::Warning,
+        ),
+        make_alert(
+            1300,
+            "ext-a",
+            SecurityAlertCategory::Quarantine,
+            SecurityAlertSeverity::Critical,
+        ),
+        make_alert(
+            1400,
+            "ext-b",
+            SecurityAlertCategory::Quarantine,
+            SecurityAlertSeverity::Critical,
+        ),
+    ]);
+    let filter = IncidentBundleFilter {
+        extension_id: Some("ext-a".to_string()),
+        alert_categories: Some(vec![
+            SecurityAlertCategory::PolicyDenial,
+            SecurityAlertCategory::Quarantine,
+        ]),
+        min_severity: Some(SecurityAlertSeverity::Error),
+        ..Default::default()
+    };
+
+    let build = || {
+        build_incident_evidence_bundle(
+            &ledger,
+            &alerts,
+            &telemetry_artifact(vec![]),
+            &exec_artifact(vec![]),
+            &secret_artifact(vec![]),
+            &[],
+            &filter,
+            &IncidentBundleRedactionPolicy::default(),
+            100_000,
+        )
+    };
+
+    let bundle_a = build();
+    let bundle_b = build();
+
+    assert_eq!(bundle_a.bundle_hash, bundle_b.bundle_hash);
+    assert_eq!(bundle_a.summary.alert_count, 2);
+    assert_eq!(
+        bundle_a
+            .security_alerts
+            .alerts
+            .iter()
+            .map(|a| a.sequence_id)
+            .collect::<Vec<_>>(),
+        vec![1100, 1300]
+    );
+    assert_eq!(
+        bundle_a
+            .risk_ledger
+            .entries
+            .iter()
+            .map(|entry| entry.ts_ms)
+            .collect::<Vec<_>>(),
+        vec![1000, 2000, 3000]
+    );
+    assert_eq!(
+        bundle_a
+            .risk_ledger
+            .entries
+            .iter()
+            .map(|entry| entry.extension_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ext-a", "ext-a", "ext-a"]
+    );
+    assert_eq!(bundle_a.risk_replay, bundle_b.risk_replay);
+
+    if let Some(replay) = bundle_a.risk_replay.as_ref() {
+        assert_eq!(
+            replay
+                .steps
+                .iter()
+                .map(|s| s.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call-1000", "call-2000", "call-3000"]
+        );
+        assert_eq!(
+            replay.steps.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    } else {
+        assert!(bundle_b.risk_replay.is_none());
+    }
+}
+
 // ---- 10. JSON round-trip stability ----
 
 #[test]

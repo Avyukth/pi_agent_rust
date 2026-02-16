@@ -24,9 +24,10 @@ use pi::extension_preflight::{
 use pi::extensions::{
     ExecMediationLedgerEntry, ExtensionManager, ExtensionPolicy, ExtensionPolicyMode,
     HostCallContext, HostCallPayload, IncidentBundleFilter, IncidentBundleRedactionPolicy,
-    RuntimeRiskConfig, SecretBrokerLedgerEntry, SecurityAlert, SecurityAlertCategory,
-    SecurityAlertFilter, SecurityAlertSeverity, build_incident_evidence_bundle,
-    dispatch_host_call_shared, query_security_alerts, verify_incident_evidence_bundle,
+    IncidentEvidenceBundle, RuntimeRiskConfig, SecretBrokerLedgerEntry, SecurityAlert,
+    SecurityAlertCategory, SecurityAlertFilter, SecurityAlertSeverity,
+    build_incident_evidence_bundle, dispatch_host_call_shared, query_security_alerts,
+    verify_incident_evidence_bundle,
 };
 use pi::tools::ToolRegistry;
 use serde_json::json;
@@ -151,6 +152,153 @@ fn sample_secret_broker(ext_id: &str, idx: usize) -> SecretBrokerLedgerEntry {
         redacted: true,
         reason: format!("matches suffix _KEY pattern {idx}"),
     }
+}
+
+fn seed_composed_filter_fixture(
+    manager: &ExtensionManager,
+    ctx_alpha: &HostCallContext<'_>,
+    ctx_beta: &HostCallContext<'_>,
+) {
+    futures::executor::block_on(async {
+        for idx in 0..4 {
+            let _ = dispatch_host_call_shared(ctx_alpha, benign_log_call(idx)).await;
+        }
+        for idx in 0..3 {
+            let _ = dispatch_host_call_shared(ctx_beta, benign_log_call(100 + idx)).await;
+        }
+    });
+
+    manager.record_exec_mediation(sample_exec_mediation("ext.alpha", 0));
+    manager.record_exec_mediation(sample_exec_mediation("ext.beta", 1));
+    manager.record_secret_broker(sample_secret_broker("ext.alpha", 0));
+    manager.record_secret_broker(sample_secret_broker("ext.beta", 1));
+
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.alpha",
+        "manual quarantine parity check",
+        0.99,
+    ));
+    manager.record_security_alert(SecurityAlert::from_secret_redaction(
+        "ext.alpha",
+        "ALPHA_KEY",
+    ));
+    manager.record_security_alert(SecurityAlert::from_quarantine(
+        "ext.beta",
+        "manual quarantine parity check",
+        0.98,
+    ));
+}
+
+fn build_bundle_with_filter(
+    manager: &ExtensionManager,
+    filter: &IncidentBundleFilter,
+    redaction: &IncidentBundleRedactionPolicy,
+    generated_at_ms: i64,
+) -> IncidentEvidenceBundle {
+    build_incident_evidence_bundle(
+        &manager.runtime_risk_ledger_artifact(),
+        &manager.security_alert_artifact(),
+        &manager.runtime_hostcall_telemetry_artifact(),
+        &manager.exec_mediation_artifact(),
+        &manager.secret_broker_artifact(),
+        &[],
+        filter,
+        redaction,
+        generated_at_ms,
+    )
+}
+
+fn assert_bundle_summary_matches_sections(bundle: &IncidentEvidenceBundle) {
+    assert_eq!(
+        bundle.summary.ledger_entry_count,
+        bundle.risk_ledger.entries.len()
+    );
+    assert_eq!(
+        bundle.summary.alert_count,
+        bundle.security_alerts.alerts.len()
+    );
+    assert_eq!(
+        bundle.summary.telemetry_event_count,
+        bundle.hostcall_telemetry.entries.len()
+    );
+    assert_eq!(
+        bundle.summary.exec_mediation_count,
+        bundle.exec_mediation.entries.len()
+    );
+    assert_eq!(
+        bundle.summary.secret_broker_count,
+        bundle.secret_broker.entries.len()
+    );
+}
+
+fn assert_bundle_extension_scope(bundle: &IncidentEvidenceBundle, extension_id: &str) {
+    assert!(
+        bundle
+            .risk_ledger
+            .entries
+            .iter()
+            .all(|entry| entry.extension_id == extension_id)
+    );
+    assert!(
+        bundle
+            .hostcall_telemetry
+            .entries
+            .iter()
+            .all(|entry| entry.extension_id == extension_id)
+    );
+    assert!(
+        bundle
+            .exec_mediation
+            .entries
+            .iter()
+            .all(|entry| entry.extension_id.as_deref() == Some(extension_id))
+    );
+    assert!(
+        bundle
+            .secret_broker
+            .entries
+            .iter()
+            .all(|entry| entry.extension_id.as_deref() == Some(extension_id))
+    );
+}
+
+fn assert_scoped_alert_filters(bundle: &IncidentEvidenceBundle) -> i64 {
+    assert_eq!(
+        bundle.security_alerts.alerts.len(),
+        1,
+        "info-level secret redaction must be excluded by min_severity=warning"
+    );
+    let only_alert = &bundle.security_alerts.alerts[0];
+    assert_eq!(only_alert.category, SecurityAlertCategory::Quarantine);
+    assert_eq!(only_alert.severity, SecurityAlertSeverity::Critical);
+    only_alert.ts_ms
+}
+
+fn assert_boundary_bundle_includes_exact_timestamp(
+    bundle: &IncidentEvidenceBundle,
+    boundary_filter: &IncidentBundleFilter,
+    target_ts: i64,
+) {
+    assert_eq!(bundle.filter, *boundary_filter);
+    assert_eq!(bundle.security_alerts.alert_count, 1);
+    assert_eq!(bundle.security_alerts.alerts[0].ts_ms, target_ts);
+    for alert in &bundle.security_alerts.alerts {
+        assert_eq!(alert.ts_ms, target_ts);
+    }
+}
+
+fn assert_empty_scoped_bundle_is_fail_closed(bundle: &IncidentEvidenceBundle) {
+    assert_eq!(bundle.summary.ledger_entry_count, 0);
+    assert_eq!(bundle.summary.alert_count, 0);
+    assert_eq!(bundle.summary.telemetry_event_count, 0);
+    assert_eq!(bundle.summary.exec_mediation_count, 0);
+    assert_eq!(bundle.summary.secret_broker_count, 0);
+    assert_eq!(bundle.summary.distinct_extensions, 0);
+    assert_eq!(bundle.summary.deny_or_terminate_count, 0);
+    assert!(
+        bundle.summary.peak_risk_score.abs() <= f64::EPSILON,
+        "empty scoped bundle should have near-zero peak risk score"
+    );
 }
 
 /// Emergency kill-switch helper: demote trust + record quarantine alert.
@@ -1616,6 +1764,122 @@ fn scenario_deterministic_artifact_manifests() {
             ctx_log.push(("scenario".into(), "deterministic_artifacts".into()));
             ctx_log.push(("result".into(), "pass".into()));
             ctx_log.push(("hash".into(), bundle1.bundle_hash.clone()));
+        },
+    );
+}
+
+// ============================================================================
+// Scenario 12: Composed bundle filters + fail-closed zero-match behavior
+// ============================================================================
+
+#[test]
+fn scenario_incident_bundle_composed_filters_fail_closed() {
+    let harness = TestHarness::new("scenario_incident_bundle_composed_filters");
+    let (tools, http, manager, policy) = setup(&harness, default_risk_config());
+    let ctx_alpha = make_ctx(&tools, &http, &manager, &policy, "ext.alpha");
+    let ctx_beta = make_ctx(&tools, &http, &manager, &policy, "ext.beta");
+
+    emit_scenario_event(
+        &harness,
+        "bundle_filter_parity",
+        "start",
+        "ext.alpha",
+        "none",
+        "setup",
+        0.0,
+        &[],
+    );
+
+    seed_composed_filter_fixture(&manager, &ctx_alpha, &ctx_beta);
+    let redaction = IncidentBundleRedactionPolicy::default();
+
+    // Composed filter: extension-scoped + category-scoped + severity-scoped.
+    let scoped_filter = IncidentBundleFilter {
+        start_ms: None,
+        end_ms: None,
+        extension_id: Some("ext.alpha".to_string()),
+        alert_categories: Some(vec![
+            SecurityAlertCategory::Quarantine,
+            SecurityAlertCategory::SecretBroker,
+        ]),
+        min_severity: Some(SecurityAlertSeverity::Warning),
+    };
+
+    let scoped_bundle =
+        build_bundle_with_filter(&manager, &scoped_filter, &redaction, 1_700_000_000_123);
+
+    let scoped_report = verify_incident_evidence_bundle(&scoped_bundle);
+    assert!(scoped_report.valid, "scoped bundle must verify");
+    assert_eq!(scoped_bundle.filter, scoped_filter);
+    assert_bundle_summary_matches_sections(&scoped_bundle);
+    assert_bundle_extension_scope(&scoped_bundle, "ext.alpha");
+    let target_ts = assert_scoped_alert_filters(&scoped_bundle);
+
+    // Time window boundary must be inclusive at exact timestamp.
+    let boundary_filter = IncidentBundleFilter {
+        start_ms: Some(target_ts),
+        end_ms: Some(target_ts),
+        extension_id: Some("ext.alpha".to_string()),
+        alert_categories: Some(vec![SecurityAlertCategory::Quarantine]),
+        min_severity: Some(SecurityAlertSeverity::Critical),
+    };
+
+    let boundary_bundle =
+        build_bundle_with_filter(&manager, &boundary_filter, &redaction, 1_700_000_000_124);
+    assert_boundary_bundle_includes_exact_timestamp(&boundary_bundle, &boundary_filter, target_ts);
+    assert!(
+        verify_incident_evidence_bundle(&boundary_bundle).valid,
+        "boundary bundle must verify"
+    );
+
+    // Fail closed: non-existent extension must produce an empty bundle with
+    // internally consistent summary counts.
+    let empty_filter = IncidentBundleFilter {
+        start_ms: Some(target_ts),
+        end_ms: Some(target_ts),
+        extension_id: Some("ext.missing".to_string()),
+        alert_categories: Some(vec![SecurityAlertCategory::Quarantine]),
+        min_severity: Some(SecurityAlertSeverity::Critical),
+    };
+    let empty_bundle =
+        build_bundle_with_filter(&manager, &empty_filter, &redaction, 1_700_000_000_125);
+
+    assert_empty_scoped_bundle_is_fail_closed(&empty_bundle);
+    assert!(
+        verify_incident_evidence_bundle(&empty_bundle).valid,
+        "empty scoped bundle must still be integrity-valid"
+    );
+
+    emit_scenario_event(
+        &harness,
+        "bundle_filter_parity",
+        "verify",
+        "ext.alpha",
+        "none",
+        "pass",
+        0.0,
+        &["composed_filter_parity", "zero_match_fail_closed"],
+    );
+
+    harness.log().info_ctx(
+        "scenario_result",
+        "incident bundle composed-filter invariants verified",
+        |ctx_log| {
+            ctx_log.push(("issue_id".into(), "bd-3ar8v.4.10.7".into()));
+            ctx_log.push(("scenario".into(), "bundle_filter_parity".into()));
+            ctx_log.push(("result".into(), "pass".into()));
+            ctx_log.push((
+                "scoped_alert_count".into(),
+                scoped_bundle.summary.alert_count.to_string(),
+            ));
+            ctx_log.push((
+                "scoped_ledger_count".into(),
+                scoped_bundle.summary.ledger_entry_count.to_string(),
+            ));
+            ctx_log.push((
+                "empty_alert_count".into(),
+                empty_bundle.summary.alert_count.to_string(),
+            ));
         },
     );
 }
