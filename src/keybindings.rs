@@ -2357,4 +2357,208 @@ mod tests {
         let action = bindings.lookup(&binding);
         assert_eq!(action, Some(AppAction::Submit));
     }
+
+    // ── Property tests ──────────────────────────────────────────────────
+
+    mod proptest_keybindings {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_valid_key() -> impl Strategy<Value = String> {
+            prop::sample::select(vec![
+                "a", "b", "c", "z", "escape", "enter", "tab", "space",
+                "backspace", "delete", "home", "end", "pageup", "pagedown",
+                "up", "down", "left", "right", "f1", "f5", "f12", "f20",
+                "`", "-", "=", "[", "]", ";", ",", ".", "/",
+            ].into_iter().map(String::from).collect::<Vec<_>>())
+        }
+
+        fn arb_modifiers() -> impl Strategy<Value = (bool, bool, bool)> {
+            (any::<bool>(), any::<bool>(), any::<bool>())
+        }
+
+        fn arb_binding_string() -> impl Strategy<Value = String> {
+            (arb_modifiers(), arb_valid_key()).prop_map(|((ctrl, alt, shift), key)| {
+                let mut parts = Vec::new();
+                if ctrl { parts.push("ctrl".to_string()); }
+                if alt { parts.push("alt".to_string()); }
+                if shift { parts.push("shift".to_string()); }
+                parts.push(key);
+                parts.join("+")
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn normalize_key_name_is_idempotent(key in arb_valid_key()) {
+                if let Some(normalized) = normalize_key_name(&key) {
+                    let double = normalize_key_name(&normalized);
+                    assert_eq!(
+                        double.as_deref(), Some(normalized.as_str()),
+                        "normalizing twice should equal normalizing once"
+                    );
+                }
+            }
+
+            #[test]
+            fn normalize_key_name_is_case_insensitive(key in arb_valid_key()) {
+                let lower = normalize_key_name(&key.to_lowercase());
+                let upper = normalize_key_name(&key.to_uppercase());
+                assert_eq!(
+                    lower, upper,
+                    "normalize should be case-insensitive for '{key}'"
+                );
+            }
+
+            #[test]
+            fn normalize_key_name_output_is_lowercase(key in arb_valid_key()) {
+                if let Some(normalized) = normalize_key_name(&key) {
+                    assert_eq!(
+                        normalized, normalized.to_lowercase(),
+                        "normalized key should be lowercase"
+                    );
+                }
+            }
+
+            #[test]
+            fn parse_key_binding_roundtrips_valid_bindings(s in arb_binding_string()) {
+                let parsed = parse_key_binding(&s);
+                if let Ok(binding) = parsed {
+                    let displayed = binding.to_string();
+                    let reparsed = parse_key_binding(&displayed);
+                    assert_eq!(
+                        reparsed.as_ref(), Ok(&binding),
+                        "roundtrip failed: '{s}' → '{displayed}' → {reparsed:?}"
+                    );
+                }
+            }
+
+            #[test]
+            fn parse_key_binding_is_case_insensitive(s in arb_binding_string()) {
+                let lower = parse_key_binding(&s.to_lowercase());
+                let upper = parse_key_binding(&s.to_uppercase());
+                assert_eq!(
+                    lower, upper,
+                    "parse should be case-insensitive"
+                );
+            }
+
+            #[test]
+            fn parse_key_binding_tolerates_whitespace(s in arb_binding_string()) {
+                let spaced = s.replace('+', " + ");
+                let normal = parse_key_binding(&s);
+                let with_spaces = parse_key_binding(&spaced);
+                assert_eq!(
+                    normal, with_spaces,
+                    "whitespace around + should not matter"
+                );
+            }
+
+            #[test]
+            fn is_valid_key_matches_parse(s in arb_binding_string()) {
+                let valid = is_valid_key(&s);
+                let parsed = parse_key_binding(&s).is_ok();
+                assert_eq!(
+                    valid, parsed,
+                    "is_valid_key should match parse_key_binding.is_ok()"
+                );
+            }
+
+            #[test]
+            fn parse_key_binding_never_panics(s in ".*") {
+                // Should never panic, even on arbitrary input
+                let _ = parse_key_binding(&s);
+            }
+
+            #[test]
+            fn modifier_order_independence(
+                key in arb_valid_key(),
+            ) {
+                // ctrl+alt+key vs alt+ctrl+key should parse identically
+                let ca = parse_key_binding(&format!("ctrl+alt+{key}"));
+                let ac = parse_key_binding(&format!("alt+ctrl+{key}"));
+                assert_eq!(ca, ac, "modifier order should not matter");
+
+                // ctrl+shift+key vs shift+ctrl+key
+                let cs = parse_key_binding(&format!("ctrl+shift+{key}"));
+                let sc = parse_key_binding(&format!("shift+ctrl+{key}"));
+                assert_eq!(cs, sc, "modifier order should not matter");
+            }
+
+            #[test]
+            fn display_always_canonical_modifier_order(
+                (ctrl, alt, shift) in arb_modifiers(),
+                key in arb_valid_key(),
+            ) {
+                let binding = KeyBinding {
+                    key: normalize_key_name(&key).unwrap_or_else(|| key.clone()),
+                    modifiers: KeyModifiers { ctrl, shift, alt },
+                };
+                let displayed = binding.to_string();
+                // Canonical order: ctrl before alt before shift before key
+                let ctrl_pos = displayed.find("ctrl+");
+                let alt_pos = displayed.find("alt+");
+                let shift_pos = displayed.find("shift+");
+                if let (Some(c), Some(a)) = (ctrl_pos, alt_pos) {
+                    assert!(c < a, "ctrl should come before alt in display");
+                }
+                if let (Some(a), Some(s)) = (alt_pos, shift_pos) {
+                    assert!(a < s, "alt should come before shift in display");
+                }
+                if let (Some(c), Some(s)) = (ctrl_pos, shift_pos) {
+                    assert!(c < s, "ctrl should come before shift in display");
+                }
+            }
+
+            #[test]
+            fn synonym_normalization_consistent(
+                synonym in prop::sample::select(vec![
+                    ("esc", "escape"),
+                    ("return", "enter"),
+                ]),
+            ) {
+                let (alias, canonical) = synonym;
+                let n1 = normalize_key_name(alias);
+                let n2 = normalize_key_name(canonical);
+                assert_eq!(
+                    n1, n2,
+                    "'{alias}' and '{canonical}' should normalize the same"
+                );
+            }
+
+            #[test]
+            fn single_letters_always_valid(
+                idx in 0..26usize,
+            ) {
+                let c = (b'a' + idx as u8) as char;
+                let s = c.to_string();
+                assert!(
+                    normalize_key_name(&s).is_some(),
+                    "single letter '{c}' should be valid"
+                );
+                assert!(
+                    is_valid_key(&s),
+                    "single letter '{c}' should be a valid key binding"
+                );
+            }
+
+            #[test]
+            fn function_keys_f1_to_f20_valid(n in 1..=20u8) {
+                let key = format!("f{n}");
+                assert!(
+                    normalize_key_name(&key).is_some(),
+                    "function key '{key}' should be valid"
+                );
+            }
+
+            #[test]
+            fn function_keys_beyond_f20_invalid(n in 21..99u8) {
+                let key = format!("f{n}");
+                assert!(
+                    normalize_key_name(&key).is_none(),
+                    "function key '{key}' should be invalid"
+                );
+            }
+        }
+    }
 }

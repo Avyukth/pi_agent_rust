@@ -1304,6 +1304,212 @@ mod tests {
         let cli = Cli::parse_from(["pi", "--list-models", "sonnet"]);
         assert_eq!(cli.list_models, Some(Some("sonnet".to_string())));
     }
+
+    // ── Property tests ──────────────────────────────────────────────────
+
+    mod proptest_cli {
+        use crate::cli::{
+            ExtensionCliFlag, ROOT_SUBCOMMANDS, is_known_short_flag, is_negative_numeric_token,
+            known_long_option, preprocess_extension_flags,
+        };
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn is_known_short_flag_accepts_known_char_combos(
+                combo in prop::sample::select(vec![
+                    "-v", "-c", "-r", "-p", "-e",
+                    "-vc", "-vp", "-cr", "-vcr", "-vcrpe",
+                ]),
+            ) {
+                assert!(
+                    is_known_short_flag(combo),
+                    "'{combo}' should be a known short flag"
+                );
+            }
+
+            #[test]
+            fn is_known_short_flag_rejects_unknown_chars(
+                c in prop::sample::select(vec!['a', 'b', 'd', 'f', 'g', 'h', 'x', 'z']),
+            ) {
+                let token = format!("-{c}");
+                assert!(
+                    !is_known_short_flag(&token),
+                    "'-{c}' should not be a known short flag"
+                );
+            }
+
+            #[test]
+            fn is_known_short_flag_rejects_non_dash_prefix(
+                body in "[a-z]{1,5}",
+            ) {
+                assert!(
+                    !is_known_short_flag(&body),
+                    "'{body}' without dash should not be a short flag"
+                );
+            }
+
+            #[test]
+            fn is_known_short_flag_rejects_double_dash(
+                body in "[vcr]{1,5}",
+            ) {
+                let token = format!("--{body}");
+                assert!(
+                    !is_known_short_flag(&token),
+                    "'--{body}' should not be a short flag"
+                );
+            }
+
+            #[test]
+            fn is_negative_numeric_token_accepts_negative_integers(
+                n in 1..10_000i64,
+            ) {
+                let token = format!("-{n}");
+                assert!(
+                    is_negative_numeric_token(&token),
+                    "'{token}' should be a negative numeric token"
+                );
+            }
+
+            #[test]
+            fn is_negative_numeric_token_accepts_negative_floats(
+                whole in 0..100u32,
+                frac in 1..100u32,
+            ) {
+                let token = format!("-{whole}.{frac}");
+                assert!(
+                    is_negative_numeric_token(&token),
+                    "'{token}' should be a negative numeric token"
+                );
+            }
+
+            #[test]
+            fn is_negative_numeric_token_rejects_positive_numbers(
+                n in 0..10_000u64,
+            ) {
+                let token = n.to_string();
+                assert!(
+                    !is_negative_numeric_token(&token),
+                    "'{token}' (positive) should not be a negative numeric token"
+                );
+            }
+
+            #[test]
+            fn is_negative_numeric_token_rejects_non_numeric(
+                s in "[a-z]{1,5}",
+            ) {
+                let token = format!("-{s}");
+                assert!(
+                    !is_negative_numeric_token(&token),
+                    "'-{s}' should not be a negative numeric token"
+                );
+            }
+
+            #[test]
+            fn preprocess_empty_returns_pi_program_name(_dummy in Just(())) {
+                let result = preprocess_extension_flags(&[]);
+                assert_eq!(result.0, vec!["pi"]);
+                let extracted: &[ExtensionCliFlag] = &result.1;
+                assert!(extracted.is_empty());
+            }
+
+            #[test]
+            fn preprocess_known_flags_never_extracted(
+                flag in prop::sample::select(vec![
+                    "--version", "--verbose", "--print", "--no-tools",
+                    "--no-extensions", "--no-skills", "--no-prompt-templates",
+                ]),
+            ) {
+                let args: Vec<String> = vec!["pi".to_string(), flag.to_string()];
+                let result = preprocess_extension_flags(&args);
+                let extracted: &[ExtensionCliFlag] = &result.1;
+                assert!(
+                    extracted.is_empty(),
+                    "known flag '{flag}' should not be extracted"
+                );
+                assert!(
+                    result.0.contains(&flag.to_string()),
+                    "known flag '{flag}' should be in filtered"
+                );
+            }
+
+            #[test]
+            fn preprocess_unknown_flags_are_extracted(
+                name in "[a-z]{3,10}".prop_filter(
+                    "must not be a known option",
+                    |n| known_long_option(n).is_none()
+                        && !ROOT_SUBCOMMANDS.contains(&n.as_str()),
+                ),
+            ) {
+                let flag = format!("--{name}");
+                let args: Vec<String> = vec!["pi".to_string(), flag.clone()];
+                let result = preprocess_extension_flags(&args);
+                assert!(
+                    !result.0.contains(&flag),
+                    "unknown flag '{flag}' should not be in filtered"
+                );
+                assert_eq!(
+                    result.1.len(), 1,
+                    "should extract exactly one extension flag"
+                );
+                assert_eq!(result.1[0].name, name);
+            }
+
+            #[test]
+            fn preprocess_double_dash_terminates(
+                tail_count in 0..5usize,
+                tail_token in "[a-z]{1,5}",
+            ) {
+                let mut args = vec!["pi".to_string(), "--".to_string()];
+                for i in 0..tail_count {
+                    args.push(format!("--{tail_token}{i}"));
+                }
+                let result = preprocess_extension_flags(&args);
+                let extracted: &[ExtensionCliFlag] = &result.1;
+                assert!(
+                    extracted.is_empty(),
+                    "after --, nothing should be extracted"
+                );
+                // All tokens should be in filtered
+                assert_eq!(result.0.len(), args.len());
+            }
+
+            #[test]
+            fn preprocess_subcommand_barrier(
+                subcommand in prop::sample::select(vec![
+                    "install", "remove", "update", "search", "info", "list", "config", "doctor",
+                ]),
+            ) {
+                let args: Vec<String> = vec![
+                    "pi".to_string(),
+                    subcommand.to_string(),
+                    "--unknown-flag".to_string(),
+                ];
+                let result = preprocess_extension_flags(&args);
+                let extracted: &[ExtensionCliFlag] = &result.1;
+                assert!(
+                    extracted.is_empty(),
+                    "after subcommand '{subcommand}', flags should not be extracted"
+                );
+                assert_eq!(result.0.len(), 3);
+            }
+
+            #[test]
+            fn extension_flag_display_name_format(
+                name in "[a-z]{1,10}",
+            ) {
+                let flag = ExtensionCliFlag {
+                    name: name.clone(),
+                    value: None,
+                };
+                assert_eq!(
+                    flag.display_name(),
+                    format!("--{name}"),
+                    "display_name should be --name"
+                );
+            }
+        }
+    }
 }
 
 /// Package management subcommands
