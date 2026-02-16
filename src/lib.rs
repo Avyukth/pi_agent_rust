@@ -72,6 +72,7 @@ pub mod extensions;
 pub mod extensions_js;
 pub mod flake_classifier;
 pub mod hostcall_amac;
+pub mod hostcall_io_uring_lane;
 pub mod hostcall_queue;
 pub mod hostcall_rewrite;
 pub mod hostcall_superinstructions;

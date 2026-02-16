@@ -34607,7 +34607,18 @@ mod tests {
             overload_window_ms: 10_000,
             overload_signals_to_fallback: 2,
             recovery_successes_to_exit: 4,
-            ..Default::default()
+            regime_shift: RegimeShiftConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            safety_envelope: SafetyEnvelopeConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            oco_tuner: OcoTunerConfig {
+                enabled: false,
+                ..Default::default()
+            },
         });
 
         assert_eq!(

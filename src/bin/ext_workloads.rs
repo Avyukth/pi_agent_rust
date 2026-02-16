@@ -3059,6 +3059,289 @@ mod tests {
     }
 
     #[test]
+    fn voi_scheduler_safe_mode_on_estimator_drift() {
+        let now = DateTime::parse_from_rfc3339("2026-02-16T05:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let hotspots = vec![json!({
+            "stage": "queue",
+            "ev_score": 55.0,
+            "confidence": 0.45,
+            "pmu_multiplier": 1.2,
+            "projected_user_impact": { "turn_latency_p95_ms": 2.4 }
+        })];
+        let plan = build_voi_scheduler_plan_at(
+            VoiPlannerInputs {
+                hotspot_entries: &hotspots,
+                run_metadata: &json!({ "finished_at": "2026-02-16T04:55:00Z" }),
+                pmu_meta: &json!({
+                    "normalized_counters": {
+                        "frontend_stall_pct": 24.0,
+                        "backend_stall_pct": 21.0,
+                        "llc_miss_pct": 15.0,
+                        "branch_miss_pct": 4.1
+                    }
+                }),
+                pmu_comparison: &json!({
+                    "status": "compared",
+                    "regressions": { "overall": false }
+                }),
+                pmu_outcome_correlation: &json!({
+                    "correlation_strength": "low",
+                    "signals": {
+                        "pmu_worse": true,
+                        "outcome_regression": false
+                    }
+                }),
+                outcome_comparison: &json!({
+                    "regressions": { "overall": false }
+                }),
+            },
+            now,
+            VoiBudgetConfig {
+                max_overhead_ms: 50.0,
+                max_experiments: 2,
+                stale_after_hours: 24.0,
+            },
+        );
+        assert_eq!(
+            plan.get("status").and_then(Value::as_str),
+            Some("safe_mode")
+        );
+        let reasons = plan
+            .get("safe_mode_reasons")
+            .and_then(Value::as_array)
+            .expect("safe_mode_reasons");
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].as_str(), Some("estimator_drift"));
+        assert_eq!(
+            plan.get("estimator")
+                .and_then(|estimator| estimator.get("missing_telemetry"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            plan.get("estimator")
+                .and_then(|estimator| estimator.get("stale_evidence"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            plan.get("estimator")
+                .and_then(|estimator| estimator.get("drift_detected"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn voi_scheduler_safe_mode_reason_order_is_deterministic() {
+        let now = DateTime::parse_from_rfc3339("2026-02-16T05:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let hotspots = vec![json!({
+            "stage": "queue",
+            "ev_score": 45.0,
+            "confidence": 0.5,
+            "pmu_multiplier": 1.0,
+            "projected_user_impact": { "turn_latency_p95_ms": 2.0 }
+        })];
+        let plan = build_voi_scheduler_plan_at(
+            VoiPlannerInputs {
+                hotspot_entries: &hotspots,
+                run_metadata: &json!({ "finished_at": "2026-02-14T01:00:00Z" }),
+                pmu_meta: &json!({
+                    "status": "not_collected"
+                }),
+                pmu_comparison: &json!({
+                    "status": "not_compared",
+                    "regressions": { "overall": false }
+                }),
+                pmu_outcome_correlation: &json!({
+                    "correlation_strength": "low",
+                    "signals": {
+                        "pmu_worse": true,
+                        "outcome_regression": false
+                    }
+                }),
+                outcome_comparison: &json!({
+                    "regressions": { "overall": false }
+                }),
+            },
+            now,
+            VoiBudgetConfig {
+                max_overhead_ms: 50.0,
+                max_experiments: 2,
+                stale_after_hours: 12.0,
+            },
+        );
+        assert_eq!(
+            plan.get("status").and_then(Value::as_str),
+            Some("safe_mode")
+        );
+        let reasons = plan
+            .get("safe_mode_reasons")
+            .and_then(Value::as_array)
+            .expect("safe_mode_reasons")
+            .iter()
+            .map(|value| value.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasons,
+            vec![
+                "missing_telemetry".to_string(),
+                "stale_evidence".to_string(),
+                "estimator_drift".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn voi_scheduler_safe_mode_selects_min_cost_diagnostic_stage() {
+        let now = DateTime::parse_from_rfc3339("2026-02-16T05:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let hotspots = vec![
+            json!({
+                "stage": "queue",
+                "ev_score": 100.0,
+                "confidence": 0.2,
+                "pmu_multiplier": 1.6,
+                "projected_user_impact": { "turn_latency_p95_ms": 9.0 }
+            }),
+            json!({
+                "stage": "marshal",
+                "ev_score": 10.0,
+                "confidence": 0.8,
+                "pmu_multiplier": 1.0,
+                "projected_user_impact": { "turn_latency_p95_ms": 1.0 }
+            }),
+            json!({
+                "stage": "policy",
+                "ev_score": 45.0,
+                "confidence": 0.4,
+                "pmu_multiplier": 1.1,
+                "projected_user_impact": { "turn_latency_p95_ms": 3.5 }
+            }),
+        ];
+        let plan = build_voi_scheduler_plan_at(
+            VoiPlannerInputs {
+                hotspot_entries: &hotspots,
+                run_metadata: &json!({ "finished_at": "2026-02-16T04:55:00Z" }),
+                pmu_meta: &json!({
+                    "status": "not_collected"
+                }),
+                pmu_comparison: &json!({
+                    "status": "not_compared"
+                }),
+                pmu_outcome_correlation: &json!({
+                    "correlation_strength": "moderate",
+                    "signals": {
+                        "pmu_worse": false,
+                        "outcome_regression": false
+                    }
+                }),
+                outcome_comparison: &json!({
+                    "regressions": { "overall": false }
+                }),
+            },
+            now,
+            VoiBudgetConfig {
+                max_overhead_ms: 20.0,
+                max_experiments: 3,
+                stale_after_hours: 24.0,
+            },
+        );
+        assert_eq!(
+            plan.get("selection_strategy").and_then(Value::as_str),
+            Some("safe_mode_min_cost_probe")
+        );
+        let selected_plan = plan
+            .get("selected_plan")
+            .and_then(Value::as_array)
+            .expect("selected_plan");
+        assert_eq!(selected_plan.len(), 1);
+        assert_eq!(
+            selected_plan[0].get("stage").and_then(Value::as_str),
+            Some("marshal")
+        );
+    }
+
+    #[test]
+    fn voi_scheduler_safe_mode_marks_diagnostic_budget_exceeded_when_too_small() {
+        let now = DateTime::parse_from_rfc3339("2026-02-16T05:00:00Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let hotspots = vec![
+            json!({
+                "stage": "queue",
+                "ev_score": 100.0,
+                "confidence": 0.2,
+                "pmu_multiplier": 1.6,
+                "projected_user_impact": { "turn_latency_p95_ms": 9.0 }
+            }),
+            json!({
+                "stage": "marshal",
+                "ev_score": 10.0,
+                "confidence": 0.8,
+                "pmu_multiplier": 1.0,
+                "projected_user_impact": { "turn_latency_p95_ms": 1.0 }
+            }),
+        ];
+        let plan = build_voi_scheduler_plan_at(
+            VoiPlannerInputs {
+                hotspot_entries: &hotspots,
+                run_metadata: &json!({ "finished_at": "2026-02-16T04:55:00Z" }),
+                pmu_meta: &json!({
+                    "status": "not_collected"
+                }),
+                pmu_comparison: &json!({
+                    "status": "not_compared"
+                }),
+                pmu_outcome_correlation: &json!({
+                    "correlation_strength": "moderate",
+                    "signals": {
+                        "pmu_worse": false,
+                        "outcome_regression": false
+                    }
+                }),
+                outcome_comparison: &json!({
+                    "regressions": { "overall": false }
+                }),
+            },
+            now,
+            VoiBudgetConfig {
+                max_overhead_ms: 5.0,
+                max_experiments: 3,
+                stale_after_hours: 24.0,
+            },
+        );
+        assert_eq!(
+            plan.get("selection_strategy").and_then(Value::as_str),
+            Some("safe_mode_min_cost_probe")
+        );
+        assert_eq!(
+            plan.get("selected_plan")
+                .and_then(Value::as_array)
+                .map(std::vec::Vec::len),
+            Some(0)
+        );
+
+        let marshal_row = plan
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.get("stage").and_then(Value::as_str) == Some("marshal"))
+            })
+            .expect("marshal candidate row");
+        assert_eq!(
+            marshal_row.get("skip_reason").and_then(Value::as_str),
+            Some("diagnostic_budget_exceeded")
+        );
+    }
+
+    #[test]
     fn voi_scheduler_safe_mode_on_missing_telemetry() {
         let now = DateTime::parse_from_rfc3339("2026-02-16T05:00:00Z")
             .expect("timestamp")
