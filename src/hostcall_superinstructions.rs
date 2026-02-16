@@ -466,4 +466,234 @@ mod tests {
         assert!(!execution.selection.hit());
         assert_eq!(execution.selection.deopt_reason, Some("no_matching_plan"));
     }
+
+    // ── Cost estimation ──
+
+    #[test]
+    fn estimated_baseline_cost_is_linear_in_width() {
+        assert_eq!(estimated_baseline_cost(1), BASE_OPCODE_COST_UNITS);
+        assert_eq!(estimated_baseline_cost(2), 2 * BASE_OPCODE_COST_UNITS);
+        assert_eq!(estimated_baseline_cost(4), 4 * BASE_OPCODE_COST_UNITS);
+        assert_eq!(estimated_baseline_cost(0), 0);
+    }
+
+    #[test]
+    fn estimated_fused_cost_is_fixed_plus_step() {
+        assert_eq!(
+            estimated_fused_cost(2),
+            FUSED_OPCODE_FIXED_COST_UNITS + 2 * FUSED_OPCODE_STEP_COST_UNITS
+        );
+        assert_eq!(
+            estimated_fused_cost(4),
+            FUSED_OPCODE_FIXED_COST_UNITS + 4 * FUSED_OPCODE_STEP_COST_UNITS
+        );
+        assert_eq!(
+            estimated_fused_cost(0),
+            FUSED_OPCODE_FIXED_COST_UNITS
+        );
+    }
+
+    #[test]
+    fn fused_cost_always_less_than_baseline_for_width_ge_2() {
+        for width in 2..=32 {
+            let baseline = estimated_baseline_cost(width);
+            let fused = estimated_fused_cost(width);
+            assert!(
+                fused < baseline,
+                "fused ({fused}) should be less than baseline ({baseline}) at width {width}"
+            );
+        }
+    }
+
+    // ── Compiler disabled ──
+
+    #[test]
+    fn compiler_disabled_returns_empty_plans() {
+        let compiler = HostcallSuperinstructionCompiler::new(false, 2, 4);
+        let traces = vec![
+            opcode_trace(&["a", "b", "c"]),
+            opcode_trace(&["a", "b", "c"]),
+            opcode_trace(&["a", "b", "c"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        assert!(plans.is_empty());
+    }
+
+    // ── Compiler edge cases ──
+
+    #[test]
+    fn compiler_ignores_single_opcode_traces() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 1, 4);
+        let traces = vec![
+            opcode_trace(&["single"]),
+            opcode_trace(&["single"]),
+            opcode_trace(&["single"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn compiler_ignores_empty_traces() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 1, 4);
+        let plans = compiler.compile_plans(&[Vec::new(), Vec::new()]);
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn compiler_skips_windows_with_empty_opcodes() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 1, 4);
+        let traces = vec![
+            opcode_trace(&["a", "", "c"]),
+            opcode_trace(&["a", "", "c"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        // Windows containing "" are skipped
+        assert!(
+            plans.iter().all(|p| p.opcode_window.iter().all(|op| !op.trim().is_empty())),
+            "no plan should contain empty opcodes"
+        );
+    }
+
+    #[test]
+    fn compiler_respects_min_support_threshold() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 5, 4);
+        // Only 3 traces — below min_support of 5
+        let traces = vec![
+            opcode_trace(&["a", "b"]),
+            opcode_trace(&["a", "b"]),
+            opcode_trace(&["a", "b"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        assert!(plans.is_empty(), "support 3 < min_support 5");
+    }
+
+    #[test]
+    fn compiler_respects_max_window_size() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 2, 2);
+        let traces = vec![
+            opcode_trace(&["a", "b", "c", "d"]),
+            opcode_trace(&["a", "b", "c", "d"]),
+            opcode_trace(&["a", "b", "c", "d"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        assert!(
+            plans.iter().all(|p| p.width() <= 2),
+            "max_window=2 should cap window width"
+        );
+    }
+
+    #[test]
+    fn compiler_plans_sorted_by_cost_delta_descending() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 2, 4);
+        let traces = vec![
+            opcode_trace(&["a", "b", "c", "d"]),
+            opcode_trace(&["a", "b", "c", "d"]),
+            opcode_trace(&["a", "b", "c", "d"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        for pair in plans.windows(2) {
+            assert!(
+                pair[0].expected_cost_delta >= pair[1].expected_cost_delta,
+                "plans should be sorted by cost delta descending"
+            );
+        }
+    }
+
+    // ── Plan schema + serde ──
+
+    #[test]
+    fn plan_serde_roundtrip() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 2, 4);
+        let traces = vec![
+            opcode_trace(&["x", "y", "z"]),
+            opcode_trace(&["x", "y", "z"]),
+            opcode_trace(&["x", "y", "z"]),
+        ];
+        let plans = compiler.compile_plans(&traces);
+        assert!(!plans.is_empty());
+        for p in &plans {
+            let json = serde_json::to_string(p).expect("serialize");
+            let roundtrip: HostcallSuperinstructionPlan =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(*p, roundtrip);
+            assert_eq!(p.schema, HOSTCALL_SUPERINSTRUCTION_SCHEMA_VERSION);
+            assert_eq!(p.version, HOSTCALL_SUPERINSTRUCTION_PLAN_VERSION);
+        }
+    }
+
+    // ── Plan.matches_trace_prefix ──
+
+    #[test]
+    fn matches_trace_prefix_exact() {
+        let p = plan("test", &["a", "b"], 3, 10);
+        assert!(p.matches_trace_prefix(&opcode_trace(&["a", "b"])));
+        assert!(p.matches_trace_prefix(&opcode_trace(&["a", "b", "c"])));
+        assert!(!p.matches_trace_prefix(&opcode_trace(&["a"])));
+        assert!(!p.matches_trace_prefix(&opcode_trace(&["b", "a"])));
+        assert!(!p.matches_trace_prefix(&[]));
+    }
+
+    // ── Selection edge cases ──
+
+    #[test]
+    fn selection_on_empty_trace_returns_empty_trace_deopt() {
+        let plans = vec![plan("p", &["a", "b"], 3, 10)];
+        let selected = select_plan_for_trace(&[], &plans);
+        assert!(!selected.hit());
+        assert_eq!(selected.deopt_reason, Some("empty_trace"));
+    }
+
+    #[test]
+    fn selection_on_empty_plans_returns_no_matching_plan() {
+        let trace = opcode_trace(&["a", "b"]);
+        let selected = select_plan_for_trace(&trace, &[]);
+        assert!(!selected.hit());
+        assert_eq!(selected.deopt_reason, Some("no_matching_plan"));
+    }
+
+    // ── Opcode window signature ──
+
+    #[test]
+    fn opcode_window_signature_is_deterministic() {
+        let window = opcode_trace(&["session.get_state", "session.get_messages"]);
+        let sig1 = opcode_window_signature(&window);
+        let sig2 = opcode_window_signature(&window);
+        assert_eq!(sig1, sig2);
+        assert_eq!(sig1.len(), 16, "signature should be 16 hex chars");
+    }
+
+    #[test]
+    fn opcode_window_signature_differs_for_different_windows() {
+        let sig_ab = opcode_window_signature(&opcode_trace(&["a", "b"]));
+        let sig_ba = opcode_window_signature(&opcode_trace(&["b", "a"]));
+        let sig_abc = opcode_window_signature(&opcode_trace(&["a", "b", "c"]));
+        assert_ne!(sig_ab, sig_ba, "order matters");
+        assert_ne!(sig_ab, sig_abc, "different length windows differ");
+    }
+
+    // ── Execution with entire trace consumed ──
+
+    #[test]
+    fn execution_fuses_entire_trace() {
+        let trace = opcode_trace(&["a", "b"]);
+        let plans = vec![plan("p_full", &["a", "b"], 5, 14)];
+        let execution = execute_with_superinstruction(&trace, &plans);
+        assert!(execution.selection.hit());
+        assert_eq!(execution.fused_trace, vec!["@p_full"]);
+        assert!(execution.fused_trace.len() < execution.canonical_trace.len());
+    }
+
+    // ── Compiler constructor + accessors ──
+
+    #[test]
+    fn compiler_accessors_match_constructor() {
+        let compiler = HostcallSuperinstructionCompiler::new(true, 7, 5);
+        assert!(compiler.enabled());
+        assert_eq!(compiler.min_support(), 7);
+        assert_eq!(compiler.max_window(), 5);
+
+        let disabled = HostcallSuperinstructionCompiler::new(false, 2, 3);
+        assert!(!disabled.enabled());
+    }
 }

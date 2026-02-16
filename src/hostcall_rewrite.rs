@@ -156,4 +156,93 @@ mod tests {
         assert_eq!(decision.selected, BASELINE);
         assert_eq!(decision.fallback_reason, Some("ambiguous_min_cost"));
     }
+
+    // ── Additional coverage ──
+
+    #[test]
+    fn rewrite_engine_rejects_no_better_candidate() {
+        let engine = HostcallRewriteEngine::new(true);
+        let worse = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::FastOpcodeFusion,
+            estimated_cost: 120,
+            rule_id: "slow_rule",
+        };
+        let equal = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::FastOpcodeFusion,
+            estimated_cost: 100,
+            rule_id: "equal_rule",
+        };
+        let decision = engine.select_plan(BASELINE, &[worse, equal]);
+        assert_eq!(decision.selected, BASELINE);
+        assert_eq!(decision.expected_cost_delta, 0);
+        assert_eq!(decision.fallback_reason, Some("no_better_candidate"));
+    }
+
+    #[test]
+    fn rewrite_engine_selects_cheapest_among_multiple_candidates() {
+        let engine = HostcallRewriteEngine::new(true);
+        let mid = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::FastOpcodeFusion,
+            estimated_cost: 50,
+            rule_id: "mid_rule",
+        };
+        let cheapest = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::FastOpcodeFusion,
+            estimated_cost: 20,
+            rule_id: "cheapest_rule",
+        };
+        let decision = engine.select_plan(BASELINE, &[mid, FAST_FUSION, cheapest]);
+        assert_eq!(decision.selected, cheapest);
+        assert_eq!(decision.expected_cost_delta, 80);
+        assert!(decision.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn rewrite_engine_empty_candidates_returns_no_better() {
+        let engine = HostcallRewriteEngine::new(true);
+        let decision = engine.select_plan(BASELINE, &[]);
+        assert_eq!(decision.selected, BASELINE);
+        assert_eq!(decision.fallback_reason, Some("no_better_candidate"));
+    }
+
+    #[test]
+    fn rewrite_engine_ambiguity_resolved_by_same_kind_and_rule() {
+        let engine = HostcallRewriteEngine::new(true);
+        // Same kind AND same rule_id = NOT ambiguous (they're the same plan)
+        let dup = HostcallRewritePlan {
+            kind: HostcallRewritePlanKind::FastOpcodeFusion,
+            estimated_cost: 35,
+            rule_id: "fuse_hash_dispatch_fast_opcode",
+        };
+        let decision = engine.select_plan(BASELINE, &[FAST_FUSION, dup]);
+        assert_eq!(decision.selected, FAST_FUSION);
+        assert!(decision.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn rewrite_engine_accessors() {
+        let enabled = HostcallRewriteEngine::new(true);
+        assert!(enabled.enabled());
+        let disabled = HostcallRewriteEngine::new(false);
+        assert!(!disabled.enabled());
+    }
+
+    #[test]
+    fn plan_kind_variants_distinct() {
+        assert_ne!(
+            HostcallRewritePlanKind::BaselineCanonical,
+            HostcallRewritePlanKind::FastOpcodeFusion
+        );
+    }
+
+    #[test]
+    fn rewrite_decision_cost_delta_correct_sign() {
+        let engine = HostcallRewriteEngine::new(true);
+        let decision = engine.select_plan(BASELINE, &[FAST_FUSION]);
+        assert!(decision.expected_cost_delta > 0, "positive delta means improvement");
+        assert_eq!(
+            decision.expected_cost_delta,
+            i64::from(BASELINE.estimated_cost) - i64::from(FAST_FUSION.estimated_cost)
+        );
+    }
 }
