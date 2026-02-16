@@ -1474,9 +1474,9 @@ mod compatibility_scanner_comment_tests {
         };
         // Regex matching `//` inside a class: /[//]/
         // Followed by code: ; import 'fs';
-        let line = r#"const r = /[//]/; import 'fs'; // real comment"#;
+        let line = r"const r = /[//]/; import 'fs'; // real comment";
         let stripped = strip_js_comments(line, &mut state);
-        assert_eq!(stripped.trim(), r#"const r = /[//]/; import 'fs';"#);
+        assert_eq!(stripped.trim(), r"const r = /[//]/; import 'fs';");
         assert!(!state.in_block_comment);
 
         // Regex matching `/*` inside a class: /[\/*]/
@@ -1485,9 +1485,9 @@ mod compatibility_scanner_comment_tests {
             in_template: false,
             last_significant_char: None,
         };
-        let line2 = r#"const r2 = /[\/*]/; import 'path'; /* real comment */"#;
+        let line2 = r"const r2 = /[\/*]/; import 'path'; /* real comment */";
         let stripped2 = strip_js_comments(line2, &mut state2);
-        assert_eq!(stripped2.trim(), r#"const r2 = /[\/*]/; import 'path';"#);
+        assert_eq!(stripped2.trim(), r"const r2 = /[\/*]/; import 'path';");
         assert!(!state2.in_block_comment);
     }
 
@@ -1640,6 +1640,29 @@ pi.exec("echo hello");
                 .iter()
                 .any(|cap| cap.capability == "exec" && cap.reason == "import:child_process"),
             "minified bundle should still infer exec capability from child_process require"
+        );
+    }
+    #[test]
+    fn compatibility_scanner_detects_backtick_tool_calls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("backtick.js");
+        fs::write(
+            &entry,
+            r#"
+pi.tool(`read`, { path: "file.txt" });
+"#,
+        )
+        .expect("write test file");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "read"),
+            "pi.tool(`read`) should be detected"
         );
     }
 }
@@ -14464,6 +14487,10 @@ struct JsRuntimeHost {
     /// The thread holds a `JsRuntimeHost` which would otherwise prevent
     /// `ExtensionManager` from being dropped (and the channel from closing).
     manager_ref: Weak<Mutex<ExtensionManagerInner>>,
+    /// Shared RCU snapshot so managers reconstructed from the weak reference
+    /// read and write the same snapshot as the original `ExtensionManager`.
+    manager_snapshot: Arc<RwLock<Arc<RegistrySnapshot>>>,
+    manager_snapshot_version: Arc<AtomicU64>,
     http: Arc<HttpConnector>,
     policy: ExtensionPolicy,
     interceptor: Option<Arc<dyn HostcallInterceptor>>,
@@ -14522,19 +14549,10 @@ impl JsRuntimeHost {
     /// Upgrade the weak manager reference.  Returns `None` if the
     /// `ExtensionManager` has already been dropped (shutdown in progress).
     fn manager(&self) -> Option<ExtensionManager> {
-        self.manager_ref.upgrade().map(|inner| {
-            let mgr = ExtensionManager {
-                inner,
-                snapshot: Arc::new(RwLock::new(Arc::new(RegistrySnapshot::default()))),
-                snapshot_version: Arc::new(AtomicU64::new(0)),
-            };
-            // Refresh snapshot from the shared inner state so the
-            // reconstructed manager sees the session handle and all
-            // registered extensions.
-            let guard = mgr.inner.lock().unwrap();
-            mgr.refresh_snapshot_locked(&guard);
-            drop(guard);
-            mgr
+        self.manager_ref.upgrade().map(|inner| ExtensionManager {
+            inner,
+            snapshot: Arc::clone(&self.manager_snapshot),
+            snapshot_version: Arc::clone(&self.manager_snapshot_version),
         })
     }
 }
@@ -14698,6 +14716,8 @@ impl JsExtensionRuntimeHandle {
         let host = JsRuntimeHost {
             tools,
             manager_ref: Arc::downgrade(&manager.inner),
+            manager_snapshot: Arc::clone(&manager.snapshot),
+            manager_snapshot_version: Arc::clone(&manager.snapshot_version),
             http: Arc::new(HttpConnector::with_defaults()),
             policy,
             interceptor,
