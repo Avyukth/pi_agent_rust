@@ -324,7 +324,7 @@ fn run_platform_checks() -> Vec<PlatformCheck> {
 
     // Check 8: Extension runtime artifacts (linux required, others informational).
     let ext_artifacts = repo_root()
-        .join("tests/ext_conformance/artifacts/VALIDATED_MANIFEST.json")
+        .join("tests/ext_conformance/VALIDATED_MANIFEST.json")
         .is_file();
     checks.push(PlatformCheck {
         id: "extension_artifacts".to_string(),
