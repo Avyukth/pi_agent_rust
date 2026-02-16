@@ -53,8 +53,11 @@ fn test_compaction_usage_double_counting_bug() {
     });
 
     let entries = vec![user1, assistant_entry, user2];
-    // Force a non-empty `messages_to_summarize` so `prepare_compaction` returns `Some(...)`.
+    // Force compaction to trigger by setting a zero window.  The default 200K window
+    // is far above the ~110 tokens in these test entries.
     let settings = ResolvedCompactionSettings {
+        context_window_tokens: 0,
+        reserve_tokens: 0,
         keep_recent_tokens: 0,
         ..Default::default()
     };

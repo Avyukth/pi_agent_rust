@@ -11052,6 +11052,7 @@ mod tests {
                 len in 256..512usize,
             ) {
                 // Construct input with every byte value appearing equally
+                #[allow(clippy::cast_possible_truncation)]
                 let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
                 let entropy = shannon_entropy_bytes(&bytes);
                 // Should be close to 8.0 (log2(256))

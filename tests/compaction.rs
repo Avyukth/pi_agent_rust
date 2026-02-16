@@ -451,8 +451,10 @@ fn log_result(harness: &TestHarness, result: &CompactionResult) {
 const fn make_settings(keep_recent_tokens: u32) -> pi::compaction::ResolvedCompactionSettings {
     pi::compaction::ResolvedCompactionSettings {
         enabled: true,
-        context_window_tokens: 200_000,
-        reserve_tokens: 1024,
+        // Use a tiny window so compaction triggers for the small test entries.
+        // Tests focus on cut-point and formatting logic, not the threshold.
+        context_window_tokens: 0,
+        reserve_tokens: 0,
         keep_recent_tokens,
     }
 }
@@ -542,7 +544,7 @@ fn prepare_compaction_skips_tool_result_as_cut_point_and_marks_split_turn() {
             assistant_with_tool_calls(vec![("read", json!({"path": "a.txt"}))]),
         ),
         message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
-        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     dump_timeline(&harness, "setup", &entries);
@@ -563,7 +565,7 @@ fn prepare_compaction_includes_non_message_entries_in_kept_region() {
     let entries = vec![
         message_entry("u1", None, user_text(text_of_tokens(1))),
         model_change_entry("mc1", Some("u1"), "p", "m"),
-        message_entry("a1", Some("mc1"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("a1", Some("mc1"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     dump_timeline(&harness, "setup", &entries);
@@ -656,7 +658,7 @@ fn compact_split_turn_calls_provider_twice_and_formats_sections() {
             assistant_with_tool_calls(vec![("read", json!({"path": "a.txt"}))]),
         ),
         message_entry("tr1", Some("a1"), tool_result("call-0", "read", "ok")),
-        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("a2", Some("tr1"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(2)).expect("prep");
@@ -1382,7 +1384,7 @@ fn prepare_compaction_turn_prefix_tool_calls_contribute_to_file_ops() {
             Some("u1"),
             assistant_with_tool_calls(vec![("edit", json!({"path": "turn.txt"}))]),
         ),
-        message_entry("a2", Some("a1"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("a2", Some("a1"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(0)).expect("prep");
@@ -1407,7 +1409,7 @@ fn prepare_compaction_considers_branch_summary_as_turn_start() {
     let entries = vec![
         branch_summary_entry("bs", None, "from", "summary"),
         message_entry("a0", Some("bs"), assistant_text(text_of_tokens(1), 0)),
-        message_entry("a1", Some("a0"), assistant_text(text_of_tokens(1), 0)),
+        message_entry("a1", Some("a0"), assistant_text(text_of_tokens(1), 100)),
     ];
 
     let prep = prepare_compaction(&entries, make_settings(0)).expect("prep");
