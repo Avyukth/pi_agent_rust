@@ -944,6 +944,20 @@ for ((i=1; i<=$#; i++)); do
     fi
   fi
 done
+if [[ "${PI_FAKE_FAIL_JEMALLOC:-0}" == "1" ]]; then
+  prev=""
+  for arg in "$@"; do
+    if [[ "$arg" == "--features=jemalloc" || "$arg" == "--features=jemalloc,"* ]]; then
+      echo "simulated jemalloc build failure" >&2
+      exit 43
+    fi
+    if [[ "$prev" == "--features" && "$arg" == *"jemalloc"* ]]; then
+      echo "simulated jemalloc build failure" >&2
+      exit 43
+    fi
+    prev="$arg"
+  done
+fi
 bin="$target_dir/$profile/pijs_workload"
 mkdir -p "$(dirname "$bin")"
 cat >"$bin" <<'EOS'
@@ -1004,6 +1018,25 @@ fn run_bench_workloads_with_mode(
     allow_fallback: bool,
     pgo_mode: &str,
 ) -> (std::process::Output, PathBuf, PathBuf) {
+    run_bench_workloads_with_config(
+        profile_state,
+        allow_fallback,
+        pgo_mode,
+        "system",
+        "system",
+        false,
+    )
+}
+
+#[cfg(unix)]
+fn run_bench_workloads_with_config(
+    profile_state: &str,
+    allow_fallback: bool,
+    pgo_mode: &str,
+    allocators_csv: &str,
+    allocator_fallback: &str,
+    fail_jemalloc_build: bool,
+) -> (std::process::Output, PathBuf, PathBuf) {
     let temp_root = unique_temp_dir("pgo-fallback");
     let bin_dir = temp_root.join("bin");
     let target_dir = temp_root.join("target");
@@ -1044,7 +1077,8 @@ fn run_bench_workloads_with_mode(
         .env("JSONL_OUT", out_dir.join("bench.jsonl"))
         .env("BENCH_CARGO_PROFILE", "perf")
         .env("BENCH_CARGO_RUNNER", "local")
-        .env("BENCH_ALLOCATORS_CSV", "system")
+        .env("BENCH_ALLOCATORS_CSV", allocators_csv)
+        .env("BENCH_ALLOCATOR_FALLBACK", allocator_fallback)
         .env("BENCH_PGO_MODE", pgo_mode)
         .env(
             "BENCH_PGO_ALLOW_FALLBACK",
@@ -1057,6 +1091,10 @@ fn run_bench_workloads_with_mode(
         .env("TOOL_CALLS_CSV", "1")
         .env("HYPERFINE_WARMUP", "0")
         .env("HYPERFINE_RUNS", "1")
+        .env(
+            "PI_FAKE_FAIL_JEMALLOC",
+            if fail_jemalloc_build { "1" } else { "0" },
+        )
         .output()
         .expect("run bench_extension_workloads.sh");
 
@@ -1210,6 +1248,102 @@ fn pgo_compare_mode_emits_delta_artifact_and_comparison_event() {
             .and_then(Value::as_str)
             .is_some(),
         "comparison event must include comparison_json path"
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn allocator_summary_artifact_emits_schema_and_recommendation() {
+    let (output, temp_root, _events_path) =
+        run_bench_workloads_with_config("missing", true, "off", "system,jemalloc", "system", false);
+    assert!(
+        output.status.success(),
+        "script should succeed for allocator summary generation. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let summary_path = temp_root.join("out/allocator_strategy_summary.json");
+    assert!(
+        summary_path.exists(),
+        "allocator strategy summary artifact must be emitted"
+    );
+
+    let summary_payload: Value = serde_json::from_str(
+        &fs::read_to_string(&summary_path).expect("read allocator strategy summary"),
+    )
+    .expect("parse allocator strategy summary");
+
+    assert_eq!(
+        summary_payload.get("schema").and_then(Value::as_str),
+        Some("pi.perf.allocator_strategy_summary.v1")
+    );
+    assert!(
+        summary_payload
+            .get("recommended_allocator")
+            .and_then(Value::as_str)
+            .is_some(),
+        "allocator summary must include recommended_allocator"
+    );
+    assert!(
+        summary_payload
+            .get("hyperfine_matrix")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty()),
+        "allocator summary must include non-empty hyperfine matrix"
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn allocator_jemalloc_request_falls_back_to_system_when_enabled() {
+    let (output, temp_root, events_path) =
+        run_bench_workloads_with_config("missing", true, "off", "jemalloc", "system", true);
+    assert!(
+        output.status.success(),
+        "script should succeed with jemalloc fallback enabled. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = load_jsonl(&events_path);
+    let build_event = first_build_event(&events);
+    assert_eq!(
+        build_event
+            .get("allocator_requested")
+            .and_then(Value::as_str),
+        Some("jemalloc")
+    );
+    assert_eq!(
+        build_event
+            .get("allocator_effective")
+            .and_then(Value::as_str),
+        Some("system")
+    );
+    assert_eq!(
+        build_event.get("fallback_reason").and_then(Value::as_str),
+        Some("jemalloc_build_failed")
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn allocator_jemalloc_request_fails_closed_when_fallback_disabled() {
+    let (output, temp_root, _events_path) =
+        run_bench_workloads_with_config("missing", true, "off", "jemalloc", "none", true);
+    assert!(
+        !output.status.success(),
+        "script must fail closed when jemalloc build fails and allocator fallback is disabled"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to build baseline binary for allocator 'jemalloc'"),
+        "failure should indicate allocator build failure. stderr={stderr}"
     );
 
     let _ = fs::remove_dir_all(temp_root);

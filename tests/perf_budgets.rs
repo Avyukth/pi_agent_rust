@@ -557,10 +557,13 @@ fn ci_enforced_budgets_have_data_sources() {
 }
 
 #[test]
-fn ci_enforced_budgets_fail_on_regression_when_data_present() {
+fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
+    let strict = std::env::var("PI_PERF_STRICT").is_ok_and(|v| v == "1");
+
     let mut checked_with_data = 0usize;
     let mut checked_without_data = 0usize;
     let mut regressions = Vec::new();
+    let mut no_data_budgets = Vec::new();
 
     for budget in BUDGETS.iter().filter(|budget| budget.ci_enforced) {
         let result = check_budget(budget);
@@ -574,17 +577,36 @@ fn ci_enforced_budgets_fail_on_regression_when_data_present() {
             }
         } else {
             checked_without_data += 1;
+            no_data_budgets.push(format!(
+                "{}: NO_DATA (source={})",
+                budget.name, result.source
+            ));
         }
     }
 
     eprintln!(
-        "[budget] CI-enforced: with_data={checked_with_data}, without_data={checked_without_data}"
+        "[budget] CI-enforced: with_data={checked_with_data}, without_data={checked_without_data}, strict={strict}"
     );
+    if !no_data_budgets.is_empty() {
+        eprintln!(
+            "[budget] CI-enforced budgets with NO_DATA:\n  {}",
+            no_data_budgets.join("\n  ")
+        );
+    }
+
     assert!(
         regressions.is_empty(),
         "CI budget regressions detected:\n{}",
         regressions.join("\n")
     );
+
+    if strict {
+        assert!(
+            no_data_budgets.is_empty(),
+            "CI-enforced budgets missing measurement data (PI_PERF_STRICT=1):\n{}",
+            no_data_budgets.join("\n")
+        );
+    }
 }
 
 #[test]
@@ -757,6 +779,10 @@ fn generate_budget_report() {
         .iter()
         .filter(|result| result.status == "FAIL")
         .count();
+    let ci_no_data_count = ci_results
+        .iter()
+        .filter(|result| result.status == "NO_DATA")
+        .count();
 
     let summary = json!({
         "schema": "pi.perf.budget_summary.v1",
@@ -765,6 +791,7 @@ fn generate_budget_report() {
         "ci_enforced": ci_enforced_count,
         "ci_with_data": ci_with_data_count,
         "ci_fail": ci_fail_count,
+        "ci_no_data": ci_no_data_count,
         "pass": pass_count,
         "fail": fail_count,
         "no_data": no_data_count,
@@ -803,6 +830,7 @@ fn generate_budget_report() {
     let _ = writeln!(md, "| CI-enforced | {ci_enforced_count} |");
     let _ = writeln!(md, "| CI-enforced with data | {ci_with_data_count} |");
     let _ = writeln!(md, "| CI-enforced FAIL | {ci_fail_count} |");
+    let _ = writeln!(md, "| CI-enforced NO_DATA | {ci_no_data_count} |");
     let _ = writeln!(md, "| PASS | {pass_count} |");
     let _ = writeln!(md, "| FAIL | {fail_count} |");
     let _ = writeln!(md, "| No data | {no_data_count} |\n");

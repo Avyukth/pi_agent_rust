@@ -211,7 +211,7 @@ fn fault_inject_multi_phase_append_crash_recover_continue() {
     );
     let mut continued = recovered;
     continued.session_dir = Some(temp_dir.path().to_path_buf());
-    continued.set_model_header("healing-model"); // Dirty header → full rewrite.
+    continued.set_model_header(Some("healing-model".to_string()), None, None);
     run_async(async { continued.save().await }).unwrap();
 
     // Phase 6: Post-healing append — incremental save should now work correctly.
@@ -948,7 +948,7 @@ fn fault_inject_mixed_entry_types_through_crash_cycle() {
     // Heal the file — force full rewrite to flush corrupt entries from disk.
     let mut cont = recovered;
     cont.session_dir = Some(temp_dir.path().to_path_buf());
-    cont.set_model_header("healing-model");
+    cont.set_model_header(Some("healing-model".to_string()), None, None);
     run_async(async { cont.save().await }).unwrap();
 
     // Now append after healing.
