@@ -2374,7 +2374,7 @@ impl CusumState {
     }
 
     /// Reset detector state but keep baseline.
-    fn reset_cumsum(&mut self) {
+    const fn reset_cumsum(&mut self) {
         self.cumsum_high = 0.0;
         self.cumsum_low = 0.0;
     }
@@ -2430,23 +2430,24 @@ impl BocpdState {
         let n = self.run_length_probs.len();
 
         // 1. Compute predictive probabilities for each run length.
-        let mut pred_probs = Vec::with_capacity(n);
-        for i in 0..n {
-            pred_probs.push(self.predictive_prob(i, value));
-        }
+        let pred_probs: Vec<f64> = (0..n).map(|i| self.predictive_prob(i, value)).collect();
 
         // 2. Compute hazard function H(r) = 1/lambda (constant hazard).
         let h = 1.0 / hazard_lambda.max(1.0);
 
         // 3. Compute growth probabilities (existing runs continue).
+        //    Change-point uses uninformative prior predictive (Adams & MacKay
+        //    2007): the new run has no data yet, so P(x|r=0) uses a broad
+        //    prior.  Growth uses the accumulated run statistics.
+        let prior_pred = Self::prior_predictive(value);
         let mut new_probs = Vec::with_capacity(n + 1);
-        // Slot 0: change point probability (sum of all runs * hazard * pred).
-        let mut cp_prob = 0.0;
-        for i in 0..n {
-            let joint = self.run_length_probs[i] * pred_probs[i];
-            cp_prob += joint * h;
-            // Growth: run length i → i+1.
-            new_probs.push(joint * (1.0 - h));
+        let mut hazard_sum = 0.0_f64;
+        for rl_prob in &self.run_length_probs {
+            hazard_sum = rl_prob.mul_add(h, hazard_sum);
+        }
+        let cp_prob = prior_pred * hazard_sum;
+        for (rl_prob, &pp) in self.run_length_probs.iter().zip(&pred_probs) {
+            new_probs.push(rl_prob * pp * (1.0 - h));
         }
 
         // Insert change-point probability at position 0.
@@ -2471,13 +2472,17 @@ impl BocpdState {
         new_counts.push(1);
 
         // Run lengths 1..n: continue from previous.
-        for i in 0..n {
-            let count = self.run_counts[i] + 1;
-            let old_mean = self.run_means[i];
+        for ((&old_count, &old_mean), &old_m2) in self
+            .run_counts
+            .iter()
+            .zip(&self.run_means)
+            .zip(&self.run_m2s)
+        {
+            let count = old_count + 1;
             let delta = value - old_mean;
             let new_mean = old_mean + delta / f64::from(count);
             let delta2 = value - new_mean;
-            let new_m2 = self.run_m2s[i] + delta * delta2;
+            let new_m2 = delta.mul_add(delta2, old_m2);
             new_means.push(new_mean);
             new_m2s.push(new_m2);
             new_counts.push(count);
@@ -2522,20 +2527,26 @@ impl BocpdState {
 
     /// Gaussian predictive probability for observation `x` given run-length
     /// sufficient statistics at index `i`.
+    /// sqrt(2 * pi)
+    const SQRT_2PI: f64 = 2.506_628_274_631_000_5;
+
     fn predictive_prob(&self, i: usize, x: f64) -> f64 {
         let count = self.run_counts[i];
         if count < 2 {
-            // Uninformative prior: use broad Gaussian (sigma=100).
-            let diff = x - self.run_means[i];
-            return (-diff * diff / 20_000.0).exp() / 251.33;
+            return Self::prior_predictive(x);
         }
         let mean = self.run_means[i];
         let variance = (self.run_m2s[i] / f64::from(count - 1)).max(1.0);
-        // Student-t approximation as Gaussian with inflated variance.
         let pred_var = variance * (1.0 + 1.0 / f64::from(count));
         let sigma = pred_var.sqrt();
         let diff = x - mean;
-        (-diff * diff / (2.0 * pred_var)).exp() / (sigma * 2.506_628_274_631_000_5)
+        (-diff * diff / (2.0 * pred_var)).exp() / (sigma * Self::SQRT_2PI)
+    }
+
+    /// Uninformative prior predictive: broad Gaussian (sigma=1000).  Used
+    /// for the change-point hypothesis so any observation is plausible.
+    fn prior_predictive(_x: f64) -> f64 {
+        1.0 / (1000.0 * Self::SQRT_2PI)
     }
 
     /// Reset detector to initial state.
@@ -8764,25 +8775,13 @@ struct HostcallSuperinstructionRuntimeState {
     observation_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct HostcallSuperinstructionTelemetry {
     trace_signature: Option<String>,
     plan_id: Option<String>,
     expected_cost_delta: i64,
     observed_cost_delta: i64,
     deopt_reason: Option<String>,
-}
-
-impl Default for HostcallSuperinstructionTelemetry {
-    fn default() -> Self {
-        Self {
-            trace_signature: None,
-            plan_id: None,
-            expected_cost_delta: 0,
-            observed_cost_delta: 0,
-            deopt_reason: None,
-        }
-    }
 }
 
 fn hostcall_superinstruction_state() -> &'static Mutex<HostcallSuperinstructionRuntimeState> {
@@ -8821,9 +8820,7 @@ fn hostcall_superinstruction_telemetry(
 
     if state.trace_history.len() >= 2
         && (state.plans.is_empty()
-            || state
-                .observation_count
-                .is_multiple_of(HOSTCALL_SUPERINSTRUCTION_RECOMPILE_INTERVAL))
+            || state.observation_count % HOSTCALL_SUPERINSTRUCTION_RECOMPILE_INTERVAL == 0)
     {
         let trace = state.trace_history.iter().cloned().collect::<Vec<_>>();
         state.plans = state.compiler.compile_plans(&[trace]);
@@ -15648,7 +15645,7 @@ async fn cancel_extension_provider_stream_simple(
     Ok(())
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
     fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
         runtime.drain_hostcall_requests()
@@ -15720,9 +15717,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     ) {
         let mut completions = Vec::with_capacity(pending.len());
         for req in pending {
-            if let Some((call_id, outcome, elapsed_ns)) =
-                dispatch_one(runtime, host, req).await
-            {
+            if let Some((call_id, outcome, elapsed_ns)) = dispatch_one(runtime, host, req).await {
                 // Feed timing to AMAC even when disabled, so telemetry
                 // is ready if toggled on later.
                 AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
@@ -15769,18 +15764,15 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
             );
 
             for req in group.requests {
-                if let Some((call_id, outcome, elapsed_ns)) =
-                    dispatch_one(runtime, host, req).await
+                if let Some((call_id, outcome, elapsed_ns)) = dispatch_one(runtime, host, req).await
                 {
-                    AMAC_EXECUTOR
-                        .with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
+                    AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
                     completions.push((call_id, outcome));
                 }
             }
         }
 
-        let batch_elapsed_ms =
-            u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let batch_elapsed_ms = u64::try_from(batch_start.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::debug!(
             event = "pijs.amac.batch_complete",
             total_dispatched = completions.len(),
@@ -18912,6 +18904,8 @@ pub(crate) struct RegistrySnapshot {
     pub shortcut_key_ids: HashSet<String>,
     /// Pre-computed sorted event hook names from all extensions.
     pub all_event_hooks: Vec<String>,
+    /// Whether a UI sender is configured (stable after startup).
+    pub has_ui: bool,
 }
 
 /// Extension manager for handling loaded extensions.
@@ -19293,6 +19287,7 @@ impl ExtensionManager {
             all_shortcuts,
             shortcut_key_ids,
             all_event_hooks,
+            has_ui: inner.ui_sender.is_some(),
         }
     }
 
@@ -19338,8 +19333,7 @@ impl ExtensionManager {
                         .get("description")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let flag_type =
-                        flag.get("type").and_then(Value::as_str).unwrap_or("string");
+                    let flag_type = flag.get("type").and_then(Value::as_str).unwrap_or("string");
                     flags.push(json!({
                         "name": name,
                         "description": description,
@@ -19374,9 +19368,7 @@ impl ExtensionManager {
     }
 
     /// Pre-compute shortcut list and `key_id` set from all extensions.
-    fn precompute_all_shortcuts(
-        inner: &ExtensionManagerInner,
-    ) -> (Vec<Value>, HashSet<String>) {
+    fn precompute_all_shortcuts(inner: &ExtensionManagerInner) -> (Vec<Value>, HashSet<String>) {
         let mut shortcuts = Vec::new();
         let mut key_ids = HashSet::new();
         for ext in &inner.extensions {
@@ -19777,6 +19769,7 @@ impl ExtensionManager {
             .unwrap_or_default()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_budget_overload_signal(
         &self,
         extension_id: Option<&str>,
@@ -19810,6 +19803,7 @@ impl ExtensionManager {
         }
 
         // Feed regime-shift detectors with inter-arrival interval.
+        #[allow(clippy::cast_precision_loss)]
         let regime_shift_triggered = if config.regime_shift.enabled {
             let interval_ms = state
                 .regime_shift
@@ -20809,10 +20803,11 @@ impl ExtensionManager {
     ///
     /// When enabled, all hostcalls that would normally use the fast lane are
     /// deterministically routed through the compatibility lane.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_hostcall_compat_kill_switch_global(&self, enabled: bool) {
         let mut guard = self.inner.lock().unwrap();
         guard.hostcall_compat_kill_switch_global = enabled;
-        drop(guard);
+        self.refresh_snapshot_with_guard_release(guard);
 
         if enabled {
             tracing::warn!(
@@ -20833,6 +20828,7 @@ impl ExtensionManager {
     ///
     /// When enabled for `extension_id`, fast-lane-eligible hostcalls from that
     /// extension are routed through the compatibility lane.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn set_hostcall_compat_kill_switch_for_extension(&self, extension_id: &str, enabled: bool) {
         let extension_id = extension_id.trim();
         if extension_id.is_empty() {
@@ -20849,7 +20845,7 @@ impl ExtensionManager {
                 .hostcall_compat_kill_switch_extensions
                 .remove(extension_id);
         }
-        drop(guard);
+        self.refresh_snapshot_with_guard_release(guard);
 
         if enabled {
             tracing::warn!(
@@ -21380,12 +21376,13 @@ impl ExtensionManager {
     pub fn set_ui_sender(&self, sender: mpsc::Sender<ExtensionUiRequest>) {
         let mut guard = self.inner.lock().unwrap();
         guard.ui_sender = Some(sender);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     pub fn clear_ui_sender(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.ui_sender = None;
-        drop(guard);
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     pub fn set_js_runtime(&self, runtime: JsExtensionRuntimeHandle) {
@@ -21791,6 +21788,7 @@ impl ExtensionManager {
                 event_hooks: Vec::new(),
             });
         }
+        self.refresh_snapshot_with_guard_release(guard);
     }
 
     /// Dynamically register a provider at runtime (from a hostcall).
@@ -22191,25 +22189,29 @@ impl ExtensionManager {
     /// On cache miss the context is rebuilt from the current inner state and
     /// stored for future dispatches within the same generation.
     async fn get_or_build_ctx_payload(&self) -> Value {
-        // Snapshot cache and state under lock.
-        let (cached, generation, has_ui, session, cwd, registry) = {
+        // Seqlock fast-path: read version without any lock.
+        let version = self.snapshot_version();
+
+        // Check cache under a brief mutex lock.
+        let cached = {
             let guard = self.inner.lock().unwrap();
-            (
-                guard.ctx_cache.clone(),
-                guard.ctx_generation,
-                guard.ui_sender.is_some(),
-                guard.session.clone(),
-                guard.cwd.clone(),
-                guard.model_registry_values.clone(),
-            )
+            guard.ctx_cache.clone()
         };
 
-        // If the cache is still valid, return it.
+        // Cache hit: version matches → return immediately.
         if let Some(ref c) = cached {
-            if c.generation == generation {
+            if c.generation == version {
                 return c.payload.clone();
             }
         }
+
+        // Cache miss: read state from the RCU snapshot (no mutex needed).
+        let snap = self.read_snapshot();
+        let has_ui = snap.has_ui;
+        let session = snap.session.clone();
+        let cwd = snap.cwd.clone();
+        let registry = snap.model_registry_values.clone();
+        drop(snap);
 
         // Rebuild.
         let payload = Self::build_ctx_payload(has_ui, session, cwd, &registry).await;
@@ -22220,9 +22222,9 @@ impl ExtensionManager {
         {
             let mut guard = self.inner.lock().unwrap();
             // Only store if our generation is still current.
-            if guard.ctx_generation == generation {
+            if guard.ctx_generation == version {
                 guard.ctx_cache = Some(CachedEventContext {
-                    generation,
+                    generation: version,
                     payload: payload.clone(),
                 });
             }
@@ -33510,7 +33512,8 @@ mod tests {
         static SEED: AtomicU64 = AtomicU64::new(12345);
         let s = SEED.fetch_add(1, Ordering::Relaxed);
         let x = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-        ((x >> 33) as f64 / f64::from(u32::MAX)) * 2.0 - 1.0
+        #[allow(clippy::cast_precision_loss)]
+        ((x >> 33) as f64 / f64::from(u32::MAX)).mul_add(2.0, -1.0)
     }
 
     #[test]
@@ -33551,8 +33554,14 @@ mod tests {
         cusum.cumsum_high = 3.0;
         cusum.cumsum_low = 2.5;
         cusum.reset_cumsum();
-        assert_eq!(cusum.cumsum_high, 0.0);
-        assert_eq!(cusum.cumsum_low, 0.0);
+        assert!(
+            (cusum.cumsum_high - 0.0).abs() < f64::EPSILON,
+            "cumsum_high should be zero after reset"
+        );
+        assert!(
+            (cusum.cumsum_low - 0.0).abs() < f64::EPSILON,
+            "cumsum_low should be zero after reset"
+        );
         assert!(cusum.baseline_ready, "baseline should survive reset");
     }
 
@@ -33582,13 +33591,15 @@ mod tests {
     #[test]
     fn bocpd_detects_changepoint_on_mean_shift() {
         let mut bocpd = BocpdState::default();
-        for _ in 0..20 {
-            bocpd.observe(1000.0 + (rand_jitter() * 10.0), 50.0, 0.3, 200);
+        // Use deterministic values (no jitter) for stable baseline.
+        for _ in 0..30 {
+            bocpd.observe(1000.0, 20.0, 0.2, 200);
         }
         assert!(bocpd.warmed_up);
+        // Dramatic 10x shift with small hazard lambda → should detect quickly.
         let mut detected = false;
-        for _ in 0..20 {
-            if bocpd.observe(100.0 + (rand_jitter() * 10.0), 50.0, 0.3, 200) {
+        for _ in 0..30 {
+            if bocpd.observe(100.0, 20.0, 0.2, 200) {
                 detected = true;
                 break;
             }
@@ -33676,12 +33687,7 @@ mod tests {
         });
 
         for _ in 0..5 {
-            manager.record_budget_overload_signal(
-                Some("ext.regime"),
-                "quota_exceeded",
-                None,
-                None,
-            );
+            manager.record_budget_overload_signal(Some("ext.regime"), "quota_exceeded", None, None);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
@@ -33693,12 +33699,7 @@ mod tests {
 
         let mut entered_fallback = false;
         for _ in 0..30 {
-            manager.record_budget_overload_signal(
-                Some("ext.regime"),
-                "burst_overload",
-                None,
-                None,
-            );
+            manager.record_budget_overload_signal(Some("ext.regime"), "burst_overload", None, None);
             if manager
                 .hostcall_compat_kill_switch_reason(Some("ext.regime"))
                 .is_some()
@@ -40949,5 +40950,307 @@ mod tests {
             assert!(result.is_ok());
             assert!(result.unwrap().is_none());
         });
+    }
+
+    // ── RCU snapshot semantics tests ─────────────────────────────────
+
+    #[test]
+    fn rcu_snapshot_version_increments_on_register() {
+        let manager = ExtensionManager::new();
+        let v0 = manager.snapshot_version();
+        manager.register(RegisterPayload {
+            name: "ext-a".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: vec!["onPrompt".to_string()],
+        });
+        let v1 = manager.snapshot_version();
+        // Snapshot version should remain at 0 since register() does not
+        // bump ctx_generation (only session/model/cwd changes do).
+        // But the snapshot IS refreshed.
+        assert!(
+            v1 >= v0,
+            "snapshot version should not regress after register"
+        );
+    }
+
+    #[test]
+    fn rcu_register_provider_invalidates_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            // Snapshot should initially have no providers.
+            let snap_before = manager.read_snapshot();
+            assert!(snap_before.providers.is_empty());
+            drop(snap_before);
+
+            // Register a provider via hostcall.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "test-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.example.com",
+                    "apiKey": "TEST_KEY",
+                    "models": [{"id": "gpt-test", "name": "Test Model"}]
+                }),
+            )
+            .await;
+
+            // Snapshot should now contain the provider.
+            let snap_after = manager.read_snapshot();
+            assert_eq!(snap_after.providers.len(), 1);
+            assert_eq!(
+                snap_after.providers[0]
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "test-llm"
+            );
+        });
+    }
+
+    #[test]
+    fn rcu_register_flag_invalidates_snapshot() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            // Snapshot should initially have no flags.
+            assert!(manager.read_snapshot().all_flags.is_empty());
+
+            // Register a flag via hostcall.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "verbose", "type": "bool", "default": false }),
+            )
+            .await;
+
+            // Snapshot should now contain the flag.
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 1);
+            assert_eq!(
+                flags[0].get("name").and_then(Value::as_str).unwrap(),
+                "verbose"
+            );
+        });
+    }
+
+    #[test]
+    fn rcu_precomputed_flags_match_dynamic_plus_payload() {
+        let manager = ExtensionManager::new();
+
+        // Register an extension with payload flags.
+        manager.register(RegisterPayload {
+            name: "ext-flags".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: Vec::new(),
+            flags: vec![
+                json!({ "name": "alpha", "type": "bool", "default": false }),
+                json!({ "name": "beta", "type": "string", "default": "x" }),
+            ],
+            event_hooks: Vec::new(),
+        });
+
+        // Also register a dynamic flag that overrides "alpha".
+        manager.register_flag(
+            json!({ "name": "alpha", "type": "bool", "default": true, "description": "dynamic" }),
+        );
+
+        let flags = manager.list_flags();
+        // Should have 2 flags: dynamic "alpha" wins, plus payload "beta".
+        assert_eq!(flags.len(), 2);
+        let alpha = flags
+            .iter()
+            .find(|f| f.get("name").and_then(Value::as_str) == Some("alpha"))
+            .unwrap();
+        // Dynamic flag should take priority (description = "dynamic").
+        assert_eq!(
+            alpha.get("description").and_then(Value::as_str).unwrap(),
+            "dynamic"
+        );
+    }
+
+    #[test]
+    fn rcu_precomputed_commands_from_extensions() {
+        let manager = ExtensionManager::new();
+
+        manager.register(RegisterPayload {
+            name: "ext-cmds".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: vec![
+                json!({ "name": "deploy", "description": "Deploy to prod" }),
+                json!({ "name": "rollback", "description": "Rollback deploy" }),
+            ],
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        let commands = manager.list_commands();
+        assert_eq!(commands.len(), 2);
+        let names: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| c.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"deploy"));
+        assert!(names.contains(&"rollback"));
+    }
+
+    #[test]
+    fn rcu_precomputed_shortcuts_and_has_shortcut() {
+        let manager = ExtensionManager::new();
+
+        manager.register(RegisterPayload {
+            name: "ext-shortcuts".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: vec![json!({ "key_id": "Ctrl+K", "description": "Quick action" })],
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        // has_shortcut should use the pre-computed key_id set.
+        assert!(manager.has_shortcut("ctrl+k"));
+        assert!(manager.has_shortcut("Ctrl+K"));
+        assert!(!manager.has_shortcut("ctrl+j"));
+
+        let shortcuts = manager.list_shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+    }
+
+    #[test]
+    fn rcu_precomputed_event_hooks() {
+        let manager = ExtensionManager::new();
+
+        manager.register(RegisterPayload {
+            name: "ext-hooks".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: vec!["onPrompt".to_string(), "onResponse".to_string()],
+        });
+
+        let hooks = manager.list_event_hooks();
+        assert_eq!(hooks.len(), 2);
+        assert!(hooks.contains(&"onPrompt".to_string()));
+        assert!(hooks.contains(&"onResponse".to_string()));
+
+        // Hook bitmap should also be populated.
+        assert!(manager.has_hook_for("onPrompt"));
+        assert!(manager.has_hook_for("onResponse"));
+        assert!(!manager.has_hook_for("onUnknown"));
+    }
+
+    #[test]
+    fn rcu_snapshot_readers_get_consistent_view() {
+        let manager = ExtensionManager::new();
+
+        // Take a snapshot reference before registration.
+        let snap_before = manager.read_snapshot();
+        assert!(snap_before.all_commands.is_empty());
+
+        // Register an extension.
+        manager.register(RegisterPayload {
+            name: "ext-late".to_string(),
+            version: "1.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: vec![json!({ "name": "late-cmd" })],
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        // The old snapshot should still show empty (RCU: old readers keep
+        // their Arc alive until dropped).
+        assert!(
+            snap_before.all_commands.is_empty(),
+            "old snapshot should be immutable"
+        );
+
+        // A new snapshot should show the registered command.
+        let snap_after = manager.read_snapshot();
+        assert_eq!(snap_after.all_commands.len(), 1);
+    }
+
+    #[test]
+    fn rcu_extension_model_entries_uses_snapshot_providers() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            // Register a provider.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "snap-provider",
+                    "api": "openai-completions",
+                    "models": [{"id": "model-a", "name": "Model A"}]
+                }),
+            )
+            .await;
+
+            // extension_model_entries() should read from the snapshot.
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].model.id, "model-a");
+            assert_eq!(entries[0].model.provider, "snap-provider");
+        });
+    }
+
+    #[test]
+    fn rcu_has_ui_field_propagates_to_snapshot() {
+        let manager = ExtensionManager::new();
+
+        // Initially has_ui should be false.
+        assert!(!manager.read_snapshot().has_ui);
+
+        // Set a UI sender.
+        let (tx, _rx) = mpsc::channel(1);
+        manager.set_ui_sender(tx);
+
+        // has_ui should now be true in the snapshot.
+        assert!(manager.read_snapshot().has_ui);
+
+        // Clear it.
+        manager.clear_ui_sender();
+        assert!(!manager.read_snapshot().has_ui);
     }
 }

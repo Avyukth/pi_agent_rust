@@ -113,11 +113,10 @@ impl AmacGroupKey {
     #[must_use]
     pub const fn memory_weight(&self) -> u32 {
         match self {
-            Self::Http => 90,        // Network IO = high stall
-            Self::Tool => 70,        // File IO, subprocess
-            Self::Exec => 70,        // Subprocess
-            Self::SessionRead => 50, // In-memory but large working set
-            Self::EventRead => 40,   // Small working set, fast
+            Self::Http => 90,                  // Network IO = high stall
+            Self::Tool | Self::Exec => 70,     // File IO or subprocess
+            Self::SessionRead => 50,           // In-memory but large working set
+            Self::EventRead => 40,             // Small working set, fast
             Self::SessionWrite => 30,
             Self::EventWrite => 20,
             Self::Ui => 10,
@@ -297,11 +296,7 @@ impl AmacStallTelemetry {
             .recent_samples
             .iter()
             .map(|sample| {
-                let diff = if sample.elapsed_ns > mean {
-                    sample.elapsed_ns - mean
-                } else {
-                    mean - sample.elapsed_ns
-                };
+                let diff = sample.elapsed_ns.abs_diff(mean);
                 diff.saturating_mul(diff)
             })
             .sum::<u64>()
@@ -454,18 +449,21 @@ impl AmacBatchExecutor {
     }
 
     #[must_use]
-    pub fn with_telemetry(config: AmacBatchExecutorConfig, telemetry: AmacStallTelemetry) -> Self {
+    pub const fn with_telemetry(
+        config: AmacBatchExecutorConfig,
+        telemetry: AmacStallTelemetry,
+    ) -> Self {
         Self { config, telemetry }
     }
 
     /// Access the current stall telemetry.
     #[must_use]
-    pub fn telemetry(&self) -> &AmacStallTelemetry {
+    pub const fn telemetry(&self) -> &AmacStallTelemetry {
         &self.telemetry
     }
 
     /// Mutable access to telemetry for recording observations.
-    pub fn telemetry_mut(&mut self) -> &mut AmacStallTelemetry {
+    pub const fn telemetry_mut(&mut self) -> &mut AmacStallTelemetry {
         &mut self.telemetry
     }
 
@@ -622,7 +620,8 @@ fn compute_interleave_width(
         + (effective_ratio * u64::from(memory_weight) * (max_width as u64 - 2))
             / (ratio_range * 100);
 
-    let width = base_width as usize;
+    // Safe: base_width is bounded by max_width (which fits in usize).
+    let width = usize::try_from(base_width).unwrap_or(max_width);
     width.min(max_width).min(group_size).max(2)
 }
 
@@ -1148,5 +1147,75 @@ mod tests {
         // Single item in group < min_batch_size=2 would be edge case,
         // but batch has 1 item total.
         assert!(plan.decisions.iter().all(|d| !d.is_interleave()));
+    }
+
+    // ── Clone semantics ─────────────────────────────────────────────
+
+    #[test]
+    fn executor_clone_preserves_telemetry_state() {
+        let mut original = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 4, 16));
+        for _ in 0..50 {
+            original.observe_call(200_000);
+        }
+        let snap_before = original.telemetry().snapshot();
+        assert_eq!(snap_before.total_calls, 50);
+
+        let cloned = original.clone();
+        let snap_cloned = cloned.telemetry().snapshot();
+        assert_eq!(snap_cloned.total_calls, snap_before.total_calls);
+        assert_eq!(snap_cloned.total_stalls, snap_before.total_stalls);
+        assert_eq!(snap_cloned.stall_ratio, snap_before.stall_ratio);
+    }
+
+    #[test]
+    fn executor_clone_is_independent() {
+        let mut original = AmacBatchExecutor::new(AmacBatchExecutorConfig::new(true, 4, 16));
+        for _ in 0..10 {
+            original.observe_call(50_000);
+        }
+
+        let mut cloned = original.clone();
+        // Mutate only the clone.
+        for _ in 0..100 {
+            cloned.observe_call(500_000);
+        }
+
+        // Original should be unaffected.
+        assert_eq!(original.telemetry().snapshot().total_calls, 10);
+        assert_eq!(cloned.telemetry().snapshot().total_calls, 110);
+    }
+
+    // ── Config from env ─────────────────────────────────────────────
+
+    #[test]
+    fn config_new_matches_parameters() {
+        let config = AmacBatchExecutorConfig::new(false, 8, 32);
+        assert!(!config.enabled);
+        assert_eq!(config.min_batch_size, 8);
+        assert_eq!(config.max_interleave_width, 32);
+    }
+
+    #[test]
+    fn default_executor_is_enabled() {
+        // Default from_env with no env vars set → enabled.
+        let executor = AmacBatchExecutor::default();
+        assert!(executor.enabled());
+    }
+
+    // ── Batch result types ──────────────────────────────────────────
+
+    #[test]
+    fn batch_telemetry_serializes() {
+        let telem = AmacBatchTelemetry {
+            total_requests: 10,
+            groups_dispatched: 3,
+            interleaved_groups: 1,
+            sequential_groups: 2,
+            total_elapsed_ns: 5_000_000,
+        };
+        let json = serde_json::to_string(&telem).expect("serialize");
+        let deser: AmacBatchTelemetry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.total_requests, 10);
+        assert_eq!(deser.interleaved_groups, 1);
     }
 }

@@ -291,10 +291,10 @@ fn hostcall_outcome_to_protocol_result_with_trace(
 
 const REGIME_MIN_SAMPLES: usize = 24;
 const REGIME_CUSUM_DRIFT: f64 = 0.03;
-const REGIME_CUSUM_THRESHOLD: f64 = 2.8;
+const REGIME_CUSUM_THRESHOLD: f64 = 1.6;
 const REGIME_BOCPD_HAZARD: f64 = 0.08;
 const REGIME_POSTERIOR_DECAY: f64 = 0.92;
-const REGIME_POSTERIOR_THRESHOLD: f64 = 0.72;
+const REGIME_POSTERIOR_THRESHOLD: f64 = 0.45;
 const REGIME_COOLDOWN_OBSERVATIONS: usize = 32;
 const REGIME_CONFIRMATION_STREAK: usize = 2;
 const REGIME_FALLBACK_QUEUE_DEPTH: f64 = 1.0;
@@ -517,9 +517,8 @@ impl RegimeShiftDetector {
         if self.sample_count < 2 {
             REGIME_VARIANCE_FLOOR
         } else {
-            let denom = f64::from(
-                u32::try_from(self.sample_count.saturating_sub(1)).unwrap_or(u32::MAX),
-            );
+            let denom =
+                f64::from(u32::try_from(self.sample_count.saturating_sub(1)).unwrap_or(u32::MAX));
             (self.m2 / denom).max(REGIME_VARIANCE_FLOOR)
         }
     }
@@ -9496,7 +9495,10 @@ mod tests {
             }
         }
 
-        assert!(switched, "detector should switch on sustained high-contention shift");
+        assert!(
+            switched,
+            "detector should switch on sustained high-contention shift"
+        );
         assert_eq!(
             detector.current_mode(),
             RegimeAdaptationMode::InterleavedBatching
@@ -9525,7 +9527,10 @@ mod tests {
             }
         }
 
-        assert_eq!(transitions, 0, "stationary noise should not trigger transitions");
+        assert_eq!(
+            transitions, 0,
+            "stationary noise should not trigger transitions"
+        );
         assert_eq!(
             detector.current_mode(),
             RegimeAdaptationMode::SequentialFastPath
