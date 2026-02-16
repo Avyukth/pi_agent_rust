@@ -1298,18 +1298,18 @@ pub fn create_live_provider(entry: &ModelEntry, client: Client) -> pi::PiResult<
 }
 
 #[must_use]
-pub fn build_live_context(prompt: &str) -> Context {
-    Context {
-        system_prompt: Some(
+pub fn build_live_context(prompt: &str) -> Context<'static> {
+    Context::owned(
+        Some(
             "You are a deterministic test harness model. Follow the user instruction exactly."
                 .to_string(),
         ),
-        messages: vec![Message::User(UserMessage {
+        vec![Message::User(UserMessage {
             content: UserContent::Text(prompt.to_string()),
             timestamp: 0,
         })],
-        tools: Vec::new(),
-    }
+        Vec::new(),
+    )
 }
 
 #[must_use]
@@ -1347,7 +1347,7 @@ pub fn load_vcr_trace(cassette_path: &Path) -> Option<LiveHttpTrace> {
 
 async fn collect_live_stream_summary(
     provider: Arc<dyn Provider>,
-    context: Context,
+    context: Context<'static>,
     options: StreamOptions,
     timeout: Duration,
 ) -> Result<LiveStreamSummary, String> {

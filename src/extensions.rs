@@ -23352,7 +23352,7 @@ impl ExtensionManager {
                     .dispatch_event(
                         event_name.clone(),
                         event_payload.clone(),
-                        ctx_payload.clone(),
+                        (*ctx_payload).clone(),
                         timeout_ms,
                     )
                     .await?;
@@ -23364,7 +23364,7 @@ impl ExtensionManager {
         if has_hook_wasm {
             let mut wasm_payload = event_payload;
             if let Value::Object(map) = &mut wasm_payload {
-                map.insert("ctx".into(), ctx_payload);
+                map.insert("ctx".into(), (*ctx_payload).clone());
             }
             if let Some(value) = Self::dispatch_wasm_event_value(
                 &wasm_extensions,
@@ -23505,7 +23505,7 @@ impl ExtensionManager {
 
         if let Some(runtime) = runtime {
             let results = runtime
-                .dispatch_event_batch(filtered_events, ctx_payload, timeout_ms)
+                .dispatch_event_batch(filtered_events, (*ctx_payload).clone(), timeout_ms)
                 .await;
             if let Err(err) = &results {
                 tracing::warn!(
@@ -23723,7 +23723,7 @@ impl ExtensionManager {
                     .dispatch_event(
                         event_name.clone(),
                         event_payload.clone(),
-                        ctx_payload.clone(),
+                        (*ctx_payload).clone(),
                         timeout_ms,
                     )
                     .await?;
@@ -36243,6 +36243,55 @@ mod tests {
                 assert!(is_final);
             }
             other => panic!("expected StreamChunk precedence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_result_to_outcome_success_flag_ignores_error_payload() {
+        let result = HostResultPayload {
+            call_id: "call-success-with-error-object".to_string(),
+            output: json!({"ok": true, "value": 7}),
+            is_error: false,
+            error: Some(HostCallError {
+                code: HostCallErrorCode::Denied,
+                message: "should be ignored when is_error=false".to_string(),
+                details: None,
+                retryable: None,
+            }),
+            chunk: None,
+        };
+
+        let outcome = host_result_to_outcome(result);
+        match outcome {
+            HostcallOutcome::Success(value) => {
+                assert_eq!(value, json!({"ok": true, "value": 7}));
+            }
+            other => panic!("expected Success precedence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_result_to_outcome_error_flag_overrides_non_empty_output() {
+        let result = HostResultPayload {
+            call_id: "call-error-over-output".to_string(),
+            output: json!({"ok": true, "value": "ignored"}),
+            is_error: true,
+            error: Some(HostCallError {
+                code: HostCallErrorCode::Denied,
+                message: "blocked".to_string(),
+                details: None,
+                retryable: None,
+            }),
+            chunk: None,
+        };
+
+        let outcome = host_result_to_outcome(result);
+        match outcome {
+            HostcallOutcome::Error { code, message } => {
+                assert_eq!(code, "denied");
+                assert_eq!(message, "blocked");
+            }
+            other => panic!("expected Error precedence, got {other:?}"),
         }
     }
 

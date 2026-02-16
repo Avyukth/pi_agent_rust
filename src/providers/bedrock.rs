@@ -957,7 +957,7 @@ mod tests {
     use chrono::TimeZone as _;
     use serde_json::json;
 
-    fn test_context_with_tools() -> Context {
+    fn test_context_with_tools() -> Context<'static> {
         Context {
             system_prompt: Some("You are concise.".to_string()),
             messages: vec![
@@ -991,7 +991,8 @@ mod tests {
                     is_error: false,
                     timestamp: 0,
                 }),
-            ],
+            ]
+            .into(),
             tools: vec![ToolDef {
                 name: "search".to_string(),
                 description: "Search docs".to_string(),
@@ -1000,7 +1001,8 @@ mod tests {
                     "properties": {"q": {"type": "string"}},
                     "required": ["q"]
                 }),
-            }],
+            }]
+            .into(),
         }
     }
 

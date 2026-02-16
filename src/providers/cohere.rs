@@ -993,7 +993,8 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("Ping".to_string()),
                 timestamp: 0,
-            })],
+            })]
+            .into(),
             tools: vec![ToolDef {
                 name: "search".to_string(),
                 description: "Search docs".to_string(),
@@ -1004,7 +1005,8 @@ mod tests {
                     },
                     "required": ["q"]
                 }),
-            }],
+            }]
+            .into(),
         };
         let options = StreamOptions {
             temperature: Some(0.2),
@@ -1260,8 +1262,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("ping".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: api_key.map(str::to_string),
@@ -1402,8 +1405,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("Hi".to_string()),
                 timestamp: 0,
-            })],
-            tools: vec![],
+            })]
+            .into(),
+            tools: vec![].into(),
         };
         let options = StreamOptions::default();
 
@@ -1429,8 +1433,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("test".to_string()),
                 timestamp: 0,
-            })],
-            tools: vec![],
+            })]
+            .into(),
+            tools: vec![].into(),
         };
         let options = StreamOptions::default();
 
@@ -1448,8 +1453,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("test".to_string()),
                 timestamp: 0,
-            })],
-            tools: vec![],
+            })]
+            .into(),
+            tools: vec![].into(),
         };
         let options = StreamOptions::default();
 
@@ -1495,12 +1501,14 @@ mod tests {
                     is_error: false,
                     timestamp: 2,
                 }),
-            ],
+            ]
+            .into(),
             tools: vec![ToolDef {
                 name: "read".to_string(),
                 description: "Read a file".to_string(),
                 parameters: json!({"type": "object"}),
-            }],
+            }]
+            .into(),
         };
         let options = StreamOptions::default();
 
@@ -1538,8 +1546,9 @@ mod tests {
                 display: false,
                 details: None,
                 timestamp: 0,
-            })],
-            tools: vec![],
+            })]
+            .into(),
+            tools: vec![].into(),
         };
 
         let msgs = build_cohere_messages(&context);

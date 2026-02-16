@@ -2305,7 +2305,7 @@ mod retry_tests {
 
         async fn stream(
             &self,
-            _context: &crate::provider::Context,
+            _context: &crate::provider::Context<'_>,
             _options: &crate::provider::StreamOptions,
         ) -> crate::error::Result<
             Pin<
@@ -2378,7 +2378,7 @@ mod retry_tests {
 
         async fn stream(
             &self,
-            _context: &crate::provider::Context,
+            _context: &crate::provider::Context<'_>,
             _options: &crate::provider::StreamOptions,
         ) -> crate::error::Result<
             Pin<

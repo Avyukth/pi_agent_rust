@@ -908,7 +908,8 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("Ping".to_string()),
                 timestamp: 0,
-            })],
+            })]
+            .into(),
             tools: vec![ToolDef {
                 name: "echo".to_string(),
                 description: "Echo a string.".to_string(),
@@ -919,7 +920,8 @@ mod tests {
                     },
                     "required": ["text"]
                 }),
-            }],
+            }]
+            .into(),
         };
         let options = StreamOptions {
             max_tokens: Some(128),
@@ -1352,8 +1354,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("ping".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: Some("test-key".to_string()),
@@ -1386,8 +1389,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("ping".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: Some("test-key".to_string()),
@@ -1418,8 +1422,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("ping".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: Some("test-key".to_string()),
@@ -1693,8 +1698,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("hi".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: Some("test-key".to_string()),
@@ -1746,8 +1752,9 @@ mod tests {
             messages: vec![Message::User(crate::model::UserMessage {
                 content: UserContent::Text("hi".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions {
             api_key: Some("test-key".to_string()),

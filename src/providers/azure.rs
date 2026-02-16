@@ -902,7 +902,8 @@ mod tests {
                     error_message: None,
                     timestamp: 0,
                 }),
-            ],
+            ]
+            .into(),
             tools: vec![ToolDef {
                 name: "echo".to_string(),
                 description: "Echo text".to_string(),
@@ -913,7 +914,8 @@ mod tests {
                     },
                     "required": ["text"]
                 }),
-            }],
+            }]
+            .into(),
         };
         let options = StreamOptions {
             max_tokens: Some(512),
@@ -945,8 +947,9 @@ mod tests {
             messages: vec![Message::User(UserMessage {
                 content: UserContent::Text("Hello".to_string()),
                 timestamp: 0,
-            })],
-            tools: Vec::new(),
+            })]
+            .into(),
+            tools: Vec::new().into(),
         };
         let options = StreamOptions::default();
 
