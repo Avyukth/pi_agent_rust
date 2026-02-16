@@ -540,6 +540,16 @@ fn canonical_perf3x_bead_segments(bead: &str) -> Option<Vec<u64>> {
         .collect::<Option<Vec<_>>>()
 }
 
+fn canonicalize_perf3x_bead_id(bead: &str) -> Option<String> {
+    let segments = canonical_perf3x_bead_segments(bead)?;
+    let suffix = segments
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    Some(format!("bd-3ar8v.{suffix}"))
+}
+
 fn validate_cross_category_evidence_uniqueness(
     row_idx: usize,
     unit_evidence: &[String],
@@ -584,6 +594,7 @@ fn validate_perf3x_bead_coverage_contract(
     }
 
     let mut seen_beads = HashSet::new();
+    let mut seen_canonical_beads = HashMap::new();
     let mut previous_bead_segments: Option<Vec<u64>> = None;
     let mut previous_bead_id: Option<String> = None;
     let mut parsed = Vec::with_capacity(rows.len());
@@ -597,6 +608,21 @@ fn validate_perf3x_bead_coverage_contract(
         if !is_canonical_perf3x_bead_id(&bead) {
             return Err(format!(
                 "coverage_rows[{row_idx}] has invalid PERF-3X bead id: {bead}"
+            ));
+        }
+        let canonical_bead = canonicalize_perf3x_bead_id(&bead).ok_or_else(|| {
+            format!("coverage_rows[{row_idx}] has unparsable canonical PERF-3X bead id: {bead}")
+        })?;
+        if let Some(existing_bead) =
+            seen_canonical_beads.insert(canonical_bead.clone(), bead.clone())
+        {
+            return Err(format!(
+                "coverage_rows[{row_idx}] bead '{bead}' is numerically equivalent to existing bead '{existing_bead}' (canonical id: {canonical_bead})"
+            ));
+        }
+        if bead != canonical_bead {
+            return Err(format!(
+                "coverage_rows[{row_idx}] bead '{bead}' must be canonical (expected '{canonical_bead}')"
             ));
         }
         let bead_segments = canonical_perf3x_bead_segments(&bead).ok_or_else(|| {
@@ -2405,6 +2431,40 @@ fn perf3x_bead_coverage_contract_fails_closed_on_missing_bead_suffix() {
 }
 
 #[test]
+fn perf3x_bead_coverage_contract_fails_closed_on_zero_padded_bead_segment() {
+    let mut contract = perf3x_bead_coverage_contract();
+    contract["coverage_rows"][0]["bead"] = serde_json::json!("bd-3ar8v.02.8");
+
+    let err = validate_perf3x_bead_coverage_contract(&contract)
+        .expect_err("zero-padded bead segment must fail closed");
+    assert!(
+        err.contains("must be canonical"),
+        "error should mention canonical bead id requirement, got: {err}"
+    );
+    assert!(
+        err.contains("bd-3ar8v.2.8"),
+        "error should include canonical equivalent bead id, got: {err}"
+    );
+}
+
+#[test]
+fn perf3x_bead_coverage_contract_fails_closed_on_numeric_equivalent_bead_ids() {
+    let mut contract = perf3x_bead_coverage_contract();
+    contract["coverage_rows"][1]["bead"] = serde_json::json!("bd-3ar8v.02.8");
+
+    let err = validate_perf3x_bead_coverage_contract(&contract)
+        .expect_err("numerically equivalent bead IDs must fail closed");
+    assert!(
+        err.contains("numerically equivalent"),
+        "error should mention numeric-equivalence rejection, got: {err}"
+    );
+    assert!(
+        err.contains("bd-3ar8v.2.8"),
+        "error should mention canonical bead id, got: {err}"
+    );
+}
+
+#[test]
 fn perf3x_bead_coverage_contract_fails_closed_on_duplicate_unit_evidence_path() {
     let mut contract = perf3x_bead_coverage_contract();
     contract["coverage_rows"][0]["unit_evidence"] =
@@ -2651,6 +2711,8 @@ fn run_all_wires_scenario_cell_status_artifacts_into_evidence_contract() {
         "claim_integrity.phase1_matrix_primary_outcomes_metrics_present",
         "claim_integrity.phase1_matrix_primary_outcomes_ordering_policy",
         "claim_integrity.phase1_matrix_cells_primary_e2e_metrics_present",
+        "claim_id=\"phase1_matrix_validation.matrix_cells.status\"",
+        "metric_scope=\"matrix_cell_primary_e2e\"",
         "primary_e2e_before_microbench",
         "cherry_pick_guard.global_claim_valid must be true",
         "required_layers = [",

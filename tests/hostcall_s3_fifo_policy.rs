@@ -549,6 +549,59 @@ fn config_clamps_zero_inputs_to_safe_minima() {
 }
 
 #[test]
+fn config_clamps_oversized_small_capacity_to_live_minus_one() {
+    let policy: S3FifoPolicy<String> = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 3,
+        small_capacity: usize::MAX,
+        ghost_capacity: 8,
+        max_entries_per_owner: 3,
+        fallback_window: 5,
+        min_ghost_hits_in_window: 2,
+        max_budget_rejections_in_window: 4,
+    });
+
+    let cfg = policy.config();
+    assert_eq!(cfg.live_capacity, 3);
+    assert_eq!(
+        cfg.small_capacity, 2,
+        "small capacity must clamp to live_capacity - 1"
+    );
+    assert_eq!(cfg.ghost_capacity, 8);
+    assert_eq!(cfg.max_entries_per_owner, 3);
+}
+
+#[test]
+fn config_caps_window_thresholds_without_over_clamping_in_range_values() {
+    let capped: S3FifoPolicy<String> = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 16,
+        small_capacity: 4,
+        ghost_capacity: 16,
+        max_entries_per_owner: 16,
+        fallback_window: 5,
+        min_ghost_hits_in_window: 9,
+        max_budget_rejections_in_window: 7,
+    });
+    let capped_cfg = capped.config();
+    assert_eq!(capped_cfg.fallback_window, 5);
+    assert_eq!(capped_cfg.min_ghost_hits_in_window, 5);
+    assert_eq!(capped_cfg.max_budget_rejections_in_window, 5);
+
+    let preserved: S3FifoPolicy<String> = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 16,
+        small_capacity: 4,
+        ghost_capacity: 16,
+        max_entries_per_owner: 16,
+        fallback_window: 5,
+        min_ghost_hits_in_window: 3,
+        max_budget_rejections_in_window: 4,
+    });
+    let preserved_cfg = preserved.config();
+    assert_eq!(preserved_cfg.fallback_window, 5);
+    assert_eq!(preserved_cfg.min_ghost_hits_in_window, 3);
+    assert_eq!(preserved_cfg.max_budget_rejections_in_window, 4);
+}
+
+#[test]
 fn fairness_fallback_never_triggers_when_budget_threshold_clamps_to_window_size() {
     let mut policy = S3FifoPolicy::new(S3FifoConfig {
         live_capacity: 8,
@@ -664,5 +717,54 @@ fn single_window_fairness_retrigger_requires_new_rejection_after_clear() {
     assert_eq!(
         policy.telemetry().fallback_reason,
         Some(S3FifoFallbackReason::FairnessInstability)
+    );
+}
+
+#[test]
+fn clear_fallback_preserves_owner_and_live_depth_telemetry_state() {
+    let mut policy = S3FifoPolicy::new(S3FifoConfig {
+        live_capacity: 8,
+        small_capacity: 4,
+        ghost_capacity: 8,
+        max_entries_per_owner: 8,
+        fallback_window: 2,
+        min_ghost_hits_in_window: 2,
+        max_budget_rejections_in_window: 2,
+    });
+
+    let _ = policy.access("ext-a", "cold-1".to_string());
+    let _ = policy.access("ext-b", "cold-2".to_string());
+    assert_eq!(
+        policy.telemetry().fallback_reason,
+        Some(S3FifoFallbackReason::SignalQualityInsufficient)
+    );
+
+    let before_clear = policy.telemetry();
+    assert_eq!(before_clear.live_depth, 2);
+    assert_eq!(before_clear.owner_live_counts.get("ext-a"), Some(&1));
+    assert_eq!(before_clear.owner_live_counts.get("ext-b"), Some(&1));
+
+    policy.clear_fallback();
+    let after_clear = policy.telemetry();
+
+    assert!(after_clear.fallback_reason.is_none());
+    assert_eq!(after_clear.live_depth, before_clear.live_depth);
+    assert_eq!(after_clear.small_depth, before_clear.small_depth);
+    assert_eq!(after_clear.main_depth, before_clear.main_depth);
+    assert_eq!(after_clear.ghost_depth, before_clear.ghost_depth);
+    assert_eq!(after_clear.owner_live_counts, before_clear.owner_live_counts);
+    assert_eq!(after_clear.admissions_total, before_clear.admissions_total);
+    assert_eq!(after_clear.promotions_total, before_clear.promotions_total);
+    assert_eq!(after_clear.ghost_hits_total, before_clear.ghost_hits_total);
+    assert_eq!(
+        after_clear.budget_rejections_total,
+        before_clear.budget_rejections_total
+    );
+
+    let post_clear = policy.access("ext-c", "fresh-1".to_string());
+    assert_ne!(post_clear.kind, S3FifoDecisionKind::FallbackBypass);
+    assert!(
+        policy.telemetry().fallback_reason.is_none(),
+        "fallback window should restart after clear"
     );
 }

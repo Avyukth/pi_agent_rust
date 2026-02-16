@@ -2096,6 +2096,54 @@ const EVIDENCE_LOGGING_CRITICAL_PERF3X_BEADS: &[&str] = &[
     "bd-3ar8v.6.11",
 ];
 
+fn parse_perf3x_critical_beads_from_full_suite_gate_source(
+    gate_source: &str,
+) -> Result<Vec<String>, String> {
+    let anchor = "const PERF3X_CRITICAL_BEADS: &[&str] = &[";
+    let start = gate_source
+        .find(anchor)
+        .ok_or_else(|| "ci_full_suite_gate.rs must define PERF3X_CRITICAL_BEADS".to_string())?
+        + anchor.len();
+    let tail = &gate_source[start..];
+    let end = tail.find("];").ok_or_else(|| {
+        "ci_full_suite_gate.rs PERF3X_CRITICAL_BEADS must terminate with ];".to_string()
+    })?;
+    let body = &tail[..end];
+
+    let mut beads = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in body.split(',') {
+        let token = entry.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let bead = token
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or_else(|| {
+                format!("PERF3X_CRITICAL_BEADS entry must be a quoted string literal: {token}")
+            })?;
+        if !bead.starts_with("bd-3ar8v.") {
+            return Err(format!(
+                "PERF3X_CRITICAL_BEADS entry must be a PERF-3X bead id, got: {bead}"
+            ));
+        }
+        if !seen.insert(bead.to_string()) {
+            return Err(format!(
+                "PERF3X_CRITICAL_BEADS must not contain duplicates, saw: {bead}"
+            ));
+        }
+        beads.push(bead.to_string());
+    }
+
+    if beads.is_empty() {
+        return Err("PERF3X_CRITICAL_BEADS must not be empty".to_string());
+    }
+
+    Ok(beads)
+}
+
 #[test]
 fn evidence_logging_contract_schema_exists_and_is_valid_json() {
     let schema = load_json(EVIDENCE_LOGGING_CONTRACT_PATH);
@@ -2466,6 +2514,22 @@ fn evidence_logging_instance_critical_perf3x_beads_fail_closed_when_unsorted() {
     assert!(
         err.contains("sorted by canonical bead id order"),
         "unexpected error for unsorted critical bead list: {err}"
+    );
+}
+
+#[test]
+fn evidence_logging_critical_perf3x_beads_match_full_suite_gate_contract() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    let gate_beads = parse_perf3x_critical_beads_from_full_suite_gate_source(&gate)
+        .expect("PERF3X_CRITICAL_BEADS in ci_full_suite_gate.rs should be valid");
+    let expected_beads: Vec<String> = EVIDENCE_LOGGING_CRITICAL_PERF3X_BEADS
+        .iter()
+        .map(|bead| (*bead).to_string())
+        .collect();
+
+    assert_eq!(
+        gate_beads, expected_beads,
+        "critical PERF-3X bead set/order drift between ci_full_suite_gate.rs and evidence logging contract"
     );
 }
 

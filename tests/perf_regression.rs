@@ -139,10 +139,10 @@ fn pi_binary() -> Option<PathBuf> {
 
 fn build_binary_size_candidates(target_dir: &Path, detected_profile: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    if !detected_profile.is_empty() {
+    candidates.push(target_dir.join("release/pi"));
+    if !detected_profile.is_empty() && !detected_profile.eq_ignore_ascii_case("debug") {
         candidates.push(target_dir.join(detected_profile).join("pi"));
     }
-    candidates.push(target_dir.join("release/pi"));
 
     let mut dedup = HashSet::new();
     candidates.retain(|path| dedup.insert(path.clone()));
@@ -1282,12 +1282,12 @@ fn pi_binary_candidate_builder_env_override_wins_and_dedups() {
 }
 
 #[test]
-fn binary_size_candidate_builder_prefers_detected_profile_then_release() {
+fn binary_size_candidate_builder_prefers_release_then_detected_profile() {
     let root = Path::new("/tmp/pi-agent-target");
     let candidates = build_binary_size_candidates(root, "bench-profile");
     assert_eq!(
         candidates,
-        vec![root.join("bench-profile/pi"), root.join("release/pi")]
+        vec![root.join("release/pi"), root.join("bench-profile/pi")]
     );
 }
 
@@ -1295,5 +1295,12 @@ fn binary_size_candidate_builder_prefers_detected_profile_then_release() {
 fn binary_size_candidate_builder_dedups_release_profile() {
     let root = Path::new("/tmp/pi-agent-target");
     let candidates = build_binary_size_candidates(root, "release");
+    assert_eq!(candidates, vec![root.join("release/pi")]);
+}
+
+#[test]
+fn binary_size_candidate_builder_ignores_debug_profile() {
+    let root = Path::new("/tmp/pi-agent-target");
+    let candidates = build_binary_size_candidates(root, "debug");
     assert_eq!(candidates, vec![root.join("release/pi")]);
 }
