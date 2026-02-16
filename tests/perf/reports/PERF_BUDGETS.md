@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-16T03:25:15Z
+> Generated: 2026-02-16T04:19:15Z
 
 ## Summary
 
@@ -9,11 +9,11 @@
 | Total budgets | 13 |
 | CI-enforced | 8 |
 | CI-enforced with data | 1 |
-| CI-enforced FAIL | 0 |
-| CI-enforced NO_DATA | 7 |
+| CI-enforced FAIL | 7 |
+| CI-enforced NO_DATA | 0 |
 | PASS | 3 |
-| FAIL | 0 |
-| No data | 10 |
+| FAIL | 7 |
+| No data | 3 |
 
 | Failing data contracts | 8 |
 
@@ -21,14 +21,14 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `startup_version_p95` | p95 latency | 100 ms | - | NO_DATA | Yes |
+| `startup_version_p95` | p95 latency | 100 ms | - | FAIL | Yes |
 | `startup_full_agent_p95` | p95 latency | 200 ms | - | NO_DATA | No |
 
 ## Extension
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | NO_DATA | Yes |
+| `ext_cold_load_simple_p95` | p95 cold load time | 5 ms | - | FAIL | Yes |
 | `ext_cold_load_complex_p95` | p95 cold load time | 50 ms | - | NO_DATA | No |
 | `ext_load_60_total` | total load time (60 official extensions) | 10000 ms | 6198.0 | PASS | No |
 
@@ -36,8 +36,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | NO_DATA | Yes |
-| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | NO_DATA | Yes |
+| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | FAIL | Yes |
+| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | FAIL | Yes |
 
 ## Event_dispatch
 
@@ -49,26 +49,26 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `policy_eval_p99` | p99 evaluation time | 500 ns | - | NO_DATA | Yes |
+| `policy_eval_p99` | p99 evaluation time | 500 ns | - | FAIL | Yes |
 
 ## Memory
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 4.6 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 3.6 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | - | NO_DATA | Yes |
+| `binary_size_release` | release binary size | 20 MB | - | FAIL | Yes |
 
 ## Protocol
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | NO_DATA | Yes |
+| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | FAIL | Yes |
 
 ## Failing Data Contracts
 
