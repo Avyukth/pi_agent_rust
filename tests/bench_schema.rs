@@ -935,9 +935,12 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     }
     let expected_required_stage_keys = ["open_ms", "append_ms", "save_ms", "index_ms"];
     let mut observed_stage_coverage: HashMap<&'static str, u64> = HashMap::new();
-    for key in expected_required_stage_keys {
-        observed_stage_coverage.insert(key, 0);
+    for key in &expected_required_stage_keys {
+        observed_stage_coverage.insert(*key, 0);
     }
+    let mut observed_complete_stage_breakdown_cells = 0_u64;
+    let mut observed_missing_stage_breakdown_cells = 0_u64;
+    let mut observed_missing_stage_cell_keys: HashSet<(String, u64)> = HashSet::new();
     let mut seen_partition_size_cells = HashSet::new();
     for cell in matrix_cells {
         let cell_obj = cell
@@ -975,7 +978,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             ));
         }
         let partition_size_key = (workload_partition.to_string(), session_messages);
-        if !seen_partition_size_cells.insert(partition_size_key) {
+        if !seen_partition_size_cells.insert(partition_size_key.clone()) {
             return Err(format!(
                 "matrix cell duplicates partition-size key ({workload_partition}, {session_messages})"
             ));
@@ -1004,10 +1007,19 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 return Err(format!("matrix cell stage_attribution missing {field}"));
             }
         }
-        for key in expected_required_stage_keys {
-            if stage.get(key).is_some_and(|value| !value.is_null()) {
-                *observed_stage_coverage.entry(key).or_insert(0) += 1;
+        let mut missing_stage_metrics = 0_u64;
+        for key in &expected_required_stage_keys {
+            if stage.get(*key).is_some_and(|value| !value.is_null()) {
+                *observed_stage_coverage.entry(*key).or_insert(0) += 1;
+            } else {
+                missing_stage_metrics += 1;
             }
+        }
+        if missing_stage_metrics == 0 {
+            observed_complete_stage_breakdown_cells += 1;
+        } else {
+            observed_missing_stage_breakdown_cells += 1;
+            observed_missing_stage_cell_keys.insert(partition_size_key);
         }
 
         let primary = cell_obj
@@ -1116,6 +1128,16 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             matrix_cells.len()
         ));
     }
+    if complete_cells != observed_complete_stage_breakdown_cells {
+        return Err(format!(
+            "stage_summary.cells_with_complete_stage_breakdown ({complete_cells}) must equal observed complete-stage cell count ({observed_complete_stage_breakdown_cells}) derived from matrix_cells.stage_attribution"
+        ));
+    }
+    if missing_cells_count != observed_missing_stage_breakdown_cells {
+        return Err(format!(
+            "stage_summary.cells_missing_stage_breakdown ({missing_cells_count}) must equal observed missing-stage cell count ({observed_missing_stage_breakdown_cells}) derived from matrix_cells.stage_attribution"
+        ));
+    }
     if covered_cells != complete_cells {
         return Err(format!(
             "stage_summary.covered_cells ({covered_cells}) must equal cells_with_complete_stage_breakdown ({complete_cells})"
@@ -1126,6 +1148,59 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             "stage_summary.missing_cells length ({}) must equal cells_missing_stage_breakdown ({missing_cells_count})",
             missing_cells.len()
         ));
+    }
+    let mut reported_missing_stage_cell_keys = HashSet::new();
+    for missing_cell in missing_cells {
+        let missing_cell_obj = missing_cell
+            .as_object()
+            .ok_or_else(|| "stage_summary.missing_cells entries must be objects".to_string())?;
+        let workload_partition = missing_cell_obj
+            .get("workload_partition")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "stage_summary.missing_cells entries must include workload_partition string"
+                    .to_string()
+            })?;
+        let session_messages = missing_cell_obj
+            .get("session_messages")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "stage_summary.missing_cells entries must include session_messages integer"
+                    .to_string()
+            })?;
+        let reasons = missing_cell_obj
+            .get("reasons")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                "stage_summary.missing_cells entries must include reasons array".to_string()
+            })?;
+        if reasons.is_empty() {
+            return Err(
+                "stage_summary.missing_cells entries must include at least one reason".to_string(),
+            );
+        }
+        for reason in reasons {
+            let reason = reason.as_str().ok_or_else(|| {
+                "stage_summary.missing_cells reasons entries must be strings".to_string()
+            })?;
+            if reason.trim().is_empty() {
+                return Err(
+                    "stage_summary.missing_cells reasons entries must be non-empty strings"
+                        .to_string(),
+                );
+            }
+        }
+        let missing_key = (workload_partition.to_string(), session_messages);
+        if !reported_missing_stage_cell_keys.insert(missing_key.clone()) {
+            return Err(format!(
+                "stage_summary.missing_cells must not contain duplicate partition-size entries: ({workload_partition}, {session_messages})"
+            ));
+        }
+        if !observed_missing_stage_cell_keys.contains(&missing_key) {
+            return Err(format!(
+                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) does not match any matrix cell with missing stage metrics"
+            ));
+        }
     }
 
     let primary_outcomes = record
@@ -2489,6 +2564,53 @@ fn phase1_matrix_validator_rejects_stage_summary_count_mismatch() {
     assert!(
         err.contains("stage_summary complete+missing"),
         "expected stage_summary mismatch failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_complete_stage_count_mismatch_vs_attribution() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["covered_cells"] = json!(1);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("cells_with_complete_stage_breakdown"),
+        "expected complete-stage count mismatch failure, got: {err}"
+    );
+    assert!(
+        err.contains("observed complete-stage cell count"),
+        "expected observed complete-stage count detail, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_missing_cells_identity_mismatch() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["missing_reasons"] = json!(["missing_stage_metrics:index_ms"]);
+    malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
+    malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["cells_missing_stage_breakdown"] = json!(1);
+    malformed["stage_summary"]["covered_cells"] = json!(1);
+    malformed["stage_summary"]["missing_cells"] = json!([
+        {
+            "workload_partition": "matched-state",
+            "session_messages": 100_000,
+            "reasons": ["missing_stage_metrics:index_ms"]
+        }
+    ]);
+    malformed["consumption_contract"]["artifact_ready_for_phase5"] = json!(false);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("stage_summary.missing_cells entry"),
+        "expected missing_cells identity mismatch failure, got: {err}"
+    );
+    assert!(
+        err.contains("missing stage metrics"),
+        "expected observed missing-stage parity detail, got: {err}"
     );
 }
 

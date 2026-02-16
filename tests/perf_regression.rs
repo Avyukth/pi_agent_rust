@@ -44,10 +44,10 @@ static PERF_LOCK: Mutex<()> = Mutex::new(());
 const PERF_RELEASE_BINARY_PATH_ENV: &str = "PERF_RELEASE_BINARY_PATH";
 const PI_PERF_STRICT_ENV: &str = "PI_PERF_STRICT";
 
-fn recover_poisoned_mutex_guard<T>(
-    lock: &'static Mutex<T>,
+fn recover_poisoned_mutex_guard<'a, T>(
+    lock: &'a Mutex<T>,
     warning_message: &str,
-) -> std::sync::MutexGuard<'static, T> {
+) -> std::sync::MutexGuard<'a, T> {
     match lock.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -1464,7 +1464,7 @@ fn binary_size_missing_release_outcome_fails_closed_when_strict() {
 
 #[test]
 fn recover_poisoned_mutex_guard_clears_poison_state() {
-    let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+    let lock = Mutex::new(());
     let _ = std::panic::catch_unwind(|| {
         let _guard = lock.lock().expect("acquire lock before poison");
         panic!("intentional poison for regression coverage");
@@ -1472,7 +1472,7 @@ fn recover_poisoned_mutex_guard_clears_poison_state() {
 
     assert!(lock.is_poisoned(), "mutex should be poisoned after panic");
     drop(recover_poisoned_mutex_guard(
-        lock,
+        &lock,
         "[perf_regression][test] recovering poisoned lock",
     ));
     assert!(
@@ -1487,9 +1487,9 @@ fn recover_poisoned_mutex_guard_clears_poison_state() {
 
 #[test]
 fn recover_poisoned_mutex_guard_handles_clean_lock() {
-    let lock: &'static Mutex<()> = Box::leak(Box::new(Mutex::new(())));
+    let lock = Mutex::new(());
     drop(recover_poisoned_mutex_guard(
-        lock,
+        &lock,
         "[perf_regression][test] clean lock",
     ));
     assert!(!lock.is_poisoned(), "clean lock should remain unpoisoned");
