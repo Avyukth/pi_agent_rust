@@ -9,5 +9,5 @@
 {"budget_name":"policy_eval_p99","category":"policy","threshold":500.0,"unit":"ns","actual":null,"status":"NO_DATA","source":"no criterion data for policy eval","ci_enforced":true}
 {"budget_name":"idle_memory_rss","category":"memory","threshold":50.0,"unit":"MB","actual":3.828125,"status":"PASS","source":"sysinfo: current process RSS","ci_enforced":true}
 {"budget_name":"sustained_load_rss_growth","category":"memory","threshold":5.0,"unit":"percent","actual":0.1317089232795522,"status":"PASS","source":"target/perf/stress_triage.json","ci_enforced":false}
-{"budget_name":"binary_size_release","category":"binary","threshold":20.0,"unit":"MB","actual":null,"status":"NO_DATA","source":"no release binary found","ci_enforced":true}
+{"budget_name":"binary_size_release","category":"binary","threshold":22.0,"unit":"MB","actual":null,"status":"NO_DATA","source":"no release binary found","ci_enforced":true}
 {"budget_name":"protocol_parse_p99","category":"protocol","threshold":50.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no criterion data for protocol parse","ci_enforced":true}

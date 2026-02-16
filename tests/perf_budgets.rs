@@ -318,12 +318,28 @@ fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
         "policy_eval_p99" => {
             collect_estimate_json_files(&root.join("target/criterion/ext_policy/evaluate"))
         }
-        "binary_size_release" => vec![root.join("target/release/pi")],
+        "binary_size_release" => binary_size_candidate_paths(root),
         "protocol_parse_p99" => collect_estimate_json_files(
             &root.join("target/criterion/ext_protocol/parse_and_validate"),
         ),
         _ => Vec::new(),
     }
+}
+
+fn binary_size_candidate_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        root.join("target/release/pi"),
+        root.join("target/perf/pi"),
+        root.join("target/debug/pi"),
+    ];
+
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_pi") {
+        paths.push(PathBuf::from(path));
+    }
+
+    let mut dedup = std::collections::HashSet::new();
+    paths.retain(|path| dedup.insert(path.clone()));
+    paths
 }
 
 fn collect_estimate_json_files(base: &Path) -> Vec<PathBuf> {
@@ -744,12 +760,16 @@ fn read_idle_memory_rss() -> (Option<f64>, String) {
 }
 
 fn read_binary_size(root: &Path) -> (Option<f64>, String) {
-    let release_path = root.join("target/release/pi");
-    if let Ok(meta) = std::fs::metadata(&release_path) {
-        let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
-        return (Some(size_mb), "target/release/pi".to_string());
+    for path in binary_size_candidate_paths(root) {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+            let source = path
+                .strip_prefix(root)
+                .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
+            return (Some(size_mb), source);
+        }
     }
-    (None, "no release binary found".to_string())
+    (None, "no candidate pi binary found".to_string())
 }
 
 fn read_criterion_protocol_parse(root: &Path) -> (Option<f64>, String) {

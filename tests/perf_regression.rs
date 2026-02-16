@@ -29,6 +29,7 @@ use pi::perf_build;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +55,12 @@ fn perf_guard() -> std::sync::MutexGuard<'static, ()> {
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn target_dir() -> PathBuf {
+    std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map_or_else(|| project_root().join("target"), PathBuf::from)
 }
 
 fn output_dir() -> PathBuf {
@@ -84,22 +91,41 @@ fn warmup_runs() -> usize {
     if is_full_mode() { 5 } else { 2 }
 }
 
-/// Find the pi binary. Prefer debug build for CI, release for nightly.
-fn pi_binary() -> Option<PathBuf> {
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .ok()
-        .map_or_else(|| project_root().join("target"), PathBuf::from);
+fn format_candidate_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-    // Prefer release for perf tests, fall back to debug
-    let release = target_dir.join("release/pi");
-    if release.exists() {
-        return Some(release);
+fn pi_binary_candidates() -> Vec<PathBuf> {
+    let target_dir = target_dir();
+    let mut candidates = Vec::new();
+
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_pi") {
+        candidates.push(PathBuf::from(path));
     }
-    let debug = target_dir.join("debug/pi");
-    if debug.exists() {
-        return Some(debug);
+
+    let detected_profile = perf_build::detect_build_profile();
+    if !detected_profile.is_empty() {
+        candidates.push(target_dir.join(&detected_profile).join("pi"));
     }
-    None
+
+    candidates.push(target_dir.join("release/pi"));
+    candidates.push(target_dir.join("perf/pi"));
+    candidates.push(target_dir.join("debug/pi"));
+
+    let mut dedup = HashSet::new();
+    candidates.retain(|path| dedup.insert(path.clone()));
+    candidates
+}
+
+/// Find the first available `pi` binary from test/build-profile candidates.
+fn pi_binary() -> Option<PathBuf> {
+    pi_binary_candidates()
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 // ─── Environment Fingerprint ────────────────────────────────────────────────
@@ -331,10 +357,16 @@ fn startup_version_latency() {
     let harness = TestHarness::new("startup_version_latency");
 
     let Some(binary) = pi_binary() else {
-        harness
-            .log()
-            .info("skip", "pi binary not found; skipping startup latency test");
-        eprintln!("[perf_regression] SKIP: pi binary not found");
+        let candidates = pi_binary_candidates();
+        let checked = format_candidate_paths(&candidates);
+        harness.log().info_ctx(
+            "skip",
+            "pi binary not found; skipping startup latency test",
+            |ctx| {
+                ctx.push(("checked_candidates".into(), checked.clone()));
+            },
+        );
+        eprintln!("[perf_regression] SKIP: pi binary not found (checked: {checked})");
         return;
     };
 
@@ -420,8 +452,13 @@ fn startup_help_latency() {
     let harness = TestHarness::new("startup_help_latency");
 
     let Some(binary) = pi_binary() else {
-        harness.log().info("skip", "pi binary not found");
-        eprintln!("[perf_regression] SKIP: pi binary not found");
+        let checked = format_candidate_paths(&pi_binary_candidates());
+        harness
+            .log()
+            .info_ctx("skip", "pi binary not found", |ctx| {
+                ctx.push(("checked_candidates".into(), checked.clone()));
+            });
+        eprintln!("[perf_regression] SKIP: pi binary not found (checked: {checked})");
         return;
     };
 
@@ -480,8 +517,13 @@ fn idle_memory_rss() {
     let harness = TestHarness::new("idle_memory_rss");
 
     let Some(binary) = pi_binary() else {
-        harness.log().info("skip", "pi binary not found");
-        eprintln!("[perf_regression] SKIP: pi binary not found");
+        let checked = format_candidate_paths(&pi_binary_candidates());
+        harness
+            .log()
+            .info_ctx("skip", "pi binary not found", |ctx| {
+                ctx.push(("checked_candidates".into(), checked.clone()));
+            });
+        eprintln!("[perf_regression] SKIP: pi binary not found (checked: {checked})");
         return;
     };
 
@@ -659,16 +701,13 @@ fn binary_size_check() {
     let _guard = perf_guard();
     let harness = TestHarness::new("binary_size_check");
 
-    let target_dir = std::env::var("CARGO_TARGET_DIR")
-        .ok()
-        .map_or_else(|| project_root().join("target"), PathBuf::from);
-
-    let release_path = target_dir.join("release/pi");
+    let release_path = target_dir().join("release/pi");
     if !release_path.exists() {
+        let checked = format_candidate_paths(&pi_binary_candidates());
         harness.log().info("skip", "release binary not found");
         eprintln!(
-            "[perf_regression] SKIP: release binary not found at {}",
-            release_path.display()
+            "[perf_regression] SKIP: release binary not found at {} (checked: {checked})",
+            release_path.display(),
         );
         return;
     }

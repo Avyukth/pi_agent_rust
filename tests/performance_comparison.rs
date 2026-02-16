@@ -11,7 +11,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -29,6 +29,16 @@ fn read_json_file(path: &Path) -> Option<Value> {
 fn reports_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn reports_guard() -> MutexGuard<'static, ()> {
+    match reports_lock().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("[perf_comparison] WARN: reports lock poisoned; continuing");
+            poisoned.into_inner()
+        }
+    }
 }
 
 fn write_atomic(path: &Path, content: &str) {
@@ -229,9 +239,7 @@ fn generate_comparison_markdown(comparisons: &[LoadComparison]) -> String {
 
 #[test]
 fn generate_performance_comparison() {
-    let _guard = reports_lock()
-        .lock()
-        .expect("lock performance comparison reports");
+    let _guard = reports_guard();
 
     let reports = reports_dir();
     let _ = std::fs::create_dir_all(&reports);
@@ -324,9 +332,7 @@ fn comparison_data_is_valid() {
 
 #[test]
 fn comparison_json_has_analysis() {
-    let _guard = reports_lock()
-        .lock()
-        .expect("lock performance comparison reports");
+    let _guard = reports_guard();
 
     let json_path = reports_dir().join("performance_comparison.json");
     if !json_path.exists() {
@@ -368,9 +374,7 @@ fn comparison_json_has_analysis() {
 
 #[test]
 fn comparison_events_complete() {
-    let _guard = reports_lock()
-        .lock()
-        .expect("lock performance comparison reports");
+    let _guard = reports_guard();
 
     let events_path = reports_dir().join("performance_events.jsonl");
     if !events_path.exists() {

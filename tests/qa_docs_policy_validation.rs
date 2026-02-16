@@ -47,6 +47,37 @@ fn load_text(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
 }
 
+fn parse_f64_literal_after(haystack: &str, needle: &str) -> Option<f64> {
+    let start = haystack.find(needle)? + needle.len();
+    let literal: String = haystack[start..]
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect();
+    if literal.is_empty() {
+        return None;
+    }
+    literal.parse::<f64>().ok()
+}
+
+fn binary_size_threshold_from_perf_budgets_source() -> f64 {
+    let source = load_text("tests/perf_budgets.rs");
+    let anchor = source
+        .find("name: \"binary_size_release\"")
+        .expect("perf_budgets.rs must define binary_size_release budget");
+    parse_f64_literal_after(&source[anchor..], "threshold:")
+        .expect("binary_size_release budget must define a numeric threshold")
+}
+
+fn binary_size_threshold_from_perf_regression_source() -> f64 {
+    let source = load_text("tests/perf_regression.rs");
+    let anchor = source
+        .find("fn binary_size_check")
+        .expect("perf_regression.rs must define binary_size_check");
+    parse_f64_literal_after(&source[anchor..], "let threshold =")
+        .expect("binary_size_check must define a numeric threshold")
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Section 1: Testing policy document structure and completeness
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3299,4 +3330,33 @@ fn capture_baseline_cross_env_diagnosis_emits_structured_report_and_log() {
             "diagnostics entries must include metric_name"
         );
     }
+}
+
+#[test]
+fn binary_size_budget_threshold_is_consistent_between_perf_sources() {
+    let perf_budget_threshold = binary_size_threshold_from_perf_budgets_source();
+    let perf_regression_threshold = binary_size_threshold_from_perf_regression_source();
+    assert!(
+        (perf_budget_threshold - perf_regression_threshold).abs() < f64::EPSILON,
+        "binary-size threshold drift: perf_budgets={perf_budget_threshold}, perf_regression={perf_regression_threshold}"
+    );
+}
+
+#[test]
+fn binary_size_budget_event_threshold_matches_perf_budget_source() {
+    let expected_threshold = binary_size_threshold_from_perf_budgets_source();
+    let events = load_text("tests/perf/reports/budget_events.jsonl");
+    let binary_event = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("budget event line must be JSON"))
+        .find(|event| event["budget_name"].as_str() == Some("binary_size_release"))
+        .expect("budget_events.jsonl must include binary_size_release record");
+    let actual_threshold = binary_event["threshold"]
+        .as_f64()
+        .expect("binary_size_release event must include numeric threshold");
+    assert!(
+        (actual_threshold - expected_threshold).abs() < f64::EPSILON,
+        "binary-size event threshold drift: event={actual_threshold}, source={expected_threshold}"
+    );
 }
