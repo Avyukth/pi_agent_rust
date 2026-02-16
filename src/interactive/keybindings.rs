@@ -190,6 +190,7 @@ impl PiApp {
         self.input.insert_string(&insert_text);
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub(super) fn paste_image_from_clipboard() -> Option<PathBuf> {
         #[cfg(all(feature = "clipboard", feature = "image-resize"))]
         {
