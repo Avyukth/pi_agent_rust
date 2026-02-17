@@ -9,6 +9,8 @@
 #   ./scripts/release_gate.sh                          # check latest evidence
 #   ./scripts/release_gate.sh --evidence-dir <path>    # check specific run
 #   ./scripts/release_gate.sh --report                 # JSON output
+#   ./scripts/release_gate.sh --require-rch            # require remote offload for cargo checks
+#   ./scripts/release_gate.sh --no-rch                 # force local cargo execution
 #
 # Environment:
 #   RELEASE_GATE_MIN_PASS_RATE     Minimum conformance pass rate (default: 80)
@@ -17,6 +19,7 @@
 #   RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED  Set to 1 to require CERTIFIED drop-in verdict
 #   RELEASE_GATE_REQUIRE_PREFLIGHT Set to 1 to require preflight analyzer (default: 0)
 #   RELEASE_GATE_REQUIRE_QUALITY   Set to 1 to require quality pipeline pass (default: 0)
+#   RELEASE_GATE_CARGO_RUNNER      Cargo runner mode: rch | auto | local (default: rch)
 
 set -euo pipefail
 
@@ -31,14 +34,37 @@ MAX_NA_COUNT="${RELEASE_GATE_MAX_NA_COUNT:-170}"
 REQUIRE_DROPIN_CERTIFIED="${RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED:-0}"
 REQUIRE_PREFLIGHT="${RELEASE_GATE_REQUIRE_PREFLIGHT:-0}"
 REQUIRE_QUALITY="${RELEASE_GATE_REQUIRE_QUALITY:-0}"
+CARGO_RUNNER_REQUEST="${RELEASE_GATE_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+declare -a CARGO_RUNNER_ARGS=("cargo")
 EVIDENCE_DIR=""
 REPORT_JSON=0
 EVIDENCE_DIR_SELECTION_DETAIL=""
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --evidence-dir) EVIDENCE_DIR="$2"; shift 2 ;;
         --report) REPORT_JSON=1; shift ;;
+        --no-rch)
+            if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+                echo "Cannot combine --no-rch and --require-rch" >&2
+                exit 1
+            fi
+            SEEN_NO_RCH=true
+            CARGO_RUNNER_REQUEST="local"
+            shift
+            ;;
+        --require-rch)
+            if [[ "$SEEN_NO_RCH" == true ]]; then
+                echo "Cannot combine --require-rch and --no-rch" >&2
+                exit 1
+            fi
+            SEEN_REQUIRE_RCH=true
+            CARGO_RUNNER_REQUEST="rch"
+            shift
+            ;;
         --help|-h)
             sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
             exit 0
@@ -46,6 +72,33 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ─── Cargo Runner Resolution ────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+    echo "Invalid RELEASE_GATE_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)" >&2
+    exit 2
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "RELEASE_GATE_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH." >&2
+        exit 2
+    fi
+    if ! rch check --quiet >/dev/null 2>&1; then
+        echo "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch." >&2
+        exit 2
+    fi
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+    if rch check --quiet >/dev/null 2>&1; then
+        CARGO_RUNNER_MODE="rch"
+        CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+    else
+        echo "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)." >&2
+    fi
+fi
 
 # Auto-detect latest complete evidence directory if not specified.
 if [[ -z "$EVIDENCE_DIR" ]]; then
@@ -125,12 +178,17 @@ check_warn() {
     CHECKS+=("{\"name\":\"$name\",\"status\":\"warn\",\"detail\":\"$detail\"}")
 }
 
+run_cargo_gate() {
+    "${CARGO_RUNNER_ARGS[@]}" "$@"
+}
+
 # ─── Gate checks ────────────────────────────────────────────────────────────
 
 # Emit evidence-directory selection diagnostics before gate checks.
 if [[ -n "$EVIDENCE_DIR_SELECTION_DETAIL" ]]; then
     check_warn "evidence_dir_selection" "$EVIDENCE_DIR_SELECTION_DETAIL"
 fi
+check_pass "cargo_runner" "mode=$CARGO_RUNNER_MODE request=$CARGO_RUNNER_REQUEST"
 
 # Gate 1: Evidence directory exists
 if [[ -z "$EVIDENCE_DIR" ]] || [[ ! -d "$EVIDENCE_DIR" ]]; then
@@ -226,14 +284,14 @@ else
 fi
 
 # Gate 6: Compilation check (cargo check)
-if cargo check --lib --quiet 2>/dev/null; then
+if run_cargo_gate check --lib --quiet 2>/dev/null; then
     check_pass "cargo_check" "Library compiles cleanly"
 else
     check_fail "cargo_check" "cargo check --lib failed"
 fi
 
 # Gate 7: Clippy lint
-if cargo clippy --lib --quiet -- -D warnings 2>/dev/null; then
+if run_cargo_gate clippy --lib --quiet -- -D warnings 2>/dev/null; then
     check_pass "clippy" "No clippy warnings"
 else
     check_fail "clippy" "Clippy has warnings"
@@ -241,7 +299,7 @@ fi
 
 # Gate 8: Preflight analyzer (optional)
 if [[ "$REQUIRE_PREFLIGHT" -eq 1 ]]; then
-    if cargo test --lib extension_preflight --quiet 2>/dev/null; then
+    if run_cargo_gate test --lib extension_preflight --quiet 2>/dev/null; then
         check_pass "preflight_tests" "Extension preflight tests pass"
     else
         check_fail "preflight_tests" "Extension preflight tests failed"
@@ -250,7 +308,13 @@ fi
 
 # Gate 9: Quality pipeline (optional)
 if [[ "$REQUIRE_QUALITY" -eq 1 ]]; then
-    if "$SCRIPT_DIR/ext_quality_pipeline.sh" --check-only --report >/dev/null 2>&1; then
+    quality_runner_flag=()
+    if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+        quality_runner_flag=(--require-rch)
+    elif [[ "$CARGO_RUNNER_REQUEST" == "local" ]]; then
+        quality_runner_flag=(--no-rch)
+    fi
+    if "$SCRIPT_DIR/ext_quality_pipeline.sh" --check-only --report "${quality_runner_flag[@]}" >/dev/null 2>&1; then
         check_pass "quality_pipeline" "Extension quality pipeline passes"
     else
         check_fail "quality_pipeline" "Extension quality pipeline failed"

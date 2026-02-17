@@ -5,7 +5,7 @@
 # transient failures (oracle timeouts, resource exhaustion, etc.).
 #
 # Usage:
-#   ./scripts/ci_conformance_retry.sh <target_name> <test_command...>
+#   ./scripts/ci_conformance_retry.sh [--require-rch|--no-rch] <target_name> <test_command...>
 #
 # Example:
 #   ./scripts/ci_conformance_retry.sh full-official \
@@ -15,12 +15,79 @@
 #   PI_CONFORMANCE_MAX_RETRIES   Max retries (default: 1)
 #   PI_CONFORMANCE_RETRY_DELAY   Seconds between retries (default: 5)
 #   PI_CONFORMANCE_CLASSIFY_ONLY Set to 1 to classify without retrying
+#   PI_CONFORMANCE_CARGO_RUNNER  Cargo runner mode: rch | auto | local (default: rch)
 
 set -euo pipefail
 
-TARGET="${1:?Usage: ci_conformance_retry.sh <target> <command...>}"
+CARGO_RUNNER_REQUEST="${PI_CONFORMANCE_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-rch)
+            if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+                echo "Cannot combine --no-rch and --require-rch" >&2
+                exit 1
+            fi
+            SEEN_NO_RCH=true
+            CARGO_RUNNER_REQUEST="local"
+            shift
+            ;;
+        --require-rch)
+            if [[ "$SEEN_NO_RCH" == true ]]; then
+                echo "Cannot combine --require-rch and --no-rch" >&2
+                exit 1
+            fi
+            SEEN_REQUIRE_RCH=true
+            CARGO_RUNNER_REQUEST="rch"
+            shift
+            ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+TARGET="${1:?Usage: ci_conformance_retry.sh [--require-rch|--no-rch] <target> <command...>}"
 shift
 CMD=("$@")
+if [[ "${#CMD[@]}" -eq 0 ]]; then
+    echo "Usage: ci_conformance_retry.sh [--require-rch|--no-rch] <target> <command...>" >&2
+    exit 1
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+    echo "Invalid PI_CONFORMANCE_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)" >&2
+    exit 2
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "PI_CONFORMANCE_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH." >&2
+        exit 2
+    fi
+    if ! rch check --quiet >/dev/null 2>&1; then
+        echo "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch." >&2
+        exit 2
+    fi
+    CARGO_RUNNER_MODE="rch"
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+    if rch check --quiet >/dev/null 2>&1; then
+        CARGO_RUNNER_MODE="rch"
+    else
+        echo "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)." >&2
+    fi
+fi
+
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]] && [[ "${CMD[0]}" == "cargo" ]]; then
+    CMD=("rch" "exec" "--" "${CMD[@]}")
+fi
 
 MAX_RETRIES="${PI_CONFORMANCE_MAX_RETRIES:-1}"
 RETRY_DELAY="${PI_CONFORMANCE_RETRY_DELAY:-5}"
@@ -84,6 +151,9 @@ attempt=0
 while true; do
     attempt=$((attempt + 1))
     echo "=== [$TARGET] attempt $attempt ==="
+    if [[ "$attempt" -eq 1 ]]; then
+        echo "=== [$TARGET] cargo runner mode: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST) ==="
+    fi
 
     OUTPUT_FILE=$(mktemp)
     EXIT_CODE=0

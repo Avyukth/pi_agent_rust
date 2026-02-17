@@ -18,6 +18,8 @@
 #   ./scripts/perf/capture_baseline.sh --validate <path>   # validate existing baseline
 #   ./scripts/perf/capture_baseline.sh --diagnose-env ci=tests/perf/reports/baseline_variance.json \
 #       --diagnose-env canary=/tmp/baseline_variance_canary.json           # cross-env variance diagnosis
+#   ./scripts/perf/capture_baseline.sh --require-rch        # require remote offload
+#   ./scripts/perf/capture_baseline.sh --no-rch             # force local cargo execution
 #
 # Environment:
 #   CARGO_TARGET_DIR          Cargo target directory
@@ -30,6 +32,7 @@
 #   BASELINE_VARIANCE_ALERT_PCT
 #                              Spread threshold (percent) for fail/warn diagnostics (default: 10.0)
 #   PERF_REGRESSION_FULL       Forward to perf_regression (default: 0)
+#   BASELINE_CARGO_RUNNER      Cargo runner mode: rch | auto | local (default: rch)
 
 set -euo pipefail
 
@@ -51,6 +54,11 @@ QUICK=0
 DIAGNOSE_OUTPUT="${BASELINE_DIAGNOSIS_OUTPUT:-$PROJECT_ROOT/tests/perf/reports/cross_env_variance_diagnosis.json}"
 VARIANCE_ALERT_PCT="${BASELINE_VARIANCE_ALERT_PCT:-10.0}"
 DIAGNOSE_ENVS=()
+CARGO_RUNNER_REQUEST="${BASELINE_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+declare -a CARGO_RUNNER_ARGS=("cargo")
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -72,6 +80,22 @@ while [[ $# -gt 0 ]]; do
     --diagnose-env) DIAGNOSE_ENVS+=("$2"); shift 2 ;;
     --diagnose-output) DIAGNOSE_OUTPUT="$2"; shift 2 ;;
     --variance-alert-pct) VARIANCE_ALERT_PCT="$2"; shift 2 ;;
+    --no-rch)
+      if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+        die "Cannot combine --no-rch and --require-rch"
+      fi
+      SEEN_NO_RCH=true
+      CARGO_RUNNER_REQUEST="local"
+      shift
+      ;;
+    --require-rch)
+      if [[ "$SEEN_NO_RCH" == true ]]; then
+        die "Cannot combine --require-rch and --no-rch"
+      fi
+      SEEN_REQUIRE_RCH=true
+      CARGO_RUNNER_REQUEST="rch"
+      shift
+      ;;
     --help|-h)
       sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
       exit 0
@@ -352,6 +376,30 @@ PYEOF
   exit $?
 fi
 
+# ─── Cargo Runner Resolution ────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+  die "Invalid BASELINE_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)"
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+  if ! command -v rch >/dev/null 2>&1; then
+    die "BASELINE_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
+  fi
+  if ! rch check --quiet >/dev/null 2>&1; then
+    die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+  fi
+  CARGO_RUNNER_MODE="rch"
+  CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+  if rch check --quiet >/dev/null 2>&1; then
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+  else
+    yellow "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)."
+  fi
+fi
+
 # ─── Capture baseline ───────────────────────────────────────────────────────
 
 bold "═══ Baseline Capture (bd-3ar8v.1.5) ═══"
@@ -360,6 +408,7 @@ echo "  Rounds:        $ROUNDS (+ $WARMUP_ROUNDS warmup)"
 echo "  Output:        $OUTPUT"
 echo "  Max CV:        $MAX_CV"
 echo "  Git commit:    $GIT_COMMIT"
+echo "  Cargo runner:  $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
 echo ""
 
 TEMP_DIR=$(mktemp -d)
@@ -379,7 +428,7 @@ for i in $(seq 1 "$total_rounds"); do
 
   PERF_REGRESSION_OUTPUT="$round_dir" \
   CARGO_TARGET_DIR="$TARGET_DIR" \
-    cargo test --test perf_regression -- --nocapture \
+    "${CARGO_RUNNER_ARGS[@]}" test --test perf_regression -- --nocapture \
     >"$round_dir/stdout.log" 2>"$round_dir/stderr.log" || true
 done
 

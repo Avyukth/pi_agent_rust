@@ -9,6 +9,8 @@
 #   ./scripts/smoke.sh --skip-lint        # skip cargo fmt/clippy checks
 #   ./scripts/smoke.sh --only unit        # only unit smoke targets
 #   ./scripts/smoke.sh --only vcr         # only VCR smoke targets
+#   ./scripts/smoke.sh --require-rch      # require remote offload for heavy cargo steps
+#   ./scripts/smoke.sh --no-rch           # force local cargo execution
 #   ./scripts/smoke.sh --verbose          # show full cargo test output
 #   ./scripts/smoke.sh --json             # machine-readable JSON summary to stdout
 #
@@ -16,6 +18,7 @@
 #   SMOKE_ARTIFACT_DIR   Override artifact output directory
 #   CARGO_TARGET_DIR     Override cargo target directory
 #   SMOKE_TIMEOUT        Per-target timeout in seconds (default: 30)
+#   SMOKE_CARGO_RUNNER   Cargo runner mode: rch | auto | local (default: rch)
 #
 # Output:
 #   $SMOKE_ARTIFACT_DIR/smoke_log.jsonl          Structured event log
@@ -39,6 +42,11 @@ SKIP_LINT=false
 ONLY_SUITE=""
 VERBOSE=false
 JSON_OUTPUT=false
+CARGO_RUNNER_REQUEST="${SMOKE_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+declare -a CARGO_RUNNER_ARGS=("cargo")
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
 
 # ─── Smoke Target Selection ──────────────────────────────────────────────────
 #
@@ -82,6 +90,24 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --no-rch)
+            if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+                echo "Cannot combine --no-rch and --require-rch" >&2
+                exit 1
+            fi
+            SEEN_NO_RCH=true
+            CARGO_RUNNER_REQUEST="local"
+            shift
+            ;;
+        --require-rch)
+            if [[ "$SEEN_NO_RCH" == true ]]; then
+                echo "Cannot combine --require-rch and --no-rch" >&2
+                exit 1
+            fi
+            SEEN_REQUIRE_RCH=true
+            CARGO_RUNNER_REQUEST="rch"
+            shift
+            ;;
         --json)
             JSON_OUTPUT=true
             shift
@@ -97,6 +123,33 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# ─── Cargo Runner Resolution ──────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+    echo "Invalid SMOKE_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)" >&2
+    exit 2
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "SMOKE_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH." >&2
+        exit 2
+    fi
+    if ! rch check --quiet >/dev/null 2>&1; then
+        echo "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch." >&2
+        exit 2
+    fi
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+    if rch check --quiet >/dev/null 2>&1; then
+        CARGO_RUNNER_MODE="rch"
+        CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+    else
+        echo "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)." >&2
+    fi
+fi
 
 # ─── Resolve target set ──────────────────────────────────────────────────────
 
@@ -157,7 +210,12 @@ emit_event "pi.smoke.session_start.v1" \
     "timestamp=$TIMESTAMP" \
     "skip_lint=$SKIP_LINT" \
     "only_suite=${ONLY_SUITE:-all}" \
-    "target_count=${#TARGETS[@]}"
+    "target_count=${#TARGETS[@]}" \
+    "cargo_runner_request=$CARGO_RUNNER_REQUEST" \
+    "cargo_runner_mode=$CARGO_RUNNER_MODE"
+
+echo "──── Runner ────"
+echo "  cargo runner: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
 
 # ─── Lint phase (optional) ────────────────────────────────────────────────────
 
@@ -175,7 +233,7 @@ if [[ "$SKIP_LINT" == false ]]; then
         LINT_OK=false
     fi
 
-    if cargo clippy --all-targets -- -D warnings > "$ARTIFACT_DIR/clippy.log" 2>&1; then
+    if "${CARGO_RUNNER_ARGS[@]}" clippy --all-targets -- -D warnings > "$ARTIFACT_DIR/clippy.log" 2>&1; then
         echo "  clippy: ok"
     else
         echo "  clippy: FAIL (see $ARTIFACT_DIR/clippy.log)"
@@ -203,7 +261,7 @@ for target in "${TARGETS[@]}"; do
     fi
 done
 
-if cargo test --no-run "${build_args[@]}" > "$ARTIFACT_DIR/build.log" 2>&1; then
+if "${CARGO_RUNNER_ARGS[@]}" test --no-run "${build_args[@]}" > "$ARTIFACT_DIR/build.log" 2>&1; then
     echo "  compile: ok"
 else
     echo "  compile: FAIL (see $ARTIFACT_DIR/build.log)"
@@ -250,10 +308,10 @@ for i in "${!TARGETS[@]}"; do
     # Run with timeout.
     set +e
     if [[ "$VERBOSE" == true ]]; then
-        timeout "${TIMEOUT}s" cargo test --test "$target" -- --test-threads=1 2>&1 | tee "$output_file"
+        timeout "${TIMEOUT}s" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads=1 2>&1 | tee "$output_file"
         exit_code=${PIPESTATUS[0]}
     else
-        timeout "${TIMEOUT}s" cargo test --test "$target" -- --test-threads=1 > "$output_file" 2>&1
+        timeout "${TIMEOUT}s" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads=1 > "$output_file" 2>&1
         exit_code=$?
     fi
     set -e
@@ -322,6 +380,8 @@ cat > "$SUMMARY_FILE" <<ENDJSON
   "schema": "pi.smoke.summary.v1",
   "timestamp": "$TIMESTAMP",
   "verdict": "$VERDICT",
+  "cargo_runner_request": "$CARGO_RUNNER_REQUEST",
+  "cargo_runner_mode": "$CARGO_RUNNER_MODE",
   "lint_ok": $LINT_OK,
   "lint_duration_seconds": $LINT_DURATION,
   "build_duration_seconds": $BUILD_DURATION,

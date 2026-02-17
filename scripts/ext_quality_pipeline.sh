@@ -14,11 +14,14 @@
 #   ./scripts/ext_quality_pipeline.sh --quick          # format + clippy + unit only
 #   ./scripts/ext_quality_pipeline.sh --check-only     # format + clippy + check (no tests)
 #   ./scripts/ext_quality_pipeline.sh --report         # write JSON report to stdout
+#   ./scripts/ext_quality_pipeline.sh --require-rch    # require remote offload for heavy cargo steps
+#   ./scripts/ext_quality_pipeline.sh --no-rch         # force local cargo execution
 #
 # Environment:
 #   EXT_QP_PARALLELISM   Test threads (default: number of CPUs)
 #   EXT_QP_TIMEOUT       Per-target timeout in seconds (default: 300)
 #   EXT_QP_VERBOSE        Set to 1 for full cargo output (default: summary only)
+#   EXT_QP_CARGO_RUNNER  Cargo runner mode: rch | auto | local (default: rch)
 
 set -euo pipefail
 
@@ -33,6 +36,11 @@ TIMEOUT="${EXT_QP_TIMEOUT:-300}"
 VERBOSE="${EXT_QP_VERBOSE:-0}"
 MODE="full"
 REPORT_JSON=0
+CARGO_RUNNER_REQUEST="${EXT_QP_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+declare -a CARGO_RUNNER_ARGS=("cargo")
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +48,24 @@ while [[ $# -gt 0 ]]; do
         --check-only) MODE="check"; shift ;;
         --report)  REPORT_JSON=1; shift ;;
         --verbose) VERBOSE=1; shift ;;
+        --no-rch)
+            if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+                echo "Cannot combine --no-rch and --require-rch" >&2
+                exit 1
+            fi
+            SEEN_NO_RCH=true
+            CARGO_RUNNER_REQUEST="local"
+            shift
+            ;;
+        --require-rch)
+            if [[ "$SEEN_NO_RCH" == true ]]; then
+                echo "Cannot combine --require-rch and --no-rch" >&2
+                exit 1
+            fi
+            SEEN_REQUIRE_RCH=true
+            CARGO_RUNNER_REQUEST="rch"
+            shift
+            ;;
         --help|-h)
             head -20 "$0" | grep '^#' | sed 's/^# \?//'
             exit 0
@@ -47,6 +73,33 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
 done
+
+# ─── Cargo Runner Resolution ────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+    echo "Invalid EXT_QP_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)" >&2
+    exit 2
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+    if ! command -v rch >/dev/null 2>&1; then
+        echo "EXT_QP_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH." >&2
+        exit 2
+    fi
+    if ! rch check --quiet >/dev/null 2>&1; then
+        echo "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch." >&2
+        exit 2
+    fi
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+    if rch check --quiet >/dev/null 2>&1; then
+        CARGO_RUNNER_MODE="rch"
+        CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+    else
+        echo "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)." >&2
+    fi
+fi
 
 # ─── State tracking ─────────────────────────────────────────────────────────
 
@@ -93,6 +146,12 @@ run_step() {
         FAIL_COUNT=$((FAIL_COUNT + 1))
         RESULTS+=("{\"name\":\"$name\",\"status\":\"fail\",\"seconds\":$elapsed,\"exit_code\":$exit_code}")
     fi
+}
+
+run_compile_step() {
+    local name="$1"
+    shift
+    run_step "$name" "${CARGO_RUNNER_ARGS[@]}" "$@"
 }
 
 skip_step() {
@@ -156,15 +215,17 @@ EXT_CONFORMANCE_TARGETS=(
 
 # ─── Pipeline stages ────────────────────────────────────────────────────────
 
+log "INFO" "cargo runner: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
+
 # Stage 1: Format check
 run_step "cargo-fmt" cargo fmt --check
 
 # Stage 2: Clippy
-run_step "clippy-lib" cargo clippy --lib -- -D warnings
-run_step "clippy-bin" cargo clippy --bin pi -- -D warnings
+run_compile_step "clippy-lib" clippy --lib -- -D warnings
+run_compile_step "clippy-bin" clippy --bin pi -- -D warnings
 
 # Stage 3: Cargo check (catches compilation errors in test files)
-run_step "cargo-check-tests" cargo check --tests
+run_compile_step "cargo-check-tests" check --tests
 
 if [[ "$MODE" == "check" ]]; then
     for target in "${EXT_UNIT_TARGETS[@]}" "${EXT_INTEGRATION_TARGETS[@]}" "${EXT_CONFORMANCE_TARGETS[@]}"; do
@@ -177,18 +238,18 @@ else
             skip_step "test:$target"
             continue
         fi
-        run_step "test:$target" timeout "$TIMEOUT" cargo test --test "$target" -- --test-threads="$PARALLELISM"
+        run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
     done
 
     if [[ "$MODE" != "quick" ]]; then
         # Stage 5: Extension integration tests
         for target in "${EXT_INTEGRATION_TARGETS[@]}"; do
-            run_step "test:$target" timeout "$TIMEOUT" cargo test --test "$target" -- --test-threads="$PARALLELISM"
+            run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
         done
 
         # Stage 6: Conformance tests
         for target in "${EXT_CONFORMANCE_TARGETS[@]}"; do
-            run_step "test:$target" timeout "$TIMEOUT" cargo test --test "$target" -- --test-threads="$PARALLELISM"
+            run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
         done
     else
         for target in "${EXT_INTEGRATION_TARGETS[@]}" "${EXT_CONFORMANCE_TARGETS[@]}"; do
@@ -197,7 +258,7 @@ else
     fi
 
     # Stage 7: Inline extension module tests
-    run_step "test:lib-extension-preflight" cargo test --lib extension_preflight -- --test-threads="$PARALLELISM"
+    run_step "test:lib-extension-preflight" "${CARGO_RUNNER_ARGS[@]}" test --lib extension_preflight -- --test-threads="$PARALLELISM"
 fi
 
 # ─── Summary ────────────────────────────────────────────────────────────────
@@ -226,6 +287,8 @@ if [[ "$REPORT_JSON" -eq 1 ]]; then
 {
   "schema": "pi.ext_quality_pipeline.v1",
   "mode": "$MODE",
+  "cargo_runner_request": "$CARGO_RUNNER_REQUEST",
+  "cargo_runner_mode": "$CARGO_RUNNER_MODE",
   "verdict": "$VERDICT",
   "total_seconds": $TOTAL_ELAPSED,
   "counts": {
@@ -242,6 +305,7 @@ else
     echo "═══════════════════════════════════════════════════════════"
     echo "  Extension Quality Pipeline — ${MODE^^} mode"
     echo "═══════════════════════════════════════════════════════════"
+    echo "  Cargo runner: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
     echo "  Pass: $PASS_COUNT  Fail: $FAIL_COUNT  Skip: $SKIP_COUNT  Total: $TOTAL"
     echo "  Duration: ${TOTAL_ELAPSED}s"
     echo "═══════════════════════════════════════════════════════════"

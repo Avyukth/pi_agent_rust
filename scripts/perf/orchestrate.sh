@@ -20,6 +20,8 @@
 #   ./scripts/perf/orchestrate.sh --output-dir <path>        # custom output directory
 #   ./scripts/perf/orchestrate.sh --bundle                   # create tar.gz bundle at end
 #   ./scripts/perf/orchestrate.sh --validate-only <dir>      # validate existing bundle
+#   ./scripts/perf/orchestrate.sh --require-rch              # require remote offload
+#   ./scripts/perf/orchestrate.sh --no-rch                   # force local cargo execution
 #
 # Environment:
 #   CARGO_TARGET_DIR          Cargo target directory (default: target/)
@@ -42,6 +44,7 @@
 #   BENCH_ITERATIONS          Override iteration count for bench harness
 #   PERF_REGRESSION_FULL      Forwarded to perf_regression (1 = full mode)
 #   PI_PERF_STRICT            Set to 1 to fail CI-enforced budgets on NO_DATA (auto-set for ci/full profiles)
+#   PERF_CARGO_RUNNER         Cargo runner mode: rch | auto | local (default: rch)
 
 set -euo pipefail
 
@@ -71,6 +74,11 @@ CREATE_BUNDLE=0
 VALIDATE_ONLY=""
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 GIT_DIRTY="$(git diff --quiet 2>/dev/null && echo "false" || echo "true")"
+CARGO_RUNNER_REQUEST="${PERF_CARGO_RUNNER:-rch}" # rch | auto | local
+CARGO_RUNNER_MODE="local"
+declare -a CARGO_RUNNER_ARGS=("cargo")
+SEEN_NO_RCH=false
+SEEN_REQUIRE_RCH=false
 
 # Suite registry: name -> cargo test target or bench name
 declare -A SUITE_TARGETS=(
@@ -174,6 +182,22 @@ while [[ $# -gt 0 ]]; do
       VALIDATE_ONLY="$2"
       shift 2
       ;;
+    --no-rch)
+      if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+        die "Cannot combine --no-rch and --require-rch"
+      fi
+      SEEN_NO_RCH=true
+      CARGO_RUNNER_REQUEST="local"
+      shift
+      ;;
+    --require-rch)
+      if [[ "$SEEN_NO_RCH" == true ]]; then
+        die "Cannot combine --require-rch and --no-rch"
+      fi
+      SEEN_REQUIRE_RCH=true
+      CARGO_RUNNER_REQUEST="rch"
+      shift
+      ;;
     --list)
       LIST_ONLY=true
       shift
@@ -256,6 +280,30 @@ if [[ -n "$VALIDATE_ONLY" ]]; then
   exit 0
 fi
 
+# ─── Cargo Runner Resolution ────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
+  die "Invalid PERF_CARGO_RUNNER value: $CARGO_RUNNER_REQUEST (expected: rch|auto|local)"
+fi
+
+if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
+  if ! command -v rch >/dev/null 2>&1; then
+    die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
+  fi
+  if ! rch check --quiet >/dev/null 2>&1; then
+    die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+  fi
+  CARGO_RUNNER_MODE="rch"
+  CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; then
+  if rch check --quiet >/dev/null 2>&1; then
+    CARGO_RUNNER_MODE="rch"
+    CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
+  else
+    log_warn "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)."
+  fi
+fi
+
 # ─── Profile-based suite selection ───────────────────────────────────────────
 
 resolve_suites() {
@@ -319,6 +367,7 @@ log_step "Git commit:     $GIT_COMMIT (dirty=$GIT_DIRTY)"
 log_step "Cargo profile:  $CARGO_PROFILE"
 log_step "PGO mode:       $PGO_MODE"
 log_step "PGO profile:    $PGO_PROFILE_DATA"
+log_step "Cargo runner:   $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
 log_step "Timestamp:      $TIMESTAMP"
 log_step "Suites:         ${SELECTED_SUITES[*]}"
 
@@ -372,6 +421,8 @@ if [[ "$SKIP_ENV_CHECK" -eq 0 ]]; then
   "git_commit": "$GIT_COMMIT",
   "git_dirty": $GIT_DIRTY,
   "rust_version": "$rust_version",
+  "cargo_runner_mode": "$CARGO_RUNNER_MODE",
+  "cargo_runner_request": "$CARGO_RUNNER_REQUEST",
   "correlation_id": "$CORRELATION_ID"
 }
 EOF
@@ -392,7 +443,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
   # Build test binaries
   log_step "Building test binaries..."
-  if cargo test --no-run --profile "$CARGO_PROFILE" 2>"$OUTPUT_DIR/logs/build_tests.log"; then
+  if "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" 2>"$OUTPUT_DIR/logs/build_tests.log"; then
     log_ok "Test binaries built"
   else
     log_warn "Test binary build had warnings (see logs/build_tests.log)"
@@ -403,7 +454,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log_step "Building criterion benchmarks..."
     for bench in "${!CRITERION_BENCHES[@]}"; do
       bench_name="${CRITERION_BENCHES[$bench]}"
-      if cargo bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
+      if "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
         log_ok "Built bench: $bench_name"
       else
         log_warn "Build warning for bench: $bench_name"
@@ -413,7 +464,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
   if suite_selected "perf_budgets" || suite_selected "perf_regression"; then
     log_step "Building release pi binary for release-size gates..."
-    if cargo build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
+    if "${CARGO_RUNNER_ARGS[@]}" build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
       log_ok "Release pi binary built: $TARGET_DIR/release/pi"
     elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
       die "Failed to build release pi binary required for binary-size gates (see logs/build_release_pi.log)"
@@ -456,7 +507,7 @@ run_test_suite() {
   PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
   CI_CORRELATION_ID="$CORRELATION_ID" \
   RUST_TEST_THREADS="$PARALLELISM" \
-    cargo test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
+    "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
     >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
     || exit_code=$?
 
@@ -504,7 +555,7 @@ run_criterion_bench() {
   mkdir -p "$result_dir"
 
   exit_code=0
-  cargo bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
+  "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
     >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
     || exit_code=$?
 

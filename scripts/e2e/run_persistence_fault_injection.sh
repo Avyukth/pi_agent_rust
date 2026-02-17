@@ -26,6 +26,7 @@ MIN_REPO_FREE_MB="${PERSISTENCE_MIN_REPO_FREE_MB:-2048}"
 MIN_TMP_FREE_MB="${PERSISTENCE_MIN_TMP_FREE_MB:-8192}"
 
 CARGO_RUNNER_MODE="${PERSISTENCE_CARGO_RUNNER:-rch}"
+PERSISTENCE_RCH_FORCE_REMOTE="${PERSISTENCE_RCH_FORCE_REMOTE:-true}"
 declare -a CARGO_RUNNER_PREFIX=()
 
 available_mb() {
@@ -76,7 +77,7 @@ run_cargo() {
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
         cargo "$@"
     else
-        "${CARGO_RUNNER_PREFIX[@]}" cargo "$@"
+        "${CARGO_RUNNER_PREFIX[@]}" env "RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE" cargo "$@"
     fi
 }
 
@@ -190,7 +191,7 @@ echo "[fault-injection] TMPDIR=$TMPDIR"
 if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
     echo "[fault-injection] Cargo runner: local cargo"
 else
-    echo "[fault-injection] Cargo runner: ${CARGO_RUNNER_PREFIX[*]} cargo"
+    echo "[fault-injection] Cargo runner: ${CARGO_RUNNER_PREFIX[*]} env RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE cargo"
 fi
 
 jsonl_exit=0
