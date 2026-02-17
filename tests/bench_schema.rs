@@ -2070,9 +2070,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| {
-                format!(
-                    "consumption_contract.downstream_beads[{index}] must be a non-empty string"
-                )
+                format!("consumption_contract.downstream_beads[{index}] must be a non-empty string")
             })?;
         downstream_bead_set.insert(bead_id.to_owned());
     }
@@ -2086,9 +2084,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     let downstream_consumers = consumption_contract
         .get("downstream_consumers")
         .and_then(Value::as_object)
-        .ok_or_else(|| {
-            "consumption_contract.downstream_consumers must be an object".to_string()
-        })?;
+        .ok_or_else(|| "consumption_contract.downstream_consumers must be an object".to_string())?;
     for (consumer_name, expected_bead_id, expected_selector) in [
         (
             "opportunity_matrix",
@@ -2105,7 +2101,9 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             .get(consumer_name)
             .and_then(Value::as_object)
             .ok_or_else(|| {
-                format!("consumption_contract.downstream_consumers.{consumer_name} must be an object")
+                format!(
+                    "consumption_contract.downstream_consumers.{consumer_name} must be an object"
+                )
             })?;
         let field_path = format!("consumption_contract.downstream_consumers.{consumer_name}");
         let observed_bead_id = require_non_empty_string_field(consumer, &field_path, "bead_id")?;
@@ -3147,6 +3145,183 @@ fn phase1_matrix_validator_rejects_weighted_global_ranking_ci_inversion() {
 }
 
 #[test]
+fn phase1_matrix_validator_rejects_weighted_mean_outside_ci_bounds() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    // Set mean_share_pct above ci95_upper_pct
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["mean_share_pct"] =
+        json!(50.0);
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_lower_pct"] =
+        json!(35.0);
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_upper_pct"] =
+        json!(45.0);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("mean_share_pct") && err.contains("within CI"),
+        "expected mean outside CI bounds failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_wrong_weighted_schema_version() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["weighted_bottleneck_attribution"]["schema"] =
+        json!("pi.perf.phase1_weighted_bottleneck_attribution.v2");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("weighted_bottleneck_attribution.schema"),
+        "expected wrong weighted schema version failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_wrong_weighting_policy() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["weighted_bottleneck_attribution"]["weighting_policy"] = json!("uniform");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("weighting_policy"),
+        "expected wrong weighting_policy failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_wrong_confidence_method() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["weighted_bottleneck_attribution"]["confidence_method"] = json!("bootstrap_95");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("confidence_method"),
+        "expected wrong confidence_method failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_weighted_ci_bounds_partially_null() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    // Set only ci95_lower_pct, leave ci95_upper_pct as null
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_lower_pct"] =
+        json!(35.0);
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_upper_pct"] =
+        Value::Null;
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("ci95_lower_pct") && err.contains("ci95_upper_pct") && err.contains("both"),
+        "expected partial CI bounds failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_weighted_sample_size_zero() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["sample_size"] = json!(0);
+    // Remove CI bounds since sample_size=0 would be invalid regardless
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_lower_pct"] =
+        Value::Null;
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_upper_pct"] =
+        Value::Null;
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["mean_share_pct"] =
+        Value::Null;
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("sample_size") && err.contains("> 0"),
+        "expected zero sample_size failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_weighted_sample_size_exceeds_valid_cells() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    // Set sample_size to something much larger than valid_cell_count
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["sample_size"] = json!(999);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("sample_size") && err.contains("valid_cell_count"),
+        "expected sample_size > valid_cell_count failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_weighted_multi_sample_without_ci_bounds() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    // sample_size > 1 but CI bounds are null
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["sample_size"] = json!(2);
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_lower_pct"] =
+        Value::Null;
+    malformed["weighted_bottleneck_attribution"]["global_ranking"][0]["ci95_upper_pct"] =
+        Value::Null;
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("sample_size") && err.contains("requires CI bounds"),
+        "expected multi-sample without CI failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_downstream_consumer_wrong_bead_id() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["consumption_contract"]["downstream_consumers"]["opportunity_matrix"]["bead_id"] =
+        json!("bd-wrong.1");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("bead_id") && err.contains("bd-3ar8v.6.1"),
+        "expected wrong downstream consumer bead_id failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_downstream_consumer_wrong_selector() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["consumption_contract"]["downstream_consumers"]["parameter_sweeps"]["selector"] =
+        json!("weighted_bottleneck_attribution.wrong_path");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("selector") && err.contains("weighted_bottleneck_attribution.per_scale"),
+        "expected wrong downstream consumer selector failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_missing_downstream_consumer() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["consumption_contract"]["downstream_consumers"]
+        .as_object_mut()
+        .expect("downstream_consumers object")
+        .remove("opportunity_matrix");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("opportunity_matrix"),
+        "expected missing downstream consumer failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_missing_required_downstream_bead() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    // Remove bd-3ar8v.6.2 from downstream_beads array
+    let beads = malformed["consumption_contract"]["downstream_beads"]
+        .as_array_mut()
+        .expect("downstream_beads array");
+    beads.retain(|v| v.as_str() != Some("bd-3ar8v.6.2"));
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("bd-3ar8v.6.2"),
+        "expected missing required downstream bead failure, got: {err}"
+    );
+}
+
+#[test]
 fn phase1_matrix_validator_rejects_non_numeric_primary_e2e_metric() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_cells"][0]["primary_e2e"]["wall_clock_ms"] = json!("1200ms");
@@ -3276,13 +3451,21 @@ fn phase1_matrix_validator_rejects_non_positive_fail_primary_outcomes_metric() {
 fn phase1_matrix_validator_accepts_nullable_fail_metrics() {
     let mut candidate = phase1_matrix_validation_golden_fixture();
     candidate["matrix_cells"][0]["status"] = json!("fail");
+    candidate["matrix_cells"][1]["status"] = json!("fail");
     candidate["matrix_cells"][0]["primary_e2e"]["wall_clock_ms"] = Value::Null;
     candidate["matrix_cells"][0]["primary_e2e"]["rust_vs_node_ratio"] = Value::Null;
     candidate["matrix_cells"][0]["primary_e2e"]["rust_vs_bun_ratio"] = Value::Null;
+    candidate["matrix_cells"][1]["primary_e2e"]["wall_clock_ms"] = Value::Null;
+    candidate["matrix_cells"][1]["primary_e2e"]["rust_vs_node_ratio"] = Value::Null;
+    candidate["matrix_cells"][1]["primary_e2e"]["rust_vs_bun_ratio"] = Value::Null;
     candidate["primary_outcomes"]["status"] = json!("fail");
     candidate["primary_outcomes"]["wall_clock_ms"] = Value::Null;
     candidate["primary_outcomes"]["rust_vs_node_ratio"] = Value::Null;
     candidate["primary_outcomes"]["rust_vs_bun_ratio"] = Value::Null;
+    candidate["weighted_bottleneck_attribution"]["status"] = json!("missing");
+    candidate["weighted_bottleneck_attribution"]["per_scale"] = json!([]);
+    candidate["weighted_bottleneck_attribution"]["global_ranking"] = json!([]);
+    candidate["weighted_bottleneck_attribution"]["lineage"]["valid_cell_count"] = json!(0);
     candidate["consumption_contract"]["artifact_ready_for_phase5"] = json!(false);
 
     assert!(
@@ -3293,163 +3476,23 @@ fn phase1_matrix_validator_accepts_nullable_fail_metrics() {
 
 #[test]
 fn phase1_matrix_validator_rejects_missing_stage_attribution() {
-    let malformed = json!({
-        "schema": PHASE1_MATRIX_SCHEMA,
-        "run_id": "20260216T010101Z",
-        "correlation_id": "abc123def456",
-        "matrix_requirements": {
-            "required_partition_tags": ["matched-state", "realistic"],
-            "required_session_message_sizes": [100_000],
-            "required_cell_count": 1
-        },
-        "matrix_cells": [
-            {
-                "workload_partition": "matched-state",
-                "session_messages": 100_000,
-                "scenario_id": "matched-state/session_100000",
-                "status": "pass",
-                "primary_e2e": {
-                    "wall_clock_ms": 1200.0,
-                    "rust_vs_node_ratio": 2.2,
-                    "rust_vs_bun_ratio": 2.2
-                },
-                "lineage": {
-                    "source_record_index": 0,
-                    "source_artifacts": []
-                }
-            }
-        ],
-        "stage_summary": {
-            "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
-            "operation_stage_coverage": {"open_ms": 1, "append_ms": 1, "save_ms": 1, "index_ms": 1},
-            "cells_with_complete_stage_breakdown": 1,
-            "cells_missing_stage_breakdown": 0,
-            "covered_cells": 1,
-            "missing_cells": []
-        },
-        "primary_outcomes": {
-            "status": "pass",
-            "wall_clock_ms": 1200.0,
-            "rust_vs_node_ratio": 2.2,
-            "rust_vs_bun_ratio": 2.2,
-            "ordering_policy": "primary_e2e_before_microbench"
-        },
-        "regression_guards": {
-            "memory": "pass",
-            "correctness": "pass",
-            "security": "pass"
-        },
-        "evidence_links": {
-            "phase1_unit_and_fault_injection": {},
-            "required_artifacts": {}
-        },
-        "consumption_contract": {
-            "downstream_beads": ["bd-3ar8v.6.1", "bd-3ar8v.6.2"],
-            "downstream_consumers": {
-                "opportunity_matrix": {
-                    "bead_id": "bd-3ar8v.6.1",
-                    "selector": "weighted_bottleneck_attribution.global_ranking",
-                    "source_artifact": "phase1_matrix_validation"
-                },
-                "parameter_sweeps": {
-                    "bead_id": "bd-3ar8v.6.2",
-                    "selector": "weighted_bottleneck_attribution.per_scale",
-                    "source_artifact": "phase1_matrix_validation"
-                }
-            },
-            "artifact_ready_for_phase5": false
-        },
-        "lineage": {
-            "run_id_lineage": ["20260216T010101Z", "abc123def456"]
-        }
-    });
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][0]
+        .as_object_mut()
+        .expect("matrix_cells[0] object")
+        .remove("stage_attribution");
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
-        err.contains("stage_attribution"),
+        err.contains("matrix cell missing stage_attribution"),
         "expected stage_attribution validation failure, got: {err}"
     );
 }
 
 #[test]
 fn phase1_matrix_validator_rejects_required_cell_count_mismatch() {
-    let malformed = json!({
-        "schema": PHASE1_MATRIX_SCHEMA,
-        "run_id": "20260216T010101Z",
-        "correlation_id": "abc123def456",
-        "matrix_requirements": {
-            "required_partition_tags": ["matched-state", "realistic"],
-            "required_session_message_sizes": [100_000],
-            "required_cell_count": 2
-        },
-        "matrix_cells": [
-            {
-                "workload_partition": "matched-state",
-                "session_messages": 100_000,
-                "scenario_id": "matched-state/session_100000",
-                "status": "pass",
-                "stage_attribution": {
-                    "open_ms": 48.0,
-                    "append_ms": 36.0,
-                    "save_ms": 22.0,
-                    "index_ms": 11.0,
-                    "total_stage_ms": 117.0
-                },
-                "primary_e2e": {
-                    "wall_clock_ms": 1200.0,
-                    "rust_vs_node_ratio": 2.2,
-                    "rust_vs_bun_ratio": 2.2
-                },
-                "lineage": {
-                    "source_record_index": 0,
-                    "source_artifacts": []
-                }
-            }
-        ],
-        "stage_summary": {
-            "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
-            "operation_stage_coverage": {"open_ms": 1, "append_ms": 1, "save_ms": 1, "index_ms": 1},
-            "cells_with_complete_stage_breakdown": 1,
-            "cells_missing_stage_breakdown": 0,
-            "covered_cells": 1,
-            "missing_cells": []
-        },
-        "primary_outcomes": {
-            "status": "pass",
-            "wall_clock_ms": 1200.0,
-            "rust_vs_node_ratio": 2.2,
-            "rust_vs_bun_ratio": 2.2,
-            "ordering_policy": "primary_e2e_before_microbench"
-        },
-        "regression_guards": {
-            "memory": "pass",
-            "correctness": "pass",
-            "security": "pass"
-        },
-        "evidence_links": {
-            "phase1_unit_and_fault_injection": {},
-            "required_artifacts": {}
-        },
-        "consumption_contract": {
-            "downstream_beads": ["bd-3ar8v.6.1", "bd-3ar8v.6.2"],
-            "downstream_consumers": {
-                "opportunity_matrix": {
-                    "bead_id": "bd-3ar8v.6.1",
-                    "selector": "weighted_bottleneck_attribution.global_ranking",
-                    "source_artifact": "phase1_matrix_validation"
-                },
-                "parameter_sweeps": {
-                    "bead_id": "bd-3ar8v.6.2",
-                    "selector": "weighted_bottleneck_attribution.per_scale",
-                    "source_artifact": "phase1_matrix_validation"
-                }
-            },
-            "artifact_ready_for_phase5": false
-        },
-        "lineage": {
-            "run_id_lineage": ["20260216T010101Z", "abc123def456"]
-        }
-    });
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_requirements"]["required_cell_count"] = json!(1);
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -3460,83 +3503,9 @@ fn phase1_matrix_validator_rejects_required_cell_count_mismatch() {
 
 #[test]
 fn phase1_matrix_validator_rejects_stage_summary_count_mismatch() {
-    let malformed = json!({
-        "schema": PHASE1_MATRIX_SCHEMA,
-        "run_id": "20260216T010101Z",
-        "correlation_id": "abc123def456",
-        "matrix_requirements": {
-            "required_partition_tags": ["matched-state", "realistic"],
-            "required_session_message_sizes": [100_000],
-            "required_cell_count": 1
-        },
-        "matrix_cells": [
-            {
-                "workload_partition": "matched-state",
-                "session_messages": 100_000,
-                "scenario_id": "matched-state/session_100000",
-                "status": "pass",
-                "stage_attribution": {
-                    "open_ms": 48.0,
-                    "append_ms": 36.0,
-                    "save_ms": 22.0,
-                    "index_ms": 11.0,
-                    "total_stage_ms": 117.0
-                },
-                "primary_e2e": {
-                    "wall_clock_ms": 1200.0,
-                    "rust_vs_node_ratio": 2.2,
-                    "rust_vs_bun_ratio": 2.2
-                },
-                "lineage": {
-                    "source_record_index": 0,
-                    "source_artifacts": []
-                }
-            }
-        ],
-        "stage_summary": {
-            "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
-            "operation_stage_coverage": {"open_ms": 1, "append_ms": 1, "save_ms": 1, "index_ms": 1},
-            "cells_with_complete_stage_breakdown": 0,
-            "cells_missing_stage_breakdown": 0,
-            "covered_cells": 0,
-            "missing_cells": []
-        },
-        "primary_outcomes": {
-            "status": "pass",
-            "wall_clock_ms": 1200.0,
-            "rust_vs_node_ratio": 2.2,
-            "rust_vs_bun_ratio": 2.2,
-            "ordering_policy": "primary_e2e_before_microbench"
-        },
-        "regression_guards": {
-            "memory": "pass",
-            "correctness": "pass",
-            "security": "pass"
-        },
-        "evidence_links": {
-            "phase1_unit_and_fault_injection": {},
-            "required_artifacts": {}
-        },
-        "consumption_contract": {
-            "downstream_beads": ["bd-3ar8v.6.1", "bd-3ar8v.6.2"],
-            "downstream_consumers": {
-                "opportunity_matrix": {
-                    "bead_id": "bd-3ar8v.6.1",
-                    "selector": "weighted_bottleneck_attribution.global_ranking",
-                    "source_artifact": "phase1_matrix_validation"
-                },
-                "parameter_sweeps": {
-                    "bead_id": "bd-3ar8v.6.2",
-                    "selector": "weighted_bottleneck_attribution.per_scale",
-                    "source_artifact": "phase1_matrix_validation"
-                }
-            },
-            "artifact_ready_for_phase5": false
-        },
-        "lineage": {
-            "run_id_lineage": ["20260216T010101Z", "abc123def456"]
-        }
-    });
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(0);
+    malformed["stage_summary"]["covered_cells"] = json!(0);
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -3691,83 +3660,8 @@ fn phase1_matrix_validator_rejects_inflated_stage_coverage_count() {
 
 #[test]
 fn phase1_matrix_validator_rejects_non_primary_ordering_policy() {
-    let malformed = json!({
-        "schema": PHASE1_MATRIX_SCHEMA,
-        "run_id": "20260216T010101Z",
-        "correlation_id": "abc123def456",
-        "matrix_requirements": {
-            "required_partition_tags": ["matched-state", "realistic"],
-            "required_session_message_sizes": [100_000],
-            "required_cell_count": 1
-        },
-        "matrix_cells": [
-            {
-                "workload_partition": "matched-state",
-                "session_messages": 100_000,
-                "scenario_id": "matched-state/session_100000",
-                "status": "pass",
-                "stage_attribution": {
-                    "open_ms": 48.0,
-                    "append_ms": 36.0,
-                    "save_ms": 22.0,
-                    "index_ms": 11.0,
-                    "total_stage_ms": 117.0
-                },
-                "primary_e2e": {
-                    "wall_clock_ms": 1200.0,
-                    "rust_vs_node_ratio": 2.2,
-                    "rust_vs_bun_ratio": 2.2
-                },
-                "lineage": {
-                    "source_record_index": 0,
-                    "source_artifacts": []
-                }
-            }
-        ],
-        "stage_summary": {
-            "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
-            "operation_stage_coverage": {"open_ms": 1, "append_ms": 1, "save_ms": 1, "index_ms": 1},
-            "cells_with_complete_stage_breakdown": 1,
-            "cells_missing_stage_breakdown": 0,
-            "covered_cells": 1,
-            "missing_cells": []
-        },
-        "primary_outcomes": {
-            "status": "pass",
-            "wall_clock_ms": 1200.0,
-            "rust_vs_node_ratio": 2.2,
-            "rust_vs_bun_ratio": 2.2,
-            "ordering_policy": "microbench_before_primary_e2e"
-        },
-        "regression_guards": {
-            "memory": "pass",
-            "correctness": "pass",
-            "security": "pass"
-        },
-        "evidence_links": {
-            "phase1_unit_and_fault_injection": {},
-            "required_artifacts": {}
-        },
-        "consumption_contract": {
-            "downstream_beads": ["bd-3ar8v.6.1", "bd-3ar8v.6.2"],
-            "downstream_consumers": {
-                "opportunity_matrix": {
-                    "bead_id": "bd-3ar8v.6.1",
-                    "selector": "weighted_bottleneck_attribution.global_ranking",
-                    "source_artifact": "phase1_matrix_validation"
-                },
-                "parameter_sweeps": {
-                    "bead_id": "bd-3ar8v.6.2",
-                    "selector": "weighted_bottleneck_attribution.per_scale",
-                    "source_artifact": "phase1_matrix_validation"
-                }
-            },
-            "artifact_ready_for_phase5": false
-        },
-        "lineage": {
-            "run_id_lineage": ["20260216T010101Z", "abc123def456"]
-        }
-    });
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["primary_outcomes"]["ordering_policy"] = json!("microbench_before_primary_e2e");
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -4576,9 +4470,15 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         let contribution = row["weighted_contribution_pct"]
             .as_f64()
             .expect("weighted_contribution_pct number");
-        let mean_share = row["mean_share_pct"].as_f64().expect("mean_share_pct number");
-        let ci95_lower = row["ci95_lower_pct"].as_f64().expect("ci95_lower_pct number");
-        let ci95_upper = row["ci95_upper_pct"].as_f64().expect("ci95_upper_pct number");
+        let mean_share = row["mean_share_pct"]
+            .as_f64()
+            .expect("mean_share_pct number");
+        let ci95_lower = row["ci95_lower_pct"]
+            .as_f64()
+            .expect("ci95_lower_pct number");
+        let ci95_upper = row["ci95_upper_pct"]
+            .as_f64()
+            .expect("ci95_upper_pct number");
         assert!(
             ci95_lower <= mean_share + 1e-9 && mean_share <= ci95_upper + 1e-9,
             "mean_share_pct must lie within CI bounds"

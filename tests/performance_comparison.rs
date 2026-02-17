@@ -8,7 +8,7 @@
 //! Run: `cargo test --test performance_comparison -- --nocapture`
 
 use chrono::{SecondsFormat, Utc};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -235,6 +235,77 @@ fn generate_comparison_markdown(comparisons: &[LoadComparison]) -> String {
     md
 }
 
+const CANONICAL_WEIGHTED_ATTRIBUTION_DOWNSTREAM_BEADS: [&str; 2] = ["bd-3ar8v.6.1", "bd-3ar8v.6.2"];
+const STALE_NON_CONSUMER_BEADS: [&str; 2] = ["bd-3ar8v.2.12", "bd-3ar8v.2.8"];
+
+fn assert_weighted_attribution_mitigation_contract(mitigation: &str) {
+    // Canonical downstream consumer contract: opportunity matrix consumes
+    // weighted_bottleneck_attribution.global_ranking and parameter sweeps
+    // consumes weighted_bottleneck_attribution.per_scale.
+    for bead in CANONICAL_WEIGHTED_ATTRIBUTION_DOWNSTREAM_BEADS {
+        assert!(
+            mitigation.contains(bead),
+            "mitigation must reference canonical downstream consumer bead {bead}"
+        );
+    }
+    assert!(
+        mitigation.contains("opportunity matrix"),
+        "mitigation must mention opportunity matrix downstream consumer"
+    );
+    assert!(
+        mitigation.contains("parameter sweeps"),
+        "mitigation must mention parameter sweeps downstream consumer"
+    );
+    assert!(
+        mitigation.contains("weighted-attribution"),
+        "mitigation must reference weighted-attribution mechanism"
+    );
+
+    // Ensure no stale legacy bead IDs are present. The only valid PERF-3X
+    // downstream consumer beads for weighted attribution are bd-3ar8v.6.1
+    // and bd-3ar8v.6.2.
+    for stale in STALE_NON_CONSUMER_BEADS {
+        assert!(
+            !mitigation.contains(stale),
+            "mitigation should not reference non-consumer bead {stale} — \
+             only canonical downstream consumers bd-3ar8v.6.1 and bd-3ar8v.6.2 \
+             belong in mitigation metadata"
+        );
+    }
+}
+
+fn assert_key_insight_startup_contract(key_insight: &str) {
+    assert!(
+        key_insight.contains("startup")
+            || key_insight.contains("cold-start")
+            || key_insight.contains("loading cost"),
+        "key_insight should characterize startup/cold-start cost, got: {key_insight}"
+    );
+    assert!(
+        key_insight.contains("session"),
+        "key_insight should mention per-session amortization, got: {key_insight}"
+    );
+}
+
+fn sample_comparisons_for_contract() -> Vec<LoadComparison> {
+    vec![
+        LoadComparison {
+            extension: "alpha".to_string(),
+            rust_ms: 120,
+            ts_ms: 2,
+            ratio: 60.0,
+            delta_ms: 118,
+        },
+        LoadComparison {
+            extension: "beta".to_string(),
+            rust_ms: 95,
+            ts_ms: 1,
+            ratio: 95.0,
+            delta_ms: 94,
+        },
+    ]
+}
+
 // ─── Test Entry Points ──────────────────────────────────────────────────────
 
 #[test]
@@ -366,21 +437,67 @@ fn comparison_json_has_analysis() {
         .get("mitigation")
         .and_then(Value::as_str)
         .expect("should document planned mitigation");
-    for token in [
-        "bd-3ar8v.6.1",
-        "bd-3ar8v.6.2",
-        "opportunity matrix",
-        "parameter sweeps",
-    ] {
-        assert!(
-            mitigation.contains(token),
-            "mitigation should include token {token}, got: {mitigation}"
-        );
-    }
+    assert_weighted_attribution_mitigation_contract(mitigation);
     assert!(
         analysis.get("methodology").is_some(),
         "should document methodology"
     );
+}
+
+#[test]
+fn generated_comparison_json_enforces_weighted_downstream_contract_without_artifacts() {
+    let comparisons = sample_comparisons_for_contract();
+    let raw = json!({
+        "generated_at": "2026-02-17T00:00:00Z",
+    });
+    let report = generate_comparison_json(&comparisons, &raw);
+
+    let analysis = report
+        .get("analysis")
+        .expect("generated report should have analysis section");
+    let mitigation = analysis
+        .get("mitigation")
+        .and_then(Value::as_str)
+        .expect("generated report should include mitigation text");
+    assert_weighted_attribution_mitigation_contract(mitigation);
+
+    let key_insight = analysis
+        .get("key_insight")
+        .and_then(Value::as_str)
+        .expect("generated report should include key_insight");
+    assert_key_insight_startup_contract(key_insight);
+}
+
+/// Verify that mitigation metadata references the canonical weighted-attribution
+/// downstream consumers (bd-3ar8v.6.1 opportunity matrix and bd-3ar8v.6.2 parameter
+/// sweeps) and not stale legacy bead IDs.
+#[test]
+fn comparison_analysis_mitigation_references_canonical_downstream_consumers() {
+    let _guard = reports_guard();
+
+    let json_path = reports_dir().join("performance_comparison.json");
+    if !json_path.exists() {
+        eprintln!("No performance_comparison.json — skipping");
+        return;
+    }
+
+    let report = read_json_file(&json_path).expect("parse comparison JSON");
+    let analysis = report
+        .get("analysis")
+        .expect("should have analysis section");
+    let mitigation = analysis
+        .get("mitigation")
+        .and_then(Value::as_str)
+        .expect("should have mitigation text");
+
+    assert_weighted_attribution_mitigation_contract(mitigation);
+
+    // Verify key_insight documents the startup vs steady-state distinction
+    let key_insight = analysis
+        .get("key_insight")
+        .and_then(Value::as_str)
+        .expect("should have key_insight");
+    assert_key_insight_startup_contract(key_insight);
 }
 
 #[test]
