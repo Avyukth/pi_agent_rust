@@ -28,6 +28,264 @@ fn require_json(relative: &str) -> Value {
     load_json(relative).unwrap_or_else(|| panic!("required evidence file missing: {relative}"))
 }
 
+const FRANKEN_NODE_CLAIM_CONTRACT_PATH: &str = "docs/franken-node-claim-gating-contract.json";
+const FRANKEN_NODE_CLAIM_CONTRACT_SCHEMA: &str = "pi.frankennode.claim_gating_contract.v1";
+const FRANKEN_NODE_REQUIRED_TIER_IDS: &[&str] = &[
+    "TIER-1-EXTENSION-HOST-PARITY",
+    "TIER-2-TARGETED-RUNTIME-PARITY",
+    "TIER-3-FULL-NODE-BUN-REPLACEMENT",
+];
+const FRANKEN_NODE_REQUIRED_ARTIFACTS: &[&str] = &[
+    "tests/full_suite_gate/franken_node_claim_verdict.json",
+    "tests/full_suite_gate/practical_finish_checkpoint.json",
+];
+const FRANKEN_NODE_REQUIRED_OVERCLAIM_BLOCKERS: &[&str] = &[
+    "missing_required_evidence",
+    "missing_or_stale_verdict_artifact",
+    "forbidden_claim_phrase_detected",
+];
+const FRANKEN_NODE_REQUIRED_LOG_FIELDS: &[&str] = &[
+    "run_id",
+    "tier_id",
+    "decision",
+    "blocking_reasons",
+    "evidence_refs",
+    "timestamp_utc",
+];
+
+fn collect_non_empty_string_array(
+    value: &Value,
+    pointer: &str,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(entries) = value.pointer(pointer).and_then(Value::as_array) else {
+        errors.push(format!("{label} must be an array at {pointer}"));
+        return Vec::new();
+    };
+    if entries.is_empty() {
+        errors.push(format!("{label} must be non-empty at {pointer}"));
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(raw) = entry.as_str() else {
+            errors.push(format!("{label}[{index}] must be a string at {pointer}"));
+            continue;
+        };
+        let normalized = raw.trim();
+        if normalized.is_empty() {
+            errors.push(format!("{label}[{index}] must be non-empty at {pointer}"));
+            continue;
+        }
+        out.push(normalized.to_string());
+    }
+    out
+}
+
+fn validate_franken_node_claim_contract(contract: &Value) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    let schema = contract.get("schema").and_then(Value::as_str).unwrap_or("");
+    if schema != FRANKEN_NODE_CLAIM_CONTRACT_SCHEMA {
+        errors.push(format!(
+            "schema must be {FRANKEN_NODE_CLAIM_CONTRACT_SCHEMA}, found {schema}"
+        ));
+    }
+
+    for field in [
+        "/mission_statement",
+        "/claim_gate_policy/release_claim_gate_mode",
+    ] {
+        let value = contract
+            .pointer(field)
+            .and_then(Value::as_str)
+            .map_or("", str::trim);
+        if value.is_empty() {
+            errors.push(format!("missing required non-empty string at {field}"));
+        }
+    }
+
+    let release_mode = contract
+        .pointer("/claim_gate_policy/release_claim_gate_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if release_mode != "hard_fail_if_unmet" {
+        errors.push(format!(
+            "claim_gate_policy.release_claim_gate_mode must be hard_fail_if_unmet, found {release_mode}"
+        ));
+    }
+
+    let mut observed_tier_ids = HashSet::new();
+    let Some(claim_tiers) = contract.get("claim_tiers").and_then(Value::as_array) else {
+        errors.push("claim_tiers must be an array".to_string());
+        return Err(errors.join("; "));
+    };
+    if claim_tiers.is_empty() {
+        errors.push("claim_tiers must be non-empty".to_string());
+    }
+
+    for (index, tier) in claim_tiers.iter().enumerate() {
+        let Some(tier_id) = tier.get("tier_id").and_then(Value::as_str).map(str::trim) else {
+            errors.push(format!("claim_tiers[{index}].tier_id must be a string"));
+            continue;
+        };
+        if tier_id.is_empty() {
+            errors.push(format!("claim_tiers[{index}].tier_id must be non-empty"));
+            continue;
+        }
+        observed_tier_ids.insert(tier_id.to_string());
+
+        let allowed = collect_non_empty_string_array(
+            tier,
+            "/allowed_claim_language",
+            &format!("claim_tiers[{index}].allowed_claim_language"),
+            &mut errors,
+        );
+        let required_evidence = collect_non_empty_string_array(
+            tier,
+            "/required_evidence",
+            &format!("claim_tiers[{index}].required_evidence"),
+            &mut errors,
+        );
+        let forbidden = collect_non_empty_string_array(
+            tier,
+            "/forbidden_claim_language",
+            &format!("claim_tiers[{index}].forbidden_claim_language"),
+            &mut errors,
+        );
+
+        if required_evidence.is_empty() {
+            errors.push(format!(
+                "claim_tiers[{index}] must include required_evidence entries"
+            ));
+        }
+
+        if !allowed.is_empty() && !forbidden.is_empty() {
+            let allowed_set = allowed
+                .iter()
+                .map(|entry| entry.to_ascii_lowercase())
+                .collect::<HashSet<_>>();
+            let overlap = forbidden
+                .iter()
+                .map(|entry| entry.to_ascii_lowercase())
+                .find(|entry| allowed_set.contains(entry));
+            if let Some(phrase) = overlap {
+                errors.push(format!(
+                    "claim_tiers[{index}] has overlap between allowed_claim_language and forbidden_claim_language: {phrase}"
+                ));
+            }
+        }
+    }
+
+    for tier_id in FRANKEN_NODE_REQUIRED_TIER_IDS {
+        if !observed_tier_ids.contains(*tier_id) {
+            errors.push(format!("missing required claim tier: {tier_id}"));
+        }
+    }
+
+    let forbidden_patterns = collect_non_empty_string_array(
+        contract,
+        "/forbidden_claim_patterns",
+        "forbidden_claim_patterns",
+        &mut errors,
+    );
+    let forbidden_pattern_set = forbidden_patterns
+        .iter()
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for required_pattern in [
+        "strict drop-in replacement for node/bun",
+        "production-ready full runtime replacement without certification",
+    ] {
+        if !forbidden_pattern_set.contains(required_pattern) {
+            errors.push(format!(
+                "forbidden_claim_patterns missing required pattern: {required_pattern}"
+            ));
+        }
+    }
+
+    let strict_replacement = contract
+        .pointer("/claim_gate_policy/strict_replacement_requires")
+        .and_then(Value::as_object);
+    let Some(strict_replacement) = strict_replacement else {
+        errors.push("claim_gate_policy.strict_replacement_requires must be an object".to_string());
+        return Err(errors.join("; "));
+    };
+
+    let strict_overall_verdict = strict_replacement
+        .get("overall_verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if strict_overall_verdict != "CERTIFIED" {
+        errors.push(format!(
+            "claim_gate_policy.strict_replacement_requires.overall_verdict must be CERTIFIED, found {strict_overall_verdict}"
+        ));
+    }
+
+    let required_artifacts = strict_replacement
+        .get("required_artifacts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let required_artifact_set = required_artifacts
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    for required_artifact in FRANKEN_NODE_REQUIRED_ARTIFACTS {
+        if !required_artifact_set.contains(*required_artifact) {
+            errors.push(format!(
+                "strict_replacement_requires.required_artifacts missing {required_artifact}"
+            ));
+        }
+    }
+
+    let overclaim_blockers = collect_non_empty_string_array(
+        contract,
+        "/claim_gate_policy/overclaim_blockers",
+        "claim_gate_policy.overclaim_blockers",
+        &mut errors,
+    );
+    let overclaim_blocker_set = overclaim_blockers
+        .iter()
+        .map(|entry| entry.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for required_blocker in FRANKEN_NODE_REQUIRED_OVERCLAIM_BLOCKERS {
+        if !overclaim_blocker_set.contains(&required_blocker.to_ascii_lowercase()) {
+            errors.push(format!(
+                "claim_gate_policy.overclaim_blockers missing {required_blocker}"
+            ));
+        }
+    }
+
+    let structured_logging_fields = collect_non_empty_string_array(
+        contract,
+        "/structured_logging_contract/required_fields",
+        "structured_logging_contract.required_fields",
+        &mut errors,
+    );
+    let structured_logging_field_set = structured_logging_fields
+        .iter()
+        .map(|entry| entry.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    for required_field in FRANKEN_NODE_REQUIRED_LOG_FIELDS {
+        if !structured_logging_field_set.contains(&required_field.to_ascii_lowercase()) {
+            errors.push(format!(
+                "structured_logging_contract.required_fields missing {required_field}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn find_latest_phase1_matrix_validation(root: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
@@ -1321,5 +1579,88 @@ fn conformance_evidence_has_linked_test_targets() {
     assert!(
         total_evidence > 0,
         "conformance summary has evidence section but all counts are zero"
+    );
+}
+
+#[test]
+fn franken_node_claim_contract_is_present_and_valid() {
+    let contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    validate_franken_node_claim_contract(&contract).unwrap_or_else(|err| {
+        panic!("franken_node claim contract should validate fail-closed: {err}")
+    });
+}
+
+#[test]
+fn franken_node_claim_contract_fails_closed_on_missing_required_tier() {
+    let mut contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    let Some(tiers) = contract
+        .get_mut("claim_tiers")
+        .and_then(Value::as_array_mut)
+    else {
+        panic!("fixture claim_tiers must be an array");
+    };
+    tiers.retain(|tier| {
+        tier.get("tier_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            != "TIER-3-FULL-NODE-BUN-REPLACEMENT"
+    });
+
+    let err = validate_franken_node_claim_contract(&contract)
+        .expect_err("missing required tier must fail closed");
+    assert!(
+        err.contains("missing required claim tier: TIER-3-FULL-NODE-BUN-REPLACEMENT"),
+        "error should name the missing required tier, got: {err}"
+    );
+}
+
+#[test]
+fn franken_node_claim_contract_fails_closed_on_empty_required_evidence_list() {
+    let mut contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    contract["claim_tiers"][0]["required_evidence"] = serde_json::json!([]);
+
+    let err = validate_franken_node_claim_contract(&contract)
+        .expect_err("empty required_evidence list must fail closed");
+    assert!(
+        err.contains("must include required_evidence entries")
+            || err.contains("required_evidence must be non-empty"),
+        "error should explain required_evidence contract failure, got: {err}"
+    );
+}
+
+#[test]
+fn franken_node_claim_contract_fails_closed_on_missing_required_overclaim_blocker() {
+    let mut contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    let Some(blockers) = contract
+        .pointer_mut("/claim_gate_policy/overclaim_blockers")
+        .and_then(Value::as_array_mut)
+    else {
+        panic!("fixture overclaim_blockers must be an array");
+    };
+    blockers
+        .retain(|entry| entry.as_str().map_or("", str::trim) != "forbidden_claim_phrase_detected");
+
+    let err = validate_franken_node_claim_contract(&contract)
+        .expect_err("missing required overclaim blocker must fail closed");
+    assert!(
+        err.contains(
+            "claim_gate_policy.overclaim_blockers missing forbidden_claim_phrase_detected"
+        ),
+        "error should identify missing overclaim blocker token, got: {err}"
+    );
+}
+
+#[test]
+fn franken_node_claim_contract_fails_closed_on_allowed_forbidden_phrase_overlap() {
+    let mut contract = require_json(FRANKEN_NODE_CLAIM_CONTRACT_PATH);
+    contract["claim_tiers"][0]["forbidden_claim_language"] =
+        serde_json::json!(["Extension-hosting parity scope only"]);
+
+    let err = validate_franken_node_claim_contract(&contract)
+        .expect_err("allowed/forbidden phrase overlap must fail closed");
+    assert!(
+        err.contains("overlap between allowed_claim_language and forbidden_claim_language"),
+        "error should explain overlap violation, got: {err}"
     );
 }

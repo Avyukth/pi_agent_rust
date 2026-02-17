@@ -32,6 +32,7 @@ const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
 const FLAKE_TRIAGE_PATH: &str = "docs/flake-triage-policy.md";
 const SCENARIO_MATRIX_PATH: &str = "docs/e2e_scenario_matrix.json";
 const PERF_SLI_MATRIX_PATH: &str = "docs/perf_sli_matrix.json";
+const FRANKEN_NODE_MISSION_CONTRACT_PATH: &str = "docs/franken-node-mission-contract.json";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 const SUITE_CLASSIFICATION_PATH: &str = "tests/suite_classification.toml";
 const TEST_DOUBLE_INVENTORY_PATH: &str = "docs/test_double_inventory.json";
@@ -1249,6 +1250,208 @@ fn perf_sli_workload_partition_contract_is_versioned_and_complete() {
 }
 
 #[test]
+fn franken_node_mission_contract_is_versioned_and_has_required_tiers() {
+    let contract = load_json(FRANKEN_NODE_MISSION_CONTRACT_PATH);
+
+    assert_eq!(
+        contract["schema"].as_str(),
+        Some("pi.franken_node.mission_contract.v1"),
+        "franken mission contract schema must be pi.franken_node.mission_contract.v1"
+    );
+    assert_eq!(
+        contract["bead_id"].as_str(),
+        Some("bd-3ar8v.7.1"),
+        "franken mission contract must be tied to bd-3ar8v.7.1"
+    );
+
+    let version = contract["contract_version"]
+        .as_str()
+        .expect("franken mission contract_version must be present");
+    let segments: Vec<&str> = version.split('.').collect();
+    assert!(
+        segments.len() == 3 && segments.iter().all(|part| part.parse::<u64>().is_ok()),
+        "franken mission contract_version must be semantic version (x.y.z), got: {version}"
+    );
+
+    let mission_statement = contract["mission_statement"]
+        .as_str()
+        .expect("franken mission contract must include mission_statement");
+    assert!(
+        !mission_statement.trim().is_empty(),
+        "mission_statement must be non-empty"
+    );
+
+    let tiers = contract["claim_tiers"]
+        .as_array()
+        .expect("franken mission claim_tiers must be an array");
+    let tier_ids: HashSet<String> = tiers
+        .iter()
+        .filter_map(|tier| tier["tier_id"].as_str().map(ToOwned::to_owned))
+        .collect();
+
+    for required in ["extension_host_dropin", "full_runtime_replacement"] {
+        assert!(
+            tier_ids.contains(required),
+            "franken mission contract must include claim tier: {required}"
+        );
+    }
+}
+
+#[test]
+fn franken_node_mission_contract_forbidden_claims_cover_strict_node_and_bun_language() {
+    let contract = load_json(FRANKEN_NODE_MISSION_CONTRACT_PATH);
+    let forbidden = contract["forbidden_claims"]
+        .as_array()
+        .expect("franken mission forbidden_claims must be an array");
+    assert!(
+        !forbidden.is_empty(),
+        "franken mission forbidden_claims must not be empty"
+    );
+
+    let mut strict_claim_ids = Vec::new();
+    let mut phrases = Vec::new();
+    for claim in forbidden {
+        let blocked_until_tier = claim["blocked_until_tier"]
+            .as_str()
+            .expect("forbidden_claims entries must include blocked_until_tier");
+        if blocked_until_tier != "full_runtime_replacement" {
+            continue;
+        }
+        let claim_id = claim["claim_id"]
+            .as_str()
+            .expect("forbidden_claims entries must include claim_id");
+        strict_claim_ids.push(claim_id.to_string());
+        let phrase = claim["phrase"]
+            .as_str()
+            .expect("forbidden_claims entries must include phrase")
+            .to_ascii_lowercase();
+        phrases.push(phrase);
+    }
+
+    assert!(
+        !strict_claim_ids.is_empty(),
+        "strict-tier forbidden claim IDs must be declared"
+    );
+    assert!(
+        phrases.iter().any(|phrase| phrase.contains("node")),
+        "strict-tier forbidden claims must include explicit Node language"
+    );
+    assert!(
+        phrases.iter().any(|phrase| phrase.contains("bun")),
+        "strict-tier forbidden claims must include explicit Bun language"
+    );
+
+    let release_policy = &contract["release_claim_policy"];
+    assert_eq!(
+        release_policy["default_allowed_tier"].as_str(),
+        Some("extension_host_dropin"),
+        "release_claim_policy.default_allowed_tier must be extension_host_dropin"
+    );
+    assert_eq!(
+        release_policy["strict_claim_tier"].as_str(),
+        Some("full_runtime_replacement"),
+        "release_claim_policy.strict_claim_tier must be full_runtime_replacement"
+    );
+    assert_eq!(
+        release_policy["strict_claim_verdict_artifact"].as_str(),
+        Some("docs/dropin-certification-verdict.json"),
+        "strict_claim_verdict_artifact must point at drop-in certification verdict"
+    );
+    assert_eq!(
+        release_policy["strict_claim_requires_dropin_verdict"].as_str(),
+        Some("CERTIFIED"),
+        "strict claim verdict requirement must be CERTIFIED"
+    );
+    assert_eq!(
+        release_policy["fail_closed"].as_bool(),
+        Some(true),
+        "release claim policy must be fail-closed"
+    );
+}
+
+#[test]
+fn franken_node_mission_contract_tier_mapping_declares_required_checks_and_phase6_beads() {
+    let contract = load_json(FRANKEN_NODE_MISSION_CONTRACT_PATH);
+    let tiers = contract["claim_tiers"]
+        .as_array()
+        .expect("franken mission claim_tiers must be an array");
+
+    let extension = tiers
+        .iter()
+        .find(|tier| tier["tier_id"].as_str() == Some("extension_host_dropin"))
+        .expect("extension_host_dropin tier must exist");
+    let extension_checks: HashSet<String> = extension["required_check_ids"]
+        .as_array()
+        .expect("extension_host_dropin.required_check_ids must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for check in [
+        "claim_integrity.realistic_session_shape_coverage",
+        "claim_integrity.microbench_only_claim",
+        "claim_integrity.global_claim_missing_partition_coverage",
+        "claim_integrity.unresolved_conflicting_claims",
+        "claim_integrity.evidence_adjudication_matrix_schema",
+        "claim_integrity.franken_node_requested_claim_tier_allowed",
+    ] {
+        assert!(
+            extension_checks.contains(check),
+            "extension_host_dropin.required_check_ids must include {check}"
+        );
+    }
+
+    let strict = tiers
+        .iter()
+        .find(|tier| tier["tier_id"].as_str() == Some("full_runtime_replacement"))
+        .expect("full_runtime_replacement tier must exist");
+    let strict_checks: HashSet<String> = strict["required_check_ids"]
+        .as_array()
+        .expect("full_runtime_replacement.required_check_ids must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for check in [
+        "claim_integrity.franken_node_strict_replacement_dropin_certified",
+        "claim_integrity.franken_node_phase6_runtime_beads_declared",
+    ] {
+        assert!(
+            strict_checks.contains(check),
+            "full_runtime_replacement.required_check_ids must include {check}"
+        );
+    }
+
+    let strict_beads: HashSet<String> = strict["required_beads"]
+        .as_array()
+        .expect("full_runtime_replacement.required_beads must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for bead in ["bd-3ar8v.7.2", "bd-3ar8v.7.3", "bd-3ar8v.7.4"] {
+        assert!(
+            strict_beads.contains(bead),
+            "full_runtime_replacement.required_beads must include {bead}"
+        );
+    }
+
+    let strict_artifacts: HashSet<String> = strict["required_evidence_artifacts"]
+        .as_array()
+        .expect("full_runtime_replacement.required_evidence_artifacts must be an array")
+        .iter()
+        .filter_map(|entry| entry.as_str().map(ToOwned::to_owned))
+        .collect();
+    for artifact in [
+        "docs/dropin-certification-verdict.json",
+        "docs/franken-node-kernel-extraction-boundary-manifest.json",
+        "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json",
+    ] {
+        assert!(
+            strict_artifacts.contains(artifact),
+            "full_runtime_replacement.required_evidence_artifacts must include {artifact}"
+        );
+    }
+}
+
+#[test]
 fn perf_sli_metric_hierarchy_has_three_levels_without_overlap() {
     let perf = load_json(PERF_SLI_MATRIX_PATH);
     let hierarchy = &perf["metric_hierarchy"];
@@ -1557,9 +1760,11 @@ fn run_all_claim_integrity_gate_wires_fail_closed_conditions() {
 
     for token in [
         "CLAIM_INTEGRITY_REQUIRED",
+        "FRANKEN_NODE_CLAIM_TIER",
         "PERF_BASELINE_CONFIDENCE_JSON",
         "PERF_EXTENSION_STRATIFICATION_JSON",
         "PERF_PHASE1_MATRIX_VALIDATION_JSON",
+        "docs/franken-node-mission-contract.json",
         "claim_integrity.phase1_matrix_validation_path_configured",
         "claim_integrity.phase1_matrix_validation_json",
         "claim_integrity.phase1_matrix_validation_schema",
@@ -1620,6 +1825,20 @@ fn run_all_claim_integrity_gate_wires_fail_closed_conditions() {
         "claim_integrity.global_claim_missing_partition_coverage",
         "claim_integrity.evidence_adjudication_matrix_schema",
         "claim_integrity.unresolved_conflicting_claims",
+        "claim_integrity.franken_node_mission_contract_json",
+        "claim_integrity.franken_node_mission_contract_schema",
+        "claim_integrity.franken_node_claim_tiers_defined",
+        "claim_integrity.franken_node_extension_tier_required_checks",
+        "claim_integrity.franken_node_forbidden_claims_defined",
+        "claim_integrity.franken_node_forbidden_claim_language_coverage",
+        "claim_integrity.franken_node_extension_host_tier_evidence",
+        "claim_integrity.franken_node_phase6_runtime_beads_declared",
+        "claim_integrity.franken_node_strict_replacement_dropin_certified",
+        "claim_integrity.franken_node_requested_claim_tier_known",
+        "claim_integrity.franken_node_requested_claim_tier_allowed",
+        "claim_integrity.franken_node_claim_gate_status_json",
+        "pi.franken_node.claim_gate_status.v1",
+        "\"franken_node_claim_gate_status\"",
     ] {
         assert!(
             run_all.contains(token),

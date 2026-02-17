@@ -4100,7 +4100,7 @@ validate_evidence_contract() {
     local selected_units_json selected_suites_json
     local all_unit_targets_json all_suites_json
     local perf_baseline_confidence_json perf_extension_stratification_json
-    local claim_integrity_required_json
+    local claim_integrity_required_json franken_node_claim_tier_json
 
     selected_units_json="$(
         printf '%s\n' "${SELECTED_UNIT_TARGETS[@]:-}" | \
@@ -4122,6 +4122,7 @@ validate_evidence_contract() {
     perf_extension_stratification_json="${PERF_EXTENSION_STRATIFICATION_JSON:-}"
     perf_phase1_matrix_validation_json="${PERF_PHASE1_MATRIX_VALIDATION_JSON:-}"
     claim_integrity_required_json="${CLAIM_INTEGRITY_REQUIRED:-}"
+    franken_node_claim_tier_json="${FRANKEN_NODE_CLAIM_TIER:-}"
 
     if ARTIFACT_DIR="$ARTIFACT_DIR" \
         PROJECT_ROOT="$PROJECT_ROOT" \
@@ -4137,6 +4138,7 @@ validate_evidence_contract() {
         PERF_PHASE1_MATRIX_VALIDATION_JSON="$perf_phase1_matrix_validation_json" \
         PERF_EVIDENCE_DIR="${PERF_EVIDENCE_DIR:-}" \
         CLAIM_INTEGRITY_REQUIRED="$claim_integrity_required_json" \
+        FRANKEN_NODE_CLAIM_TIER="$franken_node_claim_tier_json" \
         CI_ENV="${CI:-}" \
         python3 - <<'PY'
 import json
@@ -4237,6 +4239,7 @@ claim_integrity_required = env_truthy(
     "CLAIM_INTEGRITY_REQUIRED",
     default=ci_env and profile in {"ci", "full"},
 )
+requested_claim_tier_raw = str(os.environ.get("FRANKEN_NODE_CLAIM_TIER", "")).strip()
 
 checks = []
 errors = []
@@ -7170,6 +7173,8 @@ scenario_cell_status_markdown_path: Path | None = None
 adjudication_matrix_payload: dict | None = None
 adjudication_matrix_json_path: Path | None = None
 adjudication_matrix_markdown_path: Path | None = None
+franken_node_claim_gate_status_payload: dict | None = None
+franken_node_claim_gate_status_json_path: Path | None = None
 
 expected_claim_correlation_id = summary_correlation_id or environment_correlation_id
 freshness_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -10222,6 +10227,510 @@ if claim_integrity_gate_active:
         ),
     )
 
+franken_node_mission_contract_path = (
+    project_root / "docs" / "franken-node-mission-contract.json"
+)
+franken_node_mission_contract = load_json(
+    "claim_integrity.franken_node_mission_contract_json",
+    franken_node_mission_contract_path,
+    strict=True,
+)
+require_keys(
+    "claim_integrity.franken_node_mission_contract_json",
+    franken_node_mission_contract,
+    franken_node_mission_contract_path,
+    [
+        "schema",
+        "bead_id",
+        "contract_version",
+        "mission_statement",
+        "scope_boundaries",
+        "claim_tiers",
+        "forbidden_claims",
+        "release_claim_policy",
+    ],
+    strict=True,
+)
+
+franken_node_default_tier = "extension_host_dropin"
+franken_node_strict_tier = "full_runtime_replacement"
+franken_node_requested_tier = requested_claim_tier_raw or franken_node_default_tier
+franken_node_forbidden_claim_ids: list[str] = []
+extension_host_blocking_reasons: list[str] = []
+strict_replacement_blocking_reasons: list[str] = []
+requested_claim_tier_blocking_reasons: list[str] = []
+requested_claim_tier_allowed = False
+strict_verdict_required = "CERTIFIED"
+strict_verdict_path = project_root / "docs" / "dropin-certification-verdict.json"
+strict_verdict_observed = ""
+strict_verdict_schema = ""
+strict_verdict_schema_ok = False
+strict_verdict_ready = False
+strict_required_beads: list[str] = []
+
+if isinstance(franken_node_mission_contract, dict):
+    require_condition(
+        "claim_integrity.franken_node_mission_contract_schema",
+        path=franken_node_mission_contract_path,
+        ok=str(franken_node_mission_contract.get("schema", "")).strip()
+        == "pi.franken_node.mission_contract.v1",
+        ok_msg="FrankenNode mission contract schema matches",
+        fail_msg=(
+            "FrankenNode mission contract schema must be "
+            "'pi.franken_node.mission_contract.v1'"
+        ),
+        strict=True,
+        remediation=(
+            "Set docs/franken-node-mission-contract.json schema to "
+            "pi.franken_node.mission_contract.v1."
+        ),
+    )
+    require_condition(
+        "claim_integrity.franken_node_mission_contract_bead_id",
+        path=franken_node_mission_contract_path,
+        ok=str(franken_node_mission_contract.get("bead_id", "")).strip() == "bd-3ar8v.7.1",
+        ok_msg="FrankenNode mission contract bead_id is bd-3ar8v.7.1",
+        fail_msg=(
+            "FrankenNode mission contract bead_id must be bd-3ar8v.7.1, got "
+            f"{franken_node_mission_contract.get('bead_id')!r}"
+        ),
+        strict=True,
+    )
+    contract_version = str(franken_node_mission_contract.get("contract_version", "")).strip()
+    require_condition(
+        "claim_integrity.franken_node_mission_contract_version_semver",
+        path=franken_node_mission_contract_path,
+        ok=bool(re.fullmatch(r"\d+\.\d+\.\d+", contract_version)),
+        ok_msg=f"FrankenNode mission contract version is semver ({contract_version})",
+        fail_msg=f"FrankenNode mission contract version must be semver, got {contract_version!r}",
+        strict=True,
+    )
+
+    release_claim_policy = franken_node_mission_contract.get("release_claim_policy")
+    release_claim_policy_obj = (
+        release_claim_policy if isinstance(release_claim_policy, dict) else None
+    )
+    require_condition(
+        "claim_integrity.franken_node_release_claim_policy_object",
+        path=franken_node_mission_contract_path,
+        ok=release_claim_policy_obj is not None,
+        ok_msg="FrankenNode release_claim_policy object exists",
+        fail_msg="FrankenNode release_claim_policy must be an object",
+        strict=True,
+    )
+    if release_claim_policy_obj is not None:
+        default_tier_raw = str(
+            release_claim_policy_obj.get("default_allowed_tier", "")
+        ).strip()
+        strict_tier_raw = str(release_claim_policy_obj.get("strict_claim_tier", "")).strip()
+        verdict_path_raw = str(
+            release_claim_policy_obj.get("strict_claim_verdict_artifact", "")
+        ).strip()
+        verdict_required_raw = str(
+            release_claim_policy_obj.get("strict_claim_requires_dropin_verdict", "")
+        ).strip()
+        if default_tier_raw:
+            franken_node_default_tier = default_tier_raw
+        if strict_tier_raw:
+            franken_node_strict_tier = strict_tier_raw
+        if verdict_path_raw:
+            strict_verdict_path = project_root / verdict_path_raw
+        if verdict_required_raw:
+            strict_verdict_required = verdict_required_raw.upper()
+        franken_node_requested_tier = requested_claim_tier_raw or franken_node_default_tier
+        require_condition(
+            "claim_integrity.franken_node_release_claim_policy_fail_closed",
+            path=franken_node_mission_contract_path,
+            ok=release_claim_policy_obj.get("fail_closed") is True,
+            ok_msg="FrankenNode release claim policy is fail-closed",
+            fail_msg="release_claim_policy.fail_closed must be true",
+            strict=True,
+        )
+
+    claim_tiers_raw = franken_node_mission_contract.get("claim_tiers")
+    claim_tiers = claim_tiers_raw if isinstance(claim_tiers_raw, list) else []
+    tier_by_id: dict[str, dict] = {}
+    for tier in claim_tiers:
+        if not isinstance(tier, dict):
+            continue
+        tier_id = str(tier.get("tier_id", "")).strip()
+        if not tier_id:
+            continue
+        tier_by_id[tier_id] = tier
+    required_tier_ids = {franken_node_default_tier, franken_node_strict_tier}
+    missing_tier_ids = sorted(
+        tier_id for tier_id in required_tier_ids if tier_id not in tier_by_id
+    )
+    require_condition(
+        "claim_integrity.franken_node_claim_tiers_defined",
+        path=franken_node_mission_contract_path,
+        ok=not missing_tier_ids,
+        ok_msg=(
+            "FrankenNode claim tiers include default and strict tiers "
+            f"({sorted(required_tier_ids)})"
+        ),
+        fail_msg=f"FrankenNode claim tiers missing: {missing_tier_ids}",
+        strict=True,
+        remediation=(
+            "Define both extension_host_dropin and full_runtime_replacement "
+            "claim tiers in docs/franken-node-mission-contract.json."
+        ),
+    )
+
+    extension_tier_required_checks = {
+        "claim_integrity.realistic_session_shape_coverage",
+        "claim_integrity.microbench_only_claim",
+        "claim_integrity.global_claim_missing_partition_coverage",
+        "claim_integrity.unresolved_conflicting_claims",
+        "claim_integrity.evidence_adjudication_matrix_schema",
+        "claim_integrity.franken_node_requested_claim_tier_allowed",
+    }
+    extension_required_checks_raw = (
+        tier_by_id.get(franken_node_default_tier, {}).get("required_check_ids", [])
+        if franken_node_default_tier in tier_by_id
+        else []
+    )
+    extension_required_checks = {
+        str(check_id).strip()
+        for check_id in extension_required_checks_raw
+        if str(check_id).strip()
+    }
+    missing_extension_required_checks = sorted(
+        check_id
+        for check_id in extension_tier_required_checks
+        if check_id not in extension_required_checks
+    )
+    require_condition(
+        "claim_integrity.franken_node_extension_tier_required_checks",
+        path=franken_node_mission_contract_path,
+        ok=not missing_extension_required_checks,
+        ok_msg="FrankenNode extension_host_dropin tier required_check_ids complete",
+        fail_msg=(
+            "FrankenNode extension_host_dropin tier missing required checks: "
+            f"{missing_extension_required_checks}"
+        ),
+        strict=True,
+    )
+
+    strict_required_checks_raw = (
+        tier_by_id.get(franken_node_strict_tier, {}).get("required_check_ids", [])
+        if franken_node_strict_tier in tier_by_id
+        else []
+    )
+    strict_required_checks = {
+        str(check_id).strip()
+        for check_id in strict_required_checks_raw
+        if str(check_id).strip()
+    }
+    require_condition(
+        "claim_integrity.franken_node_strict_tier_required_checks",
+        path=franken_node_mission_contract_path,
+        ok=(
+            "claim_integrity.franken_node_strict_replacement_dropin_certified"
+            in strict_required_checks
+            and "claim_integrity.franken_node_phase6_runtime_beads_declared"
+            in strict_required_checks
+        ),
+        ok_msg="FrankenNode full_runtime_replacement required_check_ids include strict gates",
+        fail_msg=(
+            "FrankenNode full_runtime_replacement required_check_ids must include "
+            "claim_integrity.franken_node_strict_replacement_dropin_certified and "
+            "claim_integrity.franken_node_phase6_runtime_beads_declared"
+        ),
+        strict=True,
+    )
+
+    strict_required_beads_raw = (
+        tier_by_id.get(franken_node_strict_tier, {}).get("required_beads", [])
+        if franken_node_strict_tier in tier_by_id
+        else []
+    )
+    strict_required_beads = [
+        str(bead_id).strip()
+        for bead_id in strict_required_beads_raw
+        if str(bead_id).strip()
+    ]
+    expected_phase6_beads = {"bd-3ar8v.7.2", "bd-3ar8v.7.3", "bd-3ar8v.7.4"}
+    missing_phase6_beads = sorted(
+        bead_id for bead_id in expected_phase6_beads if bead_id not in strict_required_beads
+    )
+    require_condition(
+        "claim_integrity.franken_node_phase6_runtime_beads_declared",
+        path=franken_node_mission_contract_path,
+        ok=not missing_phase6_beads,
+        ok_msg="FrankenNode strict tier declares required phase-6 runtime beads",
+        fail_msg=f"FrankenNode strict tier missing required beads: {missing_phase6_beads}",
+        strict=True,
+    )
+
+    forbidden_claims_raw = franken_node_mission_contract.get("forbidden_claims")
+    forbidden_claims = forbidden_claims_raw if isinstance(forbidden_claims_raw, list) else []
+    strict_forbidden_claim_ids: list[str] = []
+    strict_forbidden_phrases: list[str] = []
+    for claim in forbidden_claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id", "")).strip()
+        phrase = str(claim.get("phrase", "")).strip()
+        blocked_until_tier = str(claim.get("blocked_until_tier", "")).strip()
+        if blocked_until_tier == franken_node_strict_tier:
+            if claim_id:
+                strict_forbidden_claim_ids.append(claim_id)
+            if phrase:
+                strict_forbidden_phrases.append(phrase.lower())
+    franken_node_forbidden_claim_ids = sorted(set(strict_forbidden_claim_ids))
+    require_condition(
+        "claim_integrity.franken_node_forbidden_claims_defined",
+        path=franken_node_mission_contract_path,
+        ok=bool(franken_node_forbidden_claim_ids),
+        ok_msg=(
+            "FrankenNode mission contract declares strict-tier forbidden claims "
+            f"({franken_node_forbidden_claim_ids})"
+        ),
+        fail_msg="FrankenNode mission contract must declare forbidden strict-tier claims",
+        strict=True,
+    )
+    strict_language_coverage_ok = any("node" in phrase for phrase in strict_forbidden_phrases) and any(
+        "bun" in phrase for phrase in strict_forbidden_phrases
+    )
+    require_condition(
+        "claim_integrity.franken_node_forbidden_claim_language_coverage",
+        path=franken_node_mission_contract_path,
+        ok=strict_language_coverage_ok,
+        ok_msg="forbidden strict-tier claims cover both Node and Bun language",
+        fail_msg=(
+            "forbidden strict-tier claims must include explicit Node and Bun language "
+            "patterns"
+        ),
+        strict=True,
+    )
+
+    release_overall_ready = (
+        release_readiness.get("overall_ready")
+        if isinstance(release_readiness, dict)
+        else None
+    )
+    if not claim_integrity_gate_active:
+        extension_host_blocking_reasons.append(
+            "claim_integrity gate inactive; cannot certify extension_host_dropin tier"
+        )
+    if evidence_missing_or_stale_reasons:
+        extension_host_blocking_reasons.extend(evidence_missing_or_stale_reasons)
+    if microbench_only_claim_reasons:
+        extension_host_blocking_reasons.extend(microbench_only_claim_reasons)
+    if global_claim_partition_reasons:
+        extension_host_blocking_reasons.extend(global_claim_partition_reasons)
+    if unresolved_conflicting_claim_reasons:
+        extension_host_blocking_reasons.extend(unresolved_conflicting_claim_reasons)
+    scenario_overall_status = ""
+    if isinstance(scenario_cell_status_payload, dict):
+        scenario_summary = scenario_cell_status_payload.get("summary", {})
+        if isinstance(scenario_summary, dict):
+            scenario_overall_status = normalize_claim_outcome(
+                scenario_summary.get("overall_status")
+            )
+    if scenario_overall_status != "pass":
+        extension_host_blocking_reasons.append(
+            f"scenario cell status overall_status must be pass (got {scenario_overall_status or 'missing'})"
+        )
+    adjudication_overall_status = ""
+    if isinstance(adjudication_matrix_payload, dict):
+        adjudication_summary_obj = adjudication_matrix_payload.get("summary", {})
+        if isinstance(adjudication_summary_obj, dict):
+            adjudication_overall_status = normalize_claim_outcome(
+                adjudication_summary_obj.get("overall_status")
+            )
+    if adjudication_overall_status != "pass":
+        extension_host_blocking_reasons.append(
+            "evidence adjudication matrix overall_status must be pass "
+            f"(got {adjudication_overall_status or 'missing'})"
+        )
+    if release_overall_ready is not True:
+        extension_host_blocking_reasons.append(
+            f"release_readiness.overall_ready must be true (got {release_overall_ready!r})"
+        )
+    extension_host_blocking_reasons = sorted(set(extension_host_blocking_reasons))
+    extension_host_tier_ready = not extension_host_blocking_reasons
+    require_condition(
+        "claim_integrity.franken_node_extension_host_tier_evidence",
+        path=franken_node_mission_contract_path,
+        ok=extension_host_tier_ready,
+        ok_msg="extension_host_dropin tier evidence is sufficient",
+        fail_msg=(
+            "extension_host_dropin tier evidence is insufficient: "
+            f"{extension_host_blocking_reasons}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Regenerate full claim-integrity evidence bundle and resolve blocking "
+            "claim-integrity checks before release-facing extension-host claims."
+        ),
+    )
+
+    strict_verdict_payload = None
+    if strict_verdict_path.exists():
+        try:
+            strict_verdict_payload = json.loads(strict_verdict_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # pragma: no cover - defensive
+            strict_replacement_blocking_reasons.append(
+                f"strict replacement verdict artifact invalid JSON ({exc})"
+            )
+    else:
+        strict_replacement_blocking_reasons.append(
+            f"strict replacement verdict artifact missing: {strict_verdict_path}"
+        )
+    if isinstance(strict_verdict_payload, dict):
+        strict_verdict_schema = str(strict_verdict_payload.get("schema", "")).strip()
+        strict_verdict_schema_ok = (
+            strict_verdict_schema == "pi.dropin.certification_verdict.v1"
+        )
+        strict_verdict_observed = str(
+            strict_verdict_payload.get("overall_verdict", "")
+        ).strip()
+        if not strict_verdict_observed:
+            strict_verdict_observed = str(strict_verdict_payload.get("verdict", "")).strip()
+        if not strict_verdict_schema_ok:
+            strict_replacement_blocking_reasons.append(
+                "strict replacement verdict schema must be pi.dropin.certification_verdict.v1"
+            )
+        if strict_verdict_observed.upper() != strict_verdict_required:
+            strict_replacement_blocking_reasons.append(
+                "strict replacement verdict must be "
+                f"{strict_verdict_required} (got {strict_verdict_observed or 'missing'})"
+            )
+    strict_verdict_ready = (
+        strict_verdict_schema_ok and strict_verdict_observed.upper() == strict_verdict_required
+    )
+    strict_replacement_blocking_reasons = sorted(set(strict_replacement_blocking_reasons))
+    strict_replacement_tier_ready = (
+        extension_host_tier_ready and strict_verdict_ready and not missing_phase6_beads
+    )
+    require_condition(
+        "claim_integrity.franken_node_strict_replacement_dropin_certified",
+        path=strict_verdict_path,
+        ok=strict_verdict_ready,
+        ok_msg=(
+            "strict replacement verdict artifact is certified "
+            f"({strict_verdict_required})"
+        ),
+        fail_msg=(
+            "strict replacement verdict artifact is not certified: "
+            f"{strict_replacement_blocking_reasons}"
+        ),
+        strict=False,
+        remediation=(
+            "Generate docs/dropin-certification-verdict.json with "
+            "overall_verdict=CERTIFIED before enabling strict runtime-replacement claims."
+        ),
+    )
+
+    known_tier_ids = sorted(tier_by_id.keys())
+    requested_tier_known = franken_node_requested_tier in tier_by_id
+    require_condition(
+        "claim_integrity.franken_node_requested_claim_tier_known",
+        path=franken_node_mission_contract_path,
+        ok=requested_tier_known,
+        ok_msg=f"requested claim tier is known ({franken_node_requested_tier})",
+        fail_msg=(
+            f"requested claim tier {franken_node_requested_tier!r} is unknown; "
+            f"known tiers={known_tier_ids}"
+        ),
+        strict=claim_integrity_required,
+    )
+    if requested_tier_known and franken_node_requested_tier == franken_node_default_tier:
+        requested_claim_tier_allowed = extension_host_tier_ready
+        requested_claim_tier_blocking_reasons.extend(extension_host_blocking_reasons)
+    elif requested_tier_known and franken_node_requested_tier == franken_node_strict_tier:
+        requested_claim_tier_allowed = strict_replacement_tier_ready
+        requested_claim_tier_blocking_reasons.extend(strict_replacement_blocking_reasons)
+        if not strict_replacement_tier_ready and franken_node_forbidden_claim_ids:
+            requested_claim_tier_blocking_reasons.append(
+                "forbidden strict-tier claim IDs still blocked: "
+                f"{franken_node_forbidden_claim_ids}"
+            )
+        if not extension_host_tier_ready:
+            requested_claim_tier_blocking_reasons.append(
+                "extension_host_dropin tier must pass before strict tier claims"
+            )
+    else:
+        requested_claim_tier_allowed = False
+        requested_claim_tier_blocking_reasons.append(
+            f"requested claim tier {franken_node_requested_tier!r} is not defined by mission contract"
+        )
+    requested_claim_tier_blocking_reasons = sorted(set(requested_claim_tier_blocking_reasons))
+
+    require_condition(
+        "claim_integrity.franken_node_requested_claim_tier_allowed",
+        path=franken_node_mission_contract_path,
+        ok=requested_claim_tier_allowed,
+        ok_msg=(
+            "requested FrankenNode claim tier is allowed: "
+            f"{franken_node_requested_tier}"
+        ),
+        fail_msg=(
+            "requested FrankenNode claim tier is blocked: "
+            f"{requested_claim_tier_blocking_reasons}"
+        ),
+        strict=claim_integrity_required,
+        remediation=(
+            "Select a lower claim tier or regenerate missing claim-integrity evidence "
+            "until mission-contract gating conditions are satisfied."
+        ),
+    )
+
+    franken_node_claim_gate_status_payload = {
+        "schema": "pi.franken_node.claim_gate_status.v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": expected_claim_correlation_id,
+        "mission_contract": {
+            "schema": franken_node_mission_contract.get("schema"),
+            "path": str(franken_node_mission_contract_path),
+            "version": franken_node_mission_contract.get("contract_version"),
+            "bead_id": franken_node_mission_contract.get("bead_id"),
+        },
+        "requested_claim_tier": franken_node_requested_tier,
+        "default_claim_tier": franken_node_default_tier,
+        "strict_claim_tier": franken_node_strict_tier,
+        "requested_tier_allowed": requested_claim_tier_allowed,
+        "requested_tier_blocking_reasons": requested_claim_tier_blocking_reasons,
+        "forbidden_claim_ids": franken_node_forbidden_claim_ids,
+        "tiers": {
+            franken_node_default_tier: {
+                "ready": extension_host_tier_ready,
+                "blocking_reasons": extension_host_blocking_reasons,
+            },
+            franken_node_strict_tier: {
+                "ready": strict_replacement_tier_ready,
+                "blocking_reasons": strict_replacement_blocking_reasons,
+                "required_beads": strict_required_beads,
+            },
+        },
+        "strict_replacement_verdict": {
+            "required_overall_verdict": strict_verdict_required,
+            "path": str(strict_verdict_path),
+            "schema": strict_verdict_schema or None,
+            "schema_ok": strict_verdict_schema_ok,
+            "observed_overall_verdict": strict_verdict_observed or None,
+            "ready": strict_verdict_ready,
+        },
+    }
+    franken_node_claim_gate_status_json_path = (
+        artifact_dir / "franken_node_claim_gate_status.json"
+    )
+    franken_node_claim_gate_status_json_path.write_text(
+        json.dumps(franken_node_claim_gate_status_payload, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    add_check(
+        "claim_integrity.franken_node_claim_gate_status_json",
+        franken_node_claim_gate_status_json_path,
+        True,
+        (
+            "FrankenNode claim-gate status JSON written: "
+            f"{franken_node_claim_gate_status_json_path}"
+        ),
+    )
+
 if claim_integrity_gate_active:
     require_condition(
         "claim_integrity.missing_or_stale_evidence",
@@ -10658,6 +11167,36 @@ contract_payload = {
         if adjudication_matrix_json_path is not None
         else None
     ),
+    "franken_node_claim_gate_status": (
+        {
+            "schema": "pi.franken_node.claim_gate_status.v1",
+            "path": str(franken_node_claim_gate_status_json_path),
+            "requested_claim_tier": (
+                franken_node_claim_gate_status_payload.get("requested_claim_tier")
+                if isinstance(franken_node_claim_gate_status_payload, dict)
+                else None
+            ),
+            "requested_tier_allowed": (
+                franken_node_claim_gate_status_payload.get("requested_tier_allowed")
+                if isinstance(franken_node_claim_gate_status_payload, dict)
+                else None
+            ),
+            "requested_tier_blocking_reasons": (
+                franken_node_claim_gate_status_payload.get(
+                    "requested_tier_blocking_reasons", []
+                )
+                if isinstance(franken_node_claim_gate_status_payload, dict)
+                else []
+            ),
+            "tiers": (
+                franken_node_claim_gate_status_payload.get("tiers", {})
+                if isinstance(franken_node_claim_gate_status_payload, dict)
+                else {}
+            ),
+        }
+        if franken_node_claim_gate_status_json_path is not None
+        else None
+    ),
 }
 contract_file.parent.mkdir(parents=True, exist_ok=True)
 contract_file.write_text(json.dumps(contract_payload, indent=2) + "\n", encoding="utf-8")
@@ -10693,6 +11232,24 @@ if isinstance(summary, dict):
             if adjudication_matrix_markdown_path is not None
             else None,
             "summary": adjudication_matrix_payload.get("summary", {}),
+        }
+    if franken_node_claim_gate_status_json_path is not None and isinstance(
+        franken_node_claim_gate_status_payload, dict
+    ):
+        summary["franken_node_claim_gate_status"] = {
+            "schema": "pi.franken_node.claim_gate_status.v1",
+            "path": str(franken_node_claim_gate_status_json_path),
+            "requested_claim_tier": franken_node_claim_gate_status_payload.get(
+                "requested_claim_tier"
+            ),
+            "requested_tier_allowed": franken_node_claim_gate_status_payload.get(
+                "requested_tier_allowed"
+            ),
+            "requested_tier_blocking_reasons": franken_node_claim_gate_status_payload.get(
+                "requested_tier_blocking_reasons",
+                [],
+            ),
+            "tiers": franken_node_claim_gate_status_payload.get("tiers", {}),
         }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
