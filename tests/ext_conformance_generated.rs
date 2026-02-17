@@ -4905,7 +4905,7 @@ conformance_test!(
     ignore
 );
 conformance_test!(ext_npm_pi_mcp_adapter, "npm/pi-mcp-adapter", ignore);
-conformance_test!(ext_npm_pi_package_test, "npm/pi-package-test", ignore);
+conformance_test!(ext_npm_pi_package_test, "npm/pi-package-test");
 conformance_test!(
     ext_npm_pi_powerline_footer,
     "npm/pi-powerline-footer",
