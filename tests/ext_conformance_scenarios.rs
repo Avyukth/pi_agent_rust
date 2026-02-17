@@ -564,7 +564,13 @@ fn execute_tool_scenario(
         let tool_call_id = format!("tc-{}", scenario.id);
         async move {
             runtime
-                .execute_tool(tool_name, tool_call_id, input, ctx, DEFAULT_TIMEOUT_MS)
+                .execute_tool(
+                    tool_name,
+                    tool_call_id,
+                    input,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
                 .await
                 .map_err(|e| format!("execute_tool: {e}"))
         }
@@ -597,7 +603,7 @@ fn execute_command_scenario(
         let command_name = command_name.to_string();
         async move {
             runtime
-                .execute_command(command_name, args, ctx, DEFAULT_TIMEOUT_MS)
+                .execute_command(command_name, args, Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                 .await
                 .map_err(|e| format!("execute_command: {e}"))
         }
@@ -629,7 +635,7 @@ fn execute_event_scenario(
         let event_name = event_name.to_string();
         async move {
             runtime
-                .dispatch_event(event_name, event_payload, ctx, DEFAULT_TIMEOUT_MS)
+                .dispatch_event(event_name, event_payload, Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                 .await
                 .map_err(|e| format!("dispatch_event: {e}"))
         }
@@ -1839,7 +1845,7 @@ fn load_extension_with_mocks(
                     .dispatch_event(
                         "session_start".to_string(),
                         Value::Object(serde_json::Map::new()),
-                        ctx,
+                        Arc::new(ctx),
                         DEFAULT_TIMEOUT_MS,
                     )
                     .await;
@@ -2036,7 +2042,13 @@ fn execute_tool_scenario_with_mocks(
         let tool_call_id = format!("tc-{}", scenario.id);
         async move {
             runtime
-                .execute_tool(tool_name, tool_call_id, input, ctx, DEFAULT_TIMEOUT_MS)
+                .execute_tool(
+                    tool_name,
+                    tool_call_id,
+                    input,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
                 .await
                 .map_err(|e| format!("execute_tool: {e}"))
         }
@@ -2086,7 +2098,7 @@ fn execute_command_scenario_with_mocks(
         let command_name = command_name.to_string();
         async move {
             runtime
-                .execute_command(command_name, args, ctx, DEFAULT_TIMEOUT_MS)
+                .execute_command(command_name, args, Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                 .await
                 .map_err(|e| format!("execute_command: {e}"))
         }
@@ -2135,7 +2147,7 @@ fn execute_event_scenario_with_mocks(
         let event_name = event_name.to_string();
         async move {
             runtime
-                .dispatch_event(event_name, event_payload, ctx, DEFAULT_TIMEOUT_MS)
+                .dispatch_event(event_name, event_payload, Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                 .await
                 .map_err(|e| format!("dispatch_event: {e}"))
         }
@@ -2202,7 +2214,12 @@ fn execute_multi_step_scenario(
                     let runtime = loaded.runtime.clone();
                     async move {
                         runtime
-                            .dispatch_event(event_name, event_payload, ctx, DEFAULT_TIMEOUT_MS)
+                            .dispatch_event(
+                                event_name,
+                                event_payload,
+                                Arc::new(ctx),
+                                DEFAULT_TIMEOUT_MS,
+                            )
                             .await
                             .map_err(|e| format!("dispatch_event: {e}"))
                     }
@@ -2230,7 +2247,13 @@ fn execute_multi_step_scenario(
                     let tool_call_id = format!("tc-{}-step", scenario.id);
                     async move {
                         runtime
-                            .execute_tool(tool_name, tool_call_id, input, ctx, DEFAULT_TIMEOUT_MS)
+                            .execute_tool(
+                                tool_name,
+                                tool_call_id,
+                                input,
+                                Arc::new(ctx),
+                                DEFAULT_TIMEOUT_MS,
+                            )
                             .await
                             .map_err(|e| format!("execute_tool: {e}"))
                     }
@@ -2258,7 +2281,7 @@ fn execute_multi_step_scenario(
                     let runtime = loaded.runtime.clone();
                     async move {
                         runtime
-                            .execute_command(command_name, args, ctx, DEFAULT_TIMEOUT_MS)
+                            .execute_command(command_name, args, Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                             .await
                             .map_err(|e| format!("execute_command: {e}"))
                     }

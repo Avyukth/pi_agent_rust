@@ -1695,10 +1695,10 @@
         "uses_http": false,
         "uses_ui": false,
         "uses_session": false,
-        "is_multi_file": false,
+        "is_multi_file": true,
         "has_npm_deps": false
       },
-      "conformance_tier": 2,
+      "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
         "tools": [],
@@ -1817,10 +1817,10 @@
         "uses_http": false,
         "uses_ui": false,
         "uses_session": false,
-        "is_multi_file": false,
+        "is_multi_file": true,
         "has_npm_deps": false
       },
-      "conformance_tier": 2,
+      "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
         "tools": [],
@@ -3114,6 +3114,32 @@
       }
     },
     {
+      "id": "npm/agentsbox",
+      "entry_path": "npm/agentsbox/dist/pi.js",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": true
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
       "id": "npm/aliou-pi-extension-dev",
       "entry_path": "npm/aliou-pi-extension-dev/index.ts",
       "source_tier": "npm-registry",
@@ -3574,7 +3600,7 @@
     },
     {
       "id": "npm/lsp-pi",
-      "entry_path": "npm/lsp-pi/lsp.ts",
+      "entry_path": "npm/lsp-pi/lsp-tool.ts",
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": true,
@@ -4644,13 +4670,25 @@
       "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
-        "registers_commands": false,
-        "registers_flags": false,
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "context",
+          "session_before_compact",
           "session_before_fork",
-          "session_before_switch"
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -4662,12 +4700,44 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "signal_loop_success"
+        ],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "footer",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "todos",
+          "ultrathink",
+          "usage"
+        ],
         "flags": [],
         "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "context",
+          "session_before_compact",
           "session_before_fork",
-          "session_before_switch"
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ]
       }
     },
@@ -5611,7 +5681,7 @@
     },
     {
       "id": "npm/tmustier-pi-arcade",
-      "entry_path": "npm/tmustier-pi-arcade/spice-invaders.ts",
+      "entry_path": "npm/tmustier-pi-arcade/mario-not/mario-not.ts",
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,

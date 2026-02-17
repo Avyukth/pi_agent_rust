@@ -304,7 +304,7 @@ fn phase_tool_call(
             tool_name.clone(),
             format!("lifecycle-{i}"),
             json!({"name": "test"}),
-            ctx.clone(),
+            std::sync::Arc::new(ctx.clone()),
             NORMAL_TIMEOUT_MS,
         ));
         match result {
@@ -1204,7 +1204,7 @@ fn per_extension_tool_isolation() {
                 ext_name.to_string(),
                 format!("iso-{j}"),
                 json!({"name": "test"}),
-                ctx.clone(),
+                std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
             ));
             samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
@@ -1250,7 +1250,7 @@ fn per_extension_tool_isolation() {
                 ext_name.to_string(),
                 format!("comp-{j}"),
                 json!({"name": "test"}),
-                ctx.clone(),
+                std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
             ));
             samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
@@ -1456,7 +1456,7 @@ fn measure_phase_latencies(
                 tool_name.clone(),
                 format!("decomp-{i}"),
                 json!({"name": "test"}),
-                ctx.clone(),
+                std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
             ));
             tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);
@@ -1531,7 +1531,7 @@ fn measure_composed_phase_latencies(
                 tool_name.clone(),
                 format!("composed-decomp-{i}"),
                 json!({"name": "test"}),
-                ctx.clone(),
+                std::sync::Arc::new(ctx.clone()),
                 NORMAL_TIMEOUT_MS,
             ));
             tool_samples.push(start.elapsed().as_secs_f64() * 1_000_000.0);

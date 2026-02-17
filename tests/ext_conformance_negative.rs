@@ -627,7 +627,7 @@ fn execute_nonexistent_tool() {
                 "nonexistent_tool".to_string(),
                 "tc-test".to_string(),
                 serde_json::json!({}),
-                serde_json::json!({}),
+                std::sync::Arc::new(serde_json::json!({})),
                 20_000,
             )
             .await
@@ -673,7 +673,7 @@ fn execute_tool_that_throws() {
                 "crasher".to_string(),
                 "tc-test".to_string(),
                 serde_json::json!({}),
-                serde_json::json!({}),
+                std::sync::Arc::new(serde_json::json!({})),
                 20_000,
             )
             .await
@@ -721,7 +721,7 @@ fn execute_command_that_throws() {
             .execute_command(
                 "boom".to_string(),
                 String::new(),
-                serde_json::json!({}),
+                std::sync::Arc::new(serde_json::json!({})),
                 20_000,
             )
             .await
@@ -762,7 +762,7 @@ fn dispatch_event_handler_throws() {
             .dispatch_event(
                 "agent_start".to_string(),
                 serde_json::json!({}),
-                serde_json::json!({}),
+                std::sync::Arc::new(serde_json::json!({})),
                 20_000,
             )
             .await

@@ -323,7 +323,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
             "probe_iso_a".to_string(),
             "call".to_string(),
             json!({}),
-            ctx.clone(),
+            std::sync::Arc::new(ctx.clone()),
             5_000,
         ));
     }
@@ -332,7 +332,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         "probe_iso_b".to_string(),
         "call".to_string(),
         json!({}),
-        ctx.clone(),
+        std::sync::Arc::new(ctx.clone()),
         5_000,
     ));
 
@@ -341,7 +341,7 @@ fn stateful_extensions_maintain_isolated_call_counts() {
             "probe_iso_c".to_string(),
             "call".to_string(),
             json!({}),
-            ctx.clone(),
+            std::sync::Arc::new(ctx.clone()),
             5_000,
         ));
     }
@@ -351,21 +351,21 @@ fn stateful_extensions_maintain_isolated_call_counts() {
         "probe_iso_a".to_string(),
         "final-a".to_string(),
         json!({}),
-        ctx.clone(),
+        std::sync::Arc::new(ctx.clone()),
         5_000,
     ));
     let result_b = futures::executor::block_on(runtime.execute_tool(
         "probe_iso_b".to_string(),
         "final-b".to_string(),
         json!({}),
-        ctx.clone(),
+        std::sync::Arc::new(ctx.clone()),
         5_000,
     ));
     let result_c = futures::executor::block_on(runtime.execute_tool(
         "probe_iso_c".to_string(),
         "final-c".to_string(),
         json!({}),
-        ctx.clone(),
+        std::sync::Arc::new(ctx.clone()),
         5_000,
     ));
 

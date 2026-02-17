@@ -534,7 +534,7 @@ fn bench_extension_tool_call_roundtrip(c: &mut Criterion) {
     let tool_name = "hello".to_string();
     let call_id = "bench-call-1".to_string();
     let input = json!({"name": "World"});
-    let ctx_payload = json!({ "hasUI": false, "cwd": js_cwd });
+    let ctx_payload = std::sync::Arc::new(json!({ "hasUI": false, "cwd": js_cwd }));
 
     {
         let mut group = c.benchmark_group("ext_tool_call");

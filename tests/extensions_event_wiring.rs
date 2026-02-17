@@ -716,7 +716,7 @@ fn extension_tool_execution_returns_result() {
                     "ext-greet".to_string(),
                     "call-1".to_string(),
                     json!({"name": "World"}),
-                    json!({}),
+                    std::sync::Arc::new(json!({})),
                     5000,
                 )
                 .await

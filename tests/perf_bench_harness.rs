@@ -469,7 +469,7 @@ fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usiz
 
     // Determine tool name: use the extension name as a best guess.
     let tool_name = ext_name.to_string();
-    let ctx_payload = json!({ "hasUI": false, "cwd": cwd.display().to_string() });
+    let ctx_payload = Arc::new(json!({ "hasUI": false, "cwd": cwd.display().to_string() }));
 
     let mut samples_us = Vec::with_capacity(iterations);
     for i in 0..iterations {
@@ -481,7 +481,7 @@ fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usiz
             tool_name.clone(),
             call_id,
             input,
-            ctx_payload.clone(),
+            Arc::clone(&ctx_payload),
             5_000,
         ));
 

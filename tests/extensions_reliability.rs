@@ -314,7 +314,7 @@ fn slow_tool_call_is_bounded_by_timeout() {
         "slow-tool".to_string(),
         "bench-0".to_string(),
         json!({}),
-        ctx,
+        std::sync::Arc::new(ctx),
         1_000, // 1 second timeout vs 10s busy wait
     ));
 
@@ -390,7 +390,7 @@ fn throwing_tool_returns_error_not_crash() {
         "crasher".to_string(),
         "call-1".to_string(),
         json!({}),
-        ctx.clone(),
+        std::sync::Arc::new(ctx.clone()),
         5_000,
     ));
 
@@ -402,7 +402,7 @@ fn throwing_tool_returns_error_not_crash() {
         "crasher".to_string(),
         "call-2".to_string(),
         json!({}),
-        ctx,
+        std::sync::Arc::new(ctx),
         5_000,
     ));
     eprintln!("[throwing_tool] result2: {result2:?}");
@@ -685,7 +685,7 @@ fn tool_call_with_zero_timeout_returns_quickly() {
         "greet".to_string(),
         "call-0".to_string(),
         json!({"name": "zero"}),
-        ctx,
+        std::sync::Arc::new(ctx),
         0, // Zero timeout
     ));
 

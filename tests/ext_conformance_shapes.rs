@@ -194,7 +194,7 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
                             tool_name,
                             "tc-shape-test".to_string(),
                             arguments,
-                            serde_json::json!({}),
+                            std::sync::Arc::new(serde_json::json!({})),
                             20_000,
                         )
                         .await
@@ -222,7 +222,12 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
                 let args = args.clone();
                 async move {
                     runtime
-                        .execute_command(command_name, args, serde_json::json!({}), 20_000)
+                        .execute_command(
+                            command_name,
+                            args,
+                            std::sync::Arc::new(serde_json::json!({})),
+                            20_000,
+                        )
                         .await
                         .map_err(|e| format!("execute_command: {e}"))
                 }
@@ -251,7 +256,12 @@ fn run_shape_test(shape: ExtensionShape, fixture_name: &str) -> ShapeTestResult 
                 let payload = payload.clone();
                 async move {
                     runtime
-                        .dispatch_event(event_name, payload, serde_json::json!({}), 20_000)
+                        .dispatch_event(
+                            event_name,
+                            payload,
+                            std::sync::Arc::new(serde_json::json!({})),
+                            20_000,
+                        )
                         .await
                         .map_err(|e| format!("dispatch_event: {e}"))
                 }

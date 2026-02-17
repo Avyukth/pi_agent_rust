@@ -613,14 +613,14 @@ fn execute_tool(
     tool_name: &str,
     input: Value,
 ) -> Result<Value, String> {
-    let ctx = json!({
+    let ctx = Arc::new(json!({
         "hasUI": false,
         "cwd": "/tmp/negative-test",
         "sessionEntries": [],
         "sessionBranch": [],
         "sessionLeafEntry": null,
         "modelRegistry": {},
-    });
+    }));
 
     common::run_async({
         let runtime = runtime.clone();
@@ -628,7 +628,7 @@ fn execute_tool(
         let tool_call_id = format!("tc-neg-{tool_name}");
         async move {
             runtime
-                .execute_tool(tool_name, tool_call_id, input, ctx, 10_000)
+                .execute_tool(tool_name, tool_call_id, input, Arc::clone(&ctx), 10_000)
                 .await
                 .map_err(|e| format!("{e}"))
         }
@@ -640,21 +640,21 @@ fn dispatch_event(
     event_name: &str,
     payload: Value,
 ) -> Result<Value, String> {
-    let ctx = json!({
+    let ctx = Arc::new(json!({
         "hasUI": false,
         "cwd": "/tmp/negative-test",
         "sessionEntries": [],
         "sessionBranch": [],
         "sessionLeafEntry": null,
         "modelRegistry": {},
-    });
+    }));
 
     common::run_async({
         let runtime = runtime.clone();
         let event_name = event_name.to_string();
         async move {
             runtime
-                .dispatch_event(event_name, payload, ctx, 10_000)
+                .dispatch_event(event_name, payload, Arc::clone(&ctx), 10_000)
                 .await
                 .map_err(|e| format!("{e}"))
         }

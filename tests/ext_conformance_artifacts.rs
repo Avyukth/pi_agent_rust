@@ -476,8 +476,8 @@ fn classify_ts_file(content: &str, rel_path: &str) -> EntryPointScan {
     }
 }
 
-/// Check `package.json` files for `pi.extensions` field and return the declared
-/// entry points (relative to the package directory).
+/// Check `package.json` files for declared extension entry points and return them
+/// relative to the package directory.
 fn collect_package_json_entry_points(artifacts_dir: &Path) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::new();
     let mut pkg_files = Vec::new();
@@ -492,22 +492,21 @@ fn collect_package_json_entry_points(artifacts_dir: &Path) -> BTreeMap<String, V
             continue;
         };
 
-        let Some(extensions) = json.pointer("/pi/extensions").and_then(|v| v.as_array()) else {
+        let declared = package_declared_entry_points(&json);
+        if declared.is_empty() {
             continue;
-        };
+        }
 
         let pkg_dir = pkg_path.parent().expect("package.json parent");
         let pkg_rel = relative_posix(artifacts_dir, pkg_dir);
 
-        let entries: Vec<String> = extensions
+        let entries: Vec<String> = declared
             .iter()
-            .filter_map(|v| v.as_str())
             .map(|entry| {
-                let cleaned = entry.strip_prefix("./").unwrap_or(entry);
                 if pkg_rel.is_empty() {
-                    cleaned.to_string()
+                    entry.clone()
                 } else {
-                    format!("{pkg_rel}/{cleaned}")
+                    format!("{pkg_rel}/{entry}")
                 }
             })
             .collect();
@@ -709,6 +708,20 @@ fn test_package_json_entry_point_detection() {
     assert!(
         entries.iter().any(|e| e.ends_with("index.ts")),
         "custom-provider-anthropic should declare index.ts, got: {entries:?}"
+    );
+
+    // agentsbox uses npm exports["./pi"] instead of pi.extensions and should
+    // still surface a declared extension entrypoint.
+    let agentsbox_key = pkg_entries
+        .keys()
+        .find(|k| k.contains("npm/agentsbox/package.json"))
+        .expect("npm/agentsbox package.json");
+    let agentsbox_entries = &pkg_entries[agentsbox_key];
+    assert!(
+        agentsbox_entries
+            .iter()
+            .any(|e| e.ends_with("npm/agentsbox/dist/pi.js")),
+        "agentsbox should declare dist/pi.js entrypoint, got: {agentsbox_entries:?}"
     );
 }
 
@@ -934,6 +947,65 @@ fn extract_first_string_arg(text: &str, prefix: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+fn normalized_declared_entry(entry: &str) -> Option<String> {
+    let cleaned = entry.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.strip_prefix("./").unwrap_or(cleaned).to_string())
+}
+
+fn collect_declared_export_paths(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(path) => {
+            if let Some(path) = normalized_declared_entry(path) {
+                out.push(path);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_declared_export_paths(value, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["import", "default", "require", "node", "bun"] {
+                if let Some(value) = map.get(key) {
+                    collect_declared_export_paths(value, out);
+                }
+            }
+            for value in map.values() {
+                collect_declared_export_paths(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn package_declared_entry_points(json: &serde_json::Value) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+
+    if let Some(extensions) = json.pointer("/pi/extensions").and_then(|v| v.as_array()) {
+        for ext in extensions {
+            if let Some(path) = ext.as_str().and_then(normalized_declared_entry) {
+                entries.push(path);
+            }
+        }
+    }
+
+    if let Some(exports) = json.get("exports").and_then(|v| v.as_object()) {
+        if let Some(pi_export) = exports.get("./pi") {
+            collect_declared_export_paths(pi_export, &mut entries);
+        }
+        if let Some(pi_export) = exports.get("pi") {
+            collect_declared_export_paths(pi_export, &mut entries);
+        }
+    }
+
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
 fn has_npm_dependencies(dir: &Path) -> bool {
     let pkg_path = dir.join("package.json");
     if !pkg_path.is_file() {
@@ -1041,14 +1113,10 @@ fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
     if pkg_path.is_file() {
         if let Ok(bytes) = fs::read(&pkg_path) {
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(extensions) = json.pointer("/pi/extensions").and_then(|v| v.as_array())
-                {
-                    if let Some(first) = extensions.first().and_then(|v| v.as_str()) {
-                        let cleaned = first.strip_prefix("./").unwrap_or(first);
-                        let candidate = ext_dir.join(cleaned);
-                        if candidate.is_file() {
-                            return Some(relative_posix(artifacts_dir, &candidate));
-                        }
+                for entry in package_declared_entry_points(&json) {
+                    let candidate = ext_dir.join(entry);
+                    if candidate.is_file() {
+                        return Some(relative_posix(artifacts_dir, &candidate));
                     }
                 }
             }
@@ -1249,6 +1317,14 @@ fn test_manifest_spot_check_known_extensions() {
     assert!(
         has_npm_dependencies(&provider_dir),
         "custom-provider-anthropic should have npm deps"
+    );
+
+    let agentsbox_dir = artifacts_dir.join("npm/agentsbox");
+    let agentsbox_entry = find_entry_point(&agentsbox_dir, &artifacts_dir);
+    assert_eq!(
+        agentsbox_entry.as_deref(),
+        Some("npm/agentsbox/dist/pi.js"),
+        "agentsbox entry should resolve via package exports ./pi"
     );
 }
 
