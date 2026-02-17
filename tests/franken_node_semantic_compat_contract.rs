@@ -318,6 +318,7 @@ fn sample_row(scenario_id: &str, verdict: &str) -> Value {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate_executable_semantic_matrix(contract: &Value, rows: &[Value]) -> Value {
     let taxonomy = contract["scenario_taxonomy"]
         .as_array()
