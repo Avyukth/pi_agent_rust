@@ -30,6 +30,7 @@ const FULL_SUITE_GATE_PATH: &str = "tests/ci_full_suite_gate.rs";
 const PRACTICAL_FINISH_GATE_ID: &str = "practical_finish_checkpoint";
 const EXT_REMEDIATION_GATE_ID: &str = "extension_remediation_backlog";
 const PARAMETER_SWEEPS_GATE_ID: &str = "parameter_sweeps_integrity";
+const CONFORMANCE_STRESS_LINEAGE_GATE_ID: &str = "conformance_stress_lineage";
 
 fn load_json(path: &str) -> Value {
     let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
@@ -397,6 +398,22 @@ fn full_suite_gate_wires_parameter_sweeps_integrity_contract() {
         assert!(
             gate.contains(token),
             "full suite gate must retain parameter_sweeps token: {token}"
+        );
+    }
+}
+
+#[test]
+fn full_suite_gate_wires_conformance_stress_lineage_contract() {
+    let gate = load_text(FULL_SUITE_GATE_PATH);
+    for token in [
+        CONFORMANCE_STRESS_LINEAGE_GATE_ID,
+        "check_conformance_stress_lineage_coherence",
+        "stress_triage.json",
+        "conformance_summary.json",
+    ] {
+        assert!(
+            gate.contains(token),
+            "full suite gate must retain conformance_stress_lineage token: {token}"
         );
     }
 }

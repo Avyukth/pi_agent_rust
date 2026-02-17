@@ -465,7 +465,7 @@ Normative rules:
 Release/certification decisions must apply a docs-last contract before final report wrap-up:
 
 1. `practical_finish_checkpoint` must pass before declaring final PERF-3X completion.
-2. `parameter_sweeps_integrity` and `extension_remediation_backlog` are co-required release gates.
+2. `parameter_sweeps_integrity`, `extension_remediation_backlog`, and `conformance_stress_lineage` are co-required release gates.
 3. Remaining open PERF-3X work is allowed only for docs/report scope (`docs`, `docs-last`,
    `documentation`, `report`, or `runbook` labels). Any technical open PERF-3X issue is
    fail-closed and blocks GO.
@@ -475,10 +475,12 @@ Required evidence artifacts for this policy:
 - `tests/full_suite_gate/practical_finish_checkpoint.json` (`pi.perf3x.practical_finish_checkpoint.v1`)
 - `tests/perf/reports/parameter_sweeps.json` (`pi.perf.parameter_sweeps.v1`)
 - `tests/full_suite_gate/extension_remediation_backlog.json` (`pi.qa.extension_remediation_backlog.v1`)
+- `tests/perf/reports/stress_triage.json` (`pi.ext.stress_triage.v1` with `run_id`, `correlation_id`)
+- `tests/ext_conformance/reports/conformance_summary.json` (`pi.ext.conformance_summary.v2` with `run_id`, `correlation_id`)
 
 Primary enforcement surfaces:
 
-- `tests/ci_full_suite_gate.rs` (`practical_finish_checkpoint`, `parameter_sweeps_integrity`, `extension_remediation_backlog`)
+- `tests/ci_full_suite_gate.rs` (`practical_finish_checkpoint`, `parameter_sweeps_integrity`, `extension_remediation_backlog`, `conformance_stress_lineage`)
 - `tests/release_readiness.rs` final certification gate aggregation
 - `docs/qa-runbook.md` PERF-3X regression triage + replay procedure
 

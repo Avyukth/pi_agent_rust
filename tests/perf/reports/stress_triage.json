@@ -21,6 +21,8 @@
     ],
     "rss_interval_secs": 5
   },
+  "run_id": "local-20260206T012910000Z",
+  "correlation_id": "stress-triage-local-20260206T012910000Z",
   "generated_at": "2026-02-06T01:29:10Z",
   "pass": true,
   "results": {

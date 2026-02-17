@@ -1,10 +1,8 @@
-{"id":"bd-3ar8v.6.9.5","status":"in_progress","issue_type":"task","title":"[Phase 5][Support] Exclude rollup + post-phase nodes from practical-finish technical blocker set","labels":["execution","perf-3x","phase-5","support"]}
-{"id":"bd-3ar8v.6.3.4","status":"in_progress","issue_type":"task","title":"[Phase 5][Support] Run remote conformance+stress certification bundle with canonical run-id","labels":["artifacts","benchmark","conformance","perf-3x","phase-5","support"]}
 {"id":"bd-3ar8v.6.9","status":"open","issue_type":"task","title":"[Phase 5] Declare practical-finish checkpoint before documentation wrap-up","labels":["docs-last","execution","perf-3x","phase-5","release"]}
 {"id":"bd-3ar8v.6.6","status":"in_progress","issue_type":"task","title":"[Phase 5] Build unified certification suite (unit+e2e+perf+conformance) with dossier output","labels":["certification","perf-3x","phase-5","testing"]}
 {"id":"bd-3ar8v.6.5","status":"open","issue_type":"task","title":"[Phase 5] Produce final >=3x certification report and go/no-go decision","labels":["perf-3x","phase-5","release","report"]}
 {"id":"bd-3ar8v.6.4","status":"open","issue_type":"task","title":"[Phase 5] Harden permanent perf gates and regression triage runbook","labels":["ci","perf-3x","phase-5","runbook"]}
-{"id":"bd-3ar8v.6.3","status":"open","issue_type":"task","title":"[Phase 5] Execute full-scale extension conformance plus perf stress certification","labels":["benchmark","conformance","perf-3x","phase-5"]}
+{"id":"bd-3ar8v.6.3","status":"in_progress","issue_type":"task","title":"[Phase 5] Execute full-scale extension conformance plus perf stress certification","labels":["benchmark","conformance","perf-3x","phase-5"]}
 {"id":"bd-3ar8v.6","status":"open","issue_type":"feature","title":"[PERF-3X][Phase 5] Optimization lock-in and release gate","labels":["ci","perf-3x","phase-5","release"]}
 {"id":"bd-3ar8v","status":"in_progress","issue_type":"epic","title":"[PERF-3X] Reverse performance gap: Rust >=3x faster end-to-end","labels":["benchmark","perf-3x","perf-program","priority-critical"]}
 {"id":"bd-3ar8v.7.16","status":"open","issue_type":"task","title":"[FrankenNode] Build compatibility remediation backlog generator from real package telemetry","labels":["franken-node","prioritization","telemetry"]}

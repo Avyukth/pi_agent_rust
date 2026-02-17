@@ -690,9 +690,16 @@ fn write_stress_report(result: &StressResult, duration_secs: u64, ext_names: &[S
 
     let _ = std::fs::write(&events_path, lines.join("\n") + "\n");
 
-    // Triage summary JSON
+    // Triage summary JSON — include run_id/correlation_id for Phase-5 lineage coherence.
+    let stress_run_id = std::env::var("CI_RUN_ID")
+        .or_else(|_| std::env::var("GITHUB_RUN_ID"))
+        .unwrap_or_else(|_| format!("local-{}", Utc::now().format("%Y%m%dT%H%M%S%3fZ")));
+    let stress_correlation_id = std::env::var("CI_CORRELATION_ID")
+        .unwrap_or_else(|_| format!("stress-triage-{stress_run_id}"));
     let triage = json!({
         "schema": "pi.ext.stress_triage.v1",
+        "run_id": stress_run_id,
+        "correlation_id": stress_correlation_id,
         "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         "config": {
             "duration_secs": duration_secs,

@@ -27,6 +27,10 @@
 //! 14. SEC-6.4 security compatibility conformance (bd-1a2cu)
 //! 15. PERF-3X bead-to-artifact coverage audit (bd-3ar8v.6.11)
 //! 16. Practical-finish checkpoint (bd-3ar8v.6.9)
+//! 17. Extension remediation backlog (bd-3ar8v.6.8)
+//! 18. Opportunity matrix (bd-3ar8v.6.1)
+//! 19. Parameter sweeps (bd-3ar8v.6.2)
+//! 20. Conformance+stress lineage coherence (bd-3ar8v.6.3)
 //!
 //! Run:
 //!   cargo test --test `ci_full_suite_gate` -- --nocapture
@@ -411,6 +415,9 @@ const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opport
 const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
 const PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/parameter_sweeps.json";
 const PARAMETER_SWEEPS_SCHEMA: &str = "pi.perf.parameter_sweeps.v1";
+const STRESS_TRIAGE_ARTIFACT_REL: &str = "tests/perf/reports/stress_triage.json";
+const CONFORMANCE_SUMMARY_ARTIFACT_REL: &str =
+    "tests/ext_conformance/reports/conformance_summary.json";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
@@ -564,15 +571,40 @@ fn load_open_perf3x_issues(root: &Path) -> Result<Vec<PracticalFinishOpenIssue>,
 }
 
 #[allow(dead_code)]
+type PracticalFinishIssueSourceCandidate = (u128, usize, &'static str, PathBuf, String);
+
+#[allow(dead_code)]
+fn select_practical_finish_issue_source(
+    candidates: Vec<PracticalFinishIssueSourceCandidate>,
+) -> Option<(&'static str, PathBuf, String)> {
+    use std::cmp::Reverse;
+
+    candidates
+        .into_iter()
+        .max_by_key(|(freshness_millis, order, _, _, _)| (*freshness_millis, Reverse(*order)))
+        .map(|(_, _, source, path, contents)| (source, path, contents))
+}
+
+#[allow(dead_code)]
 fn read_practical_finish_issue_source(
     root: &Path,
 ) -> Result<(&'static str, PathBuf, String), String> {
+    use std::time::UNIX_EPOCH;
+
+    let mut candidates: Vec<PracticalFinishIssueSourceCandidate> = Vec::new();
     let mut missing_paths = Vec::new();
 
-    for relative in PRACTICAL_FINISH_ISSUE_SOURCES {
+    for (order, relative) in PRACTICAL_FINISH_ISSUE_SOURCES.iter().enumerate() {
         let path = root.join(relative);
         match std::fs::read_to_string(&path) {
-            Ok(contents) => return Ok((*relative, path, contents)),
+            Ok(contents) => {
+                let freshness_millis = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |age| age.as_millis());
+                candidates.push((freshness_millis, order, *relative, path, contents));
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 missing_paths.push(path);
             }
@@ -583,6 +615,10 @@ fn read_practical_finish_issue_source(
                 ));
             }
         }
+    }
+
+    if let Some((source, path, contents)) = select_practical_finish_issue_source(candidates) {
+        return Ok((source, path, contents));
     }
 
     let tried = missing_paths
@@ -1910,6 +1946,86 @@ fn check_parameter_sweeps_artifact(root: &Path) -> (String, Option<String>) {
     ("pass".to_string(), None)
 }
 
+/// Gate 20: Cross-artifact lineage coherence for conformance+stress certification (bd-3ar8v.6.3).
+///
+/// Validates that conformance_summary.json and stress_triage.json both carry
+/// non-empty `run_id` and `correlation_id` fields, ensuring Phase-5 lineage
+/// traceability across the full conformance+stress certification pipeline.
+fn check_conformance_stress_lineage_coherence(root: &Path) -> (String, Option<String>) {
+    let mut issues: Vec<String> = Vec::new();
+
+    // Check conformance_summary.json lineage
+    let conformance_path = root.join(CONFORMANCE_SUMMARY_ARTIFACT_REL);
+    match load_json(&conformance_path) {
+        Some(conformance) => {
+            let run_id = conformance
+                .get("run_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let correlation_id = conformance
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if run_id.trim().is_empty() {
+                issues.push("conformance_summary.json missing non-empty run_id".to_string());
+            }
+            if correlation_id.trim().is_empty() {
+                issues
+                    .push("conformance_summary.json missing non-empty correlation_id".to_string());
+            }
+        }
+        None => {
+            issues.push(format!(
+                "conformance_summary.json not found or invalid at {}",
+                CONFORMANCE_SUMMARY_ARTIFACT_REL
+            ));
+        }
+    }
+
+    // Check stress_triage.json lineage
+    let stress_path = root.join(STRESS_TRIAGE_ARTIFACT_REL);
+    match load_json(&stress_path) {
+        Some(stress) => {
+            let run_id = stress.get("run_id").and_then(Value::as_str).unwrap_or("");
+            let correlation_id = stress
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if run_id.trim().is_empty() {
+                issues.push("stress_triage.json missing non-empty run_id".to_string());
+            }
+            if correlation_id.trim().is_empty() {
+                issues.push("stress_triage.json missing non-empty correlation_id".to_string());
+            }
+            let pass = stress.get("pass").and_then(Value::as_bool).unwrap_or(false);
+            if !pass {
+                issues.push("stress_triage.json verdict is not pass".to_string());
+            }
+        }
+        None => {
+            issues.push(format!(
+                "stress_triage.json not found or invalid at {}",
+                STRESS_TRIAGE_ARTIFACT_REL
+            ));
+        }
+    }
+
+    if issues.is_empty() {
+        (
+            "pass".to_string(),
+            Some("Conformance+stress lineage coherence validated: both artifacts carry run_id and correlation_id".to_string()),
+        )
+    } else {
+        (
+            "fail".to_string(),
+            Some(format!(
+                "Conformance+stress lineage coherence failed: {}",
+                issues.join("; ")
+            )),
+        )
+    }
+}
+
 /// Check that a file exists and is non-empty.
 fn check_artifact_present(root: &Path, artifact_rel: &str) -> (String, Option<String>) {
     let full = root.join(artifact_rel);
@@ -2418,6 +2534,23 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
         detail,
         reproduce_command: Some(
             "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact".to_string(),
+        ),
+    });
+
+    // Gate 20: Conformance+stress lineage coherence (bd-3ar8v.6.3).
+    // Validates that both conformance_summary.json and stress_triage.json carry
+    // non-empty run_id and correlation_id for Phase-5 traceability.
+    let (status, detail) = check_conformance_stress_lineage_coherence(root);
+    gates.push(SubGate {
+        id: "conformance_stress_lineage".to_string(),
+        name: "Conformance+stress lineage coherence".to_string(),
+        bead: "bd-3ar8v.6.3".to_string(),
+        status,
+        blocking: true,
+        artifact_path: Some(CONFORMANCE_SUMMARY_ARTIFACT_REL.to_string()),
+        detail,
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact".to_string(),
         ),
     });
 
@@ -4634,6 +4767,146 @@ fn parameter_sweeps_gate_passes_on_consistent_contract_shape() {
     assert!(
         detail.is_none(),
         "valid contract should not produce gate detail"
+    );
+}
+
+#[test]
+fn conformance_stress_lineage_passes_with_valid_artifacts() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+
+    let conformance_dir = temp
+        .path()
+        .join("tests")
+        .join("ext_conformance")
+        .join("reports");
+    std::fs::create_dir_all(&conformance_dir).expect("create conformance reports directory");
+    let conformance_path = conformance_dir.join("conformance_summary.json");
+    std::fs::write(
+        &conformance_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "run_id": "local-20260217T000000000Z",
+            "correlation_id": "conformance-summary-local-20260217T000000000Z",
+            "pass_rate_pct": 100.0,
+            "counts": { "total": 223, "pass": 60, "fail": 0, "na": 163, "tested": 60 }
+        }))
+        .expect("serialize"),
+    )
+    .expect("write conformance artifact");
+
+    let stress_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&stress_dir).expect("create perf reports directory");
+    let stress_path = stress_dir.join("stress_triage.json");
+    std::fs::write(
+        &stress_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.stress_triage.v1",
+            "run_id": "local-20260217T000000000Z",
+            "correlation_id": "stress-triage-local-20260217T000000000Z",
+            "pass": true,
+            "generated_at": "2026-02-17T00:00:00Z",
+            "results": { "extensions_loaded": 15 }
+        }))
+        .expect("serialize"),
+    )
+    .expect("write stress artifact");
+
+    let (status, _detail) = check_conformance_stress_lineage_coherence(temp.path());
+    assert_eq!(status, "pass", "valid lineage should pass");
+}
+
+#[test]
+fn conformance_stress_lineage_fails_when_run_id_missing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+
+    let conformance_dir = temp
+        .path()
+        .join("tests")
+        .join("ext_conformance")
+        .join("reports");
+    std::fs::create_dir_all(&conformance_dir).expect("create conformance reports directory");
+    std::fs::write(
+        conformance_dir.join("conformance_summary.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "correlation_id": "test-corr",
+            "pass_rate_pct": 100.0,
+            "counts": { "total": 60, "pass": 60 }
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+
+    let stress_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&stress_dir).expect("create perf reports directory");
+    std::fs::write(
+        stress_dir.join("stress_triage.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.stress_triage.v1",
+            "run_id": "local-test",
+            "correlation_id": "stress-test",
+            "pass": true
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+
+    let (status, detail) = check_conformance_stress_lineage_coherence(temp.path());
+    assert_eq!(status, "fail", "missing run_id should fail");
+    assert!(
+        detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("conformance_summary.json missing non-empty run_id"),
+        "detail should mention missing run_id: {detail:?}"
+    );
+}
+
+#[test]
+fn conformance_stress_lineage_fails_when_stress_verdict_not_pass() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+
+    let conformance_dir = temp
+        .path()
+        .join("tests")
+        .join("ext_conformance")
+        .join("reports");
+    std::fs::create_dir_all(&conformance_dir).expect("create conformance reports directory");
+    std::fs::write(
+        conformance_dir.join("conformance_summary.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "run_id": "local-test",
+            "correlation_id": "test-corr",
+            "pass_rate_pct": 100.0,
+            "counts": { "total": 60, "pass": 60 }
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+
+    let stress_dir = temp.path().join("tests").join("perf").join("reports");
+    std::fs::create_dir_all(&stress_dir).expect("create perf reports directory");
+    std::fs::write(
+        stress_dir.join("stress_triage.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": "pi.ext.stress_triage.v1",
+            "run_id": "local-test",
+            "correlation_id": "stress-test",
+            "pass": false
+        }))
+        .expect("serialize"),
+    )
+    .expect("write");
+
+    let (status, detail) = check_conformance_stress_lineage_coherence(temp.path());
+    assert_eq!(status, "fail", "stress verdict not pass should fail");
+    assert!(
+        detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("stress_triage.json verdict is not pass"),
+        "detail should mention stress verdict: {detail:?}"
     );
 }
 

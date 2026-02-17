@@ -2,7 +2,7 @@
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
   "generated_at": "2026-02-17T03:25:22.685Z",
-  "verdict": "pass",
+  "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
     {
@@ -130,6 +130,53 @@
       "reproduce_command": "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact"
     },
     {
+      "id": "practical_finish",
+      "name": "Practical-finish checkpoint (docs-only residual filter)",
+      "bead": "bd-3ar8v.6.9",
+      "status": "fail",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/practical_finish_checkpoint.json",
+      "detail": "Practical-finish checkpoint blocked: 4 technical PERF-3X issue(s) still open (bd-3ar8v.4, bd-3ar8v.6.3, bd-3ar8v.6.6, bd-3ar8v.6.7)",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact"
+    },
+    {
+      "id": "extension_remediation_backlog",
+      "name": "Extension remediation backlog artifact integrity",
+      "bead": "bd-3ar8v.6.8",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/full_suite_gate/extension_remediation_backlog.json",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- extension_remediation_backlog_gate_passes_on_consistent_summary_shape --nocapture --exact"
+    },
+    {
+      "id": "opportunity_matrix",
+      "name": "Opportunity matrix artifact integrity",
+      "bead": "bd-3ar8v.6.1",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/perf/reports/opportunity_matrix.json",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- opportunity_matrix_gate_passes_on_consistent_contract_shape --nocapture --exact"
+    },
+    {
+      "id": "parameter_sweeps",
+      "name": "Parameter sweeps artifact integrity",
+      "bead": "bd-3ar8v.6.2",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/perf/reports/parameter_sweeps.json",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- parameter_sweeps_gate_passes_on_consistent_contract_shape --nocapture --exact"
+    },
+    {
+      "id": "conformance_stress_lineage",
+      "name": "Conformance+stress lineage coherence",
+      "bead": "bd-3ar8v.6.3",
+      "status": "pass",
+      "blocking": true,
+      "artifact_path": "tests/perf/reports/stress_triage.json",
+      "detail": "Conformance+stress lineage coherence validated: both artifacts carry run_id and correlation_id",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact"
+    },
+    {
       "id": "waiver_lifecycle",
       "name": "Waiver lifecycle compliance",
       "bead": "bd-1f42.8.8.1",
@@ -152,19 +199,19 @@
   },
   "waivers_applied": [],
   "summary": {
-    "total_gates": 15,
-    "passed": 15,
-    "failed": 0,
+    "total_gates": 20,
+    "passed": 19,
+    "failed": 1,
     "warned": 0,
     "skipped": 0,
     "waived": 0,
-    "blocking_pass": 9,
-    "blocking_total": 9,
-    "all_blocking_pass": true
+    "blocking_pass": 13,
+    "blocking_total": 14,
+    "all_blocking_pass": false
   },
   "promotion_rules": {
-    "can_promote": true,
-    "blocker_gates": [],
+    "can_promote": false,
+    "blocker_gates": ["practical_finish"],
     "waiver_gates": [],
     "conditions": [
       "All blocking gates pass (including waivers)"
