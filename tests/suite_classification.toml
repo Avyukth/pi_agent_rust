@@ -35,6 +35,7 @@ files = [
     "franken_node_kernel_extraction_boundary_manifest",
     "franken_node_package_interop_contract",
     "franken_node_runtime_substrate_contract",
+    "franken_node_security_sandbox_contract",
     "franken_node_semantic_compat_contract",
     "fuzz_regression",
     "fuzz_regression_generated",
