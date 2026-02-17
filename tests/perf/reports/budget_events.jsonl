@@ -7,7 +7,7 @@
 {"budget_name":"tool_call_throughput_min","category":"tool_call","threshold":5000.0,"unit":"calls/sec","actual":null,"status":"NO_DATA","source":"no pijs_workload data","ci_enforced":true}
 {"budget_name":"event_dispatch_p99","category":"event_dispatch","threshold":5000.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no scenario_runner data for event_dispatch","ci_enforced":false}
 {"budget_name":"policy_eval_p99","category":"policy","threshold":500.0,"unit":"ns","actual":null,"status":"NO_DATA","source":"no criterion data for policy eval","ci_enforced":true}
-{"budget_name":"idle_memory_rss","category":"memory","threshold":50.0,"unit":"MB","actual":9.6171875,"status":"PASS","source":"sysinfo: current process RSS","ci_enforced":true}
+{"budget_name":"idle_memory_rss","category":"memory","threshold":50.0,"unit":"MB","actual":10.56640625,"status":"PASS","source":"sysinfo: current process RSS","ci_enforced":true}
 {"budget_name":"sustained_load_rss_growth","category":"memory","threshold":5.0,"unit":"percent","actual":0.0,"status":"PASS","source":"tests/perf/reports/stress_triage.json","ci_enforced":false}
-{"budget_name":"binary_size_release","category":"binary","threshold":22.0,"unit":"MB","actual":488.94715881347656,"status":"FAIL","source":"/data/tmp/pi_agent_rust/opus_isolated/debug/pi","ci_enforced":true}
+{"budget_name":"binary_size_release","category":"binary","threshold":22.0,"unit":"MB","actual":null,"status":"NO_DATA","source":"no candidate pi binary found","ci_enforced":true}
 {"budget_name":"protocol_parse_p99","category":"protocol","threshold":50.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no criterion data for protocol parse","ci_enforced":true}

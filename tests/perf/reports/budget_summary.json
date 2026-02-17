@@ -119,11 +119,11 @@
     }
   ],
   "ci_enforced": 8,
-  "ci_fail": 1,
-  "ci_no_data": 6,
-  "ci_with_data": 2,
-  "data_contract_failures_count": 7,
-  "fail": 1,
+  "ci_fail": 0,
+  "ci_no_data": 7,
+  "ci_with_data": 1,
+  "data_contract_failures_count": 8,
+  "fail": 0,
   "failing_data_contracts": [
     {
       "budget_name": "startup_version_p95",
@@ -156,6 +156,12 @@
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
+      "budget_name": "binary_size_release",
+      "contract_id": "missing_or_stale_budget_artifact",
+      "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]",
+      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
+    },
+    {
       "budget_name": "protocol_parse_p99",
       "contract_id": "missing_or_stale_budget_artifact",
       "detail": "missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
@@ -168,8 +174,8 @@
       "remediation": "Generate fresh extension_benchmark_stratification.json in the current perf run."
     }
   ],
-  "generated_at": "2026-02-16T19:20:03.912597056+00:00",
-  "no_data": 9,
+  "generated_at": "2026-02-17T02:36:05.897705480+00:00",
+  "no_data": 10,
   "pass": 3,
   "schema": "pi.perf.budget_summary.v1",
   "total_budgets": 13

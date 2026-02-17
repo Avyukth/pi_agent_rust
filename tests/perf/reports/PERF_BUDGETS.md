@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-16T19:20:03Z
+> Generated: 2026-02-17T02:36:05Z
 
 ## Summary
 
@@ -8,14 +8,14 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| CI-enforced with data | 2 |
-| CI-enforced FAIL | 1 |
-| CI-enforced NO_DATA | 6 |
+| CI-enforced with data | 1 |
+| CI-enforced FAIL | 0 |
+| CI-enforced NO_DATA | 7 |
 | PASS | 3 |
-| FAIL | 1 |
-| No data | 9 |
+| FAIL | 0 |
+| No data | 10 |
 
-| Failing data contracts | 7 |
+| Failing data contracts | 8 |
 
 ## Startup
 
@@ -55,14 +55,14 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 9.6 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 10.6 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 22 MB | 488.9 | FAIL | Yes |
+| `binary_size_release` | release binary size | 22 MB | - | NO_DATA | Yes |
 
 ## Protocol
 
@@ -81,6 +81,8 @@
 - `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
 - `missing_or_stale_budget_artifact` (`policy_eval_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]
+  - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
+- `missing_or_stale_budget_artifact` (`binary_size_release`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
 - `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
