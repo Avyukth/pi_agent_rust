@@ -1544,7 +1544,7 @@ impl Session {
                     let path_for_thread = path_clone.clone();
                     let handle = thread::spawn(move || {
                         let entries = entries_to_save;
-                        let res = (|| -> Result<()> {
+                        let res: Result<()> = {
                             let parent = path_for_thread.parent().unwrap_or_else(|| Path::new("."));
                             let temp_file = tempfile::NamedTempFile::new_in(parent)?;
                             {
@@ -1570,7 +1570,7 @@ impl Session {
                                 session_name,
                             );
                             Ok(())
-                        })();
+                        };
                         let cx = AgentCx::for_request();
                         let _ = tx.send(
                             cx.cx(),
