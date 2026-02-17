@@ -83,12 +83,16 @@ fn parse_truthy_flag(value: &str) -> bool {
     )
 }
 
-fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
+fn is_global_compat_scan_mode() -> bool {
     cfg!(feature = "ext-conformance")
+        || std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| parse_truthy_flag(&value))
+}
+
+fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
+    is_global_compat_scan_mode()
         || env
             .get("PI_EXT_COMPAT_SCAN")
             .is_some_and(|value| parse_truthy_flag(value))
-        || std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| parse_truthy_flag(&value))
 }
 
 /// Compatibility-mode fallback values for environment-gated extension registration.
@@ -4720,6 +4724,7 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
         "crypto" | "node:crypto" => Some("node:crypto"),
         "http" | "node:http" => Some("node:http"),
         "https" | "node:https" => Some("node:https"),
+        "http2" | "node:http2" => Some("node:http2"),
         "util" | "node:util" => Some("node:util"),
         "readline" | "node:readline" => Some("node:readline"),
         "url" | "node:url" => Some("node:url"),
@@ -4728,11 +4733,20 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
         "buffer" | "node:buffer" => Some("node:buffer"),
         "assert" | "node:assert" => Some("node:assert"),
         "stream" | "node:stream" => Some("node:stream"),
+        "stream/web" | "node:stream/web" => Some("node:stream/web"),
         "module" | "node:module" => Some("node:module"),
         "string_decoder" | "node:string_decoder" => Some("node:string_decoder"),
         "querystring" | "node:querystring" => Some("node:querystring"),
         "process" | "node:process" => Some("node:process"),
         "stream/promises" | "node:stream/promises" => Some("node:stream/promises"),
+        "constants" | "node:constants" => Some("node:constants"),
+        "tls" | "node:tls" => Some("node:tls"),
+        "tty" | "node:tty" => Some("node:tty"),
+        "zlib" | "node:zlib" => Some("node:zlib"),
+        "perf_hooks" | "node:perf_hooks" => Some("node:perf_hooks"),
+        "vm" | "node:vm" => Some("node:vm"),
+        "v8" | "node:v8" => Some("node:v8"),
+        "worker_threads" | "node:worker_threads" => Some("node:worker_threads"),
         _ => None,
     }
 }
@@ -5011,6 +5025,123 @@ const __stub = new Proxy(function __pijs_noop() {{}}, __handler);
     source
 }
 
+fn builtin_specifier_aliases(spec: &str, canonical: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_alias = |candidate: &str| {
+        if candidate.is_empty() {
+            return;
+        }
+        if seen.insert(candidate.to_string()) {
+            aliases.push(candidate.to_string());
+        }
+    };
+
+    push_alias(spec);
+    push_alias(canonical);
+
+    if let Some(bare) = spec.strip_prefix("node:") {
+        push_alias(bare);
+    }
+    if let Some(bare) = canonical.strip_prefix("node:") {
+        push_alias(bare);
+    }
+
+    aliases
+}
+
+fn extract_builtin_import_names(source: &str, spec: &str, canonical: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for alias in builtin_specifier_aliases(spec, canonical) {
+        for name in extract_import_names(source, &alias) {
+            if name == "default" || name == "__esModule" {
+                continue;
+            }
+            if is_valid_js_export_name(&name) {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
+fn generate_builtin_compat_overlay_module(
+    canonical: &str,
+    named_exports: &BTreeSet<String>,
+) -> String {
+    let spec_literal =
+        serde_json::to_string(canonical).unwrap_or_else(|_| "\"node:unknown\"".to_string());
+    let mut source = format!(
+        r"// Auto-generated Node builtin compatibility overlay for {canonical}
+import * as __pijs_builtin_ns from {spec_literal};
+const __pijs_builtin_default =
+  __pijs_builtin_ns.default !== undefined ? __pijs_builtin_ns.default : __pijs_builtin_ns;
+export default __pijs_builtin_default;
+"
+    );
+
+    for name in named_exports {
+        if !is_valid_js_export_name(name) || name == "default" || name == "__esModule" {
+            continue;
+        }
+        let _ = writeln!(
+            source,
+            "export const {name} = __pijs_builtin_ns.{name} !== undefined ? __pijs_builtin_ns.{name} : (__pijs_builtin_default && __pijs_builtin_default.{name});"
+        );
+    }
+
+    source.push_str("export const __esModule = true;\n");
+    source
+}
+
+fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    let short = &digest[..16];
+    format!("pijs-compat://builtin/{canonical}/{short}")
+}
+
+fn maybe_register_builtin_compat_overlay(
+    state: &mut PiJsModuleState,
+    base: &str,
+    spec: &str,
+    canonical: &str,
+) -> Option<String> {
+    if !canonical.starts_with("node:") {
+        return None;
+    }
+
+    let source = std::fs::read_to_string(base).ok()?;
+    let extracted_names = extract_builtin_import_names(&source, spec, canonical);
+    if extracted_names.is_empty() {
+        return None;
+    }
+
+    let overlay_key = builtin_overlay_module_key(base, canonical);
+    let needs_rebuild = state
+        .dynamic_virtual_named_exports
+        .get(&overlay_key)
+        .is_none_or(|existing| existing != &extracted_names)
+        || !state.dynamic_virtual_modules.contains_key(&overlay_key);
+
+    if needs_rebuild {
+        state
+            .dynamic_virtual_named_exports
+            .insert(overlay_key.clone(), extracted_names.clone());
+        let overlay = generate_builtin_compat_overlay_module(canonical, &extracted_names);
+        state
+            .dynamic_virtual_modules
+            .insert(overlay_key.clone(), overlay);
+        if state.compiled_sources.remove(&overlay_key).is_some() {
+            state.module_cache_counters.invalidations =
+                state.module_cache_counters.invalidations.saturating_add(1);
+        }
+    }
+
+    Some(overlay_key)
+}
+
 impl JsModuleResolver for PiJsResolver {
     #[allow(clippy::too_many_lines)]
     fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
@@ -5021,15 +5152,31 @@ impl JsModuleResolver for PiJsResolver {
 
         // Alias bare Node.js builtins to their node: prefixed virtual modules.
         let canonical = canonical_node_builtin(spec).unwrap_or(spec);
+        let compat_scan_mode = is_global_compat_scan_mode();
 
-        let state = self.state.borrow();
-        if state.dynamic_virtual_modules.contains_key(canonical)
-            || state.static_virtual_modules.contains_key(canonical)
-        {
-            return Ok(canonical.to_string());
-        }
-        let repair_mode = state.repair_mode;
-        drop(state);
+        let repair_mode = {
+            let mut state = self.state.borrow_mut();
+            if state.dynamic_virtual_modules.contains_key(canonical)
+                || state.static_virtual_modules.contains_key(canonical)
+            {
+                if compat_scan_mode
+                    && let Some(overlay_key) =
+                        maybe_register_builtin_compat_overlay(&mut state, base, spec, canonical)
+                {
+                    tracing::debug!(
+                        event = "pijs.compat.builtin_overlay",
+                        base = %base,
+                        specifier = %spec,
+                        canonical = %canonical,
+                        overlay = %overlay_key,
+                        "compat overlay for builtin named imports"
+                    );
+                    return Ok(overlay_key);
+                }
+                return Ok(canonical.to_string());
+            }
+            state.repair_mode
+        };
 
         if let Some(path) = resolve_module_path(base, spec, repair_mode) {
             // Canonicalize to collapse `.` / `..` segments and normalise
@@ -5096,10 +5243,14 @@ impl JsModuleResolver for PiJsResolver {
         }
 
         // Pattern 4 (bd-k5q5.8.5): proxy-based stubs for allowlisted npm deps.
-        // This only fires in aggressive mode and never for blocklisted/system
-        // packages. Existing hand-written virtual modules continue to win
-        // because we only reach this branch after the initial lookup misses.
-        if is_bare_package_specifier(spec) && repair_mode.allows_aggressive() {
+        // This fires in aggressive mode, and also in compatibility-scan mode
+        // (ext-conformance / PI_EXT_COMPAT_SCAN) so corpus runs can continue
+        // past optional or non-essential package holes deterministically.
+        // Blocklisted/system packages are never stubbed. Existing hand-written
+        // virtual modules continue to win because we only reach this branch
+        // after the initial lookup misses.
+        if is_bare_package_specifier(spec) && (repair_mode.allows_aggressive() || compat_scan_mode)
+        {
             let state = self.state.borrow();
             let roots = state.extension_roots.clone();
             let tiers = state.extension_root_tiers.clone();
@@ -5629,7 +5780,7 @@ static IMPORT_NAMES_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock:
 
 fn import_names_regex() -> &'static regex::Regex {
     IMPORT_NAMES_RE.get_or_init(|| {
-        regex::Regex::new(r#"(?m)import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
+        regex::Regex::new(r#"(?ms)import\s+(?:[^{};]*?,\s*)?\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]"#)
             .expect("import names regex")
     })
 }
@@ -5776,8 +5927,6 @@ pub fn generate_monorepo_stub(names: &[String]) -> String {
     lines.join("\n")
 }
 
-static REQUIRE_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-
 fn source_declares_binding(source: &str, name: &str) -> bool {
     let patterns = [
         format!("const {name}"),
@@ -5798,6 +5947,187 @@ fn source_declares_binding(source: &str, name: &str) -> bool {
         }
         patterns.iter().any(|pattern| trimmed.starts_with(pattern))
     })
+}
+
+/// Extract static `require("specifier")` calls from JavaScript source.
+///
+/// This scanner is intentionally lexical: it ignores matches inside comments
+/// and string/template literals so code-generation strings like
+/// `` `require("pkg/path").default` `` do not become false-positive imports.
+#[allow(clippy::too_many_lines)]
+fn extract_static_require_specifiers(source: &str) -> Vec<String> {
+    const REQUIRE: &[u8] = b"require";
+
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    let mut i = 0usize;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_template = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if in_line_comment {
+            if b == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_block_comment {
+            if b == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_single {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_double = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_template {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'`' {
+                in_template = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'/' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'/' => {
+                    in_line_comment = true;
+                    i += 2;
+                    continue;
+                }
+                b'*' => {
+                    in_block_comment = true;
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        if b == b'\'' {
+            in_single = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = true;
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            in_template = true;
+            i += 1;
+            continue;
+        }
+
+        if i + REQUIRE.len() <= bytes.len() && &bytes[i..i + REQUIRE.len()] == REQUIRE {
+            let has_ident_before = i > 0 && is_js_ident_continue(bytes[i - 1]);
+            let after_ident_idx = i + REQUIRE.len();
+            let has_ident_after =
+                after_ident_idx < bytes.len() && is_js_ident_continue(bytes[after_ident_idx]);
+            if has_ident_before || has_ident_after {
+                i += 1;
+                continue;
+            }
+
+            let mut j = after_ident_idx;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || bytes[j] != b'(' {
+                i += 1;
+                continue;
+            }
+
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+                i += 1;
+                continue;
+            }
+
+            let quote = bytes[j];
+            let spec_start = j + 1;
+            j += 1;
+            let mut lit_escaped = false;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if lit_escaped {
+                    lit_escaped = false;
+                    j += 1;
+                    continue;
+                }
+                if c == b'\\' {
+                    lit_escaped = true;
+                    j += 1;
+                    continue;
+                }
+                if c == quote {
+                    break;
+                }
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+
+            let spec = &source[spec_start..j];
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b')' && seen.insert(spec.to_string()) {
+                out.push(spec.to_string());
+                i = j + 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    out
 }
 
 /// Detect if a JavaScript source uses CommonJS patterns (`require(...)` or
@@ -5829,17 +6159,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_export_default = source.contains("export default");
 
     // Extract all require() specifiers
-    let mut specifiers: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    let re = REQUIRE_CALL_RE.get_or_init(|| {
-        regex::Regex::new(r#"require\(\s*["']([^"']+)["']\s*\)"#).expect("require regex")
-    });
-    for cap in re.captures_iter(source) {
-        let spec = cap[1].to_string();
-        if seen.insert(spec.clone()) {
-            specifiers.push(spec);
-        }
-    }
+    let specifiers = extract_static_require_specifiers(source);
 
     if specifiers.is_empty() && !has_module_exports && !has_exports_usage && !has_dirname_refs {
         return source.to_string();
@@ -8175,9 +8495,27 @@ import * as url from "node:url";
 import * as processMod from "node:process";
 import * as buffer from "node:buffer";
 import * as childProcess from "node:child_process";
+import * as http from "node:http";
+import * as https from "node:https";
+import * as net from "node:net";
+import * as events from "node:events";
 import * as stream from "node:stream";
 import * as streamPromises from "node:stream/promises";
+import * as streamWeb from "node:stream/web";
 import * as stringDecoder from "node:string_decoder";
+import * as http2 from "node:http2";
+import * as util from "node:util";
+import * as readline from "node:readline";
+import * as querystring from "node:querystring";
+import * as assertMod from "node:assert";
+import * as constantsMod from "node:constants";
+import * as tls from "node:tls";
+import * as tty from "node:tty";
+import * as zlib from "node:zlib";
+import * as perfHooks from "node:perf_hooks";
+import * as vm from "node:vm";
+import * as v8 from "node:v8";
+import * as workerThreads from "node:worker_threads";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -8209,15 +8547,72 @@ function __normalizeBuiltin(id) {
     case "child_process":
     case "node:child_process":
       return "node:child_process";
+    case "http":
+    case "node:http":
+      return "node:http";
+    case "https":
+    case "node:https":
+      return "node:https";
+    case "net":
+    case "node:net":
+      return "node:net";
+    case "events":
+    case "node:events":
+      return "node:events";
     case "stream":
     case "node:stream":
       return "node:stream";
+    case "stream/web":
+    case "node:stream/web":
+      return "node:stream/web";
     case "stream/promises":
     case "node:stream/promises":
       return "node:stream/promises";
     case "string_decoder":
     case "node:string_decoder":
       return "node:string_decoder";
+    case "http2":
+    case "node:http2":
+      return "node:http2";
+    case "util":
+    case "node:util":
+      return "node:util";
+    case "readline":
+    case "node:readline":
+      return "node:readline";
+    case "querystring":
+    case "node:querystring":
+      return "node:querystring";
+    case "assert":
+    case "node:assert":
+      return "node:assert";
+    case "module":
+    case "node:module":
+      return "node:module";
+    case "constants":
+    case "node:constants":
+      return "node:constants";
+    case "tls":
+    case "node:tls":
+      return "node:tls";
+    case "tty":
+    case "node:tty":
+      return "node:tty";
+    case "zlib":
+    case "node:zlib":
+      return "node:zlib";
+    case "perf_hooks":
+    case "node:perf_hooks":
+      return "node:perf_hooks";
+    case "vm":
+    case "node:vm":
+      return "node:vm";
+    case "v8":
+    case "node:v8":
+      return "node:v8";
+    case "worker_threads":
+    case "node:worker_threads":
+      return "node:worker_threads";
     default:
       return spec;
   }
@@ -8233,19 +8628,90 @@ const __builtinModules = {
   "node:process": processMod,
   "node:buffer": buffer,
   "node:child_process": childProcess,
+  "node:http": http,
+  "node:https": https,
+  "node:net": net,
+  "node:events": events,
   "node:stream": stream,
+  "node:stream/web": streamWeb,
   "node:stream/promises": streamPromises,
   "node:string_decoder": stringDecoder,
+  "node:http2": http2,
+  "node:util": util,
+  "node:readline": readline,
+  "node:querystring": querystring,
+  "node:assert": assertMod,
+  "node:module": { createRequire },
+  "node:constants": constantsMod,
+  "node:tls": tls,
+  "node:tty": tty,
+  "node:zlib": zlib,
+  "node:perf_hooks": perfHooks,
+  "node:vm": vm,
+  "node:v8": v8,
+  "node:worker_threads": workerThreads,
 };
+
+const __missingRequireCache = Object.create(null);
+
+function __isBarePackageSpecifier(spec) {
+  return (
+    typeof spec === "string" &&
+    spec.length > 0 &&
+    !spec.startsWith("./") &&
+    !spec.startsWith("../") &&
+    !spec.startsWith("/") &&
+    !spec.startsWith("file://") &&
+    !spec.includes(":")
+  );
+}
+
+function __makeMissingRequireStub(spec) {
+  if (__missingRequireCache[spec]) {
+    return __missingRequireCache[spec];
+  }
+  const handler = {
+    get(_target, prop) {
+      if (typeof prop === "symbol") {
+        if (prop === Symbol.toPrimitive) return () => "";
+        return undefined;
+      }
+      if (prop === "__esModule") return true;
+      if (prop === "default") return stub;
+      if (prop === "toString") return () => "";
+      if (prop === "valueOf") return () => "";
+      if (prop === "name") return spec;
+      if (prop === "then") return undefined;
+      return stub;
+    },
+    apply() { return stub; },
+    construct() { return stub; },
+    has() { return false; },
+    ownKeys() { return []; },
+    getOwnPropertyDescriptor() {
+      return { configurable: true, enumerable: false };
+    },
+  };
+  const stub = new Proxy(function __pijs_missing_require_stub() {}, handler);
+  __missingRequireCache[spec] = stub;
+  return stub;
+}
 
 export function createRequire(_path) {
   function require(id) {
     const normalized = __normalizeBuiltin(id);
     const builtIn = __builtinModules[normalized];
     if (builtIn) {
+      if (builtIn && Object.prototype.hasOwnProperty.call(builtIn, "default") && builtIn.default !== undefined) {
+        return builtIn.default;
+      }
       return builtIn;
     }
-    throw new Error(`Cannot find module '${String(id ?? "")}' in PiJS require()`);
+    const raw = String(id ?? "");
+    if (raw.startsWith("node:") || __isBarePackageSpecifier(raw)) {
+      return __makeMissingRequireStub(raw);
+    }
+    throw new Error(`Cannot find module '${raw}' in PiJS require()`);
   }
   require.resolve = function resolve(id) {
     // Return a synthetic path for the requested module.  This satisfies
@@ -9314,6 +9780,80 @@ export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, readlink, 
     );
 
     modules.insert(
+        "node:http2".to_string(),
+        r#"
+import EventEmitter from "node:events";
+
+export const constants = {
+  HTTP2_HEADER_STATUS: ":status",
+  HTTP2_HEADER_METHOD: ":method",
+  HTTP2_HEADER_PATH: ":path",
+  HTTP2_HEADER_AUTHORITY: ":authority",
+  HTTP2_HEADER_SCHEME: ":scheme",
+  HTTP2_HEADER_PROTOCOL: ":protocol",
+  HTTP2_HEADER_CONTENT_TYPE: "content-type",
+  NGHTTP2_CANCEL: 8,
+};
+
+function __makeStream() {
+  const stream = new EventEmitter();
+  stream.end = (_data, _encoding, cb) => {
+    if (typeof cb === "function") cb();
+    stream.emit("finish");
+  };
+  stream.close = () => stream.emit("close");
+  stream.destroy = (err) => {
+    if (err) stream.emit("error", err);
+    stream.emit("close");
+  };
+  stream.respond = () => {};
+  stream.setEncoding = () => stream;
+  stream.setTimeout = (_ms, cb) => {
+    if (typeof cb === "function") cb();
+    return stream;
+  };
+  return stream;
+}
+
+function __makeSession() {
+  const session = new EventEmitter();
+  session.closed = false;
+  session.connecting = false;
+  session.request = (_headers, _opts) => __makeStream();
+  session.close = () => {
+    session.closed = true;
+    session.emit("close");
+  };
+  session.destroy = (err) => {
+    session.closed = true;
+    if (err) session.emit("error", err);
+    session.emit("close");
+  };
+  session.ref = () => session;
+  session.unref = () => session;
+  return session;
+}
+
+export function connect(_authority, _options, listener) {
+  const session = __makeSession();
+  if (typeof listener === "function") {
+    try {
+      listener(session);
+    } catch (_err) {}
+  }
+  return session;
+}
+
+export class ClientHttp2Session extends EventEmitter {}
+export class ClientHttp2Stream extends EventEmitter {}
+
+export default { connect, constants, ClientHttp2Session, ClientHttp2Stream };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
         "node:util".to_string(),
         r#"
 export function inspect(value, opts) {
@@ -9372,7 +9912,22 @@ export function deprecate(fn, msg) {
     return fn.apply(this, args);
   };
 }
-export function inherits(ctor, superCtor) { Object.setPrototypeOf(ctor.prototype, superCtor.prototype); }
+export function inherits(ctor, superCtor) {
+  if (!ctor || !superCtor) return ctor;
+  const ctorProto = ctor && ctor.prototype;
+  const superProto = superCtor && superCtor.prototype;
+  if (!ctorProto || !superProto || typeof ctorProto !== 'object' || typeof superProto !== 'object') {
+    try { ctor.super_ = superCtor; } catch (_) {}
+    return ctor;
+  }
+  try {
+    Object.setPrototypeOf(ctorProto, superProto);
+    ctor.super_ = superCtor;
+  } catch (_) {
+    try { ctor.super_ = superCtor; } catch (_ignored) {}
+  }
+  return ctor;
+}
 export function debuglog(section) {
   const env = (typeof process !== 'undefined' && process.env && process.env.NODE_DEBUG) || '';
   const enabled = env.split(',').some(s => s.trim().toLowerCase() === (section || '').toLowerCase());
@@ -9645,6 +10200,16 @@ export function connect(_opts, _callback) {
   throw new Error('node:net.connect is not available in PiJS');
 }
 
+export function isIP(input) {
+  const value = String(input ?? '');
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) return 4;
+  if (/^[0-9a-fA-F:]+$/.test(value) && value.includes(':')) return 6;
+  return 0;
+}
+
+export function isIPv4(input) { return isIP(input) === 4; }
+export function isIPv6(input) { return isIP(input) === 6; }
+
 export class Socket {
   constructor() {
     throw new Error('node:net.Socket is not available in PiJS');
@@ -9657,7 +10222,7 @@ export class Server {
   }
 }
 
-export default { createConnection, createServer, connect, Socket, Server };
+export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, Socket, Server };
 "
         .trim()
         .to_string(),
@@ -10379,8 +10944,81 @@ class PassThrough extends Transform {
   _transform(chunk, _encoding, callback) { callback(null, chunk); }
 }
 
-export { Stream, Readable, Writable, Duplex, Transform, PassThrough };
-export default { Stream, Readable, Writable, Duplex, Transform, PassThrough };
+function finished(stream, callback) {
+  if (!stream || typeof stream.on !== "function") {
+    const err = new Error("finished expects a stream-like object");
+    if (typeof callback === "function") callback(err);
+    return Promise.reject(err);
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      stream.removeListener?.("finish", onDone);
+      stream.removeListener?.("end", onDone);
+      stream.removeListener?.("close", onDone);
+      stream.removeListener?.("error", onError);
+    };
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
+    const onDone = () => {
+      if (typeof callback === "function") callback(null, stream);
+      settle(resolve, stream);
+    };
+    const onError = (err) => {
+      const normalized = __streamToError(err);
+      if (typeof callback === "function") callback(normalized);
+      settle(reject, normalized);
+    };
+    stream.on("finish", onDone);
+    stream.on("end", onDone);
+    stream.on("close", onDone);
+    stream.on("error", onError);
+  });
+}
+
+function pipeline(...args) {
+  const callback = typeof args[args.length - 1] === "function" ? args.pop() : null;
+  const streams = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;
+  if (!Array.isArray(streams) || streams.length < 2) {
+    const err = new Error("pipeline requires at least two streams");
+    if (callback) callback(err);
+    throw err;
+  }
+
+  for (let i = 0; i < streams.length - 1; i += 1) {
+    streams[i].pipe(streams[i + 1]);
+  }
+  const last = streams[streams.length - 1];
+  const done = (err) => {
+    if (callback) callback(err || null, last);
+  };
+  last.on?.("finish", () => done(null));
+  last.on?.("end", () => done(null));
+  last.on?.("error", (err) => done(__streamToError(err)));
+  return last;
+}
+
+const promises = {
+  pipeline: (...args) =>
+    new Promise((resolve, reject) => {
+      try {
+        pipeline(...args, (err, stream) => {
+          if (err) reject(err);
+          else resolve(stream);
+        });
+      } catch (err) {
+        reject(__streamToError(err));
+      }
+    }),
+  finished: (stream) => finished(stream),
+};
+
+export { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
+export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
 "#
         .trim()
         .to_string(),
@@ -10517,6 +11155,46 @@ export default { pipeline, finished };
         .to_string(),
     );
 
+    // node:stream/web — bridge to global Web Streams when available
+    modules.insert(
+        "node:stream/web".to_string(),
+        r"
+const _ReadableStream = globalThis.ReadableStream;
+const _WritableStream = globalThis.WritableStream;
+const _TransformStream = globalThis.TransformStream;
+const _TextEncoderStream = globalThis.TextEncoderStream;
+const _TextDecoderStream = globalThis.TextDecoderStream;
+const _CompressionStream = globalThis.CompressionStream;
+const _DecompressionStream = globalThis.DecompressionStream;
+const _ByteLengthQueuingStrategy = globalThis.ByteLengthQueuingStrategy;
+const _CountQueuingStrategy = globalThis.CountQueuingStrategy;
+
+export const ReadableStream = _ReadableStream;
+export const WritableStream = _WritableStream;
+export const TransformStream = _TransformStream;
+export const TextEncoderStream = _TextEncoderStream;
+export const TextDecoderStream = _TextDecoderStream;
+export const CompressionStream = _CompressionStream;
+export const DecompressionStream = _DecompressionStream;
+export const ByteLengthQueuingStrategy = _ByteLengthQueuingStrategy;
+export const CountQueuingStrategy = _CountQueuingStrategy;
+
+export default {
+  ReadableStream,
+  WritableStream,
+  TransformStream,
+  TextEncoderStream,
+  TextDecoderStream,
+  CompressionStream,
+  DecompressionStream,
+  ByteLengthQueuingStrategy,
+  CountQueuingStrategy,
+};
+"
+        .trim()
+        .to_string(),
+    );
+
     // node:string_decoder — often imported by stream consumers
     modules.insert(
         "node:string_decoder".to_string(),
@@ -10569,6 +11247,269 @@ export const encode = stringify;
 export function escape(str) { return encodeURIComponent(str); }
 export function unescape(str) { return decodeURIComponent(str); }
 export default { parse, stringify, decode, encode, escape, unescape };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:constants — compatibility map for libraries probing process constants
+    modules.insert(
+        "node:constants".to_string(),
+        r"
+const _constants = {
+  EOL: '\n',
+  F_OK: 0,
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+  UV_UDP_REUSEADDR: 4,
+  SSL_OP_NO_SSLv2: 0,
+  SSL_OP_NO_SSLv3: 0,
+  SSL_OP_NO_TLSv1: 0,
+  SSL_OP_NO_TLSv1_1: 0,
+};
+
+const constants = new Proxy(_constants, {
+  get(target, prop) {
+    if (prop in target) return target[prop];
+    return 0;
+  },
+});
+
+export default constants;
+export { constants };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:tty — terminal capability probes
+    modules.insert(
+        "node:tty".to_string(),
+        r"
+import EventEmitter from 'node:events';
+
+export function isatty(_fd) { return false; }
+
+export class ReadStream extends EventEmitter {
+  constructor(_fd) {
+    super();
+    this.isTTY = false;
+    this.columns = 80;
+    this.rows = 24;
+  }
+  setRawMode(_mode) { return this; }
+}
+
+export class WriteStream extends EventEmitter {
+  constructor(_fd) {
+    super();
+    this.isTTY = false;
+    this.columns = 80;
+    this.rows = 24;
+  }
+  getColorDepth() { return 1; }
+  hasColors() { return false; }
+  getWindowSize() { return [this.columns, this.rows]; }
+}
+
+export default { isatty, ReadStream, WriteStream };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:tls — secure socket APIs are intentionally unavailable in PiJS
+    modules.insert(
+        "node:tls".to_string(),
+        r"
+import EventEmitter from 'node:events';
+
+export const DEFAULT_MIN_VERSION = 'TLSv1.2';
+export const DEFAULT_MAX_VERSION = 'TLSv1.3';
+
+export class TLSSocket extends EventEmitter {
+  constructor(_socket, _options) {
+    super();
+    this.authorized = false;
+    this.encrypted = true;
+  }
+}
+
+export function connect(_portOrOptions, _host, _options, _callback) {
+  throw new Error('node:tls.connect is not available in PiJS');
+}
+
+export function createServer(_options, _secureConnectionListener) {
+  throw new Error('node:tls.createServer is not available in PiJS');
+}
+
+export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_MAX_VERSION };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:zlib — compression streams are not implemented in PiJS
+    modules.insert(
+        "node:zlib".to_string(),
+        r"
+const constants = {
+  Z_NO_COMPRESSION: 0,
+  Z_BEST_SPEED: 1,
+  Z_BEST_COMPRESSION: 9,
+  Z_DEFAULT_COMPRESSION: -1,
+};
+
+function unsupported(name) {
+  throw new Error(`node:zlib.${name} is not available in PiJS`);
+}
+
+export function gzip(_buffer, callback) {
+  if (typeof callback === 'function') callback(new Error('node:zlib.gzip is not available in PiJS'));
+}
+export function gunzip(_buffer, callback) {
+  if (typeof callback === 'function') callback(new Error('node:zlib.gunzip is not available in PiJS'));
+}
+
+export function createGzip() { unsupported('createGzip'); }
+export function createGunzip() { unsupported('createGunzip'); }
+export function createDeflate() { unsupported('createDeflate'); }
+export function createInflate() { unsupported('createInflate'); }
+export function createBrotliCompress() { unsupported('createBrotliCompress'); }
+export function createBrotliDecompress() { unsupported('createBrotliDecompress'); }
+
+export const promises = {
+  gzip: async () => { unsupported('promises.gzip'); },
+  gunzip: async () => { unsupported('promises.gunzip'); },
+};
+
+export default {
+  constants,
+  gzip,
+  gunzip,
+  createGzip,
+  createGunzip,
+  createDeflate,
+  createInflate,
+  createBrotliCompress,
+  createBrotliDecompress,
+  promises,
+};
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:perf_hooks — expose lightweight performance clock surface
+    modules.insert(
+        "node:perf_hooks".to_string(),
+        r"
+const perf =
+  globalThis.performance ||
+  {
+    now: () => Date.now(),
+    mark: () => {},
+    measure: () => {},
+    clearMarks: () => {},
+    clearMeasures: () => {},
+    getEntries: () => [],
+    getEntriesByType: () => [],
+    getEntriesByName: () => [],
+  };
+
+export const performance = perf;
+export const constants = {};
+export class PerformanceObserver {
+  constructor(_callback) {}
+  observe(_opts) {}
+  disconnect() {}
+}
+
+export default { performance, constants, PerformanceObserver };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:vm — disabled in PiJS for safety
+    modules.insert(
+        "node:vm".to_string(),
+        r"
+function unsupported(name) {
+  throw new Error(`node:vm.${name} is not available in PiJS`);
+}
+
+export function runInContext() { unsupported('runInContext'); }
+export function runInNewContext() { unsupported('runInNewContext'); }
+export function runInThisContext() { unsupported('runInThisContext'); }
+export function createContext(_sandbox) { return _sandbox || {}; }
+
+export class Script {
+  constructor(_code, _options) { unsupported('Script'); }
+}
+
+export default { runInContext, runInNewContext, runInThisContext, createContext, Script };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:v8 — lightweight serialization fallback used by some libs
+    modules.insert(
+        "node:v8".to_string(),
+        r"
+function __toBuffer(str) {
+  if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+    return Buffer.from(str, 'utf8');
+  }
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(str);
+  }
+  return str;
+}
+
+function __fromBuffer(buf) {
+  if (buf == null) return '';
+  if (typeof Buffer !== 'undefined' && typeof Buffer.isBuffer === 'function' && Buffer.isBuffer(buf)) {
+    return buf.toString('utf8');
+  }
+  if (buf instanceof Uint8Array && typeof TextDecoder !== 'undefined') {
+    return new TextDecoder().decode(buf);
+  }
+  return String(buf);
+}
+
+export function serialize(value) {
+  return __toBuffer(JSON.stringify(value));
+}
+
+export function deserialize(value) {
+  return JSON.parse(__fromBuffer(value));
+}
+
+export default { serialize, deserialize };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // node:worker_threads — workers are not supported in PiJS
+    modules.insert(
+        "node:worker_threads".to_string(),
+        r"
+export const isMainThread = true;
+export const threadId = 0;
+export const workerData = null;
+export const parentPort = null;
+
+export class Worker {
+  constructor(_filename, _options) {
+    throw new Error('node:worker_threads.Worker is not available in PiJS');
+  }
+}
+
+export default { isMainThread, threadId, workerData, parentPort, Worker };
 "
         .trim()
         .to_string(),
@@ -16156,6 +17097,11 @@ if (typeof globalThis.process === 'undefined') {
     // Do NOT freeze globalThis.process — extensions may need to monkey-patch it
 }
 
+// Node.js global alias compatibility.
+if (typeof globalThis.global === 'undefined') {
+    globalThis.global = globalThis;
+}
+
 if (typeof globalThis.Bun === 'undefined') {
     const __pi_bun_require = (specifier) => {
         try {
@@ -16568,6 +17514,118 @@ if (typeof globalThis.fetch !== 'function') {
     globalThis.Headers = Headers;
     globalThis.Response = Response;
 
+    if (typeof globalThis.Event === 'undefined') {
+        class Event {
+            constructor(type, options) {
+                const opts = options && typeof options === 'object' ? options : {};
+                this.type = String(type || '');
+                this.bubbles = !!opts.bubbles;
+                this.cancelable = !!opts.cancelable;
+                this.composed = !!opts.composed;
+                this.defaultPrevented = false;
+                this.target = null;
+                this.currentTarget = null;
+                this.timeStamp = Date.now();
+            }
+            preventDefault() {
+                if (this.cancelable) this.defaultPrevented = true;
+            }
+            stopPropagation() {}
+            stopImmediatePropagation() {}
+        }
+        globalThis.Event = Event;
+    }
+
+    if (typeof globalThis.CustomEvent === 'undefined' && typeof globalThis.Event === 'function') {
+        class CustomEvent extends globalThis.Event {
+            constructor(type, options) {
+                const opts = options && typeof options === 'object' ? options : {};
+                super(type, opts);
+                this.detail = opts.detail;
+            }
+        }
+        globalThis.CustomEvent = CustomEvent;
+    }
+
+    if (typeof globalThis.EventTarget === 'undefined') {
+        class EventTarget {
+            constructor() {
+                this.__listeners = Object.create(null);
+            }
+            addEventListener(type, listener) {
+                const key = String(type || '');
+                if (!key || !listener) return;
+                if (!this.__listeners[key]) this.__listeners[key] = [];
+                if (!this.__listeners[key].includes(listener)) this.__listeners[key].push(listener);
+            }
+            removeEventListener(type, listener) {
+                const key = String(type || '');
+                const list = this.__listeners[key];
+                if (!list || !listener) return;
+                this.__listeners[key] = list.filter((fn) => fn !== listener);
+            }
+            dispatchEvent(event) {
+                if (!event || typeof event.type !== 'string') return true;
+                const key = event.type;
+                const list = (this.__listeners[key] || []).slice();
+                try {
+                    event.target = this;
+                    event.currentTarget = this;
+                } catch (_) {}
+                for (const listener of list) {
+                    try {
+                        if (typeof listener === 'function') listener.call(this, event);
+                        else if (listener && typeof listener.handleEvent === 'function') listener.handleEvent(event);
+                    } catch (_) {}
+                }
+                return !(event && event.defaultPrevented);
+            }
+        }
+        globalThis.EventTarget = EventTarget;
+    }
+
+    if (typeof globalThis.TransformStream === 'undefined') {
+        class TransformStream {
+            constructor(_transformer) {
+                const queue = [];
+                let closed = false;
+                this.readable = {
+                    getReader() {
+                        return {
+                            async read() {
+                                if (queue.length > 0) {
+                                    return { done: false, value: queue.shift() };
+                                }
+                                return { done: closed, value: undefined };
+                            },
+                            async cancel() {
+                                closed = true;
+                            },
+                            releaseLock() {},
+                        };
+                    },
+                };
+                this.writable = {
+                    getWriter() {
+                        return {
+                            async write(chunk) {
+                                queue.push(chunk);
+                            },
+                            async close() {
+                                closed = true;
+                            },
+                            async abort() {
+                                closed = true;
+                            },
+                            releaseLock() {},
+                        };
+                    },
+                };
+            }
+        }
+        globalThis.TransformStream = TransformStream;
+    }
+
     // AbortController / AbortSignal polyfill — many npm packages check for these
     if (typeof globalThis.AbortController === 'undefined') {
         class AbortSignal {
@@ -16712,6 +17770,124 @@ mod tests {
             );
             clock.set(next_deadline);
         }
+    }
+
+    #[test]
+    fn extract_static_require_specifiers_skips_literals_and_comments() {
+        let source = r#"
+const fs = require("fs");
+const text = "require('left-pad')";
+const tpl = `require("ajv/dist/runtime/validation_error").default`;
+// require("zlib")
+/* require("tty") */
+const path = require('path');
+"#;
+
+        let specifiers = extract_static_require_specifiers(source);
+        assert_eq!(specifiers, vec!["fs".to_string(), "path".to_string()]);
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_ignores_codegen_string_requires() {
+        let source = r#"
+const fs = require("fs");
+const generated = `require("ajv/dist/runtime/validation_error").default`;
+module.exports = { fs, generated };
+"#;
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(rewritten.contains(r#"from "fs";"#));
+        assert!(!rewritten.contains(r#"from "ajv/dist/runtime/validation_error";"#));
+    }
+
+    #[test]
+    fn extract_import_names_handles_default_plus_named_imports() {
+        let source = r#"
+import Ajv, {
+  KeywordDefinition,
+  type AnySchema,
+  ValidationError as AjvValidationError,
+} from "ajv";
+"#;
+
+        let names = extract_import_names(source, "ajv");
+        assert_eq!(
+            names,
+            vec![
+                "KeywordDefinition".to_string(),
+                "ValidationError".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_builtin_import_names_collects_node_aliases() {
+        let source = r#"
+import { isIP } from "net";
+import { isIPv4 as netIsIpv4 } from "node:net";
+"#;
+        let names = extract_builtin_import_names(source, "node:net", "node:net");
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["isIP".to_string(), "isIPv4".to_string()]
+        );
+    }
+
+    #[test]
+    fn builtin_overlay_generation_scopes_exports_per_importing_module() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let base_a = temp_dir.path().join("a.mjs");
+        let base_b = temp_dir.path().join("b.mjs");
+        std::fs::write(&base_a, r#"import { isIP } from "net";"#).expect("write a");
+        std::fs::write(&base_b, r#"import { isIPv6 } from "node:net";"#).expect("write b");
+
+        let mut state = PiJsModuleState::new();
+        let overlay_a = maybe_register_builtin_compat_overlay(
+            &mut state,
+            base_a.to_string_lossy().as_ref(),
+            "net",
+            "node:net",
+        )
+        .expect("overlay key for a");
+        let overlay_b = maybe_register_builtin_compat_overlay(
+            &mut state,
+            base_b.to_string_lossy().as_ref(),
+            "node:net",
+            "node:net",
+        )
+        .expect("overlay key for b");
+        assert!(overlay_a.starts_with("pijs-compat://builtin/node:net/"));
+        assert!(overlay_b.starts_with("pijs-compat://builtin/node:net/"));
+        assert_ne!(overlay_a, overlay_b);
+
+        let exported_names_a = state
+            .dynamic_virtual_named_exports
+            .get(&overlay_a)
+            .expect("export names for a");
+        assert!(exported_names_a.contains("isIP"));
+        assert!(!exported_names_a.contains("isIPv6"));
+
+        let exported_names_b = state
+            .dynamic_virtual_named_exports
+            .get(&overlay_b)
+            .expect("export names for b");
+        assert!(exported_names_b.contains("isIPv6"));
+        assert!(!exported_names_b.contains("isIP"));
+
+        let overlay_source_a = state
+            .dynamic_virtual_modules
+            .get(&overlay_a)
+            .expect("overlay source for a");
+        assert!(overlay_source_a.contains(r#"import * as __pijs_builtin_ns from "node:net";"#));
+        assert!(overlay_source_a.contains("export const isIP ="));
+        assert!(!overlay_source_a.contains("export const isIPv6 ="));
+
+        let overlay_source_b = state
+            .dynamic_virtual_modules
+            .get(&overlay_b)
+            .expect("overlay source for b");
+        assert!(overlay_source_b.contains("export const isIPv6 ="));
+        assert!(!overlay_source_b.contains("export const isIP ="));
     }
 
     #[test]
@@ -19654,10 +20830,13 @@ export default ConfigLoader;
                         const path = require('path');
                         const fs = require('node:fs');
                         const crypto = require('crypto');
+                        const http2 = require('http2');
 
                         globalThis.requireResults.pathJoinWorks = path.join('a', 'b') === 'a/b';
                         globalThis.requireResults.fsReadFileSync = typeof fs.readFileSync === 'function';
                         globalThis.requireResults.cryptoHasRandomUUID = typeof crypto.randomUUID === 'function';
+                        globalThis.requireResults.http2HasConnect = typeof http2.connect === 'function';
+                        globalThis.requireResults.http2PathHeader = http2.constants.HTTP2_HEADER_PATH;
 
                         try {
                             require('left-pad');
@@ -19678,6 +20857,8 @@ export default ConfigLoader;
             assert_eq!(r["pathJoinWorks"], serde_json::json!(true));
             assert_eq!(r["fsReadFileSync"], serde_json::json!(true));
             assert_eq!(r["cryptoHasRandomUUID"], serde_json::json!(true));
+            assert_eq!(r["http2HasConnect"], serde_json::json!(true));
+            assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
             assert_eq!(r["missingModuleThrows"], serde_json::json!(true));
         });
     }
