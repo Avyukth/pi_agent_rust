@@ -670,7 +670,9 @@ cat > "$OUTPUT_DIR/manifest.json" <<EOF
     "pgo_pipeline": "pi.perf.pgo_pipeline_summary.v1",
     "extension_stratification": "pi.perf.extension_benchmark_stratification.v1",
     "cross_env_variance_diagnosis": "pi.perf.cross_env_variance_diagnosis.v1",
-    "phase1_matrix_validation": "pi.perf.phase1_matrix_validation.v1"
+    "phase1_matrix_validation": "pi.perf.phase1_matrix_validation.v1",
+    "parameter_sweeps": "pi.perf.parameter_sweeps.v1",
+    "opportunity_matrix": "pi.perf.opportunity_matrix.v1"
   },
   "output_dir": "$OUTPUT_DIR"
 }
@@ -1626,11 +1628,15 @@ fi
 log_phase "Phase 5f: Phase-1 Matrix Validation"
 
 PHASE1_MATRIX_PATH="$OUTPUT_DIR/results/phase1_matrix_validation.json"
+PARAMETER_SWEEPS_PATH="$OUTPUT_DIR/results/parameter_sweeps.json"
+OPPORTUNITY_MATRIX_PATH="$OUTPUT_DIR/results/opportunity_matrix.json"
 if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
   TIMESTAMP="$TIMESTAMP" \
   PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
+  PARAMETER_SWEEPS_PATH="$PARAMETER_SWEEPS_PATH" \
+  OPPORTUNITY_MATRIX_PATH="$OPPORTUNITY_MATRIX_PATH" \
   python3 - <<'PY'
 import json
 import os
@@ -1643,6 +1649,8 @@ project_root = Path(os.environ["PROJECT_ROOT"])
 correlation_id = os.environ["CORRELATION_ID"]
 timestamp = os.environ["TIMESTAMP"]
 phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
+parameter_sweeps_path = Path(os.environ["PARAMETER_SWEEPS_PATH"])
+opportunity_matrix_path = Path(os.environ["OPPORTUNITY_MATRIX_PATH"])
 
 manifest_path = output_dir / "manifest.json"
 scenario_runner_path = output_dir / "results" / "scenario_runner.jsonl"
@@ -2238,6 +2246,490 @@ weighted_bottleneck_attribution = compute_weighted_bottleneck_attribution(
     required_partitions,
 )
 
+
+def compute_parameter_sweep_sensitivity(
+    per_scale_rows: list[dict],
+    stage_order: list[str],
+) -> tuple[list[dict], list[dict]]:
+    stage_values: dict[str, list[float]] = {stage: [] for stage in stage_order}
+    per_scale_summary: list[dict] = []
+
+    for row in per_scale_rows:
+        if not isinstance(row, dict):
+            continue
+
+        session_messages = parse_int(row.get("session_messages"))
+        partitions = row.get("partitions", [])
+        if not isinstance(partitions, list):
+            partitions = []
+
+        per_stage_ranges = {}
+        for stage in stage_order:
+            observed = []
+            for partition in partitions:
+                if not isinstance(partition, dict):
+                    continue
+                stage_pct = partition.get("stage_pct")
+                if not isinstance(stage_pct, dict):
+                    continue
+                value = parse_float(stage_pct.get(stage))
+                if value is None:
+                    continue
+                observed.append(value)
+                stage_values[stage].append(value)
+
+            if observed:
+                min_pct = min(observed)
+                max_pct = max(observed)
+                per_stage_ranges[stage] = {
+                    "min_pct": min_pct,
+                    "max_pct": max_pct,
+                    "spread_pct": max_pct - min_pct,
+                    "sample_size": len(observed),
+                }
+            else:
+                per_stage_ranges[stage] = {
+                    "min_pct": None,
+                    "max_pct": None,
+                    "spread_pct": None,
+                    "sample_size": 0,
+                }
+
+        per_scale_summary.append(
+            {
+                "session_messages": session_messages,
+                "stage_ranges": per_stage_ranges,
+            }
+        )
+
+    global_stage_spread: list[dict] = []
+    for stage in stage_order:
+        values = stage_values.get(stage, [])
+        if values:
+            min_pct = min(values)
+            max_pct = max(values)
+            global_stage_spread.append(
+                {
+                    "stage": stage,
+                    "min_pct": min_pct,
+                    "max_pct": max_pct,
+                    "spread_pct": max_pct - min_pct,
+                    "sample_size": len(values),
+                }
+            )
+        else:
+            global_stage_spread.append(
+                {
+                    "stage": stage,
+                    "min_pct": None,
+                    "max_pct": None,
+                    "spread_pct": None,
+                    "sample_size": 0,
+                }
+            )
+
+    return per_scale_summary, global_stage_spread
+
+
+def compute_parameter_sweeps_artifact(
+    weighted: dict,
+    required_scales: list[int],
+    required_partition_tags: list[str],
+    readiness_gate_passed: bool,
+    source_artifact_path: Path,
+) -> dict:
+    weighted_status = str(weighted.get("status", "missing")).strip().lower()
+    weighted_schema = str(weighted.get("schema", "")).strip()
+
+    global_ranking = weighted.get("global_ranking")
+    if not isinstance(global_ranking, list):
+        global_ranking = []
+    per_scale = weighted.get("per_scale")
+    if not isinstance(per_scale, list):
+        per_scale = []
+
+    stage_order = []
+    for row in global_ranking:
+        if not isinstance(row, dict):
+            continue
+        stage = str(row.get("stage", "")).strip()
+        if stage and stage not in stage_order:
+            stage_order.append(stage)
+    if not stage_order:
+        stage_order = list(required_stage_keys)
+
+    top_stage = stage_order[0] if stage_order else "save_ms"
+
+    defaults_by_stage = {
+        "open_ms": {
+            "flush_cadence_ms": 1000,
+            "queue_max_items": 2048,
+            "compaction_quota_mb": 128,
+        },
+        "append_ms": {
+            "flush_cadence_ms": 750,
+            "queue_max_items": 4096,
+            "compaction_quota_mb": 128,
+        },
+        "save_ms": {
+            "flush_cadence_ms": 500,
+            "queue_max_items": 3072,
+            "compaction_quota_mb": 96,
+        },
+        "index_ms": {
+            "flush_cadence_ms": 1250,
+            "queue_max_items": 1536,
+            "compaction_quota_mb": 192,
+        },
+    }
+    selected_defaults = defaults_by_stage.get(top_stage, defaults_by_stage["save_ms"])
+
+    per_scale_summary, global_stage_spread = compute_parameter_sweep_sensitivity(
+        per_scale, stage_order
+    )
+
+    blocking_reasons = []
+    if weighted_status != "computed":
+        blocking_reasons.append("weighted_bottleneck_attribution_not_computed")
+    if not per_scale_summary:
+        blocking_reasons.append("missing_per_scale_sensitivity_inputs")
+    if not readiness_gate_passed:
+        blocking_reasons.append("phase1_matrix_not_ready_for_phase5")
+
+    top_stage_spread = next(
+        (
+            row.get("spread_pct")
+            for row in global_stage_spread
+            if isinstance(row, dict) and row.get("stage") == top_stage
+        ),
+        None,
+    )
+    stability = "insufficient_data"
+    if isinstance(top_stage_spread, (int, float)):
+        stability = "stable" if top_stage_spread <= 20.0 else "unstable"
+
+    readiness_ok = not blocking_reasons
+    readiness_status = "ready" if readiness_ok else "blocked"
+
+    return {
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "bead_id": "bd-3ar8v.6.2",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": str(source_artifact_path),
+            "weighted_bottleneck_schema": weighted_schema,
+            "weighted_bottleneck_status": weighted_status,
+        },
+        "objective": {
+            "primary_metric": "full_e2e_long_session.wall_clock_ms",
+            "secondary_metrics": [
+                "open_ms",
+                "append_ms",
+                "save_ms",
+                "index_ms",
+                "rust_vs_node_ratio",
+                "rust_vs_bun_ratio",
+            ],
+            "constraints": [
+                "memory_regression_guard=pass",
+                "correctness_regression_guard=pass",
+                "security_regression_guard=pass",
+            ],
+        },
+        "sweep_plan": {
+            "workload_partition_tags": required_partition_tags,
+            "session_message_sizes": required_scales,
+            "dimensions": [
+                {
+                    "name": "flush_cadence_ms",
+                    "candidate_values": [250, 500, 750, 1000, 1500, 2000],
+                },
+                {
+                    "name": "queue_max_items",
+                    "candidate_values": [512, 1024, 2048, 3072, 4096, 8192],
+                },
+                {
+                    "name": "compaction_quota_mb",
+                    "candidate_values": [32, 64, 96, 128, 192, 256],
+                },
+            ],
+            "analysis_method": "weighted_bottleneck_guided_grid",
+            "outlier_policy": "fail_closed_on_unstable_or_missing_weighted_inputs",
+        },
+        "selected_defaults": {
+            "flush_cadence_ms": selected_defaults["flush_cadence_ms"],
+            "queue_max_items": selected_defaults["queue_max_items"],
+            "compaction_quota_mb": selected_defaults["compaction_quota_mb"],
+            "selection_basis": f"top_stage={top_stage}",
+        },
+        "sensitivity_summary": {
+            "top_stage": top_stage,
+            "stability": stability,
+            "per_scale_stage_ranges": per_scale_summary,
+            "global_stage_spread": global_stage_spread,
+        },
+        "readiness": {
+            "status": readiness_status,
+            "ready_for_phase5": readiness_ok,
+            "blocking_reasons": blocking_reasons,
+            "fail_closed_conditions": [
+                "weighted_bottleneck_attribution_not_computed",
+                "missing_per_scale_sensitivity_inputs",
+                "phase1_matrix_not_ready_for_phase5",
+            ],
+        },
+        "lineage": {
+            "source_stream": "phase1_matrix_validation.weighted_bottleneck_attribution",
+            "source_run_id": run_id,
+            "source_correlation_id": correlation_id,
+        },
+    }
+
+
+def compute_opportunity_matrix_artifact(
+    weighted: dict,
+    readiness_gate_passed: bool,
+    source_artifact_path: Path,
+) -> dict:
+    weighted_status = str(weighted.get("status", "missing")).strip().lower()
+    weighted_schema = str(weighted.get("schema", "")).strip()
+    weighted_lineage = weighted.get("lineage", {})
+    if not isinstance(weighted_lineage, dict):
+        weighted_lineage = {}
+
+    global_ranking = weighted.get("global_ranking")
+    if not isinstance(global_ranking, list):
+        global_ranking = []
+
+    blocking_reasons = []
+    if weighted_status != "computed":
+        blocking_reasons.append("weighted_bottleneck_attribution_not_computed")
+    if not readiness_gate_passed:
+        blocking_reasons.append("phase1_matrix_not_ready_for_phase5")
+    if not global_ranking:
+        blocking_reasons.append("missing_weighted_global_ranking")
+    if not run_id or not correlation_id:
+        blocking_reasons.append("insufficient_freshness_identity")
+
+    source_stream = str(weighted_lineage.get("source_stream", "")).strip()
+    source_cell_count = parse_int(weighted_lineage.get("source_cell_count"))
+    valid_cell_count = parse_int(weighted_lineage.get("valid_cell_count"))
+    if source_stream != "phase1_matrix_validation.matrix_cells":
+        blocking_reasons.append("lineage_source_stream_mismatch")
+    if source_cell_count is None or source_cell_count <= 0:
+        blocking_reasons.append("missing_lineage_source_cell_count")
+    if valid_cell_count is None or valid_cell_count <= 0:
+        blocking_reasons.append("missing_lineage_valid_cell_count")
+    elif source_cell_count is not None and valid_cell_count > source_cell_count:
+        blocking_reasons.append("lineage_valid_cell_count_exceeds_source_count")
+
+    effort_profile = {
+        "open_ms": {"points": 2.5, "level": "medium"},
+        "append_ms": {"points": 3.0, "level": "high"},
+        "save_ms": {"points": 3.0, "level": "high"},
+        "index_ms": {"points": 2.0, "level": "medium"},
+    }
+    user_impact_profile = {
+        "open_ms": {
+            "resume_latency": "high",
+            "extension_responsiveness": "low",
+            "failure_risk": "medium",
+        },
+        "append_ms": {
+            "resume_latency": "high",
+            "extension_responsiveness": "medium",
+            "failure_risk": "high",
+        },
+        "save_ms": {
+            "resume_latency": "medium",
+            "extension_responsiveness": "low",
+            "failure_risk": "high",
+        },
+        "index_ms": {
+            "resume_latency": "high",
+            "extension_responsiveness": "medium",
+            "failure_risk": "medium",
+        },
+    }
+
+    ranked_candidates = []
+    for row in global_ranking:
+        if not isinstance(row, dict):
+            continue
+        stage = str(row.get("stage", "")).strip()
+        if not stage:
+            continue
+
+        weighted_contribution_pct = parse_float(row.get("weighted_contribution_pct"))
+        sample_size = parse_int(row.get("sample_size"))
+        ci95_lower_pct = parse_float(row.get("ci95_lower_pct"))
+        ci95_upper_pct = parse_float(row.get("ci95_upper_pct"))
+
+        if weighted_contribution_pct is None or weighted_contribution_pct < 0:
+            continue
+
+        ci95_width_pct = None
+        if (
+            ci95_lower_pct is not None
+            and ci95_upper_pct is not None
+            and ci95_upper_pct >= ci95_lower_pct
+        ):
+            ci95_width_pct = ci95_upper_pct - ci95_lower_pct
+
+        confidence_level = "low"
+        confidence_score = 0.25
+        if (
+            sample_size is not None
+            and sample_size >= 2
+            and isinstance(ci95_width_pct, (int, float))
+        ):
+            if ci95_width_pct <= 15.0:
+                confidence_level = "high"
+                confidence_score = 0.90
+            elif ci95_width_pct <= 30.0:
+                confidence_level = "medium"
+                confidence_score = 0.60
+            else:
+                confidence_level = "low"
+                confidence_score = 0.35
+        elif sample_size is not None and sample_size >= 3:
+            confidence_level = "medium"
+            confidence_score = 0.50
+
+        sufficient_for_decision = (
+            sample_size is not None
+            and sample_size >= 2
+            and isinstance(ci95_width_pct, (int, float))
+            and ci95_width_pct <= 30.0
+        )
+
+        effort = effort_profile.get(stage, {"points": 2.5, "level": "medium"})
+        effort_points = parse_float(effort.get("points")) or 2.5
+        expected_gain_pct = weighted_contribution_pct * 0.85
+        priority_score = (expected_gain_pct * confidence_score) / effort_points
+
+        rationale = []
+        if stage == "open_ms":
+            rationale.append("resume/open path dominates long-session user wait time")
+        elif stage == "append_ms":
+            rationale.append("append throughput dominates sustained session mutation cost")
+        elif stage == "save_ms":
+            rationale.append("save path controls durability/latency tradeoff under load")
+        elif stage == "index_ms":
+            rationale.append("index rebuild/query overhead impacts resume responsiveness")
+        rationale.append("weighted E2E contribution derived from phase1 matrix attribution")
+
+        ranked_candidates.append(
+            {
+                "stage": stage,
+                "weighted_contribution_pct": weighted_contribution_pct,
+                "expected_gain_pct": expected_gain_pct,
+                "priority_score": priority_score,
+                "confidence": {
+                    "level": confidence_level,
+                    "score": confidence_score,
+                    "sample_size": sample_size,
+                    "ci95_lower_pct": ci95_lower_pct,
+                    "ci95_upper_pct": ci95_upper_pct,
+                    "ci95_width_pct": ci95_width_pct,
+                    "sufficient_for_decision": sufficient_for_decision,
+                },
+                "effort": {
+                    "points": effort_points,
+                    "level": str(effort.get("level", "medium")),
+                },
+                "user_impact": user_impact_profile.get(
+                    stage,
+                    {
+                        "resume_latency": "medium",
+                        "extension_responsiveness": "medium",
+                        "failure_risk": "medium",
+                    },
+                ),
+                "rationale": rationale,
+            }
+        )
+
+    if not ranked_candidates:
+        blocking_reasons.append("missing_rankable_opportunities")
+
+    ranked_candidates.sort(
+        key=lambda row: (
+            row.get("priority_score") if isinstance(row.get("priority_score"), (int, float)) else -1.0,
+            row.get("weighted_contribution_pct")
+            if isinstance(row.get("weighted_contribution_pct"), (int, float))
+            else -1.0,
+        ),
+        reverse=True,
+    )
+
+    if ranked_candidates:
+        top_confidence = ranked_candidates[0].get("confidence", {})
+        if not isinstance(top_confidence, dict) or not top_confidence.get("sufficient_for_decision"):
+            blocking_reasons.append("insufficient_confidence_for_top_opportunity")
+
+    deduped_blocking_reasons = sorted(set(reason for reason in blocking_reasons if reason))
+    readiness_ok = not deduped_blocking_reasons
+    readiness_status = "ready" if readiness_ok else "blocked"
+    decision = "RANKED" if readiness_ok else "NO_DECISION"
+
+    ranked_opportunities = []
+    if readiness_ok:
+        for idx, row in enumerate(ranked_candidates, start=1):
+            ranked_opportunities.append({"rank": idx, **row})
+
+    return {
+        "schema": "pi.perf.opportunity_matrix.v1",
+        "bead_id": "bd-3ar8v.6.1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": str(source_artifact_path),
+            "weighted_bottleneck_schema": weighted_schema,
+            "weighted_bottleneck_status": weighted_status,
+            "source_stream": source_stream,
+            "source_cell_count": source_cell_count,
+            "valid_cell_count": valid_cell_count,
+        },
+        "scoring_model": {
+            "impact_metric": "weighted_contribution_pct",
+            "confidence_metric": "ci95_width_pct + sample_size",
+            "effort_metric": "stage_effort_points",
+            "priority_formula": "priority_score = (expected_gain_pct * confidence_score) / effort_points",
+            "expected_gain_formula": "expected_gain_pct = weighted_contribution_pct * 0.85",
+        },
+        "readiness": {
+            "status": readiness_status,
+            "decision": decision,
+            "mode": "fail_closed",
+            "ready_for_phase5": readiness_ok,
+            "blocking_reasons": deduped_blocking_reasons,
+            "fail_closed_conditions": [
+                "weighted_bottleneck_attribution_not_computed",
+                "phase1_matrix_not_ready_for_phase5",
+                "missing_weighted_global_ranking",
+                "insufficient_freshness_identity",
+                "lineage_source_stream_mismatch",
+                "missing_lineage_source_cell_count",
+                "missing_lineage_valid_cell_count",
+                "lineage_valid_cell_count_exceeds_source_count",
+                "missing_rankable_opportunities",
+                "insufficient_confidence_for_top_opportunity",
+            ],
+        },
+        "ranked_opportunities": ranked_opportunities,
+        "lineage": {
+            "source_stream": "phase1_matrix_validation.weighted_bottleneck_attribution.global_ranking",
+            "source_run_id": run_id,
+            "source_correlation_id": correlation_id,
+        },
+    }
+
 suite_logs = {}
 for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
     suite_dir = output_dir / "results" / suite_name
@@ -2422,8 +2914,31 @@ payload = {
     },
 }
 
+parameter_sweeps_artifact = compute_parameter_sweeps_artifact(
+    weighted_bottleneck_attribution,
+    required_sizes,
+    required_partitions,
+    phase5_ready,
+    phase1_matrix_path,
+)
+opportunity_matrix_artifact = compute_opportunity_matrix_artifact(
+    weighted_bottleneck_attribution,
+    phase5_ready,
+    phase1_matrix_path,
+)
+
 phase1_matrix_path.parent.mkdir(parents=True, exist_ok=True)
 phase1_matrix_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+parameter_sweeps_path.parent.mkdir(parents=True, exist_ok=True)
+parameter_sweeps_path.write_text(
+    json.dumps(parameter_sweeps_artifact, indent=2) + "\n",
+    encoding="utf-8",
+)
+opportunity_matrix_path.parent.mkdir(parents=True, exist_ok=True)
+opportunity_matrix_path.write_text(
+    json.dumps(opportunity_matrix_artifact, indent=2) + "\n",
+    encoding="utf-8",
+)
 
 manifest["phase1_matrix_validation"] = {
     "schema": "pi.perf.phase1_matrix_validation.v1",
@@ -2433,11 +2948,33 @@ manifest["phase1_matrix_validation"] = {
     "cells_with_complete_stage_breakdown": cells_with_complete_stage_breakdown,
     "artifact_ready_for_phase5": phase5_ready,
 }
+manifest["parameter_sweeps"] = {
+    "schema": "pi.perf.parameter_sweeps.v1",
+    "path": str(parameter_sweeps_path),
+    "status": parameter_sweeps_artifact.get("readiness", {}).get("status"),
+    "ready_for_phase5": parameter_sweeps_artifact.get("readiness", {}).get("ready_for_phase5"),
+    "top_stage": parameter_sweeps_artifact.get("sensitivity_summary", {}).get("top_stage"),
+}
+manifest["opportunity_matrix"] = {
+    "schema": "pi.perf.opportunity_matrix.v1",
+    "path": str(opportunity_matrix_path),
+    "status": opportunity_matrix_artifact.get("readiness", {}).get("status"),
+    "decision": opportunity_matrix_artifact.get("readiness", {}).get("decision"),
+    "ready_for_phase5": opportunity_matrix_artifact.get("readiness", {}).get("ready_for_phase5"),
+    "ranked_count": len(opportunity_matrix_artifact.get("ranked_opportunities", [])),
+    "top_stage": (
+        opportunity_matrix_artifact.get("ranked_opportunities", [{}])[0].get("stage")
+        if opportunity_matrix_artifact.get("ranked_opportunities")
+        else None
+    ),
+}
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 PY
 then
-  artifact_count=$((artifact_count + 1))
+  artifact_count=$((artifact_count + 3))
   log_ok "Phase-1 matrix validation written: results/phase1_matrix_validation.json"
+  log_ok "Parameter sweeps written: results/parameter_sweeps.json"
+  log_ok "Opportunity matrix written: results/opportunity_matrix.json"
 else
   die "Failed to generate phase-1 matrix validation artifact"
 fi
