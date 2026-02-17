@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const MUST_PASS_GATE_SCHEMA: &str = "pi.ext.must_pass_gate.v1";
+const EXT_REMEDIATION_BACKLOG_SCHEMA: &str = "pi.qa.extension_remediation_backlog.v1";
+const PRACTICAL_FINISH_CHECKPOINT_SCHEMA: &str = "pi.perf3x.practical_finish_checkpoint.v1";
+const PARAMETER_SWEEPS_SCHEMA: &str = "pi.perf.parameter_sweeps.v1";
+const PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/parameter_sweeps.json";
+const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
+const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opportunity_matrix.json";
 
 // ── Data models ─────────────────────────────────────────────────────────────
 
@@ -140,6 +146,707 @@ fn validate_must_pass_gate_metadata(v: &V) -> Vec<String> {
     }
 
     errors
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_practical_finish_checkpoint(v: &V) -> (Signal, String) {
+    let schema = get_str(v, "/schema");
+    if schema != PRACTICAL_FINISH_CHECKPOINT_SCHEMA {
+        return (
+            Signal::Fail,
+            format!(
+                "Invalid schema: expected {PRACTICAL_FINISH_CHECKPOINT_SCHEMA}, found {schema}"
+            ),
+        );
+    }
+
+    let status = get_str(v, "/status");
+    if status != "pass" && status != "fail" {
+        return (
+            Signal::Fail,
+            format!("Invalid status: expected pass|fail, found {status}"),
+        );
+    }
+
+    let detail = get_str(v, "/detail");
+    if detail.trim().is_empty() || detail == "unknown" {
+        return (
+            Signal::Fail,
+            "Missing required detail in practical-finish artifact".to_string(),
+        );
+    }
+
+    let open_total = get_u64(v, "/open_perf3x_count");
+    let technical = get_u64(v, "/technical_open_count");
+    let docs_or_report = get_u64(v, "/docs_or_report_open_count");
+    if open_total != technical + docs_or_report {
+        return (
+            Signal::Fail,
+            format!(
+                "Count mismatch: open_perf3x_count({open_total}) != technical_open_count({technical}) + docs_or_report_open_count({docs_or_report})"
+            ),
+        );
+    }
+
+    let Some(technical_issues) = v.pointer("/technical_open_issues").and_then(V::as_array) else {
+        return (
+            Signal::Fail,
+            "Missing required array: /technical_open_issues".to_string(),
+        );
+    };
+    let Some(docs_or_report_issues) = v
+        .pointer("/docs_or_report_open_issues")
+        .and_then(V::as_array)
+    else {
+        return (
+            Signal::Fail,
+            "Missing required array: /docs_or_report_open_issues".to_string(),
+        );
+    };
+
+    let technical_issue_count = u64::try_from(technical_issues.len()).unwrap_or(u64::MAX);
+    if technical_issue_count != technical {
+        return (
+            Signal::Fail,
+            format!(
+                "Count mismatch: technical_open_count({technical}) != technical_open_issues.len()({technical_issue_count})"
+            ),
+        );
+    }
+    let docs_issue_count = u64::try_from(docs_or_report_issues.len()).unwrap_or(u64::MAX);
+    if docs_issue_count != docs_or_report {
+        return (
+            Signal::Fail,
+            format!(
+                "Count mismatch: docs_or_report_open_count({docs_or_report}) != docs_or_report_open_issues.len()({docs_issue_count})"
+            ),
+        );
+    }
+
+    let Some(technical_completion_reached) = v
+        .pointer("/technical_completion_reached")
+        .and_then(V::as_bool)
+    else {
+        return (
+            Signal::Fail,
+            "Missing required bool: /technical_completion_reached".to_string(),
+        );
+    };
+    let residual_scope = get_str(v, "/residual_open_scope");
+    let expected_scope = if technical > 0 {
+        "technical_remaining"
+    } else if docs_or_report > 0 {
+        "docs_or_report_only"
+    } else {
+        "none"
+    };
+    if residual_scope != expected_scope {
+        return (
+            Signal::Fail,
+            format!("Residual scope mismatch: expected {expected_scope}, found {residual_scope}"),
+        );
+    }
+    if technical_completion_reached != (technical == 0) {
+        return (
+            Signal::Fail,
+            format!(
+                "technical_completion_reached mismatch: expected {}, found {technical_completion_reached}",
+                technical == 0
+            ),
+        );
+    }
+
+    if status == "pass" && technical > 0 {
+        return (
+            Signal::Fail,
+            format!("Invalid pass status: technical_open_count must be 0, found {technical}"),
+        );
+    }
+
+    if status == "pass" {
+        (
+            Signal::Pass,
+            format!(
+                "Practical-finish checkpoint satisfied: {docs_or_report} docs/report residual issue(s)"
+            ),
+        )
+    } else {
+        (
+            Signal::Fail,
+            format!(
+                "Practical-finish checkpoint blocked: technical_open_count={technical}, docs_or_report_open_count={docs_or_report}"
+            ),
+        )
+    }
+}
+
+fn find_latest_parameter_sweeps(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for relative in [
+        PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL,
+        "tests/perf/runs/results/parameter_sweeps.json",
+    ] {
+        let path = root.join(relative);
+        if path.is_file() {
+            candidates.push(path);
+        }
+    }
+    let e2e_root = root.join("tests/e2e_results");
+    if let Ok(entries) = std::fs::read_dir(e2e_root) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("results/parameter_sweeps.json");
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.into_iter().max()
+}
+
+fn parse_positive_u64(value: &V) -> Option<u64> {
+    value.as_u64().filter(|value| *value > 0)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_parameter_sweeps_artifact(v: &V) -> (Signal, String) {
+    let schema = get_str(v, "/schema");
+    if schema != PARAMETER_SWEEPS_SCHEMA {
+        return (
+            Signal::Fail,
+            format!("Invalid schema: expected {PARAMETER_SWEEPS_SCHEMA}, found {schema}"),
+        );
+    }
+
+    let Some(source_identity) = v.pointer("/source_identity").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /source_identity".to_string(),
+        );
+    };
+    let source_artifact = source_identity
+        .get("source_artifact")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if source_artifact != "phase1_matrix_validation" {
+        return (
+            Signal::Fail,
+            format!(
+                "source_identity.source_artifact must be phase1_matrix_validation, found {source_artifact}"
+            ),
+        );
+    }
+    let source_artifact_path = source_identity
+        .get("source_artifact_path")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if !source_artifact_path.contains("phase1_matrix_validation.json") {
+        return (
+            Signal::Fail,
+            "source_identity.source_artifact_path must reference phase1_matrix_validation.json"
+                .to_string(),
+        );
+    }
+
+    let Some(readiness) = v.pointer("/readiness").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /readiness".to_string(),
+        );
+    };
+    let readiness_status = readiness
+        .get("status")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    let Some(ready_for_phase5) = readiness.get("ready_for_phase5").and_then(V::as_bool) else {
+        return (
+            Signal::Fail,
+            "readiness.ready_for_phase5 must be boolean".to_string(),
+        );
+    };
+    let Some(blocking_reasons) = readiness.get("blocking_reasons").and_then(V::as_array) else {
+        return (
+            Signal::Fail,
+            "readiness.blocking_reasons must be an array".to_string(),
+        );
+    };
+    match readiness_status {
+        "ready" => {
+            if !ready_for_phase5 {
+                return (
+                    Signal::Fail,
+                    "readiness.ready_for_phase5 must be true when status=ready".to_string(),
+                );
+            }
+            if !blocking_reasons.is_empty() {
+                return (
+                    Signal::Fail,
+                    "readiness.blocking_reasons must be empty when status=ready".to_string(),
+                );
+            }
+        }
+        "blocked" => {
+            if ready_for_phase5 {
+                return (
+                    Signal::Fail,
+                    "readiness.ready_for_phase5 must be false when status=blocked".to_string(),
+                );
+            }
+            if blocking_reasons.is_empty() {
+                return (
+                    Signal::Fail,
+                    "readiness.blocking_reasons must be non-empty when status=blocked".to_string(),
+                );
+            }
+        }
+        _ => {
+            return (
+                Signal::Fail,
+                format!("readiness.status must be ready|blocked, found {readiness_status}"),
+            );
+        }
+    }
+
+    let Some(selected_defaults) = v.pointer("/selected_defaults").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /selected_defaults".to_string(),
+        );
+    };
+    for required in ["flush_cadence_ms", "queue_max_items", "compaction_quota_mb"] {
+        let Some(value) = selected_defaults.get(required).and_then(parse_positive_u64) else {
+            return (
+                Signal::Fail,
+                format!("selected_defaults.{required} must be a positive integer"),
+            );
+        };
+        if value == 0 {
+            return (
+                Signal::Fail,
+                format!("selected_defaults.{required} must be > 0"),
+            );
+        }
+    }
+
+    let Some(sweep_plan) = v.pointer("/sweep_plan").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /sweep_plan".to_string(),
+        );
+    };
+    let Some(dimensions) = sweep_plan.get("dimensions").and_then(V::as_array) else {
+        return (
+            Signal::Fail,
+            "sweep_plan.dimensions must be an array".to_string(),
+        );
+    };
+    if dimensions.is_empty() {
+        return (
+            Signal::Fail,
+            "sweep_plan.dimensions must be non-empty".to_string(),
+        );
+    }
+
+    let mut seen_required = std::collections::BTreeSet::new();
+    for dimension in dimensions {
+        let Some(dimension_obj) = dimension.as_object() else {
+            return (
+                Signal::Fail,
+                "sweep_plan.dimensions entries must be objects".to_string(),
+            );
+        };
+        let name = dimension_obj
+            .get("name")
+            .and_then(V::as_str)
+            .unwrap_or("unknown")
+            .trim();
+        if name.is_empty() || name == "unknown" {
+            return (
+                Signal::Fail,
+                "sweep_plan.dimensions[].name must be non-empty".to_string(),
+            );
+        }
+        let Some(candidate_values) = dimension_obj.get("candidate_values").and_then(V::as_array)
+        else {
+            return (
+                Signal::Fail,
+                format!("sweep_plan.dimensions[{name}].candidate_values must be an array"),
+            );
+        };
+        if candidate_values.is_empty() {
+            return (
+                Signal::Fail,
+                format!("sweep_plan.dimensions[{name}].candidate_values must be non-empty"),
+            );
+        }
+        if candidate_values
+            .iter()
+            .any(|value| parse_positive_u64(value).is_none())
+        {
+            return (
+                Signal::Fail,
+                format!(
+                    "sweep_plan.dimensions[{name}].candidate_values must contain only positive integers"
+                ),
+            );
+        }
+        if matches!(
+            name,
+            "flush_cadence_ms" | "queue_max_items" | "compaction_quota_mb"
+        ) {
+            seen_required.insert(name.to_string());
+        }
+    }
+    for required in ["flush_cadence_ms", "queue_max_items", "compaction_quota_mb"] {
+        if !seen_required.contains(required) {
+            return (
+                Signal::Fail,
+                format!("sweep_plan.dimensions missing required knob {required}"),
+            );
+        }
+    }
+
+    (
+        Signal::Pass,
+        format!(
+            "Parameter sweeps contract valid: readiness={readiness_status}, dimensions={}",
+            dimensions.len()
+        ),
+    )
+}
+
+fn check_parameter_sweeps_cert_gate(root: &Path) -> CertEvidence {
+    let gate = "parameter_sweeps_integrity".to_string();
+    let bead = "bd-3ar8v.6.5.1".to_string();
+    let Some(path) = find_latest_parameter_sweeps(root) else {
+        return CertEvidence {
+            gate,
+            bead,
+            status: Signal::NoData,
+            detail: format!(
+                "Artifact not found: {PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL} (or alternate perf/e2e sweep locations)"
+            ),
+            artifact_path: Some(PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL.to_string()),
+            artifact_sha256: None,
+        };
+    };
+
+    let artifact_path = path
+        .strip_prefix(root)
+        .unwrap_or(path.as_path())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let (status, detail, sha) = load_json(&path).map_or_else(
+        || {
+            (
+                Signal::Fail,
+                format!("parameter_sweeps artifact is not valid JSON: {artifact_path}"),
+                None,
+            )
+        },
+        |v| {
+            let (sig, det) = validate_parameter_sweeps_artifact(&v);
+            let sha = sha256_file(&path);
+            (sig, det, sha)
+        },
+    );
+
+    CertEvidence {
+        gate,
+        bead,
+        status,
+        detail,
+        artifact_path: Some(artifact_path),
+        artifact_sha256: sha,
+    }
+}
+
+fn find_latest_opportunity_matrix(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for relative in [
+        OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL,
+        "tests/perf/runs/results/opportunity_matrix.json",
+    ] {
+        let path = root.join(relative);
+        if path.is_file() {
+            candidates.push(path);
+        }
+    }
+    let e2e_root = root.join("tests/e2e_results");
+    if let Ok(entries) = std::fs::read_dir(e2e_root) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("results/opportunity_matrix.json");
+            if path.is_file() {
+                candidates.push(path);
+            }
+        }
+    }
+    candidates.into_iter().max()
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_opportunity_matrix_artifact(v: &V) -> (Signal, String) {
+    let schema = get_str(v, "/schema");
+    if schema != OPPORTUNITY_MATRIX_SCHEMA {
+        return (
+            Signal::Fail,
+            format!("Invalid schema: expected {OPPORTUNITY_MATRIX_SCHEMA}, found {schema}"),
+        );
+    }
+
+    let Some(source_identity) = v.pointer("/source_identity").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /source_identity".to_string(),
+        );
+    };
+    let source_artifact = source_identity
+        .get("source_artifact")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if source_artifact != "phase1_matrix_validation" {
+        return (
+            Signal::Fail,
+            format!(
+                "source_identity.source_artifact must be phase1_matrix_validation, found {source_artifact}"
+            ),
+        );
+    }
+    let source_artifact_path = source_identity
+        .get("source_artifact_path")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if !source_artifact_path.contains("phase1_matrix_validation.json") {
+        return (
+            Signal::Fail,
+            "source_identity.source_artifact_path must reference phase1_matrix_validation.json"
+                .to_string(),
+        );
+    }
+    let weighted_schema = source_identity
+        .get("weighted_bottleneck_schema")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if weighted_schema != "pi.perf.phase1_weighted_bottleneck_attribution.v1" {
+        return (
+            Signal::Fail,
+            format!(
+                "source_identity.weighted_bottleneck_schema must be pi.perf.phase1_weighted_bottleneck_attribution.v1, found {weighted_schema}"
+            ),
+        );
+    }
+    let weighted_status = source_identity
+        .get("weighted_bottleneck_status")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if !matches!(weighted_status, "computed" | "missing") {
+        return (
+            Signal::Fail,
+            format!(
+                "source_identity.weighted_bottleneck_status must be computed|missing, found {weighted_status}"
+            ),
+        );
+    }
+
+    let Some(readiness) = v.pointer("/readiness").and_then(V::as_object) else {
+        return (
+            Signal::Fail,
+            "Missing required object: /readiness".to_string(),
+        );
+    };
+    let readiness_status = readiness
+        .get("status")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if !matches!(readiness_status, "ready" | "blocked") {
+        return (
+            Signal::Fail,
+            format!("readiness.status must be ready|blocked, found {readiness_status}"),
+        );
+    }
+    let decision = readiness
+        .get("decision")
+        .and_then(V::as_str)
+        .unwrap_or("unknown");
+    if !matches!(decision, "RANKED" | "NO_DECISION") {
+        return (
+            Signal::Fail,
+            format!("readiness.decision must be RANKED|NO_DECISION, found {decision}"),
+        );
+    }
+    let Some(ready_for_phase5) = readiness.get("ready_for_phase5").and_then(V::as_bool) else {
+        return (
+            Signal::Fail,
+            "readiness.ready_for_phase5 must be boolean".to_string(),
+        );
+    };
+    let Some(blocking_reasons) = readiness.get("blocking_reasons").and_then(V::as_array) else {
+        return (
+            Signal::Fail,
+            "readiness.blocking_reasons must be an array".to_string(),
+        );
+    };
+    match readiness_status {
+        "ready" => {
+            if !ready_for_phase5 {
+                return (
+                    Signal::Fail,
+                    "readiness.ready_for_phase5 must be true when status=ready".to_string(),
+                );
+            }
+            if decision != "RANKED" {
+                return (
+                    Signal::Fail,
+                    "readiness.decision must be RANKED when status=ready".to_string(),
+                );
+            }
+            if !blocking_reasons.is_empty() {
+                return (
+                    Signal::Fail,
+                    "readiness.blocking_reasons must be empty when status=ready".to_string(),
+                );
+            }
+        }
+        "blocked" => {
+            if ready_for_phase5 {
+                return (
+                    Signal::Fail,
+                    "readiness.ready_for_phase5 must be false when status=blocked".to_string(),
+                );
+            }
+            if decision != "NO_DECISION" {
+                return (
+                    Signal::Fail,
+                    "readiness.decision must be NO_DECISION when status=blocked".to_string(),
+                );
+            }
+            if blocking_reasons.is_empty() {
+                return (
+                    Signal::Fail,
+                    "readiness.blocking_reasons must be non-empty when status=blocked".to_string(),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    let Some(ranked) = v.pointer("/ranked_opportunities").and_then(V::as_array) else {
+        return (
+            Signal::Fail,
+            "Missing required array: /ranked_opportunities".to_string(),
+        );
+    };
+    if readiness_status == "ready" && ranked.is_empty() {
+        return (
+            Signal::Fail,
+            "ranked_opportunities must be non-empty when readiness.status=ready".to_string(),
+        );
+    }
+    if readiness_status == "blocked" && !ranked.is_empty() {
+        return (
+            Signal::Fail,
+            "ranked_opportunities must be empty when readiness.status=blocked".to_string(),
+        );
+    }
+    for (index, row) in ranked.iter().enumerate() {
+        let Some(row_obj) = row.as_object() else {
+            return (
+                Signal::Fail,
+                format!("ranked_opportunities[{index}] must be an object"),
+            );
+        };
+        let expected_rank = u64::try_from(index + 1).unwrap_or(u64::MAX);
+        let Some(rank) = row_obj.get("rank").and_then(V::as_u64) else {
+            return (
+                Signal::Fail,
+                format!("ranked_opportunities[{index}].rank must be a positive integer"),
+            );
+        };
+        if rank != expected_rank {
+            return (
+                Signal::Fail,
+                format!(
+                    "ranked_opportunities[{index}].rank expected {expected_rank}, found {rank}"
+                ),
+            );
+        }
+        let stage = row_obj
+            .get("stage")
+            .and_then(V::as_str)
+            .unwrap_or("unknown")
+            .trim();
+        if stage.is_empty() || stage == "unknown" {
+            return (
+                Signal::Fail,
+                format!("ranked_opportunities[{index}].stage must be non-empty"),
+            );
+        }
+        let Some(priority_score) = row_obj.get("priority_score").and_then(V::as_f64) else {
+            return (
+                Signal::Fail,
+                format!("ranked_opportunities[{index}].priority_score must be numeric"),
+            );
+        };
+        if !priority_score.is_finite() || priority_score <= 0.0 {
+            return (
+                Signal::Fail,
+                format!("ranked_opportunities[{index}].priority_score must be > 0"),
+            );
+        }
+    }
+
+    (
+        Signal::Pass,
+        format!(
+            "Opportunity matrix contract valid: readiness={readiness_status}, ranked_opportunities={}",
+            ranked.len()
+        ),
+    )
+}
+
+fn check_opportunity_matrix_cert_gate(root: &Path) -> CertEvidence {
+    let gate = "opportunity_matrix_integrity".to_string();
+    let bead = "bd-3ar8v.6.5.3".to_string();
+    let Some(path) = find_latest_opportunity_matrix(root) else {
+        return CertEvidence {
+            gate,
+            bead,
+            status: Signal::NoData,
+            detail: format!(
+                "Artifact not found: {OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL} (or alternate perf/e2e opportunity_matrix locations)"
+            ),
+            artifact_path: Some(OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL.to_string()),
+            artifact_sha256: None,
+        };
+    };
+
+    let artifact_path = path
+        .strip_prefix(root)
+        .unwrap_or(path.as_path())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let (status, detail, sha) = load_json(&path).map_or_else(
+        || {
+            (
+                Signal::Fail,
+                format!("opportunity_matrix artifact is not valid JSON: {artifact_path}"),
+                None,
+            )
+        },
+        |v| {
+            let (sig, det) = validate_opportunity_matrix_artifact(&v);
+            let sha = sha256_file(&path);
+            (sig, det, sha)
+        },
+    );
+
+    CertEvidence {
+        gate,
+        bead,
+        status,
+        detail,
+        artifact_path: Some(artifact_path),
+        artifact_sha256: sha,
+    }
 }
 
 // ── Evidence collectors ─────────────────────────────────────────────────────
@@ -580,6 +1287,51 @@ struct FinalCertification {
     ci_run_link_template: String,
 }
 
+const PHASE5_GO_NO_GO_GATES: &[&str] = &[
+    "practical_finish_checkpoint",
+    "extension_remediation_backlog",
+    "parameter_sweeps_integrity",
+    "opportunity_matrix_integrity",
+];
+
+#[derive(Debug, Clone)]
+struct Phase5SnapshotRow {
+    gate: &'static str,
+    status: Signal,
+    detail: String,
+}
+
+fn build_phase5_go_no_go_snapshot(
+    cert: &FinalCertification,
+) -> (Vec<Phase5SnapshotRow>, &'static str) {
+    let mut rows = Vec::with_capacity(PHASE5_GO_NO_GO_GATES.len());
+    let mut all_pass = true;
+
+    for gate in PHASE5_GO_NO_GO_GATES {
+        if let Some(evidence) = cert.evidence.iter().find(|entry| entry.gate == *gate) {
+            if evidence.status != Signal::Pass {
+                all_pass = false;
+            }
+            rows.push(Phase5SnapshotRow {
+                gate,
+                status: evidence.status,
+                detail: evidence.detail.clone(),
+            });
+            continue;
+        }
+
+        all_pass = false;
+        rows.push(Phase5SnapshotRow {
+            gate,
+            status: Signal::NoData,
+            detail: "MISSING from certification evidence (fail-closed)".to_string(),
+        });
+    }
+
+    let decision = if all_pass { "GO" } else { "NO-GO" };
+    (rows, decision)
+}
+
 fn sha256_file(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
     let digest = {
@@ -717,8 +1469,7 @@ fn generate_certification() -> FinalCertification {
             let schema = get_str(v, "/schema");
             let total = get_u64(v, "/summary/total_artifacts");
             let verdict = get_str(v, "/summary/verdict");
-            if schema.starts_with("pi.ci.evidence_bundle") && total > 0 && verdict == "complete"
-            {
+            if schema.starts_with("pi.ci.evidence_bundle") && total > 0 && verdict == "complete" {
                 (
                     Signal::Pass,
                     format!("Evidence bundle: {total} artifacts collected ({verdict})"),
@@ -787,6 +1538,71 @@ fn generate_certification() -> FinalCertification {
     ));
 
     // 7. Conformance baseline delta
+    evidence.push(check_cert_gate(
+        &root,
+        "extension_remediation_backlog",
+        "bd-3ar8v.6.8.3",
+        "tests/full_suite_gate/extension_remediation_backlog.json",
+        |v| {
+            let schema = get_str(v, "/schema");
+            let entries = v
+                .pointer("/entries")
+                .and_then(V::as_array)
+                .map_or(0u64, |items| u64::try_from(items.len()).unwrap_or(u64::MAX));
+            let summary_total = get_u64(v, "/summary/total_non_pass_extensions");
+            let actionable = get_u64(v, "/summary/actionable");
+            let non_actionable = get_u64(v, "/summary/non_actionable");
+
+            if schema != EXT_REMEDIATION_BACKLOG_SCHEMA {
+                return (
+                    Signal::Fail,
+                    format!(
+                        "Invalid schema: expected {EXT_REMEDIATION_BACKLOG_SCHEMA}, found {schema}"
+                    ),
+                );
+            }
+            if summary_total != entries {
+                return (
+                    Signal::Fail,
+                    format!(
+                        "Summary mismatch: total_non_pass_extensions={summary_total}, entries={entries}"
+                    ),
+                );
+            }
+            if actionable + non_actionable != summary_total {
+                return (
+                    Signal::Fail,
+                    format!(
+                        "Summary mismatch: actionable({actionable}) + non_actionable({non_actionable}) != total({summary_total})"
+                    ),
+                );
+            }
+
+            (
+                Signal::Pass,
+                format!(
+                    "Remediation backlog valid: {entries} entries ({actionable} actionable, {non_actionable} non-actionable)"
+                ),
+            )
+        },
+    ));
+
+    // 8. Practical-finish checkpoint (docs-only residual filter)
+    evidence.push(check_cert_gate(
+        &root,
+        "practical_finish_checkpoint",
+        "bd-3ar8v.6.9",
+        "tests/full_suite_gate/practical_finish_checkpoint.json",
+        validate_practical_finish_checkpoint,
+    ));
+
+    // 9. Parameter-sweeps certification linkage
+    evidence.push(check_parameter_sweeps_cert_gate(&root));
+
+    // 10. Opportunity-matrix certification linkage
+    evidence.push(check_opportunity_matrix_cert_gate(&root));
+
+    // 11. Conformance baseline delta
     evidence.push(check_cert_gate(
         &root,
         "health_delta",
@@ -897,6 +1713,18 @@ fn render_certification_markdown(cert: &FinalCertification) -> String {
     }
     out.push('\n');
 
+    let (phase5_snapshot, phase5_decision) = build_phase5_go_no_go_snapshot(cert);
+    out.push_str("## Phase-5 Go/No-Go Snapshot\n\n");
+    out.push_str("| Gate | Status | Detail |\n");
+    out.push_str("|------|--------|--------|\n");
+    for row in &phase5_snapshot {
+        let detail = row.detail.replace('|', "\\|");
+        let _ = writeln!(out, "| {} | {} | {} |", row.gate, row.status, detail);
+    }
+    out.push('\n');
+    let _ = writeln!(out, "**Snapshot Decision**: {phase5_decision}");
+    out.push_str("**Fail-Closed Rule**: missing gate or non-PASS status => NO-GO\n\n");
+
     if !cert.risk_register.is_empty() {
         out.push_str("## Risk Register\n\n");
         out.push_str("| ID | Severity | Description | Mitigation |\n");
@@ -928,8 +1756,8 @@ fn final_qa_certification() {
     // Schema
     assert_eq!(cert.schema, CERT_SCHEMA);
 
-    // 7 evidence gates
-    assert_eq!(cert.evidence.len(), 7, "Expected 7 evidence gates");
+    // 11 evidence gates
+    assert_eq!(cert.evidence.len(), 11, "Expected 11 evidence gates");
 
     // Verify gate IDs
     let gate_ids: Vec<&str> = cert.evidence.iter().map(|e| e.gate.as_str()).collect();
@@ -958,8 +1786,43 @@ fn final_qa_certification() {
         "Missing full_suite_gate gate"
     );
     assert!(
+        gate_ids.contains(&"extension_remediation_backlog"),
+        "Missing extension_remediation_backlog gate"
+    );
+    assert!(
+        gate_ids.contains(&"practical_finish_checkpoint"),
+        "Missing practical_finish_checkpoint gate"
+    );
+    assert!(
+        gate_ids.contains(&"parameter_sweeps_integrity"),
+        "Missing parameter_sweeps_integrity gate"
+    );
+    assert!(
+        gate_ids.contains(&"opportunity_matrix_integrity"),
+        "Missing opportunity_matrix_integrity gate"
+    );
+    assert!(
         gate_ids.contains(&"health_delta"),
         "Missing health_delta gate"
+    );
+
+    assert!(
+        md.contains("## Phase-5 Go/No-Go Snapshot"),
+        "final report markdown must include go/no-go snapshot section"
+    );
+    for gate in PHASE5_GO_NO_GO_GATES {
+        assert!(
+            md.contains(gate),
+            "final report markdown missing phase-5 go/no-go gate marker: {gate}"
+        );
+    }
+    assert!(
+        md.contains("**Snapshot Decision**:"),
+        "final report markdown must include explicit snapshot decision marker"
+    );
+    assert!(
+        md.contains("missing gate or non-PASS status => NO-GO"),
+        "final report markdown must include fail-closed go/no-go rule marker"
     );
 
     // Each evidence has an artifact path
@@ -1038,14 +1901,37 @@ fn certification_report_schema_valid() {
     assert!(parsed.get("certification_verdict").is_some());
     assert!(parsed.get("evidence").and_then(V::as_array).is_some());
     assert!(parsed.get("risk_register").and_then(V::as_array).is_some());
-    assert!(parsed
-        .get("reproduce_commands")
-        .and_then(V::as_array)
-        .is_some());
-    assert!(parsed
-        .get("ci_run_link_template")
-        .and_then(V::as_str)
-        .is_some());
+    assert!(
+        parsed
+            .get("reproduce_commands")
+            .and_then(V::as_array)
+            .is_some()
+    );
+    assert!(
+        parsed
+            .get("ci_run_link_template")
+            .and_then(V::as_str)
+            .is_some()
+    );
+}
+
+#[test]
+fn phase5_go_no_go_snapshot_fails_closed_when_gate_missing() {
+    let mut cert = generate_certification();
+    cert.evidence
+        .retain(|entry| entry.gate != "parameter_sweeps_integrity");
+
+    let md = render_certification_markdown(&cert);
+    assert!(
+        md.contains(
+            "| parameter_sweeps_integrity | NO_DATA | MISSING from certification evidence (fail-closed) |"
+        ),
+        "missing go/no-go gate must render NO_DATA marker in snapshot table"
+    );
+    assert!(
+        md.contains("**Snapshot Decision**: NO-GO"),
+        "snapshot decision must fail closed to NO-GO when required gate evidence is missing"
+    );
 }
 
 #[test]
@@ -1118,5 +2004,211 @@ fn validate_must_pass_gate_metadata_rejects_legacy_payload() {
     assert!(
         errors.iter().any(|msg| msg.contains("/run_id")),
         "expected run_id validation error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn practical_finish_checkpoint_accepts_docs_only_residual_contract() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf3x.practical_finish_checkpoint.v1",
+        "generated_at": "2026-02-17T04:00:00.000Z",
+        "status": "pass",
+        "detail": "Practical-finish checkpoint reached: technical PERF-3X scope complete; 1 docs/report issue(s) remain.",
+        "open_perf3x_count": 1,
+        "technical_open_count": 0,
+        "docs_or_report_open_count": 1,
+        "technical_completion_reached": true,
+        "residual_open_scope": "docs_or_report_only",
+        "technical_open_issues": [],
+        "docs_or_report_open_issues": [
+            {
+                "id": "bd-3ar8v.6.5",
+                "title": "Final report polish",
+                "status": "open",
+                "issue_type": "docs",
+                "labels": ["docs", "report"]
+            }
+        ]
+    });
+
+    let (signal, detail) = validate_practical_finish_checkpoint(&artifact);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+}
+
+#[test]
+fn practical_finish_checkpoint_rejects_residual_count_mismatch() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf3x.practical_finish_checkpoint.v1",
+        "generated_at": "2026-02-17T04:00:00.000Z",
+        "status": "pass",
+        "detail": "Practical-finish checkpoint reached: technical PERF-3X scope complete; 1 docs/report issue(s) remain.",
+        "open_perf3x_count": 2,
+        "technical_open_count": 0,
+        "docs_or_report_open_count": 1,
+        "technical_completion_reached": true,
+        "residual_open_scope": "docs_or_report_only",
+        "technical_open_issues": [],
+        "docs_or_report_open_issues": [
+            {
+                "id": "bd-3ar8v.6.5",
+                "title": "Final report polish",
+                "status": "open",
+                "issue_type": "docs",
+                "labels": ["docs", "report"]
+            }
+        ]
+    });
+
+    let (signal, detail) = validate_practical_finish_checkpoint(&artifact);
+    assert_eq!(signal, Signal::Fail);
+    assert!(
+        detail.contains("open_perf3x_count"),
+        "expected mismatch detail, got: {detail}"
+    );
+}
+
+#[test]
+fn parameter_sweeps_contract_accepts_consistent_shape() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json"
+        },
+        "readiness": {
+            "status": "ready",
+            "ready_for_phase5": true,
+            "blocking_reasons": []
+        },
+        "selected_defaults": {
+            "flush_cadence_ms": 125,
+            "queue_max_items": 64,
+            "compaction_quota_mb": 8
+        },
+        "sweep_plan": {
+            "dimensions": [
+                {
+                    "name": "flush_cadence_ms",
+                    "candidate_values": [50, 125, 250]
+                },
+                {
+                    "name": "queue_max_items",
+                    "candidate_values": [32, 64, 128]
+                },
+                {
+                    "name": "compaction_quota_mb",
+                    "candidate_values": [4, 8, 12]
+                }
+            ]
+        }
+    });
+
+    let (signal, detail) = validate_parameter_sweeps_artifact(&artifact);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+}
+
+#[test]
+fn parameter_sweeps_contract_rejects_readiness_incoherence() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json"
+        },
+        "readiness": {
+            "status": "ready",
+            "ready_for_phase5": false,
+            "blocking_reasons": ["awaiting artifact"]
+        },
+        "selected_defaults": {
+            "flush_cadence_ms": 125,
+            "queue_max_items": 64,
+            "compaction_quota_mb": 8
+        },
+        "sweep_plan": {
+            "dimensions": [
+                {
+                    "name": "flush_cadence_ms",
+                    "candidate_values": [50, 125, 250]
+                },
+                {
+                    "name": "queue_max_items",
+                    "candidate_values": [32, 64, 128]
+                },
+                {
+                    "name": "compaction_quota_mb",
+                    "candidate_values": [4, 8, 12]
+                }
+            ]
+        }
+    });
+
+    let (signal, detail) = validate_parameter_sweeps_artifact(&artifact);
+    assert_eq!(signal, Signal::Fail);
+    assert!(
+        detail.contains("ready_for_phase5"),
+        "expected readiness coherence failure detail, got: {detail}"
+    );
+}
+
+#[test]
+fn opportunity_matrix_contract_accepts_consistent_shape() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf.opportunity_matrix.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json",
+            "weighted_bottleneck_schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+            "weighted_bottleneck_status": "computed"
+        },
+        "readiness": {
+            "status": "ready",
+            "decision": "RANKED",
+            "ready_for_phase5": true,
+            "blocking_reasons": []
+        },
+        "ranked_opportunities": [
+            {
+                "rank": 1,
+                "stage": "phase2_persistence",
+                "priority_score": 2.5
+            }
+        ]
+    });
+
+    let (signal, detail) = validate_opportunity_matrix_artifact(&artifact);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+}
+
+#[test]
+fn opportunity_matrix_contract_rejects_readiness_incoherence() {
+    let artifact = serde_json::json!({
+        "schema": "pi.perf.opportunity_matrix.v1",
+        "source_identity": {
+            "source_artifact": "phase1_matrix_validation",
+            "source_artifact_path": "tests/perf/reports/phase1_matrix_validation.json",
+            "weighted_bottleneck_schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
+            "weighted_bottleneck_status": "computed"
+        },
+        "readiness": {
+            "status": "ready",
+            "decision": "NO_DECISION",
+            "ready_for_phase5": false,
+            "blocking_reasons": ["phase1_matrix_not_ready_for_phase5"]
+        },
+        "ranked_opportunities": [
+            {
+                "rank": 1,
+                "stage": "phase2_persistence",
+                "priority_score": 2.5
+            }
+        ]
+    });
+
+    let (signal, detail) = validate_opportunity_matrix_artifact(&artifact);
+    assert_eq!(signal, Signal::Fail);
+    assert!(
+        detail.contains("ready_for_phase5") || detail.contains("decision"),
+        "expected readiness coherence failure detail, got: {detail}"
     );
 }

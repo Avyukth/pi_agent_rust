@@ -90,6 +90,13 @@ struct ArtifactSource {
     required: bool,
 }
 
+const PERF3X_LINEAGE_CONTRACT_SCHEMA: &str = "pi.perf3x.lineage_contract.v1";
+const PERF3X_LINEAGE_CONTRACT_ARTIFACTS: &str = "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | \
+tests/ext_conformance/reports/conformance_summary.json | \
+tests/perf/reports/stress_triage.json";
+const PERF3X_LINEAGE_MAX_ARTIFACT_SPAN_DAYS: i64 = 14;
+const PARAMETER_SWEEPS_MISSING_DIAGNOSTIC: &str = "parameter_sweeps artifact not found (expected tests/perf/reports, tests/perf/runs/results, or tests/e2e_results/*/results)";
+
 const ARTIFACT_SOURCES: &[ArtifactSource] = &[
     // ── Extension conformance ──
     ArtifactSource {
@@ -259,6 +266,33 @@ const ARTIFACT_SOURCES: &[ArtifactSource] = &[
         required: false,
     },
     ArtifactSource {
+        id: "perf_comparison",
+        label: "PERF-3X comparison report",
+        category: "performance",
+        path: "tests/perf/reports/perf_comparison.json",
+        expected_schema: Some("pi.ext.perf_comparison"),
+        is_directory: false,
+        required: true,
+    },
+    ArtifactSource {
+        id: "parameter_sweeps",
+        label: "PERF-3X parameter sweeps report",
+        category: "performance",
+        path: "tests/perf/reports/parameter_sweeps.json",
+        expected_schema: Some("pi.perf.parameter_sweeps"),
+        is_directory: false,
+        required: true,
+    },
+    ArtifactSource {
+        id: "stress_triage",
+        label: "PERF-3X stress triage report",
+        category: "performance",
+        path: "tests/perf/reports/stress_triage.json",
+        expected_schema: Some("pi.ext.stress_triage"),
+        is_directory: false,
+        required: true,
+    },
+    ArtifactSource {
         id: "load_time_benchmark",
         label: "Extension load-time benchmark",
         category: "performance",
@@ -404,124 +438,329 @@ fn validate_must_pass_gate_payload(val: &Value) -> Result<Value, String> {
     }))
 }
 
+fn validate_perf_comparison_payload(val: &Value) -> Result<Value, String> {
+    let generated_at = val
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "perf_comparison: missing generated_at".to_string())?;
+    if generated_at.trim().is_empty() {
+        return Err("perf_comparison: generated_at is empty".to_string());
+    }
+
+    let summary = val
+        .get("summary")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "perf_comparison: missing summary object".to_string())?;
+    let overall_verdict = summary
+        .get("overall_verdict")
+        .and_then(Value::as_str)
+        .map_or("", str::trim);
+    if overall_verdict.is_empty() {
+        return Err("perf_comparison: summary.overall_verdict is missing/empty".to_string());
+    }
+
+    let faster_count = summary
+        .get("faster_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "perf_comparison: missing summary.faster_count".to_string())?;
+    let slower_count = summary
+        .get("slower_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "perf_comparison: missing summary.slower_count".to_string())?;
+    let comparable_count = summary
+        .get("comparable_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "perf_comparison: missing summary.comparable_count".to_string())?;
+
+    Ok(serde_json::json!({
+        "generated_at": generated_at,
+        "overall_verdict": overall_verdict,
+        "faster_count": faster_count,
+        "slower_count": slower_count,
+        "comparable_count": comparable_count,
+    }))
+}
+
+fn validate_parameter_sweeps_payload(val: &Value) -> Result<Value, String> {
+    let generated_at = val
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "parameter_sweeps: missing generated_at".to_string())?;
+    if generated_at.trim().is_empty() {
+        return Err("parameter_sweeps: generated_at is empty".to_string());
+    }
+
+    let readiness = val
+        .get("readiness")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "parameter_sweeps: missing readiness object".to_string())?;
+    let readiness_status = readiness
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "parameter_sweeps: missing readiness.status".to_string())?;
+    if !matches!(readiness_status, "ready" | "blocked") {
+        return Err(format!(
+            "parameter_sweeps: readiness.status must be ready|blocked, got '{readiness_status}'"
+        ));
+    }
+
+    let ready_for_phase5 = readiness
+        .get("ready_for_phase5")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "parameter_sweeps: missing readiness.ready_for_phase5 bool".to_string())?;
+    let blocking_reasons = readiness
+        .get("blocking_reasons")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "parameter_sweeps: missing readiness.blocking_reasons array".to_string())?;
+
+    let source_identity = val
+        .get("source_identity")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "parameter_sweeps: missing source_identity object".to_string())?;
+    let source_artifact = source_identity
+        .get("source_artifact")
+        .and_then(Value::as_str)
+        .map_or("", str::trim);
+    if source_artifact.is_empty() {
+        return Err(
+            "parameter_sweeps: source_identity.source_artifact is missing/empty".to_string(),
+        );
+    }
+
+    Ok(serde_json::json!({
+        "generated_at": generated_at,
+        "readiness_status": readiness_status,
+        "ready_for_phase5": ready_for_phase5,
+        "blocking_reasons_count": blocking_reasons.len(),
+        "source_artifact": source_artifact,
+    }))
+}
+
+fn missing_section(source: &ArtifactSource, diagnostics: &str) -> BundleSection {
+    BundleSection {
+        id: source.id.to_string(),
+        label: source.label.to_string(),
+        category: source.category.to_string(),
+        status: "missing".to_string(),
+        artifact_path: Some(source.path.to_string()),
+        schema: None,
+        summary: None,
+        diagnostics: Some(diagnostics.to_string()),
+        file_count: 0,
+        total_bytes: 0,
+    }
+}
+
+fn collect_directory_section(full_path: &Path, source: &ArtifactSource) -> BundleSection {
+    if !full_path.is_dir() {
+        return missing_section(source, "Directory not found");
+    }
+
+    let (file_count, total_bytes) = dir_stats(full_path);
+    BundleSection {
+        id: source.id.to_string(),
+        label: source.label.to_string(),
+        category: source.category.to_string(),
+        status: if file_count > 0 {
+            "present".to_string()
+        } else {
+            "missing".to_string()
+        },
+        artifact_path: Some(source.path.to_string()),
+        schema: None,
+        summary: Some(serde_json::json!({
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+        })),
+        diagnostics: None,
+        file_count,
+        total_bytes,
+    }
+}
+
+#[derive(Debug, Default)]
+struct JsonFileAnalysis {
+    status: String,
+    schema: Option<String>,
+    summary: Option<Value>,
+    diagnostics: Option<String>,
+}
+
+fn artifact_uses_json_schema(source: &ArtifactSource) -> bool {
+    Path::new(source.path)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+fn find_latest_parameter_sweeps(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for relative in [
+        "tests/perf/reports/parameter_sweeps.json",
+        "tests/perf/runs/results/parameter_sweeps.json",
+    ] {
+        let candidate = root.join(relative);
+        if candidate.is_file() {
+            candidates.push(candidate);
+        }
+    }
+
+    let e2e_results_dir = root.join("tests/e2e_results");
+    if let Ok(entries) = std::fs::read_dir(e2e_results_dir) {
+        for entry in entries.flatten() {
+            let candidate = entry.path().join("results/parameter_sweeps.json");
+            if candidate.is_file() {
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    candidates.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    candidates.pop()
+}
+
+fn analyze_json_file(full_path: &Path, source: &ArtifactSource) -> JsonFileAnalysis {
+    let Some(val) = load_json(full_path) else {
+        return JsonFileAnalysis {
+            status: "invalid".to_string(),
+            diagnostics: Some("Failed to parse JSON".to_string()),
+            ..JsonFileAnalysis::default()
+        };
+    };
+
+    let mut analysis = JsonFileAnalysis {
+        status: "present".to_string(),
+        schema: val.get("schema").and_then(Value::as_str).map(String::from),
+        ..JsonFileAnalysis::default()
+    };
+
+    if let Some(expected) = source.expected_schema {
+        if let Some(actual) = analysis.schema.as_deref() {
+            if !actual.starts_with(expected) {
+                analysis.status = "invalid".to_string();
+                analysis.diagnostics = Some(format!(
+                    "Schema mismatch: expected prefix '{expected}', found '{actual}'"
+                ));
+            }
+        } else {
+            analysis.status = "invalid".to_string();
+            analysis.diagnostics = Some(format!(
+                "Missing schema field (expected prefix '{expected}')"
+            ));
+        }
+    }
+
+    if source.id == "must_pass_gate" {
+        match validate_must_pass_gate_payload(&val) {
+            Ok(payload) => {
+                analysis.summary = Some(payload);
+            }
+            Err(err) => {
+                analysis.status = "invalid".to_string();
+                analysis.diagnostics = Some(err);
+            }
+        }
+    } else if source.id == "perf_comparison" {
+        match validate_perf_comparison_payload(&val) {
+            Ok(payload) => {
+                analysis.summary = Some(payload);
+            }
+            Err(err) => {
+                analysis.status = "invalid".to_string();
+                analysis.diagnostics = Some(err);
+            }
+        }
+    } else if source.id == "parameter_sweeps" {
+        match validate_parameter_sweeps_payload(&val) {
+            Ok(payload) => {
+                analysis.summary = Some(payload);
+            }
+            Err(err) => {
+                analysis.status = "invalid".to_string();
+                analysis.diagnostics = Some(err);
+            }
+        }
+    } else {
+        analysis.summary = extract_summary(&val, source.id);
+    }
+
+    analysis
+}
+
+fn collect_file_section(full_path: &Path, source: &ArtifactSource) -> BundleSection {
+    if !full_path.is_file() {
+        return missing_section(source, "File not found");
+    }
+
+    let file_size = std::fs::metadata(full_path).map_or(0, |m| m.len());
+    let (status, schema, summary, diagnostics) = if artifact_uses_json_schema(source) {
+        let analysis = analyze_json_file(full_path, source);
+        (
+            analysis.status,
+            analysis.schema,
+            analysis.summary,
+            analysis.diagnostics,
+        )
+    } else {
+        ("present".to_string(), None, None, None)
+    };
+
+    BundleSection {
+        id: source.id.to_string(),
+        label: source.label.to_string(),
+        category: source.category.to_string(),
+        status,
+        artifact_path: Some(source.path.to_string()),
+        schema,
+        summary,
+        diagnostics,
+        file_count: 1,
+        total_bytes: file_size,
+    }
+}
+
+fn collect_parameter_sweeps_section(root: &Path, source: &ArtifactSource) -> BundleSection {
+    let Some(full_path) = find_latest_parameter_sweeps(root) else {
+        return missing_section(source, PARAMETER_SWEEPS_MISSING_DIAGNOSTIC);
+    };
+
+    let file_size = std::fs::metadata(&full_path).map_or(0, |m| m.len());
+    let analysis = analyze_json_file(&full_path, source);
+    let artifact_path = full_path.strip_prefix(root).map_or_else(
+        |_| full_path.display().to_string(),
+        |relative| relative.display().to_string(),
+    );
+
+    BundleSection {
+        id: source.id.to_string(),
+        label: source.label.to_string(),
+        category: source.category.to_string(),
+        status: analysis.status,
+        artifact_path: Some(artifact_path),
+        schema: analysis.schema,
+        summary: analysis.summary,
+        diagnostics: analysis.diagnostics,
+        file_count: 1,
+        total_bytes: file_size,
+    }
+}
+
 /// Collect a section from an artifact source.
-#[allow(clippy::too_many_lines)]
 fn collect_section(root: &Path, source: &ArtifactSource) -> BundleSection {
+    if source.id == "parameter_sweeps" {
+        return collect_parameter_sweeps_section(root, source);
+    }
+
     let full_path = root.join(source.path);
 
     if source.is_directory {
-        if full_path.is_dir() {
-            let (file_count, total_bytes) = dir_stats(&full_path);
-            BundleSection {
-                id: source.id.to_string(),
-                label: source.label.to_string(),
-                category: source.category.to_string(),
-                status: if file_count > 0 {
-                    "present".to_string()
-                } else {
-                    "missing".to_string()
-                },
-                artifact_path: Some(source.path.to_string()),
-                schema: None,
-                summary: Some(serde_json::json!({
-                    "file_count": file_count,
-                    "total_bytes": total_bytes,
-                })),
-                diagnostics: None,
-                file_count,
-                total_bytes,
-            }
-        } else {
-            BundleSection {
-                id: source.id.to_string(),
-                label: source.label.to_string(),
-                category: source.category.to_string(),
-                status: "missing".to_string(),
-                artifact_path: Some(source.path.to_string()),
-                schema: None,
-                summary: None,
-                diagnostics: Some("Directory not found".to_string()),
-                file_count: 0,
-                total_bytes: 0,
-            }
-        }
-    } else if full_path.is_file() {
-        let file_size = std::fs::metadata(&full_path).map_or(0, |m| m.len());
-        let mut schema_found = None;
-        let mut summary = None;
-        let mut status = "present".to_string();
-        let mut diagnostics: Option<String> = None;
-
-        // Try to validate JSON files.
-        if std::path::Path::new(source.path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-        {
-            if let Some(val) = load_json(&full_path) {
-                schema_found = val.get("schema").and_then(Value::as_str).map(String::from);
-
-                // Validate schema prefix if expected.
-                if let Some(expected) = source.expected_schema {
-                    if let Some(ref actual) = schema_found {
-                        if !actual.starts_with(expected) {
-                            status = "invalid".to_string();
-                            diagnostics = Some(format!(
-                                "Schema mismatch: expected prefix '{expected}', found '{actual}'"
-                            ));
-                        }
-                    } else {
-                        status = "invalid".to_string();
-                        diagnostics = Some(format!(
-                            "Missing schema field (expected prefix '{expected}')"
-                        ));
-                    }
-                }
-
-                // Extract lightweight summary for index.
-                if source.id == "must_pass_gate" {
-                    match validate_must_pass_gate_payload(&val) {
-                        Ok(payload) => {
-                            summary = Some(payload);
-                        }
-                        Err(err) => {
-                            status = "invalid".to_string();
-                            diagnostics = Some(err);
-                        }
-                    }
-                } else {
-                    summary = extract_summary(&val, source.id);
-                }
-            } else {
-                status = "invalid".to_string();
-                diagnostics = Some("Failed to parse JSON".to_string());
-            }
-        }
-
-        BundleSection {
-            id: source.id.to_string(),
-            label: source.label.to_string(),
-            category: source.category.to_string(),
-            status,
-            artifact_path: Some(source.path.to_string()),
-            schema: schema_found,
-            summary,
-            diagnostics,
-            file_count: 1,
-            total_bytes: file_size,
-        }
+        collect_directory_section(&full_path, source)
     } else {
-        BundleSection {
-            id: source.id.to_string(),
-            label: source.label.to_string(),
-            category: source.category.to_string(),
-            status: "missing".to_string(),
-            artifact_path: Some(source.path.to_string()),
-            schema: None,
-            summary: None,
-            diagnostics: Some("File not found".to_string()),
-            file_count: 0,
-            total_bytes: 0,
-        }
+        collect_file_section(&full_path, source)
     }
 }
 
@@ -535,6 +774,7 @@ fn extract_summary(val: &Value, section_id: &str) -> Option<Value> {
                 "pass": counts.get("pass"),
                 "fail": counts.get("fail"),
                 "pass_rate_pct": val.get("pass_rate_pct"),
+                "generated_at": val.get("generated_at"),
             }))
         }
         "conformance_baseline" => {
@@ -555,10 +795,156 @@ fn extract_summary(val: &Value, section_id: &str) -> Option<Value> {
             "active_count": val.get("active_count"),
             "expired_count": val.get("expired_count"),
         })),
+        "perf_comparison" => {
+            let summary = val.get("summary")?;
+            Some(serde_json::json!({
+                "generated_at": val.get("generated_at"),
+                "overall_verdict": summary.get("overall_verdict"),
+                "faster_count": summary.get("faster_count"),
+                "slower_count": summary.get("slower_count"),
+                "comparable_count": summary.get("comparable_count"),
+            }))
+        }
+        "parameter_sweeps" => {
+            let readiness = val.get("readiness")?;
+            Some(serde_json::json!({
+                "generated_at": val.get("generated_at"),
+                "readiness_status": readiness.get("status"),
+                "ready_for_phase5": readiness.get("ready_for_phase5"),
+                "blocking_reasons_count": readiness.get("blocking_reasons").and_then(Value::as_array).map(Vec::len),
+            }))
+        }
+        "stress_triage" => Some(serde_json::json!({
+            "pass": val.get("pass"),
+            "generated_at": val.get("generated_at"),
+        })),
         "extension_inventory" => Some(serde_json::json!({
             "total_extensions": val.get("total_extensions"),
         })),
         _ => None,
+    }
+}
+
+fn summary_string_field(
+    sections: &[BundleSection],
+    section_id: &str,
+    field: &str,
+) -> Result<String, String> {
+    let section = sections
+        .iter()
+        .find(|section| section.id == section_id)
+        .ok_or_else(|| format!("missing required section '{section_id}'"))?;
+    if section.status != "present" {
+        return Err(format!(
+            "section '{section_id}' must be present, found status '{}'",
+            section.status
+        ));
+    }
+    let summary = section
+        .summary
+        .as_ref()
+        .ok_or_else(|| format!("section '{section_id}' missing summary payload"))?;
+    let value = summary
+        .get(field)
+        .and_then(Value::as_str)
+        .map_or("", str::trim);
+    if value.is_empty() {
+        return Err(format!(
+            "section '{section_id}' missing non-empty summary field '{field}'"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn summary_generated_at(
+    sections: &[BundleSection],
+    section_id: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let generated_at = summary_string_field(sections, section_id, "generated_at")?;
+    chrono::DateTime::parse_from_rfc3339(&generated_at)
+        .map(|ts| ts.with_timezone(&chrono::Utc))
+        .map_err(|err| {
+            format!("section '{section_id}' has invalid generated_at '{generated_at}': {err}")
+        })
+}
+
+fn validate_perf3x_lineage_contract(sections: &[BundleSection]) -> Result<Value, String> {
+    let run_id = summary_string_field(sections, "must_pass_gate", "run_id")?;
+    let correlation_id = summary_string_field(sections, "must_pass_gate", "correlation_id")?;
+    if !correlation_id.contains(&run_id) {
+        return Err(format!(
+            "must_pass_gate correlation_id '{correlation_id}' must include run_id '{run_id}'"
+        ));
+    }
+
+    let must_pass_generated_at = summary_generated_at(sections, "must_pass_gate")?;
+    let conformance_generated_at = summary_generated_at(sections, "conformance_summary")?;
+    let stress_generated_at = summary_generated_at(sections, "stress_triage")?;
+
+    let oldest = [
+        must_pass_generated_at,
+        conformance_generated_at,
+        stress_generated_at,
+    ]
+    .iter()
+    .min()
+    .copied()
+    .expect("lineage timestamp set is non-empty");
+    let newest = [
+        must_pass_generated_at,
+        conformance_generated_at,
+        stress_generated_at,
+    ]
+    .iter()
+    .max()
+    .copied()
+    .expect("lineage timestamp set is non-empty");
+
+    let span = newest.signed_duration_since(oldest);
+    if span > chrono::Duration::days(PERF3X_LINEAGE_MAX_ARTIFACT_SPAN_DAYS) {
+        return Err(format!(
+            "PERF-3X lineage span exceeds {PERF3X_LINEAGE_MAX_ARTIFACT_SPAN_DAYS} days \
+             for run_id '{run_id}' (oldest={oldest}, newest={newest})"
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "must_pass_generated_at": must_pass_generated_at.to_rfc3339(),
+        "conformance_generated_at": conformance_generated_at.to_rfc3339(),
+        "stress_generated_at": stress_generated_at.to_rfc3339(),
+        "artifact_span_minutes": span.num_minutes(),
+        "max_allowed_span_days": PERF3X_LINEAGE_MAX_ARTIFACT_SPAN_DAYS,
+    }))
+}
+
+fn build_perf3x_lineage_section(sections: &[BundleSection]) -> BundleSection {
+    match validate_perf3x_lineage_contract(sections) {
+        Ok(summary) => BundleSection {
+            id: "perf3x_lineage_contract".to_string(),
+            label: "PERF-3X lineage coherence contract".to_string(),
+            category: "performance".to_string(),
+            status: "present".to_string(),
+            artifact_path: Some(PERF3X_LINEAGE_CONTRACT_ARTIFACTS.to_string()),
+            schema: Some(PERF3X_LINEAGE_CONTRACT_SCHEMA.to_string()),
+            summary: Some(summary),
+            diagnostics: None,
+            file_count: 0,
+            total_bytes: 0,
+        },
+        Err(err) => BundleSection {
+            id: "perf3x_lineage_contract".to_string(),
+            label: "PERF-3X lineage coherence contract".to_string(),
+            category: "performance".to_string(),
+            status: "invalid".to_string(),
+            artifact_path: Some(PERF3X_LINEAGE_CONTRACT_ARTIFACTS.to_string()),
+            schema: Some(PERF3X_LINEAGE_CONTRACT_SCHEMA.to_string()),
+            summary: None,
+            diagnostics: Some(err),
+            file_count: 0,
+            total_bytes: 0,
+        },
     }
 }
 
@@ -611,6 +997,19 @@ fn build_evidence_bundle() {
         sections.push(section);
     }
 
+    let perf3x_lineage_section = build_perf3x_lineage_section(&sections);
+    eprint!("  [{:.<40}] ", perf3x_lineage_section.label);
+    match perf3x_lineage_section.status.as_str() {
+        "present" => eprintln!("PRESENT"),
+        "invalid" => eprintln!(
+            "INVALID  {}",
+            perf3x_lineage_section.diagnostics.as_deref().unwrap_or("")
+        ),
+        status => eprintln!("{status}"),
+    }
+    let lineage_failed = perf3x_lineage_section.status == "invalid";
+    sections.push(perf3x_lineage_section);
+
     // ── Compute summary ──
     let present = sections.iter().filter(|s| s.status == "present").count();
     let missing = sections.iter().filter(|s| s.status == "missing").count();
@@ -625,7 +1024,9 @@ fn build_evidence_bundle() {
         .count();
     let required_total = ARTIFACT_SOURCES.iter().filter(|s| s.required).count();
 
-    let verdict = if required_present == required_total && invalid == 0 {
+    let verdict = if lineage_failed {
+        "insufficient"
+    } else if required_present == required_total && invalid == 0 {
         "complete"
     } else if required_present > 0 {
         "partial"
@@ -902,6 +1303,46 @@ fn must_pass_gate_source_is_required_json_verdict_file() {
 }
 
 #[test]
+fn perf_comparison_source_is_required_json_artifact() {
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "perf_comparison")
+        .expect("perf_comparison source must exist");
+    assert!(
+        !source.is_directory,
+        "perf_comparison source must target a JSON artifact"
+    );
+    assert!(
+        source.path.ends_with("perf_comparison.json"),
+        "perf_comparison source must point to perf_comparison.json"
+    );
+    assert!(
+        source.required,
+        "perf_comparison source should be required for PERF-3X evidence completeness"
+    );
+}
+
+#[test]
+fn parameter_sweeps_source_is_required_json_artifact() {
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "parameter_sweeps")
+        .expect("parameter_sweeps source must exist");
+    assert!(
+        !source.is_directory,
+        "parameter_sweeps source must target a JSON artifact"
+    );
+    assert!(
+        source.path.ends_with("parameter_sweeps.json"),
+        "parameter_sweeps source must point to parameter_sweeps.json"
+    );
+    assert!(
+        source.required,
+        "parameter_sweeps source should be required for PERF-3X evidence completeness"
+    );
+}
+
+#[test]
 fn full_cert_diagnostics_are_required_for_complete_verdict() {
     let health_delta = ARTIFACT_SOURCES
         .iter()
@@ -963,6 +1404,357 @@ fn validate_must_pass_gate_payload_rejects_missing_lineage() {
     assert!(
         err.contains("run_id"),
         "expected run_id validation error, got: {err}"
+    );
+}
+
+#[test]
+fn validate_perf_comparison_payload_accepts_current_shape() {
+    let payload = serde_json::json!({
+        "schema": "pi.ext.perf_comparison.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "summary": {
+            "overall_verdict": "faster",
+            "faster_count": 7,
+            "slower_count": 1,
+            "comparable_count": 2
+        }
+    });
+
+    let summary = validate_perf_comparison_payload(&payload)
+        .expect("current perf_comparison payload shape should validate");
+    assert_eq!(summary["overall_verdict"], "faster");
+    assert_eq!(summary["faster_count"], 7);
+    assert_eq!(summary["slower_count"], 1);
+    assert_eq!(summary["comparable_count"], 2);
+}
+
+#[test]
+fn validate_perf_comparison_payload_rejects_missing_overall_verdict() {
+    let payload = serde_json::json!({
+        "schema": "pi.ext.perf_comparison.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "summary": {
+            "faster_count": 7,
+            "slower_count": 1,
+            "comparable_count": 2
+        }
+    });
+
+    let err = validate_perf_comparison_payload(&payload)
+        .expect_err("perf_comparison without overall_verdict should fail closed");
+    assert!(
+        err.contains("overall_verdict"),
+        "expected overall_verdict validation error, got: {err}"
+    );
+}
+
+#[test]
+fn validate_parameter_sweeps_payload_accepts_current_shape() {
+    let payload = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "readiness": {
+            "status": "ready",
+            "ready_for_phase5": true,
+            "blocking_reasons": []
+        },
+        "source_identity": {
+            "source_artifact": "tests/perf/runs/results/phase1_matrix_validation.json"
+        }
+    });
+
+    let summary = validate_parameter_sweeps_payload(&payload)
+        .expect("current parameter_sweeps payload shape should validate");
+    assert_eq!(summary["readiness_status"], "ready");
+    assert_eq!(summary["ready_for_phase5"], true);
+    assert_eq!(summary["blocking_reasons_count"], 0);
+}
+
+#[test]
+fn validate_parameter_sweeps_payload_rejects_unknown_readiness_status() {
+    let payload = serde_json::json!({
+        "schema": "pi.perf.parameter_sweeps.v1",
+        "generated_at": "2026-02-17T03:00:00.000Z",
+        "readiness": {
+            "status": "unknown",
+            "ready_for_phase5": false,
+            "blocking_reasons": ["lineage_missing"]
+        },
+        "source_identity": {
+            "source_artifact": "tests/perf/runs/results/phase1_matrix_validation.json"
+        }
+    });
+
+    let err = validate_parameter_sweeps_payload(&payload)
+        .expect_err("parameter_sweeps with non-contract readiness status must fail closed");
+    assert!(
+        err.contains("ready|blocked"),
+        "expected readiness status validation error, got: {err}"
+    );
+}
+
+fn lineage_fixture_section(id: &str, summary: Value) -> BundleSection {
+    BundleSection {
+        id: id.to_string(),
+        label: id.to_string(),
+        category: "performance".to_string(),
+        status: "present".to_string(),
+        artifact_path: Some(format!("{id}.json")),
+        schema: None,
+        summary: Some(summary),
+        diagnostics: None,
+        file_count: 1,
+        total_bytes: 1,
+    }
+}
+
+fn unique_temp_root(label: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!(
+        "ci-evidence-bundle-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}
+
+fn write_fixture_json(path: &Path, payload: &Value) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = serde_json::to_string_pretty(payload).expect("fixture JSON should serialize");
+    std::fs::write(path, text).expect("fixture JSON should write");
+}
+
+#[test]
+fn stress_triage_source_is_required_json_artifact() {
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "stress_triage")
+        .expect("stress_triage source must exist");
+    assert!(
+        !source.is_directory,
+        "stress_triage source must target a JSON artifact"
+    );
+    assert!(
+        source.path.ends_with("stress_triage.json"),
+        "stress_triage source must point to stress_triage.json"
+    );
+    assert!(
+        source.required,
+        "stress_triage source should be required for PERF-3X lineage contract"
+    );
+}
+
+#[test]
+fn validate_perf3x_lineage_contract_accepts_coherent_generated_at_fields() {
+    let sections = vec![
+        lineage_fixture_section(
+            "must_pass_gate",
+            serde_json::json!({
+                "run_id": "local-20260217T030608928Z",
+                "correlation_id": "corr-local-20260217T030608928Z",
+                "generated_at": "2026-02-17T03:06:08.928Z"
+            }),
+        ),
+        lineage_fixture_section(
+            "conformance_summary",
+            serde_json::json!({
+                "generated_at": "2026-02-16T20:45:35Z"
+            }),
+        ),
+        lineage_fixture_section(
+            "stress_triage",
+            serde_json::json!({
+                "generated_at": "2026-02-06T01:29:10Z"
+            }),
+        ),
+    ];
+
+    let summary = validate_perf3x_lineage_contract(&sections)
+        .expect("coherent lineage metadata should pass contract validation");
+    assert_eq!(summary["run_id"], "local-20260217T030608928Z");
+}
+
+#[test]
+fn validate_perf3x_lineage_contract_rejects_excessive_artifact_span() {
+    let sections = vec![
+        lineage_fixture_section(
+            "must_pass_gate",
+            serde_json::json!({
+                "run_id": "run-123",
+                "correlation_id": "corr-run-123",
+                "generated_at": "2026-02-17T03:06:08.928Z"
+            }),
+        ),
+        lineage_fixture_section(
+            "conformance_summary",
+            serde_json::json!({
+                "generated_at": "2026-02-16T20:45:35Z"
+            }),
+        ),
+        lineage_fixture_section(
+            "stress_triage",
+            serde_json::json!({
+                "generated_at": "2026-01-01T00:00:00Z"
+            }),
+        ),
+    ];
+
+    let err = validate_perf3x_lineage_contract(&sections)
+        .expect_err("lineage span beyond threshold must fail closed");
+    assert!(
+        err.contains("span exceeds"),
+        "expected span-threshold failure detail, got: {err}"
+    );
+}
+
+#[test]
+fn validate_perf3x_lineage_contract_rejects_missing_generated_at() {
+    let sections = vec![
+        lineage_fixture_section(
+            "must_pass_gate",
+            serde_json::json!({
+                "run_id": "run-123",
+                "correlation_id": "corr-run-123",
+                "generated_at": "2026-02-17T03:06:08.928Z"
+            }),
+        ),
+        lineage_fixture_section("conformance_summary", serde_json::json!({})),
+        lineage_fixture_section(
+            "stress_triage",
+            serde_json::json!({
+                "generated_at": "2026-02-06T01:29:10Z"
+            }),
+        ),
+    ];
+
+    let err = validate_perf3x_lineage_contract(&sections)
+        .expect_err("missing generated_at metadata must fail closed");
+    assert!(
+        err.contains("generated_at"),
+        "expected generated_at validation detail, got: {err}"
+    );
+}
+
+#[test]
+fn collect_section_reports_missing_file_path_diagnostics() {
+    let root = unique_temp_root("missing-file");
+    let _ = std::fs::create_dir_all(&root);
+    let source = ArtifactSource {
+        id: "missing_file",
+        label: "Missing file",
+        category: "unit",
+        path: "does/not/exist.json",
+        expected_schema: Some("pi.test"),
+        is_directory: false,
+        required: false,
+    };
+
+    let section = collect_section(&root, &source);
+    assert_eq!(section.status, "missing");
+    assert_eq!(section.file_count, 0);
+    assert_eq!(section.total_bytes, 0);
+    assert_eq!(
+        section.artifact_path.as_deref(),
+        Some("does/not/exist.json")
+    );
+    assert_eq!(section.diagnostics.as_deref(), Some("File not found"));
+}
+
+#[test]
+fn collect_section_reports_missing_directory_path_diagnostics() {
+    let root = unique_temp_root("missing-directory");
+    let _ = std::fs::create_dir_all(&root);
+    let source = ArtifactSource {
+        id: "missing_dir",
+        label: "Missing dir",
+        category: "unit",
+        path: "does/not/exist",
+        expected_schema: None,
+        is_directory: true,
+        required: false,
+    };
+
+    let section = collect_section(&root, &source);
+    assert_eq!(section.status, "missing");
+    assert_eq!(section.file_count, 0);
+    assert_eq!(section.total_bytes, 0);
+    assert_eq!(section.artifact_path.as_deref(), Some("does/not/exist"));
+    assert_eq!(section.diagnostics.as_deref(), Some("Directory not found"));
+}
+
+#[test]
+fn collect_section_parameter_sweeps_reports_custom_missing_diagnostic() {
+    let root = unique_temp_root("parameter-sweeps-missing");
+    let _ = std::fs::create_dir_all(&root);
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "parameter_sweeps")
+        .expect("parameter_sweeps source must exist");
+
+    let section = collect_section(&root, source);
+    assert_eq!(section.status, "missing");
+    assert_eq!(section.artifact_path.as_deref(), Some(source.path));
+    assert_eq!(
+        section.diagnostics.as_deref(),
+        Some(PARAMETER_SWEEPS_MISSING_DIAGNOSTIC)
+    );
+}
+
+#[test]
+fn collect_section_parameter_sweeps_uses_discovered_artifact_path() {
+    let root = unique_temp_root("parameter-sweeps-discovery");
+    let _ = std::fs::create_dir_all(&root);
+    let source = ARTIFACT_SOURCES
+        .iter()
+        .find(|source| source.id == "parameter_sweeps")
+        .expect("parameter_sweeps source must exist");
+    let discovered_path = root.join("tests/e2e_results/run-42/results/parameter_sweeps.json");
+    write_fixture_json(
+        &discovered_path,
+        &serde_json::json!({
+            "schema": "pi.perf.parameter_sweeps.v1",
+            "generated_at": "2026-02-17T04:00:00.000Z",
+            "readiness": {
+                "status": "blocked",
+                "ready_for_phase5": false,
+                "blocking_reasons": ["need_additional_runs"]
+            },
+            "source_identity": {
+                "source_artifact": "tests/perf/runs/results/phase1_matrix_validation.json"
+            }
+        }),
+    );
+
+    let section = collect_section(&root, source);
+    assert_eq!(section.status, "present");
+    assert_eq!(
+        section.artifact_path.as_deref(),
+        Some("tests/e2e_results/run-42/results/parameter_sweeps.json")
+    );
+    assert_eq!(section.file_count, 1);
+    assert!(
+        section.total_bytes > 0,
+        "parameter_sweeps section should include file size for discovered artifact"
+    );
+    let summary = section
+        .summary
+        .as_ref()
+        .expect("parameter_sweeps section should include summary payload");
+    assert_eq!(
+        summary.get("readiness_status").and_then(Value::as_str),
+        Some("blocked")
+    );
+    assert_eq!(
+        summary.get("ready_for_phase5").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        summary
+            .get("blocking_reasons_count")
+            .and_then(Value::as_u64),
+        Some(1)
     );
 }
 
