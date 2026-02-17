@@ -21082,6 +21082,44 @@ const fn hostcall_code_to_str(code: HostCallErrorCode) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionHostcallOp {
+    AppendMessage,
+    AppendEntry,
+    GetState,
+    GetMessages,
+    GetEntries,
+    GetBranch,
+    GetFile,
+    GetName,
+    SetName,
+    SetModel,
+    GetModel,
+    SetThinkingLevel,
+    GetThinkingLevel,
+    SetLabel,
+}
+
+fn parse_session_hostcall_op(op: &str) -> Option<SessionHostcallOp> {
+    with_folded_ascii_alnum_token(op, |folded| match folded {
+        b"appendmessage" => Some(SessionHostcallOp::AppendMessage),
+        b"appendentry" => Some(SessionHostcallOp::AppendEntry),
+        b"getstate" => Some(SessionHostcallOp::GetState),
+        b"getmessages" => Some(SessionHostcallOp::GetMessages),
+        b"getentries" => Some(SessionHostcallOp::GetEntries),
+        b"getbranch" => Some(SessionHostcallOp::GetBranch),
+        b"getfile" => Some(SessionHostcallOp::GetFile),
+        b"getname" => Some(SessionHostcallOp::GetName),
+        b"setname" => Some(SessionHostcallOp::SetName),
+        b"setmodel" => Some(SessionHostcallOp::SetModel),
+        b"getmodel" => Some(SessionHostcallOp::GetModel),
+        b"setthinkinglevel" => Some(SessionHostcallOp::SetThinkingLevel),
+        b"getthinkinglevel" => Some(SessionHostcallOp::GetThinkingLevel),
+        b"setlabel" => Some(SessionHostcallOp::SetLabel),
+        _ => None,
+    })
+}
+
 #[allow(clippy::future_not_send)]
 #[allow(clippy::too_many_lines)]
 async fn dispatch_hostcall_session(
@@ -21108,168 +21146,170 @@ async fn dispatch_hostcall_session_ref(
             message: "No session configured".to_string(),
         };
     };
-
-    let mut invalidate_ctx_cache = false;
-    let result = if token_eq_ascii_folded(op, "appendmessage") {
-        invalidate_ctx_cache = true;
-        let message_value = if let Some(message) = payload.get("message") {
-            message.clone()
-        } else {
-            match payload {
-                Value::Object(map) => {
-                    if map.contains_key("op") {
-                        let mut without_op = map.clone();
-                        without_op.remove("op");
-                        Value::Object(without_op)
-                    } else {
-                        Value::Object(map.clone())
-                    }
-                }
-                other => other.clone(),
-            }
+    let Some(op_kind) = parse_session_hostcall_op(op) else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("Unknown session op: {op}"),
         };
-        match serde_json::from_value(message_value) {
-            Ok(message) => session.append_message(message).await.map(|()| Value::Null),
-            Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
+    };
+
+    let invalidate_ctx_cache = matches!(
+        op_kind,
+        SessionHostcallOp::AppendMessage
+            | SessionHostcallOp::AppendEntry
+            | SessionHostcallOp::SetName
+            | SessionHostcallOp::SetModel
+            | SessionHostcallOp::SetThinkingLevel
+            | SessionHostcallOp::SetLabel
+    );
+
+    let result = match op_kind {
+        SessionHostcallOp::AppendMessage => {
+            let message_value = if let Some(message) = payload.get("message") {
+                message.clone()
+            } else {
+                match payload {
+                    Value::Object(map) => {
+                        if map.contains_key("op") {
+                            let mut without_op = map.clone();
+                            without_op.remove("op");
+                            Value::Object(without_op)
+                        } else {
+                            Value::Object(map.clone())
+                        }
+                    }
+                    other => other.clone(),
+                }
+            };
+            match serde_json::from_value(message_value) {
+                Ok(message) => session.append_message(message).await.map(|()| Value::Null),
+                Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
+            }
         }
-    } else if token_eq_ascii_folded(op, "appendentry") {
-        invalidate_ctx_cache = true;
-        let custom_type = payload
-            .get("customType")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("custom_type").and_then(Value::as_str))
-            .or_else(|| payload.get("customtype").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_string();
-        let data = payload.get("data").cloned();
-        session
-            .append_custom_entry(custom_type, data)
-            .await
-            .map(|()| Value::Null)
-    } else {
-        match parse_session_opcode_atom(op) {
-            Some(CommonHostcallOpcode::SessionGetState) => Ok(session.get_state().await),
-            Some(CommonHostcallOpcode::SessionGetMessages) => {
-                serde_json::to_value(session.get_messages().await)
-                    .map_err(|err| Error::extension(format!("Serialize messages: {err}")))
+        SessionHostcallOp::AppendEntry => {
+            let custom_type = payload
+                .get("customType")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                .or_else(|| payload.get("customtype").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            let data = payload.get("data").cloned();
+            session
+                .append_custom_entry(custom_type, data)
+                .await
+                .map(|()| Value::Null)
+        }
+        SessionHostcallOp::GetState => Ok(session.get_state().await),
+        SessionHostcallOp::GetMessages => serde_json::to_value(session.get_messages().await)
+            .map_err(|err| Error::extension(format!("Serialize messages: {err}"))),
+        SessionHostcallOp::GetEntries => serde_json::to_value(session.get_entries().await)
+            .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
+        SessionHostcallOp::GetBranch => serde_json::to_value(session.get_branch().await)
+            .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
+        SessionHostcallOp::GetFile => {
+            let state = session.get_state().await;
+            let file = state
+                .get("sessionFile")
+                .or_else(|| state.get("session_file"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(file)
+        }
+        SessionHostcallOp::GetName => {
+            let state = session.get_state().await;
+            let name = state
+                .get("sessionName")
+                .or_else(|| state.get("session_name"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(name)
+        }
+        SessionHostcallOp::SetName => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            session.set_name(name).await.map(|()| Value::Null)
+        }
+        SessionHostcallOp::SetModel => {
+            let provider = payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model_id = payload
+                .get("modelId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("model_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if provider.is_empty() || model_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setModel: provider and modelId are required".to_string(),
+                };
             }
-            Some(CommonHostcallOpcode::SessionGetEntries) => {
-                serde_json::to_value(session.get_entries().await)
-                    .map_err(|err| Error::extension(format!("Serialize entries: {err}")))
+            session
+                .set_model(provider, model_id)
+                .await
+                .map(|()| Value::Bool(true))
+        }
+        SessionHostcallOp::GetModel => {
+            let (provider, model_id) = session.get_model().await;
+            Ok(serde_json::json!({
+                "provider": provider,
+                "modelId": model_id,
+            }))
+        }
+        SessionHostcallOp::SetThinkingLevel => {
+            let level = payload
+                .get("level")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
+                .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if level.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setThinkingLevel: level is required".to_string(),
+                };
             }
-            Some(CommonHostcallOpcode::SessionGetBranch) => {
-                serde_json::to_value(session.get_branch().await)
-                    .map_err(|err| Error::extension(format!("Serialize branch: {err}")))
+            session
+                .set_thinking_level(level)
+                .await
+                .map(|()| Value::Null)
+        }
+        SessionHostcallOp::GetThinkingLevel => {
+            let level = session.get_thinking_level().await;
+            Ok(level.map_or(Value::Null, Value::String))
+        }
+        SessionHostcallOp::SetLabel => {
+            let target_id = payload
+                .get("targetId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("target_id").and_then(Value::as_str))
+                .or_else(|| payload.get("entryId").and_then(Value::as_str))
+                .or_else(|| payload.get("entry_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if target_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setLabel: targetId is required".to_string(),
+                };
             }
-            Some(CommonHostcallOpcode::SessionGetFile) => {
-                let state = session.get_state().await;
-                let file = state
-                    .get("sessionFile")
-                    .or_else(|| state.get("session_file"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                Ok(file)
-            }
-            Some(CommonHostcallOpcode::SessionGetName) => {
-                let state = session.get_state().await;
-                let name = state
-                    .get("sessionName")
-                    .or_else(|| state.get("session_name"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                Ok(name)
-            }
-            Some(CommonHostcallOpcode::SessionSetName) => {
-                invalidate_ctx_cache = true;
-                let name = payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                session.set_name(name).await.map(|()| Value::Null)
-            }
-            Some(CommonHostcallOpcode::SessionSetModel) => {
-                invalidate_ctx_cache = true;
-                let provider = payload
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let model_id = payload
-                    .get("modelId")
-                    .and_then(Value::as_str)
-                    .or_else(|| payload.get("model_id").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                if provider.is_empty() || model_id.is_empty() {
-                    return HostcallOutcome::Error {
-                        code: "invalid_request".to_string(),
-                        message: "setModel: provider and modelId are required".to_string(),
-                    };
-                }
-                session
-                    .set_model(provider, model_id)
-                    .await
-                    .map(|()| Value::Bool(true))
-            }
-            Some(CommonHostcallOpcode::SessionGetModel) => {
-                let (provider, model_id) = session.get_model().await;
-                Ok(serde_json::json!({
-                    "provider": provider,
-                    "modelId": model_id,
-                }))
-            }
-            Some(CommonHostcallOpcode::SessionSetThinkingLevel) => {
-                invalidate_ctx_cache = true;
-                let level = payload
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
-                    .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                if level.is_empty() {
-                    return HostcallOutcome::Error {
-                        code: "invalid_request".to_string(),
-                        message: "setThinkingLevel: level is required".to_string(),
-                    };
-                }
-                session
-                    .set_thinking_level(level)
-                    .await
-                    .map(|()| Value::Null)
-            }
-            Some(CommonHostcallOpcode::SessionGetThinkingLevel) => {
-                let level = session.get_thinking_level().await;
-                Ok(level.map_or(Value::Null, Value::String))
-            }
-            Some(CommonHostcallOpcode::SessionSetLabel) => {
-                invalidate_ctx_cache = true;
-                let target_id = payload
-                    .get("targetId")
-                    .and_then(Value::as_str)
-                    .or_else(|| payload.get("target_id").and_then(Value::as_str))
-                    .or_else(|| payload.get("entryId").and_then(Value::as_str))
-                    .or_else(|| payload.get("entry_id").and_then(Value::as_str))
-                    .unwrap_or_default()
-                    .to_string();
-                if target_id.is_empty() {
-                    return HostcallOutcome::Error {
-                        code: "invalid_request".to_string(),
-                        message: "setLabel: targetId is required".to_string(),
-                    };
-                }
-                let label = payload
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                session
-                    .set_label(target_id, label)
-                    .await
-                    .map(|()| Value::Null)
-            }
-            Some(_) | None => Err(Error::validation(format!("Unknown session op: {op}"))),
+            let label = payload
+                .get("label")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            session
+                .set_label(target_id, label)
+                .await
+                .map(|()| Value::Null)
         }
     };
 
