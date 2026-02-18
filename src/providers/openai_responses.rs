@@ -117,9 +117,12 @@ impl OpenAIResponsesProvider {
             )
         };
 
+        let instructions = context.system_prompt.as_deref().map(ToString::to_string);
+
         OpenAIResponsesRequest {
             model: self.model.clone(),
             input,
+            instructions,
             temperature: options.temperature,
             max_output_tokens: options.max_tokens.or(Some(DEFAULT_MAX_OUTPUT_TOKENS)),
             tools,
@@ -741,6 +744,8 @@ pub struct OpenAIResponsesRequest {
     model: String,
     input: Vec<OpenAIResponsesInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
@@ -821,12 +826,9 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
 fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInputItem> {
     let mut input = Vec::new();
 
-    if let Some(system) = &context.system_prompt {
-        input.push(OpenAIResponsesInputItem::System {
-            role: "system",
-            content: system.to_string(),
-        });
-    }
+    // System prompt is sent as top-level `instructions` field, not in input array.
+    // Some providers (e.g. OpenAI Codex) require `instructions` and reject system
+    // messages in the input array.
 
     for message in context.messages.iter() {
         match message {
@@ -1111,11 +1113,10 @@ mod tests {
         assert!((temperature - 0.3).abs() < 1e-6);
         assert_eq!(value["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(value["stream"], true);
-        assert_eq!(value["input"][0]["role"], "system");
-        assert_eq!(value["input"][0]["content"], "System guidance");
-        assert_eq!(value["input"][1]["role"], "user");
-        assert_eq!(value["input"][1]["content"][0]["type"], "input_text");
-        assert_eq!(value["input"][1]["content"][0]["text"], "Ping");
+        assert_eq!(value["instructions"], "System guidance");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["content"][0]["text"], "Ping");
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["tools"][0]["name"], "search");
         assert_eq!(value["tools"][0]["description"], "Search docs");
