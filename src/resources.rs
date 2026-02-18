@@ -1711,8 +1711,8 @@ mod tests {
     fn test_cli_extensions_load_when_no_extensions_flag_set() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.js");
-            fs::write(&extension_path, "export default function() {}").expect("write extension");
+            let extension_path = temp_dir.path().join("ext.native.json");
+            fs::write(&extension_path, "{}").expect("write extension");
 
             let manager = PackageManager::new(temp_dir.path().to_path_buf());
             let config = Config::default();
@@ -1738,8 +1738,8 @@ mod tests {
     fn test_extension_paths_deduped_between_settings_and_cli() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.js");
-            fs::write(&extension_path, "export default function() {}").expect("write extension");
+            let extension_path = temp_dir.path().join("ext.native.json");
+            fs::write(&extension_path, "{}").expect("write extension");
 
             let settings_dir = temp_dir.path().join(".pi");
             fs::create_dir_all(&settings_dir).expect("create settings dir");

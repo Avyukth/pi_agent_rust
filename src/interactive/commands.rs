@@ -195,12 +195,11 @@ pub(super) fn save_provider_credential(
 ) {
     let requested = provider.trim().to_ascii_lowercase();
     let canonical = normalize_auth_provider_input(&requested);
-    auth.set(canonical.clone(), credential);
-    if canonical == "google" {
-        let _ = auth.remove("gemini");
-    } else if requested != canonical {
-        let _ = auth.remove(&requested);
+    let _ = auth.remove_provider_aliases(&requested);
+    if requested != canonical {
+        let _ = auth.remove_provider_aliases(&canonical);
     }
+    auth.set(canonical.clone(), credential);
 }
 
 pub(super) fn remove_provider_credentials(
@@ -210,21 +209,19 @@ pub(super) fn remove_provider_credentials(
     let requested = requested_provider.trim().to_ascii_lowercase();
     let canonical = normalize_auth_provider_input(&requested);
 
-    let mut removed = auth.remove(&canonical);
+    let mut removed = auth.remove_provider_aliases(&canonical);
     if requested != canonical {
-        removed |= auth.remove(&requested);
-    }
-    if canonical == "google" {
-        removed |= auth.remove("gemini");
+        removed |= auth.remove_provider_aliases(&requested);
     }
     removed
 }
 
-const BUILTIN_LOGIN_PROVIDERS: [(&str, &str); 8] = [
+const BUILTIN_LOGIN_PROVIDERS: [(&str, &str); 9] = [
     ("anthropic", "OAuth"),
     ("openai-codex", "OAuth"),
     ("google-gemini-cli", "OAuth"),
     ("google-antigravity", "OAuth"),
+    ("kimi-for-coding", "OAuth"),
     ("github-copilot", "OAuth"),
     ("gitlab", "OAuth"),
     ("openai", "API key"),
@@ -303,6 +300,22 @@ fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<Str
     providers.sort_unstable();
     providers.dedup();
     providers
+}
+
+fn extension_oauth_config_for_provider(
+    available_models: &[ModelEntry],
+    provider: &str,
+) -> Option<crate::models::OAuthConfig> {
+    available_models.iter().find_map(|entry| {
+        let model_provider = entry.model.provider.as_str();
+        let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
+            .unwrap_or(model_provider);
+        if canonical.eq_ignore_ascii_case(provider) {
+            entry.oauth_config.clone()
+        } else {
+            None
+        }
+    })
 }
 
 fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, String, String)]) {
@@ -385,6 +398,18 @@ pub(super) fn format_startup_oauth_hint(auth: &crate::auth::AuthStorage) -> Stri
 }
 
 pub(super) fn should_show_startup_oauth_hint(auth: &crate::auth::AuthStorage) -> bool {
+    let has_any_credential = crate::provider_metadata::PROVIDER_METADATA
+        .iter()
+        .map(|meta| meta.canonical_id)
+        .any(|provider| {
+            auth.has_stored_credential(provider)
+                || auth.external_setup_source(provider).is_some()
+                || auth.resolve_api_key(provider, None).is_some()
+        });
+    if has_any_credential {
+        return false;
+    }
+
     STARTUP_PRIORITY_OAUTH_PROVIDERS
         .iter()
         .all(|(provider, _)| {
@@ -413,10 +438,27 @@ pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
 }
 
 pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
-    left.model
-        .provider
-        .eq_ignore_ascii_case(&right.model.provider)
+    let left_provider = crate::provider_metadata::canonical_provider_id(&left.model.provider)
+        .unwrap_or(&left.model.provider);
+    let right_provider = crate::provider_metadata::canonical_provider_id(&right.model.provider)
+        .unwrap_or(&right.model.provider);
+
+    left_provider.eq_ignore_ascii_case(right_provider)
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
+}
+
+fn provider_ids_match(left: &str, right: &str) -> bool {
+    normalize_auth_provider_input(left) == normalize_auth_provider_input(right)
+}
+
+fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
+    let (provider, model_id) = model_spec.split_once('/')?;
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    if provider.is_empty() || model_id.is_empty() {
+        return None;
+    }
+    Some((provider, model_id))
 }
 
 pub fn resolve_scoped_model_entries(
@@ -674,29 +716,43 @@ impl PiApp {
                 }
                 PendingLoginKind::DeviceFlow => match device_code {
                     Some(dc) => {
-                        let client_id =
-                            std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
-                        let copilot_config = crate::auth::CopilotOAuthConfig {
-                            client_id,
-                            ..crate::auth::CopilotOAuthConfig::default()
-                        };
-                        let poll_result =
+                        let poll_result = if provider == "kimi-for-coding" {
+                            Box::pin(crate::auth::poll_kimi_code_device_flow(&dc)).await
+                        } else {
+                            let client_id =
+                                std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
+                            let copilot_config = crate::auth::CopilotOAuthConfig {
+                                client_id,
+                                ..crate::auth::CopilotOAuthConfig::default()
+                            };
                             Box::pin(crate::auth::poll_copilot_device_flow(&copilot_config, &dc))
-                                .await;
+                                .await
+                        };
                         match poll_result {
                             crate::auth::DeviceFlowPollResult::Success(cred) => Ok(cred),
                             crate::auth::DeviceFlowPollResult::Error(e) => {
                                 Err(crate::error::Error::auth(e))
                             }
                             crate::auth::DeviceFlowPollResult::Expired => {
-                                Err(crate::error::Error::auth("Device code expired".to_string()))
+                                Err(crate::error::Error::auth(format!(
+                                    "Device code expired for {provider}. Run /login {provider} again."
+                                )))
                             }
                             crate::auth::DeviceFlowPollResult::AccessDenied => {
-                                Err(crate::error::Error::auth("Access denied".to_string()))
+                                Err(crate::error::Error::auth(format!(
+                                    "Access denied for {provider}."
+                                )))
                             }
-                            other => Err(crate::error::Error::auth(format!(
-                                "Unexpected device flow state: {other:?}"
-                            ))),
+                            crate::auth::DeviceFlowPollResult::Pending => {
+                                Err(crate::error::Error::auth(format!(
+                                    "Authorization for {provider} is still pending. Complete the browser step and submit again."
+                                )))
+                            }
+                            crate::auth::DeviceFlowPollResult::SlowDown => {
+                                Err(crate::error::Error::auth(format!(
+                                    "Authorization server asked to slow down for {provider}. Wait a few seconds and submit again."
+                                )))
+                            }
                         }
                     }
                     None => Err(crate::error::Error::auth(
@@ -1483,6 +1539,48 @@ impl PiApp {
             return None;
         }
 
+        if provider == "kimi-for-coding" {
+            let device_start =
+                futures::executor::block_on(crate::auth::start_kimi_code_device_flow());
+            match device_start {
+                Ok(device) => {
+                    let verification_url = device
+                        .verification_uri_complete
+                        .clone()
+                        .unwrap_or_else(|| device.verification_uri.clone());
+                    let message = format!(
+                        "OAuth login: kimi-for-coding\n\n\
+Open this URL:\n{verification_url}\n\n\
+If prompted, enter this code: {}\n\
+Code expires in {} seconds.\n\n\
+After approving access in the browser, press Enter in Pi to complete login.",
+                        device.user_code, device.expires_in
+                    );
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: message,
+                        thinking: None,
+                        collapsed: false,
+                    });
+                    self.scroll_to_bottom();
+                    self.pending_oauth = Some(PendingOAuth {
+                        provider,
+                        kind: PendingLoginKind::DeviceFlow,
+                        verifier: String::new(),
+                        oauth_config: None,
+                        device_code: Some(device.device_code),
+                    });
+                    self.input_mode = InputMode::SingleLine;
+                    self.set_input_height(3);
+                    self.input.focus();
+                }
+                Err(err) => {
+                    self.status_message = Some(format!("OAuth login failed: {err}"));
+                }
+            }
+            return None;
+        }
+
         // Look up OAuth config: built-in providers or extension-registered OAuth config.
         let oauth_result = if provider == "anthropic" {
             crate::auth::start_anthropic_oauth().map(|info| (info, None))
@@ -1511,16 +1609,7 @@ impl PiApp {
             crate::auth::start_gitlab_oauth(&gitlab_config).map(|info| (info, None))
         } else {
             // Check extension providers for OAuth config.
-            let ext_oauth = self
-                .available_models
-                .iter()
-                .find(|m| {
-                    let model_provider = m.model.provider.as_str();
-                    let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
-                        .unwrap_or(model_provider);
-                    canonical == provider
-                })
-                .and_then(|m| m.oauth_config.clone());
+            let ext_oauth = extension_oauth_config_for_provider(&self.available_models, &provider);
             if let Some(config) = ext_oauth {
                 crate::auth::start_extension_oauth(&provider, &config)
                     .map(|info| (info, Some(config)))
@@ -1623,11 +1712,18 @@ impl PiApp {
 
         let pattern = args.trim();
         let pattern_lower = pattern.to_ascii_lowercase();
+        let provider_scoped_pattern = split_provider_model_spec(pattern);
 
         let mut exact_matches = Vec::new();
         for entry in &self.available_models {
             let full = format!("{}/{}", entry.model.provider, entry.model.id);
-            if full.eq_ignore_ascii_case(pattern) || entry.model.id.eq_ignore_ascii_case(pattern) {
+            if full.eq_ignore_ascii_case(pattern)
+                || entry.model.id.eq_ignore_ascii_case(pattern)
+                || provider_scoped_pattern.is_some_and(|(provider, model_id)| {
+                    provider_ids_match(&entry.model.provider, provider)
+                        && entry.model.id.eq_ignore_ascii_case(model_id)
+                })
+            {
                 exact_matches.push(entry.clone());
             }
         }
@@ -1651,17 +1747,14 @@ impl PiApp {
         matches.sort_by(|a, b| {
             let left = format!("{}/{}", a.model.provider, a.model.id);
             let right = format!("{}/{}", b.model.provider, b.model.id);
-            left.cmp(&right)
+            left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
         });
-        matches.dedup_by(|a, b| {
-            a.model.provider.eq_ignore_ascii_case(&b.model.provider)
-                && a.model.id.eq_ignore_ascii_case(&b.model.id)
-        });
+        matches.dedup_by(|a, b| model_entry_matches(a, b));
 
         if matches.is_empty()
             && let Some((provider, model_id)) = pattern.split_once('/')
         {
-            let provider = provider.trim().to_ascii_lowercase();
+            let provider = normalize_auth_provider_input(provider);
             let model_id = model_id.trim();
             if !provider.is_empty()
                 && !model_id.is_empty()
@@ -1712,9 +1805,7 @@ impl PiApp {
             return None;
         }
 
-        if next.model.provider == self.model_entry.model.provider
-            && next.model.id == self.model_entry.model.id
-        {
+        if model_entry_matches(&next, &self.model_entry) {
             self.status_message = Some(format!("Current model: {}", self.model));
             return None;
         }
@@ -1991,6 +2082,9 @@ impl PiApp {
 mod tests {
     use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
     use crate::auth::{AuthCredential, AuthStorage};
+    use crate::models::ModelEntry;
+    use crate::provider::{InputType, Model, ModelCost};
+    use std::collections::{HashMap, HashSet};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn empty_auth_storage() -> AuthStorage {
@@ -2000,6 +2094,34 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("pi_auth_storage_test_{nonce}.json"));
         AuthStorage::load(path).expect("load empty auth storage")
+    }
+
+    fn test_model_entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-responses".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.test/v1".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: Some("test-key".to_string()),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
     }
 
     #[test]
@@ -2106,10 +2228,158 @@ mod tests {
     }
 
     #[test]
+    fn startup_hint_is_hidden_when_non_oauth_provider_is_available() {
+        let mut auth = empty_auth_storage();
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "test-openai-key".to_string(),
+            },
+        );
+        assert!(!should_show_startup_oauth_hint(&auth));
+    }
+
+    #[test]
     fn startup_hint_copy_no_longer_uses_front_and_center_phrase() {
         let auth = empty_auth_storage();
         let hint = super::format_startup_oauth_hint(&auth);
         assert!(hint.contains("No provider credentials were detected."));
         assert!(!hint.contains("front and center"));
+    }
+
+    #[test]
+    fn builtin_login_providers_cover_legacy_oauth_registry() {
+        let login_oauth: HashSet<&str> = super::BUILTIN_LOGIN_PROVIDERS
+            .iter()
+            .filter_map(|(provider, mode)| (*mode == "OAuth").then_some(*provider))
+            .collect();
+
+        // Legacy pi-mono OAuth provider registry (packages/ai/src/utils/oauth/index.ts)
+        // includes exactly these built-ins.
+        let legacy_oauth = [
+            "anthropic",
+            "openai-codex",
+            "google-gemini-cli",
+            "google-antigravity",
+            "github-copilot",
+        ];
+
+        let missing: Vec<&str> = legacy_oauth
+            .iter()
+            .copied()
+            .filter(|provider| !login_oauth.contains(provider))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "missing legacy OAuth providers in /login table: {}",
+            missing.join(", ")
+        );
+
+        assert!(
+            login_oauth.contains("kimi-for-coding"),
+            "kimi-for-coding should remain available in /login OAuth providers"
+        );
+    }
+
+    #[test]
+    fn model_entry_matches_provider_aliases_case_insensitively() {
+        let left = test_model_entry("openrouter", "openai/gpt-4o-mini");
+        let right = test_model_entry("open-router", "openai/gpt-4o-mini");
+        assert!(super::model_entry_matches(&left, &right));
+    }
+
+    #[test]
+    fn provider_ids_match_normalizes_aliases() {
+        assert!(super::provider_ids_match("openrouter", "open-router"));
+        assert!(super::provider_ids_match("google-gemini-cli", "gemini-cli"));
+        assert!(super::provider_ids_match("kimi-for-coding", "kimi-code"));
+        assert!(!super::provider_ids_match("openai", "anthropic"));
+    }
+
+    #[test]
+    fn normalize_auth_provider_input_maps_kimi_code_alias() {
+        assert_eq!(
+            super::normalize_auth_provider_input("kimi-code"),
+            "kimi-for-coding"
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_model_entries_dedupes_provider_alias_variants() {
+        let available = vec![
+            test_model_entry("openrouter", "openai/gpt-4o-mini"),
+            test_model_entry("open-router", "openai/gpt-4o-mini"),
+        ];
+        let patterns = vec!["openrouter/openai/gpt-4o-mini".to_string()];
+        let resolved = super::resolve_scoped_model_entries(&patterns, &available)
+            .expect("resolve scoped models");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].model.id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn save_provider_credential_canonicalizes_alias_input() {
+        let mut auth = empty_auth_storage();
+        super::save_provider_credential(
+            &mut auth,
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "new-google-key".to_string(),
+            },
+        );
+
+        assert!(auth.get("gemini").is_none());
+        match auth.get("google") {
+            Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
+            other => panic!("expected google api key credential, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_provider_credentials_removes_alias_entries() {
+        let mut auth = empty_auth_storage();
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key".to_string(),
+            },
+        );
+        auth.set(
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "gemini-key".to_string(),
+            },
+        );
+
+        assert!(super::remove_provider_credentials(&mut auth, "gemini"));
+        assert!(auth.get("google").is_none());
+        assert!(auth.get("gemini").is_none());
+    }
+
+    #[test]
+    fn extension_oauth_config_selection_skips_non_oauth_entries() {
+        let mut no_oauth = test_model_entry("ext-provider", "model-a");
+        no_oauth.oauth_config = None;
+        let mut with_oauth = test_model_entry("ext-provider", "model-b");
+        with_oauth.oauth_config = Some(crate::models::OAuthConfig {
+            auth_url: "https://example.test/oauth/authorize".to_string(),
+            token_url: "https://example.test/oauth/token".to_string(),
+            scopes: vec!["scope:a".to_string()],
+            client_id: "client-id".to_string(),
+            redirect_uri: Some("http://localhost/callback".to_string()),
+        });
+
+        let selected =
+            super::extension_oauth_config_for_provider(&[no_oauth, with_oauth], "ext-provider");
+        let selected = selected.expect("expected oauth config");
+        assert_eq!(selected.auth_url, "https://example.test/oauth/authorize");
+        assert_eq!(selected.token_url, "https://example.test/oauth/token");
+        assert_eq!(selected.client_id, "client-id");
+        assert_eq!(selected.scopes, vec!["scope:a".to_string()]);
+        assert_eq!(
+            selected.redirect_uri.as_deref(),
+            Some("http://localhost/callback")
+        );
     }
 }

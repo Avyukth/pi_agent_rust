@@ -25,6 +25,7 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
+use crate::provider_metadata::canonical_provider_id;
 use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
@@ -41,6 +42,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+fn provider_ids_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    let left_canonical = canonical_provider_id(left).unwrap_or(left);
+    let right_canonical = canonical_provider_id(right).unwrap_or(right);
+
+    left_canonical.eq_ignore_ascii_case(right)
+        || right_canonical.eq_ignore_ascii_case(left)
+        || left_canonical.eq_ignore_ascii_case(right_canonical)
+}
 
 #[derive(Clone)]
 pub struct RpcOptions {
@@ -751,7 +767,10 @@ pub async fn run(
                 let Some(entry) = options
                     .available_models
                     .iter()
-                    .find(|m| m.model.provider == provider && m.model.id == model_id)
+                    .find(|m| {
+                        provider_ids_match(&m.model.provider, provider)
+                            && m.model.id.eq_ignore_ascii_case(model_id)
+                    })
                     .cloned()
                 else {
                     let _ = out_tx.send(response_error(
@@ -2802,10 +2821,10 @@ fn session_state(
         .as_deref()
         .zip(session.header.model_id.as_deref())
         .and_then(|(provider, model_id)| {
-            options
-                .available_models
-                .iter()
-                .find(|m| m.model.provider == provider && m.model.id == model_id)
+            options.available_models.iter().find(|m| {
+                provider_ids_match(&m.model.provider, provider)
+                    && m.model.id.eq_ignore_ascii_case(model_id)
+            })
         })
         .map(rpc_model_from_entry);
 
@@ -3322,10 +3341,9 @@ fn current_model_entry<'a>(
 ) -> Option<&'a ModelEntry> {
     let provider = session.header.provider.as_deref()?;
     let model_id = session.header.model_id.as_deref()?;
-    options
-        .available_models
-        .iter()
-        .find(|m| m.model.provider == provider && m.model.id == model_id)
+    options.available_models.iter().find(|m| {
+        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
+    })
 }
 
 async fn apply_thinking_level(
@@ -3457,8 +3475,12 @@ async fn cycle_model_for_rpc(
     };
 
     let current_index = candidates.iter().position(|entry| {
-        current_provider.as_deref() == Some(entry.model.provider.as_str())
-            && current_model_id.as_deref() == Some(entry.model.id.as_str())
+        current_provider
+            .as_deref()
+            .is_some_and(|provider| provider_ids_match(provider, &entry.model.provider))
+            && current_model_id
+                .as_deref()
+                .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
     });
 
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
@@ -3513,6 +3535,7 @@ mod tests {
         ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
     };
     use crate::provider::{InputType, Model, ModelCost};
+    use crate::session::Session;
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -3552,6 +3575,29 @@ mod tests {
         }
     }
 
+    fn rpc_options_with_models(available_models: Vec<ModelEntry>) -> RpcOptions {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let auth = AuthStorage::load(auth_path).expect("auth load");
+
+        RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models,
+            scoped_models: Vec::new(),
+            auth,
+            runtime_handle,
+        }
+    }
+
     // -----------------------------------------------------------------------
     // parse_queue_mode
     // -----------------------------------------------------------------------
@@ -3583,6 +3629,13 @@ mod tests {
     #[test]
     fn parse_queue_mode_trims_whitespace() {
         assert_eq!(parse_queue_mode(Some("  all  ")), Some(QueueMode::All));
+    }
+
+    #[test]
+    fn provider_ids_match_accepts_aliases() {
+        assert!(provider_ids_match("openrouter", "open-router"));
+        assert!(provider_ids_match("google-gemini-cli", "gemini-cli"));
+        assert!(!provider_ids_match("openai", "anthropic"));
     }
 
     // -----------------------------------------------------------------------
@@ -4358,6 +4411,45 @@ mod tests {
         let cost = &value["cost"];
         assert_eq!(cost["input"], 3.0);
         assert_eq!(cost["output"], 15.0);
+    }
+
+    #[test]
+    fn current_model_entry_matches_provider_alias_and_model_case() {
+        let mut model = dummy_entry("gpt-4o-mini", true);
+        model.model.provider = "openrouter".to_string();
+        let options = rpc_options_with_models(vec![model]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("open-router".to_string());
+        session.header.model_id = Some("GPT-4O-MINI".to_string());
+
+        let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
+        assert_eq!(resolved.model.provider, "openrouter");
+        assert_eq!(resolved.model.id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn session_state_resolves_model_for_provider_alias() {
+        let mut model = dummy_entry("gpt-4o-mini", true);
+        model.model.provider = "openrouter".to_string();
+        let options = rpc_options_with_models(vec![model]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("open-router".to_string());
+        session.header.model_id = Some("gpt-4o-mini".to_string());
+
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+
+        let state = session_state(&session, &options, &snapshot, false, false);
+        assert_eq!(state["model"]["provider"], "openrouter");
+        assert_eq!(state["model"]["id"], "gpt-4o-mini");
     }
 
     // -----------------------------------------------------------------------

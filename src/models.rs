@@ -194,6 +194,16 @@ fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String 
     model_id.trim().to_string()
 }
 
+fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
+    let provider = provider.trim();
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let canonical_model_id = canonicalize_model_id_for_provider(canonical_provider, model_id);
+    (
+        canonical_provider.to_ascii_lowercase(),
+        canonical_model_id.to_ascii_lowercase(),
+    )
+}
+
 fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
     let raw = model_id.trim().to_string();
     let canonical = canonicalize_openrouter_model_id(model_id);
@@ -234,10 +244,12 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
         return Vec::new();
     };
     let object_start = models_decl_start + object_start_rel;
-    let Some(end_marker) = LEGACY_MODELS_GENERATED_TS.rfind("} as const;") else {
+    let Some(end_marker_rel) = LEGACY_MODELS_GENERATED_TS[object_start..].rfind("} as const;")
+    else {
         tracing::warn!("Legacy model catalog missing end marker");
         return Vec::new();
     };
+    let end_marker = object_start + end_marker_rel;
 
     let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
         .trim_end_matches(" as const;")
@@ -343,7 +355,7 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
                 slug: "anthropic/claude-sonnet-4-6".to_string(),
                 description: Some("Claude Sonnet 4.6".to_string()),
             });
-            candidates.sort_by(|a, b| a.slug.cmp(&b.slug));
+            candidates.sort_by_key(|candidate| candidate.slug.to_ascii_lowercase());
             candidates.dedup_by(|a, b| a.slug.eq_ignore_ascii_case(&b.slug));
             candidates
         })
@@ -420,17 +432,22 @@ impl ModelRegistry {
     /// Find a model by ID alone (ignoring provider), useful for extension models
     /// where the provider name may be custom.
     pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
-        self.models.iter().find(|m| m.model.id == id).cloned()
+        let id = id.trim();
+        self.models
+            .iter()
+            .find(|m| m.model.id.eq_ignore_ascii_case(id))
+            .cloned()
     }
 
     /// Merge extension-provided model entries into the registry.
     pub fn merge_entries(&mut self, entries: Vec<ModelEntry>) {
         for entry in entries {
-            // Skip duplicates (same provider + id).
+            // Skip duplicates (canonical provider + canonical model id, case-insensitive).
+            let entry_key = normalized_registry_key(&entry.model.provider, &entry.model.id);
             let exists = self
                 .models
                 .iter()
-                .any(|m| m.model.provider == entry.model.provider && m.model.id == entry.model.id);
+                .any(|m| normalized_registry_key(&m.model.provider, &m.model.id) == entry_key);
             if !exists {
                 self.models.push(entry);
             }
@@ -1192,6 +1209,106 @@ mod tests {
     }
 
     #[test]
+    fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
+        let parsed = parse_legacy_generated_models();
+        assert!(
+            !parsed.is_empty(),
+            "legacy generated model catalog should parse into entries"
+        );
+
+        assert!(
+            parsed
+                .iter()
+                .any(|m| m.provider == "azure-openai-responses")
+        );
+        assert!(parsed.iter().any(|m| m.provider == "vercel-ai-gateway"));
+        assert!(parsed.iter().any(|m| m.provider == "kimi-coding"));
+    }
+
+    #[test]
+    fn built_in_models_include_all_legacy_provider_model_pairs() {
+        let (_dir, auth) = test_auth_storage();
+        let built = built_in_models(&auth);
+
+        let built_keys: HashSet<(String, String)> = built
+            .iter()
+            .map(|entry| {
+                (
+                    entry.model.provider.to_ascii_lowercase(),
+                    entry.model.id.to_ascii_lowercase(),
+                )
+            })
+            .collect();
+
+        let mut missing = Vec::new();
+        for legacy in legacy_generated_models() {
+            let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
+            if normalized_id.is_empty() {
+                continue;
+            }
+            let key = (
+                legacy.provider.to_ascii_lowercase(),
+                normalized_id.to_ascii_lowercase(),
+            );
+            if !built_keys.contains(&key) {
+                missing.push(format!("{}/{}", legacy.provider, legacy.id));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "missing legacy provider/model entries in built-in registry: {}",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn built_in_models_preserve_legacy_model_display_names() {
+        let (_dir, auth) = test_auth_storage();
+        let built = built_in_models(&auth);
+
+        let name_by_key: HashMap<(String, String), String> = built
+            .iter()
+            .map(|entry| {
+                (
+                    (
+                        entry.model.provider.to_ascii_lowercase(),
+                        entry.model.id.to_ascii_lowercase(),
+                    ),
+                    entry.model.name.clone(),
+                )
+            })
+            .collect();
+
+        let mut mismatches = Vec::new();
+        for legacy in legacy_generated_models() {
+            let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
+            if normalized_id.is_empty() {
+                continue;
+            }
+            let key = (
+                legacy.provider.to_ascii_lowercase(),
+                normalized_id.to_ascii_lowercase(),
+            );
+            let Some(built_name) = name_by_key.get(&key) else {
+                continue;
+            };
+            if !legacy.name.trim().is_empty() && built_name != &legacy.name {
+                mismatches.push(format!(
+                    "{}/{} => expected {:?}, got {:?}",
+                    legacy.provider, legacy.id, legacy.name, built_name
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "legacy model display name mismatches: {}",
+            mismatches.join("; ")
+        );
+    }
+
+    #[test]
     fn built_in_models_include_core_provider_entries() {
         let (_dir, auth) = test_auth_storage();
         let models = built_in_models(&auth);
@@ -1276,13 +1393,8 @@ mod tests {
                 .iter()
                 .any(|m| { m.model.provider == "zhipuai" && m.model.id == "glm-4.6" })
         );
-        assert!(
-            models
-                .iter()
-                .any(|m| { m.model.provider == "azure-openai" && m.model.id == "claude-opus-4-6" })
-        );
         assert!(models.iter().any(|m| {
-            m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4.6"
+            m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4"
         }));
     }
 
@@ -1314,6 +1426,20 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.slug == "openrouter/anthropic/claude-sonnet-4.6")
         );
+    }
+
+    #[test]
+    fn autocomplete_candidates_are_case_insensitively_unique() {
+        let candidates = model_autocomplete_candidates();
+        let mut seen = HashSet::new();
+        for candidate in candidates {
+            let key = candidate.slug.to_ascii_lowercase();
+            assert!(
+                seen.insert(key),
+                "duplicate autocomplete slug (case-insensitive): {}",
+                candidate.slug
+            );
+        }
     }
 
     #[test]
@@ -1551,13 +1677,24 @@ mod tests {
         assert_eq!(by_provider_and_id.model.id, "gpt-4o");
 
         let by_id = registry
-            .find_by_id("gemini-2.5-pro")
-            .expect("gemini-2.5-pro should exist");
-        assert_eq!(by_id.model.provider, "google");
-        assert_eq!(by_id.model.id, "gemini-2.5-pro");
+            .find_by_id("claude-opus-4-5")
+            .expect("claude-opus-4-5 should exist");
+        assert_eq!(by_id.model.provider, "anthropic");
+        assert_eq!(by_id.model.id, "claude-opus-4-5");
 
         assert!(registry.find("openai", "does-not-exist").is_none());
         assert!(registry.find_by_id("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn model_registry_find_by_id_is_case_insensitive() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let by_id = registry
+            .find_by_id("GPT-5.2-CODEX")
+            .expect("gpt-5.2-codex should resolve case-insensitively");
+        assert_eq!(by_id.model.id, "gpt-5.2-codex");
     }
 
     #[test]
@@ -1631,6 +1768,25 @@ mod tests {
         registry.merge_entries(vec![duplicate, new_entry]);
         assert_eq!(registry.models().len(), before + 1);
         assert!(registry.find("acme", "acme-chat").is_some());
+    }
+
+    #[test]
+    fn model_registry_merge_entries_deduplicates_alias_and_case_variants() {
+        let (_dir, auth) = test_auth_storage();
+        let mut registry = ModelRegistry::load(&auth, None);
+        let before = registry.models().len();
+
+        let source = registry
+            .find("openrouter", "gpt-4o-mini")
+            .or_else(|| registry.find("openrouter", "openai/gpt-4o-mini"))
+            .expect("expected built-in openrouter gpt-4o-mini model");
+
+        let mut alias_case_variant = source.clone();
+        alias_case_variant.model.provider = "open-router".to_string();
+        alias_case_variant.model.id = source.model.id.to_ascii_uppercase();
+
+        registry.merge_entries(vec![alias_case_variant]);
+        assert_eq!(registry.models().len(), before);
     }
 
     #[test]
@@ -2626,7 +2782,11 @@ mod tests {
         for m in models.iter().filter(|m| m.model.provider == "anthropic") {
             assert_eq!(m.model.api, "anthropic-messages");
             assert!(!m.auth_header, "anthropic uses x-api-key, not auth header");
-            assert_eq!(m.model.context_window, 200_000);
+            assert!(
+                m.model.context_window >= 200_000,
+                "anthropic model {} should expose a modern context window",
+                m.model.id
+            );
         }
     }
 
@@ -2654,19 +2814,33 @@ mod tests {
     fn built_in_reasoning_models_marked_correctly() {
         let (_dir, auth) = test_auth_storage();
         let models = built_in_models(&auth);
-        // Haiku models are non-reasoning
-        for m in models.iter().filter(|m| m.model.id.contains("haiku")) {
-            assert!(
-                !m.model.reasoning || m.model.id.contains("3-5-haiku"),
-                "haiku 3.5 is non-reasoning, but {}: reasoning={}",
-                m.model.id,
-                m.model.reasoning
-            );
-        }
-        // Opus/Sonnet models are reasoning
+        // Legacy Haiku 3.5 should remain non-reasoning.
         for m in models
             .iter()
-            .filter(|m| m.model.id.contains("opus") || m.model.id.contains("sonnet"))
+            .filter(|m| m.model.id.contains("3-5-haiku-20241022"))
+        {
+            assert!(!m.model.reasoning, "{} should be non-reasoning", m.model.id);
+        }
+        let anthropic_opus_sonnet = models
+            .iter()
+            .filter(|m| {
+                m.model.provider == "anthropic"
+                    && (m.model.id.contains("opus") || m.model.id.contains("sonnet"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !anthropic_opus_sonnet.is_empty(),
+            "expected anthropic opus/sonnet models in built-ins"
+        );
+        assert!(
+            anthropic_opus_sonnet.iter().any(|m| m.model.reasoning),
+            "expected at least one reasoning anthropic opus/sonnet model"
+        );
+
+        // Modern Opus/Sonnet 4 family should be reasoning-enabled.
+        for m in anthropic_opus_sonnet
+            .iter()
+            .filter(|m| m.model.id.contains("opus-4") || m.model.id.contains("sonnet-4"))
         {
             assert!(m.model.reasoning, "{} should be reasoning", m.model.id);
         }

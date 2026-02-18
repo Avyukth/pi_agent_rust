@@ -128,6 +128,20 @@ impl OpenAIResponsesProvider {
     }
 }
 
+fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty() {
+        Some(token.trim().to_string())
+    } else {
+        None
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIResponsesProvider {
     fn name(&self) -> &str {
@@ -152,6 +166,13 @@ impl Provider for OpenAIResponsesProvider {
             .headers
             .keys()
             .any(|key| key.eq_ignore_ascii_case("authorization"));
+        let authorization_header_value = options.headers.iter().find_map(|(key, value)| {
+            if key.eq_ignore_ascii_case("authorization") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        });
 
         let auth_value = if has_authorization_header {
             None
@@ -179,23 +200,34 @@ impl Provider for OpenAIResponsesProvider {
             .post(&self.base_url)
             .header("Accept", "text/event-stream");
 
-        if let Some(auth_value) = auth_value {
+        if let Some(ref auth_value) = auth_value {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
-            if self.codex_mode {
-                let account_id = extract_chatgpt_account_id(&auth_value).ok_or_else(|| {
+        }
+
+        if self.codex_mode {
+            let codex_token = authorization_header_value
+                .as_deref()
+                .and_then(bearer_token_from_authorization_header)
+                .or_else(|| auth_value.clone())
+                .ok_or_else(|| {
                     Error::provider(
                         self.name(),
-                        "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                        "OpenAI Codex mode requires a Bearer token. Provide one via /login openai-codex or an Authorization: Bearer <token> header.",
                     )
                 })?;
-                request = request
-                    .header("chatgpt-account-id", account_id)
-                    .header("OpenAI-Beta", "responses=experimental")
-                    .header("originator", "pi")
-                    .header("User-Agent", "pi_agent_rust");
-                if let Some(session_id) = &options.session_id {
-                    request = request.header("session_id", session_id);
-                }
+            let account_id = extract_chatgpt_account_id(&codex_token).ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                )
+            })?;
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("User-Agent", "pi_agent_rust");
+            if let Some(session_id) = &options.session_id {
+                request = request.header("session_id", session_id);
             }
         }
 
@@ -1237,6 +1269,88 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    fn build_test_jwt(account_id: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id
+                }
+            }))
+            .expect("payload json"),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn test_bearer_token_parser_accepts_case_insensitive_scheme() {
+        let token = super::bearer_token_from_authorization_header("bEaReR abc.def.ghi");
+        assert_eq!(token.as_deref(), Some("abc.def.ghi"));
+        assert!(super::bearer_token_from_authorization_header("Basic abc").is_none());
+        assert!(super::bearer_token_from_authorization_header("Bearer").is_none());
+    }
+
+    #[test]
+    fn test_codex_mode_adds_required_headers_with_authorization_override() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIResponsesProvider::new("gpt-4o")
+            .with_provider_name("openai-codex")
+            .with_api_name("openai-codex-responses")
+            .with_codex_mode(true)
+            .with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let token = build_test_jwt("acct_test_123");
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+        let options = StreamOptions {
+            headers,
+            session_id: Some("session-abc".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        let expected_auth = format!("Bearer {token}");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test_123")
+        );
+        assert_eq!(
+            captured.headers.get("openai-beta").map(String::as_str),
+            Some("responses=experimental")
+        );
+        assert_eq!(
+            captured.headers.get("session_id").map(String::as_str),
+            Some("session-abc")
+        );
     }
 
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {

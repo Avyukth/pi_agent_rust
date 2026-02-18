@@ -11,11 +11,13 @@ use crate::model::{
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
+use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::pin::Pin;
 
 // ============================================================================
@@ -27,10 +29,166 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20";
+const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 #[inline]
 fn is_anthropic_oauth_token(token: &str) -> bool {
     token.contains(ANTHROPIC_OAUTH_TOKEN_PREFIX)
+}
+
+#[inline]
+fn is_anthropic_provider(provider: &str) -> bool {
+    canonical_provider_id(provider).unwrap_or(provider) == "anthropic"
+}
+
+#[inline]
+fn is_anthropic_bearer_token(provider: &str, token: &str) -> bool {
+    if !is_anthropic_provider(provider) {
+        return false;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return false;
+    }
+
+    // OAuth tokens use the Bearer lane.
+    if is_anthropic_oauth_token(token) {
+        return true;
+    }
+
+    // Legacy/external Claude credentials are bearer tokens and do not start with sk-ant.
+    !token.starts_with("sk-ant-")
+}
+
+#[inline]
+fn is_kimi_coding_provider(provider: &str) -> bool {
+    canonical_provider_id(provider).unwrap_or(provider) == "kimi-for-coding"
+}
+
+#[inline]
+fn is_kimi_oauth_token(provider: &str, token: &str) -> bool {
+    is_kimi_coding_provider(provider) && !token.starts_with("sk-")
+}
+
+fn sanitize_ascii_header_value(value: &str, fallback: &str) -> String {
+    if value.is_ascii() && !value.trim().is_empty() {
+        return value.to_string();
+    }
+    let sanitized = value
+        .chars()
+        .filter(char::is_ascii)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn home_dir_with_env_lookup<F>(env_lookup: F) -> Option<std::path::PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("HOME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    home_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_share_dir_with_env_lookup<F>(env_lookup: F) -> Option<std::path::PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup(KIMI_SHARE_DIR_ENV_KEY)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home_dir_with_env_lookup(env_lookup).map(|home| home.join(".kimi")))
+}
+
+fn kimi_share_dir() -> Option<std::path::PathBuf> {
+    kimi_share_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_device_id_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let primary = kimi_share_dir()?.join("device_id");
+    let legacy = home_dir().map_or_else(
+        || primary.clone(),
+        |home| home.join(".pi").join("agent").join("kimi-device-id"),
+    );
+    Some((primary, legacy))
+}
+
+fn kimi_device_id() -> String {
+    let generated = uuid::Uuid::new_v4().simple().to_string();
+    let Some((primary, legacy)) = kimi_device_id_paths() else {
+        return generated;
+    };
+
+    for path in [&primary, &legacy] {
+        if let Ok(existing) = fs::read_to_string(path) {
+            let existing = existing.trim();
+            if !existing.is_empty() {
+                return existing.to_string();
+            }
+        }
+    }
+
+    if let Some(parent) = primary.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    if fs::write(&primary, generated.as_bytes()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&primary, fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    generated
+}
+
+fn kimi_common_headers() -> Vec<(String, String)> {
+    let device_name = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let device_model = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let os_version = std::env::consts::OS.to_string();
+
+    vec![
+        (
+            "X-Msh-Platform".to_string(),
+            sanitize_ascii_header_value("kimi_cli", "unknown"),
+        ),
+        (
+            "X-Msh-Version".to_string(),
+            sanitize_ascii_header_value(env!("CARGO_PKG_VERSION"), "unknown"),
+        ),
+        (
+            "X-Msh-Device-Name".to_string(),
+            sanitize_ascii_header_value(&device_name, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Model".to_string(),
+            sanitize_ascii_header_value(&device_model, "unknown"),
+        ),
+        (
+            "X-Msh-Os-Version".to_string(),
+            sanitize_ascii_header_value(&os_version, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Id".to_string(),
+            sanitize_ascii_header_value(&kimi_device_id(), "unknown"),
+        ),
+    ]
 }
 
 // ============================================================================
@@ -42,6 +200,7 @@ pub struct AnthropicProvider {
     client: Client,
     model: String,
     base_url: String,
+    provider: String,
     compat: Option<CompatConfig>,
 }
 
@@ -52,8 +211,16 @@ impl AnthropicProvider {
             client: Client::new(),
             model: model.into(),
             base_url: ANTHROPIC_API_URL.to_string(),
+            provider: "anthropic".to_string(),
             compat: None,
         }
+    }
+
+    /// Override the provider name reported in streamed events.
+    #[must_use]
+    pub fn with_provider_name(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     /// Create with a custom base URL.
@@ -149,8 +316,8 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn name(&self) -> &'static str {
-        "anthropic"
+    fn name(&self) -> &str {
+        &self.provider
     }
 
     fn api(&self) -> &'static str {
@@ -173,13 +340,14 @@ impl Provider for AnthropicProvider {
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .ok_or_else(|| {
                 Error::provider(
-                    "anthropic",
-                    "Missing API key for Anthropic. Set ANTHROPIC_API_KEY or use `pi auth`.",
+                    self.name(),
+                    "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
                 )
             })?;
 
         let request_body = self.build_request(context, options);
-        let oauth_token = is_anthropic_oauth_token(&auth_value);
+        let anthropic_bearer_token = is_anthropic_bearer_token(&self.provider, &auth_value);
+        let kimi_oauth_token = is_kimi_oauth_token(&self.provider, &auth_value);
 
         // Build request with headers (Content-Type set by .json() below)
         let mut request = self
@@ -188,7 +356,7 @@ impl Provider for AnthropicProvider {
             .header("Accept", "text/event-stream")
             .header("anthropic-version", ANTHROPIC_API_VERSION);
 
-        if oauth_token {
+        if anthropic_bearer_token {
             request = request
                 .header("Authorization", format!("Bearer {auth_value}"))
                 .header("anthropic-dangerous-direct-browser-access", "true")
@@ -200,12 +368,25 @@ impl Provider for AnthropicProvider {
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
+        } else if kimi_oauth_token {
+            request = request
+                .header("Authorization", format!("Bearer {auth_value}"))
+                .header(
+                    "user-agent",
+                    format!(
+                        "pi_agent_rust/{} (kimi-oauth, cli)",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                );
+            for (name, value) in kimi_common_headers() {
+                request = request.header(name, value);
+            }
         } else {
             request = request.header("X-API-Key", &auth_value);
         }
 
         let mut beta_flags: Vec<&str> = Vec::new();
-        if oauth_token {
+        if anthropic_bearer_token {
             beta_flags.push(ANTHROPIC_OAUTH_BETA_FLAGS);
         }
         if options.cache_retention != CacheRetention::None {
@@ -239,7 +420,7 @@ impl Provider for AnthropicProvider {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::provider(
-                "anthropic",
+                self.name(),
                 format!("Anthropic API error (HTTP {status}): {body}"),
             ));
         }
@@ -1403,6 +1584,64 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_claude_style_non_sk_token_uses_bearer_auth_headers() {
+        let captured =
+            run_stream_and_capture_headers_with_api_key(CacheRetention::None, "claude-oauth-token")
+                .expect("captured request for claude bearer headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer claude-oauth-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn test_stream_kimi_oauth_uses_bearer_and_kimi_headers() {
+        let captured = run_stream_and_capture_headers_for_provider_with_api_key(
+            CacheRetention::None,
+            "kimi-for-coding",
+            "kimi-oauth-token",
+        )
+        .expect("captured request for kimi oauth headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer kimi-oauth-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert!(
+            !captured
+                .headers
+                .contains_key("anthropic-dangerous-direct-browser-access")
+        );
+        assert!(!captured.headers.contains_key("anthropic-beta"));
+        assert_eq!(
+            captured.headers.get("x-msh-platform").map(String::as_str),
+            Some("kimi_cli")
+        );
+        assert!(captured.headers.contains_key("x-msh-version"));
+        assert!(captured.headers.contains_key("x-msh-device-name"));
+        assert!(captured.headers.contains_key("x-msh-device-model"));
+        assert!(captured.headers.contains_key("x-msh-os-version"));
+        assert!(captured.headers.contains_key("x-msh-device-id"));
+    }
+
+    #[test]
+    fn test_stream_kimi_api_key_uses_x_api_key_header() {
+        let captured = run_stream_and_capture_headers_for_provider_with_api_key(
+            CacheRetention::None,
+            "kimi-for-coding",
+            "sk-kimi-api-key",
+        )
+        .expect("captured request for kimi api-key headers");
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("sk-kimi-api-key")
+        );
+        assert!(!captured.headers.contains_key("authorization"));
+        assert!(!captured.headers.contains_key("x-msh-platform"));
+    }
+
+    #[test]
     fn test_stream_oauth_beta_header_includes_prompt_caching_when_enabled() {
         let captured =
             run_stream_and_capture_headers_with_api_key(CacheRetention::Short, "sk-ant-oat-test")
@@ -1449,6 +1688,12 @@ mod tests {
         assert!(message.contains("Invalid API key"));
     }
 
+    #[test]
+    fn test_provider_name_reflects_override() {
+        let provider = AnthropicProvider::new("claude-test").with_provider_name("kimi-for-coding");
+        assert_eq!(provider.name(), "kimi-for-coding");
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
@@ -1463,8 +1708,22 @@ mod tests {
         cache_retention: CacheRetention,
         api_key: &str,
     ) -> Option<CapturedRequest> {
+        run_stream_and_capture_headers_for_provider_with_api_key(
+            cache_retention,
+            "anthropic",
+            api_key,
+        )
+    }
+
+    fn run_stream_and_capture_headers_for_provider_with_api_key(
+        cache_retention: CacheRetention,
+        provider_name: &str,
+        api_key: &str,
+    ) -> Option<CapturedRequest> {
         let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
-        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let provider = AnthropicProvider::new("claude-test")
+            .with_provider_name(provider_name)
+            .with_base_url(base_url);
         let context = Context {
             system_prompt: Some("test system".to_string().into()),
             messages: vec![Message::User(crate::model::UserMessage {

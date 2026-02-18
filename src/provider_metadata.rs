@@ -958,7 +958,7 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         canonical_id: "kimi-for-coding",
         display_name: Some("Kimi for Coding"),
-        aliases: &["kimi-coding"],
+        aliases: &["kimi-coding", "kimi-code"],
         auth_env_keys: &["KIMI_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1522,7 +1522,11 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         canonical_id: "azure-openai",
         display_name: Some("Azure OpenAI"),
-        aliases: &["azure", "azure-cognitive-services", "azure-openai-responses"],
+        aliases: &[
+            "azure",
+            "azure-cognitive-services",
+            "azure-openai-responses",
+        ],
         auth_env_keys: &["AZURE_OPENAI_API_KEY"],
         onboarding: ProviderOnboardingMode::NativeAdapterRequired,
         routing_defaults: None,
@@ -1609,6 +1613,8 @@ mod tests {
         let kimi_coding_alias =
             provider_metadata("kimi-coding").expect("kimi-coding alias metadata");
         assert_eq!(kimi_coding_alias.canonical_id, "kimi-for-coding");
+        let kimi_code_alias = provider_metadata("kimi-code").expect("kimi-code alias metadata");
+        assert_eq!(kimi_code_alias.canonical_id, "kimi-for-coding");
     }
 
     #[test]
@@ -1712,6 +1718,7 @@ mod tests {
             &["AI_GATEWAY_API_KEY"]
         );
         assert_eq!(provider_auth_env_keys("kimi-coding"), &["KIMI_API_KEY"]);
+        assert_eq!(provider_auth_env_keys("kimi-code"), &["KIMI_API_KEY"]);
         // New UX aliases resolve to same auth keys as canonical
         assert_eq!(
             provider_auth_env_keys("together"),
@@ -2328,9 +2335,11 @@ mod tests {
         let kimi_coding = canonical_provider_id("kimi-for-coding").expect("kimi-for-coding");
         let kimi_coding_legacy =
             canonical_provider_id("kimi-coding").expect("kimi-coding legacy alias");
+        let kimi_code_alias = canonical_provider_id("kimi-code").expect("kimi-code alias");
         assert_eq!(kimi_alias, "moonshotai");
         assert_eq!(kimi_coding, "kimi-for-coding");
         assert_eq!(kimi_coding_legacy, "kimi-for-coding");
+        assert_eq!(kimi_code_alias, "kimi-for-coding");
 
         let minimax = provider_routing_defaults("minimax").expect("minimax defaults");
         let minimax_cp =

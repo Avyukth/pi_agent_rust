@@ -148,7 +148,9 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         "google-gemini-cli" | "google-antigravity" => ProviderRouteKind::NativeGoogleGeminiCli,
         "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
         "amazon-bedrock" | "bedrock" => ProviderRouteKind::NativeBedrock,
-        "azure-openai" | "azure" | "azure-cognitive-services" => ProviderRouteKind::NativeAzure,
+        "azure-openai" | "azure" | "azure-cognitive-services" | "azure-openai-responses" => {
+            ProviderRouteKind::NativeAzure
+        }
         "github-copilot" | "copilot" => ProviderRouteKind::NativeCopilot,
         "gitlab" | "gitlab-duo" => ProviderRouteKind::NativeGitlab,
         _ => match effective_api.as_str() {
@@ -161,6 +163,7 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
             "google-gemini-cli" => ProviderRouteKind::ApiGoogleGeminiCli,
             "google-vertex" => ProviderRouteKind::NativeGoogleVertex,
             "bedrock-converse-stream" => ProviderRouteKind::NativeBedrock,
+            "azure-openai-responses" => ProviderRouteKind::NativeAzure,
             _ => {
                 let suggestions = suggest_similar_providers(&entry.model.provider);
                 let msg = if suggestions.is_empty() {
@@ -387,6 +390,34 @@ where
         deployment,
         api_version,
         endpoint_url,
+    })
+}
+
+fn resolve_copilot_token(entry: &ModelEntry) -> Result<String> {
+    resolve_copilot_token_with_env(entry, |name| env::var(name).ok())
+}
+
+fn resolve_copilot_token_with_env<F>(entry: &ModelEntry, mut env_lookup: F) -> Result<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let inline = entry
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let from_env = || {
+        env_lookup("GITHUB_COPILOT_API_KEY")
+            .or_else(|| env_lookup("GITHUB_TOKEN"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+
+    inline.or_else(from_env).ok_or_else(|| {
+        Error::auth(
+            "GitHub Copilot requires login credentials or GITHUB_COPILOT_API_KEY/GITHUB_TOKEN",
+        )
     })
 }
 
@@ -823,6 +854,7 @@ pub fn create_provider(
         ProviderRouteKind::NativeAnthropic | ProviderRouteKind::ApiAnthropicMessages => {
             Ok(Arc::new(
                 anthropic::AnthropicProvider::new(entry.model.id.clone())
+                    .with_provider_name(entry.model.provider.clone())
                     .with_base_url(entry.model.base_url.clone())
                     .with_compat(entry.compat.clone())
                     .with_client(client),
@@ -911,13 +943,7 @@ pub fn create_provider(
             ))
         }
         ProviderRouteKind::NativeCopilot => {
-            let github_token = env::var("GITHUB_COPILOT_API_KEY")
-                .or_else(|_| env::var("GITHUB_TOKEN"))
-                .map_err(|_| {
-                    Error::auth(
-                        "GitHub Copilot requires GITHUB_COPILOT_API_KEY or GITHUB_TOKEN to be set",
-                    )
-                })?;
+            let github_token = resolve_copilot_token(entry)?;
             let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
                 .with_provider_name(&entry.model.provider)
                 .with_compat(entry.compat.clone())
@@ -1610,6 +1636,71 @@ export default function init(pi) {
         assert_eq!(route, ProviderRouteKind::NativeAzure);
         assert_eq!(canonical_provider, "azure-openai");
         assert_eq!(effective_api, "openai-completions");
+    }
+
+    #[test]
+    fn resolve_provider_route_uses_native_azure_route_for_legacy_provider_alias() {
+        let entry = model_entry(
+            "azure-openai-responses",
+            "azure-openai-responses",
+            "gpt-4o-mini",
+            "https://myresource.openai.azure.com",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve azure legacy alias route");
+        assert_eq!(route, ProviderRouteKind::NativeAzure);
+        assert_eq!(canonical_provider, "azure-openai");
+        assert_eq!(effective_api, "azure-openai-responses");
+    }
+
+    #[test]
+    fn resolve_provider_route_accepts_azure_legacy_api_for_custom_provider_id() {
+        let entry = model_entry(
+            "my-azure",
+            "azure-openai-responses",
+            "gpt-4o-mini",
+            "https://example.invalid",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve azure legacy api fallback");
+        assert_eq!(route, ProviderRouteKind::NativeAzure);
+        assert_eq!(canonical_provider, "my-azure");
+        assert_eq!(effective_api, "azure-openai-responses");
+    }
+
+    #[test]
+    fn resolve_copilot_token_prefers_inline_model_api_key() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = Some("inline-copilot-token".to_string());
+
+        let token = resolve_copilot_token_with_env(&entry, |_| None)
+            .expect("inline token should be accepted");
+        assert_eq!(token, "inline-copilot-token");
+    }
+
+    #[test]
+    fn resolve_copilot_token_falls_back_to_env() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = None;
+
+        let token = resolve_copilot_token_with_env(&entry, |name| match name {
+            "GITHUB_COPILOT_API_KEY" => Some("env-copilot-token".to_string()),
+            _ => None,
+        })
+        .expect("env token should be accepted");
+        assert_eq!(token, "env-copilot-token");
+    }
+
+    #[test]
+    fn resolve_copilot_token_errors_when_missing_everywhere() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = None;
+
+        let err = resolve_copilot_token_with_env(&entry, |_| None).expect_err("expected error");
+        assert!(
+            err.to_string().contains("GitHub Copilot requires"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -2,30 +2,49 @@ use super::commands::model_entry_matches;
 use super::*;
 
 impl PiApp {
+    fn normalize_model_key(entry: &ModelEntry) -> (String, String) {
+        let canonical_provider =
+            crate::provider_metadata::canonical_provider_id(entry.model.provider.as_str())
+                .unwrap_or(entry.model.provider.as_str());
+        (
+            canonical_provider.to_ascii_lowercase(),
+            entry.model.id.to_ascii_lowercase(),
+        )
+    }
+
+    fn unique_model_count(models: &[ModelEntry]) -> usize {
+        models
+            .iter()
+            .map(Self::normalize_model_key)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
     fn available_models_with_credentials(&self) -> Vec<ModelEntry> {
         let auth = crate::auth::AuthStorage::load(crate::config::Config::auth_path()).ok();
-        let mut filtered = self
-            .available_models
-            .iter()
-            .filter(|entry| {
-                entry
-                    .api_key
-                    .as_ref()
-                    .is_some_and(|key| !key.trim().is_empty())
-                    || auth
-                        .as_ref()
-                        .and_then(|storage| storage.resolve_api_key(&entry.model.provider, None))
-                        .is_some()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut provider_has_credential: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut filtered = Vec::new();
+        for entry in &self.available_models {
+            let has_inline_key = entry
+                .api_key
+                .as_ref()
+                .is_some_and(|key| !key.trim().is_empty());
+            let has_auth_key = auth.as_ref().is_some_and(|storage| {
+                let provider = entry.model.provider.as_str();
+                let canonical = crate::provider_metadata::canonical_provider_id(provider)
+                    .unwrap_or(provider)
+                    .to_ascii_lowercase();
+                *provider_has_credential
+                    .entry(canonical.clone())
+                    .or_insert_with(|| storage.resolve_api_key(&canonical, None).is_some())
+            });
+            if has_inline_key || has_auth_key {
+                filtered.push(entry.clone());
+            }
+        }
 
-        filtered.sort_by(|a, b| {
-            a.model
-                .provider
-                .cmp(&b.model.provider)
-                .then_with(|| a.model.id.cmp(&b.model.id))
-        });
+        filtered.sort_by_key(Self::normalize_model_key);
         filtered.dedup_by(|left, right| model_entry_matches(left, right));
         filtered
     }
@@ -68,7 +87,7 @@ impl PiApp {
         }
 
         let mut overlay = crate::model_selector::ModelSelectorOverlay::new(&filtered);
-        overlay.set_configured_only_scope(self.available_models.len());
+        overlay.set_configured_only_scope(Self::unique_model_count(&self.available_models));
         self.model_selector = Some(overlay);
     }
 
@@ -139,7 +158,23 @@ impl PiApp {
             self.status_message = Some("Agent busy; try again".to_string());
             return;
         };
+        let resolved_key_opt = if next.api_key.is_some() {
+            next.api_key.clone()
+        } else {
+            let auth_path = crate::config::Config::auth_path();
+            crate::auth::AuthStorage::load(auth_path)
+                .ok()
+                .and_then(|auth| auth.resolve_api_key(&next.model.provider, None))
+        };
         agent_guard.set_provider(provider_impl);
+        agent_guard
+            .stream_options_mut()
+            .api_key
+            .clone_from(&resolved_key_opt);
+        agent_guard
+            .stream_options_mut()
+            .headers
+            .clone_from(&next.headers);
         drop(agent_guard);
 
         let Ok(mut session_guard) = self.session.try_lock() else {
@@ -164,6 +199,7 @@ impl PiApp {
     }
 
     /// Render the model selector overlay.
+    #[allow(clippy::too_many_lines)]
     pub(super) fn render_model_selector(
         &self,
         selector: &crate::model_selector::ModelSelectorOverlay,
@@ -289,5 +325,196 @@ impl PiApp {
                 .render("↑/↓/j/k: navigate  Enter: select  Esc: cancel  * = current")
         );
         output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, AgentConfig};
+    use crate::model::{StreamEvent, Usage};
+    use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use asupersync::channel::mpsc;
+    use asupersync::runtime::RuntimeBuilder;
+    use futures::stream;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "dummy-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 8)
+                .build()
+                .expect("build runtime")
+        })
+        .handle()
+    }
+
+    fn model_entry(provider: &str, id: &str, api_key: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.invalid".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: api_key.map(str::to_string),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
+        let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+        let resources = ResourceLoader::empty(false);
+        let resource_cli = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        PiApp::new(
+            agent,
+            session,
+            Config::default(),
+            resources,
+            resource_cli,
+            Path::new(".").to_path_buf(),
+            current,
+            Vec::new(),
+            available,
+            Vec::new(),
+            event_tx,
+            runtime_handle(),
+            true,
+            None,
+            Some(KeyBindings::new()),
+            Vec::new(),
+            Usage::default(),
+        )
+    }
+
+    #[test]
+    fn apply_model_selection_replaces_stream_options_api_key_and_headers() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"));
+        let mut next = model_entry("openrouter", "openai/gpt-4o-mini", Some("next-key"));
+        next.headers
+            .insert("x-provider-header".to_string(), "next".to_string());
+
+        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "stale".to_string());
+        }
+
+        app.apply_model_selection(&crate::model_selector::ModelKey {
+            provider: next.model.provider.clone(),
+            id: next.model.id,
+        });
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(
+            guard.stream_options_mut().api_key.as_deref(),
+            Some("next-key")
+        );
+        assert_eq!(
+            guard
+                .stream_options_mut()
+                .headers
+                .get("x-provider-header")
+                .map(String::as_str),
+            Some("next")
+        );
+        assert!(
+            !guard.stream_options_mut().headers.contains_key("x-stale"),
+            "switching models must replace stale provider headers"
+        );
+    }
+
+    #[test]
+    fn apply_model_selection_clears_stale_api_key_when_next_model_has_no_key() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"));
+        let next = model_entry("ollama", "llama3.2", None);
+        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+        }
+
+        app.apply_model_selection(&crate::model_selector::ModelKey {
+            provider: next.model.provider.clone(),
+            id: next.model.id,
+        });
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert!(
+            guard.stream_options_mut().api_key.is_none(),
+            "switching to a keyless model must clear stale API key"
+        );
     }
 }

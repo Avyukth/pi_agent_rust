@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::provider::{StreamOptions, ThinkingBudgets};
+use crate::provider_metadata::canonical_provider_id;
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -373,7 +374,7 @@ pub fn select_model_and_thinking(
         let mut candidates: Vec<ModelEntry> = registry
             .models()
             .iter()
-            .filter(|m| m.model.provider == provider)
+            .filter(|m| provider_ids_match(&m.model.provider, provider))
             .cloned()
             .collect();
         if candidates.is_empty() {
@@ -395,7 +396,7 @@ pub fn select_model_and_thinking(
             let matches: Vec<ModelEntry> = registry
                 .models()
                 .iter()
-                .filter(|m| m.model.id == model_id)
+                .filter(|m| m.model.id.eq_ignore_ascii_case(model_id))
                 .cloned()
                 .collect();
             if matches.is_empty() {
@@ -404,7 +405,7 @@ pub fn select_model_and_thinking(
             if let Some(default_provider) = config.default_provider.as_deref() {
                 if let Some(found) = matches
                     .iter()
-                    .find(|m| m.model.provider == default_provider)
+                    .find(|m| provider_ids_match(&m.model.provider, default_provider))
                 {
                     selected_model = Some(found.clone());
                 }
@@ -424,7 +425,8 @@ pub fn select_model_and_thinking(
             config.default_model.as_deref(),
         ) {
             if let Some(found) = scoped_models.iter().find(|sm| {
-                sm.model.model.provider == default_provider && sm.model.model.id == default_model
+                provider_ids_match(&sm.model.model.provider, default_provider)
+                    && sm.model.model.id.eq_ignore_ascii_case(default_model)
             }) {
                 selected_model = Some(found.model.clone());
                 if cli.thinking.is_none() {
@@ -610,16 +612,41 @@ fn restore_model_from_session(
 
 fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
     let defaults = [
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
         ("anthropic", "claude-opus-4-5"),
         ("openai", "gpt-5.1-codex"),
+        ("azure-openai-responses", "gpt-5.2"),
+        ("openai-codex", "gpt-5.2-codex"),
         ("google", "gemini-2.5-pro"),
+        ("google-gemini-cli", "gemini-2.5-pro"),
+        ("google-antigravity", "gemini-3-pro-high"),
+        ("google-vertex", "gemini-3-pro-preview"),
+        ("github-copilot", "gpt-4o"),
+        ("openrouter", "openai/gpt-5.1-codex"),
+        ("vercel-ai-gateway", "anthropic/claude-opus-4.5"),
+        ("xai", "grok-4-fast-non-reasoning"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("cerebras", "zai-glm-4.6"),
+        ("zai", "glm-4.6"),
+        ("mistral", "devstral-medium-latest"),
+        ("minimax", "MiniMax-M2.1"),
+        ("minimax-cn", "MiniMax-M2.1"),
+        ("huggingface", "moonshotai/Kimi-K2.5"),
+        ("opencode", "claude-opus-4-5"),
+        ("kimi-coding", "kimi-k2-thinking"),
     ];
 
+    let canonical = |provider: &str| {
+        canonical_provider_id(provider)
+            .unwrap_or(provider)
+            .to_ascii_lowercase()
+    };
+
     for (provider, model_id) in defaults {
-        if let Some(found) = available
-            .iter()
-            .find(|m| m.model.provider == provider && m.model.id == model_id)
-        {
+        if let Some(found) = available.iter().find(|m| {
+            canonical(&m.model.provider) == canonical(provider)
+                && m.model.id.eq_ignore_ascii_case(model_id)
+        }) {
             return found.clone();
         }
     }
@@ -820,10 +847,25 @@ fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
     Some((provider, model_id))
 }
 
+fn provider_ids_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    let left_canonical = canonical_provider_id(left).unwrap_or(left);
+    let right_canonical = canonical_provider_id(right).unwrap_or(right);
+
+    left_canonical.eq_ignore_ascii_case(right)
+        || right_canonical.eq_ignore_ascii_case(left)
+        || left_canonical.eq_ignore_ascii_case(right_canonical)
+}
+
 fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<ModelEntry> {
     if let Some((provider, model_id)) = split_provider_model_spec(pattern) {
         if let Some(found) = available_models.iter().find(|m| {
-            m.model.provider.eq_ignore_ascii_case(provider)
+            provider_ids_match(&m.model.provider, provider)
                 && m.model.id.eq_ignore_ascii_case(model_id)
         }) {
             return Some(found.clone());
@@ -908,8 +950,10 @@ mod tests {
     use std::collections::HashMap;
 
     use clap::Parser;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::auth::AuthStorage;
     use crate::provider::{InputType, Model, ModelCost};
 
     fn test_model_entry(id: &str, provider: &str, reasoning: bool) -> ModelEntry {
@@ -940,12 +984,64 @@ mod tests {
         }
     }
 
+    fn registry_with_entries(entries: Vec<ModelEntry>) -> ModelRegistry {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut registry = ModelRegistry::load(&auth, None);
+        registry.merge_entries(entries);
+        registry
+    }
+
     #[test]
     fn parse_models_arg_splits_and_trims() {
         assert_eq!(
             parse_models_arg("gpt-4*, claude* ,,"),
             vec!["gpt-4*".to_string(), "claude*".to_string()]
         );
+    }
+
+    #[test]
+    fn default_model_from_available_prefers_azure_legacy_default() {
+        let available = vec![
+            test_model_entry("gpt-4o-mini", "azure-openai-responses", true),
+            test_model_entry("gpt-5.2", "azure-openai-responses", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "azure-openai-responses");
+        assert_eq!(selected.model.id, "gpt-5.2");
+    }
+
+    #[test]
+    fn default_model_from_available_applies_vercel_gateway_alias_mapping() {
+        let available = vec![
+            test_model_entry("gpt-4o-mini", "vercel", true),
+            test_model_entry("anthropic/claude-opus-4.5", "vercel", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "vercel");
+        assert_eq!(selected.model.id, "anthropic/claude-opus-4.5");
+    }
+
+    #[test]
+    fn default_model_from_available_applies_kimi_coding_alias_mapping() {
+        let available = vec![
+            test_model_entry("kimi-k2-instruct", "kimi-for-coding", true),
+            test_model_entry("kimi-k2-thinking", "kimi-for-coding", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "kimi-for-coding");
+        assert_eq!(selected.model.id, "kimi-k2-thinking");
+    }
+
+    #[test]
+    fn default_model_from_available_matches_default_id_case_insensitively() {
+        let available = vec![test_model_entry("GPT-5.2-CODEX", "openai-codex", true)];
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "openai-codex");
+        assert_eq!(selected.model.id, "GPT-5.2-CODEX");
     }
 
     #[test]
@@ -1011,6 +1107,157 @@ mod tests {
         assert_eq!(model.model.id, "gpt-5.1-codex-latest");
         assert!(parsed.thinking_level.is_none());
         assert!(parsed.warning.is_none());
+    }
+
+    #[test]
+    fn try_match_model_prefers_existing_entry_for_provider_alias() {
+        let mut openrouter = test_model_entry("openai/gpt-4o-mini", "openrouter", true);
+        openrouter
+            .headers
+            .insert("x-test".to_string(), "1".to_string());
+
+        let matched = try_match_model("open-router/openai/gpt-4o-mini", &[openrouter.clone()])
+            .expect("provider alias should match existing entry");
+
+        assert_eq!(matched.model.provider, "openrouter");
+        assert_eq!(matched.model.id, "openai/gpt-4o-mini");
+        assert_eq!(
+            matched.headers.get("x-test").map(String::as_str),
+            Some("1"),
+            "must preserve existing model metadata instead of falling back to ad-hoc"
+        );
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_accepts_provider_alias() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "open-router"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![test_model_entry(
+            "openai/gpt-4o-mini",
+            "openrouter",
+            true,
+        )]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider alias should resolve");
+
+        assert!(provider_ids_match(
+            &selection.model_entry.model.provider,
+            "open-router"
+        ));
+        assert!(!selection.model_entry.model.id.is_empty());
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_prefers_default_provider_alias() {
+        let model_id = "__test-openrouter-alias-model__";
+        let cli = cli::Cli::parse_from(["pi", "--model", model_id]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry(model_id, "openai", true),
+            test_model_entry(model_id, "openrouter", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("default provider alias should resolve in model-only selection");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_matches_case_insensitively() {
+        let model_id = "__test-case-insensitive-model__";
+        let cli = cli::Cli::parse_from(["pi", "--model", "__TEST-CASE-INSENSITIVE-MODEL__"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![test_model_entry(model_id, "openai", true)]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("model-only selection should be case-insensitive");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn select_model_and_thinking_scoped_models_prefers_default_provider_alias() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(Vec::new());
+        let scoped_models = vec![
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openai", true),
+                thinking_level: None,
+            },
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::High),
+            },
+        ];
+
+        let selection = select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped_models,
+            Path::new("/tmp"),
+        )
+        .expect("scoped models should honor default provider alias");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+        assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn select_model_and_thinking_scoped_models_matches_default_model_case_insensitively() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            default_model: Some("GPT-4O-MINI".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(Vec::new());
+        let scoped_models = vec![
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::Low),
+            },
+            ScopedModel {
+                model: test_model_entry("gpt-4o", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::High),
+            },
+        ];
+
+        let selection = select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped_models,
+            Path::new("/tmp"),
+        )
+        .expect("scoped default model should match case-insensitively");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+        assert_eq!(selection.thinking_level, model::ThinkingLevel::Low);
     }
 
     #[test]

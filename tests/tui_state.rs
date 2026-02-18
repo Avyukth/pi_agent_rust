@@ -2838,6 +2838,40 @@ fn tui_state_slash_model_no_args_opens_configured_only_selector() {
 }
 
 #[test]
+fn tui_state_slash_model_no_args_dedupes_case_variant_models() {
+    let harness = TestHarness::new("tui_state_slash_model_no_args_dedupes_case_variant_models");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let mut openai_lower = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    openai_lower.api_key = Some("test-openai-key".to_string());
+    let mut openai_upper = make_model_entry("OpenAI", "GPT-A", "https://api.openai.com/v1");
+    openai_upper.api_key = Some("test-openai-key-2".to_string());
+
+    let available_models = vec![anthropic.clone(), openai_lower, openai_upper];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    type_text(&harness, &mut app, "/model");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "openai/gpt-a");
+    assert_after_not_contains(&harness, &step, "OpenAI/GPT-A");
+}
+
+#[test]
 fn tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp() {
     let harness = TestHarness::new("tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp");
 
