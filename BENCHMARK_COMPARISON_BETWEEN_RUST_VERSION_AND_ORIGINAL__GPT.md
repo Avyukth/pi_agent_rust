@@ -1,6 +1,6 @@
 # BENCHMARK_COMPARISON_BETWEEN_RUST_VERSION_AND_ORIGINAL__GPT
 
-Generated: 2026-02-17
+Generated: 2026-02-18
 Workspace: `/data/projects/pi_agent_rust`
 
 ## 0) Post-Hardening Status Update (2026-02-17)
@@ -35,22 +35,24 @@ This report now includes a post-hardening extension-compatibility checkpoint.
 
 ## 1) Lede (Do Not Bury This)
 
-1. Rust is currently **slower** than legacy in wall-clock for long-session resume/workload paths in this snapshot, often ~`1.2x` to `2.0x` slower than Node and ~`1.9x` to `4.0x` slower than Bun in realistic end-to-end runs.
-2. Rust is currently **much smaller in memory footprint** for equivalent workloads in synthetic matched-state runs, and still significantly smaller in realistic runs with heavy exports/forks/extension activity.
+1. Fresh secure-path reruns (2026-02-18) show major Rust improvements; against the last validated legacy baselines, Rust now wins the measured `1M`/`5M` matched-state and realistic workload totals in this report’s harness.
+2. Rust remains **much smaller in memory footprint** in matched-state and realistic flows, with substantial RSS advantages retained.
 3. Extension compatibility is currently fully passing in local conformance validation: matrix run shows `224/224` pass (`0` fail, `0` skipped).
 4. Rust has significantly expanded first-class capability surface versus legacy coding-agent CLI (commands, policy explainers, provider metadata/control, risk/quota/security instrumentation).
 5. The largest practical optimization target remains session append/save behavior at high token-volume and large histories; this is the best lever for major speed gains.
-6. Startup/readiness latency strongly favors Rust in this snapshot: `--help` is low-single-digit ms for Rust while prior validated legacy baselines remain near ~`1s` (Node) and ~`0.7s` (Bun), with much lower baseline RSS for Rust.
-7. Extension micro-harness inversion is now achieved on the real native runtime lane: in `pijs_workload` release runs, native runtime is `~17.08x` faster per call than QuickJS (`0.4925us` vs `8.4132us`).
+6. Startup/readiness latency strongly favors Rust in this snapshot: fresh Rust `--help`/`--version` means are ~`3.02ms`/`2.77ms`; direct legacy reruns are currently blocked, but prior validated legacy means remain ~`1.0s` (Node) and ~`0.73s` (Bun).
+7. Extension micro-harness inversion remains achieved on the real native runtime lane: in fresh `pijs_workload` release runs, native runtime is `~17.74x` faster per call than QuickJS (`0.4678us` vs `8.2980us`).
 
-## 1.1) Refresh Delta (2026-02-17)
+## 1.1) Refresh Delta (2026-02-18)
 
 Freshly re-measured in this run:
-- `pijs_workload` release microbench with precision fix (`per_call_us_f64` now true fractional; added `per_call_ns_f64`)
-- `pijs_workload` 3-lane runtime comparison (`quickjs`, `native-rust-runtime`, `native-rust-preview`) at `50,000` iterations
+- `pijs_workload` release 3-lane comparison (`quickjs`, `native-rust-runtime`, `native-rust-preview`) at `50,000` iterations
+- Rust release startup/readiness (`hyperfine` for `--help` and `--version`) and one-shot `/usr/bin/time` footprints
+- Rust long-session benchmarks via `session_workload_bench`:
+  - matched-state (`prepare` + `workload`) at `1M` and `5M` target tokens
+  - realistic (`prepare-realistic` + `workload-realistic`) at `1M` and `5M` target tokens
+- Rust extension workload matrix via `ext_workloads` with hotspot matrix + trace artifacts
 - targeted extension/runtime suites (`event_loop_conformance`, `extensions_event_wiring`, `lab_runtime_extensions`)
-- full extension conformance matrix (`ext_conformance_generated`) now at `224/224` pass
-- Rust release cold startup/readiness (`hyperfine` for `--help` and `--version`)
 - local strict quality gates (`cargo fmt --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`)
 
 Reused (existing in-repo evidence, unchanged methodology):
@@ -67,7 +69,12 @@ Reused (existing in-repo evidence, unchanged methodology):
 
 Build/regeneration note:
 - `cargo build --release --bin pi` succeeds in this run and was used for fresh Rust startup numbers.
-- Direct legacy Node/Bun reruns in this workspace are currently blocked by dependency/lockfile drift in `legacy_pi_mono_code/pi-mono` (`bun.lock` parse errors + unresolved runtime packages like `@sinclair/typebox`), so legacy startup/extension comparison rows remain sourced from prior validated artifacts.
+- Direct legacy Node/Bun reruns in this workspace are currently blocked by missing dependency surfaces in `legacy_pi_mono_code/pi-mono`:
+  - Node startup: `ERR_MODULE_NOT_FOUND` for `chalk`
+  - Bun startup: missing `node_modules/chalk`
+  - legacy extension workloads (Node): missing `@mariozechner/jiti`
+  - legacy extension workloads (Bun): missing `@sinclair/typebox` / `proper-lockfile`
+  so legacy comparison rows continue to use prior validated artifacts where direct reruns were not possible.
 
 ---
 
@@ -260,23 +267,27 @@ Parameters for realistic matrix:
 
 ## 6) Performance Results
 
+Interpretation note:
+- Sections 6.1-6.3 include the prior validated cross-runtime baseline matrix.
+- Section 6.3.1 adds fresh 2026-02-18 Rust reruns and compares them to those prior validated legacy baselines where direct legacy reruns were blocked.
+
 ## 6.0 Cold Startup / Readiness (time-to-response)
 
 Command-level readiness benchmark (`hyperfine`, no network calls):
 
 | Probe | Rust mean | Legacy Node mean | Legacy Bun mean | Node/Rust | Bun/Rust |
 |---|---:|---:|---:|---:|---:|
-| `--help` | 3.34 ms | 1,045.10 ms | 726.28 ms | 313.13x | 217.61x |
-| `--version` | 20.09 ms | 1,024.75 ms | 729.70 ms | 51.01x | 36.32x |
+| `--help` | 3.02 ms | 1,045.10 ms | 726.28 ms | 346.22x | 240.60x |
+| `--version` | 2.77 ms | 1,024.75 ms | 729.70 ms | 370.17x | 263.59x |
 
 One-shot baseline footprint snapshot (`/usr/bin/time`):
 
 | Probe | Runtime | RSS KB | User s | Sys s | Elapsed |
 |---|---|---:|---:|---:|---:|
-| `--help` | rust | 6,448 | 0.00 | 0.00 | 0:00.00 |
+| `--help` | rust | 6,912 | 0.00 | 0.00 | 0:00.00 |
 | `--help` | legacy_node | 156,720 | 1.11 | 0.20 | 0:01.02 |
 | `--help` | legacy_bun | 195,820 | 0.91 | 0.22 | 0:00.71 |
-| `--version` | rust | 7,556 | 0.00 | 0.01 | 0:00.01 |
+| `--version` | rust | 6,400 | 0.00 | 0.00 | 0:00.00 |
 | `--version` | legacy_node | 156,560 | 1.11 | 0.21 | 0:01.03 |
 | `--version` | legacy_bun | 194,624 | 0.96 | 0.20 | 0:00.73 |
 
@@ -347,8 +358,37 @@ Ratios at matched state:
 | legacy_bun | 5M | 325.28 | 3,882.84 | 0.00 | 4,208.12 | 3,057,908 | 1.67 | 3.42 | 0 | 0:04.75 |
 
 Interpretation:
-- Latency: Rust still slower in realistic E2E.
-- Memory: Rust remains much smaller (`~7.9x` to `~11.5x` lower RSS in these realistic runs).
+- In this baseline table, Rust latency is slower in realistic E2E.
+- Memory remains much smaller (`~7.9x` to `~11.5x` lower RSS in these realistic runs).
+
+## 6.3.1 Secure-Path Refresh (2026-02-18, New Rust Reruns)
+
+Fresh Rust reruns (release binaries, same harness family) produced the following:
+
+Matched-state (`resume + append same 10`):
+
+| Runtime | Token level | Open ms | Append ms | Save ms | Total ms | RSS KB | FS out |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rust (fresh) | 1M | 17.49 | 47.54 | 22.63 | 87.66 | 45,140 | 15,496 |
+| rust (fresh) | 5M | 58.03 | 233.92 | 73.57 | 365.52 | 146,040 | 77,224 |
+
+Realistic (`append + compactions + extension/slash/fork/export ops`):
+
+| Runtime | Token level | Open ms | Append/Ops ms | Save ms | Total ms | RSS KB | FS out |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rust (fresh) | 1M | 17.59 | 210.35 | 22.36 | 250.29 | 67,572 | 88,840 |
+| rust (fresh) | 5M | 58.68 | 1,225.95 | 97.49 | 1,382.12 | 268,844 | 438,104 |
+
+Comparison against prior validated legacy baselines in this report:
+
+- Matched 1M: Rust total `87.66ms` vs Node `296.94ms` and Bun `143.36ms` (`Rust/Node=0.295x`, `Rust/Bun=0.611x`).
+- Matched 5M: Rust total `365.52ms` vs Node `1,795.41ms` and Bun `561.86ms` (`Rust/Node=0.204x`, `Rust/Bun=0.651x`).
+- Realistic 1M: Rust total `250.29ms` vs Node `1,238.67ms` and Bun `700.52ms` (`Rust/Node=0.202x`, `Rust/Bun=0.357x`).
+- Realistic 5M: Rust total `1,382.12ms` vs Node `5,974.67ms` and Bun `2,959.42ms` (`Rust/Node=0.231x`, `Rust/Bun=0.467x`).
+
+Important comparability note:
+- Direct legacy reruns in this workspace were blocked by missing runtime dependencies (see Section 1.1).
+- Therefore, the ratios above use fresh Rust reruns against prior validated legacy baselines from this report.
 
 ## 6.4 Session Save Hotpath Optimization Update (2026-02-17)
 
@@ -456,15 +496,37 @@ We re-ran `pijs_workload` to isolate runtime-engine overhead for a minimal tool 
 
 | Runtime engine | Command | Result |
 |---|---|---:|
-| QuickJS | `cargo run --release --bin pijs_workload -- --iterations 50000 --runtime-engine quickjs` | `per_call_us_f64 = 8.41320198` (`per_call_ns_f64 = 8413.20198`) |
-| Native Rust runtime (real handle path) | `cargo run --release --bin pijs_workload -- --iterations 50000 --runtime-engine native-rust-runtime` | `per_call_us_f64 = 0.49253646` (`per_call_ns_f64 = 492.53646`) |
-| Native Rust preview | `cargo run --release --bin pijs_workload -- --iterations 50000 --runtime-engine native-rust-preview` | `per_call_us_f64 = 0.0076797` (`per_call_ns_f64 = 7.6797`) |
+| QuickJS | `target/release/pijs_workload --iterations 50000 --runtime-engine quickjs` | `per_call_us_f64 = 8.29795126` (`per_call_ns_f64 = 8297.95126`) |
+| Native Rust runtime (real handle path) | `target/release/pijs_workload --iterations 50000 --runtime-engine native-rust-runtime` | `per_call_us_f64 = 0.46778008` (`per_call_ns_f64 = 467.78008`) |
+| Native Rust preview | `target/release/pijs_workload --iterations 50000 --runtime-engine native-rust-preview` | `per_call_us_f64 = 0.00777448` (`per_call_ns_f64 = 7.77448`) |
 
 Important caveat:
 - `native-rust-preview` is synthetic and not parity-complete.
-- `native-rust-runtime` is the real runtime-handle path and is now `~17.08x` faster per call than QuickJS in this harness.
-- Preview is still far faster (`~1095.26x` vs QuickJS), indicating additional headroom beyond the current real-runtime implementation.
+- `native-rust-runtime` is the real runtime-handle path and is now `~17.74x` faster per call than QuickJS in this harness.
+- Preview is still far faster (`~1067.33x` vs QuickJS), indicating additional headroom beyond the current real-runtime implementation.
 - This micro-harness does not supersede the larger realistic session benchmarks in Section 6; it isolates extension-call runtime overhead only.
+
+### 7.2.2.1 Fresh Extension Workload Rerun (2026-02-18)
+
+Fresh Rust rerun artifacts:
+- `target/perf/secure_path_refresh_20260218/rust_extension_workloads.jsonl`
+- `target/perf/secure_path_refresh_20260218/rust_ext_hotspot_matrix.json`
+- `target/perf/secure_path_refresh_20260218/rust_ext_trace.jsonl`
+
+Fresh Rust extension metrics:
+- `ext_load_init/load_init_cold` (`hello`): `p50=7.02ms`, `p95=8.52ms`
+- `ext_load_init/load_init_cold` (`pirate`): `p50=6.75ms`, `p95=6.78ms`
+- `ext_tool_call/hello`: `13.10us/call` (`~76.3k calls/s`)
+- `ext_event_hook/before_agent_start`: `15.37us/call` (`~65.1k calls/s`)
+- `ext_hostcall_bridge/long_session_real_corpus` (8 real extensions): `15.53us/call` (`~64.4k calls/s`)
+
+Compared to prior validated legacy extension baselines in this report:
+- Cold load remains faster in Rust (`hello`: `0.315x` Node, `0.316x` Bun; `pirate`: `0.564x` Node, `0.355x` Bun).
+- Per-call extension dispatch remains slower (`tool_call`: `~9.56x` Node, `~15.06x` Bun; `event_hook`: `~8.99x` Node, `~15.37x` Bun).
+
+Direct legacy extension reruns are currently blocked in this workspace:
+- Node22 run: missing `@mariozechner/jiti`
+- Bun run: missing `@sinclair/typebox` / `proper-lockfile`
 
 ### 7.2.3 QuickJS Removal Program (performance inversion path)
 
@@ -593,12 +655,13 @@ Note: legacy tree in this workspace does not provide an equivalent consolidated 
 - Cancellation becomes a first-class control flow primitive instead of a best-effort convention, reducing stuck-session and shutdown race risk.
 - Deterministic runtime patterns make failure reproduction and forensic replay more credible (especially with extension hostcall/risk ledgers).
 - The primary tradeoff is a stricter execution model that can add engineering/coordination overhead versus loosely structured async graphs.
-- In this benchmark snapshot, correctness and controllability gains are clear, while latency still needs targeted optimization in the large-session hot paths.
+- In this refreshed snapshot, correctness/controllability gains remain, and large-session latency has improved sharply on the secure path versus prior baselines; extension per-call overhead is still the main remaining latency gap.
 
 ## 9.4 Performance Trade in This Snapshot
-- Legacy (especially Bun) wins latency on current long-session end-to-end paths.
-- Rust wins memory footprint substantially.
-- High-value optimization targets are clear and measurable.
+- Rust startup/readiness remains decisively faster.
+- Fresh Rust long-session/matched-state reruns are faster than the report’s prior validated legacy baselines at `1M` and `5M`.
+- Rust still wins memory footprint substantially.
+- Remaining major gap: extension per-call dispatch overhead relative to legacy Node/Bun extension runtimes.
 
 ---
 
