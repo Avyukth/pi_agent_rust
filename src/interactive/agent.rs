@@ -223,6 +223,9 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::CredentialUpdated { provider } => {
+                self.sync_active_provider_credentials(&provider);
+            }
             PiMsg::UpdateLastUserMessage(content) => {
                 if let Some(message) = self
                     .messages

@@ -447,6 +447,37 @@ pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
+pub(super) fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
+    api_key.and_then(|key| {
+        let trimmed = key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+pub(super) fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    let provider = entry.model.provider.as_str();
+    entry.auth_header
+        || crate::provider_metadata::provider_metadata(provider)
+            .is_some_and(|meta| !meta.auth_env_keys.is_empty())
+        || entry.oauth_config.is_some()
+}
+
+pub(super) fn resolve_model_key_with_auth(
+    auth: &crate::auth::AuthStorage,
+    entry: &ModelEntry,
+) -> Option<String> {
+    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+}
+
+pub(super) fn resolve_model_key_from_default_auth(entry: &ModelEntry) -> Option<String> {
+    let auth_path = crate::config::Config::auth_path();
+    crate::auth::AuthStorage::load(auth_path)
+        .ok()
+        .and_then(|auth| resolve_model_key_with_auth(&auth, entry))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+}
+
 fn provider_ids_match(left: &str, right: &str) -> bool {
     normalize_auth_provider_input(left) == normalize_auth_provider_input(right)
 }
@@ -609,6 +640,55 @@ fn build_reload_diagnostics(
 }
 
 impl PiApp {
+    pub(super) fn sync_active_provider_credentials(&mut self, changed_provider: &str) {
+        let changed_canonical = normalize_auth_provider_input(changed_provider);
+        let auth = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+            Ok(auth) => auth,
+            Err(err) => {
+                tracing::warn!(
+                    event = "pi.auth.sync_credentials.load_failed",
+                    provider = %changed_canonical,
+                    error = %err,
+                    "Skipping in-memory credential sync because auth storage could not be loaded"
+                );
+                return;
+            }
+        };
+
+        let provider_matches_changed =
+            |provider: &str| normalize_auth_provider_input(provider) == changed_canonical;
+
+        if !provider_matches_changed(&self.model_entry.model.provider) {
+            return;
+        }
+
+        // Keep catalog/model-scope entries immutable here so inline model keys
+        // are never overwritten by transient auth state. We only refresh the
+        // active runtime key.
+        let fallback_inline_key = self
+            .available_models
+            .iter()
+            .find(|entry| model_entry_matches(entry, &self.model_entry))
+            .and_then(|entry| normalize_api_key_opt(entry.api_key.clone()))
+            .or_else(|| normalize_api_key_opt(self.model_entry.api_key.clone()));
+
+        let resolved_key_opt =
+            normalize_api_key_opt(auth.resolve_api_key(&changed_canonical, None))
+                .or(fallback_inline_key);
+
+        if let Ok(mut agent_guard) = self.agent.try_lock() {
+            agent_guard
+                .stream_options_mut()
+                .api_key
+                .clone_from(&resolved_key_opt);
+        }
+
+        self.model_entry.api_key.clone_from(&resolved_key_opt);
+        if let Ok(mut shared_entry) = self.model_entry_shared.lock() {
+            shared_entry.api_key.clone_from(&resolved_key_opt);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn submit_oauth_code(
         &mut self,
@@ -774,6 +854,9 @@ impl PiApp {
                 let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                 return;
             }
+            let _ = event_tx.try_send(PiMsg::CredentialUpdated {
+                provider: provider.clone(),
+            });
 
             let status = match kind {
                 PendingLoginKind::ApiKey => {
@@ -1684,6 +1767,7 @@ After approving access in the browser, press Enter in Pi to complete login.",
                     self.status_message = Some(err.to_string());
                     return None;
                 }
+                self.sync_active_provider_credentials(&provider);
                 if removed {
                     self.status_message =
                         Some(format!("Removed stored credentials for {provider}."));
@@ -1789,18 +1873,11 @@ After approving access in the browser, press Enter in Pi to complete login.",
 
         let next = matches.into_iter().next().expect("matches is non-empty");
 
-        let resolved_key_opt = if next.api_key.is_some() {
-            next.api_key.clone()
-        } else {
-            let auth_path = crate::config::Config::auth_path();
-            crate::auth::AuthStorage::load(auth_path)
-                .ok()
-                .and_then(|auth| auth.resolve_api_key(&next.model.provider, None))
-        };
-        if resolved_key_opt.is_none() {
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
             self.status_message = Some(format!(
-                "Missing API key for provider {}",
-                next.model.provider
+                "Missing credentials for provider {}. Run /login {}.",
+                next.model.provider, next.model.provider
             ));
             return None;
         }
@@ -2334,6 +2411,37 @@ mod tests {
             Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
             other => panic!("expected google api key credential, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_model_key_with_auth_prefers_stored_key_over_inline_key() {
+        let mut auth = empty_auth_storage();
+        auth.set(
+            "openai",
+            AuthCredential::ApiKey {
+                key: "stored-auth-key".to_string(),
+            },
+        );
+
+        let mut entry = test_model_entry("openai", "gpt-4o-mini");
+        entry.api_key = Some("inline-model-key".to_string());
+
+        assert_eq!(
+            super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
+            Some("stored-auth-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_key_with_auth_falls_back_to_inline_key() {
+        let auth = empty_auth_storage();
+        let mut entry = test_model_entry("openai", "gpt-4o-mini");
+        entry.api_key = Some("inline-model-key".to_string());
+
+        assert_eq!(
+            super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
+            Some("inline-model-key")
+        );
     }
 
     #[test]

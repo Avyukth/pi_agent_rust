@@ -906,7 +906,7 @@ async fn run(
                                 .unwrap_or(provider.as_str());
                         if canonical_provider == "sap-ai-core" {
                             if let Some(token) = pi::auth::exchange_sap_access_token(&auth).await? {
-                                break (selection, token);
+                                break (selection, Some(token));
                             }
                         }
                     }

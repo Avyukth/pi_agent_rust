@@ -210,6 +210,10 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
 }
 
 pub(super) fn extension_model_from_entry(entry: &ModelEntry) -> Value {
+    let api_key_present = entry
+        .api_key
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
     json!({
         "provider": entry.model.provider.as_str(),
         "id": entry.model.id.as_str(),
@@ -219,7 +223,7 @@ pub(super) fn extension_model_from_entry(entry: &ModelEntry) -> Value {
         "reasoning": entry.model.reasoning,
         "contextWindow": entry.model.context_window,
         "maxTokens": entry.model.max_tokens,
-        "apiKeyPresent": entry.api_key.is_some(),
+        "apiKeyPresent": api_key_present,
     })
 }
 
@@ -496,6 +500,41 @@ mod tests {
         assert_eq!(json["reasoning"], true);
         assert_eq!(json["contextWindow"], 128_000);
         assert_eq!(json["apiKeyPresent"], true);
+    }
+
+    #[test]
+    fn extension_model_json_treats_blank_key_as_missing() {
+        use crate::models::ModelEntry;
+        use crate::provider::{InputType, Model, ModelCost};
+
+        let entry = ModelEntry {
+            model: Model {
+                id: "dev-model".to_string(),
+                name: "Dev Model".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "acme".to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 8_192,
+                max_tokens: 2_048,
+                headers: HashMap::new(),
+            },
+            api_key: Some("   ".to_string()),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        };
+
+        let json = extension_model_from_entry(&entry);
+        assert_eq!(json["apiKeyPresent"], false);
     }
 
     // ── last_assistant_message ───────────────────────────────────────────

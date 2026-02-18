@@ -172,14 +172,18 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         }
     };
 
-    step!("10. Resolving API key...");
+    step!("10. Resolving provider credentials...");
     let resolved_key = match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
         Ok(key) => {
-            step!("    API key resolved");
+            if key.is_some() {
+                step!("    Credential resolved");
+            } else {
+                step!("    No credential required for selected model");
+            }
             key
         }
         Err(err) => {
-            step!("    API key resolution FAILED: {err}");
+            step!("    Credential resolution FAILED: {err}");
             return Err(err);
         }
     };

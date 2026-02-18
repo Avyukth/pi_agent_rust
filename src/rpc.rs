@@ -25,7 +25,7 @@ use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
-use crate::provider_metadata::canonical_provider_id;
+use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
@@ -781,14 +781,15 @@ pub async fn run(
                     continue;
                 };
 
-                let Some(key) = resolve_model_key(&options.auth, &entry) else {
+                let key = resolve_model_key(&options.auth, &entry);
+                if model_requires_configured_credential(&entry) && key.is_none() {
                     let err = Error::auth(format!(
-                        "No API key for {}/{}",
+                        "Missing credentials for {}/{}",
                         entry.model.provider, entry.model.id
                     ));
                     let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
                     continue;
-                };
+                }
 
                 {
                     let mut guard = session
@@ -803,7 +804,7 @@ pub async fn run(
                             .map(crate::extensions::ExtensionRegion::manager),
                     )?;
                     guard.agent.set_provider(provider_impl);
-                    let _ = guard.agent.stream_options_mut().api_key.replace(key);
+                    guard.agent.stream_options_mut().api_key.clone_from(&key);
                     guard
                         .agent
                         .stream_options_mut()
@@ -3327,8 +3328,22 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
 }
 
 fn resolve_model_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
-    auth.resolve_api_key(&entry.model.provider, None)
-        .or_else(|| entry.api_key.clone())
+    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+}
+
+fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
+    api_key.and_then(|key| {
+        let trimmed = key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    let provider = entry.model.provider.as_str();
+    entry.auth_header
+        || provider_metadata(provider).is_some_and(|meta| !meta.auth_env_keys.is_empty())
+        || entry.oauth_config.is_some()
 }
 
 fn parse_thinking_level(level: &str) -> Result<crate::model::ThinkingLevel> {
@@ -3495,13 +3510,14 @@ async fn cycle_model_for_rpc(
     )?;
     guard.agent.set_provider(provider_impl);
 
-    let key = resolve_model_key(&options.auth, &next_entry).ok_or_else(|| {
-        Error::auth(format!(
-            "No API key for {}/{}",
+    let key = resolve_model_key(&options.auth, &next_entry);
+    if model_requires_configured_credential(&next_entry) && key.is_none() {
+        return Err(Error::auth(format!(
+            "Missing credentials for {}/{}",
             next_entry.model.provider, next_entry.model.id
-        ))
-    })?;
-    let _ = guard.agent.stream_options_mut().api_key.replace(key);
+        )));
+    }
+    guard.agent.stream_options_mut().api_key.clone_from(&key);
     guard
         .agent
         .stream_options_mut()
@@ -3531,6 +3547,7 @@ async fn cycle_model_for_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthCredential;
     use crate::model::{
         ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
     };
@@ -3636,6 +3653,76 @@ mod tests {
         assert!(provider_ids_match("openrouter", "open-router"));
         assert!(provider_ids_match("google-gemini-cli", "gemini-cli"));
         assert!(!provider_ids_match("openai", "anthropic"));
+    }
+
+    #[test]
+    fn resolve_model_key_prefers_stored_auth_key_over_inline_entry_key() {
+        let mut entry = dummy_entry("gpt-4o-mini", true);
+        entry.model.provider = "openai".to_string();
+        entry.auth_header = true;
+        entry.api_key = Some("inline-model-key".to_string());
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("auth load");
+        auth.set(
+            "openai".to_string(),
+            AuthCredential::ApiKey {
+                key: "stored-auth-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            resolve_model_key(&auth, &entry).as_deref(),
+            Some("stored-auth-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_key_ignores_blank_inline_key_and_falls_back_to_auth_storage() {
+        let mut entry = dummy_entry("gpt-4o-mini", true);
+        entry.model.provider = "openai".to_string();
+        entry.auth_header = true;
+        entry.api_key = Some("   ".to_string());
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("auth load");
+        auth.set(
+            "openai".to_string(),
+            AuthCredential::ApiKey {
+                key: "stored-auth-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            resolve_model_key(&auth, &entry).as_deref(),
+            Some("stored-auth-key")
+        );
+    }
+
+    #[test]
+    fn unknown_keyless_model_does_not_require_credentials() {
+        let mut entry = dummy_entry("dev-model", false);
+        entry.model.provider = "acme-local".to_string();
+        entry.auth_header = false;
+        entry.oauth_config = None;
+
+        assert!(!model_requires_configured_credential(&entry));
+    }
+
+    #[test]
+    fn anthropic_model_requires_credentials_even_without_auth_header() {
+        let mut entry = dummy_entry("claude-sonnet-4-6", true);
+        entry.model.provider = "anthropic".to_string();
+        entry.auth_header = false;
+        entry.oauth_config = None;
+
+        assert!(model_requires_configured_credential(&entry));
     }
 
     // -----------------------------------------------------------------------

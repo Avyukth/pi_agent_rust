@@ -362,6 +362,22 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
         .as_slice()
 }
 
+fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    let provider = entry.model.provider.as_str();
+    entry.auth_header
+        || crate::provider_metadata::provider_metadata(provider)
+            .is_some_and(|meta| !meta.auth_env_keys.is_empty())
+        || entry.oauth_config.is_some()
+}
+
+fn model_entry_is_ready(entry: &ModelEntry) -> bool {
+    !model_requires_configured_credential(entry)
+        || entry
+            .api_key
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
 impl ModelRegistry {
     pub fn load(auth: &AuthStorage, models_path: Option<PathBuf>) -> Self {
         let mut models = built_in_models(auth);
@@ -397,7 +413,7 @@ impl ModelRegistry {
     pub fn get_available(&self) -> Vec<ModelEntry> {
         self.models
             .iter()
-            .filter(|&m| m.api_key.is_some())
+            .filter(|&m| model_entry_is_ready(m))
             .cloned()
             .collect()
     }
@@ -2452,17 +2468,50 @@ mod tests {
     // ─── ModelRegistry ───────────────────────────────────────────────
 
     #[test]
-    fn model_registry_get_available_filters_by_api_key() {
+    fn model_registry_get_available_returns_only_ready_models() {
         let (_dir, auth) = test_auth_storage();
         let registry = ModelRegistry::load(&auth, None);
         let available = registry.get_available();
         assert!(!available.is_empty());
         for entry in &available {
             assert!(
-                entry.api_key.is_some(),
-                "all available models should have api_key"
+                model_entry_is_ready(entry),
+                "all available models should be ready for use"
             );
         }
+    }
+
+    #[test]
+    fn model_registry_get_available_includes_keyless_models() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let models_path = dir.path().join("models.json");
+        let config = serde_json::json!({
+            "providers": {
+                "acme-local": {
+                    "baseUrl": "http://127.0.0.1:11434/v1",
+                    "api": "openai-completions",
+                    "authHeader": false,
+                    "models": [
+                        { "id": "dev-model", "name": "Dev Model", "reasoning": false }
+                    ]
+                }
+            }
+        });
+        std::fs::write(
+            &models_path,
+            serde_json::to_string(&config).expect("serialize models"),
+        )
+        .expect("write models.json");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let available = registry.get_available();
+        assert!(
+            available
+                .iter()
+                .any(|entry| entry.model.provider == "acme-local" && entry.model.id == "dev-model"),
+            "keyless models should be considered available"
+        );
     }
 
     #[test]

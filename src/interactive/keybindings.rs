@@ -409,12 +409,30 @@ impl PiApp {
                 return;
             }
         };
+        let resolved_key_opt = super::commands::resolve_model_key_from_default_auth(&next);
+        if super::commands::model_requires_configured_credential(&next)
+            && resolved_key_opt.is_none()
+        {
+            self.status_message = Some(format!(
+                "Missing credentials for provider {}. Run /login {}.",
+                next.model.provider, next.model.provider
+            ));
+            return;
+        }
 
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             self.status_message = Some("Agent busy; try again".to_string());
             return;
         };
         agent_guard.set_provider(provider_impl);
+        agent_guard
+            .stream_options_mut()
+            .api_key
+            .clone_from(&resolved_key_opt);
+        agent_guard
+            .stream_options_mut()
+            .headers
+            .clone_from(&next.headers);
         drop(agent_guard);
 
         let Ok(mut session_guard) = self.session.try_lock() else {
@@ -597,7 +615,7 @@ impl PiApp {
                 None
             }
             AppAction::SelectModel => {
-                self.open_model_selector();
+                self.open_model_selector_configured_only();
                 None
             }
 
@@ -870,5 +888,265 @@ impl PiApp {
             // Other actions pass through to TextArea
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, AgentConfig};
+    use crate::config::Config;
+    use crate::model::{StreamEvent, Usage};
+    use crate::models::ModelEntry;
+    use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use asupersync::channel::mpsc;
+    use asupersync::runtime::RuntimeBuilder;
+    use futures::stream;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "dummy-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 8)
+                .build()
+                .expect("build runtime")
+        })
+        .handle()
+    }
+
+    fn model_entry(
+        provider: &str,
+        id: &str,
+        api_key: Option<&str>,
+        headers: HashMap<String, String>,
+    ) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.invalid".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: api_key.map(str::to_string),
+            headers,
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
+        let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+        let resources = ResourceLoader::empty(false);
+        let resource_cli = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        PiApp::new(
+            agent,
+            session,
+            Config::default(),
+            resources,
+            resource_cli,
+            Path::new(".").to_path_buf(),
+            current,
+            Vec::new(),
+            available,
+            Vec::new(),
+            event_tx,
+            runtime_handle(),
+            true,
+            None,
+            Some(KeyBindings::new()),
+            Vec::new(),
+            Usage::default(),
+        )
+    }
+
+    #[test]
+    fn cycle_model_replaces_stream_options_api_key_and_headers() {
+        let mut current_headers = HashMap::new();
+        current_headers.insert("x-stale".to_string(), "old".to_string());
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), current_headers);
+
+        let mut next_headers = HashMap::new();
+        next_headers.insert("x-provider-header".to_string(), "next".to_string());
+        let next = model_entry(
+            "openrouter",
+            "openai/gpt-4o-mini",
+            Some("next-key"),
+            next_headers,
+        );
+
+        let mut app = build_test_app(current.clone(), vec![current, next]);
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "stale".to_string());
+        }
+
+        app.cycle_model(1);
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(
+            guard.stream_options_mut().api_key.as_deref(),
+            Some("next-key")
+        );
+        assert_eq!(
+            guard
+                .stream_options_mut()
+                .headers
+                .get("x-provider-header")
+                .map(String::as_str),
+            Some("next")
+        );
+        assert!(
+            !guard.stream_options_mut().headers.contains_key("x-stale"),
+            "cycling models must replace stale provider headers"
+        );
+    }
+
+    #[test]
+    fn cycle_model_clears_stale_api_key_when_next_model_has_no_key() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut next = model_entry("ollama", "llama3.2", None, HashMap::new());
+        next.auth_header = false;
+        let mut app = build_test_app(current.clone(), vec![current, next]);
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "stale".to_string());
+        }
+
+        app.cycle_model(1);
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert!(
+            guard.stream_options_mut().api_key.is_none(),
+            "cycling to a keyless model must clear stale API key"
+        );
+        assert!(
+            guard.stream_options_mut().headers.is_empty(),
+            "cycling to keyless model with no headers must clear stale headers"
+        );
+    }
+
+    #[test]
+    fn slash_model_allows_switch_to_keyless_provider_without_api_key() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut keyless = model_entry("ollama", "llama3.2", None, HashMap::new());
+        keyless.auth_header = false;
+        let mut app = build_test_app(current.clone(), vec![current, keyless]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "ollama/llama3.2");
+
+        assert_eq!(app.model, "ollama/llama3.2");
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert!(
+            guard.stream_options_mut().api_key.is_none(),
+            "keyless model switch must not keep stale API key"
+        );
+    }
+
+    #[test]
+    fn slash_model_rejects_missing_credentials_for_required_provider() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut requires_creds = model_entry("acme-remote", "cloud-model", None, HashMap::new());
+        requires_creds.auth_header = true;
+        let mut app = build_test_app(current.clone(), vec![current, requires_creds]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "acme-remote/cloud-model");
+
+        assert_eq!(app.model, "openai/gpt-4o-mini");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("Missing credentials for provider acme-remote")),
+            "switch should fail fast when selected provider still lacks credentials"
+        );
+    }
+
+    #[test]
+    fn slash_model_treats_blank_inline_key_as_missing_credentials() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut blank_key = model_entry("acme-remote", "cloud-model", Some("   "), HashMap::new());
+        blank_key.auth_header = true;
+        let mut app = build_test_app(current.clone(), vec![current, blank_key]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "acme-remote/cloud-model");
+
+        assert_eq!(app.model, "openai/gpt-4o-mini");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("Missing credentials for provider acme-remote")),
+            "blank inline keys must not bypass credential checks"
+        );
     }
 }

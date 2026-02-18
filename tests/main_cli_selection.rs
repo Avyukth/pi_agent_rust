@@ -595,18 +595,19 @@ fn resolve_api_key_precedence_and_error_paths() {
 
     let cli_override = cli::Cli::parse_from(["pi", "--api-key", "cli-key"]);
     let resolved = resolve_api_key(&auth, &cli_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "cli-key");
+    assert_eq!(resolved.as_deref(), Some("cli-key"));
 
     let cli_no_override = cli::Cli::parse_from(["pi"]);
     let resolved = resolve_api_key(&auth, &cli_no_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "auth-key");
+    assert_eq!(resolved.as_deref(), Some("auth-key"));
 
     let auth_empty =
         AuthStorage::load(harness.temp_path("empty-auth.json")).expect("load empty auth storage");
     let resolved = resolve_api_key(&auth_empty, &cli_no_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "entry-key");
+    assert_eq!(resolved.as_deref(), Some("entry-key"));
 
-    let entry_missing = custom_model_entry("custom", None);
+    let mut entry_missing = custom_model_entry("custom", None);
+    entry_missing.auth_header = true;
     let err = resolve_api_key(&auth_empty, &cli_no_override, &entry_missing)
         .expect_err("missing key should error");
     assert!(

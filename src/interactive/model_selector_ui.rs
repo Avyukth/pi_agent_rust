@@ -1,4 +1,6 @@
-use super::commands::model_entry_matches;
+use super::commands::{
+    model_entry_matches, model_requires_configured_credential, resolve_model_key_from_default_auth,
+};
 use super::*;
 
 impl PiApp {
@@ -26,20 +28,21 @@ impl PiApp {
             std::collections::HashMap::new();
         let mut filtered = Vec::new();
         for entry in &self.available_models {
+            let provider = entry.model.provider.as_str();
+            let canonical = crate::provider_metadata::canonical_provider_id(provider)
+                .unwrap_or(provider)
+                .to_ascii_lowercase();
+            let requires_configured_credential = model_requires_configured_credential(entry);
             let has_inline_key = entry
                 .api_key
                 .as_ref()
                 .is_some_and(|key| !key.trim().is_empty());
             let has_auth_key = auth.as_ref().is_some_and(|storage| {
-                let provider = entry.model.provider.as_str();
-                let canonical = crate::provider_metadata::canonical_provider_id(provider)
-                    .unwrap_or(provider)
-                    .to_ascii_lowercase();
                 *provider_has_credential
                     .entry(canonical.clone())
                     .or_insert_with(|| storage.resolve_api_key(&canonical, None).is_some())
             });
-            if has_inline_key || has_auth_key {
+            if !requires_configured_credential || has_inline_key || has_auth_key {
                 filtered.push(entry.clone());
             }
         }
@@ -80,7 +83,7 @@ impl PiApp {
         let filtered = self.available_models_with_credentials();
         if filtered.is_empty() {
             self.status_message = Some(
-                "No models with configured API keys. Use /login <provider> to configure credentials."
+                "No models are ready to use. Configure credentials with /login <provider>."
                     .to_string(),
             );
             return;
@@ -146,6 +149,15 @@ impl PiApp {
             return;
         }
 
+        let resolved_key_opt = resolve_model_key_from_default_auth(&next);
+        if model_requires_configured_credential(&next) && resolved_key_opt.is_none() {
+            self.status_message = Some(format!(
+                "Missing credentials for provider {}. Run /login {}.",
+                next.model.provider, next.model.provider
+            ));
+            return;
+        }
+
         let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
             Ok(p) => p,
             Err(err) => {
@@ -157,14 +169,6 @@ impl PiApp {
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             self.status_message = Some("Agent busy; try again".to_string());
             return;
-        };
-        let resolved_key_opt = if next.api_key.is_some() {
-            next.api_key.clone()
-        } else {
-            let auth_path = crate::config::Config::auth_path();
-            crate::auth::AuthStorage::load(auth_path)
-                .ok()
-                .and_then(|auth| auth.resolve_api_key(&next.model.provider, None))
         };
         agent_guard.set_provider(provider_impl);
         agent_guard
@@ -212,9 +216,9 @@ impl PiApp {
             let _ = writeln!(
                 output,
                 "  {}",
-                self.styles.muted.render(
-                    "Only showing models with configured API keys (see README for details)"
-                )
+                self.styles
+                    .muted
+                    .render("Only showing models that are ready to use (see README for details)")
             );
         }
 
@@ -498,7 +502,8 @@ mod tests {
     #[test]
     fn apply_model_selection_clears_stale_api_key_when_next_model_has_no_key() {
         let current = model_entry("openai", "gpt-4o-mini", Some("old-key"));
-        let next = model_entry("ollama", "llama3.2", None);
+        let mut next = model_entry("ollama", "llama3.2", None);
+        next.auth_header = false;
         let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
 
         {
@@ -516,5 +521,65 @@ mod tests {
             guard.stream_options_mut().api_key.is_none(),
             "switching to a keyless model must clear stale API key"
         );
+    }
+
+    #[test]
+    fn configured_only_selector_includes_keyless_ready_models() {
+        let mut keyless = model_entry("ollama", "llama3.2", None);
+        keyless.auth_header = false;
+
+        let mut requires_creds = model_entry("acme-remote", "cloud-model", None);
+        requires_creds.auth_header = true;
+
+        let mut app = build_test_app(keyless.clone(), vec![keyless, requires_creds]);
+        app.open_model_selector_configured_only();
+
+        let selector = app
+            .model_selector
+            .as_ref()
+            .expect("configured-only selector should open when keyless models are ready");
+        let mut ids = Vec::new();
+        for idx in 0..selector.filtered_len() {
+            if let Some(item) = selector.item_at(idx) {
+                ids.push(item.full_id());
+            }
+        }
+
+        assert!(
+            ids.iter().any(|id| id == "ollama/llama3.2"),
+            "keyless local model must be considered ready"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "acme-remote/cloud-model"),
+            "credentialed providers without configured auth should not appear"
+        );
+    }
+
+    #[test]
+    fn configured_only_selector_keeps_unknown_keyless_provider_models() {
+        let mut unknown_keyless = model_entry("acme-local", "dev-model", None);
+        unknown_keyless.auth_header = false;
+        let mut unknown_requires = model_entry("acme-remote", "cloud-model", None);
+        unknown_requires.auth_header = true;
+
+        let mut app = build_test_app(
+            unknown_keyless.clone(),
+            vec![unknown_keyless, unknown_requires],
+        );
+        app.open_model_selector_configured_only();
+
+        let selector = app
+            .model_selector
+            .as_ref()
+            .expect("unknown keyless model should keep selector available");
+        let mut ids = Vec::new();
+        for idx in 0..selector.filtered_len() {
+            if let Some(item) = selector.item_at(idx) {
+                ids.push(item.full_id());
+            }
+        }
+
+        assert!(ids.iter().any(|id| id == "acme-local/dev-model"));
+        assert!(!ids.iter().any(|id| id == "acme-remote/cloud-model"));
     }
 }

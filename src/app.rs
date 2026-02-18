@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::provider::{StreamOptions, ThinkingBudgets};
-use crate::provider_metadata::canonical_provider_id;
+use crate::provider_metadata::{canonical_provider_id, provider_metadata};
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -380,7 +380,7 @@ pub fn select_model_and_thinking(
         if candidates.is_empty() {
             bail!("No models available for provider {provider}");
         }
-        if let Some(found) = candidates.iter().find(|m| m.api_key.is_some()) {
+        if let Some(found) = candidates.iter().find(|m| model_entry_is_ready(m)) {
             selected_model = Some(found.clone());
         } else {
             selected_model = Some(candidates.remove(0));
@@ -411,7 +411,7 @@ pub fn select_model_and_thinking(
                 }
             }
             if selected_model.is_none() {
-                if let Some(found) = matches.iter().find(|m| m.api_key.is_some()) {
+                if let Some(found) = matches.iter().find(|m| model_entry_is_ready(m)) {
                     selected_model = Some(found.clone());
                 }
             }
@@ -654,25 +654,55 @@ fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
     available[0].clone()
 }
 
-pub fn resolve_api_key(auth: &AuthStorage, cli: &cli::Cli, entry: &ModelEntry) -> Result<String> {
-    auth.resolve_api_key(&entry.model.provider, cli.api_key.as_deref())
-        .or_else(|| entry.api_key.clone())
-        .ok_or_else(|| {
-            StartupError::MissingApiKey {
-                provider: entry.model.provider.clone(),
-            }
-            .into()
-        })
+fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
+    api_key.and_then(|key| {
+        let trimmed = key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    let provider = entry.model.provider.as_str();
+    entry.auth_header
+        || provider_metadata(provider).is_some_and(|meta| !meta.auth_env_keys.is_empty())
+        || entry.oauth_config.is_some()
+}
+
+fn model_entry_is_ready(entry: &ModelEntry) -> bool {
+    !model_requires_configured_credential(entry)
+        || entry
+            .api_key
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub fn resolve_api_key(
+    auth: &AuthStorage,
+    cli: &cli::Cli,
+    entry: &ModelEntry,
+) -> Result<Option<String>> {
+    let key = normalize_api_key_opt(cli.api_key.clone())
+        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+
+    if model_requires_configured_credential(entry) && key.is_none() {
+        return Err(StartupError::MissingApiKey {
+            provider: entry.model.provider.clone(),
+        }
+        .into());
+    }
+
+    Ok(key)
 }
 
 pub fn build_stream_options(
     config: &Config,
-    api_key: String,
+    api_key: Option<String>,
     selection: &ModelSelection,
     session: &Session,
 ) -> StreamOptions {
     let mut options = StreamOptions {
-        api_key: Some(api_key),
+        api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         ..Default::default()
@@ -930,7 +960,8 @@ fn is_alias(model_id: &str) -> bool {
 }
 
 fn models_equal(left: &ModelEntry, right: &ModelEntry) -> bool {
-    left.model.provider == right.model.provider && left.model.id == right.model.id
+    provider_ids_match(&left.model.provider, &right.model.provider)
+        && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
 pub fn output_final_text(message: &AssistantMessage) {
@@ -1022,6 +1053,42 @@ mod tests {
         let selected = default_model_from_available(&available);
         assert_eq!(selected.model.provider, "vercel");
         assert_eq!(selected.model.id, "anthropic/claude-opus-4.5");
+    }
+
+    #[test]
+    fn resolve_api_key_allows_keyless_model_when_credentials_not_required() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut entry = test_model_entry("llama3.2", "ollama", false);
+        entry.api_key = None;
+        entry.auth_header = false;
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let resolved = resolve_api_key(&auth, &cli, &entry).expect("resolve keyless model");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_api_key_still_requires_credentials_for_remote_provider() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut entry = test_model_entry("gpt-4o-mini", "openai", true);
+        entry.api_key = None;
+        entry.auth_header = true;
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let err = resolve_api_key(&auth, &cli, &entry).unwrap_err();
+        let startup = err
+            .downcast_ref::<StartupError>()
+            .expect("missing key should map to startup error");
+        match startup {
+            StartupError::MissingApiKey { provider } => {
+                assert_eq!(provider, "openai");
+            }
+            StartupError::NoModelsAvailable { .. } => {
+                panic!("unexpected startup error: {startup:?}");
+            }
+        }
     }
 
     #[test]
@@ -1148,6 +1215,29 @@ mod tests {
             "open-router"
         ));
         assert!(!selection.model_entry.model.id.is_empty());
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_prefers_ready_model() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let mut unready_remote = test_model_entry("cloud-model", "acme", true);
+        unready_remote.api_key = None;
+        unready_remote.auth_header = true;
+
+        let mut keyless_ready = test_model_entry("local-model", "acme", false);
+        keyless_ready.api_key = None;
+        keyless_ready.auth_header = false;
+
+        let registry = registry_with_entries(vec![unready_remote, keyless_ready]);
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider selection should prefer ready models");
+
+        assert_eq!(selection.model_entry.model.provider, "acme");
+        assert_eq!(selection.model_entry.model.id, "local-model");
     }
 
     #[test]
@@ -1589,6 +1679,13 @@ mod tests {
                     assert!(!models_equal(&a, &b));
                 }
             }
+        }
+
+        #[test]
+        fn models_equal_normalizes_provider_aliases_and_model_case() {
+            let left = test_model_entry("openai/gpt-4o-mini", "openrouter", true);
+            let right = test_model_entry("OPENAI/GPT-4O-MINI", "open-router", false);
+            assert!(models_equal(&left, &right));
         }
     }
 }

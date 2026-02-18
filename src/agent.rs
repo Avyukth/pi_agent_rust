@@ -4243,10 +4243,17 @@ impl AgentSession {
     }
 
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
+        let normalize = |key_opt: Option<String>| {
+            key_opt.and_then(|key| {
+                let trimmed = key.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            })
+        };
+
         self.auth_storage
             .as_ref()
-            .and_then(|auth| auth.resolve_api_key(&entry.model.provider, None))
-            .or_else(|| entry.api_key.clone())
+            .and_then(|auth| normalize(auth.resolve_api_key(&entry.model.provider, None)))
+            .or_else(|| normalize(entry.api_key.clone()))
     }
 
     fn apply_session_model_selection(&mut self, provider_id: &str, model_id: &str) {
@@ -5166,8 +5173,10 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 mod tests {
     use super::*;
     use crate::auth::AuthCredential;
+    use crate::provider::{InputType, Model, ModelCost};
     use async_trait::async_trait;
     use futures::Stream;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::pin::Pin;
 
@@ -5668,6 +5677,51 @@ mod tests {
             agent_session.agent.stream_options().api_key,
             None,
             "stale key must be cleared when target model has no configured key"
+        );
+    }
+
+    #[test]
+    fn apply_session_model_selection_treats_blank_model_key_as_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage::load(auth_path).expect("load auth");
+
+        let mut registry = ModelRegistry::load(&auth, None);
+        registry.merge_entries(vec![ModelEntry {
+            model: Model {
+                id: "blank-model".to_string(),
+                name: "Blank Model".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "acme".to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: Some("   ".to_string()),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }]);
+
+        let mut agent_session = build_switch_test_session(&auth);
+        agent_session.set_model_registry(registry);
+        agent_session.apply_session_model_selection("acme", "blank-model");
+
+        assert_eq!(agent_session.agent.provider().name(), "acme");
+        assert_eq!(
+            agent_session.agent.stream_options().api_key,
+            None,
+            "blank model keys must not be treated as valid credentials"
         );
     }
 

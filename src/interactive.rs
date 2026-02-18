@@ -1127,6 +1127,8 @@ pub enum PiMsg {
     },
     /// Agent error.
     AgentError(String),
+    /// Credentials changed for a provider; refresh in-memory provider auth state.
+    CredentialUpdated { provider: String },
     /// Non-error system message.
     System(String),
     /// System note that does not mutate agent state (safe during streaming).
