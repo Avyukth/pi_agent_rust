@@ -15,6 +15,24 @@ This report now includes a post-hardening extension-compatibility checkpoint.
   - `cargo clippy --all-targets -- -D warnings`
   - `cargo fmt --check`
 
+## 0.1) Post-Compaction Secure-Path Verification (2026-02-18)
+
+- Security/perf guardrail: feature/security defaults were restored and preserved (no benchmark-goosing default flips):
+  - `DUAL_EXEC_DEFAULT_SAMPLE_PPM` restored to original default (`25_000`) in `src/extension_dispatcher.rs`.
+  - AMAC `from_env()` default behavior restored to enabled-by-default semantics in `src/hostcall_amac.rs`.
+- Fast-path optimization in dispatcher remains security-preserving:
+  - Capability deny checks still execute before hostcall completion on the fast path.
+  - No policy/risk/quota controls were removed.
+- Native runtime hot-path cleanup landed in active scaffold (`src/extensions.rs`):
+  - lock-scope tightening and drop timing fixes for `RwLock` guards,
+  - allocation/clone reductions in tool/command/shortcut/provider-stream flows,
+  - clippy-driven correctness/style rewrites (`option_if_let_else`, `manual_let_else`, `significant_drop_tightening`).
+- Gate status from this pass:
+  - `cargo fmt --check` ✅
+  - `cargo check --all-targets` ✅
+  - `cargo clippy --all-targets -- -D warnings` ✅
+  - `cargo test --test event_loop_conformance --test lab_runtime_extensions --test extensions_event_wiring` ✅ (`12 + 15 + 133` tests passed)
+
 ## 1) Lede (Do Not Bury This)
 
 1. Rust is currently **slower** than legacy in wall-clock for long-session resume/workload paths in this snapshot, often ~`1.2x` to `2.0x` slower than Node and ~`1.9x` to `4.0x` slower than Bun in realistic end-to-end runs.
