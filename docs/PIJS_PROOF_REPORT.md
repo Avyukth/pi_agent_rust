@@ -16,8 +16,9 @@ performance advantage.
 
 | Claim | Evidence |
 |---|---|
-| 187 of 223 extensions run unmodified | Conformance tests (§3) |
-| All 60 official pi-mono extensions pass (except 1 test fixture) | `conformance_baseline.json` |
+| Current vendored matrix is fully green (`224/224`) | `tests/ext_conformance/reports/sharded/shard_0_report.json` |
+| Scenario conformance suite is fully green (`25/25`) | `tests/ext_conformance/reports/scenario_conformance.json` |
+| Differential parity triage sample has zero mismatches (`22` match, `0` mismatch, `3` skip) | `tests/ext_conformance/reports/parity/triage.json` |
 | Cold load P95 = 106ms (debug build) | `ext_bench_baseline.json` |
 | Warm load P99 < 1ms | Performance benchmarks (§5) |
 | Event dispatch P99 = 616us | Performance benchmarks (§5) |
@@ -138,21 +139,15 @@ capability-gated rather than ambient.
 
 ### 3.4 Conformance evidence
 
-**187 of 223 extensions pass conformance tests without any source modifications:**
+Current conformance matrix status is fully green:
+- `224/224` pass
+- `0` fail
+- `0` skip
 
-| Source tier | Total | Pass | Rate |
-|---|---|---|---|
-| Official (pi-mono) | 61 | 60 | 98.4% |
-| Community | 58 | 52 | 89.7% |
-| npm registry | 75 | 48 | 64.0% |
-| Third-party GitHub | 23 | 16 | 69.6% |
+Source artifact:
+- `tests/ext_conformance/reports/sharded/shard_0_report.json` (`generated_at=2026-02-18T23:43:48Z`)
 
-The 36 failures break down as:
-- 22 manifest registration mismatches (fixable by auditing test manifests)
-- 5 missing npm package stubs (fixable by adding virtual modules)
-- 4 multi-file dependency issues (need bundling)
-- 4 runtime errors (under investigation)
-- 1 test fixture (not a real extension)
+Historical `187/223` baseline figures are superseded by this current run and are retained only as older archival context.
 
 **Reproduction:**
 
@@ -204,7 +199,7 @@ Given identical inputs (artifact bytes, event sequence, hostcall results,
 clock), PiJS produces identical outputs. This is verified by:
 
 - Golden fixture comparison (16 representative extensions)
-- Differential oracle (TS vs Rust runtime comparison for 223 extensions)
+- Differential parity triage sample (TS vs Rust): `22` match, `0` mismatch, `3` skip (`25` total)
 - Property-based tests (13 proptest suites, 512 cases each)
 
 ---
@@ -280,7 +275,7 @@ PI_BENCH_MODE=nightly PI_BENCH_MAX=103 PI_BENCH_ITERATIONS=10 \
 | **Test harness** | Manual setup | Manual setup | LabRuntime (built-in) |
 | **Native addons** | Supported (risk) | Supported (risk) | Blocked (safe) |
 | **WebAssembly** | Built-in | Built-in | Via wasmtime bridge* |
-| **Compatibility** | 100% Node API | ~98% Node API | 84% of real extensions |
+| **Compatibility** | 100% Node API | ~98% Node API | `224/224` in current vendored conformance matrix (harness scope) |
 | **Dependencies** | node binary (80MB+) | bun binary (60MB+) | Embedded (0 bytes) |
 
 *PiWasm bridge planned for extensions that require WebAssembly; no current
@@ -293,9 +288,9 @@ corpus extension uses it.
 All evidence can be regenerated from scratch:
 
 ```bash
-# 1. Conformance (all 223 extensions)
-cargo test --test ext_conformance_generated conformance_full_report \
-  --features ext-conformance -- --nocapture
+# 1. Conformance (all 224 current vendored extensions)
+cargo test --test ext_conformance_generated --features ext-conformance -- \
+  conformance_sharded_matrix --nocapture --exact
 
 # 2. Performance (103 safe extensions)
 PI_BENCH_MODE=nightly PI_BENCH_MAX=103 PI_BENCH_ITERATIONS=10 \
@@ -315,9 +310,9 @@ cargo test --test perf_budgets --features ext-conformance -- --nocapture
 
 | Artifact | Location |
 |---|---|
-| Conformance baseline | `tests/ext_conformance/reports/conformance_baseline.json` |
-| Conformance report | `tests/ext_conformance/reports/CONFORMANCE_REPORT.md` |
-| Combined summary | `tests/ext_conformance/reports/COMPATIBILITY_SUMMARY.md` |
+| Conformance shard report | `tests/ext_conformance/reports/sharded/shard_0_report.json` |
+| Scenario conformance report | `tests/ext_conformance/reports/scenario_conformance.json` |
+| Parity triage report | `tests/ext_conformance/reports/parity/triage.json` |
 | Perf baseline | `tests/perf/reports/ext_bench_baseline.json` |
 | Perf report | `tests/perf/reports/BASELINE_REPORT.md` |
 | Budget summary | `tests/perf/reports/budget_summary.json` |

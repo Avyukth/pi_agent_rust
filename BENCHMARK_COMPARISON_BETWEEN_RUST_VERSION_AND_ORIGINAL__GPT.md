@@ -543,33 +543,39 @@ To actually invert the extension overhead (Rust faster than legacy per-call), th
 Near-term measurable target from current data:
 - Drive `ext_tool_call/hello` from ~`11.9-12.3us` to `<1.3us` and `ext_event_hook/before_agent_start` from ~`15.0-15.5us` to `<1.7us` while maintaining conformance.
 
-## 7.3 Corpus Conformance (223+ extension target)
+## 7.3 Corpus Conformance (Current 2026-02-18)
 
-Source: `tests/ext_conformance/reports/pipeline/full_validation_report.compat2.json` (`generatedAt=2026-02-14T09:05:16Z`)
+Sources:
+- `tests/ext_conformance/reports/sharded/shard_0_report.json` (`generated_at=2026-02-18T23:43:48Z`)
+- `tests/ext_conformance/reports/scenario_conformance.json` (`generated_at=2026-02-18T23:11:57Z`)
+- `tests/ext_conformance/reports/parity/triage.json` (`generated_at=2026-02-18T23:12:13Z`)
 
-Corpus:
-- total candidates: `1000`
-- vendored: `223`
-- unvendored: `777`
+Vendored matrix status:
+- manifest count: `224`
+- tested: `224`
+- pass: `224`
+- fail: `0`
+- skip: `0`
+- overall pass rate: `100%`
 
-Vendored status:
-- pass: `187`
-- fail: `29`
-- pending manifest alignment: `7`
-- tested pass rate (`pass/(pass+fail)`): `86.57%`
-- overall vendored pass rate (`pass/223`): `83.86%`
+Scenario conformance suite:
+- total: `25`
+- pass: `25`
+- fail: `0`
+- error: `0`
+- skip: `0`
 
-Failure taxonomy (vendored non-pass):
-- `harness_gap`: `23`
-- `needs_review`: `12`
-- `extension_problem`: `1`
+Parity triage sample:
+- total: `25`
+- match: `22`
+- mismatch: `0`
+- skip: `3`
+- rust_error: `0`
+- ts_error: `0`
 
-Stage summary:
-- passed: `8`
-- failed: `1` (`auto_repair_full_corpus`, exit 101)
-- skipped: `1` (`differential_suite`)
+## 7.4 Historical Baseline (2026-02-14, Superseded)
 
-## 7.4 Extensions Not Yet 100% Passing (All 36 Vendored Non-Pass)
+The following TSV is retained for audit history from the older `223`-entry baseline run and is superseded by the current `224/224` matrix status above.
 
 Columns: `id`, `status`, `verdict`, `failure_category`, `reason`, `suggested_fix`
 
@@ -612,12 +618,12 @@ third-party/pasky-pi-amplike	fail	harness_gap	registration_mismatch	Observed reg
 third-party/w-winter-dot314	fail	harness_gap	registration_mismatch	Observed registration output diverges from manifest expectations.	Refresh expected snapshot from TS oracle and re-validate.
 ```
 
-## 7.5 Remediation Plan for Remaining Extension Gaps
+## 7.5 Current Gap Status
 
-1. Close `harness_gap` first (`23` items): refresh TS oracle snapshots and regenerate validated manifests.
-2. Resolve pending manifest drift (`7` items): rebuild `VALIDATED_MANIFEST.json`, re-run shards.
-3. Triage `needs_review` load failures (`12` items): classify runtime shim gap vs extension defect with dossier reproduction.
-4. Contain true extension defects (`extension_problem`): package missing assets or mark as extension-side defect.
+1. Current vendored conformance matrix has no outstanding non-pass entries (`224/224` pass).
+2. Current scenario suite has no outstanding failures (`25/25` pass).
+3. Differential parity triage currently shows `0` mismatches in sampled cases (`22` match, `3` skip).
+4. Remaining work is regression prevention: keep the matrix/scenario/parity lanes as release-gate checks and investigate any future drift immediately.
 
 ---
 
@@ -695,7 +701,7 @@ These are the highest expected-value targets from measured bottlenecks:
 
 ---
 
-## 11) Appendix A — Full Vendored Extension List (223)
+## 11) Appendix A — Historical Vendored Extension List Snapshot (223, 2026-02-14)
 
 Columns: `id`, `sourceTier`, `candidateStatus`, `conformanceStatus`, `verdict`, `conformanceFailureCategory`, `classificationReason`, `suggestedFix`
 

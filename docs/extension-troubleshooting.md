@@ -85,6 +85,16 @@ in `PolicyCheck`:
 
 ## Extension Loading Failures
 
+### Symptom: "Do I need to convert JS extensions to descriptors first?"
+
+**Answer**: No. Legacy `.js/.ts` extensions run directly in the embedded
+QuickJS runtime. There is no required descriptor conversion step for normal
+extension usage.
+
+Descriptor entries (`*.native.json`) are an optional native-rust runtime path.
+Current sessions must use one runtime family at a time (JS/TS or native
+descriptor).
+
 ### Symptom: "Extension entry does not exist"
 
 **Cause**: `JsExtensionLoadSpec::from_entry_path()` cannot find the file.

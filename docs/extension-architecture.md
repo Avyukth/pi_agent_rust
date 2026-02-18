@@ -6,11 +6,17 @@ boundaries, and structured concurrency.
 
 ## Overview
 
-Extensions are third-party JavaScript modules that run inside an embedded
-QuickJS interpreter. They register capabilities (tools, slash commands,
-shortcuts, flags, event hooks) at load time and interact with the host
-through a capability-gated hostcall interface. The host enforces a
-configurable policy before dispatching each request.
+Extensions support two runtime modes:
+
+1. Legacy JS/TS entrypoints (`.js/.ts/.mjs/.cjs/.tsx/.mts/.cts`) run inside an
+   embedded QuickJS interpreter.
+2. Native descriptor entrypoints (`*.native.json`) run through the
+   native-rust descriptor runtime.
+
+For legacy Pi compatibility, JS/TS entrypoints are loaded directly with no
+manual conversion step. Runtime selection is automatic from the entrypoint type.
+The host enforces a configurable capability policy before dispatching each
+request.
 
 ```
  Extension JS (untrusted)          Rust Host (trusted)
@@ -27,29 +33,29 @@ configurable policy before dispatching each request.
 
 ## Core Types
 
-### `ExtensionManager` (`src/extensions.rs:8104`)
+### `ExtensionManager` (`src/extensions.rs`)
 
 Central registry wrapping `Arc<Mutex<ExtensionManagerInner>>`. Thread-safe,
 cheaply cloneable. Owns:
 
-| Field                  | Type                                    | Purpose                                |
-|------------------------|-----------------------------------------|----------------------------------------|
-| `extensions`           | `Vec<RegisterPayload>`                  | Registered extension metadata          |
-| `js_runtime`           | `Option<JsExtensionRuntimeHandle>`      | QuickJS runtime thread handle          |
-| `ui_sender`            | `Option<mpsc::Sender<ExtensionUiRequest>>`| Channel to TUI for user prompts      |
-| `session`              | `Option<Arc<dyn ExtensionSession>>`     | Current session state access           |
-| `active_tools`         | `Option<Vec<String>>`                   | Enabled tool names for this session    |
-| `providers`            | `Vec<Value>`                            | Custom `streamSimple` provider models  |
-| `flags`                | `Vec<Value>`                            | Extension-registered feature flags     |
-| `policy_prompt_cache`  | `HashMap<String, HashMap<String, bool>>`| Cached per-session permission decisions|
-| `permission_store`     | `Option<PermissionStore>`               | Persistent Allow/Deny Always store     |
-| `extension_budget`     | `Budget`                                | Structured concurrency timeout budget  |
+| Field | Type | Purpose |
+|-------|------|---------|
+| `extensions` | `Vec<RegisterPayload>` | Registered extension metadata |
+| `runtime` | `Option<ExtensionRuntimeHandle>` | Active extension runtime handle (QuickJS or native-rust) |
+| `ui_sender` | `Option<mpsc::Sender<ExtensionUiRequest>>` | Channel to TUI for user prompts |
+| `session` | `Option<Arc<dyn ExtensionSession>>` | Current session state access |
+| `active_tools` | `Option<Vec<String>>` | Enabled tool names for this session |
+| `providers` | `Vec<Value>` | Custom `streamSimple` provider models |
+| `flags` | `Vec<Value>` | Extension-registered feature flags |
+| `policy_prompt_cache` | `HashMap<String, HashMap<String, bool>>` | Cached per-session permission decisions |
+| `permission_store` | `Option<PermissionStore>` | Persistent Allow/Deny Always store |
+| `extension_budget` | `Budget` | Structured concurrency timeout budget |
 
-### `ExtensionRegion` (`src/extensions.rs:8172`)
+### `ExtensionRegion` (`src/extensions.rs`)
 
 RAII guard wrapping `ExtensionManager` for structured concurrency. When
-dropped, sends `JsRuntimeCommand::Shutdown` to the QuickJS thread with a
-configurable cleanup budget (default 5 seconds).
+dropped, it shuts down the active extension runtime handle with a configurable
+cleanup budget (default 5 seconds).
 
 ```rust
 pub struct ExtensionRegion {
@@ -62,7 +68,7 @@ pub struct ExtensionRegion {
 Usage: `AgentSession.extensions: Option<ExtensionRegion>`. Callers access
 the inner manager via `region.manager()`.
 
-### `JsExtensionLoadSpec` (`src/extensions.rs:4825`)
+### `JsExtensionLoadSpec` (`src/extensions.rs`)
 
 Declarative specification for loading a JavaScript extension from disk:
 
@@ -72,6 +78,14 @@ Declarative specification for loading a JavaScript extension from disk:
 
 Factory: `JsExtensionLoadSpec::from_entry_path(path)` parses the manifest
 and canonicalizes the path.
+
+### `NativeRustExtensionLoadSpec` (`src/extensions.rs`)
+
+Declarative specification for loading a native descriptor extension:
+
+- `extension_id` -- unique identifier (e.g. `ext.some_native_extension`)
+- `entry_path` -- canonical `PathBuf` to `*.native.json`
+- `name`, `version`, `api_version` -- metadata from `extension.json`
 
 ### `RegisterPayload` (`src/extensions.rs:2017`)
 

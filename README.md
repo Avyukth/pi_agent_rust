@@ -329,6 +329,10 @@ Pi runs in three modes, each suited to different workflows:
 Pi runs legacy JS/TS extensions **without Node or Bun**, using an embedded
 QuickJS runtime with capability-gated host connectors:
 
+- Extension entrypoints are auto-detected:
+  - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
+  - `*.native.json` loads the optional native-rust descriptor runtime.
+  - Mixed JS + native descriptor entries are not supported in the same session yet.
 - Compatibility metrics are tracked in [docs/ext-compat.md](docs/ext-compat.md) and `tests/ext_conformance/reports/pipeline/`
 - **Sub-100ms cold load** (P95), **sub-1ms warm load** (P99)
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
@@ -337,13 +341,13 @@ QuickJS runtime with capability-gated host connectors:
 Extensions can register tools, slash commands, event hooks, flags, providers,
 and shortcuts. See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture
 and [docs/extension-catalog.json](docs/extension-catalog.json) for the
-223-entry catalog with per-extension conformance status and perf budgets.
+224-entry catalog with per-extension conformance status and perf budgets.
 
 ## Extension Validation Pipeline
 
 This project validates extension compatibility with a two-track pipeline:
 
-- **Vendored corpus (223)**: deterministic conformance, compatibility matrix, and scenario suites.
+- **Vendored corpus (224)**: deterministic conformance, compatibility matrix, and scenario suites.
 - **Unvendored corpus (777)**: source acquisition and onboarding prioritization.
 
 ### Why this exists
@@ -410,15 +414,17 @@ cargo run --bin ext_unvendored_fetch_run -- run-all --workers 8 --no-probe
 cargo run --bin ext_full_validation --
 ```
 
-### Latest run snapshot (2026-02-14)
+### Latest run snapshot (2026-02-18)
 
-From `tests/ext_conformance/reports/pipeline/full_validation_report.md`
-(generated `2026-02-14T05:46:49Z`):
+From:
+- `tests/ext_conformance/reports/sharded/shard_0_report.json` (generated `2026-02-18T23:43:48Z`)
+- `tests/ext_conformance/reports/scenario_conformance.json` (generated `2026-02-18T23:11:57Z`)
+- `tests/ext_conformance/reports/parity/triage.json` (generated `2026-02-18T23:12:13Z`)
 
-- Stage summary: `passed=4`, `failed=5`, `skipped=1`
-- Corpus counts: `vendored=223`, `unvendored=777`, `totalCandidates=1000`
-- Verdict breakdown: `harness_gap=216`, `needs_review=7`, `not_extension=1`, `not_tested_unvendored=776`
-- The report indicates active harness gaps; treat compatibility percentages as in-progress until failed stages are cleared.
+- Vendored matrix conformance: `manifest_count=224`, `tested=224`, `passed=224`, `failed=0`, `skipped=0`
+- Scenario suite conformance: `25/25` passed (`0` fail, `0` error, `0` skip)
+- Differential parity triage sample: `22` match, `0` mismatch, `3` skip (`total=25`)
+- Scope note: these figures reflect the current extension conformance harness artifacts; full release-binary end-to-end certification remains tracked as a separate release gate.
 
 ---
 
@@ -1970,6 +1976,11 @@ environment with no ambient OS access:
 2. **Capability-based security**: each host connector call is policy-checked and logged
 3. **Conformance-tested**: status is tracked in `docs/ext-compat.md` and `tests/ext_conformance/reports/pipeline/`
 4. **Sub-100ms load times**: extensions load in <100ms (P95) with no JIT warmup
+
+Legacy extension behavior is automatic:
+- Existing `.js/.ts` extensions run directly (no manual conversion step).
+- `*.native.json` descriptors are optional and mainly useful for native-rust runtime workflows.
+- One session currently uses one runtime family at a time (JS/TS or native descriptor).
 
 Policy preset quick-start:
 
