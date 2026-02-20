@@ -551,11 +551,7 @@ Notable installer flags:
 By default, the installer also installs a `pi-agent-rust` skill for both Claude Code and Codex CLI:
 - Claude Code: `~/.claude/skills/pi-agent-rust/SKILL.md`
 - Codex CLI: `~/.codex/skills/pi-agent-rust/SKILL.md` (or `$CODEX_HOME/skills/pi-agent-rust/SKILL.md` if `CODEX_HOME` is set)
-
-It also auto-configures pre-tool hooks when supported:
-- Claude Code: merges `PreToolUse` `Bash` hook into `settings.json`
-- Gemini CLI: merges `BeforeTool` `run_shell_command` hook into `settings.json`
-- Codex CLI: reported as unsupported (no pre-exec hook API)
+- During upgrades, installer-managed legacy pre-tool entries from older versions are removed automatically (idempotent, path-scoped, and non-destructive) when prior installer state is present.
 
 Installer regression harness (options + checksum + signature + completions):
 
@@ -617,8 +613,8 @@ Pi has minimal runtime dependencies:
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/uninstall.sh" | bash
 ```
 
-By default, uninstall removes installer-managed Rust binaries/aliases, skill directories,
-and Claude/Gemini hook entries, then restores a migrated TypeScript `pi` if one was preserved.
+By default, uninstall removes installer-managed Rust binaries/aliases and skill directories,
+then restores a migrated TypeScript `pi` if one was preserved.
 
 ---
 

@@ -814,7 +814,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
 
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything — builds are intercepted and offloaded transparently.
+**RCH is installed at `~/.local/bin/rch`.** Use it explicitly for heavy compile/test commands.
 
 To manually offload a build:
 ```bash
@@ -833,4 +833,4 @@ rch queue                # See active/waiting builds
 
 If rch or its workers are unavailable, it fails open — builds run locally as normal.
 
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+**Note for Codex/GPT-5.2:** Use manual offload for compute-intensive commands: `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.

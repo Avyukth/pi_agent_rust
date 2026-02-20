@@ -502,7 +502,7 @@ test_proxy_args_are_applied_to_curl_downloads() {
   fi
 }
 
-test_linux_target_uses_musl_triple() {
+test_linux_target_uses_supported_linux_artifact_naming() {
   local dir artifact checksum curl_log
   dir="$(case_dir "linux-target-musl")"
   write_existing_pi_stub "$dir"
@@ -525,8 +525,8 @@ test_linux_target_uses_musl_triple() {
     --no-agent-skills
 
   assert_exit_code "$dir" 0
-  if ! grep -Fq "x86_64-unknown-linux-musl" "$curl_log"; then
-    echo "expected musl target triple in artifact URL candidates" >&2
+  if ! grep -Eq "pi_linux_amd64|x86_64-unknown-linux-musl" "$curl_log"; then
+    echo "expected linux-amd64 or musl artifact URL candidate" >&2
     cat "$curl_log" >&2
     return 1
   fi
@@ -556,24 +556,26 @@ test_wsl_detection_warning_is_emitted() {
   assert_output_contains "$dir" "WSL detected"
 }
 
-test_claude_hook_merge_ignores_substring_false_positive() {
-  local dir artifact artifact_url checksum settings_file installed_bin
-  dir="$(case_dir "claude-hook-substring-merge")"
+test_legacy_agent_settings_cleanup_is_safe_and_idempotent() {
+  local dir artifact artifact_url checksum state_file install_bin claude_settings gemini_settings
+  dir="$(case_dir "legacy-agent-settings-cleanup")"
   write_existing_pi_stub "$dir"
 
-  settings_file="${dir}/home/.claude/settings.json"
-  mkdir -p "$(dirname "$settings_file")"
-  cat > "$settings_file" <<'JSON'
+  install_bin="${dir}/dest/pi"
+  claude_settings="${dir}/home/.claude/settings.json"
+  gemini_settings="${dir}/home/.gemini/settings.json"
+  mkdir -p "$(dirname "$claude_settings")" "$(dirname "$gemini_settings")"
+
+  cat > "$claude_settings" <<JSON
 {
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
-          {
-            "type": "command",
-            "command": "/usr/bin/pipx"
-          }
+          {"type":"command","command":"${install_bin}"},
+          {"type":"command","command":"${install_bin}","label":"keep-me"},
+          {"type":"command","command":"/usr/bin/pipx"}
         ]
       }
     ]
@@ -581,56 +583,28 @@ test_claude_hook_merge_ignores_substring_false_positive() {
 }
 JSON
 
-  artifact="${dir}/fixtures/pi-fixture"
-  write_artifact_binary "$artifact" "unsupported"
-  artifact_url="file://${artifact}"
-  checksum="$(sha256_file "$artifact")"
-
-  run_installer "$dir" \
-    --yes --no-gum --offline \
-    --version v9.9.9 \
-    --dest "${dir}/dest" \
-    --artifact-url "${artifact_url}" \
-    --checksum "${checksum}" \
-    --no-completions \
-    --no-agent-skills
-
-  installed_bin="${dir}/dest/pi"
-  assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Claude hook: merged"
-  grep -Fq "\"command\": \"${installed_bin}\"" "$settings_file" || {
-    echo "expected Claude hook command for installed binary in settings" >&2
-    cat "$settings_file" >&2
-    return 1
-  }
-}
-
-test_gemini_hook_merge_ignores_substring_false_positive() {
-  local dir artifact artifact_url checksum settings_file installed_bin
-  dir="$(case_dir "gemini-hook-substring-merge")"
-  write_existing_pi_stub "$dir"
-
-  settings_file="${dir}/home/.gemini/settings.json"
-  mkdir -p "$(dirname "$settings_file")"
-  cat > "$settings_file" <<'JSON'
+  cat > "$gemini_settings" <<JSON
 {
   "hooks": {
     "BeforeTool": [
       {
         "matcher": "run_shell_command",
         "hooks": [
-          {
-            "name": "legacy-tool",
-            "type": "command",
-            "command": "/usr/bin/pipx",
-            "timeout": 5000
-          }
+          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":5000},
+          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":7000},
+          {"name":"legacy","type":"command","command":"${install_bin}","timeout":5000}
         ]
       }
     ]
   }
 }
 JSON
+
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  mkdir -p "$(dirname "$state_file")"
+  cat > "$state_file" <<STATE
+PIAR_INSTALL_BIN='${install_bin}'
+STATE
 
   artifact="${dir}/fixtures/pi-fixture"
   write_artifact_binary "$artifact" "unsupported"
@@ -646,40 +620,80 @@ JSON
     --no-completions \
     --no-agent-skills
 
-  installed_bin="${dir}/dest/pi"
   assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Gemini hook: merged"
-  grep -Fq "\"command\": \"${installed_bin}\"" "$settings_file" || {
-    echo "expected Gemini hook command for installed binary in settings" >&2
-    cat "$settings_file" >&2
+  if [ "$(grep -E "\"command\"[[:space:]]*:[[:space:]]*\"${install_bin}\"" "$claude_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected exactly one Claude command entry for ${install_bin} after cleanup" >&2
+    cat "$claude_settings" >&2
     return 1
-  }
+  fi
+  if ! grep -Eq "\"label\"[[:space:]]*:[[:space:]]*\"keep-me\"" "$claude_settings"; then
+    echo "expected custom Claude entry to remain after cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"command\"[[:space:]]*:[[:space:]]*\"/usr/bin/pipx\"" "$claude_settings"; then
+    echo "expected non-installer Claude entry to remain after cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+
+  if [ "$(grep -E "\"name\"[[:space:]]*:[[:space:]]*\"pi-agent-rust\"" "$gemini_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected only the non-default pi-agent-rust Gemini entry to remain after cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"timeout\"[[:space:]]*:[[:space:]]*7000" "$gemini_settings"; then
+    echo "expected custom-timeout Gemini entry to remain after cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"name\"[[:space:]]*:[[:space:]]*\"legacy\"" "$gemini_settings"; then
+    echo "expected non-installer Gemini entry to remain after cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+
+  run_installer "$dir" \
+    --yes --no-gum --offline \
+    --version v9.9.9 \
+    --dest "${dir}/dest" \
+    --artifact-url "${artifact_url}" \
+    --checksum "${checksum}" \
+    --no-completions \
+    --no-agent-skills
+
+  assert_exit_code "$dir" 0
 }
 
-test_claude_hook_merge_does_not_treat_bare_pi_as_installer_hook() {
-  local dir artifact artifact_url checksum settings_file installed_bin
-  dir="$(case_dir "claude-hook-bare-pi-merge")"
+test_legacy_cleanup_skips_unexpected_settings_paths() {
+  local dir artifact artifact_url checksum state_file install_bin unexpected_settings
+  dir="$(case_dir "legacy-agent-settings-unexpected-path")"
   write_existing_pi_stub "$dir"
 
-  settings_file="${dir}/home/.claude/settings.json"
-  mkdir -p "$(dirname "$settings_file")"
-  cat > "$settings_file" <<'JSON'
+  install_bin="${dir}/dest/pi"
+  unexpected_settings="${dir}/home/custom/settings.json"
+  mkdir -p "$(dirname "$unexpected_settings")"
+  cat > "$unexpected_settings" <<JSON
 {
   "hooks": {
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
-          {
-            "type": "command",
-            "command": "pi --legacy-mode"
-          }
+          {"type":"command","command":"${install_bin}"}
         ]
       }
     ]
   }
 }
 JSON
+
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  mkdir -p "$(dirname "$state_file")"
+  cat > "$state_file" <<STATE
+PIAR_INSTALL_BIN='${install_bin}'
+PIAR_CLAUDE_HOOK_SETTINGS='${unexpected_settings}'
+STATE
 
   artifact="${dir}/fixtures/pi-fixture"
   write_artifact_binary "$artifact" "unsupported"
@@ -695,109 +709,12 @@ JSON
     --no-completions \
     --no-agent-skills
 
-  installed_bin="${dir}/dest/pi"
   assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Claude hook: merged"
-  grep -Fq "\"command\": \"${installed_bin}\"" "$settings_file" || {
-    echo "expected installer Claude hook command to be added alongside bare pi command" >&2
-    cat "$settings_file" >&2
+  if ! grep -Eq "\"command\"[[:space:]]*:[[:space:]]*\"${install_bin}\"" "$unexpected_settings"; then
+    echo "unexpected settings path should remain untouched by cleanup" >&2
+    cat "$unexpected_settings" >&2
     return 1
-  }
-  grep -Fq "\"command\": \"pi --legacy-mode\"" "$settings_file" || {
-    echo "expected existing bare pi Claude hook command to remain" >&2
-    cat "$settings_file" >&2
-    return 1
-  }
-}
-
-test_gemini_hook_merge_does_not_treat_bare_pi_as_installer_hook() {
-  local dir artifact artifact_url checksum settings_file installed_bin
-  dir="$(case_dir "gemini-hook-bare-pi-merge")"
-  write_existing_pi_stub "$dir"
-
-  settings_file="${dir}/home/.gemini/settings.json"
-  mkdir -p "$(dirname "$settings_file")"
-  cat > "$settings_file" <<'JSON'
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {
-            "name": "legacy-tool",
-            "type": "command",
-            "command": "pi --legacy-mode",
-            "timeout": 5000
-          }
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  artifact="${dir}/fixtures/pi-fixture"
-  write_artifact_binary "$artifact" "unsupported"
-  artifact_url="file://${artifact}"
-  checksum="$(sha256_file "$artifact")"
-
-  run_installer "$dir" \
-    --yes --no-gum --offline \
-    --version v9.9.9 \
-    --dest "${dir}/dest" \
-    --artifact-url "${artifact_url}" \
-    --checksum "${checksum}" \
-    --no-completions \
-    --no-agent-skills
-
-  installed_bin="${dir}/dest/pi"
-  assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Gemini hook: merged"
-  grep -Fq "\"command\": \"${installed_bin}\"" "$settings_file" || {
-    echo "expected installer Gemini hook command to be added alongside bare pi command" >&2
-    cat "$settings_file" >&2
-    return 1
-  }
-  grep -Fq "\"command\": \"pi --legacy-mode\"" "$settings_file" || {
-    echo "expected existing bare pi Gemini hook command to remain" >&2
-    cat "$settings_file" >&2
-    return 1
-  }
-}
-
-test_hook_commands_use_absolute_path_for_relative_dest() {
-  local dir artifact artifact_url checksum settings_file expected_bin
-  dir="$(case_dir "hook-absolute-path-relative-dest")"
-  write_existing_pi_stub "$dir"
-
-  settings_file="${dir}/home/.claude/settings.json"
-  mkdir -p "$(dirname "$settings_file")"
-
-  artifact="${dir}/fixtures/pi-fixture"
-  write_artifact_binary "$artifact" "unsupported"
-  artifact_url="file://${artifact}"
-  checksum="$(sha256_file "$artifact")"
-  expected_bin="${dir}/relbin/pi"
-
-  (
-    cd "$dir"
-    run_installer "$dir" \
-      --yes --no-gum --offline \
-      --version v9.9.9 \
-      --dest "relbin" \
-      --artifact-url "${artifact_url}" \
-      --checksum "${checksum}" \
-      --no-completions \
-      --no-agent-skills
-  )
-
-  assert_exit_code "$dir" 0
-  grep -Fq "\"command\": \"${expected_bin}\"" "$settings_file" || {
-    echo "expected Claude hook command to use absolute install path for relative --dest" >&2
-    cat "$settings_file" >&2
-    return 1
-  }
+  fi
 }
 
 test_agent_skills_install_by_default() {
@@ -1016,6 +933,102 @@ SKILL
   fi
 }
 
+test_uninstall_cleans_legacy_agent_settings_hooks() {
+  local dir state_file install_bin claude_settings gemini_settings
+  dir="$(case_dir "uninstall-legacy-agent-settings-cleanup")"
+
+  install_bin="${dir}/dest/pi"
+  claude_settings="${dir}/home/.claude/settings.json"
+  gemini_settings="${dir}/home/.gemini/settings.json"
+  mkdir -p "$(dirname "$claude_settings")" "$(dirname "$gemini_settings")"
+
+  cat > "$claude_settings" <<JSON
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type":"command","command":"${install_bin}"},
+          {"type":"command","command":"${install_bin}","label":"keep-me"}
+        ]
+      }
+    ]
+  }
+}
+JSON
+
+  cat > "$gemini_settings" <<JSON
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":5000},
+          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":7000}
+        ]
+      }
+    ]
+  }
+}
+JSON
+
+  state_file="${dir}/state/pi-agent-rust/install-state.env"
+  mkdir -p "$(dirname "$state_file")"
+  cat > "$state_file" <<STATE
+PIAR_INSTALL_BIN='${install_bin}'
+STATE
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  if [ "$(grep -E "\"command\"[[:space:]]*:[[:space:]]*\"${install_bin}\"" "$claude_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected exactly one Claude command entry for ${install_bin} after uninstall cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"label\"[[:space:]]*:[[:space:]]*\"keep-me\"" "$claude_settings"; then
+    echo "expected custom Claude hook to remain after uninstall cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+  if [ "$(grep -E "\"name\"[[:space:]]*:[[:space:]]*\"pi-agent-rust\"" "$gemini_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected only custom-timeout pi-agent-rust Gemini hook to remain after uninstall cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"timeout\"[[:space:]]*:[[:space:]]*7000" "$gemini_settings"; then
+    echo "expected custom Gemini hook timeout to remain after uninstall cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+
+  run_uninstaller "$dir" --yes --no-gum
+
+  assert_exit_code "$dir" 0
+  if [ "$(grep -E "\"command\"[[:space:]]*:[[:space:]]*\"${install_bin}\"" "$claude_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected exactly one Claude command entry for ${install_bin} after second uninstall cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"label\"[[:space:]]*:[[:space:]]*\"keep-me\"" "$claude_settings"; then
+    echo "expected custom Claude hook to remain after second uninstall cleanup" >&2
+    cat "$claude_settings" >&2
+    return 1
+  fi
+  if [ "$(grep -E "\"name\"[[:space:]]*:[[:space:]]*\"pi-agent-rust\"" "$gemini_settings" | wc -l | tr -d ' ')" -ne 1 ]; then
+    echo "expected only custom-timeout pi-agent-rust Gemini hook to remain after second uninstall cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+  if ! grep -Eq "\"timeout\"[[:space:]]*:[[:space:]]*7000" "$gemini_settings"; then
+    echo "expected custom Gemini hook timeout to remain after second uninstall cleanup" >&2
+    cat "$gemini_settings" >&2
+    return 1
+  fi
+}
+
 test_uninstall_uses_recorded_skill_paths() {
   local dir state_file recorded_codex managed_claude managed_codex
   dir="$(case_dir "uninstall-recorded-skill-paths")"
@@ -1081,277 +1094,6 @@ STATE
   assert_output_contains "$dir" "Skipping unexpected skill directory path: ${unexpected_dir}"
   if [ ! -f "$unexpected_skill" ]; then
     echo "unexpected skill path should be preserved" >&2
-    return 1
-  fi
-}
-
-test_uninstall_removes_installer_managed_hook_entries() {
-  local dir state_file claude_settings gemini_settings install_bin
-  dir="$(case_dir "uninstall-remove-hooks")"
-  install_bin="${dir}/dest/pi"
-
-  claude_settings="${dir}/home/.claude/settings.json"
-  gemini_settings="${dir}/home/.gemini/settings.json"
-  mkdir -p "$(dirname "$claude_settings")" "$(dirname "$gemini_settings")"
-
-  cat > "$claude_settings" <<JSON
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type": "command", "command": "${install_bin}"},
-          {"type": "command", "command": "/usr/bin/pipx"},
-          {"type": "command", "command": "pi --legacy-mode"}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  cat > "$gemini_settings" <<JSON
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":5000},
-          {"name":"legacy","type":"command","command":"/usr/bin/pipx","timeout":5000},
-          {"name":"legacy-bare","type":"command","command":"pi --legacy-mode","timeout":5000}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  state_file="${dir}/state/pi-agent-rust/install-state.env"
-  mkdir -p "$(dirname "$state_file")"
-  cat > "$state_file" <<STATE
-PIAR_INSTALL_BIN='${install_bin}'
-PIAR_INSTALL_BIN_NAME='pi'
-PIAR_CLAUDE_HOOK_SETTINGS='${claude_settings}'
-PIAR_GEMINI_HOOK_SETTINGS='${gemini_settings}'
-STATE
-
-  run_uninstaller "$dir" --yes --no-gum
-
-  assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Removed installer hook from ${claude_settings}"
-  assert_output_contains "$dir" "Removed installer hook from ${gemini_settings}"
-
-  if grep -Fq "\"command\": \"${install_bin}\"" "$claude_settings"; then
-    echo "expected installer Claude hook to be removed" >&2
-    cat "$claude_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "\"command\": \"/usr/bin/pipx\"" "$claude_settings"; then
-    echo "expected non-installer Claude hook to remain" >&2
-    cat "$claude_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "\"command\": \"pi --legacy-mode\"" "$claude_settings"; then
-    echo "expected bare pi Claude hook to remain" >&2
-    cat "$claude_settings" >&2
-    return 1
-  fi
-
-  if grep -Fq "\"command\": \"${install_bin}\"" "$gemini_settings"; then
-    echo "expected installer Gemini hook to be removed" >&2
-    cat "$gemini_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "\"command\": \"/usr/bin/pipx\"" "$gemini_settings"; then
-    echo "expected non-installer Gemini hook to remain" >&2
-    cat "$gemini_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "\"command\": \"pi --legacy-mode\"" "$gemini_settings"; then
-    echo "expected bare pi Gemini hook to remain" >&2
-    cat "$gemini_settings" >&2
-    return 1
-  fi
-}
-
-test_uninstall_does_not_touch_hooks_without_installer_state() {
-  local dir claude_settings gemini_settings
-  dir="$(case_dir "uninstall-no-state-hook-preserve")"
-
-  claude_settings="${dir}/home/.claude/settings.json"
-  gemini_settings="${dir}/home/.gemini/settings.json"
-  mkdir -p "$(dirname "$claude_settings")" "$(dirname "$gemini_settings")"
-
-  cat > "$claude_settings" <<'JSON'
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type":"command","command":"/usr/bin/pi"}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  cat > "$gemini_settings" <<'JSON'
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {"name":"custom","type":"command","command":"/usr/bin/pi","timeout":5000}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  run_uninstaller "$dir" --yes --no-gum
-
-  assert_exit_code "$dir" 0
-  if ! grep -Fq "/usr/bin/pi" "$claude_settings"; then
-    echo "expected Claude hook settings to remain untouched without installer state" >&2
-    cat "$claude_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "/usr/bin/pi" "$gemini_settings"; then
-    echo "expected Gemini hook settings to remain untouched without installer state" >&2
-    cat "$gemini_settings" >&2
-    return 1
-  fi
-}
-
-test_uninstall_skips_unexpected_hook_settings_paths() {
-  local dir state_file unexpected_claude unexpected_gemini install_bin
-  dir="$(case_dir "uninstall-skip-unexpected-hook-paths")"
-  install_bin="${dir}/dest/pi"
-
-  unexpected_claude="${dir}/home/custom/claude-settings.json"
-  unexpected_gemini="${dir}/home/custom/gemini-settings.json"
-  mkdir -p "$(dirname "$unexpected_claude")" "$(dirname "$unexpected_gemini")"
-
-  cat > "$unexpected_claude" <<JSON
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type":"command","command":"${install_bin}"}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  cat > "$unexpected_gemini" <<JSON
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":5000}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  state_file="${dir}/state/pi-agent-rust/install-state.env"
-  mkdir -p "$(dirname "$state_file")"
-  cat > "$state_file" <<STATE
-PIAR_INSTALL_BIN='${install_bin}'
-PIAR_INSTALL_BIN_NAME='pi'
-PIAR_CLAUDE_HOOK_SETTINGS='${unexpected_claude}'
-PIAR_GEMINI_HOOK_SETTINGS='${unexpected_gemini}'
-STATE
-
-  run_uninstaller "$dir" --yes --no-gum
-
-  assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Skipping unexpected Claude hook settings path: ${unexpected_claude}"
-  assert_output_contains "$dir" "Skipping unexpected Gemini hook settings path: ${unexpected_gemini}"
-  if ! grep -Fq "${install_bin}" "$unexpected_claude"; then
-    echo "unexpected Claude hook settings should remain untouched" >&2
-    cat "$unexpected_claude" >&2
-    return 1
-  fi
-  if ! grep -Fq "${install_bin}" "$unexpected_gemini"; then
-    echo "unexpected Gemini hook settings should remain untouched" >&2
-    cat "$unexpected_gemini" >&2
-    return 1
-  fi
-}
-
-test_uninstall_skips_hook_cleanup_without_recorded_install_bin() {
-  local dir state_file claude_settings gemini_settings install_bin
-  dir="$(case_dir "uninstall-skip-hooks-missing-install-bin")"
-  install_bin="${dir}/dest/pi"
-
-  claude_settings="${dir}/home/.claude/settings.json"
-  gemini_settings="${dir}/home/.gemini/settings.json"
-  mkdir -p "$(dirname "$claude_settings")" "$(dirname "$gemini_settings")"
-
-  cat > "$claude_settings" <<JSON
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {"type":"command","command":"${install_bin}"}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  cat > "$gemini_settings" <<JSON
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {"name":"pi-agent-rust","type":"command","command":"${install_bin}","timeout":5000}
-        ]
-      }
-    ]
-  }
-}
-JSON
-
-  state_file="${dir}/state/pi-agent-rust/install-state.env"
-  mkdir -p "$(dirname "$state_file")"
-  cat > "$state_file" <<STATE
-PIAR_CLAUDE_HOOK_SETTINGS='${claude_settings}'
-PIAR_GEMINI_HOOK_SETTINGS='${gemini_settings}'
-STATE
-
-  run_uninstaller "$dir" --yes --no-gum
-
-  assert_exit_code "$dir" 0
-  assert_output_contains "$dir" "Skipping hook cleanup because installer binary path is missing from state"
-  if ! grep -Fq "${install_bin}" "$claude_settings"; then
-    echo "Claude hook should remain when install bin path is missing" >&2
-    cat "$claude_settings" >&2
-    return 1
-  fi
-  if ! grep -Fq "${install_bin}" "$gemini_settings"; then
-    echo "Gemini hook should remain when install bin path is missing" >&2
-    cat "$gemini_settings" >&2
     return 1
   fi
 }
@@ -1605,25 +1347,19 @@ main() {
   run_test test_offline_mode_blocks_network_artifact_urls
   run_test test_offline_relative_tarball_path_is_accepted
   run_test test_proxy_args_are_applied_to_curl_downloads
-  run_test test_linux_target_uses_musl_triple
+  run_test test_linux_target_uses_supported_linux_artifact_naming
   run_test test_wsl_detection_warning_is_emitted
-  run_test test_claude_hook_merge_ignores_substring_false_positive
-  run_test test_gemini_hook_merge_ignores_substring_false_positive
-  run_test test_claude_hook_merge_does_not_treat_bare_pi_as_installer_hook
-  run_test test_gemini_hook_merge_does_not_treat_bare_pi_as_installer_hook
-  run_test test_hook_commands_use_absolute_path_for_relative_dest
+  run_test test_legacy_agent_settings_cleanup_is_safe_and_idempotent
+  run_test test_legacy_cleanup_skips_unexpected_settings_paths
   run_test test_agent_skills_install_by_default
   run_test test_no_agent_skills_opt_out
   run_test test_existing_custom_skill_dirs_are_not_overwritten
   run_test test_skill_copy_failure_preserves_existing_managed_skills
   run_test test_skill_custom_plus_copy_failure_reports_partial
   run_test test_uninstall_removes_only_installer_managed_skills
+  run_test test_uninstall_cleans_legacy_agent_settings_hooks
   run_test test_uninstall_uses_recorded_skill_paths
   run_test test_uninstall_skips_unexpected_skill_paths
-  run_test test_uninstall_removes_installer_managed_hook_entries
-  run_test test_uninstall_does_not_touch_hooks_without_installer_state
-  run_test test_uninstall_skips_unexpected_hook_settings_paths
-  run_test test_uninstall_skips_hook_cleanup_without_recorded_install_bin
   run_test test_checksum_inline_success
   run_test test_checksum_mismatch_fails_hard
   run_test test_checksum_missing_manifest_entry_fails_hard

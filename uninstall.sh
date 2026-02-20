@@ -30,8 +30,6 @@ PIAR_PATH_MARKER=""
 PIAR_AGENT_SKILL_STATUS=""
 PIAR_AGENT_SKILL_CLAUDE_PATH=""
 PIAR_AGENT_SKILL_CODEX_PATH=""
-PIAR_CLAUDE_HOOK_SETTINGS=""
-PIAR_GEMINI_HOOK_SETTINGS=""
 RESTORE_CONFLICT=0
 
 AGENT_SKILL_NAME="pi-agent-rust"
@@ -251,22 +249,7 @@ is_managed_alias() {
   grep -q "pi_agent_rust installer managed alias" "$path" 2>/dev/null
 }
 
-is_managed_skill_file() {
-  local path="$1"
-  [ -f "$path" ] || return 1
-  grep -q "$AGENT_SKILL_MARKER" "$path" 2>/dev/null
-}
-
-is_expected_skill_directory() {
-  local dir="$1"
-  [ -n "$dir" ] || return 1
-  case "$dir" in
-    */skills/${AGENT_SKILL_NAME}) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_expected_hook_settings_path() {
+is_expected_legacy_agent_settings_path() {
   local path="$1"
   local agent="$2"
   [ -n "$path" ] || return 1
@@ -291,46 +274,20 @@ is_expected_hook_settings_path() {
   return 1
 }
 
-hook_binary_path() {
-  if [ -n "${PIAR_INSTALL_BIN:-}" ]; then
-    printf '%s\n' "$PIAR_INSTALL_BIN"
-    return 0
-  fi
-  printf '%s\n' ""
-}
-
-hook_binary_name() {
-  if [ -n "${PIAR_INSTALL_BIN_NAME:-}" ]; then
-    printf '%s\n' "$PIAR_INSTALL_BIN_NAME"
-    return 0
-  fi
-  if [ -n "${PIAR_INSTALL_BIN:-}" ]; then
-    printf '%s\n' "$(basename "$PIAR_INSTALL_BIN")"
-    return 0
-  fi
-  printf '%s\n' "pi"
-}
-
-remove_hook_from_settings() {
+cleanup_legacy_settings_entries() {
   local settings_file="$1"
   local hook_key="$2"
   local matcher="$3"
+  local require_name="$4"
+  shift 4
+  local bin_candidates=("$@")
 
-  if [ -z "$settings_file" ] || [ ! -f "$settings_file" ]; then
-    return 0
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    warn "python3 not found; skipping hook cleanup for $settings_file"
-    return 0
-  fi
-
-  local bin_path
-  local bin_name
-  bin_path="$(hook_binary_path)"
-  bin_name="$(hook_binary_name)"
+  [ -f "$settings_file" ] || return 0
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
 
   local py_result=""
-  if ! py_result=$(python3 - "$settings_file" "$hook_key" "$matcher" "$bin_path" "$bin_name" <<'PYEOF'
+  if ! py_result=$(python3 - "$settings_file" "$hook_key" "$matcher" "$require_name" "${bin_candidates[@]}" <<'PYEOF'
 import json
 import os
 import shlex
@@ -339,33 +296,39 @@ import sys
 settings_file = sys.argv[1]
 hook_key = sys.argv[2]
 matcher = sys.argv[3]
-binary_path = sys.argv[4]
-binary_name = sys.argv[5]
+require_name = sys.argv[4]
+candidate_bins = [arg for arg in sys.argv[5:] if arg]
 
-def matches_binary(command: str) -> bool:
+if not candidate_bins:
+    print("NO_CANDIDATES")
+    raise SystemExit(0)
+
+
+def command_matches(command: str) -> bool:
     if not isinstance(command, str):
         return False
     cmd = command.strip()
     if not cmd:
         return False
-    if binary_path and cmd == binary_path:
-        return True
     try:
         parts = shlex.split(cmd)
     except Exception:
         parts = cmd.split()
-    if not parts:
+    if len(parts) != 1:
         return False
     first = parts[0]
-    if binary_path and first == binary_path:
-        return True
-    if binary_path and os.path.isabs(first):
+    if not os.path.isabs(first):
+        return False
+    for bin_path in candidate_bins:
+        if first == bin_path:
+            return True
         try:
-            if os.path.realpath(first) == os.path.realpath(binary_path):
+            if os.path.realpath(first) == os.path.realpath(bin_path):
                 return True
         except Exception:
             pass
     return False
+
 
 try:
     with open(settings_file, "r", encoding="utf-8") as f:
@@ -388,23 +351,49 @@ if not isinstance(entries, list):
     print("NO_HOOKS")
     raise SystemExit(0)
 
+removed = 0
 changed = False
 new_entries = []
+
 for entry in entries:
     if isinstance(entry, dict) and entry.get("matcher") == matcher:
-        current_hooks = entry.get("hooks", [])
-        if not isinstance(current_hooks, list):
-            current_hooks = []
+        existing_hooks = entry.get("hooks", [])
+        if not isinstance(existing_hooks, list):
+            existing_hooks = []
+
         kept = []
-        for hook in current_hooks:
-            if isinstance(hook, dict) and matches_binary(str(hook.get("command", ""))):
+        for hook in existing_hooks:
+            should_remove = False
+            if isinstance(hook, dict):
+                command = str(hook.get("command", ""))
+                if require_name:
+                    if (
+                        str(hook.get("name", "")) == require_name
+                        and str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"name", "type", "command", "timeout"})
+                        and hook.get("timeout", 5000) in (5000, "5000")
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+                else:
+                    if (
+                        str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"type", "command"})
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+
+            if should_remove:
+                removed += 1
                 changed = True
                 continue
+
             kept.append(hook)
+
         if kept:
             entry["hooks"] = kept
             new_entries.append(entry)
-        elif current_hooks:
+        elif existing_hooks:
             changed = True
     else:
         new_entries.append(entry)
@@ -423,56 +412,81 @@ with open(settings_file, "w", encoding="utf-8") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
 
-print("REMOVED")
+print(f"REMOVED:{removed}")
 PYEOF
   ); then
-    warn "Failed to update hook settings: $settings_file"
+    warn "Legacy settings cleanup failed for $settings_file"
     return 0
   fi
 
   case "$py_result" in
-    REMOVED)
-      ok "Removed installer hook from $settings_file"
-      ;;
-    ALREADY_ABSENT|NO_HOOKS)
-      ;;
-    SKIP_INVALID_JSON)
-      warn "Skipping hook cleanup; invalid JSON in $settings_file"
-      ;;
-    *)
-      warn "Unexpected hook cleanup result for $settings_file: $py_result"
+    REMOVED:*)
+      local count="${py_result#REMOVED:}"
+      if [ "$count" -gt 0 ] 2>/dev/null; then
+        ok "Removed ${count} legacy installer entries from $settings_file"
+      fi
       ;;
   esac
 }
 
-remove_installer_hooks() {
-  if [ "$STATE_LOADED" -ne 1 ]; then
-    return 0
+cleanup_legacy_agent_settings() {
+  local bin_candidates=()
+  if [ -n "$PIAR_INSTALL_BIN" ]; then
+    bin_candidates+=("$PIAR_INSTALL_BIN")
   fi
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if [ "$candidate" != "$PIAR_INSTALL_BIN" ]; then
+      bin_candidates+=("$candidate")
+    fi
+  done < <(fallback_binary_candidates)
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
 
-  if [ -z "${PIAR_CLAUDE_HOOK_SETTINGS:-}" ] && [ -z "${PIAR_GEMINI_HOOK_SETTINGS:-}" ]; then
-    return 0
-  fi
-
-  if [ -z "$(hook_binary_path)" ]; then
-    warn "Skipping hook cleanup because installer binary path is missing from state"
-    return 0
-  fi
-
+  local claude_candidates=()
   if [ -n "${PIAR_CLAUDE_HOOK_SETTINGS:-}" ]; then
-    if is_expected_hook_settings_path "$PIAR_CLAUDE_HOOK_SETTINGS" "claude"; then
-      remove_hook_from_settings "$PIAR_CLAUDE_HOOK_SETTINGS" "PreToolUse" "Bash"
-    else
-      warn "Skipping unexpected Claude hook settings path: $PIAR_CLAUDE_HOOK_SETTINGS"
-    fi
+    claude_candidates+=("${PIAR_CLAUDE_HOOK_SETTINGS}")
   fi
+  claude_candidates+=(
+    "$HOME/.claude/settings.json"
+    "$HOME/.config/claude/settings.json"
+    "$HOME/Library/Application Support/Claude/settings.json"
+  )
+
+  local gemini_candidates=()
   if [ -n "${PIAR_GEMINI_HOOK_SETTINGS:-}" ]; then
-    if is_expected_hook_settings_path "$PIAR_GEMINI_HOOK_SETTINGS" "gemini"; then
-      remove_hook_from_settings "$PIAR_GEMINI_HOOK_SETTINGS" "BeforeTool" "run_shell_command"
-    else
-      warn "Skipping unexpected Gemini hook settings path: $PIAR_GEMINI_HOOK_SETTINGS"
-    fi
+    gemini_candidates+=("${PIAR_GEMINI_HOOK_SETTINGS}")
   fi
+  gemini_candidates+=(
+    "$HOME/.gemini/settings.json"
+    "$HOME/.gemini-cli/settings.json"
+  )
+
+  local settings_path=""
+  for settings_path in "${claude_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "claude"; then
+      cleanup_legacy_settings_entries "$settings_path" "PreToolUse" "Bash" "" "${bin_candidates[@]}"
+    fi
+  done
+  for settings_path in "${gemini_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "gemini"; then
+      cleanup_legacy_settings_entries "$settings_path" "BeforeTool" "run_shell_command" "pi-agent-rust" "${bin_candidates[@]}"
+    fi
+  done
+}
+
+is_managed_skill_file() {
+  local path="$1"
+  [ -f "$path" ] || return 1
+  grep -q "$AGENT_SKILL_MARKER" "$path" 2>/dev/null
+}
+
+is_expected_skill_directory() {
+  local dir="$1"
+  [ -n "$dir" ] || return 1
+  case "$dir" in
+    */skills/${AGENT_SKILL_NAME}) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 remove_file_if_exists() {
@@ -668,9 +682,6 @@ plan_summary() {
   if [ -n "$PIAR_AGENT_SKILL_CLAUDE_PATH" ] || [ -n "$PIAR_AGENT_SKILL_CODEX_PATH" ]; then
     lines+=("Agent skills: remove installer-managed Claude/Codex skill dirs")
   fi
-  if [ -n "$PIAR_CLAUDE_HOOK_SETTINGS" ] || [ -n "$PIAR_GEMINI_HOOK_SETTINGS" ]; then
-    lines+=("Agent hooks: remove installer-managed Claude/Gemini hook entries")
-  fi
   if [ -n "$PIAR_AGENT_SKILL_STATUS" ]; then
     lines+=("Recorded skill status: $PIAR_AGENT_SKILL_STATUS")
   fi
@@ -711,10 +722,10 @@ main() {
     exit 0
   fi
 
+  cleanup_legacy_agent_settings
   remove_installed_binary
   remove_legacy_alias
   remove_installed_skills
-  remove_installer_hooks
   restore_moved_typescript_pi
   remove_path_entries
   remove_state

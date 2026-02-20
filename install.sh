@@ -97,13 +97,6 @@ INSTALL_SOURCE="release"
 CHECKSUM_STATUS="pending"
 SIGSTORE_STATUS="pending"
 COMPLETIONS_STATUS="pending"
-CLAUDE_HOOK_STATUS="pending"
-GEMINI_HOOK_STATUS="pending"
-CODEX_HOOK_STATUS="pending"
-CLAUDE_HOOK_SETTINGS=""
-GEMINI_HOOK_SETTINGS=""
-CLAUDE_HOOK_BACKUP=""
-GEMINI_HOOK_BACKUP=""
 
 HAS_GUM=0
 if command -v gum >/dev/null 2>&1 && [ -t 1 ]; then
@@ -268,16 +261,6 @@ redact_proxy_value() {
   fi
 
   printf '%s\n' "$raw"
-}
-
-json_escape_string() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  s="${s//$'\t'/\\t}"
-  printf '%s' "$s"
 }
 
 ensure_network_allowed() {
@@ -1942,443 +1925,229 @@ maybe_install_completions() {
   install_completions_for_shell "$shell_name" || true
 }
 
-claude_agent_detected() {
-  [ -d "$HOME/.claude" ] \
-    || [ -d "$HOME/.config/claude" ] \
-    || [ -d "$HOME/Library/Application Support/Claude" ] \
-    || command -v claude >/dev/null 2>&1
+is_expected_legacy_agent_settings_path() {
+  local path="$1"
+  local agent="$2"
+  [ -n "$path" ] || return 1
+
+  case "$agent" in
+    claude)
+      case "$path" in
+        "$HOME/.claude/settings.json"|"$HOME/.config/claude/settings.json"|"$HOME/Library/Application Support/Claude/settings.json")
+          return 0
+          ;;
+      esac
+      ;;
+    gemini)
+      case "$path" in
+        "$HOME/.gemini/settings.json"|"$HOME/.gemini-cli/settings.json")
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
 }
 
-gemini_agent_detected() {
-  [ -d "$HOME/.gemini" ] \
-    || [ -d "$HOME/.gemini-cli" ] \
-    || command -v gemini >/dev/null 2>&1
+cleanup_legacy_settings_entries() {
+  local settings_file="$1"
+  local hook_key="$2"
+  local matcher="$3"
+  local require_name="$4"
+  shift 4
+  local bin_candidates=("$@")
+
+  [ -f "$settings_file" ] || return 0
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local py_result=""
+  if ! py_result=$(python3 - "$settings_file" "$hook_key" "$matcher" "$require_name" "${bin_candidates[@]}" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+hook_key = sys.argv[2]
+matcher = sys.argv[3]
+require_name = sys.argv[4]
+candidate_bins = [arg for arg in sys.argv[5:] if arg]
+
+if not candidate_bins:
+    print("NO_CANDIDATES")
+    raise SystemExit(0)
+
+
+def command_matches(command: str) -> bool:
+    if not isinstance(command, str):
+        return False
+    cmd = command.strip()
+    if not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except Exception:
+        parts = cmd.split()
+    if len(parts) != 1:
+        return False
+    first = parts[0]
+    if not os.path.isabs(first):
+        return False
+    for bin_path in candidate_bins:
+        if first == bin_path:
+            return True
+        try:
+            if os.path.realpath(first) == os.path.realpath(bin_path):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+try:
+    with open(settings_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except Exception:
+    print("SKIP_INVALID_JSON")
+    raise SystemExit(0)
+
+if not isinstance(settings, dict):
+    print("SKIP_INVALID_JSON")
+    raise SystemExit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    print("NO_HOOKS")
+    raise SystemExit(0)
+
+entries = hooks.get(hook_key)
+if not isinstance(entries, list):
+    print("NO_HOOKS")
+    raise SystemExit(0)
+
+removed = 0
+changed = False
+new_entries = []
+
+for entry in entries:
+    if isinstance(entry, dict) and entry.get("matcher") == matcher:
+        existing_hooks = entry.get("hooks", [])
+        if not isinstance(existing_hooks, list):
+            existing_hooks = []
+
+        kept = []
+        for hook in existing_hooks:
+            should_remove = False
+            if isinstance(hook, dict):
+                command = str(hook.get("command", ""))
+                if require_name:
+                    if (
+                        str(hook.get("name", "")) == require_name
+                        and str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"name", "type", "command", "timeout"})
+                        and hook.get("timeout", 5000) in (5000, "5000")
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+                else:
+                    if (
+                        str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"type", "command"})
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+
+            if should_remove:
+                removed += 1
+                changed = True
+                continue
+
+            kept.append(hook)
+
+        if kept:
+            entry["hooks"] = kept
+            new_entries.append(entry)
+        elif existing_hooks:
+            changed = True
+    else:
+        new_entries.append(entry)
+
+if not changed:
+    print("ALREADY_ABSENT")
+    raise SystemExit(0)
+
+hooks[hook_key] = new_entries
+if not hooks[hook_key]:
+    del hooks[hook_key]
+if not hooks:
+    settings.pop("hooks", None)
+
+with open(settings_file, "w", encoding="utf-8") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+print(f"REMOVED:{removed}")
+PYEOF
+  ); then
+    warn "Legacy settings cleanup failed for $settings_file"
+    return 0
+  fi
+
+  case "$py_result" in
+    REMOVED:*)
+      local count="${py_result#REMOVED:}"
+      if [ "$count" -gt 0 ] 2>/dev/null; then
+        ok "Removed ${count} legacy installer entries from $settings_file"
+      fi
+      ;;
+  esac
 }
 
-codex_agent_detected() {
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  [ -d "$codex_home" ] || command -v codex >/dev/null 2>&1
-}
+cleanup_legacy_agent_settings() {
+  local bin_candidates=()
+  local recorded_bin="${PIAR_INSTALL_BIN:-}"
+  local current_bin="${INSTALL_BIN_PATH:-}"
 
-resolve_claude_settings_path() {
-  local candidates=(
+  if [ -n "$recorded_bin" ]; then
+    bin_candidates+=("$recorded_bin")
+  fi
+  if [ -n "$current_bin" ] && [ "$current_bin" != "$recorded_bin" ]; then
+    bin_candidates+=("$current_bin")
+  fi
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
+
+  local claude_candidates=()
+  if [ -n "${PIAR_CLAUDE_HOOK_SETTINGS:-}" ]; then
+    claude_candidates+=("${PIAR_CLAUDE_HOOK_SETTINGS}")
+  fi
+  claude_candidates+=(
     "$HOME/.claude/settings.json"
     "$HOME/.config/claude/settings.json"
     "$HOME/Library/Application Support/Claude/settings.json"
   )
-  local path=""
-  for path in "${candidates[@]}"; do
-    if [ -f "$path" ]; then
-      printf '%s\n' "$path"
-      return 0
-    fi
-  done
-  printf '%s\n' "${candidates[0]}"
-}
 
-resolve_gemini_settings_path() {
-  local candidates=(
+  local gemini_candidates=()
+  if [ -n "${PIAR_GEMINI_HOOK_SETTINGS:-}" ]; then
+    gemini_candidates+=("${PIAR_GEMINI_HOOK_SETTINGS}")
+  fi
+  gemini_candidates+=(
     "$HOME/.gemini/settings.json"
     "$HOME/.gemini-cli/settings.json"
   )
-  local path=""
-  for path in "${candidates[@]}"; do
-    if [ -f "$path" ]; then
-      printf '%s\n' "$path"
-      return 0
+
+  local settings_path=""
+  for settings_path in "${claude_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "claude"; then
+      cleanup_legacy_settings_entries "$settings_path" "PreToolUse" "Bash" "" "${bin_candidates[@]}"
     fi
   done
-  printf '%s\n' "${candidates[0]}"
-}
-
-create_settings_backup() {
-  local settings_file="$1"
-  if [ ! -f "$settings_file" ]; then
-    return 0
-  fi
-  local backup_path=""
-  backup_path="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$settings_file" "$backup_path"
-  printf '%s\n' "$backup_path"
-}
-
-configure_claude_hook() {
-  CLAUDE_HOOK_BACKUP=""
-  CLAUDE_HOOK_SETTINGS=""
-
-  if ! claude_agent_detected; then
-    CLAUDE_HOOK_STATUS="skipped (not detected)"
-    return 0
-  fi
-
-  CLAUDE_HOOK_SETTINGS="$(resolve_claude_settings_path)"
-  local settings_file="$CLAUDE_HOOK_SETTINGS"
-  local binary_path="$INSTALL_BIN_PATH"
-
-  if [ ! -f "$settings_file" ]; then
-    if ! mkdir -p "$(dirname "$settings_file")" 2>/dev/null; then
-      CLAUDE_HOOK_STATUS="failed (mkdir error)"
-      warn "Failed to prepare Claude settings directory: $(dirname "$settings_file")"
-      return 0
+  for settings_path in "${gemini_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "gemini"; then
+      cleanup_legacy_settings_entries "$settings_path" "BeforeTool" "run_shell_command" "pi-agent-rust" "${bin_candidates[@]}"
     fi
-    local escaped_binary_path
-    escaped_binary_path="$(json_escape_string "$binary_path")"
-    if ! cat > "$settings_file" <<EOF_CLAUDE
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${escaped_binary_path}"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF_CLAUDE
-    then
-      CLAUDE_HOOK_STATUS="failed (write error)"
-      warn "Failed to write Claude settings file: $settings_file"
-      return 0
-    fi
-    CLAUDE_HOOK_STATUS="created"
-    ok "Configured Claude Code hook: $settings_file"
-    return 0
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    CLAUDE_HOOK_STATUS="failed (python3 missing)"
-    warn "python3 not found; cannot merge Claude hook settings"
-    return 0
-  fi
-
-  local backup_path=""
-  backup_path="$(create_settings_backup "$settings_file" 2>/dev/null || true)"
-  if [ -f "$settings_file" ] && [ -z "$backup_path" ]; then
-    CLAUDE_HOOK_STATUS="failed (backup error)"
-    warn "Failed to create Claude settings backup: $settings_file"
-    return 0
-  fi
-  CLAUDE_HOOK_BACKUP="$backup_path"
-
-  local merge_result=""
-  if ! merge_result=$(python3 - "$settings_file" "$binary_path" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-binary_path = sys.argv[2]
-binary_name = binary_path.rsplit("/", 1)[-1]
-
-try:
-    with open(settings_file, "r", encoding="utf-8") as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-hooks = settings.get("hooks")
-if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
-
-pre = hooks.get("PreToolUse")
-if not isinstance(pre, list):
-    pre = []
-    hooks["PreToolUse"] = pre
-
-bash_hooks = []
-other_entries = []
-for entry in pre:
-    if isinstance(entry, dict) and entry.get("matcher") == "Bash":
-        for hook in entry.get("hooks", []):
-            if hook not in bash_hooks:
-                bash_hooks.append(hook)
-    else:
-        other_entries.append(entry)
-
-def matches_binary(command: str) -> bool:
-    if not isinstance(command, str):
-        return False
-    cmd = command.strip()
-    if not cmd:
-        return False
-    if cmd == binary_path:
-        return True
-    try:
-        parts = shlex.split(cmd)
-    except Exception:
-        parts = cmd.split()
-    if not parts:
-        return False
-    first = parts[0]
-    if first == binary_path:
-        return True
-    if os.path.isabs(first):
-        try:
-            if os.path.realpath(first) == os.path.realpath(binary_path):
-                return True
-        except Exception:
-            pass
-    return False
-
-for hook in bash_hooks:
-    if isinstance(hook, dict):
-        command = str(hook.get("command", ""))
-        if matches_binary(command):
-            print("ALREADY")
-            raise SystemExit(0)
-
-bash_hooks.insert(0, {"type": "command", "command": binary_path})
-hooks["PreToolUse"] = [{"matcher": "Bash", "hooks": bash_hooks}] + other_entries
-
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("MERGED")
-PYEOF
-  ); then
-    if [ -n "$backup_path" ]; then
-      mv "$backup_path" "$settings_file" 2>/dev/null || true
-      CLAUDE_HOOK_BACKUP=""
-    fi
-    CLAUDE_HOOK_STATUS="failed (merge error)"
-    warn "Failed to merge Claude settings: $settings_file"
-    return 0
-  fi
-
-  case "$merge_result" in
-    ALREADY)
-      CLAUDE_HOOK_STATUS="already"
-      if [ -n "$backup_path" ]; then
-        rm -f "$backup_path" 2>/dev/null || true
-        CLAUDE_HOOK_BACKUP=""
-      fi
-      ;;
-    MERGED)
-      CLAUDE_HOOK_STATUS="merged"
-      ok "Updated Claude Code hook settings: $settings_file"
-      ;;
-    *)
-      if [ -n "$backup_path" ]; then
-        mv "$backup_path" "$settings_file" 2>/dev/null || true
-        CLAUDE_HOOK_BACKUP=""
-      fi
-      CLAUDE_HOOK_STATUS="failed (unexpected merge output)"
-      warn "Unexpected Claude hook merge result for $settings_file"
-      ;;
-  esac
-}
-
-configure_gemini_hook() {
-  GEMINI_HOOK_BACKUP=""
-  GEMINI_HOOK_SETTINGS=""
-
-  if ! gemini_agent_detected; then
-    GEMINI_HOOK_STATUS="skipped (not detected)"
-    return 0
-  fi
-
-  GEMINI_HOOK_SETTINGS="$(resolve_gemini_settings_path)"
-  local settings_file="$GEMINI_HOOK_SETTINGS"
-  local binary_path="$INSTALL_BIN_PATH"
-
-  if [ ! -f "$settings_file" ]; then
-    if ! mkdir -p "$(dirname "$settings_file")" 2>/dev/null; then
-      GEMINI_HOOK_STATUS="failed (mkdir error)"
-      warn "Failed to prepare Gemini settings directory: $(dirname "$settings_file")"
-      return 0
-    fi
-    local escaped_binary_path
-    escaped_binary_path="$(json_escape_string "$binary_path")"
-    if ! cat > "$settings_file" <<EOF_GEMINI
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {
-            "name": "pi-agent-rust",
-            "type": "command",
-            "command": "${escaped_binary_path}",
-            "timeout": 5000
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF_GEMINI
-    then
-      GEMINI_HOOK_STATUS="failed (write error)"
-      warn "Failed to write Gemini settings file: $settings_file"
-      return 0
-    fi
-    GEMINI_HOOK_STATUS="created"
-    ok "Configured Gemini hook: $settings_file"
-    return 0
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    GEMINI_HOOK_STATUS="failed (python3 missing)"
-    warn "python3 not found; cannot merge Gemini hook settings"
-    return 0
-  fi
-
-  local backup_path=""
-  backup_path="$(create_settings_backup "$settings_file" 2>/dev/null || true)"
-  if [ -f "$settings_file" ] && [ -z "$backup_path" ]; then
-    GEMINI_HOOK_STATUS="failed (backup error)"
-    warn "Failed to create Gemini settings backup: $settings_file"
-    return 0
-  fi
-  GEMINI_HOOK_BACKUP="$backup_path"
-
-  local merge_result=""
-  if ! merge_result=$(python3 - "$settings_file" "$binary_path" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-binary_path = sys.argv[2]
-binary_name = binary_path.rsplit("/", 1)[-1]
-
-try:
-    with open(settings_file, "r", encoding="utf-8") as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-hooks = settings.get("hooks")
-if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
-
-before = hooks.get("BeforeTool")
-if not isinstance(before, list):
-    before = []
-    hooks["BeforeTool"] = before
-
-shell_hooks = []
-other_entries = []
-for entry in before:
-    if isinstance(entry, dict) and entry.get("matcher") == "run_shell_command":
-        for hook in entry.get("hooks", []):
-            if hook not in shell_hooks:
-                shell_hooks.append(hook)
-    else:
-        other_entries.append(entry)
-
-def matches_binary(command: str) -> bool:
-    if not isinstance(command, str):
-        return False
-    cmd = command.strip()
-    if not cmd:
-        return False
-    if cmd == binary_path:
-        return True
-    try:
-        parts = shlex.split(cmd)
-    except Exception:
-        parts = cmd.split()
-    if not parts:
-        return False
-    first = parts[0]
-    if first == binary_path:
-        return True
-    if os.path.isabs(first):
-        try:
-            if os.path.realpath(first) == os.path.realpath(binary_path):
-                return True
-        except Exception:
-            pass
-    return False
-
-for hook in shell_hooks:
-    if isinstance(hook, dict):
-        command = str(hook.get("command", ""))
-        if matches_binary(command):
-            print("ALREADY")
-            raise SystemExit(0)
-
-shell_hooks.insert(
-    0,
-    {
-        "name": "pi-agent-rust",
-        "type": "command",
-        "command": binary_path,
-        "timeout": 5000,
-    },
-)
-hooks["BeforeTool"] = [{"matcher": "run_shell_command", "hooks": shell_hooks}] + other_entries
-
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("MERGED")
-PYEOF
-  ); then
-    if [ -n "$backup_path" ]; then
-      mv "$backup_path" "$settings_file" 2>/dev/null || true
-      GEMINI_HOOK_BACKUP=""
-    fi
-    GEMINI_HOOK_STATUS="failed (merge error)"
-    warn "Failed to merge Gemini settings: $settings_file"
-    return 0
-  fi
-
-  case "$merge_result" in
-    ALREADY)
-      GEMINI_HOOK_STATUS="already"
-      if [ -n "$backup_path" ]; then
-        rm -f "$backup_path" 2>/dev/null || true
-        GEMINI_HOOK_BACKUP=""
-      fi
-      ;;
-    MERGED)
-      GEMINI_HOOK_STATUS="merged"
-      ok "Updated Gemini hook settings: $settings_file"
-      ;;
-    *)
-      if [ -n "$backup_path" ]; then
-        mv "$backup_path" "$settings_file" 2>/dev/null || true
-        GEMINI_HOOK_BACKUP=""
-      fi
-      GEMINI_HOOK_STATUS="failed (unexpected merge output)"
-      warn "Unexpected Gemini hook merge result for $settings_file"
-      ;;
-  esac
-}
-
-configure_codex_hook_status() {
-  if codex_agent_detected; then
-    CODEX_HOOK_STATUS="unsupported (Codex has no pre-exec hooks)"
-  else
-    CODEX_HOOK_STATUS="skipped (not detected)"
-  fi
-}
-
-configure_agent_hooks() {
-  info "Scanning AI agents and applying hook auto-configuration"
-  configure_claude_hook
-  configure_gemini_hook
-  configure_codex_hook_status
+  done
 }
 
 is_installer_managed_skill_file() {
@@ -2859,13 +2628,6 @@ write_state() {
     printf 'PIAR_CHECKSUM_STATUS=%q\n' "$CHECKSUM_STATUS"
     printf 'PIAR_SIGSTORE_STATUS=%q\n' "$SIGSTORE_STATUS"
     printf 'PIAR_COMPLETIONS_STATUS=%q\n' "$COMPLETIONS_STATUS"
-    printf 'PIAR_CLAUDE_HOOK_STATUS=%q\n' "$CLAUDE_HOOK_STATUS"
-    printf 'PIAR_GEMINI_HOOK_STATUS=%q\n' "$GEMINI_HOOK_STATUS"
-    printf 'PIAR_CODEX_HOOK_STATUS=%q\n' "$CODEX_HOOK_STATUS"
-    printf 'PIAR_CLAUDE_HOOK_SETTINGS=%q\n' "$CLAUDE_HOOK_SETTINGS"
-    printf 'PIAR_GEMINI_HOOK_SETTINGS=%q\n' "$GEMINI_HOOK_SETTINGS"
-    printf 'PIAR_CLAUDE_HOOK_BACKUP=%q\n' "$CLAUDE_HOOK_BACKUP"
-    printf 'PIAR_GEMINI_HOOK_BACKUP=%q\n' "$GEMINI_HOOK_BACKUP"
     printf 'PIAR_AGENT_SKILL_STATUS=%q\n' "$AGENT_SKILL_STATUS"
     printf 'PIAR_AGENT_SKILL_CLAUDE_PATH=%q\n' "$AGENT_SKILL_CLAUDE_PATH"
     printf 'PIAR_AGENT_SKILL_CODEX_PATH=%q\n' "$AGENT_SKILL_CODEX_PATH"
@@ -2917,21 +2679,6 @@ print_summary() {
   fi
   if [ "$WSL_DETECTED" -eq 1 ]; then
     lines+=("Platform:  WSL detected")
-  fi
-  lines+=("Claude hook: $CLAUDE_HOOK_STATUS")
-  lines+=("Gemini hook: $GEMINI_HOOK_STATUS")
-  lines+=("Codex hook:  $CODEX_HOOK_STATUS")
-  if [ -n "$CLAUDE_HOOK_SETTINGS" ]; then
-    lines+=("Claude cfg:  $CLAUDE_HOOK_SETTINGS")
-  fi
-  if [ -n "$GEMINI_HOOK_SETTINGS" ]; then
-    lines+=("Gemini cfg:  $GEMINI_HOOK_SETTINGS")
-  fi
-  if [ -n "$CLAUDE_HOOK_BACKUP" ]; then
-    lines+=("Claude bak:  $CLAUDE_HOOK_BACKUP")
-  fi
-  if [ -n "$GEMINI_HOOK_BACKUP" ]; then
-    lines+=("Gemini bak:  $GEMINI_HOOK_BACKUP")
   fi
   lines+=("Skills:    $AGENT_SKILL_STATUS")
   if [ -n "$AGENT_SKILL_CLAUDE_PATH" ] && [ -f "$AGENT_SKILL_CLAUDE_PATH/SKILL.md" ]; then
@@ -3018,7 +2765,7 @@ main() {
     fi
     maybe_add_path
     maybe_install_completions
-    configure_agent_hooks
+    cleanup_legacy_agent_settings
     install_agent_skills
     write_state
     print_summary
@@ -3080,7 +2827,7 @@ main() {
 
   maybe_add_path
   maybe_install_completions
-  configure_agent_hooks
+  cleanup_legacy_agent_settings
   install_agent_skills
   write_state
   INSTALL_COMMITTED=1
