@@ -50,6 +50,219 @@ async fn dispatch_input_event(
     Ok(apply_input_event_response(response, text, images))
 }
 
+const UI_STREAM_DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(45);
+const UI_STREAM_DELTA_MAX_BUFFER_BYTES: usize = 2 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamDeltaKind {
+    Text,
+    Thinking,
+}
+
+struct UiStreamDeltaBatcher {
+    sender: mpsc::Sender<PiMsg>,
+    pending: std::collections::VecDeque<PiMsg>,
+    pending_bytes: usize,
+    flush_interval: std::time::Duration,
+    max_pending_bytes: usize,
+    last_flush: std::time::Instant,
+}
+
+impl UiStreamDeltaBatcher {
+    fn new(sender: mpsc::Sender<PiMsg>) -> Self {
+        let now = std::time::Instant::now();
+        let flush_interval = UI_STREAM_DELTA_FLUSH_INTERVAL;
+        Self {
+            sender,
+            pending: std::collections::VecDeque::new(),
+            pending_bytes: 0,
+            flush_interval,
+            max_pending_bytes: UI_STREAM_DELTA_MAX_BUFFER_BYTES,
+            // Prime the first delta flush so the UI shows immediate output.
+            last_flush: now.checked_sub(flush_interval).unwrap_or(now),
+        }
+    }
+
+    fn push_delta(&mut self, kind: StreamDeltaKind, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(last) = self.pending.back_mut() {
+            match (kind, last) {
+                (StreamDeltaKind::Text, PiMsg::TextDelta(text))
+                | (StreamDeltaKind::Thinking, PiMsg::ThinkingDelta(text)) => {
+                    text.push_str(delta);
+                    self.pending_bytes += delta.len();
+                    self.flush(false);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let msg = match kind {
+            StreamDeltaKind::Text => PiMsg::TextDelta(delta.to_string()),
+            StreamDeltaKind::Thinking => PiMsg::ThinkingDelta(delta.to_string()),
+        };
+        self.pending.push_back(msg);
+        self.pending_bytes += delta.len();
+        self.flush(false);
+    }
+
+    fn send_immediate(&mut self, msg: PiMsg) {
+        self.pending.push_back(msg);
+        self.flush(true);
+    }
+
+    fn delta_bytes_for_msg(msg: &PiMsg) -> usize {
+        match msg {
+            PiMsg::TextDelta(text) | PiMsg::ThinkingDelta(text) => text.len(),
+            _ => 0,
+        }
+    }
+
+    fn flush(&mut self, force: bool) {
+        if self.pending.is_empty() {
+            return;
+        }
+
+        if !force
+            && self.pending_bytes < self.max_pending_bytes
+            && self.last_flush.elapsed() < self.flush_interval
+        {
+            return;
+        }
+
+        let mut sent_any = false;
+
+        while let Some(msg) = self.pending.pop_front() {
+            let delta_bytes = Self::delta_bytes_for_msg(&msg);
+            match self.sender.try_send(msg) {
+                Ok(()) => {
+                    self.pending_bytes = self.pending_bytes.saturating_sub(delta_bytes);
+                    sent_any = true;
+                }
+                Err(err) => {
+                    match err {
+                        mpsc::SendError::Full(msg) => {
+                            self.pending.push_front(msg);
+                        }
+                        mpsc::SendError::Disconnected(_) | mpsc::SendError::Cancelled(_) => {
+                            self.pending.clear();
+                            self.pending_bytes = 0;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if sent_any {
+            self.last_flush = std::time::Instant::now();
+        }
+    }
+}
+
+fn build_agent_done_pi_msg(messages: &[ModelMessage]) -> PiMsg {
+    let last = last_assistant_message(messages);
+    let mut usage = Usage::default();
+    for message in messages {
+        if let ModelMessage::Assistant(assistant) = message {
+            add_usage(&mut usage, &assistant.usage);
+        }
+    }
+    PiMsg::AgentDone {
+        usage: Some(usage),
+        stop_reason: last
+            .as_ref()
+            .map_or(StopReason::Stop, |msg| msg.stop_reason),
+        error_message: last.as_ref().and_then(|msg| msg.error_message.clone()),
+    }
+}
+
+fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBatcher) {
+    match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event.as_ref() {
+            AssistantMessageEvent::TextDelta { delta, .. } => {
+                batcher.push_delta(StreamDeltaKind::Text, delta);
+            }
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                batcher.push_delta(StreamDeltaKind::Thinking, delta);
+            }
+            _ => {}
+        },
+        AgentEvent::AgentStart { .. } => {
+            batcher.send_immediate(PiMsg::AgentStart);
+        }
+        AgentEvent::ToolExecutionStart {
+            tool_name,
+            tool_call_id,
+            ..
+        } => {
+            batcher.send_immediate(PiMsg::ToolStart {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+            });
+        }
+        AgentEvent::ToolExecutionUpdate {
+            tool_name,
+            tool_call_id,
+            partial_result,
+            ..
+        } => {
+            batcher.send_immediate(PiMsg::ToolUpdate {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+                content: partial_result.content.clone(),
+                details: partial_result.details.clone(),
+            });
+        }
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            tool_call_id,
+            is_error,
+            ..
+        } => {
+            batcher.send_immediate(PiMsg::ToolEnd {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+                is_error: *is_error,
+            });
+        }
+        AgentEvent::AgentEnd { messages, .. } => {
+            batcher.send_immediate(build_agent_done_pi_msg(messages));
+        }
+        _ => {}
+    }
+}
+
+async fn flush_ui_stream_batcher_with_backpressure(batcher: &StdMutex<UiStreamDeltaBatcher>) {
+    let (sender, pending) = {
+        let mut guard = match batcher.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.flush(true);
+        if guard.pending.is_empty() {
+            return;
+        }
+        let sender = guard.sender.clone();
+        let pending = guard.pending.drain(..).collect::<Vec<_>>();
+        guard.pending_bytes = 0;
+        (sender, pending)
+    };
+
+    let cx = Cx::for_request();
+    for msg in pending {
+        if sender.send(&cx, msg).await.is_err() {
+            break;
+        }
+    }
+}
+
 impl PiApp {
     /// Handle custom Pi messages from the agent.
     #[allow(clippy::too_many_lines)]
@@ -76,13 +289,18 @@ impl PiApp {
             }
             PiMsg::TextDelta(text) => {
                 self.current_response.push_str(&text);
-                // Keep the viewport content in sync so scroll position math is
-                // correct.  Only auto-scroll if the user hasn't scrolled away.
-                self.refresh_conversation_viewport(self.follow_stream_tail);
+                // While tail-following, `view()` computes the bottom slice
+                // directly, so we can skip full viewport rebuilds on every
+                // token to reduce redraw jitter.
+                if !self.follow_stream_tail {
+                    self.refresh_conversation_viewport(false);
+                }
             }
             PiMsg::ThinkingDelta(text) => {
                 self.current_thinking.push_str(&text);
-                self.refresh_conversation_viewport(self.follow_stream_tail);
+                if !self.follow_stream_tail {
+                    self.refresh_conversation_viewport(false);
+                }
             }
             PiMsg::ToolStart { name, .. } => {
                 self.agent_state = AgentState::ToolRunning;
@@ -835,74 +1053,18 @@ impl PiApp {
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
+            let ui_stream_batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new(
+                event_sender.clone(),
+            )));
+            let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
             let result = agent_guard
                 .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
-                    let mapped = match &event {
-                        AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
-                        AgentEvent::MessageUpdate {
-                            assistant_message_event,
-                            ..
-                        } => match assistant_message_event.as_ref() {
-                            AssistantMessageEvent::TextDelta { delta, .. } => {
-                                Some(PiMsg::TextDelta(delta.clone()))
-                            }
-                            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                Some(PiMsg::ThinkingDelta(delta.clone()))
-                            }
-                            _ => None,
-                        },
-                        AgentEvent::ToolExecutionStart {
-                            tool_name,
-                            tool_call_id,
-                            ..
-                        } => Some(PiMsg::ToolStart {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                        }),
-                        AgentEvent::ToolExecutionUpdate {
-                            tool_name,
-                            tool_call_id,
-                            partial_result,
-                            ..
-                        } => Some(PiMsg::ToolUpdate {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                            content: partial_result.content.clone(),
-                            details: partial_result.details.clone(),
-                        }),
-                        AgentEvent::ToolExecutionEnd {
-                            tool_name,
-                            tool_call_id,
-                            is_error,
-                            ..
-                        } => Some(PiMsg::ToolEnd {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                            is_error: *is_error,
-                        }),
-                        AgentEvent::AgentEnd { messages, .. } => {
-                            let last = last_assistant_message(messages);
-                            let mut usage = Usage::default();
-                            for message in messages {
-                                if let ModelMessage::Assistant(assistant) = message {
-                                    add_usage(&mut usage, &assistant.usage);
-                                }
-                            }
-                            Some(PiMsg::AgentDone {
-                                usage: Some(usage),
-                                stop_reason: last
-                                    .as_ref()
-                                    .map_or(StopReason::Stop, |msg| msg.stop_reason),
-                                error_message: last
-                                    .as_ref()
-                                    .and_then(|msg| msg.error_message.clone()),
-                            })
-                        }
-                        _ => None,
-                    };
-
-                    if let Some(msg) = mapped {
-                        let _ = event_sender.try_send(msg);
+                    {
+                        let mut batcher = match ui_stream_batcher_for_events.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        dispatch_agent_event_to_ui(&event, &mut batcher);
                     }
 
                     if let Some(coal) = &coalescer {
@@ -910,6 +1072,7 @@ impl PiApp {
                     }
                 })
                 .await;
+            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
@@ -1118,75 +1281,19 @@ impl PiApp {
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
+            let ui_stream_batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new(
+                event_sender.clone(),
+            )));
             let result = if input_images.is_empty() {
+                let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
                 agent_guard
                     .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
-                        let mapped = match &event {
-                            AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
-                            AgentEvent::MessageUpdate {
-                                assistant_message_event,
-                                ..
-                            } => match assistant_message_event.as_ref() {
-                                AssistantMessageEvent::TextDelta { delta, .. } => {
-                                    Some(PiMsg::TextDelta(delta.clone()))
-                                }
-                                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                    Some(PiMsg::ThinkingDelta(delta.clone()))
-                                }
-                                _ => None,
-                            },
-                            AgentEvent::ToolExecutionStart {
-                                tool_name,
-                                tool_call_id,
-                                ..
-                            } => Some(PiMsg::ToolStart {
-                                name: tool_name.clone(),
-                                tool_id: tool_call_id.clone(),
-                            }),
-                            AgentEvent::ToolExecutionUpdate {
-                                tool_name,
-                                tool_call_id,
-                                partial_result,
-                                ..
-                            } => Some(PiMsg::ToolUpdate {
-                                name: tool_name.clone(),
-                                tool_id: tool_call_id.clone(),
-                                content: partial_result.content.clone(),
-                                details: partial_result.details.clone(),
-                            }),
-                            AgentEvent::ToolExecutionEnd {
-                                tool_name,
-                                tool_call_id,
-                                is_error,
-                                ..
-                            } => Some(PiMsg::ToolEnd {
-                                name: tool_name.clone(),
-                                tool_id: tool_call_id.clone(),
-                                is_error: *is_error,
-                            }),
-                            AgentEvent::AgentEnd { messages, .. } => {
-                                let last = last_assistant_message(messages);
-                                let mut usage = Usage::default();
-                                for message in messages {
-                                    if let ModelMessage::Assistant(assistant) = message {
-                                        add_usage(&mut usage, &assistant.usage);
-                                    }
-                                }
-                                Some(PiMsg::AgentDone {
-                                    usage: Some(usage),
-                                    stop_reason: last
-                                        .as_ref()
-                                        .map_or(StopReason::Stop, |msg| msg.stop_reason),
-                                    error_message: last
-                                        .as_ref()
-                                        .and_then(|msg| msg.error_message.clone()),
-                                })
-                            }
-                            _ => None,
-                        };
-
-                        if let Some(msg) = mapped {
-                            let _ = event_sender.try_send(msg);
+                        {
+                            let mut batcher = match ui_stream_batcher_for_events.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            dispatch_agent_event_to_ui(&event, &mut batcher);
                         }
 
                         if let Some(coal) = &coalescer {
@@ -1197,77 +1304,18 @@ impl PiApp {
             } else {
                 let content_for_agent =
                     build_content_blocks_for_input(&message_for_agent, &input_images);
+                let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
                 agent_guard
                     .run_with_content_with_abort(
                         content_for_agent,
                         Some(abort_signal),
                         move |event| {
-                            let mapped = match &event {
-                                AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
-                                AgentEvent::MessageUpdate {
-                                    assistant_message_event,
-                                    ..
-                                } => match assistant_message_event.as_ref() {
-                                    AssistantMessageEvent::TextDelta { delta, .. } => {
-                                        Some(PiMsg::TextDelta(delta.clone()))
-                                    }
-                                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                        Some(PiMsg::ThinkingDelta(delta.clone()))
-                                    }
-                                    _ => None,
-                                },
-                                AgentEvent::ToolExecutionStart {
-                                    tool_name,
-                                    tool_call_id,
-                                    ..
-                                } => Some(PiMsg::ToolStart {
-                                    name: tool_name.clone(),
-                                    tool_id: tool_call_id.clone(),
-                                }),
-                                AgentEvent::ToolExecutionUpdate {
-                                    tool_name,
-                                    tool_call_id,
-                                    partial_result,
-                                    ..
-                                } => Some(PiMsg::ToolUpdate {
-                                    name: tool_name.clone(),
-                                    tool_id: tool_call_id.clone(),
-                                    content: partial_result.content.clone(),
-                                    details: partial_result.details.clone(),
-                                }),
-                                AgentEvent::ToolExecutionEnd {
-                                    tool_name,
-                                    tool_call_id,
-                                    is_error,
-                                    ..
-                                } => Some(PiMsg::ToolEnd {
-                                    name: tool_name.clone(),
-                                    tool_id: tool_call_id.clone(),
-                                    is_error: *is_error,
-                                }),
-                                AgentEvent::AgentEnd { messages, .. } => {
-                                    let last = last_assistant_message(messages);
-                                    let mut usage = Usage::default();
-                                    for message in messages {
-                                        if let ModelMessage::Assistant(assistant) = message {
-                                            add_usage(&mut usage, &assistant.usage);
-                                        }
-                                    }
-                                    Some(PiMsg::AgentDone {
-                                        usage: Some(usage),
-                                        stop_reason: last
-                                            .as_ref()
-                                            .map_or(StopReason::Stop, |msg| msg.stop_reason),
-                                        error_message: last
-                                            .as_ref()
-                                            .and_then(|msg| msg.error_message.clone()),
-                                    })
-                                }
-                                _ => None,
-                            };
-
-                            if let Some(msg) = mapped {
-                                let _ = event_sender.try_send(msg);
+                            {
+                                let mut batcher = match ui_stream_batcher_for_events.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => poisoned.into_inner(),
+                                };
+                                dispatch_agent_event_to_ui(&event, &mut batcher);
                             }
 
                             if let Some(coal) = &coalescer {
@@ -1277,6 +1325,7 @@ impl PiApp {
                     )
                     .await
             };
+            flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
@@ -1313,5 +1362,101 @@ impl PiApp {
         });
 
         None
+    }
+}
+
+#[cfg(test)]
+mod stream_delta_batcher_tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_adjacent_deltas_of_same_kind() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+
+        batcher.push_delta(StreamDeltaKind::Text, "Hel");
+        batcher.push_delta(StreamDeltaKind::Text, "lo");
+        assert!(rx.try_recv().is_err());
+
+        batcher.flush(true);
+        let msg = rx.try_recv().expect("expected coalesced text delta");
+        assert!(matches!(msg, PiMsg::TextDelta(text) if text == "Hello"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn send_immediate_flushes_pending_before_tool_event() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+
+        batcher.push_delta(StreamDeltaKind::Text, "partial");
+        batcher.send_immediate(PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "t1".to_string(),
+        });
+
+        let first = rx.try_recv().expect("expected flushed text delta first");
+        let second = rx.try_recv().expect("expected immediate tool start second");
+        assert!(matches!(first, PiMsg::TextDelta(text) if text == "partial"));
+        assert!(
+            matches!(second, PiMsg::ToolStart { name, tool_id } if name == "bash" && tool_id == "t1")
+        );
+    }
+
+    #[test]
+    fn retains_unsent_chunk_when_channel_is_full() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+
+        batcher.send_immediate(PiMsg::System("occupy".to_string()));
+        batcher.push_delta(StreamDeltaKind::Text, "later");
+        batcher.flush(true);
+        assert_eq!(batcher.pending_bytes, "later".len());
+
+        let _ = rx.try_recv().expect("expected occupied slot message");
+        batcher.flush(true);
+
+        let msg = rx.try_recv().expect("expected retained text delta");
+        assert!(matches!(msg, PiMsg::TextDelta(text) if text == "later"));
+        assert_eq!(batcher.pending_bytes, 0);
+    }
+
+    #[test]
+    fn retains_immediate_events_when_channel_is_full() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut batcher = UiStreamDeltaBatcher::new(tx);
+        batcher.flush_interval = std::time::Duration::from_secs(60);
+        batcher.last_flush = std::time::Instant::now();
+
+        // Occupy the single slot.
+        batcher.send_immediate(PiMsg::System("occupy".to_string()));
+
+        // Queue a delta and a control event while the channel is full.
+        batcher.push_delta(StreamDeltaKind::Text, "before-done");
+        batcher.send_immediate(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        });
+
+        // Nothing should be dropped; queue should still hold both messages.
+        assert_eq!(batcher.pending_bytes, "before-done".len());
+        assert_eq!(batcher.pending.len(), 2);
+
+        // Free slot and flush repeatedly; ordering must be preserved.
+        let _ = rx.try_recv().expect("expected occupied slot message");
+        batcher.flush(true);
+        let first = rx.try_recv().expect("expected retained text delta");
+        assert!(matches!(first, PiMsg::TextDelta(text) if text == "before-done"));
+
+        batcher.flush(true);
+        let second = rx.try_recv().expect("expected retained agent_done event");
+        assert!(matches!(second, PiMsg::AgentDone { .. }));
     }
 }

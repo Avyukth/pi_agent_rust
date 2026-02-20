@@ -16,7 +16,7 @@ use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
-use bubbles::spinner::{SpinnerModel, spinners};
+use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{
@@ -721,12 +721,38 @@ impl PiApp {
         self.maybe_trigger_autocomplete();
     }
 
-    /// Compute the conversation viewport height based on the current input area height.
-    /// Layout budget: header (2 rows) + input decoration (2 rows) + input lines + footer (2 rows).
+    /// Compute the conversation viewport height based on the current UI chrome.
+    ///
+    /// This delegates to [`view_effective_conversation_height`] so viewport
+    /// scroll math stays aligned with the rows actually rendered in `view()`.
     fn conversation_viewport_height(&self) -> usize {
-        let chrome = 2 + 2 + 2; // header + input_decoration + footer
-        self.term_height
-            .saturating_sub(chrome + self.input.height())
+        self.view_effective_conversation_height()
+    }
+
+    /// Return whether the generic "Processing..." spinner row should be shown.
+    ///
+    /// Once provider text/thinking deltas are streaming, that output already
+    /// acts as progress feedback; suppressing the extra animated status row
+    /// reduces redraw churn and visible flicker.
+    fn show_processing_status_spinner(&self) -> bool {
+        if self.agent_state == AgentState::Idle || self.current_tool.is_some() {
+            return false;
+        }
+
+        let has_visible_stream_progress = !self.current_response.is_empty()
+            || (self.thinking_visible && !self.current_thinking.is_empty());
+        !has_visible_stream_progress
+    }
+
+    /// Return whether any spinner row is currently visible in `view()`.
+    ///
+    /// The spinner is rendered either for tool execution progress, or for the
+    /// generic processing state before visible stream output appears.
+    fn spinner_visible(&self) -> bool {
+        if self.agent_state == AgentState::Idle {
+            return false;
+        }
+        self.current_tool.is_some() || self.show_processing_status_spinner()
     }
 
     /// Compute the effective conversation viewport height for the current
@@ -737,8 +763,10 @@ impl PiApp {
     /// never exceeds `term_height` rows.  The stored
     /// `conversation_viewport.height` still drives scroll-position management.
     fn view_effective_conversation_height(&self) -> usize {
-        // Fixed chrome: header(2) + footer(2).
-        let mut chrome: usize = 2 + 2;
+        // Fixed chrome:
+        // header(4) = title/model + hints + resources + spacer line
+        // footer(2) = blank line + footer line
+        let mut chrome: usize = 4 + 2;
 
         // Budget 1 row for the scroll indicator.  Slightly conservative
         // when content is short, but prevents the off-by-one that triggers
@@ -778,7 +806,7 @@ impl PiApp {
         if show_input {
             // render_input: "\n  header\n" (2 rows) + input.height() rows.
             chrome += 2 + self.input.height();
-        } else if self.agent_state != AgentState::Idle {
+        } else if self.show_processing_status_spinner() {
             // Processing spinner: "\n  spinner Processing...\n" = 2 rows.
             chrome += 2;
         }
@@ -1400,8 +1428,9 @@ impl PiApp {
         let spinner = SpinnerModel::with_spinner(spinners::dot()).style(styles.accent.clone());
 
         // Configure viewport for conversation history.
-        // Height budget: header(2) + input_decoration(2) + input_lines + footer(2).
-        let chrome = 2 + 2 + 2; // header + input_decoration + footer
+        // Height budget at startup (idle):
+        // header(4) + scroll-indicator reserve(1) + input_decoration(2) + input_lines + footer(2).
+        let chrome = 4 + 1 + 2 + 2;
         let viewport_height = term_height.saturating_sub(chrome + input.height());
         let mut conversation_viewport =
             Viewport::new(term_width.saturating_sub(2), viewport_height);
@@ -1676,17 +1705,13 @@ impl PiApp {
 
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
-        // Start text input cursor blink and spinner
+        // Start text input cursor blink.
+        // Spinner ticks are started lazily when we transition idle -> busy.
         let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
         let input_cmd = if test_mode {
             None
         } else {
             BubbleteaModel::init(&self.input)
-        };
-        let spinner_cmd = if test_mode {
-            None
-        } else {
-            BubbleteaModel::init(&self.spinner)
         };
         let pending_cmd = if self.pending_inputs.is_empty() {
             None
@@ -1695,7 +1720,15 @@ impl PiApp {
         };
 
         // Batch commands
-        batch(vec![input_cmd, spinner_cmd, pending_cmd])
+        batch(vec![input_cmd, pending_cmd])
+    }
+
+    fn spinner_init_cmd(&self) -> Option<Cmd> {
+        if std::env::var_os("PI_TEST_MODE").is_some() {
+            None
+        } else {
+            BubbleteaModel::init(&self.spinner)
+        }
     }
 
     /// Handle messages (keyboard input, async events, etc.).
@@ -1706,7 +1739,16 @@ impl PiApp {
         } else {
             None
         };
+        let was_busy = self.agent_state != AgentState::Idle;
+        let was_spinner_visible = self.spinner_visible();
         let result = self.update_inner(msg);
+        let became_busy = !was_busy && self.agent_state != AgentState::Idle;
+        let spinner_became_visible = !was_spinner_visible && self.spinner_visible();
+        let result = if became_busy || spinner_became_visible {
+            batch(vec![result, self.spinner_init_cmd()])
+        } else {
+            result
+        };
         if let Some(start) = update_start {
             self.frame_timing
                 .record_update(micros_as_u64(start.elapsed().as_micros()));
@@ -1728,6 +1770,12 @@ impl PiApp {
 
         if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
             self.set_terminal_size(size.width as usize, size.height as usize);
+            return None;
+        }
+
+        // Ignore spinner ticks when no spinner row is visible so old tick
+        // chains naturally stop and do not trigger hidden redraw churn.
+        if msg.downcast_ref::<SpinnerTickMsg>().is_some() && !self.spinner_visible() {
             return None;
         }
 

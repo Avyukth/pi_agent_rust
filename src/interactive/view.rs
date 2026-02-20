@@ -1,4 +1,5 @@
 use super::*;
+use unicode_width::UnicodeWidthChar;
 
 /// Ensure the view output fits within `term_height` terminal rows.
 ///
@@ -52,6 +53,41 @@ pub(super) fn normalize_raw_terminal_newlines(input: String) -> String {
         }
     }
     out
+}
+
+/// Append one plain-text line with hard wrapping to `max_width` display cells.
+///
+/// We do explicit wrapping here instead of relying on terminal auto-wrap so the
+/// renderer's logical rows stay aligned with physical rows in alt-screen mode.
+fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
+    if max_width == 0 || line.is_empty() {
+        return vec![line];
+    }
+
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    let mut segment_width = 0usize;
+
+    for (idx, ch) in line.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if segment_width + ch_width > max_width && idx > segment_start {
+            segments.push(&line[segment_start..idx]);
+            segment_start = idx;
+            segment_width = 0;
+        }
+        segment_width += ch_width;
+    }
+
+    segments.push(&line[segment_start..]);
+    segments
+}
+
+fn push_wrapped_plain_line(output: &mut String, line: &str, max_width: usize) {
+    for segment in wrapped_line_segments(line, max_width) {
+        output.push_str("  ");
+        output.push_str(segment);
+        output.push('\n');
+    }
 }
 
 fn format_persistence_footer_segment(
@@ -154,10 +190,13 @@ impl PiApp {
             // instead of collecting all lines into a Vec.  For a 10K-line
             // conversation this avoids a ~80KB Vec<&str> allocation per frame.
             let total_lines = memchr::memchr_iter(b'\n', viewport_content.as_bytes()).count() + 1;
-            let start = self
-                .conversation_viewport
-                .y_offset()
-                .min(total_lines.saturating_sub(1));
+            let start = if self.follow_stream_tail {
+                total_lines.saturating_sub(effective_vp)
+            } else {
+                self.conversation_viewport
+                    .y_offset()
+                    .min(total_lines.saturating_sub(1))
+            };
             let end = (start + effective_vp).min(total_lines);
 
             // Skip `start` lines, then take `end - start` lines — no Vec
@@ -269,13 +308,16 @@ impl PiApp {
                 output.push_str(&self.render_autocomplete_dropdown());
             }
         } else if self.agent_state != AgentState::Idle {
-            // Show spinner when processing
-            let _ = write!(
-                output,
-                "\n  {} {}\n",
-                self.spinner.view(),
-                self.styles.accent.render("Processing...")
-            );
+            if self.show_processing_status_spinner() {
+                // Show spinner while waiting on provider/tool activity, before
+                // we have visible streaming deltas.
+                let _ = write!(
+                    output,
+                    "\n  {} {}\n",
+                    self.spinner.view(),
+                    self.styles.accent.render("Processing...")
+                );
+            }
 
             if let Some(pending_queue) = self.render_pending_message_queue() {
                 output.push_str(&pending_queue);
@@ -625,7 +667,10 @@ impl PiApp {
     /// all messages during streaming. Streaming content (current_response)
     /// always renders fresh.
     pub fn build_conversation_content(&self) -> String {
-        let is_streaming = !self.current_response.is_empty() || !self.current_thinking.is_empty();
+        let has_streaming_state =
+            !self.current_response.is_empty() || !self.current_thinking.is_empty();
+        let has_visible_streaming_tail = !self.current_response.is_empty()
+            || (self.thinking_visible && !self.current_thinking.is_empty());
 
         // PERF-7: Reuse the pre-allocated conversation buffer from the
         // previous frame. `take_conversation_buffer()` clears the buffer
@@ -634,11 +679,13 @@ impl PiApp {
 
         // PERF-2 fast path: during streaming, reuse the cached prefix
         // (all finalized messages) and only rebuild the streaming tail.
-        if is_streaming && self.message_render_cache.prefix_valid(self.messages.len()) {
+        if has_streaming_state && self.message_render_cache.prefix_valid(self.messages.len()) {
             // PERF-7: Append prefix directly into the reusable buffer
             // instead of cloning via prefix_get().
             self.message_render_cache.prefix_append_to(&mut output);
-            self.append_streaming_tail(&mut output);
+            if has_visible_streaming_tail {
+                self.append_streaming_tail(&mut output);
+            }
             return output;
         }
 
@@ -665,7 +712,7 @@ impl PiApp {
             .prefix_set(&output, self.messages.len());
 
         // Append streaming content if active.
-        if is_streaming {
+        if has_visible_streaming_tail {
             self.append_streaming_tail(&mut output);
         }
 
@@ -681,22 +728,22 @@ impl PiApp {
             self.styles.success_bold.render("Assistant:")
         );
 
+        let content_width = self.term_width.saturating_sub(4).max(1);
+
         // Show thinking if present
         if self.thinking_visible && !self.current_thinking.is_empty() {
             let truncated = truncate(&self.current_thinking, 100);
-            let _ = writeln!(
-                output,
-                "  {}",
-                self.styles
-                    .muted_italic
-                    .render(&format!("Thinking: {truncated}"))
-            );
+            let thinking_line = format!("Thinking: {truncated}");
+            for segment in wrapped_line_segments(&thinking_line, content_width) {
+                let _ = writeln!(output, "  {}", self.styles.muted_italic.render(segment));
+            }
         }
 
-        // Show response (no markdown rendering while streaming)
+        // Show response (no markdown rendering while streaming), but wrap
+        // explicitly so renderer row mapping remains stable.
         if !self.current_response.is_empty() {
-            for line in self.current_response.lines() {
-                let _ = writeln!(output, "  {line}");
+            for line in self.current_response.split('\n') {
+                push_wrapped_plain_line(output, line.trim_end_matches('\r'), content_width);
             }
         }
     }
@@ -1397,5 +1444,26 @@ mod tests {
         assert!(rendered.contains("pending 256/256"));
         assert!(rendered.contains("flush-fail 2"));
         assert!(rendered.contains("backpressure"));
+    }
+
+    #[test]
+    fn wrapped_plain_line_no_wrap_when_under_width() {
+        let mut out = String::new();
+        push_wrapped_plain_line(&mut out, "hello", 10);
+        assert_eq!(out, "  hello\n");
+    }
+
+    #[test]
+    fn wrapped_plain_line_wraps_when_over_width() {
+        let mut out = String::new();
+        push_wrapped_plain_line(&mut out, "abcdef", 4);
+        assert_eq!(out, "  abcd\n  ef\n");
+    }
+
+    #[test]
+    fn wrapped_plain_line_preserves_empty_line() {
+        let mut out = String::new();
+        push_wrapped_plain_line(&mut out, "", 8);
+        assert_eq!(out, "  \n");
     }
 }
