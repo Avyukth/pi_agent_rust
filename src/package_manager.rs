@@ -430,6 +430,97 @@ impl PackageManager {
         Ok(global.chain(project).collect())
     }
 
+    /// Best-effort synchronous package resource resolution for startup/config fast paths.
+    ///
+    /// Returns `Ok(Some(...))` when all package resources can be resolved from local state
+    /// without any install/update work. Returns `Ok(None)` when a package source would require
+    /// install/update behavior (for example, missing npm/git package files), allowing callers
+    /// to fall back to the canonical async `resolve()` path.
+    pub fn resolve_package_resources_blocking(&self) -> Result<Option<ResolvedPaths>> {
+        let roots = ResolveRoots::from_env(&self.cwd);
+        self.resolve_package_resources_with_roots_blocking(&roots)
+    }
+
+    fn resolve_package_resources_with_roots_blocking(
+        &self,
+        roots: &ResolveRoots,
+    ) -> Result<Option<ResolvedPaths>> {
+        let global = read_settings_snapshot(&roots.global_settings_path)?;
+        let project = read_settings_snapshot(&roots.project_settings_path)?;
+
+        let mut all_packages: Vec<ScopedPackage> = Vec::new();
+        all_packages.extend(global.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::User,
+        }));
+        all_packages.extend(project.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::Project,
+        }));
+        let package_sources = self.dedupe_packages(all_packages);
+
+        let mut accumulator = ResourceAccumulator::new();
+
+        for entry in package_sources {
+            let source_str = entry.pkg.source.trim();
+            if source_str.is_empty() {
+                continue;
+            }
+
+            let parsed = parse_source(source_str, &self.cwd);
+            let mut metadata = PathMetadata {
+                source: source_str.to_string(),
+                scope: entry.scope,
+                origin: ResourceOrigin::Package,
+                base_dir: None,
+            };
+
+            match parsed {
+                ParsedSource::Local { path } => {
+                    Self::resolve_local_extension_source(
+                        &path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &mut metadata,
+                    );
+                }
+                ParsedSource::Npm { name, .. } => {
+                    let installed_path = self
+                        .npm_install_path(&name, entry.scope)?
+                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+
+                    if !installed_path.exists() {
+                        return Ok(None);
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    );
+                }
+                ParsedSource::Git { host, path, .. } => {
+                    let installed_path = self.git_install_path(&host, &path, entry.scope);
+                    if !installed_path.exists() {
+                        return Ok(None);
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    );
+                }
+            }
+        }
+
+        Ok(Some(accumulator.into_resolved_paths()))
+    }
+
     /// Ensure all packages in settings are installed.
     /// Returns the list of packages that were newly installed.
     pub async fn ensure_packages_installed(&self) -> Result<Vec<PackageEntry>> {
