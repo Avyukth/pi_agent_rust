@@ -185,7 +185,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
-        } => match assistant_message_event.as_ref() {
+        } => match assistant_message_event {
             AssistantMessageEvent::TextDelta { delta, .. } => {
                 batcher.push_delta(StreamDeltaKind::Text, delta);
             }
@@ -250,7 +250,7 @@ async fn flush_ui_stream_batcher_with_backpressure(batcher: &StdMutex<UiStreamDe
             return;
         }
         let sender = guard.sender.clone();
-        let pending = guard.pending.drain(..).collect::<Vec<_>>();
+        let pending = std::mem::take(&mut guard.pending);
         guard.pending_bytes = 0;
         drop(guard);
         (sender, pending)

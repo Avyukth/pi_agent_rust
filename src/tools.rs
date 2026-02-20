@@ -1609,7 +1609,7 @@ impl Tool for ReadTool {
         );
         truncation.total_lines = total_lines;
 
-        let mut output_text = truncation.content.clone();
+        let mut output_text = std::mem::take(&mut truncation.content);
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
@@ -1878,7 +1878,7 @@ pub(crate) async fn run_bash_command(
     let mut output_text = if truncation.content.is_empty() {
         "(no output)".to_string()
     } else {
-        truncation.content.clone()
+        std::mem::take(&mut truncation.content)
     };
 
     let mut full_output_path = None;
@@ -3299,9 +3299,9 @@ impl Tool for GrepTool {
 
         // Apply byte truncation (no line limit since we already have match limit).
         let raw_output = output_lines.join("\n");
-        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
-        let mut output = truncation.content.clone();
+        let mut output = std::mem::take(&mut truncation.content);
         let mut notices: Vec<String> = Vec::new();
         let mut details_map = serde_json::Map::new();
 
@@ -3591,9 +3591,9 @@ impl Tool for FindTool {
 
         let result_limit_reached = relativized.len() >= effective_limit;
         let raw_output = relativized.join("\n");
-        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
-        let mut result_output = truncation.content.clone();
+        let mut result_output = std::mem::take(&mut truncation.content);
         let mut notices: Vec<String> = Vec::new();
         let mut details_map = serde_json::Map::new();
 
@@ -3784,9 +3784,9 @@ impl Tool for LsTool {
 
         // Apply byte truncation (no line limit since we already have entry limit).
         let raw_output = results.join("\n");
-        let truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
-        let mut output = truncation.content.clone();
+        let mut output = std::mem::take(&mut truncation.content);
         let mut details_map = serde_json::Map::new();
         let mut notices: Vec<String> = Vec::new();
 

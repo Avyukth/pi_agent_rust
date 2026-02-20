@@ -7,8 +7,10 @@ use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -97,7 +99,7 @@ pub struct ModelConfig {
     pub compat: Option<CompatConfig>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompatConfig {
     // ── Capability flags ────────────────────────────────────────────────
@@ -139,7 +141,7 @@ pub struct ModelAutocompleteCandidate {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyGeneratedModel {
     id: String,
@@ -175,6 +177,7 @@ const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.goo
 static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = OnceLock::new();
 static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
+static LEGACY_PROVIDER_IDS_CACHE: OnceLock<HashSet<String>> = OnceLock::new();
 static SATISFIES_RE: OnceLock<Regex> = OnceLock::new();
 const INPUT_TEXT_ONLY: [InputType; 1] = [InputType::Text];
 const INPUT_TEXT_AND_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image];
@@ -238,7 +241,54 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
         .collect()
 }
 
+fn legacy_generated_models_cache_path() -> Option<PathBuf> {
+    let checksum = crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes());
+    dirs::cache_dir().map(|dir| {
+        dir.join("pi")
+            .join("models-cache")
+            .join(format!("legacy-generated-models-{checksum:08x}.json"))
+    })
+}
+
+fn load_legacy_generated_models_cache() -> Option<Vec<LegacyGeneratedModel>> {
+    let path = legacy_generated_models_cache_path()?;
+    let cache = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<LegacyGeneratedModel>>(&cache).ok()
+}
+
+fn persist_legacy_generated_models_cache(models: &[LegacyGeneratedModel]) {
+    let Some(path) = legacy_generated_models_cache_path() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    let Ok(file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+    else {
+        return;
+    };
+    let mut writer = std::io::BufWriter::new(file);
+    if serde_json::to_writer(&mut writer, models).is_ok() && writer.flush().is_ok() {
+        let _ = fs::rename(temp_path, path);
+    }
+}
+
 fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
+    if let Some(cached) = load_legacy_generated_models_cache() {
+        return cached;
+    }
+
     let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
         tracing::warn!("Legacy model catalog missing MODELS declaration");
         return Vec::new();
@@ -282,6 +332,7 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
             .then_with(|| a.id.cmp(&b.id))
             .then_with(|| a.api.cmp(&b.api))
     });
+    persist_legacy_generated_models_cache(&models);
     models
 }
 
@@ -502,16 +553,18 @@ fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults>
     }
 }
 
-fn legacy_provider_ids() -> HashSet<String> {
-    legacy_generated_models()
-        .iter()
-        .map(|model| {
-            let provider = model.provider.trim();
-            canonical_provider_id(provider)
-                .unwrap_or(provider)
-                .to_ascii_lowercase()
-        })
-        .collect()
+fn legacy_provider_ids() -> &'static HashSet<String> {
+    LEGACY_PROVIDER_IDS_CACHE.get_or_init(|| {
+        legacy_generated_models()
+            .iter()
+            .map(|model| {
+                let provider = model.provider.trim();
+                canonical_provider_id(provider)
+                    .unwrap_or(provider)
+                    .to_ascii_lowercase()
+            })
+            .collect()
+    })
 }
 
 fn resolve_provider_api_key_cached(
@@ -551,7 +604,8 @@ fn append_upstream_nonlegacy_models(
             continue;
         }
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        if legacy_providers.contains(&canonical_provider.to_ascii_lowercase()) {
+        let canonical_provider_lower = canonical_provider.to_ascii_lowercase();
+        if legacy_providers.contains(&canonical_provider_lower) {
             continue;
         }
 
@@ -577,7 +631,7 @@ fn append_upstream_nonlegacy_models(
             }
             let dedupe_key = format!(
                 "{}::{}",
-                canonical_provider.to_ascii_lowercase(),
+                canonical_provider_lower,
                 normalized_model_id.to_ascii_lowercase()
             );
             if !seen.insert(dedupe_key) {
@@ -619,6 +673,7 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
     let mut seen = HashSet::new();
     let mut canonical_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut provider_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut parsed_api_cache: HashMap<String, String> = HashMap::new();
 
     for legacy in legacy_generated_models() {
         let provider = legacy.provider.trim();
@@ -641,11 +696,16 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         }
 
         let routing_defaults = provider_routing_defaults(provider);
-        let parsed_api: Api = legacy
-            .api
-            .parse()
-            .unwrap_or_else(|_| Api::Custom(legacy.api.clone()));
-        let api_string = parsed_api.to_string();
+        let api_string = parsed_api_cache
+            .entry(legacy.api.clone())
+            .or_insert_with(|| {
+                legacy
+                    .api
+                    .parse::<Api>()
+                    .unwrap_or_else(|_| Api::Custom(legacy.api.clone()))
+                    .to_string()
+            })
+            .clone();
 
         let base_url = if !legacy.base_url.trim().is_empty() {
             legacy.base_url.trim().to_string()

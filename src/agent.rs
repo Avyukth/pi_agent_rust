@@ -206,12 +206,12 @@ pub enum AgentEvent {
     /// Agent lifecycle start.
     AgentStart {
         #[serde(rename = "sessionId")]
-        session_id: String,
+        session_id: Arc<str>,
     },
     /// Agent lifecycle end with all new messages.
     AgentEnd {
         #[serde(rename = "sessionId")]
-        session_id: String,
+        session_id: Arc<str>,
         messages: Vec<Message>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -219,7 +219,7 @@ pub enum AgentEvent {
     /// Turn lifecycle start (assistant response + tool calls).
     TurnStart {
         #[serde(rename = "sessionId")]
-        session_id: String,
+        session_id: Arc<str>,
         #[serde(rename = "turnIndex")]
         turn_index: usize,
         timestamp: i64,
@@ -227,7 +227,7 @@ pub enum AgentEvent {
     /// Turn lifecycle end with tool results.
     TurnEnd {
         #[serde(rename = "sessionId")]
-        session_id: String,
+        session_id: Arc<str>,
         #[serde(rename = "turnIndex")]
         turn_index: usize,
         message: Message,
@@ -240,7 +240,7 @@ pub enum AgentEvent {
     MessageUpdate {
         message: Message,
         #[serde(rename = "assistantMessageEvent")]
-        assistant_message_event: Box<AssistantMessageEvent>,
+        assistant_message_event: AssistantMessageEvent,
     },
     /// Message lifecycle end.
     MessageEnd { message: Message },
@@ -670,12 +670,13 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        let session_id = self
+        let session_id: Arc<str> = self
             .config
             .stream_options
             .session_id
-            .clone()
-            .unwrap_or_default();
+            .as_deref()
+            .unwrap_or("")
+            .into();
         let mut iterations = 0usize;
         let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
@@ -1026,10 +1027,10 @@ impl Agent {
                         let abort_arc = Arc::new(self.build_abort_message(last_partial));
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&abort_arc)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::Error {
+                            assistant_message_event: AssistantMessageEvent::Error {
                                 reason: StopReason::Aborted,
                                 error: Arc::clone(&abort_arc),
-                            }),
+                            },
                         });
                         return Ok(self.finalize_assistant_message(
                             Arc::try_unwrap(abort_arc).unwrap_or_else(|a| (*a).clone()),
@@ -1058,9 +1059,9 @@ impl Agent {
                     sent_start = true;
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(Arc::clone(&shared)),
-                        assistant_message_event: Box::new(AssistantMessageEvent::Start {
+                        assistant_message_event: AssistantMessageEvent::Start {
                             partial: shared,
-                        }),
+                        },
                     });
                 }
                 StreamEvent::TextStart { content_index, .. } => {
@@ -1078,10 +1079,10 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::TextStart {
+                            assistant_message_event: AssistantMessageEvent::TextStart {
                                 content_index,
                                 partial: shared,
-                            }),
+                            },
                         });
                     }
                 }
@@ -1108,11 +1109,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                            assistant_message_event: AssistantMessageEvent::TextDelta {
                                 content_index,
                                 delta,
                                 partial: shared,
-                            }),
+                            },
                         });
                     }
                 }
@@ -1139,11 +1140,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::TextEnd {
+                            assistant_message_event: AssistantMessageEvent::TextEnd {
                                 content_index,
                                 content,
                                 partial: shared,
-                            }),
+                            },
                         });
                     }
                 }
@@ -1165,12 +1166,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(
+                            assistant_message_event:
                                 AssistantMessageEvent::ThinkingStart {
                                     content_index,
                                     partial: shared,
                                 },
-                            ),
                         });
                     }
                 }
@@ -1197,13 +1197,12 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(
+                            assistant_message_event:
                                 AssistantMessageEvent::ThinkingDelta {
                                     content_index,
                                     delta,
                                     partial: shared,
                                 },
-                            ),
                         });
                     }
                 }
@@ -1230,11 +1229,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::ThinkingEnd {
+                            assistant_message_event: AssistantMessageEvent::ThinkingEnd {
                                 content_index,
                                 content,
                                 partial: shared,
-                            }),
+                            },
                         });
                     }
                 }
@@ -1258,12 +1257,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(
+                            assistant_message_event:
                                 AssistantMessageEvent::ToolCallStart {
                                     content_index,
                                     partial: shared,
                                 },
-                            ),
                         });
                     }
                 }
@@ -1284,13 +1282,12 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(
+                            assistant_message_event:
                                 AssistantMessageEvent::ToolCallDelta {
                                     content_index,
                                     delta,
                                     partial: shared,
                                 },
-                            ),
                         });
                     }
                 }
@@ -1317,11 +1314,11 @@ impl Agent {
                         }
                         on_event(AgentEvent::MessageUpdate {
                             message: Message::Assistant(Arc::clone(&shared)),
-                            assistant_message_event: Box::new(AssistantMessageEvent::ToolCallEnd {
+                            assistant_message_event: AssistantMessageEvent::ToolCallEnd {
                                 content_index,
                                 tool_call,
                                 partial: shared,
-                            }),
+                            },
                         });
                     }
                 }
@@ -3495,7 +3492,7 @@ mod abort_tests {
             AgentEvent::MessageUpdate {
                 assistant_message_event,
                 ..
-            } => match assistant_message_event.as_ref() {
+            } => match &assistant_message_event {
                 AssistantMessageEvent::Error {
                     reason: StopReason::Aborted,
                     ..

@@ -1763,10 +1763,11 @@ impl PiApp {
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();
 
-        // Handle our custom Pi messages.
-        if let Some(pi_msg) = msg.downcast_ref::<PiMsg>() {
-            return self.handle_pi_message(pi_msg.clone());
-        }
+        // Handle our custom Pi messages (take ownership to avoid per-token clone).
+        let msg = match msg.try_downcast::<PiMsg>() {
+            Ok(pi_msg) => return self.handle_pi_message(pi_msg),
+            Err(original) => original,
+        };
 
         if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
             self.set_terminal_size(size.width as usize, size.height as usize);

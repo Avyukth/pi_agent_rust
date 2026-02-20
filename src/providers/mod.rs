@@ -261,7 +261,7 @@ fn suggest_similar_providers(input: &str) -> Vec<String> {
         }
     }
 
-    matches.sort_by_key(|(score, name)| (*score, name.clone()));
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     matches.dedup_by(|a, b| a.1 == b.1);
     matches.truncate(3);
     matches.into_iter().map(|(_, name)| name).collect()

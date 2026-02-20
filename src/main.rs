@@ -2832,11 +2832,16 @@ fn list_providers() {
     let env_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(8);
     let api_w = rows.iter().map(|r| r.4.len()).max().unwrap_or(0).max(3);
 
-    println!(
+    // Buffer all output to reduce write syscalls from O(rows) to O(1).
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let _ = writeln!(
+        out,
         "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
         "provider", "name", "aliases", "auth env", "api",
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
         "-".repeat(id_w),
         "-".repeat(name_w),
@@ -2845,11 +2850,12 @@ fn list_providers() {
         "-".repeat(api_w),
     );
     for (id, name, aliases, env_keys, api) in &rows {
-        println!(
+        let _ = writeln!(
+            out,
             "{id:<id_w$}  {name:<name_w$}  {aliases:<alias_w$}  {env_keys:<env_w$}  {api:<api_w$}"
         );
     }
-    println!("\n{} providers available.", rows.len());
+    let _ = writeln!(out, "\n{} providers available.", rows.len());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
