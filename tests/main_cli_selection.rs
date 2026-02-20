@@ -532,6 +532,24 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
 }
 
 #[test]
+fn process_file_arguments_escapes_special_chars_in_file_tag_name() {
+    let harness = TestHarness::new("process_file_arguments_escapes_special_chars_in_file_tag_name");
+    let file_path = harness.create_file("unsafe\"<&>.txt", "hello\n");
+    let args = vec![file_path.to_string_lossy().to_string()];
+
+    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("process ok");
+    assert!(processed.text.contains("&quot;"));
+    assert!(processed.text.contains("&lt;"));
+    assert!(processed.text.contains("&gt;"));
+    assert!(processed.text.contains("&amp;"));
+    assert!(
+        !processed
+            .text
+            .contains(&format!("<file name=\"{}\">", file_path.display()))
+    );
+}
+
+#[test]
 fn apply_piped_stdin_inserts_message_and_sets_print() {
     let mut cli = cli::Cli::parse_from(["pi", "hello", "world"]);
     apply_piped_stdin(&mut cli, Some("stdin".to_string()));

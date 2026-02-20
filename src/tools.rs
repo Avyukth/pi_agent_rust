@@ -682,6 +682,130 @@ pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
     normalize_dot_segments(path)
 }
 
+fn escape_file_tag_attribute(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '"' => escaped.push_str("&quot;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\n' => escaped.push_str("&#10;"),
+            '\r' => escaped.push_str("&#13;"),
+            '\t' => escaped.push_str("&#9;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escaped_file_tag_name(path: &Path) -> String {
+    escape_file_tag_attribute(&path.display().to_string())
+}
+
+fn append_file_notice_block(out: &mut String, path: &Path, notice: &str) {
+    let path_str = escaped_file_tag_name(path);
+    let _ = writeln!(out, "<file name=\"{path_str}\">\n{notice}\n</file>");
+}
+
+fn append_image_file_ref(out: &mut String, path: &Path, note: Option<&str>) {
+    let path_str = escaped_file_tag_name(path);
+    match note {
+        Some(text) => {
+            let _ = writeln!(out, "<file name=\"{path_str}\">{text}</file>");
+        }
+        None => {
+            let _ = writeln!(out, "<file name=\"{path_str}\"></file>");
+        }
+    }
+}
+
+fn append_text_file_block(out: &mut String, path: &Path, bytes: &[u8]) {
+    let content = String::from_utf8_lossy(bytes);
+    let path_str = escaped_file_tag_name(path);
+    let _ = writeln!(out, "<file name=\"{path_str}\">");
+
+    let truncation = truncate_head(content.into_owned(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let needs_trailing_newline = !truncation.truncated && !truncation.content.ends_with('\n');
+    out.push_str(&truncation.content);
+
+    if truncation.truncated {
+        let _ = write!(
+            out,
+            "\n... [Truncated: showing {}/{} lines, {}/{} bytes]",
+            truncation.output_lines,
+            truncation.total_lines,
+            format_size(truncation.output_bytes),
+            format_size(truncation.total_bytes)
+        );
+    } else if needs_trailing_newline {
+        out.push('\n');
+    }
+    let _ = writeln!(out, "</file>");
+}
+
+fn maybe_append_image_argument(
+    out: &mut ProcessedFiles,
+    absolute_path: &Path,
+    bytes: &[u8],
+    auto_resize_images: bool,
+) -> Result<bool> {
+    let Some(mime_type) = detect_supported_image_mime_type_from_bytes(bytes) else {
+        return Ok(false);
+    };
+
+    let resized = if auto_resize_images {
+        resize_image_if_needed(bytes, mime_type)?
+    } else {
+        ResizedImage::original(bytes.to_vec(), mime_type)
+    };
+
+    if resized.bytes.len() > IMAGE_MAX_BYTES {
+        let msg = if resized.resized {
+            format!(
+                "[Image is too large ({} bytes) after resizing. Max allowed is {} bytes.]",
+                resized.bytes.len(),
+                IMAGE_MAX_BYTES
+            )
+        } else {
+            format!(
+                "[Image is too large ({} bytes). Max allowed is {} bytes.]",
+                resized.bytes.len(),
+                IMAGE_MAX_BYTES
+            )
+        };
+        append_file_notice_block(&mut out.text, absolute_path, &msg);
+        return Ok(true);
+    }
+
+    let base64_data =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
+    out.images.push(ImageContent {
+        data: base64_data,
+        mime_type: resized.mime_type.to_string(),
+    });
+
+    let note = if resized.resized {
+        if let (Some(ow), Some(oh), Some(w), Some(h)) = (
+            resized.original_width,
+            resized.original_height,
+            resized.width,
+            resized.height,
+        ) {
+            let scale = f64::from(ow) / f64::from(w);
+            Some(format!(
+                "[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    append_image_file_ref(&mut out.text, absolute_path, note.as_deref());
+    Ok(true)
+}
+
 /// Process `@file` arguments into a single text prefix and image attachments.
 ///
 /// Matches the legacy TypeScript behavior:
@@ -711,12 +835,14 @@ pub fn process_file_arguments(
         }
 
         if meta.len() > READ_TOOL_MAX_BYTES {
-            let path_str = absolute_path.display();
-            let _ = writeln!(
-                out.text,
-                "<file name=\"{path_str}\">\n[File is too large ({} bytes). Max allowed is {} bytes.]\n</file>",
-                meta.len(),
-                READ_TOOL_MAX_BYTES
+            append_file_notice_block(
+                &mut out.text,
+                &absolute_path,
+                &format!(
+                    "[File is too large ({} bytes). Max allowed is {} bytes.]",
+                    meta.len(),
+                    READ_TOOL_MAX_BYTES
+                ),
             );
             continue;
         }
@@ -728,88 +854,11 @@ pub fn process_file_arguments(
             )
         })?;
 
-        if let Some(mime_type) = detect_supported_image_mime_type_from_bytes(&bytes) {
-            let resized = if auto_resize_images {
-                resize_image_if_needed(&bytes, mime_type)?
-            } else {
-                ResizedImage::original(bytes, mime_type)
-            };
-
-            if resized.bytes.len() > IMAGE_MAX_BYTES {
-                let path_str = absolute_path.display();
-                let msg = if resized.resized {
-                    format!(
-                        "[Image is too large ({} bytes) after resizing. Max allowed is {} bytes.]",
-                        resized.bytes.len(),
-                        IMAGE_MAX_BYTES
-                    )
-                } else {
-                    format!(
-                        "[Image is too large ({} bytes). Max allowed is {} bytes.]",
-                        resized.bytes.len(),
-                        IMAGE_MAX_BYTES
-                    )
-                };
-
-                let _ = writeln!(out.text, "<file name=\"{path_str}\">\n{msg}\n</file>");
-                continue;
-            }
-
-            let base64_data =
-                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
-            out.images.push(ImageContent {
-                data: base64_data,
-                mime_type: resized.mime_type.to_string(),
-            });
-
-            let note = if resized.resized {
-                if let (Some(ow), Some(oh), Some(w), Some(h)) = (
-                    resized.original_width,
-                    resized.original_height,
-                    resized.width,
-                    resized.height,
-                ) {
-                    let scale = f64::from(ow) / f64::from(w);
-                    format!(
-                        "[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
-                    )
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            };
-
-            let path_str = absolute_path.display();
-            if note.is_empty() {
-                let _ = writeln!(out.text, "<file name=\"{path_str}\"></file>");
-            } else {
-                let _ = writeln!(out.text, "<file name=\"{path_str}\">{note}</file>");
-            }
+        if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
             continue;
         }
 
-        let content = String::from_utf8_lossy(&bytes);
-        let path_str = absolute_path.display();
-        let _ = writeln!(out.text, "<file name=\"{path_str}\">");
-
-        let truncation = truncate_head(content.into_owned(), DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-        let needs_trailing_newline = !truncation.truncated && !truncation.content.ends_with('\n');
-        out.text.push_str(&truncation.content);
-
-        if truncation.truncated {
-            let _ = write!(
-                out.text,
-                "\n... [Truncated: showing {}/{} lines, {}/{} bytes]",
-                truncation.output_lines,
-                truncation.total_lines,
-                format_size(truncation.output_bytes),
-                format_size(truncation.total_bytes)
-            );
-        } else if needs_trailing_newline {
-            out.text.push('\n');
-        }
-        let _ = writeln!(out.text, "</file>");
+        append_text_file_block(&mut out.text, &absolute_path, &bytes);
     }
 
     Ok(out)
