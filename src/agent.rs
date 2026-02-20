@@ -690,13 +690,14 @@ impl Agent {
         on_event(agent_start_event);
 
         for prompt in prompts {
+            self.messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
             });
-            self.messages.push(prompt.clone());
-            let end_msg = prompt.clone();
-            new_messages.push(prompt); // move, no clone
-            on_event(AgentEvent::MessageEnd { message: end_msg });
+            on_event(AgentEvent::MessageEnd {
+                message: prompt.clone(),
+            });
+            new_messages.push(prompt);
         }
 
         // Delivery boundary: start of turn (steering messages queued while idle).
@@ -718,13 +719,14 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
+                    self.messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
                     });
-                    self.messages.push(message.clone());
-                    let end_msg = message.clone();
-                    new_messages.push(message); // move, no clone
-                    on_event(AgentEvent::MessageEnd { message: end_msg });
+                    on_event(AgentEvent::MessageEnd {
+                        message: message.clone(),
+                    });
+                    new_messages.push(message);
                 }
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -1545,18 +1547,9 @@ impl Agent {
             // If `None`, the tool was skipped/aborted.
             if let Some((output, is_error)) = tool_outputs[index].take() {
                 // Tool executed normally.
-                // Always emit ToolExecutionEnd to close the lifecycle.
-                on_event(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tool_call.id.clone(),
-                    tool_name: tool_call.name.clone(),
-                    result: ToolOutput {
-                        content: output.content.clone(),
-                        details: output.details.clone(),
-                        is_error,
-                    },
-                    is_error,
-                });
-
+                // Build ToolResultMessage first and wrap in Arc; the message
+                // clone below is O(1) Arc refcount bump since ToolResult is
+                // already Arc-wrapped in the Message enum.
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
@@ -1566,14 +1559,26 @@ impl Agent {
                     timestamp: Utc::now().timestamp_millis(),
                 });
 
+                // Emit ToolExecutionEnd. We clone content/details from the
+                // Arc'd result — same data, no extra source clone.
+                on_event(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_result.tool_call_id.clone(),
+                    tool_name: tool_result.tool_name.clone(),
+                    result: ToolOutput {
+                        content: tool_result.content.clone(),
+                        details: tool_result.details.clone(),
+                        is_error,
+                    },
+                    is_error,
+                });
+
                 let msg = Message::ToolResult(Arc::clone(&tool_result));
                 self.messages.push(msg.clone());
                 on_event(AgentEvent::MessageStart {
                     message: msg.clone(),
                 });
-                let end_msg = msg.clone();
-                new_messages.push(msg);
-                on_event(AgentEvent::MessageEnd { message: end_msg });
+                new_messages.push(msg.clone());
+                on_event(AgentEvent::MessageEnd { message: msg });
 
                 results.push(tool_result);
             } else if steering_messages.is_some() {

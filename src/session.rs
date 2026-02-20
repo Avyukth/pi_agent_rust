@@ -2362,7 +2362,7 @@ impl Session {
         }
 
         if let Some((compaction_idx, compaction)) = last_compaction {
-            let mut messages = Vec::new();
+            let mut messages = Vec::with_capacity(path_len);
             let summary_message = SessionMessage::CompactionSummary {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
@@ -2410,7 +2410,7 @@ impl Session {
             return messages;
         }
 
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(path_len);
         for idx in 0..path_len {
             Self::append_model_message_for_entry(&mut messages, entry_at(idx));
         }
