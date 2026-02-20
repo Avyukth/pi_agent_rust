@@ -139,7 +139,7 @@ fn truncate_head_unicode_multibyte() {
 fn truncate_tail_empty_content() {
     let result = truncate_tail("", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 1);
+    assert_eq!(result.total_lines, 0);
     assert_eq!(result.total_bytes, 0);
 }
 
@@ -185,12 +185,12 @@ fn truncate_tail_single_long_line_partial_output() {
 
 #[test]
 fn truncate_tail_file_ending_with_newline() {
-    // File "a\n" has 2 lines: "a" and empty string after newline
+    // A trailing newline terminates the current line; it does not add another line.
     let content = "a\n";
     let result = truncate_tail(content, 1, 1024);
-    // With max_lines=1, we keep only last line (empty string after \n)
-    // Actually the tail keeps the last line which is empty
-    assert!(result.truncated);
+    assert!(!result.truncated);
+    assert_eq!(result.total_lines, 1);
+    assert_eq!(result.content, content);
 }
 
 #[test]
@@ -198,6 +198,9 @@ fn truncate_tail_max_lines_zero() {
     let result = truncate_tail("hello", 0, 1024);
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
+    assert_eq!(result.output_lines, 0);
+    assert_eq!(result.output_bytes, 0);
+    assert!(result.content.is_empty());
 }
 
 #[test]

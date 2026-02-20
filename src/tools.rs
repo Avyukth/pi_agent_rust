@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::strip_unc_prefix;
 use crate::model::{ContentBlock, ImageContent, TextContent};
-use asupersync::io::AsyncWriteExt;
+use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,9 @@ pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
 
 const BASH_TERMINATE_GRACE_SECS: u64 = 5;
 
+/// Hard limit for bash output file size (100MB) to prevent disk exhaustion DoS.
+pub(crate) const BASH_FILE_LIMIT_BYTES: usize = 100 * 1024 * 1024;
+
 /// Result of truncation operation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,8 +165,18 @@ pub fn truncate_head(
 ) -> TruncationResult {
     let mut content = content.into();
     let total_bytes = content.len();
-    // Count total lines without collecting into Vec — just count newlines + 1.
-    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
+    // Count lines correctly: trailing newline terminates the last line, it doesn't start a
+    // new one. "a\n" -> 1 line. "a\nb" -> 2 lines. "a" -> 1 line. "" -> 0 lines.
+    let total_lines = {
+        let nl = memchr::memchr_iter(b'\n', content.as_bytes()).count();
+        if content.is_empty() {
+            0
+        } else if content.ends_with('\n') {
+            nl
+        } else {
+            nl + 1
+        }
+    };
 
     // No truncation needed — reuse the owned String (zero-copy move).
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -251,6 +264,7 @@ pub fn truncate_head(
 /// Takes ownership of the input `String` to avoid allocation in the common
 /// no-truncation case (content moved, zero-copy). When truncation is needed,
 /// the prefix is drained in-place, reusing the original buffer.
+#[allow(clippy::too_many_lines)]
 pub fn truncate_tail(
     content: impl Into<String>,
     max_lines: usize,
@@ -258,7 +272,39 @@ pub fn truncate_tail(
 ) -> TruncationResult {
     let mut content = content.into();
     let total_bytes = content.len();
-    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
+
+    // Count lines correctly: trailing newline terminates the last line, it doesn't start a new one.
+    // "a\n" -> 1 line. "a\nb" -> 2 lines. "a" -> 1 line. "" -> 0 lines (handled below).
+    let mut total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count();
+    if !content.ends_with('\n') && !content.is_empty() {
+        total_lines += 1;
+    }
+    if content.is_empty() {
+        total_lines = 0;
+    }
+
+    // Explicitly handle zero-line budgets. Keeping any line would violate the
+    // contract (`output_lines <= max_lines`) and proptest invariants.
+    if max_lines == 0 {
+        let truncated = !content.is_empty();
+        return TruncationResult {
+            content: String::new(),
+            truncated,
+            truncated_by: if truncated {
+                Some(TruncatedBy::Lines)
+            } else {
+                None
+            },
+            total_lines,
+            total_bytes,
+            output_lines: 0,
+            output_bytes: 0,
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+            max_lines,
+            max_bytes,
+        };
+    }
 
     // No truncation needed — reuse the owned String (zero-copy move).
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -280,7 +326,6 @@ pub fn truncate_tail(
     let mut line_count = 0usize;
     let mut byte_count = 0usize;
     let mut start_idx = content.len();
-    let mut search_end = content.len();
     let mut partial_output: Option<String> = None;
     let mut truncated_by = None;
     let mut last_line_partial = false;
@@ -288,32 +333,32 @@ pub fn truncate_tail(
     // Scope the immutable borrow so we can mutate `content` afterwards.
     {
         let bytes = content.as_bytes();
-        loop {
-            if line_count >= max_lines {
-                truncated_by = Some(TruncatedBy::Lines);
-                break;
-            }
+        // Initialize search_limit outside the loop to track progress backwards.
+        // If the file ends with a newline, we skip it for the purpose of finding
+        // the *start* of the last line, but start_idx (at len) includes it.
+        let mut search_limit = bytes.len();
+        if search_limit > 0 && bytes[search_limit - 1] == b'\n' {
+            search_limit -= 1;
+        }
 
-            let prev_newline = memchr::memrchr(b'\n', &bytes[..search_end]);
+        loop {
+            // Find the *previous* newline.
+            let prev_newline = memchr::memrchr(b'\n', &bytes[..search_limit]);
             let line_start = prev_newline.map_or(0, |idx| idx + 1);
-            let added_bytes = (search_end - line_start) + usize::from(line_count > 0);
+
+            // Bytes for this line (including its newline if it's not the last one,
+            // or if the file ends with newline). start_idx is the end of the
+            // segment we are accumulating.
+            let added_bytes = start_idx - line_start;
 
             if byte_count + added_bytes > max_bytes {
-                // Preserve existing behavior: partial suffix is only allowed when no full
-                // line has been included yet and there is at least one byte available.
-                //
-                // Fix: Also allow partial fallback if we have only consumed the trailing
-                // empty line (line_count == 1 && byte_count == 0), which happens for
-                // files ending in newline (e.g. "a\n") when the limit is small.
+                // Truncate!
+                // Try to take a partial line if we haven't collected any full lines yet.
                 let remaining = max_bytes.saturating_sub(byte_count);
-                if remaining > 0 && (line_count == 0 || (line_count == 1 && byte_count == 0)) {
-                    // Use content[line_start..] (not ..search_end) so trailing
-                    // newlines are included, preserving the suffix invariant:
-                    // `input.ends_with(&result.content)` must hold.
-                    let truncated =
-                        truncate_string_to_bytes_from_end(&content[line_start..], max_bytes);
-                    line_count = memchr::memchr_iter(b'\n', truncated.as_bytes()).count() + 1;
-                    partial_output = Some(truncated);
+                if remaining > 0 && line_count == 0 {
+                    let chunk = &content[line_start..start_idx];
+                    let truncated_chunk = truncate_string_to_bytes_from_end(chunk, remaining);
+                    partial_output = Some(truncated_chunk);
                     last_line_partial = true;
                 }
                 truncated_by = Some(TruncatedBy::Bytes);
@@ -324,19 +369,70 @@ pub fn truncate_tail(
             byte_count += added_bytes;
             start_idx = line_start;
 
+            if line_count >= max_lines {
+                truncated_by = Some(TruncatedBy::Lines);
+                break;
+            }
+
             if line_start == 0 {
                 break;
             }
-            search_end = line_start - 1;
+
+            // Prepare for next iter.
+            // We just consumed line starting at `line_start`.
+            // The separator before it is at `line_start - 1`.
+            // That separator is the `\n` of the *previous* line.
+            // We want to search *before* it.
+            search_limit = line_start - 1;
         }
     } // immutable borrow of `content` released
 
     // Extract the suffix: drain the prefix in-place (reuses the buffer),
     // or use the partial output from the byte-truncation path.
-    let output = partial_output.unwrap_or_else(|| {
+    let partial_suffix = if last_line_partial {
+        Some(content[start_idx..].to_string())
+    } else {
+        None
+    };
+
+    let mut output = partial_output.unwrap_or_else(|| {
         drop(content.drain(..start_idx));
         content
     });
+
+    // If we have a partial last line, we need to append the *rest* of the content
+    // that we successfully kept (the `byte_count` lines).
+    // Wait, `partial_output` replaces the *current line*.
+    // The previous successful lines are in `content[old_start_idx..]`.
+    // My logic above for partial output:
+    // `truncated_chunk` is the partial tail of the *current line*.
+    // We need to prepend it to the lines we already collected?
+    // Actually, `content` is the full string.
+    // We are scanning backwards.
+    // `start_idx` tracks the start of the valid suffix so far.
+    // When we hit the byte limit, we are at `line_start..start_idx`.
+    // `truncated_chunk` is the tail of *that* segment.
+    // So final output = `truncated_chunk` + `content[start_idx..]`.
+
+    if let Some(suffix) = partial_suffix {
+        // Need to reconstruct.
+        // `output` is currently just the truncated chunk.
+        // We need to append the previously accumulated suffix.
+        // `content` still holds everything.
+        // `start_idx` points to the start of the *valid* suffix from previous iters.
+        output.push_str(&suffix);
+        // Recalculate line count from the final output.
+        // Since truncated output is bounded (<= max_bytes), this scan is cheap.
+        let mut count = memchr::memchr_iter(b'\n', output.as_bytes()).count();
+        if !output.ends_with('\n') && !output.is_empty() {
+            count += 1;
+        }
+        if output.is_empty() {
+            count = 0;
+        }
+        line_count = count;
+    }
+
     let output_bytes = output.len();
 
     TruncationResult {
@@ -638,6 +734,26 @@ pub fn process_file_arguments(
             } else {
                 ResizedImage::original(bytes, mime_type)
             };
+
+            if resized.bytes.len() > IMAGE_MAX_BYTES {
+                let path_str = absolute_path.display();
+                let msg = if resized.resized {
+                    format!(
+                        "[Image is too large ({} bytes) after resizing. Max allowed is {} bytes.]",
+                        resized.bytes.len(),
+                        IMAGE_MAX_BYTES
+                    )
+                } else {
+                    format!(
+                        "[Image is too large ({} bytes). Max allowed is {} bytes.]",
+                        resized.bytes.len(),
+                        IMAGE_MAX_BYTES
+                    )
+                };
+
+                let _ = writeln!(out.text, "<file name=\"{path_str}\">\n{msg}\n</file>");
+                continue;
+            }
 
             let base64_data =
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
@@ -1077,6 +1193,25 @@ impl ReadTool {
     }
 }
 
+async fn read_some<R>(reader: &mut R, dst: &mut [u8]) -> std::io::Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    if dst.is_empty() {
+        return Ok(0);
+    }
+
+    futures::future::poll_fn(|cx| {
+        let mut read_buf = ReadBuf::new(dst);
+        match std::pin::Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
+            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(read_buf.filled().len())),
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReadTool {
@@ -1122,27 +1257,19 @@ impl Tool for ReadTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        use asupersync::io::{AsyncRead, AsyncReadExt, ReadBuf, SeekFrom};
-        use std::pin::Pin;
-        use std::task::Poll;
-
-        async fn read_some<R: AsyncRead + Unpin>(
-            reader: &mut R,
-            dst: &mut [u8],
-        ) -> std::io::Result<usize> {
-            futures::future::poll_fn(|cx| {
-                let mut read_buf = ReadBuf::new(dst);
-                match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-                }
-            })
-            .await
-        }
-
         let input: ReadInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+
+        if matches!(input.limit, Some(limit) if limit <= 0) {
+            return Err(Error::validation(
+                "`limit` must be greater than 0".to_string(),
+            ));
+        }
+        if matches!(input.offset, Some(offset) if offset < 0) {
+            return Err(Error::validation(
+                "`offset` must be non-negative".to_string(),
+            ));
+        }
 
         let path = resolve_read_path(&input.path, &self.cwd);
 
@@ -1190,10 +1317,15 @@ impl Tool for ReadTool {
 
             // For images, we must read the whole file to resize/encode.
             // Since we checked metadata len above, this is safe up to READ_TOOL_MAX_BYTES,
-            // but we double-check against IMAGE_MAX_BYTES.
+            // but we double-check against IMAGE_MAX_BYTES using take() to avoid reading
+            // more than necessary into memory.
             let mut all_bytes = Vec::with_capacity(initial_read);
             all_bytes.extend_from_slice(initial_bytes);
-            file.read_to_end(&mut all_bytes)
+
+            let remaining_limit = IMAGE_MAX_BYTES.saturating_sub(initial_read);
+            let mut limiter = file.take((remaining_limit as u64).saturating_add(1));
+            limiter
+                .read_to_end(&mut all_bytes)
                 .await
                 .map_err(|e| Error::tool("read", format!("Failed to read image: {e}")))?;
 
@@ -1251,18 +1383,6 @@ impl Tool for ReadTool {
         // 1. Total line count.
         // 2. Content for the requested range (offset/limit) OR head/tail if no range.
 
-        // If range is requested, we can just scan line endings until offset, capture, then stop.
-        // BUT, user might want "total lines" context. The original implementation provided `total_file_lines`.
-        // To provide `total_file_lines`, we MUST scan the whole file.
-        // `memchr` is very fast, so scanning 100MB is cheap. Allocating 100MB is expensive.
-        //
-        // Strategy:
-        // - Stream file in chunks (e.g. 64KB).
-        // - Count newlines.
-        // - Maintain a buffer for "content we want to keep".
-        //   - If no range: Keep first N bytes (head) and last N bytes (tail).
-        //   - If range: Keep bytes between line X and Y.
-
         // Reset file to start if we read some bytes
         if initial_read > 0 {
             file.seek(SeekFrom::Start(0))
@@ -1270,23 +1390,27 @@ impl Tool for ReadTool {
                 .map_err(|e| Error::tool("read", format!("Failed to seek: {e}")))?;
         }
 
-        let mut total_lines = 1; // Start at line 1
-        // Simplified approach: Stream and collect "relevant" bytes.
-        // If we collect > 2x limit, stop collecting but keep scanning for line count?
-        // Or just stop? Legacy stopped reading if content > 2*MAX_BYTES.
-        // Let's stick to the legacy "stop reading" safety check for now to be safe,
-        // but optimized to not load everything if we don't need it.
+        let mut raw_content = Vec::new();
+        let mut newlines_seen = 0usize;
 
-        // Actually, legacy `read` read the WHOLE file, then sliced.
-        // We want to avoid reading the whole file into RAM.
+        // Input offset is 1-based. Convert to 0-based index.
+        let start_line_idx = match input.offset {
+            Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
+            _ => 0,
+        };
+        let limit_lines = input
+            .limit
+            .map_or(usize::MAX, |l| l.try_into().unwrap_or(usize::MAX));
+        let end_line_idx = start_line_idx.saturating_add(limit_lines);
 
+        let mut collecting = start_line_idx == 0;
         let mut buf = vec![0u8; 64 * 1024].into_boxed_slice(); // 64KB chunks
+        let mut last_byte_was_newline = false;
 
-        // If no range specified, we default to reading the start (and potentially tail).
-        // Handling tail optimization in a single pass is tricky without a circular buffer.
-        // Let's just implement the "read all until limit" optimization first.
-
-        let mut raw_content = Vec::with_capacity(initial_read.min(DEFAULT_MAX_BYTES * 2));
+        // We need to track total_lines accurately for the output.
+        // We will respect MAX_BYTES for *collected* content, but continue scanning for line counts
+        // so pagination metadata is correct.
+        let mut total_bytes_read = 0u64;
 
         loop {
             let n = read_some(&mut file, &mut buf)
@@ -1295,33 +1419,77 @@ impl Tool for ReadTool {
             if n == 0 {
                 break;
             }
-            let chunk = &buf[..n];
-
-            // Count lines
-            total_lines += memchr::memchr_iter(b'\n', chunk).count();
-
-            // Collect content logic
-            if raw_content.len() + n > DEFAULT_MAX_BYTES * 4 {
-                // Safety break: if we exceed 4x the default limit (200KB), stop collecting
-                // to prevent OOM. We continue scanning for line counts if needed?
-                // Legacy behavior: "Safety break: if we've accumulated significantly more than the truncation limit... break"
-                // So we should just break.
-                // If we stop collecting, we also stop scanning, because legacy did that.
-                // This means `total_lines` will be truncated count. That's acceptable behavior match.
-                break;
+            total_bytes_read = total_bytes_read.saturating_add(n as u64);
+            if total_bytes_read > READ_TOOL_MAX_BYTES {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "File grew beyond limit during read ({total_bytes_read} bytes). Max allowed is {READ_TOOL_MAX_BYTES} bytes."
+                    ),
+                ));
             }
-            raw_content.extend_from_slice(chunk);
+
+            let chunk = &buf[..n];
+            last_byte_was_newline = chunk[n - 1] == b'\n';
+            let mut chunk_cursor = 0;
+
+            for pos in memchr::memchr_iter(b'\n', chunk) {
+                // Check if this newline marks the end of a line we are collecting
+                if collecting {
+                    // newlines_seen is the index of the line ending at this newline
+                    if newlines_seen + 1 == end_line_idx {
+                        // We reached the limit. Collect up to this newline.
+                        if raw_content.len() < DEFAULT_MAX_BYTES {
+                            let remaining = DEFAULT_MAX_BYTES - raw_content.len();
+                            let slice_len = (pos + 1 - chunk_cursor).min(remaining);
+                            raw_content
+                                .extend_from_slice(&chunk[chunk_cursor..chunk_cursor + slice_len]);
+                        }
+                        collecting = false;
+                        chunk_cursor = pos + 1;
+                    }
+                }
+
+                newlines_seen += 1;
+
+                // Check if this newline marks the start of the window
+                if !collecting && newlines_seen == start_line_idx {
+                    collecting = true;
+                    chunk_cursor = pos + 1;
+                }
+            }
+
+            // Append remainder of chunk if collecting
+            if collecting && chunk_cursor < chunk.len() && raw_content.len() < DEFAULT_MAX_BYTES {
+                let remaining = DEFAULT_MAX_BYTES - raw_content.len();
+                let slice_len = (chunk.len() - chunk_cursor).min(remaining);
+                raw_content.extend_from_slice(&chunk[chunk_cursor..chunk_cursor + slice_len]);
+            }
         }
 
-        // Correct line count for trailing newline
-        if raw_content.last() == Some(&b'\n') {
-            total_lines = total_lines.saturating_sub(1);
-        }
-
+        // A trailing newline terminates the last line rather than starting a new one.
+        // Also keep empty files at 0 lines so explicit positive offsets can error correctly.
+        let total_lines = if total_bytes_read == 0 {
+            0
+        } else if last_byte_was_newline {
+            newlines_seen
+        } else {
+            newlines_seen + 1
+        };
         let text_content = String::from_utf8_lossy(&raw_content).into_owned();
 
-        // Handle empty file
-        if text_content.is_empty() {
+        // Handle empty file.
+        // Offset=0 behaves like "start from beginning", but positive offsets should fail.
+        if total_lines == 0 {
+            if input.offset.unwrap_or(0) > 0 {
+                let offset_display = input.offset.unwrap_or(0);
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "Offset {offset_display} is beyond end of file ({total_lines} lines total)"
+                    ),
+                ));
+            }
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(""))],
                 details: None,
@@ -1329,16 +1497,10 @@ impl Tool for ReadTool {
             });
         }
 
-        // Now we have the content (up to safety limit) in memory.
-        // We can reuse the existing logic for offset/limit/formatting since it operates on `String`.
-        // This optimization avoids loading 100MB files, but still loads ~200KB.
-        // This solves the OOM risk for massive files.
+        // Now we have the content (up to safety limit) in memory, but only for the requested window.
+        // `text_content` starts at `start_line_idx`.
 
-        // Reuse existing logic
-        let start_line: usize = match input.offset {
-            Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
-            _ => 0,
-        };
+        let start_line = start_line_idx;
         let start_line_display = start_line.saturating_add(1);
 
         if start_line >= total_lines {
@@ -1351,42 +1513,34 @@ impl Tool for ReadTool {
             ));
         }
 
-        let (end_line, user_limited_lines): (usize, Option<usize>) = input.limit.map_or_else(
-            || (total_lines, None),
-            |limit| {
-                let limit_usize = if limit > 0 {
-                    usize::try_from(limit).unwrap_or(usize::MAX)
-                } else {
-                    0
-                };
-                let end = start_line.saturating_add(limit_usize).min(total_lines);
-                (end, Some(end.saturating_sub(start_line)))
-            },
-        );
-
         let max_lines_for_truncation = input
             .limit
             .and_then(|l| usize::try_from(l).ok())
             .unwrap_or(DEFAULT_MAX_LINES);
         let display_limit = max_lines_for_truncation.saturating_add(1);
-        let clamped_end_line = end_line.min(start_line.saturating_add(display_limit));
 
-        let max_line_num = clamped_end_line;
-        let line_num_width = max_line_num.to_string().len().max(5);
+        // We calculate lines to take based on the limit, but since we already filtered
+        // during read, we can mostly trust `text_content`, except for `DEFAULT_MAX_BYTES` truncation.
 
+        let lines_to_take = limit_lines.min(display_limit);
+
+        let mut selected_content = String::new();
         let line_iter = text_content.split('\n');
+
+        // Note: we use skip(0) because text_content is already offset
         let effective_iter = if text_content.ends_with('\n') {
-            line_iter.take(total_lines)
+            line_iter.take(lines_to_take)
         } else {
             line_iter.take(usize::MAX)
         };
 
-        let mut selected_content = String::new();
-        for (i, line) in effective_iter
-            .skip(start_line)
-            .take(clamped_end_line - start_line)
-            .enumerate()
-        {
+        let max_line_num = start_line.saturating_add(lines_to_take).min(total_lines);
+        let line_num_width = max_line_num.to_string().len().max(5);
+
+        for (i, line) in effective_iter.enumerate() {
+            if i >= lines_to_take {
+                break;
+            }
             if i > 0 {
                 selected_content.push('\n');
             }
@@ -1410,7 +1564,7 @@ impl Tool for ReadTool {
         let mut details: Option<serde_json::Value> = None;
 
         if truncation.first_line_exceeds_limit {
-            let first_line = text_content.split('\n').nth(start_line).unwrap_or("");
+            let first_line = text_content.split('\n').next().unwrap_or("");
             let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
             let first_line_size = format_size(first_line.len());
             output_text = format!(
@@ -1439,10 +1593,19 @@ impl Tool for ReadTool {
             }
 
             details = Some(serde_json::json!({ "truncation": truncation }));
-        } else if let Some(user_limited) = user_limited_lines {
-            if start_line.saturating_add(user_limited) < total_lines {
-                let remaining = total_lines.saturating_sub(start_line.saturating_add(user_limited));
-                let next_offset = start_line.saturating_add(user_limited).saturating_add(1);
+        } else {
+            // Calculate how many lines we actually displayed
+            let displayed_lines = text_content
+                .split('\n')
+                .count()
+                .saturating_sub(usize::from(text_content.ends_with('\n')));
+            let end_line_display = start_line_display
+                .saturating_add(displayed_lines)
+                .saturating_sub(1);
+
+            if end_line_display < total_lines {
+                let remaining = total_lines.saturating_sub(end_line_display);
+                let next_offset = end_line_display.saturating_add(1);
                 let _ = write!(
                     output_text,
                     "\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
@@ -1656,8 +1819,11 @@ pub(crate) async fn run_bash_command(
         truncation.truncated = true;
         truncation.truncated_by = Some(TruncatedBy::Bytes);
         truncation.total_bytes = bash_output.total_bytes;
-        // bash_output.line_count counts newlines; add 1 for the line count.
-        truncation.total_lines = bash_output.line_count.saturating_add(1);
+        truncation.total_lines = line_count_from_newline_count(
+            bash_output.total_bytes,
+            bash_output.line_count,
+            bash_output.last_byte_was_newline,
+        );
     }
 
     let mut output_text = if truncation.content.is_empty() {
@@ -1825,9 +1991,6 @@ impl Tool for BashTool {
         };
 
         let is_error = result.cancelled || result.exit_code != 0;
-        if is_error {
-            return Err(Error::tool("bash", result.output));
-        }
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(result.output))],
@@ -1862,11 +2025,9 @@ impl EditTool {
     }
 }
 
-fn strip_bom(s: &str) -> (String, bool) {
-    s.strip_prefix('\u{FEFF}').map_or_else(
-        || (s.to_string(), false),
-        |stripped| (stripped.to_string(), true),
-    )
+fn strip_bom(s: &str) -> (&str, bool) {
+    s.strip_prefix('\u{FEFF}')
+        .map_or_else(|| (s, false), |stripped| (stripped, true))
 }
 
 fn detect_line_ending(content: &str) -> &'static str {
@@ -2034,59 +2195,55 @@ fn build_normalized_content(content: &str) -> String {
 }
 
 fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
-    let (result, _) = fuzzy_find_text_with_normalized(content, old_text, None, None);
-    result
+    fuzzy_find_text_with_normalized(content, old_text, None, None)
 }
 
 /// Like [`fuzzy_find_text`], but accepts optional pre-computed normalized
-/// versions and returns the normalized strings it used (if any) so the caller
-/// can reuse them for occurrence counting.
+/// versions.
 fn fuzzy_find_text_with_normalized(
     content: &str,
     old_text: &str,
-    precomputed_content: Option<String>,
-    precomputed_old: Option<String>,
-) -> (FuzzyMatchResult, Option<(String, String)>) {
+    precomputed_content: Option<&str>,
+    precomputed_old: Option<&str>,
+) -> FuzzyMatchResult {
+    use std::borrow::Cow;
+
     // First, try exact match (fastest path)
     if let Some(index) = content.find(old_text) {
-        return (
-            FuzzyMatchResult {
-                found: true,
-                index,
-                match_length: old_text.len(),
-            },
-            precomputed_content.zip(precomputed_old),
-        );
+        return FuzzyMatchResult {
+            found: true,
+            index,
+            match_length: old_text.len(),
+        };
     }
 
     // Build normalized versions (reuse pre-computed if available)
-    let normalized_content =
-        precomputed_content.unwrap_or_else(|| build_normalized_content(content));
-    let normalized_old_text = precomputed_old.unwrap_or_else(|| build_normalized_content(old_text));
+    let normalized_content = precomputed_content.map_or_else(
+        || Cow::Owned(build_normalized_content(content)),
+        Cow::Borrowed,
+    );
+    let normalized_old_text = precomputed_old.map_or_else(
+        || Cow::Owned(build_normalized_content(old_text)),
+        Cow::Borrowed,
+    );
 
     // Try to find the normalized old_text in normalized content
-    if let Some(normalized_index) = normalized_content.find(&normalized_old_text) {
+    if let Some(normalized_index) = normalized_content.find(normalized_old_text.as_ref()) {
         let (original_start, original_match_len) =
             map_normalized_range_to_original(content, normalized_index, normalized_old_text.len());
 
-        return (
-            FuzzyMatchResult {
-                found: true,
-                index: original_start,
-                match_length: original_match_len,
-            },
-            Some((normalized_content, normalized_old_text)),
-        );
+        return FuzzyMatchResult {
+            found: true,
+            index: original_start,
+            match_length: original_match_len,
+        };
     }
 
-    (
-        FuzzyMatchResult {
-            found: false,
-            index: 0,
-            match_length: 0,
-        },
-        Some((normalized_content, normalized_old_text)),
-    )
+    FuzzyMatchResult {
+        found: false,
+        index: 0,
+        match_length: 0,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2290,7 +2447,7 @@ impl Tool for EditTool {
         let input: EditInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
-        let absolute_path = resolve_path(&input.path, &self.cwd);
+        let absolute_path = resolve_read_path(&input.path, &self.cwd);
 
         // Match legacy behavior: any access failure is reported as "File not found".
         if asupersync::fs::OpenOptions::new()
@@ -2334,10 +2491,9 @@ impl Tool for EditTool {
         // Strip BOM before matching (LLM won't include invisible BOM in oldText).
         let (content_no_bom, had_bom) = strip_bom(&raw_content);
 
-        let original_ending = detect_line_ending(&content_no_bom);
-        let normalized_content = normalize_to_lf(&content_no_bom);
+        let original_ending = detect_line_ending(content_no_bom);
+        let normalized_content = normalize_to_lf(content_no_bom);
         let normalized_old_text = normalize_to_lf(&input.old_text);
-        let normalized_new_text = normalize_to_lf(&input.new_text);
 
         if normalized_old_text.is_empty() {
             return Err(Error::tool(
@@ -2367,26 +2523,26 @@ impl Tool for EditTool {
 
         // Pre-compute normalized versions once and reuse for both matching and
         // occurrence counting (avoids 2x redundant O(n) normalization).
-        let precomputed_content = build_normalized_content(&normalized_content);
+        let precomputed_content = build_normalized_content(content_no_bom);
 
-        let mut best_match: Option<(FuzzyMatchResult, Option<(String, String)>)> = None;
+        let mut best_match: Option<(FuzzyMatchResult, String)> = None;
 
         for variant in variants {
             let precomputed_variant = build_normalized_content(&variant);
-            let (match_result, normalized_pair) = fuzzy_find_text_with_normalized(
-                &normalized_content,
+            let match_result = fuzzy_find_text_with_normalized(
+                content_no_bom,
                 &variant,
-                Some(precomputed_content.clone()),
-                Some(precomputed_variant),
+                Some(precomputed_content.as_str()),
+                Some(precomputed_variant.as_str()),
             );
 
             if match_result.found {
-                best_match = Some((match_result, normalized_pair));
+                best_match = Some((match_result, precomputed_variant));
                 break;
             }
         }
 
-        let Some((match_result, normalized_pair)) = best_match else {
+        let Some((match_result, normalized_old_text)) = best_match else {
             return Err(Error::tool(
                 "edit",
                 format!(
@@ -2397,27 +2553,13 @@ impl Tool for EditTool {
         };
 
         // Count occurrences reusing pre-computed normalized versions.
-        let occurrences = if let Some((fuzzy_content, fuzzy_old_text)) = &normalized_pair {
-            if fuzzy_old_text.is_empty() {
-                0
-            } else {
-                fuzzy_content
-                    .split(fuzzy_old_text.as_str())
-                    .count()
-                    .saturating_sub(1)
-            }
+        let occurrences = if normalized_old_text.is_empty() {
+            0
         } else {
-            // Exact match path — still need to normalize for occurrence counting.
-            let fuzzy_content = build_normalized_content(&normalized_content);
-            let fuzzy_old_text = build_normalized_content(&normalized_old_text);
-            if fuzzy_old_text.is_empty() {
-                0
-            } else {
-                fuzzy_content
-                    .split(&fuzzy_old_text)
-                    .count()
-                    .saturating_sub(1)
-            }
+            precomputed_content
+                .split(&normalized_old_text)
+                .count()
+                .saturating_sub(1)
         };
 
         if occurrences > 1 {
@@ -2430,17 +2572,24 @@ impl Tool for EditTool {
             ));
         }
 
-        // Perform replacement in the matched coordinate space (exact or fuzzy-normalized).
+        // Perform replacement in the original coordinate space to preserve
+        // line endings and unmatched content exactly.
         let idx = match_result.index;
         let match_len = match_result.match_length;
 
-        let new_len = normalized_content.len() - match_len + normalized_new_text.len();
-        let mut new_content = String::with_capacity(new_len);
-        new_content.push_str(&normalized_content[..idx]);
-        new_content.push_str(&normalized_new_text);
-        new_content.push_str(&normalized_content[idx + match_len..]);
+        // Adapt new_text to match the file's line endings.
+        // normalize_to_lf ensures we start from a known state (LF), then
+        // restore_line_endings converts LFs to the target ending (e.g. CRLF).
+        let adapted_new_text =
+            restore_line_endings(&normalize_to_lf(&input.new_text), original_ending);
 
-        if normalized_content == new_content {
+        let new_len = content_no_bom.len() - match_len + adapted_new_text.len();
+        let mut new_content = String::with_capacity(new_len);
+        new_content.push_str(&content_no_bom[..idx]);
+        new_content.push_str(&adapted_new_text);
+        new_content.push_str(&content_no_bom[idx + match_len..]);
+
+        if content_no_bom == new_content {
             return Err(Error::tool(
                 "edit",
                 format!(
@@ -2450,8 +2599,10 @@ impl Tool for EditTool {
             ));
         }
 
-        // Restore original line endings and re-add BOM if present.
-        let mut final_content = restore_line_endings(&new_content, original_ending);
+        let new_content_for_diff = normalize_to_lf(&new_content);
+
+        // Re-add BOM if present.
+        let mut final_content = new_content;
         if had_bom {
             final_content = format!("\u{FEFF}{final_content}");
         }
@@ -2486,7 +2637,8 @@ impl Tool for EditTool {
             .persist(&absolute_path)
             .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
 
-        let (diff, first_changed_line) = generate_diff_string(&normalized_content, &new_content);
+        let (diff, first_changed_line) =
+            generate_diff_string(&normalized_content, &new_content_for_diff);
         let mut details = serde_json::Map::new();
         details.insert("diff".to_string(), serde_json::Value::String(diff));
         if let Some(line) = first_changed_line {
@@ -2831,7 +2983,7 @@ impl Tool for GrepTool {
         }
 
         let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = resolve_path(search_dir, &self.cwd);
+        let search_path = resolve_read_path(search_dir, &self.cwd);
 
         let is_directory = std::fs::metadata(&search_path)
             .map_err(|e| {
@@ -2875,28 +3027,15 @@ impl Tool for GrepTool {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf()
         };
-        let mut gitignore_files: Vec<PathBuf> = Vec::new();
+        // NOTE: We rely on rg's native .gitignore discovery. We only explicitly pass
+        // the root .gitignore if it exists, to ensure it's respected even if the
+        // search path logic might otherwise miss it (e.g. searching a subdir).
+        // We do NOT perform a blocking `glob("**/.gitignore")` here, as that stalls
+        // the async runtime on large repos.
         let root_gitignore = ignore_root.join(".gitignore");
         if root_gitignore.exists() {
-            gitignore_files.push(root_gitignore);
-        }
-        let nested_pattern = ignore_root.join("**/.gitignore");
-        if let Some(pattern_str) = nested_pattern.to_str()
-            && let Ok(paths) = glob::glob(pattern_str)
-        {
-            for entry in paths.flatten() {
-                let entry_str = entry.to_string_lossy();
-                if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
-                    continue;
-                }
-                gitignore_files.push(entry);
-            }
-        }
-        gitignore_files.sort();
-        gitignore_files.dedup();
-        for gi in gitignore_files {
             args.push("--ignore-file".to_string());
-            args.push(gi.display().to_string());
+            args.push(root_gitignore.display().to_string());
         }
 
         args.push("--".to_string());
@@ -3088,7 +3227,7 @@ impl Tool for GrepTool {
                 *line_number
             };
             let end = if context_value > 0 {
-                (line_number + context_value).min(lines.len())
+                line_number.saturating_add(context_value).min(lines.len())
             } else {
                 *line_number
             };
@@ -3232,7 +3371,7 @@ impl Tool for FindTool {
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
         let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = strip_unc_prefix(resolve_path(search_dir, &self.cwd));
+        let search_path = strip_unc_prefix(resolve_read_path(search_dir, &self.cwd));
         let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
 
         if !search_path.exists() {
@@ -3258,32 +3397,14 @@ impl Tool for FindTool {
             effective_limit.to_string(),
         ];
 
-        // Include root .gitignore and nested .gitignore files (excluding node_modules/.git).
-        let mut gitignore_files: Vec<PathBuf> = Vec::new();
+        // NOTE: We rely on fd's native .gitignore discovery. We only explicitly pass
+        // the root .gitignore if it exists, to ensure it's respected even if the
+        // search path logic might otherwise miss it.
+        // We do NOT perform a blocking `glob("**/.gitignore")` here.
         let root_gitignore = search_path.join(".gitignore");
         if root_gitignore.exists() {
-            gitignore_files.push(root_gitignore);
-        }
-
-        let nested_pattern = search_path.join("**/.gitignore");
-        if let Some(pattern_str) = nested_pattern.to_str()
-            && let Ok(paths) = glob::glob(pattern_str)
-        {
-            for entry in paths.flatten() {
-                let entry_str = entry.to_string_lossy();
-                if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
-                    continue;
-                }
-                gitignore_files.push(entry);
-            }
-        }
-
-        gitignore_files.sort();
-        gitignore_files.dedup();
-
-        for gi in gitignore_files {
             args.push("--ignore-file".to_string());
-            args.push(gi.display().to_string());
+            args.push(root_gitignore.display().to_string());
         }
 
         args.push("--".to_string());
@@ -3535,7 +3656,7 @@ impl Tool for LsTool {
         let dir_path = input
             .path
             .as_ref()
-            .map_or_else(|| self.cwd.clone(), |p| resolve_path(p, &self.cwd));
+            .map_or_else(|| self.cwd.clone(), |p| resolve_read_path(p, &self.cwd));
 
         let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 
@@ -3569,7 +3690,20 @@ impl Tool for LsTool {
             }
             let name = entry.file_name().to_string_lossy().to_string();
             // Handle broken symlinks or permission errors by treating them as non-directories
-            let is_dir = entry.metadata().await.is_ok_and(|meta| meta.is_dir());
+            // Optimization: use file_type() first to avoid stat overhead on every file.
+            let is_dir = match entry.file_type().await {
+                Ok(ft) => {
+                    if ft.is_dir() {
+                        true
+                    } else if ft.is_symlink() {
+                        // Only stat if it's a symlink to see if it points to a directory
+                        entry.metadata().await.is_ok_and(|meta| meta.is_dir())
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => entry.metadata().await.is_ok_and(|meta| meta.is_dir()),
+            };
             entries.push((name, is_dir));
         }
 
@@ -3652,6 +3786,63 @@ impl Tool for LsTool {
 }
 
 // ============================================================================
+// Cleanup
+// ============================================================================
+
+/// Clean up old temporary files created by the bash tool.
+///
+/// Scans the system temporary directory for files matching `pi-bash-*.log`
+/// that are older than 24 hours and deletes them. This prevents indefinite
+/// accumulation of log files from long-running sessions.
+pub fn cleanup_temp_files() {
+    // Run in a detached thread to avoid blocking startup/shutdown.
+    std::thread::spawn(|| {
+        let temp_dir = std::env::temp_dir();
+        let Ok(entries) = std::fs::read_dir(&temp_dir) else {
+            return;
+        };
+
+        let now = std::time::SystemTime::now();
+        let threshold = now
+            .checked_sub(Duration::from_secs(24 * 60 * 60))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            // Match "pi-bash-" or "pi-rpc-bash-" prefix and ".log" suffix.
+            if (file_name.starts_with("pi-bash-") || file_name.starts_with("pi-rpc-bash-"))
+                && std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified < threshold {
+                            if let Err(e) = std::fs::remove_file(&path) {
+                                // Log but don't panic on cleanup failure
+                                tracing::debug!(
+                                    "Failed to remove temp file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// ============================================================================
 // Helper functions
 // ============================================================================
 
@@ -3695,6 +3886,7 @@ fn concat_chunks(chunks: &VecDeque<Vec<u8>>) -> Vec<u8> {
 struct BashOutputState {
     total_bytes: usize,
     line_count: usize,
+    last_byte_was_newline: bool,
     start_time: std::time::Instant,
     timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
@@ -3702,6 +3894,7 @@ struct BashOutputState {
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
     max_chunks_bytes: usize,
+    spill_failed: bool,
 }
 
 impl BashOutputState {
@@ -3709,6 +3902,7 @@ impl BashOutputState {
         Self {
             total_bytes: 0,
             line_count: 0,
+            last_byte_was_newline: false,
             start_time: std::time::Instant::now(),
             timeout_ms: None,
             temp_file_path: None,
@@ -3716,23 +3910,27 @@ impl BashOutputState {
             chunks: VecDeque::new(),
             chunks_bytes: 0,
             max_chunks_bytes,
+            spill_failed: false,
         }
     }
 }
 
 async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Result<()> {
+    state.last_byte_was_newline = chunk.last().is_some_and(|byte| *byte == b'\n');
     state.total_bytes = state.total_bytes.saturating_add(chunk.len());
     state.line_count = state
         .line_count
         .saturating_add(memchr::memchr_iter(b'\n', &chunk).count());
 
-    if state.total_bytes > DEFAULT_MAX_BYTES && state.temp_file.is_none() {
+    if state.total_bytes > DEFAULT_MAX_BYTES && state.temp_file.is_none() && !state.spill_failed {
         let id_full = Uuid::new_v4().simple().to_string();
         let id = &id_full[..16];
         let path = std::env::temp_dir().join(format!("pi-bash-{id}.log"));
+
         // Create the file synchronously with restricted permissions to avoid
         // a race condition where the file is world-readable before we fix it.
-        {
+        // We also capture the inode (on Unix) to verify identity later.
+        let expected_inode = {
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
 
@@ -3742,16 +3940,43 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
                 options.mode(0o600);
             }
 
-            let _ = options
+            let file = options
                 .open(&path)
                 .map_err(|e| Error::tool("bash", format!("Failed to create temp file: {e}")))?;
-        }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                file.metadata().ok().map(|m| m.ino())
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        };
 
         let mut file = asupersync::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .await
             .map_err(|e| Error::tool("bash", format!("Failed to open temp file: {e}")))?;
+
+        // Validate identity to prevent TOCTOU/symlink attacks (someone replacing the file
+        // between creation and async open).
+        #[cfg(unix)]
+        if let Some(expected) = expected_inode {
+            use std::os::unix::fs::MetadataExt;
+            let meta = file
+                .metadata()
+                .await
+                .map_err(|e| Error::tool("bash", format!("Failed to stat temp file: {e}")))?;
+            if meta.ino() != expected {
+                return Err(Error::tool(
+                    "bash",
+                    "Temp file identity mismatch (possible TOCTOU attack)".to_string(),
+                ));
+            }
+        }
 
         // Write buffered chunks to file first so it contains output from the beginning.
         for existing in &state.chunks {
@@ -3765,9 +3990,20 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
     }
 
     if let Some(file) = state.temp_file.as_mut() {
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| Error::tool("bash", e.to_string()))?;
+        if state.total_bytes <= BASH_FILE_LIMIT_BYTES {
+            if let Err(e) = file.write_all(&chunk).await {
+                tracing::warn!("Failed to write bash chunk to temp file: {e}");
+                state.spill_failed = true;
+                state.temp_file = None;
+            }
+        } else {
+            // Hard limit reached. Stop writing and close the file to release the FD.
+            if !state.spill_failed {
+                tracing::warn!("Bash output exceeded hard limit; stopping file log");
+                state.spill_failed = true;
+                state.temp_file = None;
+            }
+        }
     }
 
     state.chunks_bytes = state.chunks_bytes.saturating_add(chunk.len());
@@ -3778,6 +4014,20 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
         }
     }
     Ok(())
+}
+
+const fn line_count_from_newline_count(
+    total_bytes: usize,
+    newline_count: usize,
+    last_byte_was_newline: bool,
+) -> usize {
+    if total_bytes == 0 {
+        0
+    } else if last_byte_was_newline {
+        newline_count
+    } else {
+        newline_count.saturating_add(1)
+    }
 }
 
 fn emit_bash_update(
@@ -3795,10 +4045,15 @@ fn emit_bash_update(
         // allocations per update for the constant field-name keys
         // ("elapsedMs", "lineCount", …) that the manual path required.
         let elapsed_ms = state.start_time.elapsed().as_millis();
+        let line_count = line_count_from_newline_count(
+            state.total_bytes,
+            state.line_count,
+            state.last_byte_was_newline,
+        );
         let mut details = serde_json::json!({
             "progress": {
                 "elapsedMs": elapsed_ms,
-                "lineCount": state.line_count,
+                "lineCount": line_count,
                 "byteCount": state.total_bytes
             }
         });
@@ -4042,6 +4297,25 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_tail_zero_lines_returns_empty_output() {
+        let result = truncate_tail("line1\nline2".to_string(), 0, 1000);
+
+        assert!(result.truncated);
+        assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
+        assert_eq!(result.output_lines, 0);
+        assert_eq!(result.output_bytes, 0);
+        assert!(result.content.is_empty());
+    }
+
+    #[test]
+    fn test_line_count_from_newline_count_matches_trailing_newline_semantics() {
+        assert_eq!(line_count_from_newline_count(0, 0, false), 0);
+        assert_eq!(line_count_from_newline_count(2, 1, true), 1);
+        assert_eq!(line_count_from_newline_count(1, 0, false), 1);
+        assert_eq!(line_count_from_newline_count(3, 1, false), 2);
+    }
+
+    #[test]
     fn test_truncate_by_bytes() {
         let content = "short\nthis is a longer line\nanother".to_string();
         let result = truncate_head(content, 100, 15);
@@ -4206,6 +4480,55 @@ mod tests {
             let text = get_text(&out.content);
             assert_eq!(text, "");
             assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_read_empty_file_positive_offset_errors() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("empty.txt"), "").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("empty.txt").to_string_lossy(),
+                        "offset": 1
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+            let msg = err.unwrap_err().to_string();
+            assert!(msg.contains("beyond end of file"));
+        });
+    }
+
+    #[test]
+    fn test_read_rejects_zero_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("lines.txt"), "a\nb\nc\n").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("lines.txt").to_string_lossy(),
+                        "limit": 0
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+            assert!(
+                err.unwrap_err()
+                    .to_string()
+                    .contains("`limit` must be greater than 0")
+            );
         });
     }
 
@@ -4825,15 +5148,15 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let err = tool
+            let out = tool
                 .execute("t", serde_json::json!({ "command": "exit 42" }), None)
-                .await;
-            // Non-zero exit codes are reported as Err
-            assert!(err.is_err());
-            let msg = err.unwrap_err().to_string();
+                .await
+                .expect("non-zero exit should return Ok with is_error=true");
+            assert!(out.is_error, "non-zero exit must set is_error");
+            let msg = get_text(&out.content);
             assert!(
                 msg.contains("42"),
-                "expected exit code 42 in error, got: {msg}"
+                "expected exit code 42 in output, got: {msg}"
             );
         });
     }
@@ -4844,14 +5167,15 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let err = tool
+            let out = tool
                 .execute("t", serde_json::json!({ "command": "kill -KILL $$" }), None)
-                .await;
+                .await
+                .expect("signal-terminated shell should return Ok with is_error=true");
             assert!(
-                err.is_err(),
+                out.is_error,
                 "signal-terminated shell must be reported as error"
             );
-            let msg = err.unwrap_err().to_string();
+            let msg = get_text(&out.content);
             assert!(
                 msg.contains("Command exited with code"),
                 "expected explicit exit-code report, got: {msg}"
@@ -4889,16 +5213,16 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let tmp = tempfile::tempdir().unwrap();
             let tool = BashTool::new(tmp.path());
-            let err = tool
+            let out = tool
                 .execute(
                     "t",
                     serde_json::json!({ "command": "sleep 60", "timeout": 2 }),
                     None,
                 )
-                .await;
-            // Timeouts are reported as Err
-            assert!(err.is_err());
-            let msg = err.unwrap_err().to_string();
+                .await
+                .expect("timeout should return Ok with is_error=true");
+            assert!(out.is_error, "timeout must set is_error");
+            let msg = get_text(&out.content);
             assert!(
                 msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
                 "expected timeout indication, got: {msg}"
@@ -4914,7 +5238,7 @@ mod tests {
             let marker = tmp.path().join("leaked_child.txt");
             let tool = BashTool::new(tmp.path());
 
-            let err = tool
+            let out = tool
                 .execute(
                     "t",
                     serde_json::json!({
@@ -4924,9 +5248,11 @@ mod tests {
                     None,
                 )
                 .await
-                .expect_err("expected timeout");
+                .expect("timeout should return Ok with is_error=true");
 
-            assert!(err.to_string().contains("Command timed out"));
+            assert!(out.is_error, "timeout must set is_error");
+            let msg = get_text(&out.content);
+            assert!(msg.contains("Command timed out"));
 
             // If process tree cleanup fails, this file appears after ~3 seconds.
             std::thread::sleep(Duration::from_secs(4));
@@ -6246,5 +6572,42 @@ mod tests {
         let content = "Line1\n".to_string();
         let result = truncate_head(content, 1, 1000);
         assert_eq!(result.content, "Line1\n");
+    }
+
+    #[test]
+    fn test_edit_crlf_content_correctness() {
+        // Regression test: ensure we don't mix original indices with normalized content slices.
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("crlf.txt");
+            // "line1" (5) + "\r\n" (2) + "line2" (5) + "\r\n" (2) + "line3" (5) = 19 bytes
+            let content = "line1\r\nline2\r\nline3";
+            std::fs::write(&path, content).unwrap();
+
+            let tool = EditTool::new(tmp.path());
+
+            // Replacing "line2" should work correctly and preserve CRLF.
+            // Original "line2" is at index 7. Normalized "line2" is at index 6.
+            // If we used original index (7) on normalized string ("line1\nline2\nline3"),
+            // we would start at "ine2..." instead of "line2...", corrupting the file.
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "line2",
+                        "newText": "changed"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert!(!out.is_error);
+            let new_content = std::fs::read_to_string(&path).unwrap();
+
+            // Expect: "line1\r\nchanged\r\nline3"
+            assert_eq!(new_content, "line1\r\nchanged\r\nline3");
+        });
     }
 }
