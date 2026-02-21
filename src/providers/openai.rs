@@ -40,15 +40,15 @@ const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 /// allocation).  For an unknown role name (extremely rare – only possible via
 /// exotic compat overrides) we leak a heap copy so that callers can always
 /// work with `&'static str`.
-fn to_static_role(role: &str) -> &'static str {
+fn to_cow_role<'a>(role: &'a str) -> Cow<'a, str> {
     match role {
-        "system" => "system",
-        "developer" => "developer",
-        "user" => "user",
-        "assistant" => "assistant",
-        "tool" => "tool",
-        "function" => "function",
-        other => Box::leak(other.to_string().into_boxed_str()),
+        "system" => Cow::Borrowed("system"),
+        "developer" => Cow::Borrowed("developer"),
+        "user" => Cow::Borrowed("user"),
+        "assistant" => Cow::Borrowed("assistant"),
+        "tool" => Cow::Borrowed("tool"),
+        "function" => Cow::Borrowed("function"),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
@@ -246,14 +246,14 @@ impl OpenAIProvider {
     /// Build the messages array with system prompt prepended using the given role name.
     fn build_messages_with_role<'a>(
         context: &'a Context<'_>,
-        system_role: &str,
+        system_role: &'a str,
     ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(OpenAIMessage {
-                role: to_static_role(system_role),
+                role: to_cow_role(system_role),
                 content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
@@ -831,7 +831,7 @@ struct OpenAIStreamOptions {
 
 #[derive(Debug, Serialize)]
 struct OpenAIMessage<'a> {
-    role: &'static str,
+    role: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<OpenAIContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -958,13 +958,13 @@ struct OpenAIChunkError {
 fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
-            role: "user",
+            role: Cow::Borrowed("user"),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
         Message::Custom(custom) => vec![OpenAIMessage {
-            role: "user",
+            role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
@@ -1012,7 +1012,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
             };
 
             messages.push(OpenAIMessage {
-                role: "assistant",
+                role: Cow::Borrowed("assistant"),
                 content,
                 tool_calls,
                 tool_call_id: None,
@@ -1056,7 +1056,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
             };
 
             vec![OpenAIMessage {
-                role: "tool",
+                role: Cow::Borrowed("tool"),
                 content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),

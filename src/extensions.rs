@@ -21906,7 +21906,7 @@ async fn dispatch_hostcall_exec_ref(
     cmd: &str,
     payload: &Value,
 ) -> HostcallOutcome {
-    use std::io::{BufRead as _, Read as _};
+    use std::io::Read as _;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 
@@ -21918,28 +21918,139 @@ async fn dispatch_hostcall_exec_ref(
     }
 
     fn pump_stream<R: std::io::Read>(
-        reader: R,
+        mut reader: R,
         tx: &SyncSender<ExecStreamFrame>,
         stdout: bool,
     ) -> std::result::Result<(), String> {
-        let mut reader = std::io::BufReader::new(reader);
+        let mut buf = [0u8; 4096];
+        let mut partial = Vec::new();
+
         loop {
-            let mut buf = Vec::new();
-            let read = reader
-                .read_until(b'\n', &mut buf)
-                .map_err(|err| err.to_string())?;
+            let read = reader.read(&mut buf).map_err(|err| err.to_string())?;
             if read == 0 {
+                // EOF. Flush partial if any (lossy).
+                if !partial.is_empty() {
+                    let text = String::from_utf8_lossy(&partial).to_string();
+                    let frame = if stdout {
+                        ExecStreamFrame::Stdout(text)
+                    } else {
+                        ExecStreamFrame::Stderr(text)
+                    };
+                    let _ = tx.send(frame);
+                }
                 break;
             }
 
-            let text = String::from_utf8_lossy(&buf).to_string();
-            let frame = if stdout {
-                ExecStreamFrame::Stdout(text)
+            let chunk = &buf[..read];
+
+            if partial.is_empty() {
+                let mut processed = 0;
+                loop {
+                    match std::str::from_utf8(&chunk[processed..]) {
+                        Ok(s) => {
+                            if !s.is_empty() {
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout(s.to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr(s.to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            let valid_len = e.valid_up_to();
+                            if valid_len > 0 {
+                                let s = std::str::from_utf8(
+                                    &chunk[processed..processed + valid_len],
+                                )
+                                .expect("valid utf8 prefix");
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout(s.to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr(s.to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                                processed += valid_len;
+                            }
+
+                            if let Some(len) = e.error_len() {
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout("\u{FFFD}".to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr("\u{FFFD}".to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                                processed += len;
+                            } else {
+                                partial.extend_from_slice(&chunk[processed..]);
+                                break;
+                            }
+                        }
+                    }
+                }
             } else {
-                ExecStreamFrame::Stderr(text)
-            };
-            if tx.send(frame).is_err() {
-                break;
+                partial.extend_from_slice(chunk);
+                let mut processed = 0;
+                loop {
+                    match std::str::from_utf8(&partial[processed..]) {
+                        Ok(s) => {
+                            if !s.is_empty() {
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout(s.to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr(s.to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            partial.clear();
+                            break;
+                        }
+                        Err(e) => {
+                            let valid_len = e.valid_up_to();
+                            if valid_len > 0 {
+                                let s = std::str::from_utf8(
+                                    &partial[processed..processed + valid_len],
+                                )
+                                .expect("valid utf8 prefix");
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout(s.to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr(s.to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                                processed += valid_len;
+                            }
+
+                            if let Some(len) = e.error_len() {
+                                let frame = if stdout {
+                                    ExecStreamFrame::Stdout("\u{FFFD}".to_string())
+                                } else {
+                                    ExecStreamFrame::Stderr("\u{FFFD}".to_string())
+                                };
+                                if tx.send(frame).is_err() {
+                                    return Ok(());
+                                }
+                                processed += len;
+                            } else {
+                                let remaining = partial.len() - processed;
+                                partial.copy_within(processed.., 0);
+                                partial.truncate(remaining);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
