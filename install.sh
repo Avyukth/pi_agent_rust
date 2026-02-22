@@ -315,7 +315,7 @@ fetch_url_to_file() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" \
+  curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     --connect-timeout "$connect_timeout" \
     --max-time "$max_time" \
     --retry "$retries" \
@@ -360,7 +360,7 @@ fetch_url_to_stdout() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" \
+  curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     --connect-timeout "$connect_timeout" \
     --max-time "$max_time" \
     --retry "$retries" \
@@ -399,7 +399,7 @@ fetch_effective_url() {
     return 0
   fi
 
-  curl -fsSL -o /dev/null -w '%{url_effective}' "${PROXY_ARGS[@]}" \
+  curl -fsSL -o /dev/null -w '%{url_effective}' ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     --connect-timeout "$connect_timeout" \
     --max-time "$max_time" \
     --retry "$retries" \
@@ -423,7 +423,7 @@ probe_url_head() {
     return $?
   fi
 
-  curl -fsSLI "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1
+  curl -fsSLI ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1
 }
 
 remove_path_recursively() {
