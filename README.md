@@ -2439,6 +2439,7 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/program-governance.md` - Purpose: governance model for roadmap, gates, and ownership. Bottom line: governance decisions and responsibilities are defined here. Link: [View](docs/program-governance.md)
 - `docs/prompt-templates.md` - Purpose: prompt template system and usage guide. Bottom line: reusable prompt behaviors are managed via this doc. Link: [View](docs/prompt-templates.md)
 - `docs/sdk.md` - Purpose: SDK cookbook and migration guide for embedding Pi programmatically. Bottom line: use this for copy/paste Rust equivalents of TypeScript SDK workflows. Link: [View](docs/sdk.md)
+- `docs/integrator-migration-playbook.md` - Purpose: step-by-step migration and compatibility validation runbook for downstream integrators moving from TypeScript Pi to Rust Pi. Bottom line: follow this to execute and evidence a go/no-go migration decision safely. Link: [View](docs/integrator-migration-playbook.md)
 
 ### 3. Provider Subsystem
 

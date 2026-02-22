@@ -40,6 +40,55 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 #[test]
+fn dropin174_config_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_config_surface_logs_include_requirement_id");
+    harness.log().info_ctx(
+        "dropin174.config",
+        "Config precedence parity assertion",
+        |ctx| {
+            ctx.push((
+                "requirement_id".to_string(),
+                "DROPIN-174-CONFIG".to_string(),
+            ));
+            ctx.push(("surface".to_string(), "config".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Config/env precedence parity".to_string(),
+            ));
+        },
+    );
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.config")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-CONFIG")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("config")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
+}
+
+#[test]
 fn config_load_pi_config_path_override_beats_project_and_global() {
     let _lock = config_lock();
     let harness = TestHarness::new("config_load_pi_config_path_override_beats_project_and_global");

@@ -71,6 +71,53 @@ fn assert_contains_entry<'a>(
     );
 }
 
+#[test]
+fn dropin174_session_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_session_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("dropin174.session", "Session parity assertion", |ctx| {
+            ctx.push((
+                "requirement_id".to_string(),
+                "DROPIN-174-SESSION".to_string(),
+            ));
+            ctx.push(("surface".to_string(), "session".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Session/branch/compaction parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.session")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-SESSION")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("session")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
+}
+
 fn proptest_session_header() -> impl Strategy<Value = SessionHeader> {
     let provider = prop_oneof![
         Just(None),

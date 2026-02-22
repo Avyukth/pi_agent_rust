@@ -48,6 +48,50 @@ fn get_text_content(content: &[pi::model::ContentBlock]) -> String {
         .join("")
 }
 
+#[test]
+fn dropin174_error_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_error_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("dropin174.error", "Error parity assertion", |ctx| {
+            ctx.push(("requirement_id".to_string(), "DROPIN-174-ERROR".to_string()));
+            ctx.push(("surface".to_string(), "error".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Error model + exit code parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.error")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-ERROR")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("error")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
+}
+
 // ============================================================================
 // VCR Cassette Helpers
 // ============================================================================

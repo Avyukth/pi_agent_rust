@@ -369,11 +369,10 @@ fn index_by_string_key(
             continue;
         }
         if out.contains_key(key) {
-            diffs.push(DiffItem::new(
-                DiffKind::Registration,
-                format!("{path}[{key_field}={key}]"),
-                "duplicate key",
-            ));
+            // Silently skip duplicate keys within a single side.
+            // Emitting diffs here would break reflexivity: comparing X to
+            // itself would fail whenever duplicates exist, because both
+            // the expected and actual side would each push a diff item.
             continue;
         }
         out.insert(key.to_string(), item.clone());
@@ -3769,6 +3768,31 @@ mod tests {
             json!([]),
         );
         compare_conformance_output(&expected, &actual).unwrap();
+    }
+
+    #[test]
+    fn compare_models_with_duplicate_ids_is_reflexive() {
+        // Regression fixture from a shrunk proptest case: duplicate model IDs
+        // should not make comparator fail on self-compare.
+        let sample = json!({
+            "extension_id": "a",
+            "name": "_",
+            "version": "0.0.0",
+            "registrations": {
+                "commands": [],
+                "event_hooks": [],
+                "flags": [],
+                "models": [
+                    {"id": "_", "name": "model-_"},
+                    {"id": "_", "name": "model-_"}
+                ],
+                "providers": [],
+                "shortcuts": [],
+                "tool_defs": []
+            },
+            "hostcall_log": []
+        });
+        compare_conformance_output(&sample, &sample).unwrap();
     }
 
     #[test]

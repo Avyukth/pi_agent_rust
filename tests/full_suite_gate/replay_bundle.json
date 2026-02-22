@@ -1,7 +1,7 @@
 {
   "schema": "pi.e2e.replay_bundle.v1",
-  "generated_at": "2026-02-15T03:03:38.734Z",
-  "correlation_id": "replay-bundle-20260215T030338Z",
+  "generated_at": "2026-02-15T03:01:58.325Z",
+  "correlation_id": "replay-bundle-20260215T030158Z",
   "source_summary_path": "tests/full_suite_gate/full_suite_verdict.json",
   "one_command_replay": "cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact",
   "environment": {
