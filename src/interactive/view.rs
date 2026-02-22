@@ -82,6 +82,137 @@ fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
     segments
 }
 
+#[inline]
+fn starts_with_unordered_list_marker(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'-' | b'+' | b'*') && bytes[1].is_ascii_whitespace()
+}
+
+#[inline]
+fn starts_with_ordered_list_marker(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+
+    idx > 0
+        && idx <= 9
+        && (idx + 1) < bytes.len()
+        && matches!(bytes[idx], b'.' | b')')
+        && bytes[idx + 1].is_ascii_whitespace()
+}
+
+#[inline]
+fn is_repeated_marker_line(trimmed: &str, marker: u8) -> bool {
+    let mut marker_count = 0usize;
+    for byte in trimmed.bytes() {
+        if byte == marker {
+            marker_count += 1;
+        } else if !byte.is_ascii_whitespace() {
+            return false;
+        }
+    }
+    marker_count >= 3
+}
+
+#[inline]
+fn has_potential_underscore_emphasis(markdown: &str) -> bool {
+    let bytes = markdown.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'_' {
+            continue;
+        }
+        let prev_alnum = idx
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(u8::is_ascii_alphanumeric);
+        let next_alnum = bytes.get(idx + 1).is_some_and(u8::is_ascii_alphanumeric);
+        if !(prev_alnum && next_alnum) {
+            return true;
+        }
+    }
+    false
+}
+
+fn streaming_needs_markdown_renderer(markdown: &str) -> bool {
+    // Inline syntax that can change visible formatting mid-stream.
+    if markdown.as_bytes().iter().any(|byte| {
+        matches!(
+            *byte,
+            b'`' | b'*' | b'[' | b']' | b'<' | b'>' | b'|' | b'!' | b'~' | b'\t'
+        )
+    }) {
+        return true;
+    }
+    if has_potential_underscore_emphasis(markdown) {
+        return true;
+    }
+
+    // Block-level syntax that only needs quick line-prefix checks.
+    for line in markdown.lines() {
+        if line.starts_with("    ") || parse_fence_line(line).is_some() {
+            return true;
+        }
+
+        let trimmed = line.trim_start_matches(' ');
+        let leading_spaces = line.len().saturating_sub(trimmed.len());
+        if leading_spaces > 3 || trimmed.is_empty() {
+            if leading_spaces > 3 {
+                return true;
+            }
+            continue;
+        }
+
+        let first = trimmed.as_bytes()[0];
+        if first == b'#'
+            || first == b'>'
+            || starts_with_unordered_list_marker(trimmed)
+            || starts_with_ordered_list_marker(trimmed)
+            || is_repeated_marker_line(trimmed, b'-')
+            || is_repeated_marker_line(trimmed, b'*')
+            || is_repeated_marker_line(trimmed, b'=')
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn render_streaming_plaintext(markdown: &str, max_width: usize) -> String {
+    let mut rendered = String::with_capacity(markdown.len() + 8);
+    for (line_idx, line) in markdown.split('\n').enumerate() {
+        if line_idx > 0 {
+            rendered.push('\n');
+        }
+        let segments = wrapped_line_segments(line, max_width);
+        for (segment_idx, segment) in segments.into_iter().enumerate() {
+            if segment_idx > 0 {
+                rendered.push('\n');
+            }
+            rendered.push_str(segment);
+        }
+    }
+    rendered
+}
+
+fn render_streaming_markdown(
+    markdown: &str,
+    markdown_style: &GlamourStyleConfig,
+    max_width: usize,
+) -> String {
+    if !streaming_needs_markdown_renderer(markdown) {
+        return render_streaming_plaintext(markdown, max_width);
+    }
+
+    let stabilized_markdown = stabilize_streaming_markdown(markdown);
+    glamour::Renderer::new()
+        .with_style_config(markdown_style.clone())
+        .with_word_wrap(max_width)
+        .render(stabilized_markdown.as_ref())
+}
+
 fn parse_fence_line(line: &str) -> Option<(char, usize, &str)> {
     let trimmed_line = line.trim_end_matches(['\r', '\n']);
     let leading_spaces = trimmed_line.chars().take_while(|ch| *ch == ' ').count();
@@ -809,11 +940,11 @@ impl PiApp {
         // Render partial markdown on every stream update so headings/lists/code
         // format as they arrive instead of showing raw markers.
         if !self.current_response.is_empty() {
-            let stabilized_markdown = stabilize_streaming_markdown(&self.current_response);
-            let rendered = glamour::Renderer::new()
-                .with_style_config(self.markdown_style.clone())
-                .with_word_wrap(self.term_width.saturating_sub(6).max(40))
-                .render(stabilized_markdown.as_ref());
+            let rendered = render_streaming_markdown(
+                &self.current_response,
+                &self.markdown_style,
+                self.term_width.saturating_sub(6).max(40),
+            );
             for line in rendered.lines() {
                 let _ = writeln!(output, "  {line}");
             }
@@ -1590,5 +1721,29 @@ mod tests {
         let markdown = "# Title\n\n- item\n";
         let stabilized = stabilize_streaming_markdown(markdown);
         assert_eq!(stabilized.as_ref(), markdown);
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_false_for_plain_text() {
+        let markdown = "Starting response... token_1 token_2";
+        assert!(!streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_true_for_heading() {
+        let markdown = "# Heading";
+        assert!(streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_true_for_underscore_emphasis() {
+        let markdown = "This is _important_.";
+        assert!(streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn render_streaming_markdown_plain_text_fast_path_wraps() {
+        let rendered = render_streaming_markdown("abcdef", &GlamourStyleConfig::default(), 4);
+        assert_eq!(rendered, "abcd\nef");
     }
 }
