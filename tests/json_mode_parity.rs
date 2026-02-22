@@ -101,7 +101,7 @@ fn test_tool_output() -> ToolOutput {
 fn json_parity_agent_start_schema() {
     let harness = TestHarness::new("json_parity_agent_start_schema");
     let event = AgentEvent::AgentStart {
-        session_id: "session-abc".to_string(),
+        session_id: Arc::from("session-abc"),
     };
     let json = event_to_json(&event);
 
@@ -130,7 +130,7 @@ fn json_parity_agent_start_schema() {
 fn json_parity_agent_end_schema() {
     let harness = TestHarness::new("json_parity_agent_end_schema");
     let event = AgentEvent::AgentEnd {
-        session_id: "session-abc".to_string(),
+        session_id: Arc::from("session-abc"),
         messages: vec![test_user_message()],
         error: None,
     };
@@ -146,7 +146,7 @@ fn json_parity_agent_end_schema() {
 
     // With error
     let event_err = AgentEvent::AgentEnd {
-        session_id: "s".to_string(),
+        session_id: Arc::from("s"),
         messages: vec![],
         error: Some("provider timeout".to_string()),
     };
@@ -168,7 +168,7 @@ fn json_parity_agent_end_schema() {
 fn json_parity_turn_start_schema() {
     let harness = TestHarness::new("json_parity_turn_start_schema");
     let event = AgentEvent::TurnStart {
-        session_id: "session-abc".to_string(),
+        session_id: Arc::from("session-abc"),
         turn_index: 0,
         timestamp: 1_700_000_000,
     };
@@ -202,7 +202,7 @@ fn json_parity_turn_end_schema() {
     let harness = TestHarness::new("json_parity_turn_end_schema");
     let assistant_msg = Message::Assistant(Arc::new(test_assistant_message()));
     let event = AgentEvent::TurnEnd {
-        session_id: "session-abc".to_string(),
+        session_id: Arc::from("session-abc"),
         turn_index: 0,
         message: assistant_msg,
         tool_results: vec![],
@@ -259,11 +259,11 @@ fn json_parity_message_update_schema() {
     let partial = Arc::new(test_assistant_message());
     let event = AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
-        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+        assistant_message_event: AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: "hello".to_string(),
             partial,
-        }),
+        },
     };
     let json = event_to_json(&event);
 
@@ -622,7 +622,7 @@ fn json_parity_complete_lifecycle_ordering() {
 
     let events: Vec<AgentEvent> = vec![
         AgentEvent::AgentStart {
-            session_id: session_id.to_string(),
+            session_id: Arc::from(session_id),
         },
         AgentEvent::MessageStart {
             message: test_user_message(),
@@ -631,7 +631,7 @@ fn json_parity_complete_lifecycle_ordering() {
             message: test_user_message(),
         },
         AgentEvent::TurnStart {
-            session_id: session_id.to_string(),
+            session_id: Arc::from(session_id),
             turn_index: 0,
             timestamp: 1_700_000_000,
         },
@@ -640,23 +640,23 @@ fn json_parity_complete_lifecycle_ordering() {
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+            assistant_message_event: AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "hello".to_string(),
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&partial)),
         },
         AgentEvent::TurnEnd {
-            session_id: session_id.to_string(),
+            session_id: Arc::from(session_id),
             turn_index: 0,
             message: Message::Assistant(Arc::clone(&partial)),
             tool_results: vec![],
         },
         AgentEvent::AgentEnd {
-            session_id: session_id.to_string(),
+            session_id: Arc::from(session_id),
             messages: vec![test_user_message(), Message::Assistant(partial)],
             error: None,
         },
@@ -814,7 +814,7 @@ fn json_parity_assistant_message_event_all_subtypes() {
     for (expected_type, ame) in &variants {
         let event = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(ame.clone()),
+            assistant_message_event: ame.clone(),
         };
         let json = event_to_json(&event);
         let ame_json = &json["assistantMessageEvent"];
@@ -849,20 +849,20 @@ fn json_parity_no_snake_case_leak() {
     // Test every event type for snake_case field leaks.
     let events: Vec<AgentEvent> = vec![
         AgentEvent::AgentStart {
-            session_id: "s".to_string(),
+            session_id: Arc::from("s"),
         },
         AgentEvent::AgentEnd {
-            session_id: "s".to_string(),
+            session_id: Arc::from("s"),
             messages: vec![],
             error: None,
         },
         AgentEvent::TurnStart {
-            session_id: "s".to_string(),
+            session_id: Arc::from("s"),
             turn_index: 0,
             timestamp: 0,
         },
         AgentEvent::TurnEnd {
-            session_id: "s".to_string(),
+            session_id: Arc::from("s"),
             turn_index: 0,
             message: test_user_message(),
             tool_results: vec![],
@@ -872,11 +872,11 @@ fn json_parity_no_snake_case_leak() {
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+            assistant_message_event: AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "x".to_string(),
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageEnd {
             message: test_user_message(),
@@ -1023,13 +1023,13 @@ fn json_parity_all_event_type_strings() {
     let cases: Vec<(AgentEvent, &str)> = vec![
         (
             AgentEvent::AgentStart {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
             },
             "agent_start",
         ),
         (
             AgentEvent::AgentEnd {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 messages: vec![],
                 error: None,
             },
@@ -1037,7 +1037,7 @@ fn json_parity_all_event_type_strings() {
         ),
         (
             AgentEvent::TurnStart {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 turn_index: 0,
                 timestamp: 0,
             },
@@ -1045,7 +1045,7 @@ fn json_parity_all_event_type_strings() {
         ),
         (
             AgentEvent::TurnEnd {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 turn_index: 0,
                 message: test_user_message(),
                 tool_results: vec![],
@@ -1061,9 +1061,9 @@ fn json_parity_all_event_type_strings() {
         (
             AgentEvent::MessageUpdate {
                 message: Message::Assistant(Arc::clone(&partial)),
-                assistant_message_event: Box::new(AssistantMessageEvent::Start {
+                assistant_message_event: AssistantMessageEvent::Start {
                     partial: Arc::clone(&partial),
-                }),
+                },
             },
             "message_update",
         ),
@@ -1766,13 +1766,13 @@ fn json_parity_extension_event_from_agent_mapping() {
     let forwarded: Vec<(AgentEvent, ExtensionEventName)> = vec![
         (
             AgentEvent::AgentStart {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
             },
             ExtensionEventName::AgentStart,
         ),
         (
             AgentEvent::AgentEnd {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 messages: vec![],
                 error: None,
             },
@@ -1780,7 +1780,7 @@ fn json_parity_extension_event_from_agent_mapping() {
         ),
         (
             AgentEvent::TurnStart {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 turn_index: 0,
                 timestamp: 0,
             },
@@ -1788,7 +1788,7 @@ fn json_parity_extension_event_from_agent_mapping() {
         ),
         (
             AgentEvent::TurnEnd {
-                session_id: "s".to_string(),
+                session_id: Arc::from("s"),
                 turn_index: 0,
                 message: test_user_message(),
                 tool_results: vec![],
@@ -1804,11 +1804,11 @@ fn json_parity_extension_event_from_agent_mapping() {
         (
             AgentEvent::MessageUpdate {
                 message: Message::Assistant(Arc::clone(&partial)),
-                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                assistant_message_event: AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: "x".to_string(),
                     partial: Arc::clone(&partial),
-                }),
+                },
             },
             ExtensionEventName::MessageUpdate,
         ),
@@ -2875,7 +2875,7 @@ fn json_parity_ame_text_streaming_lifecycle() {
     for (ame, expected_type) in ame_sequence.iter().zip(expected_types.iter()) {
         let event = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(ame.clone()),
+            assistant_message_event: ame.clone(),
         };
         let json = event_to_json(&event);
         let ame_type = json["assistantMessageEvent"]["type"]
@@ -2887,11 +2887,11 @@ fn json_parity_ame_text_streaming_lifecycle() {
     // Verify text_end content matches accumulated deltas.
     let text_end_event = AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
-        assistant_message_event: Box::new(AssistantMessageEvent::TextEnd {
+        assistant_message_event: AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: "Hello world".to_string(),
             partial: Arc::clone(&partial),
-        }),
+        },
     };
     let json = event_to_json(&text_end_event);
     assert_eq!(
@@ -2944,7 +2944,7 @@ fn json_parity_ame_thinking_lifecycle() {
     for (expected_type, ame) in &events {
         let update = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(ame.clone()),
+            assistant_message_event: ame.clone(),
         };
         let json = event_to_json(&update);
         let ame_json = &json["assistantMessageEvent"];
@@ -2993,7 +2993,7 @@ fn json_parity_ame_toolcall_lifecycle() {
     // Verify toolcall_end includes full ToolCall details.
     let end_event = AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
-        assistant_message_event: Box::new(toolcall_end),
+        assistant_message_event: toolcall_end,
     };
     let json = event_to_json(&end_event);
     let ame = &json["assistantMessageEvent"];
@@ -3011,7 +3011,7 @@ fn json_parity_ame_toolcall_lifecycle() {
     // Verify start and delta.
     let start_json = event_to_json(&AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
-        assistant_message_event: Box::new(toolcall_start),
+        assistant_message_event: toolcall_start,
     });
     assert_eq!(
         start_json["assistantMessageEvent"]["type"],
@@ -3021,7 +3021,7 @@ fn json_parity_ame_toolcall_lifecycle() {
 
     let delta_json = event_to_json(&AgentEvent::MessageUpdate {
         message: Message::Assistant(Arc::clone(&partial)),
-        assistant_message_event: Box::new(toolcall_delta),
+        assistant_message_event: toolcall_delta,
     });
     assert_eq!(
         delta_json["assistantMessageEvent"]["type"],
@@ -3058,10 +3058,10 @@ fn json_parity_ame_error_stop_reasons() {
         // Done variant.
         let done = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::Done {
+            assistant_message_event: AssistantMessageEvent::Done {
                 reason: *reason,
                 message: Arc::clone(&partial),
-            }),
+            },
         };
         let json = event_to_json(&done);
         assert_eq!(
@@ -3072,10 +3072,10 @@ fn json_parity_ame_error_stop_reasons() {
         // Error variant.
         let err = AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::Error {
+            assistant_message_event: AssistantMessageEvent::Error {
                 reason: *reason,
                 error: Arc::clone(&partial),
-            }),
+            },
         };
         let json_err = event_to_json(&err);
         assert_eq!(
@@ -3101,7 +3101,7 @@ fn json_parity_optional_fields_absent_when_none() {
 
     // AgentEnd.error: skip_serializing_if = "Option::is_none"
     let end_no_err = event_to_json(&AgentEvent::AgentEnd {
-        session_id: "s".to_string(),
+        session_id: Arc::from("s"),
         messages: vec![],
         error: None,
     });
@@ -3158,7 +3158,7 @@ fn json_parity_optional_fields_absent_when_none() {
 
     // Verify presence when Some.
     let end_with_err = event_to_json(&AgentEvent::AgentEnd {
-        session_id: "s".to_string(),
+        session_id: Arc::from("s"),
         messages: vec![],
         error: Some("oops".to_string()),
     });
@@ -3298,7 +3298,7 @@ fn json_parity_full_lifecycle_with_tool_turn() {
     let events: Vec<AgentEvent> = vec![
         // Agent start.
         AgentEvent::AgentStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
         },
         // User message lifecycle.
         AgentEvent::MessageStart {
@@ -3309,7 +3309,7 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         },
         // Turn 0: assistant with tool call.
         AgentEvent::TurnStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             timestamp: 1_700_000_000,
         },
@@ -3318,20 +3318,20 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::Start {
+            assistant_message_event: AssistantMessageEvent::Start {
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::ToolCallStart {
+            assistant_message_event: AssistantMessageEvent::ToolCallStart {
                 content_index: 0,
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::ToolCallEnd {
+            assistant_message_event: AssistantMessageEvent::ToolCallEnd {
                 content_index: 0,
                 tool_call: ToolCall {
                     id: "tc-1".to_string(),
@@ -3340,14 +3340,14 @@ fn json_parity_full_lifecycle_with_tool_turn() {
                     thought_signature: None,
                 },
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::Done {
+            assistant_message_event: AssistantMessageEvent::Done {
                 reason: StopReason::ToolUse,
                 message: Arc::clone(&partial),
-            }),
+            },
         },
         AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&partial)),
@@ -3370,14 +3370,14 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         },
         // Turn end with tool results.
         AgentEvent::TurnEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             message: Message::Assistant(Arc::clone(&partial)),
             tool_results: vec![test_user_message()],
         },
         // Agent end.
         AgentEvent::AgentEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             messages: vec![test_user_message(), Message::Assistant(partial)],
             error: None,
         },
@@ -3452,7 +3452,7 @@ fn json_parity_lifecycle_with_retry() {
 
     let events: Vec<AgentEvent> = vec![
         AgentEvent::AgentStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
         },
         AgentEvent::MessageStart {
             message: test_user_message(),
@@ -3474,7 +3474,7 @@ fn json_parity_lifecycle_with_retry() {
             final_error: None,
         },
         AgentEvent::TurnStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             timestamp: 1_700_001_000,
         },
@@ -3485,13 +3485,13 @@ fn json_parity_lifecycle_with_retry() {
             message: Message::Assistant(Arc::new(test_assistant_message())),
         },
         AgentEvent::TurnEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             message: Message::Assistant(Arc::new(test_assistant_message())),
             tool_results: vec![],
         },
         AgentEvent::AgentEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             messages: vec![],
             error: None,
         },
@@ -3534,16 +3534,16 @@ fn json_parity_lifecycle_with_compaction() {
 
     let events: Vec<AgentEvent> = vec![
         AgentEvent::AgentStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
         },
         // Turn 0 completes normally.
         AgentEvent::TurnStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             timestamp: 1_700_000_000,
         },
         AgentEvent::TurnEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 0,
             message: Message::Assistant(Arc::new(test_assistant_message())),
             tool_results: vec![],
@@ -3564,18 +3564,18 @@ fn json_parity_lifecycle_with_compaction() {
         },
         // Turn 1 after compaction.
         AgentEvent::TurnStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 1,
             timestamp: 1_700_001_000,
         },
         AgentEvent::TurnEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: 1,
             message: Message::Assistant(Arc::new(test_assistant_message())),
             tool_results: vec![],
         },
         AgentEvent::AgentEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             messages: vec![],
             error: None,
         },
@@ -3628,18 +3628,18 @@ fn json_parity_turn_index_monotonic() {
 
     let mut events = Vec::new();
     events.push(AgentEvent::AgentStart {
-        session_id: sid.to_string(),
+        session_id: Arc::from(sid),
     });
 
     for turn in 0..5_usize {
         events.push(AgentEvent::TurnStart {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: turn,
             #[allow(clippy::cast_possible_wrap)]
             timestamp: 1_700_000_000 + (turn as i64),
         });
         events.push(AgentEvent::TurnEnd {
-            session_id: sid.to_string(),
+            session_id: Arc::from(sid),
             turn_index: turn,
             message: Message::Assistant(Arc::new(test_assistant_message())),
             tool_results: vec![],
@@ -3647,7 +3647,7 @@ fn json_parity_turn_index_monotonic() {
     }
 
     events.push(AgentEvent::AgentEnd {
-        session_id: sid.to_string(),
+        session_id: Arc::from(sid),
         messages: vec![],
         error: None,
     });
@@ -3710,11 +3710,11 @@ fn json_parity_ndjson_single_line() {
         // Tab and carriage return in delta.
         AgentEvent::MessageUpdate {
             message: Message::Assistant(Arc::clone(&partial)),
-            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+            assistant_message_event: AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "col1\tcol2\r\ncol3".to_string(),
                 partial: Arc::clone(&partial),
-            }),
+            },
         },
         // Error message with newlines.
         AgentEvent::ExtensionError {
@@ -3750,7 +3750,7 @@ fn json_parity_turn_end_multiple_tool_results() {
     let harness = TestHarness::new("json_parity_turn_end_multiple_tool_results");
 
     let event = AgentEvent::TurnEnd {
-        session_id: "s".to_string(),
+        session_id: Arc::from("s"),
         turn_index: 0,
         message: Message::Assistant(Arc::new(test_assistant_message())),
         tool_results: vec![
@@ -3789,7 +3789,7 @@ fn json_parity_agent_end_message_ordering() {
         .collect();
 
     let event = AgentEvent::AgentEnd {
-        session_id: "s".to_string(),
+        session_id: Arc::from("s"),
         messages: msgs,
         error: None,
     };
@@ -3824,13 +3824,13 @@ fn json_parity_extension_event_payload_all_forwarded() {
     let events: Vec<(AgentEvent, &str)> = vec![
         (
             AgentEvent::AgentStart {
-                session_id: "s123".to_string(),
+                session_id: Arc::from("s123"),
             },
             "sessionId",
         ),
         (
             AgentEvent::AgentEnd {
-                session_id: "s123".to_string(),
+                session_id: Arc::from("s123"),
                 messages: vec![test_user_message()],
                 error: Some("timeout".to_string()),
             },
@@ -3838,7 +3838,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
         ),
         (
             AgentEvent::TurnStart {
-                session_id: "s123".to_string(),
+                session_id: Arc::from("s123"),
                 turn_index: 3,
                 timestamp: 1_700_000_000,
             },
@@ -3846,7 +3846,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
         ),
         (
             AgentEvent::TurnEnd {
-                session_id: "s123".to_string(),
+                session_id: Arc::from("s123"),
                 turn_index: 3,
                 message: test_user_message(),
                 tool_results: vec![],
@@ -3862,11 +3862,11 @@ fn json_parity_extension_event_payload_all_forwarded() {
         (
             AgentEvent::MessageUpdate {
                 message: Message::Assistant(Arc::clone(&partial)),
-                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                assistant_message_event: AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: "x".to_string(),
                     partial: Arc::clone(&partial),
-                }),
+                },
             },
             "assistantMessageEvent",
         ),
