@@ -1419,10 +1419,19 @@ pub fn validate_proposal(
     // 5. Monotonicity for path-bearing ops.
     if let Some(root) = extension_root {
         for op in &proposal.ops {
-            let path_str = op_target_path(op);
-            let target = Path::new(&path_str);
-            if target.is_absolute() {
-                let verdict = verify_repair_monotonicity(root, root, target);
+            let mut paths_to_check = vec![op_target_path(op)];
+            if let PatchOp::ReplaceModulePath { from, .. } = op {
+                paths_to_check.push(from.clone());
+            }
+            
+            for path_str in paths_to_check {
+                let target = Path::new(&path_str);
+                let resolved = if target.is_absolute() {
+                    target.to_path_buf()
+                } else {
+                    root.join(target)
+                };
+                let verdict = verify_repair_monotonicity(root, root, &resolved);
                 if !verdict.is_safe() {
                     errors.push(ProposalValidationError::MonotonicityViolation { path: path_str });
                 }

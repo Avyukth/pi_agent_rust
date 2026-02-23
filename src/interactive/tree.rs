@@ -165,7 +165,7 @@ impl TreeSelectorState {
             self.selected = self.selected.saturating_sub(delta.unsigned_abs());
         } else {
             let delta = usize::try_from(delta).unwrap_or(usize::MAX);
-            self.selected = (self.selected + delta).min(max_index);
+            self.selected = self.selected.saturating_add(delta).min(max_index);
         }
         self.last_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
         self.ensure_scroll_visible();

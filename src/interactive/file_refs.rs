@@ -117,7 +117,10 @@ pub(super) fn path_for_display(path: &Path, cwd: &Path) -> String {
 }
 
 pub(super) fn format_file_ref(path: &str) -> String {
-    if path.chars().any(char::is_whitespace) {
+    let needs_quotes = path.chars().any(char::is_whitespace)
+        || path.chars().last().is_some_and(is_trailing_punct);
+
+    if needs_quotes {
         if !path.contains('"') {
             format!("@\"{path}\"")
         } else if !path.contains('\'') {
