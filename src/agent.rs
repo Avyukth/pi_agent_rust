@@ -2604,11 +2604,8 @@ mod extensions_integration_tests {
                 .await
                 .expect("run_text");
 
-            // With parallel tool execution, all tool functions run concurrently,
-            // so both tools execute (calls == 2). The steering message causes
-            // the second tool's result to be replaced with a "Skipped" placeholder
-            // in the conversation, preserving the steering interrupt semantics.
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            // A steer message should short-circuit remaining tool dispatch.
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
         });
     }
 

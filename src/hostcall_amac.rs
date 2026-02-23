@@ -968,7 +968,13 @@ mod tests {
         ];
         let plan = executor.plan_batch(requests);
         assert_eq!(plan.total_requests, 5);
-        assert_eq!(plan.groups.len(), 3); // SessionRead, Tool, Http
+        // Grouping is done by contiguous runs to preserve global ordering.
+        assert_eq!(plan.groups.len(), 5);
+        assert_eq!(plan.groups[0].key, AmacGroupKey::SessionRead);
+        assert_eq!(plan.groups[1].key, AmacGroupKey::Tool);
+        assert_eq!(plan.groups[2].key, AmacGroupKey::SessionRead);
+        assert_eq!(plan.groups[3].key, AmacGroupKey::Http);
+        assert_eq!(plan.groups[4].key, AmacGroupKey::Tool);
     }
 
     #[test]
@@ -1193,22 +1199,17 @@ mod tests {
         ];
         let plan = executor.plan_batch(requests);
         assert_eq!(plan.total_requests, 8);
-
-        // Should have groups for: SessionRead(2), SessionWrite(1), EventRead(1),
-        // Tool(2), Http(1), Log(1)
-        assert_eq!(plan.groups.len(), 6);
-
-        // Verify group sizes.
-        let session_read_group = plan
-            .groups
-            .iter()
-            .find(|g| g.key == AmacGroupKey::SessionRead);
-        assert!(session_read_group.is_some());
-        assert_eq!(session_read_group.unwrap().len(), 2);
-
-        let tool_group = plan.groups.iter().find(|g| g.key == AmacGroupKey::Tool);
-        assert!(tool_group.is_some());
-        assert_eq!(tool_group.unwrap().len(), 2);
+        // Contiguous-run grouping keeps ordering strict, and log calls are sunk
+        // to their own group once a non-log key boundary is crossed.
+        assert_eq!(plan.groups.len(), 8);
+        assert_eq!(plan.groups[0].key, AmacGroupKey::SessionRead);
+        assert_eq!(plan.groups[1].key, AmacGroupKey::Tool);
+        assert_eq!(plan.groups[2].key, AmacGroupKey::Http);
+        assert_eq!(plan.groups[3].key, AmacGroupKey::SessionWrite);
+        assert_eq!(plan.groups[4].key, AmacGroupKey::Log);
+        assert_eq!(plan.groups[5].key, AmacGroupKey::EventRead);
+        assert_eq!(plan.groups[6].key, AmacGroupKey::SessionRead);
+        assert_eq!(plan.groups[7].key, AmacGroupKey::Tool);
     }
 
     #[test]

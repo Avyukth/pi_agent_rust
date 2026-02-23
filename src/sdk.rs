@@ -1680,12 +1680,12 @@ mod tests {
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let provider = handle.session().agent.provider();
-        assert_eq!(provider.name(), "anthropic");
-        assert_eq!(provider.model_id(), "claude-opus-4-5");
+        assert_eq!(provider.name(), "openai-codex");
+        assert_eq!(provider.model_id(), "gpt-5.3-codex");
     }
 
     #[test]
-    fn create_agent_session_respects_provider_model_and_thinking() {
+    fn create_agent_session_respects_provider_model_and_clamps_thinking() {
         let tmp = tempdir().expect("tempdir");
         let options = SessionOptions {
             provider: Some("openai".to_string()),
@@ -1702,7 +1702,7 @@ mod tests {
         assert_eq!(provider.model_id(), "gpt-4o");
         assert_eq!(
             handle.session().agent.stream_options().thinking_level,
-            Some(crate::model::ThinkingLevel::Low)
+            Some(crate::model::ThinkingLevel::Off)
         );
     }
 

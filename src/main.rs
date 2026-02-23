@@ -3214,6 +3214,28 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
     let (first, rest) = normalized
         .split_once(char::is_whitespace)
         .map_or((normalized.as_str(), ""), |(a, b)| (a, b.trim()));
+    let wants_oauth = rest.contains("oauth");
+    let wants_key = rest.contains("key") || rest.contains("api");
+
+    let select_choice_for_provider = |provider: &str| -> Option<ProviderChoice> {
+        let canonical = provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
+
+        if (wants_oauth || wants_key)
+            && let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
+                choice.provider.eq_ignore_ascii_case(canonical)
+                    && ((wants_oauth
+                        && matches!(
+                            choice.kind,
+                            SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
+                        ))
+                        || (wants_key && choice.kind == SetupCredentialKind::ApiKey))
+            })
+        {
+            return Some(found);
+        }
+
+        provider_choice_default_for_provider(canonical)
+    };
 
     // Try numbered choice first (1-N).
     if let Ok(num) = first.parse::<usize>() {
@@ -3225,46 +3247,27 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
 
     // Try exact match against listed labels.
     for choice in PROVIDER_CHOICES {
-        if normalized == choice.label.to_ascii_lowercase()
-            || first == choice.provider
-            || first == choice.provider.to_ascii_lowercase()
-        {
+        if normalized == choice.label.to_ascii_lowercase() {
             return Some(*choice);
         }
+    }
+    if let Some(found) = select_choice_for_provider(first) {
+        return Some(found);
     }
 
     // Common nicknames.
     match first {
-        "codex" | "chatgpt" | "gpt" => return provider_choice_default_for_provider("openai-codex"),
-        "claude" => return provider_choice_default_for_provider("anthropic"),
-        "gemini" => return provider_choice_default_for_provider("google"),
-        "kimi" => return provider_choice_default_for_provider("kimi-for-coding"),
+        "codex" | "chatgpt" | "gpt" => return select_choice_for_provider("openai-codex"),
+        "claude" => return select_choice_for_provider("anthropic"),
+        "gemini" => return select_choice_for_provider("google"),
+        "kimi" => return select_choice_for_provider("kimi-for-coding"),
         _ => {}
     }
 
     // Fall back to provider_metadata registry for any canonical ID or alias.
     let meta = provider_metadata::provider_metadata(first)?;
     let canonical = meta.canonical_id;
-
-    // If we have an explicit method preference, honor it when multiple choices exist.
-    let wants_oauth = rest.contains("oauth");
-    let wants_key = rest.contains("key") || rest.contains("api");
-    if wants_oauth || wants_key {
-        if let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
-            choice.provider.eq_ignore_ascii_case(canonical)
-                && ((wants_oauth
-                    && matches!(
-                        choice.kind,
-                        SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
-                    ))
-                    || (wants_key && choice.kind == SetupCredentialKind::ApiKey))
-        }) {
-            return Some(found);
-        }
-    }
-
-    // Prefer known built-in flows for providers we support.
-    if let Some(found) = provider_choice_default_for_provider(canonical) {
+    if let Some(found) = select_choice_for_provider(canonical) {
         return Some(found);
     }
 

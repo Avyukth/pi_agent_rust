@@ -181,13 +181,7 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_usage_in_streaming)
             .unwrap_or(true);
 
-        let stream_options = if include_usage {
-            Some(OpenAIStreamOptions {
-                include_usage: true,
-            })
-        } else {
-            None
-        };
+        let stream_options = Some(OpenAIStreamOptions { include_usage });
 
         OpenAIRequest {
             model: &self.model,

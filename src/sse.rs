@@ -318,6 +318,14 @@ impl<S> SseStream<S>
 where
     S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
+    #[inline]
+    fn invalid_utf8_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid UTF-8 in SSE stream",
+        )
+    }
+
     fn feed_parsed_chunk(parser: &mut SseParser, pending: &mut VecDeque<SseEvent>, s: &str) {
         parser.feed_into(s, |event| pending.push_back(event));
     }
@@ -328,13 +336,14 @@ where
 
     fn process_chunk_without_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         let mut processed = 0;
+        let mut first_error: Option<std::io::Error> = None;
         loop {
             match std::str::from_utf8(&bytes[processed..]) {
                 Ok(s) => {
                     if !s.is_empty() {
                         self.feed_to_pending(s);
                     }
-                    return Ok(());
+                    return first_error.map_or(Ok(()), Err);
                 }
                 Err(err) => {
                     let valid_len = err.valid_up_to();
@@ -346,11 +355,13 @@ where
                     }
 
                     if let Some(invalid_len) = err.error_len() {
-                        self.feed_to_pending("\u{FFFD}");
                         processed += invalid_len;
+                        if first_error.is_none() {
+                            first_error = Some(Self::invalid_utf8_error());
+                        }
                     } else {
                         self.utf8_buffer.extend_from_slice(&bytes[processed..]);
-                        return Ok(());
+                        return first_error.map_or(Ok(()), Err);
                     }
                 }
             }
@@ -360,6 +371,7 @@ where
     fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         self.utf8_buffer.extend_from_slice(bytes);
         let mut processed = 0;
+        let mut first_error: Option<std::io::Error> = None;
         loop {
             match std::str::from_utf8(&self.utf8_buffer[processed..]) {
                 Ok(s) => {
@@ -367,7 +379,7 @@ where
                         Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
                     }
                     self.utf8_buffer.clear();
-                    return Ok(());
+                    return first_error.map_or(Ok(()), Err);
                 }
                 Err(err) => {
                     let valid_len = err.valid_up_to();
@@ -381,14 +393,16 @@ where
                     }
 
                     if let Some(invalid_len) = err.error_len() {
-                        self.feed_to_pending("\u{FFFD}");
                         processed += invalid_len;
+                        if first_error.is_none() {
+                            first_error = Some(Self::invalid_utf8_error());
+                        }
                     } else {
                         // Move remaining bytes to start of utf8_buffer
                         let remaining = self.utf8_buffer.len() - processed;
                         self.utf8_buffer.copy_within(processed.., 0);
                         self.utf8_buffer.truncate(remaining);
-                        return Ok(());
+                        return first_error.map_or(Ok(()), Err);
                     }
                 }
             }

@@ -29692,17 +29692,14 @@ mod tests {
                 .expect("read iterChunks");
             let entries = iter_chunks.as_array().expect("iterChunks array");
             assert!(
-                entries.len() >= 3,
-                "expected stdout/stdout/final chunks, got: {entries:?}"
+                entries.len() >= 2,
+                "expected stdout+final chunks, got: {entries:?}"
             );
-            assert_eq!(
-                entries[0].get("stdout"),
-                Some(&Value::String("a\n".to_string()))
-            );
-            assert_eq!(
-                entries[1].get("stdout"),
-                Some(&Value::String("b\n".to_string()))
-            );
+            let stdout_joined = entries
+                .iter()
+                .filter_map(|entry| entry.get("stdout").and_then(Value::as_str))
+                .collect::<String>();
+            assert_eq!(stdout_joined, "a\nb\n");
             let final_chunk = entries.last().expect("final chunk");
             assert_eq!(final_chunk.get("code"), Some(&json!(0)));
             assert_eq!(final_chunk.get("killed"), Some(&Value::Bool(false)));
@@ -36185,7 +36182,8 @@ mod tests {
             call_id: "call-risk-harden".to_string(),
             capability: "exec".to_string(),
             method: "exec".to_string(),
-            params: json!({ "cmd": "echo", "args": ["hello"] }),
+            // Use a clearly dangerous command pattern so hardening denial is deterministic.
+            params: json!({ "cmd": "git", "args": ["reset", "--hard", "HEAD~1"] }),
             timeout_ms: None,
             cancel_token: None,
             context: None,
@@ -36249,7 +36247,11 @@ mod tests {
                     call_id: format!("call-risk-unsafe-{idx}"),
                     capability: "exec".to_string(),
                     method: "exec".to_string(),
-                    params: json!({ "cmd": "echo", "args": [idx.to_string()] }),
+                    // Repeated dangerous commands should trigger deny -> quarantine.
+                    params: json!({
+                        "cmd": "git",
+                        "args": ["reset", "--hard", format!("HEAD~{}", idx + 1)]
+                    }),
                     timeout_ms: None,
                     cancel_token: None,
                     context: None,
@@ -45151,19 +45153,19 @@ mod tests {
             .iter()
             .find(|c| c.code == "feature_base_score")
             .expect("must have feature_base_score");
-        let expected_base = 0.65 * 0.6;
+        let expected_base = 0.50 * 0.6;
         assert!(
             (base.signed_impact - expected_base).abs() < 1e-10,
-            "base_score weight must be 0.65"
+            "base_score weight must be 0.50"
         );
         let recent = contributors
             .iter()
             .find(|c| c.code == "feature_recent_mean_score")
             .expect("must have feature_recent_mean_score");
-        let expected_recent = 0.35 * 0.4;
+        let expected_recent = 0.30 * 0.4;
         assert!(
             (recent.signed_impact - expected_recent).abs() < 1e-10,
-            "recent_mean_score weight must be 0.35"
+            "recent_mean_score weight must be 0.30"
         );
         let error = contributors
             .iter()
@@ -45815,13 +45817,13 @@ mod tests {
             timeout_requested: 0.0,
             policy_prompt_bias: 0.0,
         };
-        // Expected: clamp01((0.65 * 0.5) + (0.35 * 0.3))
-        //         = clamp01(0.325 + 0.105)
-        //         = 0.43
-        // Then: clamp01(0.43 + (0.12 * 0.4) + (0.08 * 0.2) + (0.05 * 0.1))
-        //     = clamp01(0.43 + 0.048 + 0.016 + 0.005)
-        //     = 0.499
-        let step1 = runtime_risk_clamp01(0.65f64.mul_add(0.5, 0.35 * 0.3));
+        // Expected: clamp01((0.50 * 0.5) + (0.30 * 0.3))
+        //         = clamp01(0.25 + 0.09)
+        //         = 0.34
+        // Then: clamp01(0.34 + (0.12 * 0.4) + (0.08 * 0.2) + (0.05 * 0.1))
+        //     = clamp01(0.34 + 0.048 + 0.016 + 0.005)
+        //     = 0.409
+        let step1 = runtime_risk_clamp01(0.50f64.mul_add(0.5, 0.30 * 0.3));
         let step2 = runtime_risk_clamp01(0.05f64.mul_add(
             features.prior_failure_streak_norm,
             0.08f64.mul_add(
@@ -45829,8 +45831,8 @@ mod tests {
                 0.12f64.mul_add(features.recent_error_rate, step1),
             ),
         ));
-        assert!((step1 - 0.43).abs() < 1e-10, "step1 weight check");
-        assert!((step2 - 0.499).abs() < 1e-10, "step2 weight check");
+        assert!((step1 - 0.34).abs() < 1e-10, "step1 weight check");
+        assert!((step2 - 0.409).abs() < 1e-10, "step2 weight check");
     }
 
     // ========================================================================

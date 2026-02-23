@@ -161,6 +161,7 @@ pub enum TruncatedBy {
 /// no-truncation case (content moved, zero-copy) and to enable in-place
 /// truncation when the content exceeds limits (`String::truncate`, no new
 /// allocation).
+#[allow(clippy::too_many_lines)]
 pub fn truncate_head(
     content: impl Into<String>,
     max_lines: usize,
@@ -180,6 +181,28 @@ pub fn truncate_head(
             nl + 1
         }
     };
+
+    // Explicitly honor zero-line budgets.
+    if max_lines == 0 {
+        let truncated = !content.is_empty();
+        return TruncationResult {
+            content: String::new(),
+            truncated,
+            truncated_by: if truncated {
+                Some(TruncatedBy::Lines)
+            } else {
+                None
+            },
+            total_lines,
+            total_bytes,
+            output_lines: 0,
+            output_bytes: 0,
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+            max_lines,
+            max_bytes,
+        };
+    }
 
     // No truncation needed — reuse the owned String (zero-copy move).
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -366,8 +389,10 @@ pub fn truncate_tail(
                 if remaining > 0 && line_count == 0 {
                     let chunk = &content[line_start..start_idx];
                     let truncated_chunk = truncate_string_to_bytes_from_end(chunk, remaining);
-                    partial_output = Some(truncated_chunk);
-                    last_line_partial = true;
+                    if !truncated_chunk.is_empty() {
+                        partial_output = Some(truncated_chunk);
+                        last_line_partial = true;
+                    }
                 }
                 truncated_by = Some(TruncatedBy::Bytes);
                 break;
@@ -6267,7 +6292,9 @@ mod tests {
             if result.first_line_exceeds_limit {
                 prop_assert!(result.truncated);
                 prop_assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-                prop_assert!(result.content.is_empty());
+                prop_assert!(result.output_bytes <= max_bytes);
+                prop_assert!(result.output_lines <= 1);
+                prop_assert!(input.starts_with(&result.content));
             }
         }
 

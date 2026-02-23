@@ -14069,11 +14069,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
                                 return Ok(None);
                             }
-                            // Use the configured policy to check if the key is a secret.
-                            // This respects the disclosure_allowlist in config.json.
-                            let allowed = policy_for_env
-                                .as_ref()
-                                .is_none_or(|policy| !policy.secret_broker.is_secret(&key));
+                            // If a policy is present, use its SecretBroker (including
+                            // disclosure_allowlist). Otherwise fall back to default
+                            // secret filtering so obvious credentials are still hidden.
+                            let allowed = policy_for_env.as_ref().map_or_else(
+                                || is_env_var_allowed(&key),
+                                |policy| !policy.secret_broker.is_secret(&key),
+                            );
                             tracing::debug!(
                                 event = "pijs.env.get",
                                 key = %key,
@@ -21219,11 +21221,15 @@ export default ConfigLoader;
                         globalThis.requireResults.http2PathHeader = http2.constants.HTTP2_HEADER_PATH;
 
                         try {
-                            require('left-pad');
+                            const missing = require('left-pad');
                             globalThis.requireResults.missingModuleThrows = false;
+                            globalThis.requireResults.missingModuleIsStub =
+                              typeof missing === 'function' &&
+                              typeof missing.default === 'function' &&
+                              typeof missing.anyNestedProperty === 'function';
                         } catch (err) {
-                            globalThis.requireResults.missingModuleThrows =
-                              String(err && err.message || '').includes('Cannot find module');
+                            globalThis.requireResults.missingModuleThrows = true;
+                            globalThis.requireResults.missingModuleIsStub = false;
                         }
                         globalThis.requireResults.done = true;
                     });
@@ -21239,7 +21245,8 @@ export default ConfigLoader;
             assert_eq!(r["cryptoHasRandomUUID"], serde_json::json!(true));
             assert_eq!(r["http2HasConnect"], serde_json::json!(true));
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
-            assert_eq!(r["missingModuleThrows"], serde_json::json!(true));
+            assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
+            assert_eq!(r["missingModuleIsStub"], serde_json::json!(true));
         });
     }
 
