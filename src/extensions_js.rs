@@ -5181,6 +5181,17 @@ fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
     format!("pijs-compat://builtin/{canonical}/{short}")
 }
 
+/// Read up to 1MB of a source file for import extraction.
+/// This prevents OOM vulnerabilities if a module path resolves to a massive file or /dev/zero.
+fn read_source_for_import_extraction(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut handle = file.take(1024 * 1024); // 1MB limit
+    let mut buffer = String::new();
+    handle.read_to_string(&mut buffer).ok()?;
+    Some(buffer)
+}
+
 fn maybe_register_builtin_compat_overlay(
     state: &mut PiJsModuleState,
     base: &str,
@@ -5191,7 +5202,7 @@ fn maybe_register_builtin_compat_overlay(
         return None;
     }
 
-    let source = std::fs::read_to_string(base).ok()?;
+    let source = read_source_for_import_extraction(base)?;
     let extracted_names = extract_builtin_import_names(&source, spec, canonical);
     if extracted_names.is_empty() {
         return None;
@@ -5293,7 +5304,7 @@ impl JsModuleResolver for PiJsResolver {
 
             if let Some(escaped_path) = detect_monorepo_escape(base, spec, &roots) {
                 // Read the importing file to extract import names.
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let names = extract_import_names(&source, spec);
 
                 let stub = generate_monorepo_stub(&names);
@@ -5360,7 +5371,7 @@ impl JsModuleResolver for PiJsResolver {
                     "auto-repair: generated proxy stub for missing npm dependency"
                 );
 
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let extracted_names = extract_import_names(&source, spec);
                 let mut state = self.state.borrow_mut();
                 let entry_key = spec.to_string();
@@ -5469,8 +5480,23 @@ fn compile_module_source(
     }
 
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let raw = fs::read_to_string(path)
+    let file = fs::File::open(path)
+        .map_err(|err| rquickjs::Error::new_loading_message(name, format!("open: {err}")))?;
+    let mut handle = std::io::Read::take(file, MAX_MODULE_SOURCE_BYTES + 1);
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut handle, &mut raw)
         .map_err(|err| rquickjs::Error::new_loading_message(name, format!("read: {err}")))?;
+    
+    if raw.len() as u64 > MAX_MODULE_SOURCE_BYTES {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            format!(
+                "Module source exceeds size limit: {} > {}",
+                raw.len(),
+                MAX_MODULE_SOURCE_BYTES
+            ),
+        ));
+    }
 
     let compiled = match extension {
         "ts" | "tsx" => {
@@ -5733,20 +5759,21 @@ fn resolve_module_path(
 
     if let Some(path) = specifier.strip_prefix("file://") {
         let resolved = resolve_existing_file(PathBuf::from(path))?;
-        if !roots.is_empty() {
-            let canonical = crate::extensions::safe_canonicalize(&resolved);
-            let allowed = roots.iter().any(|root| {
-                let canonical_root = crate::extensions::safe_canonicalize(root);
-                canonical.starts_with(&canonical_root)
-            });
-            if !allowed {
-                tracing::warn!(
-                    event = "pijs.resolve.monotonicity_violation",
-                    resolved = %resolved.display(),
-                    "resolution blocked: file:// path escapes extension root"
-                );
-                return None;
-            }
+        if roots.is_empty() {
+            return None;
+        }
+        let canonical = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = roots.iter().any(|root| {
+            let canonical_root = crate::extensions::safe_canonicalize(root);
+            canonical.starts_with(&canonical_root)
+        });
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                resolved = %resolved.display(),
+                "resolution blocked: file:// path escapes extension root"
+            );
+            return None;
         }
         return Some(resolved);
     }
@@ -5770,38 +5797,40 @@ fn resolve_module_path(
     // SEC-FIX: Enforce scope monotonicity before checking file existence (bd-k5q5.9.1.3).
     // This prevents directory traversal probes from revealing existence of files
     // outside the extension root (e.g. `../../../../etc/passwd`).
-    if !roots.is_empty() {
-        let canonical = crate::extensions::safe_canonicalize(&path);
-        let allowed = roots.iter().any(|root| {
-            let canonical_root = crate::extensions::safe_canonicalize(root);
-            canonical.starts_with(&canonical_root)
-        });
+    if roots.is_empty() {
+        return None;
+    }
+    let canonical = crate::extensions::safe_canonicalize(&path);
+    let allowed = roots.iter().any(|root| {
+        let canonical_root = crate::extensions::safe_canonicalize(root);
+        canonical.starts_with(&canonical_root)
+    });
 
-        if !allowed {
-            return None;
-        }
+    if !allowed {
+        return None;
     }
 
     if let Some(resolved) = resolve_existing_module_candidate(path.clone()) {
         // SEC-FIX: Enforce scope monotonicity on the *resolved* path (bd-k5q5.9.1.3).
         // This handles cases where `resolve_existing_module_candidate` finds a file
         // (e.g. .ts sibling) that is a symlink escaping the root, even if the base path was safe.
-        if !roots.is_empty() {
-            let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
-            let allowed = roots.iter().any(|root| {
-                let canonical_root = crate::extensions::safe_canonicalize(root);
-                canonical_resolved.starts_with(&canonical_root)
-            });
+        if roots.is_empty() {
+            return None;
+        }
+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = roots.iter().any(|root| {
+            let canonical_root = crate::extensions::safe_canonicalize(root);
+            canonical_resolved.starts_with(&canonical_root)
+        });
 
-            if !allowed {
-                tracing::warn!(
-                    event = "pijs.resolve.monotonicity_violation",
-                    original = %path.display(),
-                    resolved = %resolved.display(),
-                    "resolution blocked: resolved path escapes extension root"
-                );
-                return None;
-            }
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                original = %path.display(),
+                resolved = %resolved.display(),
+                "resolution blocked: resolved path escapes extension root"
+            );
+            return None;
         }
         return Some(resolved);
     }
@@ -5834,12 +5863,16 @@ fn resolve_module_path(
 /// references compiled output that was never built.
 fn try_dist_to_src_fallback(path: &Path) -> Option<PathBuf> {
     let path_str = path.to_string_lossy();
-    let idx = path_str.find("/dist/")?;
+    
+    // Normalize to handle both Windows backslashes and Unix forward slashes.
+    let normalized = path_str.replace('\\', "/");
+    let idx = normalized.find("/dist/")?;
 
     // The extension root is the directory containing /dist/.
     let extension_root = PathBuf::from(&path_str[..idx]);
 
-    let src_path = format!("{}/src/{}", &path_str[..idx], &path_str[idx + 6..]);
+    let sep = std::path::MAIN_SEPARATOR;
+    let src_path = format!("{}{sep}src{sep}{}", &path_str[..idx], &path_str[idx + 6..]);
 
     let candidate = PathBuf::from(&src_path);
 
@@ -5995,7 +6028,8 @@ fn detect_monorepo_escape(
         .unwrap_or_else(|_| resolved.clone());
 
     for root in extension_roots {
-        if effective.starts_with(root) {
+        let canonical_root = crate::extensions::safe_canonicalize(root);
+        if effective.starts_with(&canonical_root) {
             return None; // Within an extension root — not an escape
         }
     }
