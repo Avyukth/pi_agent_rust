@@ -1650,9 +1650,9 @@ impl Tool for ReadTool {
             let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
             let first_line_size = format_size(first_line.len());
             output_text = format!(
-                "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' \"{}\" | head -c {DEFAULT_MAX_BYTES}]",
+                "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' '{}' | head -c {DEFAULT_MAX_BYTES}]",
                 format_size(DEFAULT_MAX_BYTES),
-                input.path.replace('"', "\\\"")
+                input.path.replace('\'', "'\\''")
             );
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else if truncation.truncated {
@@ -3190,10 +3190,11 @@ impl Tool for GrepTool {
         });
 
         let stderr_thread = std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stderr);
+            let reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             let _ = stderr_tx.send(
                 reader
+                    .take(READ_TOOL_MAX_BYTES)
                     .read_to_end(&mut buf)
                     .map(|_| buf)
                     .map_err(|err| err.to_string()),
@@ -3548,6 +3549,7 @@ impl Tool for FindTool {
         let stdout_handle = std::thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             stdout_pipe
+                .take(READ_TOOL_MAX_BYTES)
                 .read_to_end(&mut buf)
                 .map_err(|err| err.to_string())?;
             Ok(buf)
@@ -3556,6 +3558,7 @@ impl Tool for FindTool {
         let stderr_handle = std::thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             stderr_pipe
+                .take(READ_TOOL_MAX_BYTES)
                 .read_to_end(&mut buf)
                 .map_err(|err| err.to_string())?;
             Ok(buf)

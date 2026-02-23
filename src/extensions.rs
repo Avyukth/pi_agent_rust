@@ -3978,13 +3978,26 @@ fn normalize_command_for_classification(command: &str) -> String {
         }
 
         let mut chars = remaining.chars();
-        let Some(ch) = chars.next() else {
+        let Some(mut ch) = chars.next() else {
             break;
         };
 
-        // Treat escaped ASCII whitespace (`\ `, `\n`, `\t`) as whitespace.
+        // Strip quotes to prevent obfuscation like `r"m" -rf /`
+        if ch == '\'' || ch == '"' {
+            remaining = chars.as_str();
+            continue;
+        }
+
         if ch == '\\' {
-            if let Some(next) = chars.next() {
+            let mut peek_chars = chars.clone();
+            if let Some(next) = peek_chars.next() {
+                if next == '\n' || next == '\r' {
+                    remaining = peek_chars.as_str();
+                    continue;
+                }
+                
+                chars.next(); // consume the escaped character
+
                 if next.is_ascii_whitespace() {
                     if !previous_was_space {
                         normalized.push(' ');
@@ -3993,6 +4006,14 @@ fn normalize_command_for_classification(command: &str) -> String {
                     remaining = chars.as_str();
                     continue;
                 }
+
+                // Strip escaped quotes as well
+                if next == '\'' || next == '"' {
+                    remaining = chars.as_str();
+                    continue;
+                }
+
+                ch = next;
             }
         }
 
@@ -22295,14 +22316,14 @@ async fn dispatch_hostcall_exec_ref(
 
             let stdout_handle = thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
                 let mut buf = Vec::new();
-                stdout
+                std::io::Read::take(&mut stdout, crate::tools::READ_TOOL_MAX_BYTES)
                     .read_to_end(&mut buf)
                     .map_err(|err| err.to_string())?;
                 Ok(buf)
             });
             let stderr_handle = thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
                 let mut buf = Vec::new();
-                stderr
+                std::io::Read::take(&mut stderr, crate::tools::READ_TOOL_MAX_BYTES)
                     .read_to_end(&mut buf)
                     .map_err(|err| err.to_string())?;
                 Ok(buf)
