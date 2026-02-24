@@ -2440,10 +2440,7 @@ mod tests {
         let full = prepare_compaction(&entries, settings);
         // If fast-path says no, full should also return None.
         if !fast {
-            assert!(
-                full.is_none(),
-                "fast-path false → full should be None"
-            );
+            assert!(full.is_none(), "fast-path false → full should be None");
         }
     }
 }

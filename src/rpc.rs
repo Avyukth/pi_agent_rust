@@ -2584,7 +2584,8 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+            let (out_tx, out_rx) =
+                std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -2685,7 +2686,8 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+            let (out_tx, out_rx) =
+                std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -5018,7 +5020,8 @@ mod output_channel_bound_tests {
 
         // Fill the channel to capacity.
         for i in 0..RPC_OUTPUT_CHANNEL_BOUND {
-            tx.send(format!("msg-{i}")).expect("send within bound should succeed");
+            tx.send(format!("msg-{i}"))
+                .expect("send within bound should succeed");
         }
 
         // The next try_send must report Full — proves the channel is bounded.
@@ -5047,6 +5050,7 @@ mod output_channel_bound_tests {
         let _ = rx.recv().unwrap();
 
         // Now one more send should succeed.
-        tx.send("after-drain".to_string()).expect("send after drain should succeed");
+        tx.send("after-drain".to_string())
+            .expect("send after drain should succeed");
     }
 }
