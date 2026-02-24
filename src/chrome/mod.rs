@@ -21,8 +21,12 @@ const DISCOVERY_PREFIX: &str = "pi-chrome-host-";
 const DISCOVERY_SUFFIX: &str = ".discovery.json";
 const DEFAULT_MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 1000;
+const MAX_ESL_RETRY_ATTEMPTS: u8 = 3;
+const MAX_ESL_IN_PROGRESS_RETRIES: u8 = 3;
+const ESL_IN_PROGRESS_BACKOFF_MS: u64 = 5;
 
 type PendingResponses = HashMap<String, oneshot::Sender<protocol::ResponseEnvelope>>;
+type RequestFingerprintRegistry = HashMap<(String, String), protocol::RequestFingerprint>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -31,6 +35,13 @@ pub enum ConnectionState {
     Authenticating,
     Connected,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionClass {
+    ReadOnlyReplayable,
+    ConditionallyIdempotent,
+    NonIdempotent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +90,7 @@ pub struct ChromeBridge {
     writer: Arc<StdMutex<Option<OwnedWriteHalf>>>,
     pending: Arc<StdMutex<PendingResponses>>,
     observations: Arc<StdMutex<Vec<protocol::ObservationEvent>>>,
+    request_fingerprints: StdMutex<RequestFingerprintRegistry>,
     request_seq: AtomicU64,
     connection_seq: AtomicU64,
 }
@@ -109,6 +121,7 @@ impl ChromeBridge {
             writer: Arc::new(StdMutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             observations: Arc::new(StdMutex::new(Vec::new())),
+            request_fingerprints: StdMutex::new(HashMap::new()),
             request_seq: AtomicU64::new(1),
             connection_seq: AtomicU64::new(1),
         }
@@ -271,17 +284,181 @@ impl ChromeBridge {
         op: impl Into<String>,
         payload: serde_json::Value,
     ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        self.send_request_with_id(self.next_request_id(), op.into(), payload)
+            .await
+    }
+
+    pub async fn execute_request_with_esl(
+        &self,
+        op: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        let op = op.into();
+        let request_id = self.next_request_id();
+        self.execute_request_with_esl_id(request_id, op, payload)
+            .await
+    }
+
+    async fn execute_request_with_esl_id(
+        &self,
+        request_id: String,
+        op: String,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        let execution_class = classify_execution_class(&op);
+        let mut baseline_host_epoch: Option<String> = None;
+        let mut retry_attempts = 0_u8;
+        let mut in_progress_retries = 0_u8;
+
+        loop {
+            if self.status().state != ConnectionState::Connected {
+                self.connect().await?;
+            }
+
+            let current_epoch = self.current_host_epoch()?;
+            if baseline_host_epoch.is_none() {
+                baseline_host_epoch = Some(current_epoch.clone());
+            }
+
+            let response = self
+                .send_request_with_id(request_id.clone(), op.clone(), payload.clone())
+                .await;
+
+            match response {
+                Ok(protocol::ResponseEnvelope::Error(err)) if is_esl_in_progress_error(&err) => {
+                    in_progress_retries = in_progress_retries.saturating_add(1);
+                    if in_progress_retries > MAX_ESL_IN_PROGRESS_RETRIES {
+                        return Ok(protocol::ResponseEnvelope::Error(err));
+                    }
+
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(ESL_IN_PROGRESS_BACKOFF_MS),
+                    )
+                    .await;
+                }
+                Ok(protocol::ResponseEnvelope::Error(err))
+                    if is_timeout_or_disconnect_error_code(err.error.code) =>
+                {
+                    let baseline = baseline_host_epoch.as_deref().unwrap_or_default();
+                    let message = err.error.message.clone();
+                    let retry_decision = self
+                        .handle_esl_retry_after_ambiguous_result(
+                            execution_class,
+                            baseline,
+                            &request_id,
+                            &mut retry_attempts,
+                            message,
+                        )
+                        .await;
+                    let should_retry = match retry_decision {
+                        Ok(v) => v,
+                        Err(ChromeBridgeError::EslIndeterminate { message, .. }) => {
+                            return Ok(execution_indeterminate_envelope(&request_id, message));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if !should_retry {
+                        return Ok(protocol::ResponseEnvelope::Error(err));
+                    }
+                }
+                Ok(envelope) => return Ok(envelope),
+                Err(err) if is_ambiguous_transport_error(&err) => {
+                    let baseline = baseline_host_epoch.as_deref().unwrap_or_default();
+                    let retry_decision = self
+                        .handle_esl_retry_after_ambiguous_result(
+                            execution_class,
+                            baseline,
+                            &request_id,
+                            &mut retry_attempts,
+                            err.to_string(),
+                        )
+                        .await;
+                    let should_retry = match retry_decision {
+                        Ok(v) => v,
+                        Err(ChromeBridgeError::EslIndeterminate { message, .. }) => {
+                            return Ok(execution_indeterminate_envelope(&request_id, message));
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    if !should_retry {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn handle_esl_retry_after_ambiguous_result(
+        &self,
+        execution_class: ExecutionClass,
+        baseline_host_epoch: &str,
+        request_id: &str,
+        retry_attempts: &mut u8,
+        detail: String,
+    ) -> Result<bool, ChromeBridgeError> {
+        *retry_attempts = retry_attempts.saturating_add(1);
+        if *retry_attempts > MAX_ESL_RETRY_ATTEMPTS {
+            return if execution_class == ExecutionClass::NonIdempotent {
+                Err(ChromeBridgeError::EslIndeterminate {
+                    request_id: request_id.to_string(),
+                    message: format!("retry budget exhausted after ambiguous result: {detail}"),
+                })
+            } else {
+                Ok(false)
+            };
+        }
+
+        if self.status().state != ConnectionState::Connected {
+            match self.connect().await {
+                Ok(()) => {}
+                Err(err) => {
+                    return if execution_class == ExecutionClass::NonIdempotent {
+                        Err(ChromeBridgeError::EslIndeterminate {
+                            request_id: request_id.to_string(),
+                            message: format!("reconnect failed after ambiguous result: {err}"),
+                        })
+                    } else {
+                        Err(err)
+                    };
+                }
+            }
+        }
+
+        if execution_class == ExecutionClass::NonIdempotent {
+            let current_epoch = self.current_host_epoch()?;
+            if current_epoch != baseline_host_epoch {
+                return Err(ChromeBridgeError::EslIndeterminate {
+                    request_id: request_id.to_string(),
+                    message: format!(
+                        "host_epoch changed from {baseline_host_epoch} to {current_epoch}"
+                    ),
+                });
+            }
+        }
+
+        Ok(true)
+    }
+
+    async fn send_request_with_id(
+        &self,
+        request_id: String,
+        op: String,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
         if self.status().state != ConnectionState::Connected {
             return Err(ChromeBridgeError::NotConnected);
         }
+        let host_epoch = self.current_host_epoch()?;
+        self.ensure_request_id_fingerprint(&host_epoch, &request_id, &op, &payload)?;
 
         let request = protocol::Request {
             version: protocol::PROTOCOL_VERSION_V1,
-            id: self.next_request_id(),
-            op: op.into(),
+            id: request_id.clone(),
+            op,
             payload,
         };
-        let request_id = request.id.clone();
         let (tx, rx) = oneshot::channel();
         self.pending
             .lock()
@@ -313,6 +490,49 @@ impl ChromeBridge {
         rx.recv(&cx)
             .await
             .map_err(|_| ChromeBridgeError::ResponseChannelClosed { request_id })
+    }
+
+    fn current_host_epoch(&self) -> Result<String, ChromeBridgeError> {
+        let guard = self.inner.lock().expect("chrome bridge mutex poisoned");
+        if guard.state != ConnectionState::Connected {
+            return Err(ChromeBridgeError::NotConnected);
+        }
+        guard
+            .host_epoch
+            .clone()
+            .ok_or(ChromeBridgeError::NotConnected)
+    }
+
+    fn ensure_request_id_fingerprint(
+        &self,
+        host_epoch: &str,
+        request_id: &str,
+        op: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), ChromeBridgeError> {
+        let fingerprint = protocol::RequestFingerprint::new(op, payload)
+            .map_err(ChromeBridgeError::Fingerprint)?;
+        let key = (host_epoch.to_string(), request_id.to_string());
+        let mut guard = self
+            .request_fingerprints
+            .lock()
+            .expect("request fingerprints mutex poisoned");
+
+        match guard.get(&key) {
+            Some(existing) if existing != &fingerprint => {
+                Err(ChromeBridgeError::RequestIdPayloadMismatch {
+                    host_epoch: host_epoch.to_string(),
+                    request_id: request_id.to_string(),
+                    expected_fingerprint: existing.as_str().to_string(),
+                    actual_fingerprint: fingerprint.as_str().to_string(),
+                })
+            }
+            Some(_) => Ok(()),
+            None => {
+                guard.insert(key, fingerprint);
+                Ok(())
+            }
+        }
     }
 
     #[must_use]
@@ -529,10 +749,21 @@ pub enum ChromeBridgeError {
     Io(std::io::Error),
     #[error("chrome bridge frame codec error: {0}")]
     Frame(#[from] protocol::FrameCodecError),
+    #[error("failed to fingerprint request payload: {0}")]
+    Fingerprint(serde_json::Error),
     #[error("chrome bridge is not connected")]
     NotConnected,
     #[error("response channel closed before request {request_id} completed")]
     ResponseChannelClosed { request_id: String },
+    #[error(
+        "logical request id {request_id} reused with different payload in host_epoch {host_epoch}"
+    )]
+    RequestIdPayloadMismatch {
+        host_epoch: String,
+        request_id: String,
+        expected_fingerprint: String,
+        actual_fingerprint: String,
+    },
     #[error("host {host_id} is busy (claimed_by={claimed_by:?})")]
     AuthBusy {
         host_id: String,
@@ -542,6 +773,8 @@ pub enum ChromeBridgeError {
     AuthRejected(String),
     #[error("chrome bridge protocol mismatch: {0}")]
     ProtocolMismatch(String),
+    #[error("ESL ambiguity for request {request_id}: {message}")]
+    EslIndeterminate { request_id: String, message: String },
     #[error("unexpected handshake message: {0}")]
     UnexpectedHandshakeMessage(String),
 }
@@ -724,6 +957,58 @@ fn unix_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn classify_execution_class(op: &str) -> ExecutionClass {
+    match op {
+        "read_page" | "get_page_text" | "tabs_context" | "read_console" | "read_network" => {
+            ExecutionClass::ReadOnlyReplayable
+        }
+        _ => ExecutionClass::NonIdempotent,
+    }
+}
+
+fn is_timeout_or_disconnect_error_code(code: protocol::ProtocolErrorCode) -> bool {
+    matches!(
+        code,
+        protocol::ProtocolErrorCode::ChromeBridgeTimeout
+            | protocol::ProtocolErrorCode::ChromeBridgeDisconnected
+    )
+}
+
+fn is_esl_in_progress_error(err: &protocol::ErrorResponse) -> bool {
+    err.error.retryable
+        && err.error.code == protocol::ProtocolErrorCode::ChromeBridgeBusy
+        && err
+            .error
+            .message
+            .to_ascii_lowercase()
+            .contains("in_progress")
+}
+
+fn is_ambiguous_transport_error(err: &ChromeBridgeError) -> bool {
+    matches!(
+        err,
+        ChromeBridgeError::ResponseChannelClosed { .. }
+            | ChromeBridgeError::Io(_)
+            | ChromeBridgeError::NotConnected
+    )
+}
+
+fn execution_indeterminate_envelope(
+    request_id: &str,
+    message: impl Into<String>,
+) -> protocol::ResponseEnvelope {
+    protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: request_id.to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code: protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+            message: message.into(),
+            retryable: false,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -978,6 +1263,235 @@ mod tests {
         })
     }
 
+    fn spawn_mock_host_esl_timeout_then_replay(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Error(
+                    protocol::ErrorResponse {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id.clone(),
+                        ok: false,
+                        error: protocol::ProtocolErrorDetail {
+                            code: protocol::ProtocolErrorCode::ChromeBridgeTimeout,
+                            message: "request timed out waiting for chrome".to_string(),
+                            retryable: true,
+                        },
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            assert_eq!(
+                second.id, first.id,
+                "ESL retry must reuse stable request id for timeout replay"
+            );
+            assert_eq!(
+                second.payload, first.payload,
+                "ESL retry must preserve payload for duplicate request id"
+            );
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({"replayed": true, "epoch": "epoch-1"}),
+                    },
+                )),
+            );
+        })
+    }
+
+    fn spawn_mock_host_esl_in_progress_then_complete(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Error(
+                    protocol::ErrorResponse {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id.clone(),
+                        ok: false,
+                        error: protocol::ProtocolErrorDetail {
+                            code: protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                            message: "in_progress: request still executing".to_string(),
+                            retryable: true,
+                        },
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            assert_eq!(
+                second.id, first.id,
+                "in-progress retry must reuse stable request id"
+            );
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({"status": "completed_after_wait"}),
+                    },
+                )),
+            );
+        })
+    }
+
+    fn spawn_mock_host_esl_host_restart_indeterminate(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            // First host epoch: read one request then drop connection before responding.
+            {
+                let (mut stream, _) = listener.accept().expect("accept conn1");
+                let mut reader = std::io::BufReader::new(
+                    stream
+                        .try_clone()
+                        .expect("clone accepted unix stream for buffered read"),
+                );
+                read_and_assert_auth_claim(&mut reader);
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthOk(protocol::AuthOk {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        host_id: "host-esl".to_string(),
+                        claimed_by: protocol::ClaimedBy {
+                            pi_session_id: "session-1".to_string(),
+                            client_instance_id: "client-1".to_string(),
+                        },
+                        host_epoch: "epoch-1".to_string(),
+                        protocol: protocol::PROTOCOL_VERSION_V1,
+                        capabilities: vec!["browser_tools".to_string()],
+                        lease_ttl_ms: 30_000,
+                    }),
+                );
+                let _request = read_request_frame(&mut reader);
+            }
+
+            // Second host epoch: handshake only; agent should return indeterminate without resending.
+            let (mut stream, _) = listener.accept().expect("accept conn2");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-2".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .expect("set read timeout");
+            let mut maybe_line = Vec::new();
+            match reader.read_until(b'\n', &mut maybe_line) {
+                Ok(0) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(n) => {
+                    panic!("agent should not resend request after epoch change, read {n} bytes")
+                }
+                Err(err) => panic!("unexpected conn2 read error: {err}"),
+            }
+        })
+    }
+
+    fn read_request_frame(
+        reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    ) -> protocol::Request {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .expect("read request frame");
+        assert!(bytes_read > 0, "mock host must receive request frame");
+        let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+            .expect("decode request frame")
+            .expect("complete request frame");
+        assert_eq!(
+            consumed,
+            line.len(),
+            "mock host must consume one request frame"
+        );
+        match message {
+            protocol::MessageType::Request(request) => request,
+            other => panic!("expected request frame, got {other:?}"),
+        }
+    }
+
     fn read_and_assert_auth_claim(reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>) {
         let mut line = Vec::new();
         let bytes_read = reader
@@ -1215,6 +1729,201 @@ mod tests {
             );
             server.join().expect("mock host thread join");
         });
+    }
+
+    #[test]
+    fn test_timeout_then_retry_replays_cached_result() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-timeout.sock");
+            let record = make_record(&socket_path, "host-esl");
+            let server = spawn_mock_host_esl_timeout_then_replay(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let response = bridge
+                .execute_request_with_esl(
+                    "browser.navigate",
+                    json!({ "url": "https://example.test" }),
+                )
+                .await
+                .expect("ESL timeout replay path should succeed");
+
+            match response {
+                protocol::ResponseEnvelope::Ok(ok) => {
+                    assert_eq!(ok.result["replayed"], json!(true), "host replay result");
+                    assert_eq!(ok.result["epoch"], json!("epoch-1"), "same epoch replay");
+                }
+                other => panic!("expected replayed ok response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_esl_in_progress_waits_and_retries_same_request_id() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-in-progress.sock");
+            let record = make_record(&socket_path, "host-esl");
+            let server = spawn_mock_host_esl_in_progress_then_complete(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let response = bridge
+                .execute_request_with_esl("browser.navigate", json!({ "step": 1 }))
+                .await
+                .expect("in_progress retry path should eventually succeed");
+
+            match response {
+                protocol::ResponseEnvelope::Ok(ok) => {
+                    assert_eq!(
+                        ok.result["status"],
+                        json!("completed_after_wait"),
+                        "in-progress retry should return terminal result"
+                    );
+                }
+                other => panic!("expected terminal ok response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_non_idempotent_retry_after_host_restart_returns_indeterminate() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-host-restart.sock");
+            let record = DiscoveryRecord {
+                host_id: "host-esl".to_string(),
+                host_epoch: "ignored".to_string(),
+                socket_path: socket_path.clone(),
+                token: "secret-token".to_string(),
+                protocol_min: protocol::PROTOCOL_MIN_SUPPORTED,
+                protocol_max: protocol::PROTOCOL_MAX_SUPPORTED,
+                capabilities: vec!["browser_tools".to_string()],
+                claimed_by: None,
+                lease_expires_at_ms: None,
+                expires_at_ms: Some(unix_time_ms() + 60_000),
+            };
+            write_discovery_record(
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-esl.discovery.json"),
+                &record,
+            );
+            let server = spawn_mock_host_esl_host_restart_indeterminate(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect()
+                .await
+                .expect("initial connect should succeed");
+
+            let response = bridge
+                .execute_request_with_esl(
+                    "browser.navigate",
+                    json!({ "url": "https://restart.test" }),
+                )
+                .await
+                .expect("indeterminate should be returned as protocol error envelope");
+
+            match response {
+                protocol::ResponseEnvelope::Error(err) => {
+                    assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+                        "epoch change after ambiguous non-idempotent request must fail closed"
+                    );
+                    assert!(
+                        !err.error.retryable,
+                        "indeterminate safety error must not be auto-retryable"
+                    );
+                }
+                other => panic!("expected indeterminate error response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_retry_policy_classifies_non_idempotent_fail_closed() {
+        assert_eq!(
+            classify_execution_class("read_page"),
+            ExecutionClass::ReadOnlyReplayable,
+            "read_page should be classified as read_only_replayable"
+        );
+        assert_eq!(
+            classify_execution_class("browser.navigate"),
+            ExecutionClass::NonIdempotent,
+            "navigate defaults to non-idempotent in v1"
+        );
+        assert_eq!(
+            classify_execution_class("javascript_tool"),
+            ExecutionClass::NonIdempotent,
+            "javascript_tool defaults to non-idempotent in v1"
+        );
+        assert_eq!(
+            classify_execution_class("unknown_future_browser_op"),
+            ExecutionClass::NonIdempotent,
+            "unknown ops must fail closed to non-idempotent"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_request_id_payload_mismatch_rejected_before_dispatch() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+        bridge
+            .ensure_request_id_fingerprint("epoch-1", "call-1", "read_page", &json!({"a": 1}))
+            .expect("first fingerprint registration should succeed");
+
+        let err = bridge
+            .ensure_request_id_fingerprint("epoch-1", "call-1", "read_page", &json!({"a": 2}))
+            .expect_err("same request id with different payload must be rejected");
+
+        match err {
+            ChromeBridgeError::RequestIdPayloadMismatch {
+                request_id,
+                host_epoch,
+                ..
+            } => {
+                assert_eq!(request_id, "call-1");
+                assert_eq!(host_epoch, "epoch-1");
+            }
+            other => panic!("expected RequestIdPayloadMismatch, got {other:?}"),
+        }
     }
 
     #[test]
