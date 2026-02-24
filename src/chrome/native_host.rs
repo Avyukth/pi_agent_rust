@@ -717,10 +717,24 @@ fn relay_until_disconnect<R: IoRead, W: IoWrite>(
             Err(err) => return Err(err),
         }
 
-        match relay_one_chrome_message_to_agent(chrome_reader, agent_stream) {
-            Ok(_message) => {}
+        match relay_chrome_messages_until_response(chrome_reader, agent_stream) {
+            Ok(_forwarded) => {}
             Err(err) if is_clean_disconnect_error(&err) => return Ok(()),
             Err(err) => return Err(err),
+        }
+    }
+}
+
+fn relay_chrome_messages_until_response<R: IoRead, W: IoWrite>(
+    chrome_reader: &mut R,
+    agent_writer: &mut W,
+) -> Result<usize, NativeHostError> {
+    let mut forwarded = 0_usize;
+    loop {
+        let message = relay_one_chrome_message_to_agent(chrome_reader, agent_writer)?;
+        forwarded = forwarded.saturating_add(1);
+        if matches!(message, protocol::MessageType::Response(_)) {
+            return Ok(forwarded);
         }
     }
 }
@@ -1454,6 +1468,93 @@ mod tests {
             assert_eq!(
                 decoded_forwarded_request, request,
                 "run_with_io must forward agent request to chrome native-messaging writer"
+            );
+        });
+    }
+
+    #[test]
+    fn test_native_host_run_with_io_forwards_observation_before_terminal_response() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let request = sample_request();
+            let observation = protocol::MessageType::Observation(protocol::ObservationEvent {
+                version: protocol::PROTOCOL_VERSION_V1,
+                observer_id: "observer-run-loop".to_string(),
+                events: vec![protocol::ObservationEntry {
+                    kind: "console_warn".to_string(),
+                    message: Some("slow render".to_string()),
+                    source: Some("page".to_string()),
+                    url: Some("https://example.test".to_string()),
+                    ts: unix_time_ms(),
+                }],
+            });
+            let response = sample_response_for("req-e2e-1");
+            let mut chrome_in = Vec::new();
+            write_native_messaging_message(&mut chrome_in, &observation)
+                .expect("encode mock chrome observation");
+            write_native_messaging_message(&mut chrome_in, &response)
+                .expect("encode mock chrome response");
+            let mut chrome_reader = std::io::Cursor::new(chrome_in);
+            let mut chrome_writer = Vec::new();
+
+            let socket_path = host.socket_path().to_path_buf();
+            let request_for_client = request.clone();
+            let observation_for_client = observation.clone();
+            let response_for_client = response.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone client stream for reads"),
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                let handshake = read_frame(&mut reader);
+                send_frame(&mut stream, &request_for_client);
+                let relayed_observation = read_frame(&mut reader);
+                let relayed_response = read_frame(&mut reader);
+                (handshake, relayed_observation, relayed_response)
+            });
+
+            let outcome = host
+                .run_with_io(&mut chrome_reader, &mut chrome_writer)
+                .await
+                .expect(
+                    "run_with_io should relay observation + response and exit after disconnect",
+                );
+            assert_eq!(
+                outcome,
+                NativeHostRunOutcome::AgentConnected,
+                "agent connection should be recorded on successful relay session"
+            );
+
+            let (client_handshake, client_observation, client_response) =
+                client.join().expect("client thread join");
+            assert!(
+                matches!(client_handshake, protocol::MessageType::AuthOk(_)),
+                "client must observe auth_ok before relay traffic"
+            );
+            assert_eq!(
+                client_observation, observation_for_client,
+                "run loop must forward observation messages before the terminal response"
+            );
+            assert_eq!(
+                client_response, response_for_client,
+                "run loop must forward terminal response after preceding observations"
+            );
+
+            let mut chrome_wire_reader = std::io::Cursor::new(chrome_writer);
+            let decoded_forwarded_request = read_native_messaging_message(&mut chrome_wire_reader)
+                .expect("decode forwarded request");
+            assert_eq!(
+                decoded_forwarded_request, request,
+                "agent request forwarded to chrome must remain intact"
             );
         });
     }
