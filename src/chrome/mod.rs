@@ -160,9 +160,10 @@ impl ChromeBridge {
                 Err(err) => {
                     last_error = Some(err);
                     if attempt_idx + 1 < attempts {
-                        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(
-                            self.config.reconnect_backoff_ms,
-                        ))
+                        asupersync::time::sleep(
+                            asupersync::time::wall_now(),
+                            Duration::from_millis(self.config.reconnect_backoff_ms),
+                        )
                         .await;
                     }
                     continue;
@@ -204,7 +205,10 @@ impl ChromeBridge {
         Err(last_error.unwrap_or(ChromeBridgeError::NoHostsFound))
     }
 
-    pub async fn connect_to_record(&self, record: &DiscoveryRecord) -> Result<(), ChromeBridgeError> {
+    pub async fn connect_to_record(
+        &self,
+        record: &DiscoveryRecord,
+    ) -> Result<(), ChromeBridgeError> {
         if self.status().browser_tools_disabled {
             return Err(ChromeBridgeError::BrowserToolsDisabled);
         }
@@ -249,7 +253,11 @@ impl ChromeBridge {
     pub fn discover_hosts(&self) -> Result<Vec<DiscoveryRecord>, ChromeBridgeError> {
         let now_ms = unix_time_ms();
         let pinned_host_id = self.status().pinned_host_id;
-        discover_hosts_in_dir(&self.config.discovery_dir, now_ms, pinned_host_id.as_deref())
+        discover_hosts_in_dir(
+            &self.config.discovery_dir,
+            now_ms,
+            pinned_host_id.as_deref(),
+        )
     }
 
     #[must_use]
@@ -375,7 +383,9 @@ impl ChromeBridge {
             {
                 Err(ChromeBridgeError::AuthRejected(err.error.message))
             }
-            other => Err(ChromeBridgeError::UnexpectedHandshakeMessage(format!("{other:?}"))),
+            other => Err(ChromeBridgeError::UnexpectedHandshakeMessage(format!(
+                "{other:?}"
+            ))),
         }
     }
 
@@ -395,12 +405,7 @@ impl ChromeBridge {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     tracing::debug!("chrome reader runtime init failed: {err}");
-                    finalize_reader_shutdown(
-                        connection_token,
-                        &inner,
-                        &writer,
-                        &pending,
-                    );
+                    finalize_reader_shutdown(connection_token, &inner, &writer, &pending);
                     return;
                 }
             };
@@ -506,9 +511,15 @@ pub enum ChromeBridgeError {
     #[error("no valid chrome host discovery records found")]
     NoHostsFound,
     #[error("failed to read discovery directory {path}: {source}")]
-    DiscoveryDirRead { path: PathBuf, source: std::io::Error },
+    DiscoveryDirRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to read discovery record {path}: {source}")]
-    DiscoveryFileRead { path: PathBuf, source: std::io::Error },
+    DiscoveryFileRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to parse discovery record {path}: {source}")]
     DiscoveryFileParse {
         path: PathBuf,
@@ -564,8 +575,10 @@ fn discover_hosts_in_dir(
             continue;
         }
 
-        let raw = fs::read(&path)
-            .map_err(|source| ChromeBridgeError::DiscoveryFileRead { path: path.clone(), source })?;
+        let raw = fs::read(&path).map_err(|source| ChromeBridgeError::DiscoveryFileRead {
+            path: path.clone(),
+            source,
+        })?;
         let record: DiscoveryRecord = serde_json::from_slice(&raw).map_err(|source| {
             ChromeBridgeError::DiscoveryFileParse {
                 path: path.clone(),
@@ -594,7 +607,10 @@ async fn write_message(
     message: &protocol::MessageType,
 ) -> Result<(), ChromeBridgeError> {
     let frame = protocol::encode_frame(message)?;
-    stream.write_all(&frame).await.map_err(ChromeBridgeError::Io)
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(ChromeBridgeError::Io)
 }
 
 async fn read_message(stream: &mut UnixStream) -> Result<protocol::MessageType, ChromeBridgeError> {
@@ -637,7 +653,10 @@ fn finalize_reader_shutdown(
             .lock()
             .expect("pending responses mutex poisoned")
             .clear();
-        writer.lock().expect("chrome bridge writer mutex poisoned").take();
+        writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
     }
 }
 
@@ -692,7 +711,10 @@ async fn write_request_frame(
     message: &protocol::MessageType,
 ) -> Result<(), ChromeBridgeError> {
     let frame = protocol::encode_frame(message)?;
-    write_half.write_all(&frame).await.map_err(ChromeBridgeError::Io)
+    write_half
+        .write_all(&frame)
+        .await
+        .map_err(ChromeBridgeError::Io)
 }
 
 fn unix_time_ms() -> i64 {
@@ -762,7 +784,9 @@ mod tests {
         })
     }
 
-    fn spawn_mock_host_keepalive_after_auth_ok(socket_path: PathBuf) -> std::thread::JoinHandle<()> {
+    fn spawn_mock_host_keepalive_after_auth_ok(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
         let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept mock client");
@@ -833,12 +857,18 @@ mod tests {
             let mut requests = Vec::with_capacity(expected_requests);
             for _ in 0..expected_requests {
                 let mut line = Vec::new();
-                let bytes_read = reader.read_until(b'\n', &mut line).expect("read request frame");
+                let bytes_read = reader
+                    .read_until(b'\n', &mut line)
+                    .expect("read request frame");
                 assert!(bytes_read > 0, "mock host must receive request frames");
                 let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
                     .expect("decode request frame")
                     .expect("complete request frame");
-                assert_eq!(consumed, line.len(), "mock host must consume one request frame");
+                assert_eq!(
+                    consumed,
+                    line.len(),
+                    "mock host must consume one request frame"
+                );
                 match message {
                     protocol::MessageType::Request(request) => requests.push(request),
                     other => panic!("expected request frame, got {other:?}"),
@@ -909,12 +939,18 @@ mod tests {
                 );
 
                 let mut line = Vec::new();
-                let bytes_read = reader.read_until(b'\n', &mut line).expect("read request frame");
+                let bytes_read = reader
+                    .read_until(b'\n', &mut line)
+                    .expect("read request frame");
                 assert!(bytes_read > 0, "mock host must receive request frame");
                 let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
                     .expect("decode request frame")
                     .expect("complete request frame");
-                assert_eq!(consumed, line.len(), "mock host must consume one request frame");
+                assert_eq!(
+                    consumed,
+                    line.len(),
+                    "mock host must consume one request frame"
+                );
 
                 let request = match message {
                     protocol::MessageType::Request(request) => request,
@@ -944,18 +980,27 @@ mod tests {
 
     fn read_and_assert_auth_claim(reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>) {
         let mut line = Vec::new();
-        let bytes_read = reader.read_until(b'\n', &mut line).expect("read auth_claim frame");
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .expect("read auth_claim frame");
         assert!(bytes_read > 0, "mock host must receive an auth_claim frame");
 
         let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
             .expect("decode auth_claim frame")
             .expect("complete auth_claim frame");
-        assert_eq!(consumed, line.len(), "mock host must consume exactly one frame");
+        assert_eq!(
+            consumed,
+            line.len(),
+            "mock host must consume exactly one frame"
+        );
 
         match message {
             protocol::MessageType::AuthClaim(auth) => {
                 assert_eq!(auth.version, protocol::PROTOCOL_VERSION_V1, "auth version");
-                assert_eq!(auth.token, "secret-token", "auth token forwarded from discovery");
+                assert_eq!(
+                    auth.token, "secret-token",
+                    "auth token forwarded from discovery"
+                );
             }
             other => panic!("expected auth_claim, got {other:?}"),
         }
@@ -1037,9 +1082,21 @@ mod tests {
                 .expect("connect/auth handshake should succeed");
 
             let status = bridge.status();
-            assert_eq!(status.state, ConnectionState::Connected, "state after connect");
-            assert_eq!(status.pinned_host_id.as_deref(), Some("host-1"), "pinned host cached");
-            assert_eq!(status.host_epoch.as_deref(), Some("epoch-1"), "host epoch cached");
+            assert_eq!(
+                status.state,
+                ConnectionState::Connected,
+                "state after connect"
+            );
+            assert_eq!(
+                status.pinned_host_id.as_deref(),
+                Some("host-1"),
+                "pinned host cached"
+            );
+            assert_eq!(
+                status.host_epoch.as_deref(),
+                Some("epoch-1"),
+                "host epoch cached"
+            );
 
             bridge.disconnect().expect("disconnect should succeed");
             assert_eq!(
@@ -1096,10 +1153,13 @@ mod tests {
             }
 
             let observations = bridge.take_observations();
-            assert_eq!(observations.len(), 1, "reader loop must buffer pushed observations");
             assert_eq!(
-                observations[0].events[0].kind,
-                "console",
+                observations.len(),
+                1,
+                "reader loop must buffer pushed observations"
+            );
+            assert_eq!(
+                observations[0].events[0].kind, "console",
                 "observation event kind must roundtrip"
             );
             assert_eq!(
@@ -1134,10 +1194,9 @@ mod tests {
                 .await
                 .expect("connect/auth handshake should succeed");
 
-            let responses = future::join_all((0..8).map(|n| {
-                bridge.send_request("echo", json!({ "n": n }))
-            }))
-            .await;
+            let responses =
+                future::join_all((0..8).map(|n| bridge.send_request("echo", json!({ "n": n }))))
+                    .await;
 
             for (n, response) in (0..8).zip(responses) {
                 let envelope = response.expect("request must complete");
@@ -1302,7 +1361,9 @@ mod tests {
             let record = make_record(&missing_socket, "host-missing");
 
             write_discovery_record(
-                &tempdir.path().join("pi-chrome-host-host-missing.discovery.json"),
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-missing.discovery.json"),
                 &record,
             );
 
@@ -1365,7 +1426,9 @@ mod tests {
             };
             let server = spawn_mock_host_reconnect_two_sessions(socket_path.clone());
             write_discovery_record(
-                &tempdir.path().join("pi-chrome-host-host-reconnect.discovery.json"),
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-reconnect.discovery.json"),
                 &record,
             );
 
@@ -1378,7 +1441,10 @@ mod tests {
                 reconnect_backoff_ms: 1,
             });
 
-            bridge.connect().await.expect("initial connect should succeed");
+            bridge
+                .connect()
+                .await
+                .expect("initial connect should succeed");
             assert_eq!(
                 bridge.status().host_epoch.as_deref(),
                 Some("epoch-1"),
@@ -1397,7 +1463,10 @@ mod tests {
             }
 
             // Server closes conn1 after response; reconnect should re-pin same host and update epoch.
-            bridge.connect().await.expect("reconnect after connection loss should succeed");
+            bridge
+                .connect()
+                .await
+                .expect("reconnect after connection loss should succeed");
             let status = bridge.status();
             assert_eq!(
                 status.pinned_host_id.as_deref(),
@@ -1416,7 +1485,11 @@ mod tests {
                 .expect("second request after reconnect must succeed");
             match second {
                 protocol::ResponseEnvelope::Ok(resp) => {
-                    assert_eq!(resp.result["epoch"], json!("epoch-2"), "second epoch echoed");
+                    assert_eq!(
+                        resp.result["epoch"],
+                        json!("epoch-2"),
+                        "second epoch echoed"
+                    );
                 }
                 other => panic!("expected ok response, got {other:?}"),
             }
@@ -1435,7 +1508,14 @@ mod tests {
         assert_eq!(b, "chrome-2");
         assert_eq!(bridge.pending_response_count(), 0);
         assert_eq!(bridge.observation_buffer_len(), 0);
-        assert_eq!(bridge.take_observations(), Vec::<protocol::ObservationEvent>::new());
-        assert_eq!(json!({"ok": true})["ok"], true, "serde_json smoke for test module");
+        assert_eq!(
+            bridge.take_observations(),
+            Vec::<protocol::ObservationEvent>::new()
+        );
+        assert_eq!(
+            json!({"ok": true})["ok"],
+            true,
+            "serde_json smoke for test module"
+        );
     }
 }

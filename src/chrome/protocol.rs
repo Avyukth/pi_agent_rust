@@ -273,8 +273,15 @@ mod tests {
             .expect("decode should succeed for valid frame")
             .expect("complete frame should decode");
 
-        assert_eq!(decoded.1, encoded.len(), "decoder must report consumed frame bytes");
-        assert_eq!(decoded.0, message, "frame roundtrip must preserve message content");
+        assert_eq!(
+            decoded.1,
+            encoded.len(),
+            "decoder must report consumed frame bytes"
+        );
+        assert_eq!(
+            decoded.0, message,
+            "frame roundtrip must preserve message content"
+        );
     }
 
     #[test]
@@ -283,7 +290,10 @@ mod tests {
 
         let decoded = decode_frame::<MessageType>(partial).expect("partial read is not an error");
 
-        assert!(decoded.is_none(), "decoder must signal incomplete frame without newline");
+        assert!(
+            decoded.is_none(),
+            "decoder must signal incomplete frame without newline"
+        );
     }
 
     #[test]
@@ -345,7 +355,10 @@ mod tests {
             MessageType::Response(ResponseEnvelope::Ok(resp)) => {
                 assert!(resp.ok, "success response must preserve ok=true");
                 assert_eq!(resp.id, "req-1", "response id must decode correctly");
-                assert_eq!(resp.result["title"], "Example", "result payload must decode");
+                assert_eq!(
+                    resp.result["title"], "Example",
+                    "result payload must decode"
+                );
             }
             other => panic!("expected success response variant, got {other:?}"),
         }
@@ -361,7 +374,11 @@ mod tests {
         match decoded {
             MessageType::Response(ResponseEnvelope::Error(resp)) => {
                 assert!(!resp.ok, "error response must preserve ok=false");
-                assert_eq!(resp.error.code, ProtocolErrorCode::TabNotFound, "code must decode");
+                assert_eq!(
+                    resp.error.code,
+                    ProtocolErrorCode::TabNotFound,
+                    "code must decode"
+                );
                 assert!(!resp.error.retryable, "retryable flag must decode");
             }
             other => panic!("expected error response variant, got {other:?}"),
