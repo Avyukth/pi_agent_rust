@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::unix::UnixListener;
 use thiserror::Error;
 use uuid::Uuid;
@@ -65,6 +66,7 @@ pub struct NativeHost {
     token: String,
     socket_path: PathBuf,
     discovery_path: PathBuf,
+    claimed_by: Option<protocol::ClaimedBy>,
     listener: Option<UnixListener>,
 }
 
@@ -87,6 +89,7 @@ impl NativeHost {
             token,
             socket_path,
             discovery_path,
+            claimed_by: None,
             listener: None,
         })
     }
@@ -114,6 +117,11 @@ impl NativeHost {
     #[must_use]
     pub fn discovery_path(&self) -> &Path {
         &self.discovery_path
+    }
+
+    #[must_use]
+    pub fn claimed_by(&self) -> Option<&protocol::ClaimedBy> {
+        self.claimed_by.as_ref()
     }
 
     pub async fn startup(&mut self) -> Result<(), NativeHostError> {
@@ -164,6 +172,106 @@ impl NativeHost {
         }
     }
 
+    pub async fn accept_and_handle_claim_for_test(
+        &mut self,
+    ) -> Result<protocol::MessageType, NativeHostError> {
+        self.startup().await?;
+        let listener = self.listener.as_ref().expect("listener initialized by startup");
+        let (mut stream, _addr) = listener.accept().await.map_err(|source| NativeHostError::Io {
+            path: self.socket_path.clone(),
+            source,
+        })?;
+
+        let inbound = read_socket_message(&mut stream).await?;
+        let response = match inbound {
+            protocol::MessageType::AuthClaim(claim) => self.handle_auth_claim(claim)?,
+            _ => handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                "first socket message must be auth_claim",
+                false,
+            ),
+        };
+
+        write_socket_message(&mut stream, &response).await?;
+        Ok(response)
+    }
+
+    pub fn handle_auth_claim(
+        &mut self,
+        claim: protocol::AuthClaim,
+    ) -> Result<protocol::MessageType, NativeHostError> {
+        if claim.host_id != self.host_id {
+            return Ok(handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                format!(
+                    "host_id mismatch: claim={}, host={}",
+                    claim.host_id, self.host_id
+                ),
+                false,
+            ));
+        }
+        if claim.token != self.token {
+            return Ok(handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                "auth token mismatch",
+                false,
+            ));
+        }
+
+        if !protocol_ranges_overlap(
+            claim.protocol_min,
+            claim.protocol_max,
+            protocol::PROTOCOL_MIN_SUPPORTED,
+            protocol::PROTOCOL_MAX_SUPPORTED,
+        ) {
+            return Ok(handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                "no overlapping protocol version",
+                false,
+            ));
+        }
+
+        let missing_capability = claim
+            .want_capabilities
+            .iter()
+            .find(|wanted| !self.config.capabilities.iter().any(|have| have == *wanted));
+        if let Some(capability) = missing_capability {
+            return Ok(handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                format!("required capability not supported: {capability}"),
+                false,
+            ));
+        }
+
+        let requester = protocol::ClaimedBy {
+            pi_session_id: claim.pi_session_id,
+            client_instance_id: claim.client_instance_id,
+        };
+
+        if let Some(current_claim) = &self.claimed_by {
+            if current_claim != &requester {
+                return Ok(protocol::MessageType::AuthBusy(protocol::AuthBusy {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: self.host_id.clone(),
+                    claimed_by: current_claim.clone(),
+                }));
+            }
+        }
+
+        self.claimed_by = Some(requester.clone());
+        self.write_discovery_record()?;
+
+        Ok(protocol::MessageType::AuthOk(protocol::AuthOk {
+            version: protocol::PROTOCOL_VERSION_V1,
+            host_id: self.host_id.clone(),
+            claimed_by: requester,
+            host_epoch: self.host_epoch.clone(),
+            protocol: protocol::PROTOCOL_VERSION_V1,
+            capabilities: self.config.capabilities.clone(),
+            lease_ttl_ms: self.config.lease_ttl_ms,
+        }))
+    }
+
     fn write_discovery_record(&self) -> Result<(), NativeHostError> {
         let now_ms = unix_time_ms();
         let lease_expiry = now_ms.saturating_add(
@@ -182,7 +290,7 @@ impl NativeHost {
             protocol_min: protocol::PROTOCOL_MIN_SUPPORTED,
             protocol_max: protocol::PROTOCOL_MAX_SUPPORTED,
             capabilities: self.config.capabilities.clone(),
-            claimed_by: None,
+            claimed_by: self.claimed_by.clone(),
             lease_expires_at_ms: Some(lease_expiry),
             expires_at_ms: Some(discovery_expiry),
         };
@@ -224,6 +332,8 @@ pub enum NativeHostError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    #[error("native host frame codec error: {0}")]
+    Frame(#[from] protocol::FrameCodecError),
 }
 
 fn random_id() -> String {
@@ -248,6 +358,69 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), NativeHostError> {
     })
 }
 
+fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
+    if a_min > a_max || b_min > b_max {
+        return false;
+    }
+    a_min <= b_max && b_min <= a_max
+}
+
+fn handshake_error_response(
+    code: protocol::ProtocolErrorCode,
+    message: impl Into<String>,
+    retryable: bool,
+) -> protocol::MessageType {
+    protocol::MessageType::Response(protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: "handshake".to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code,
+            message: message.into(),
+            retryable,
+        },
+    }))
+}
+
+async fn write_socket_message(
+    stream: &mut asupersync::net::unix::UnixStream,
+    message: &protocol::MessageType,
+) -> Result<(), NativeHostError> {
+    let frame = protocol::encode_frame(message)?;
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<agent-socket>"),
+            source,
+        })
+}
+
+async fn read_socket_message(
+    stream: &mut asupersync::net::unix::UnixStream,
+) -> Result<protocol::MessageType, NativeHostError> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let byte = stream.read_u8().await.map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<agent-socket>"),
+            source,
+        })?;
+        buf.push(byte);
+        if let Some((message, consumed)) = protocol::decode_frame::<protocol::MessageType>(&buf)? {
+            if consumed != buf.len() {
+                return Err(NativeHostError::Io {
+                    path: PathBuf::from("<agent-socket>"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "multiple frames in handshake read are not supported",
+                    ),
+                });
+            }
+            return Ok(message);
+        }
+    }
+}
+
 fn unix_time_ms() -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -260,6 +433,7 @@ mod tests {
     use super::*;
 
     use asupersync::runtime::RuntimeBuilder;
+    use std::io::{BufRead, Write};
 
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
         let runtime = RuntimeBuilder::current_thread()
@@ -420,6 +594,222 @@ mod tests {
                 !socket_path.exists(),
                 "dropping native host should drop listener and remove socket path"
             );
+        });
+    }
+
+    fn sample_auth_claim(token: &str) -> protocol::AuthClaim {
+        protocol::AuthClaim {
+            version: protocol::PROTOCOL_VERSION_V1,
+            host_id: "host-test".to_string(),
+            pi_session_id: "session-1".to_string(),
+            client_instance_id: "client-1".to_string(),
+            token: token.to_string(),
+            protocol_min: protocol::PROTOCOL_MIN_SUPPORTED,
+            protocol_max: protocol::PROTOCOL_MAX_SUPPORTED,
+            want_capabilities: vec!["browser_tools".to_string()],
+        }
+    }
+
+    fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
+        let frame = protocol::encode_frame(message).expect("encode frame");
+        stream.write_all(&frame).expect("write frame");
+    }
+
+    fn read_frame(
+        reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    ) -> protocol::MessageType {
+        let mut line = Vec::new();
+        let bytes_read = reader.read_until(b'\n', &mut line).expect("read frame");
+        assert!(bytes_read > 0, "peer must send a complete frame");
+        let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+            .expect("decode frame")
+            .expect("complete frame");
+        assert_eq!(consumed, line.len(), "frame decode must consume full line");
+        message
+    }
+
+    #[test]
+    fn test_native_host_auth_claim_accepts_and_updates_discovery_claim() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let response = host
+                .handle_auth_claim(sample_auth_claim("secret-test-token"))
+                .expect("auth claim should be processed");
+
+            match response {
+                protocol::MessageType::AuthOk(auth_ok) => {
+                    assert_eq!(auth_ok.host_id, "host-test", "host_id in auth_ok");
+                    assert_eq!(
+                        auth_ok.host_epoch, "epoch-test",
+                        "auth_ok should advertise current host epoch"
+                    );
+                    assert_eq!(
+                        auth_ok.claimed_by.pi_session_id, "session-1",
+                        "claim owner should match requester"
+                    );
+                }
+                other => panic!("expected auth_ok, got {other:?}"),
+            }
+
+            assert_eq!(
+                host.claimed_by(),
+                Some(&protocol::ClaimedBy {
+                    pi_session_id: "session-1".to_string(),
+                    client_instance_id: "client-1".to_string(),
+                }),
+                "host should store exclusive claim state after auth_ok"
+            );
+
+            let raw = fs::read(host.discovery_path()).expect("read discovery");
+            let record: DiscoveryRecord = serde_json::from_slice(&raw).expect("parse discovery");
+            assert_eq!(
+                record.claimed_by,
+                host.claimed_by().cloned(),
+                "discovery record should publish current claim holder for rendezvous selection"
+            );
+        });
+    }
+
+    #[test]
+    fn test_native_host_auth_claim_rejects_token_mismatch() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let response = host
+                .handle_auth_claim(sample_auth_claim("wrong-token"))
+                .expect("handler should return protocol error response");
+
+            match response {
+                protocol::MessageType::Response(protocol::ResponseEnvelope::Error(err)) => {
+                    assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                        "token mismatch must be rejected as auth failure"
+                    );
+                }
+                other => panic!("expected auth failure response, got {other:?}"),
+            }
+            assert!(
+                host.claimed_by().is_none(),
+                "failed auth claim must not mutate exclusive claim state"
+            );
+        });
+    }
+
+    #[test]
+    fn test_native_host_auth_claim_rejects_protocol_mismatch() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let mut claim = sample_auth_claim("secret-test-token");
+            claim.protocol_min = protocol::PROTOCOL_MAX_SUPPORTED.saturating_add(1);
+            claim.protocol_max = claim.protocol_min;
+
+            let response = host
+                .handle_auth_claim(claim)
+                .expect("handler should return protocol mismatch response");
+
+            match response {
+                protocol::MessageType::Response(protocol::ResponseEnvelope::Error(err)) => {
+                    assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                        "non-overlapping protocol range must be rejected"
+                    );
+                }
+                other => panic!("expected protocol mismatch response, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_native_host_auth_claim_enforces_exclusive_claim_with_same_session_reclaim() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let first = host
+                .handle_auth_claim(sample_auth_claim("secret-test-token"))
+                .expect("initial auth claim should succeed");
+            assert!(
+                matches!(first, protocol::MessageType::AuthOk(_)),
+                "initial claim should be accepted"
+            );
+
+            let mut other_claim = sample_auth_claim("secret-test-token");
+            other_claim.pi_session_id = "session-2".to_string();
+            other_claim.client_instance_id = "client-2".to_string();
+            let busy = host
+                .handle_auth_claim(other_claim)
+                .expect("busy rejection should be encoded as protocol message");
+            match busy {
+                protocol::MessageType::AuthBusy(auth_busy) => {
+                    assert_eq!(
+                        auth_busy.claimed_by.pi_session_id, "session-1",
+                        "busy response must identify current claim holder"
+                    );
+                }
+                other => panic!("expected auth_busy, got {other:?}"),
+            }
+
+            let reclaim = host
+                .handle_auth_claim(sample_auth_claim("secret-test-token"))
+                .expect("same-session reclaim should be allowed");
+            assert!(
+                matches!(reclaim, protocol::MessageType::AuthOk(_)),
+                "same session/client should be able to reclaim during lease window"
+            );
+        });
+    }
+
+    #[test]
+    fn test_native_host_socket_auth_claim_roundtrip_returns_auth_ok() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let socket_path = host.socket_path().to_path_buf();
+            let client = std::thread::spawn(move || {
+                let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
+                    .expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream
+                        .try_clone()
+                        .expect("clone client stream for buffered reads"),
+                );
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                read_frame(&mut reader)
+            });
+
+            let server_response = host
+                .accept_and_handle_claim_for_test()
+                .await
+                .expect("server handshake should complete");
+            assert!(
+                matches!(server_response, protocol::MessageType::AuthOk(_)),
+                "server should produce auth_ok for valid claim"
+            );
+
+            let client_response = client.join().expect("client thread join");
+            match client_response {
+                protocol::MessageType::AuthOk(auth_ok) => {
+                    assert_eq!(auth_ok.host_id, "host-test", "roundtrip auth_ok host id");
+                    assert_eq!(auth_ok.host_epoch, "epoch-test", "roundtrip host epoch");
+                }
+                other => panic!("expected auth_ok over socket roundtrip, got {other:?}"),
+            }
         });
     }
 }
