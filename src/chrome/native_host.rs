@@ -1461,6 +1461,42 @@ mod tests {
         })
     }
 
+    fn trace_request_for_slot(slot: u8, payload_variant: u8) -> protocol::Request {
+        sample_request_struct(
+            &format!("req-trace-{}", slot % 4),
+            serde_json::json!({
+                "slot": slot % 4,
+                "variant": payload_variant % 4,
+                "flag": (payload_variant % 2) == 0,
+            }),
+        )
+    }
+
+    fn trace_terminal_response_for(
+        request: &protocol::Request,
+        ok: bool,
+    ) -> protocol::ResponseEnvelope {
+        if ok {
+            protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: request.id.clone(),
+                ok: true,
+                result: serde_json::json!({"ok": true, "op": request.op}),
+            })
+        } else {
+            protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: request.id.clone(),
+                ok: false,
+                error: protocol::ProtocolErrorDetail {
+                    code: protocol::ProtocolErrorCode::JavascriptError,
+                    message: "synthetic terminal failure for ESL trace test".to_string(),
+                    retryable: false,
+                },
+            })
+        }
+    }
+
     fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
         let frame = protocol::encode_frame(message).expect("encode frame");
         stream.write_all(&frame).expect("write frame");
@@ -1716,6 +1752,8 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
         #[test]
         fn test_esl_proptest_duplicate_delivery_is_at_most_once_with_terminal_replay(
             payload in esl_json_value_strategy(),
@@ -1825,6 +1863,60 @@ mod tests {
                 EslBeginOutcome::Dispatch,
                 "host_epoch bump must create a distinct ESL key and require a new dispatch"
             );
+        }
+
+        #[test]
+        fn test_esl_proptest_trace_duplicate_requests_are_terminally_idempotent(
+            trace in prop::collection::vec((0_u8..6_u8, 0_u8..8_u8, 0_u8..8_u8), 0..48)
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(60_000, 512, 8 << 20);
+            let mut now_ms = unix_time_ms();
+            let mut epoch = "epoch-trace-a".to_string();
+            let session = "session-trace";
+            let mut dispatch_counts: std::collections::BTreeMap<(String, String, String), usize> =
+                std::collections::BTreeMap::new();
+
+            for (kind, slot_raw, variant_raw) in trace {
+                match kind % 6 {
+                    0 | 1 | 2 => {
+                        let request = trace_request_for_slot(slot_raw, variant_raw);
+                        let key = (session.to_string(), request.id.clone(), epoch.clone());
+                        let outcome = journal.begin_request(session, &epoch, &request, now_ms)?;
+                        if outcome == EslBeginOutcome::Dispatch {
+                            let entry = dispatch_counts.entry(key).or_insert(0);
+                            *entry = entry.saturating_add(1);
+                        }
+                    }
+                    3 => {
+                        // Record a terminal success for the canonical payload variant.
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, true);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                    }
+                    4 => {
+                        // Record a terminal failure for the canonical payload variant.
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, false);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                    }
+                    5 => {
+                        epoch = if epoch == "epoch-trace-a" {
+                            format!("epoch-trace-b-{}", variant_raw % 4)
+                        } else {
+                            "epoch-trace-a".to_string()
+                        };
+                    }
+                    _ => unreachable!("kind % 6 constrains the action space"),
+                }
+                now_ms = now_ms.saturating_add(1);
+            }
+
+            for ((sess, request_id, host_epoch), count) in &dispatch_counts {
+                prop_assert!(
+                    *count <= 1,
+                    "ESL duplicate-delivery invariant violated: dispatch_count={count} for ({sess}, {request_id}, {host_epoch})",
+                );
+            }
         }
     }
 
