@@ -4,6 +4,9 @@
 //! aliases, auth env keys, and default routing hints so models/auth/provider
 //! selection paths don't drift independently.
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use crate::provider::InputType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1552,18 +1555,29 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     },
 ];
 
+/// V8-A optimization: O(1) lookup via lazily-built HashMap keyed by
+/// lowercase canonical IDs and aliases.
+fn provider_index() -> &'static HashMap<String, usize> {
+    static INDEX: OnceLock<HashMap<String, usize>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map = HashMap::new();
+        for (i, meta) in PROVIDER_METADATA.iter().enumerate() {
+            map.insert(meta.canonical_id.to_ascii_lowercase(), i);
+            for alias in meta.aliases {
+                map.insert(alias.to_ascii_lowercase(), i);
+            }
+        }
+        map
+    })
+}
+
 pub fn provider_metadata(provider_id: &str) -> Option<&'static ProviderMetadata> {
     if provider_id.is_empty() {
         return None;
     }
 
-    PROVIDER_METADATA.iter().find(|meta| {
-        meta.canonical_id.eq_ignore_ascii_case(provider_id)
-            || meta
-                .aliases
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(provider_id))
-    })
+    let idx = *provider_index().get(&provider_id.to_ascii_lowercase())?;
+    Some(&PROVIDER_METADATA[idx])
 }
 
 pub fn canonical_provider_id(provider_id: &str) -> Option<&'static str> {
