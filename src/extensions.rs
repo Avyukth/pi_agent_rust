@@ -8956,7 +8956,9 @@ pub enum PolicyDecision {
 pub struct PolicyCheck {
     pub decision: PolicyDecision,
     pub capability: String,
-    pub reason: String,
+    /// O2: Cow avoids allocating a String for the static reason on the
+    /// hot PolicySnapshot::lookup path (saves 1 alloc per browser tool call).
+    pub reason: std::borrow::Cow<'static, str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -9067,12 +9069,13 @@ impl ExtensionPolicy {
     /// Applies the full precedence chain documented above.
     #[allow(clippy::too_many_lines)]
     pub fn evaluate_for(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
+        use std::borrow::Cow;
         let normalized = capability.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             return PolicyCheck {
                 decision: PolicyDecision::Deny,
                 capability: String::new(),
-                reason: "empty_capability".to_string(),
+                reason: Cow::Borrowed("empty_capability"),
             };
         }
 
@@ -9088,7 +9091,7 @@ impl ExtensionPolicy {
                 return PolicyCheck {
                     decision: PolicyDecision::Deny,
                     capability: normalized,
-                    reason: "extension_deny".to_string(),
+                    reason: Cow::Borrowed("extension_deny"),
                 };
             }
         }
@@ -9102,7 +9105,7 @@ impl ExtensionPolicy {
             return PolicyCheck {
                 decision: PolicyDecision::Deny,
                 capability: normalized,
-                reason: "deny_caps".to_string(),
+                reason: Cow::Borrowed("deny_caps"),
             };
         }
 
@@ -9116,7 +9119,7 @@ impl ExtensionPolicy {
                 return PolicyCheck {
                     decision: PolicyDecision::Allow,
                     capability: normalized,
-                    reason: "extension_allow".to_string(),
+                    reason: Cow::Borrowed("extension_allow"),
                 };
             }
         }
@@ -9138,11 +9141,11 @@ impl ExtensionPolicy {
                     PolicyDecision::Deny
                 },
                 capability: normalized,
-                reason: if in_default_caps {
-                    "default_caps".to_string()
+                reason: Cow::Borrowed(if in_default_caps {
+                    "default_caps"
                 } else {
-                    "not_in_default_caps".to_string()
-                },
+                    "not_in_default_caps"
+                }),
             },
             ExtensionPolicyMode::Prompt => PolicyCheck {
                 decision: if in_default_caps {
@@ -9151,16 +9154,16 @@ impl ExtensionPolicy {
                     PolicyDecision::Prompt
                 },
                 capability: normalized,
-                reason: if in_default_caps {
-                    "default_caps".to_string()
+                reason: Cow::Borrowed(if in_default_caps {
+                    "default_caps"
                 } else {
-                    "prompt_required".to_string()
-                },
+                    "prompt_required"
+                }),
             },
             ExtensionPolicyMode::Permissive => PolicyCheck {
                 decision: PolicyDecision::Allow,
                 capability: normalized,
-                reason: "permissive".to_string(),
+                reason: Cow::Borrowed("permissive"),
             },
         }
     }
@@ -9187,7 +9190,7 @@ impl ExtensionPolicy {
                 CapabilityExplanation {
                     capability: cap.as_str().to_string(),
                     decision: check.decision,
-                    reason: check.reason,
+                    reason: check.reason.into_owned(),
                     is_dangerous: cap.is_dangerous(),
                 }
             })
@@ -9320,10 +9323,12 @@ impl PolicySnapshot {
                 let entry = extension_id
                     .and_then(|id| self.per_extension.get(id))
                     .map_or(&self.global[idx], |arr| &arr[idx]);
+                // O2: reason is &'static str from SnapshotEntry, so
+                // Cow::Borrowed avoids 1 String allocation per lookup.
                 PolicyCheck {
                     decision: entry.decision,
                     capability: capability.to_string(),
-                    reason: entry.reason.to_string(),
+                    reason: std::borrow::Cow::Borrowed(entry.reason),
                 }
             },
         )
@@ -9496,6 +9501,51 @@ mod policy_snapshot_tests {
         // ext.special allows "exec", but global deny remains authoritative.
         let ext = snapshot.lookup("exec", Some("ext.special"));
         assert_eq!(ext.decision, PolicyDecision::Deny);
+    }
+
+    // O2 guardrail: verify lookup returns Cow::Borrowed (zero-alloc) reasons.
+    #[test]
+    fn lookup_reason_is_borrowed_cow() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        // Allow path (hot): reason must be Cow::Borrowed
+        let check = snapshot.lookup("read", None);
+        assert_eq!(check.decision, PolicyDecision::Allow);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "Allow reason should be Cow::Borrowed, got Owned(\"{}\")",
+            check.reason
+        );
+
+        // Deny path: reason must also be Cow::Borrowed
+        let check = snapshot.lookup("exec", None);
+        assert_eq!(check.decision, PolicyDecision::Deny);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "Deny reason should be Cow::Borrowed, got Owned(\"{}\")",
+            check.reason
+        );
+    }
+
+    // O2 guardrail: evaluate_for also returns Cow::Borrowed reasons.
+    #[test]
+    fn evaluate_for_reason_is_borrowed_cow() {
+        let policy = make_policy_with_per_extension();
+
+        let check = policy.evaluate_for("read", None);
+        assert_eq!(check.decision, PolicyDecision::Allow);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "evaluate_for Allow should be Cow::Borrowed"
+        );
+
+        let check = policy.evaluate_for("exec", None);
+        assert_eq!(check.decision, PolicyDecision::Deny);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "evaluate_for Deny should be Cow::Borrowed"
+        );
     }
 }
 
@@ -13182,7 +13232,7 @@ mod wasm_host {
             } = self.policy.evaluate(required);
 
             if decision != PolicyDecision::Prompt {
-                return (decision, reason, capability);
+                return (decision, reason.into_owned(), capability);
             }
 
             let Some(manager) = self.manager() else {
@@ -20027,12 +20077,18 @@ async fn resolve_js_hostcall_policy_decision(
     let PolicyCheck {
         mut decision,
         capability,
-        mut reason,
+        reason,
     } = host.policy.evaluate(required);
 
     if decision != PolicyDecision::Prompt {
-        return (decision, reason, capability);
+        return (decision, reason.into_owned(), capability);
     }
+
+    // Original Cow<str> reason is unused on the Prompt path — all branches
+    // below assign their own reason string before reading.
+    drop(reason);
+    #[allow(unused_assignments)]
+    let mut reason = String::new();
 
     if let Some(extension_id) = extension_id {
         if let Some(allow) = host
@@ -20329,7 +20385,8 @@ pub async fn dispatch_host_call_shared(
         PolicyDecision::Deny => (PolicyDecision::Deny, policy_check.reason),
         PolicyDecision::Prompt => {
             // Check prompt cache, then prompt the user.
-            resolve_shared_policy_prompt(ctx, capability).await
+            let (d, r) = resolve_shared_policy_prompt(ctx, capability).await;
+            (d, std::borrow::Cow::Owned(r))
         }
     };
 
@@ -20642,9 +20699,9 @@ pub async fn dispatch_host_call_shared(
                 severity: SecurityAlertSeverity::Error,
                 capability: capability.to_string(),
                 method: method.to_string(),
-                reason_codes: vec![reason.clone()],
+                reason_codes: vec![reason.to_string()],
                 summary: format!("Capability '{capability}' denied by policy ({reason})"),
-                policy_source: reason.clone(),
+                policy_source: reason.to_string(),
                 action: SecurityAlertAction::Deny,
                 remediation: format!(
                     "Grant '{capability}' in extension policy or switch to a more permissive profile."
@@ -20724,7 +20781,7 @@ pub async fn dispatch_host_call_shared(
                 crate::extension_replay::ReplayEventKind::PolicyDecision,
                 std::collections::BTreeMap::from([
                     ("decision".to_string(), format!("{decision:?}")),
-                    ("reason".to_string(), reason.clone()),
+                    ("reason".to_string(), reason.to_string()),
                 ]),
             );
             recorder.tick();
