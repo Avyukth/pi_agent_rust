@@ -4749,12 +4749,15 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let entries_ref = session.entries_for_current_path();
+            // O18: fast-path threshold check on references avoids deep-cloning
+            // all entries when compaction won't trigger (~99% of turns).
+            if compaction::should_prepare_compaction(&entries_ref, &self.compaction_settings) {
+                let entries: Vec<_> = entries_ref.into_iter().cloned().collect();
+                compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(prep) = preparation {
@@ -4829,12 +4832,15 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let entries_ref = session.entries_for_current_path();
+            // O18: fast-path threshold check on references avoids deep-cloning
+            // all entries when compaction won't trigger (~99% of turns).
+            if compaction::should_prepare_compaction(&entries_ref, &self.compaction_settings) {
+                let entries: Vec<_> = entries_ref.into_iter().cloned().collect();
+                compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(prep) = preparation {
