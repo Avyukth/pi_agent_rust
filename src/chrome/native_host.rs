@@ -1,9 +1,10 @@
 use std::fs;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+use asupersync::io::AsyncReadExt;
 use asupersync::net::unix::UnixListener;
 use thiserror::Error;
 use uuid::Uuid;
@@ -346,6 +347,13 @@ pub enum NativeHostError {
     },
     #[error("native host frame codec error: {0}")]
     Frame(#[from] protocol::FrameCodecError),
+    #[error("invalid native messaging JSON payload: {0}")]
+    NativeMessageJson(serde_json::Error),
+    #[error("chrome native messaging frame exceeds {max_bytes} bytes (got {frame_bytes})")]
+    NativeMessageFrameTooLarge {
+        frame_bytes: usize,
+        max_bytes: usize,
+    },
 }
 
 fn random_id() -> String {
@@ -399,13 +407,152 @@ async fn write_socket_message(
     message: &protocol::MessageType,
 ) -> Result<(), NativeHostError> {
     let frame = protocol::encode_frame(message)?;
-    stream
-        .write_all(&frame)
+    asupersync::io::AsyncWriteExt::write_all(stream, &frame)
         .await
         .map_err(|source| NativeHostError::Io {
             path: PathBuf::from("<agent-socket>"),
             source,
         })
+}
+
+fn write_native_messaging_frame<W: IoWrite>(
+    writer: &mut W,
+    payload: &[u8],
+) -> Result<(), NativeHostError> {
+    if payload.len() > protocol::MAX_SOCKET_FRAME_BYTES {
+        return Err(NativeHostError::NativeMessageFrameTooLarge {
+            frame_bytes: payload.len(),
+            max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
+        });
+    }
+
+    let len =
+        u32::try_from(payload.len()).map_err(|_| NativeHostError::NativeMessageFrameTooLarge {
+            frame_bytes: payload.len(),
+            max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
+        })?;
+    writer
+        .write_all(&len.to_le_bytes())
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<chrome-stdio>"),
+            source,
+        })?;
+    writer
+        .write_all(payload)
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<chrome-stdio>"),
+            source,
+        })?;
+    writer.flush().map_err(|source| NativeHostError::Io {
+        path: PathBuf::from("<chrome-stdio>"),
+        source,
+    })?;
+    Ok(())
+}
+
+fn read_native_messaging_frame<R: IoRead>(reader: &mut R) -> Result<Vec<u8>, NativeHostError> {
+    let mut header = [0_u8; 4];
+    reader
+        .read_exact(&mut header)
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<chrome-stdio>"),
+            source,
+        })?;
+    let frame_len = u32::from_le_bytes(header) as usize;
+    if frame_len > protocol::MAX_SOCKET_FRAME_BYTES {
+        return Err(NativeHostError::NativeMessageFrameTooLarge {
+            frame_bytes: frame_len,
+            max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
+        });
+    }
+
+    let mut payload = vec![0_u8; frame_len];
+    reader
+        .read_exact(&mut payload)
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<chrome-stdio>"),
+            source,
+        })?;
+    Ok(payload)
+}
+
+fn write_native_messaging_message<W: IoWrite>(
+    writer: &mut W,
+    message: &protocol::MessageType,
+) -> Result<(), NativeHostError> {
+    let payload = serde_json::to_vec(message).map_err(NativeHostError::NativeMessageJson)?;
+    write_native_messaging_frame(writer, &payload)
+}
+
+fn read_native_messaging_message<R: IoRead>(
+    reader: &mut R,
+) -> Result<protocol::MessageType, NativeHostError> {
+    let payload = read_native_messaging_frame(reader)?;
+    serde_json::from_slice(&payload).map_err(NativeHostError::NativeMessageJson)
+}
+
+fn read_agent_socket_message_blocking<R: IoRead>(
+    reader: &mut R,
+) -> Result<protocol::MessageType, NativeHostError> {
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        let mut byte = [0_u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .map_err(|source| NativeHostError::Io {
+                path: PathBuf::from("<agent-socket>"),
+                source,
+            })?;
+        buf.push(byte[0]);
+        if let Some((message, consumed)) = protocol::decode_frame::<protocol::MessageType>(&buf)? {
+            if consumed != buf.len() {
+                return Err(NativeHostError::Io {
+                    path: PathBuf::from("<agent-socket>"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "multiple agent frames in one blocking read are not supported",
+                    ),
+                });
+            }
+            return Ok(message);
+        }
+    }
+}
+
+fn write_agent_socket_message_blocking<W: IoWrite>(
+    writer: &mut W,
+    message: &protocol::MessageType,
+) -> Result<(), NativeHostError> {
+    let frame = protocol::encode_frame(message)?;
+    writer
+        .write_all(&frame)
+        .map_err(|source| NativeHostError::Io {
+            path: PathBuf::from("<agent-socket>"),
+            source,
+        })?;
+    writer.flush().map_err(|source| NativeHostError::Io {
+        path: PathBuf::from("<agent-socket>"),
+        source,
+    })?;
+    Ok(())
+}
+
+fn relay_one_agent_message_to_chrome<R: IoRead, W: IoWrite>(
+    agent_reader: &mut R,
+    chrome_writer: &mut W,
+) -> Result<protocol::MessageType, NativeHostError> {
+    let message = read_agent_socket_message_blocking(agent_reader)?;
+    write_native_messaging_message(chrome_writer, &message)?;
+    Ok(message)
+}
+
+fn relay_one_chrome_message_to_agent<R: IoRead, W: IoWrite>(
+    chrome_reader: &mut R,
+    agent_writer: &mut W,
+) -> Result<protocol::MessageType, NativeHostError> {
+    let message = read_native_messaging_message(chrome_reader)?;
+    write_agent_socket_message_blocking(agent_writer, &message)?;
+    Ok(message)
 }
 
 async fn read_socket_message(
@@ -828,5 +975,133 @@ mod tests {
                 other => panic!("expected auth_ok over socket roundtrip, got {other:?}"),
             }
         });
+    }
+
+    #[test]
+    fn test_native_messaging_frame_roundtrip_preserves_json_payload() {
+        let message =
+            protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: "req-1".to_string(),
+                ok: true,
+                result: serde_json::json!({"title": "Example", "url": "https://example.test"}),
+            }));
+
+        let mut bytes = Vec::new();
+        write_native_messaging_message(&mut bytes, &message)
+            .expect("native messaging write should succeed");
+        assert!(
+            bytes.len() >= 4,
+            "native messaging frame must include 4-byte LE length prefix"
+        );
+        let declared_len = u32::from_le_bytes(bytes[..4].try_into().expect("header")) as usize;
+        assert_eq!(
+            declared_len,
+            bytes.len() - 4,
+            "4-byte LE header must match serialized JSON payload length"
+        );
+
+        let mut cursor = std::io::Cursor::new(bytes);
+        let decoded = read_native_messaging_message(&mut cursor)
+            .expect("native messaging frame should roundtrip decode");
+        assert_eq!(
+            decoded, message,
+            "native messaging codec must preserve message"
+        );
+    }
+
+    #[test]
+    fn test_native_messaging_frame_rejects_oversized_payload() {
+        let oversized = vec![b'x'; protocol::MAX_SOCKET_FRAME_BYTES + 1];
+        let err = write_native_messaging_frame(&mut Vec::new(), &oversized)
+            .expect_err("payload larger than Chrome native messaging cap must be rejected");
+        assert!(
+            matches!(err, NativeHostError::NativeMessageFrameTooLarge { .. }),
+            "expected native frame size error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_relay_agent_request_to_chrome_preserves_message_type_and_payload() {
+        let request = protocol::MessageType::Request(protocol::Request {
+            version: protocol::PROTOCOL_VERSION_V1,
+            id: "req-relay-1".to_string(),
+            op: "navigate".to_string(),
+            payload: serde_json::json!({"url": "https://relay.test"}),
+        });
+        let agent_bytes = protocol::encode_frame(&request).expect("encode agent frame");
+        let mut agent_reader = std::io::Cursor::new(agent_bytes);
+        let mut chrome_writer = Vec::new();
+
+        let relayed = relay_one_agent_message_to_chrome(&mut agent_reader, &mut chrome_writer)
+            .expect("relay agent->chrome should succeed");
+        assert_eq!(
+            relayed, request,
+            "relay helper should return parsed agent message"
+        );
+
+        let mut chrome_reader = std::io::Cursor::new(chrome_writer);
+        let chrome_message = read_native_messaging_message(&mut chrome_reader)
+            .expect("chrome native frame should decode");
+        assert_eq!(
+            chrome_message, request,
+            "agent->chrome relay must preserve request type and payload"
+        );
+    }
+
+    #[test]
+    fn test_relay_chrome_messages_to_agent_preserves_order_and_type_integrity() {
+        let response =
+            protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: "req-relay-2".to_string(),
+                ok: true,
+                result: serde_json::json!({"ok": true}),
+            }));
+        let observation = protocol::MessageType::Observation(protocol::ObservationEvent {
+            version: protocol::PROTOCOL_VERSION_V1,
+            observer_id: "obs-1".to_string(),
+            events: vec![protocol::ObservationEntry {
+                kind: "load_complete".to_string(),
+                message: Some("done".to_string()),
+                source: Some("page".to_string()),
+                url: Some("https://relay.test".to_string()),
+                ts: 1_708_700_001,
+            }],
+        });
+
+        let mut chrome_bytes = Vec::new();
+        write_native_messaging_message(&mut chrome_bytes, &response).expect("write response frame");
+        write_native_messaging_message(&mut chrome_bytes, &observation)
+            .expect("write observation frame");
+
+        let mut chrome_reader = std::io::Cursor::new(chrome_bytes);
+        let mut agent_writer = Vec::new();
+        let first = relay_one_chrome_message_to_agent(&mut chrome_reader, &mut agent_writer)
+            .expect("relay response should succeed");
+        let second = relay_one_chrome_message_to_agent(&mut chrome_reader, &mut agent_writer)
+            .expect("relay observation should succeed");
+        assert_eq!(
+            first, response,
+            "first relayed message should remain response"
+        );
+        assert_eq!(
+            second, observation,
+            "second relayed message should remain observation"
+        );
+
+        let mut agent_reader = std::io::Cursor::new(agent_writer);
+        let decoded_first = read_agent_socket_message_blocking(&mut agent_reader)
+            .expect("decode first agent frame");
+        let decoded_second = read_agent_socket_message_blocking(&mut agent_reader)
+            .expect("decode second agent frame");
+        assert_eq!(
+            decoded_first, response,
+            "chrome->agent relay must preserve first message ordering"
+        );
+        assert_eq!(
+            decoded_second, observation,
+            "chrome->agent relay must preserve second message ordering and type"
+        );
     }
 }
