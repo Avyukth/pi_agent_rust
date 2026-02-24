@@ -155,6 +155,10 @@ harness = false
 name = "tui_perf"
 harness = false
 
+[[bench]]
+name = "optimizations"
+harness = false
+
 # Gap H: jemalloc for 10-20% allocation-heavy path improvement.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", optional = true }
