@@ -2950,14 +2950,16 @@ fn session_state(
         })
         .map(rpc_model_from_entry);
 
-    let message_count = session
-        .entries_for_current_path()
+    // V7-A optimization: reuse a single path snapshot for both queries
+    // instead of traversing entries_for_current_path() twice.
+    let entries = session.entries_for_current_path();
+
+    let message_count = entries
         .iter()
         .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
         .count();
 
-    let session_name = session
-        .entries_for_current_path()
+    let session_name = entries
         .iter()
         .rev()
         .find_map(|entry| {
