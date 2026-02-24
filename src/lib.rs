@@ -47,6 +47,7 @@ pub mod auth;
 pub mod autocomplete;
 pub mod buffer_shim;
 pub mod cli;
+pub mod chrome;
 pub mod compaction;
 pub mod compaction_worker;
 pub mod config;
