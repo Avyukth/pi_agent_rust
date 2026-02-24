@@ -577,7 +577,7 @@ fn e2e_cross_provider_parity() {
     }
 
     let registry = LiveE2eRegistry::load(harness.log())
-        .unwrap_or_else(|err| panic!("failed to load live E2E registry: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to load live E2E registry: {err}"));
 
     asupersync::test_utils::run_test(|| {
         let harness_ref = &harness;
@@ -743,12 +743,12 @@ fn e2e_cross_provider_parity() {
 
             let jsonl_path = harness_ref.temp_path("e2e_cross_provider_parity.jsonl");
             write_jsonl(&jsonl_path, &records)
-                .unwrap_or_else(|err| panic!("write parity jsonl artifact: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write parity jsonl artifact: {err}"));
             harness_ref.record_artifact("e2e_cross_provider_parity.jsonl", &jsonl_path);
 
             let markdown_path = harness_ref.temp_path("e2e_cross_provider_parity.md");
             write_markdown_report(&markdown_path, &records)
-                .unwrap_or_else(|err| panic!("write parity markdown artifact: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write parity markdown artifact: {err}"));
             harness_ref.record_artifact("e2e_cross_provider_parity.md", &markdown_path);
         }
     });

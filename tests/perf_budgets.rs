@@ -196,7 +196,7 @@ fn read_jsonl_file(path: &Path) -> Vec<Value> {
 
 fn load_perf_sli_matrix() -> Value {
     let path = project_root().join("docs/perf_sli_matrix.json");
-    read_json_file(&path).unwrap_or_else(|| panic!("failed to parse {}", path.display()))
+    read_json_file(&path).unwrap_or_else(|| assert!(false, "failed to parse {}", path.display()))
 }
 
 /// Measurement result for a budget check.

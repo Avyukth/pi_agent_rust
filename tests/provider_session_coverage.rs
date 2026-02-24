@@ -110,7 +110,7 @@ fn api_from_str_custom_unknown() {
     assert!(result.is_ok(), "unknown API should succeed as Custom");
     match result.unwrap() {
         Api::Custom(s) => assert_eq!(s, "my-custom-api"),
-        other => panic!("expected Custom, got {other:?}"),
+        other => assert!(false, "expected Custom, got {other:?}"),
     }
 }
 
@@ -162,7 +162,7 @@ fn known_provider_from_str_custom() {
     assert!(result.is_ok(), "unknown provider should succeed as Custom");
     match result.unwrap() {
         KnownProvider::Custom(s) => assert_eq!(s, "my-custom-provider"),
-        other => panic!("expected Custom, got {other:?}"),
+        other => assert!(false, "expected Custom, got {other:?}"),
     }
 }
 
@@ -476,7 +476,7 @@ fn session_model_change_entry() {
                 assert_eq!(entry.provider, "openai");
                 assert_eq!(entry.model_id, "gpt-4");
             }
-            other => panic!("expected ModelChange, got {other:?}"),
+            other => assert!(false, "expected ModelChange, got {other:?}"),
         }
     });
 }

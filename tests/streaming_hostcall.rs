@@ -114,10 +114,8 @@ fn complete_expected_tools_unordered(
             .iter()
             .position(|(name, payload)| *name == tool_name && *payload == request.payload)
             .unwrap_or_else(|| {
-                panic!(
-                    "{context}: unexpected tool payload for {tool_name}: {}",
-                    request.payload
-                )
+                assert!(false, "{context}: unexpected tool payload for {tool_name}: {}",
+                request.payload)
             });
         remaining.remove(index);
         runtime.complete_hostcall(request.call_id, HostcallOutcome::Success(Value::Null));

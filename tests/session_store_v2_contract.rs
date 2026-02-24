@@ -16,14 +16,14 @@ fn schema_path() -> PathBuf {
 fn compiled_contract_schema() -> Validator {
     let path = schema_path();
     let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("Failed to read schema {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "Failed to read schema {}: {err}", path.display()));
     let schema: Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("Failed to parse schema {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "Failed to parse schema {}: {err}", path.display()));
 
     jsonschema::draft202012::options()
         .should_validate_formats(true)
         .build(&schema)
-        .unwrap_or_else(|err| panic!("Failed to compile schema {}: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "Failed to compile schema {}: {err}", path.display()))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -190,7 +190,7 @@ fn session_store_v2_contract_bundle_validates() {
     let bundle = canonical_contract_bundle();
 
     if let Err(err) = validator.validate(&bundle) {
-        panic!("Canonical session store V2 contract bundle must validate: {err}");
+        assert!(false, "Canonical session store V2 contract bundle must validate: {err}");
     }
 }
 

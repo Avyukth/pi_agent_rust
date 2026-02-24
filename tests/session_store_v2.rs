@@ -2011,7 +2011,7 @@ fn e2e_corrupt_migration_recovery_cleanup_only() -> PiResult<()> {
     // Status should be Corrupt.
     match pi::session::migration_status(&jsonl) {
         MigrationState::Corrupt { .. } => {}
-        other => panic!("Expected Corrupt, got {other:?}"),
+        other => assert!(false, "Expected Corrupt, got {other:?}"),
     }
 
     // Recover WITHOUT re-migration.
@@ -2127,7 +2127,7 @@ fn e2e_migration_state_machine_transitions() -> PiResult<()> {
         MigrationState::Corrupt { error } => {
             assert!(!error.is_empty(), "corrupt error message must be non-empty");
         }
-        other => panic!("Expected Corrupt after segment tampering, got {other:?}"),
+        other => assert!(false, "Expected Corrupt after segment tampering, got {other:?}"),
     }
 
     // State 4: Recovered via recover_partial_migration (with re-migration).
@@ -2435,7 +2435,7 @@ fn e2e_forensic_ledger_is_valid_jsonl() -> PiResult<()> {
             continue;
         }
         let parsed: Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("Ledger line is not valid JSON: {e}\nLine: {line}"));
+            .unwrap_or_else(|e| assert!(false, "Ledger line is not valid JSON: {e}\nLine: {line}"));
         // Each entry must have the schema field.
         assert_eq!(
             parsed["schema"].as_str(),

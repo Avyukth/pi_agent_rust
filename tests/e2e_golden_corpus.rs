@@ -264,11 +264,11 @@ impl GoldenTestHarness {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
-                Err(err) => panic!("try_wait failed: {err}"),
+                Err(err) => assert!(false, "try_wait failed: {err}"),
             }
             if start.elapsed() > timeout {
                 let _ = child.kill();
-                panic!("golden test timed out after {}s", timeout.as_secs());
+                assert!(false, "golden test timed out after {}s", timeout.as_secs());
             }
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -443,11 +443,9 @@ fn assert_json_event_order(scenario: &str, expected: &[String], actual: &[&str])
                 actual_idx += offset + 1;
             }
             None => {
-                panic!(
-                    "[{scenario}] expected event '{expected_type}' not found in order.\n\
-                     Expected sequence: {expected:?}\n\
-                     Actual types: {actual:?}"
-                );
+                assert!(false, "[{scenario}] expected event '{expected_type}' not found in order.\n\
+                 Expected sequence: {expected:?}\n\
+                 Actual types: {actual:?}");
             }
         }
     }
@@ -483,9 +481,9 @@ fn corpus_dir() -> PathBuf {
 
 fn load_fixture(path: &Path) -> GoldenFixture {
     let content = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "failed to read fixture {}: {e}", path.display()));
     let fixture: GoldenFixture = serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "failed to parse fixture {}: {e}", path.display()));
     assert_eq!(
         fixture.schema,
         GOLDEN_SCHEMA,

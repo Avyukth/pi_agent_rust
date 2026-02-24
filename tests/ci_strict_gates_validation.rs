@@ -34,12 +34,12 @@ const PARAMETER_SWEEPS_GATE_ID: &str = "parameter_sweeps_integrity";
 const CONFORMANCE_STRESS_LINEAGE_GATE_ID: &str = "conformance_stress_lineage";
 
 fn load_json(path: &str) -> Value {
-    let content = std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"));
-    serde_json::from_str(&content).unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
+    let content = std::fs::read_to_string(path).unwrap_or_else(|_| assert!(false, "Should read {path}"));
+    serde_json::from_str(&content).unwrap_or_else(|_| assert!(false, "Should parse {path} as JSON"))
 }
 
 fn load_text(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
+    std::fs::read_to_string(path).unwrap_or_else(|_| assert!(false, "Should read {path}"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -549,7 +549,7 @@ fn suite_classification_is_valid_toml() {
     // Use toml::Table (document) parse — toml 1.0 changed Value::from_str
     // to parse a single value expression rather than a full TOML document.
     if let Err(e) = content.parse::<toml::Table>() {
-        panic!("suite_classification.toml must be valid TOML: {e}");
+        assert!(false, "suite_classification.toml must be valid TOML: {e}");
     }
 }
 

@@ -1010,7 +1010,7 @@ fn streaming_event_timeline_is_well_ordered() {
     common::run_async(async move {
         let meta = pi::provider_metadata::provider_metadata(provider_id).unwrap();
         let provider = build_provider_from_metadata(meta)
-            .unwrap_or_else(|| panic!("failed to build provider for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "failed to build provider for {provider_id}"));
         let context = simple_context("Say just the word hello");
         let options = simple_options(&api_key);
         let sr = collect_stream_events(provider.as_ref(), &context, &options).await;

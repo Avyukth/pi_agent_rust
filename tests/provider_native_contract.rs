@@ -1097,7 +1097,7 @@ mod openai_compat_preset_contract {
                 "openai-completions",
             );
             let provider = create_provider(&entry, None)
-                .unwrap_or_else(|e| panic!("create_provider should work for {provider_id}: {e}"));
+                .unwrap_or_else(|e| assert!(false, "create_provider should work for {provider_id}: {e}"));
 
             let api_key = format!("{provider_id}-contract-key");
             collect_stream_events(provider, simple_context(), options_with_key(&api_key));
@@ -1175,7 +1175,7 @@ mod cross_provider_invariants {
                 entry.model.api = "openai-completions".to_string();
             }
             let provider = create_provider(&entry, None)
-                .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+                .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
             let events =
                 collect_stream_events(provider, simple_context(), options_with_key("test"));
@@ -1229,7 +1229,7 @@ mod cross_provider_invariants {
                 entry.model.api = "openai-completions".to_string();
             }
             let provider = create_provider(&entry, None)
-                .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+                .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
             collect_stream_events(provider, simple_context(), options_with_key("test"));
 
@@ -1289,7 +1289,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         assert_eq!(
             provider.api(),
@@ -1326,7 +1326,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         let api_key = format!("{provider_id}-secret-key-42");
         collect_stream_events(provider, simple_context(), options_with_key(&api_key));
@@ -1357,7 +1357,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         collect_stream_events(provider, simple_context(), options_with_key("key"));
 
@@ -1399,7 +1399,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         collect_stream_events(provider, context_with_tools(), options_with_key("key"));
 
@@ -1408,7 +1408,7 @@ mod gap_provider_helpers {
 
         let tools = body["tools"]
             .as_array()
-            .unwrap_or_else(|| panic!("{provider_id}: tools must be array"));
+            .unwrap_or_else(|| assert!(false, "{provider_id}: tools must be array"));
         assert_eq!(tools.len(), 2, "{provider_id} tool count");
 
         let echo_tool = &tools[0];
@@ -1439,7 +1439,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         let events = collect_stream_events(provider, simple_context(), options_with_key("key"));
 
@@ -1469,7 +1469,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         let events = collect_stream_events(provider, context_with_tools(), options_with_key("key"));
 
@@ -1499,7 +1499,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         let ctx = simple_context();
         let opts = options_with_key("bad-key");
@@ -1565,7 +1565,7 @@ mod gap_provider_helpers {
             "openai-completions",
         );
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider for {provider_id}: {e}"));
 
         let ctx = simple_context();
         let opts = options_with_key("key");
@@ -2540,9 +2540,7 @@ mod failure_taxonomy {
                     covered.insert(category);
                 }
                 pi::flake_classifier::FlakeClassification::Deterministic => {
-                    panic!(
-                        "Expected Transient({expected_cat:?}) but got Deterministic for: {output}"
-                    );
+                    assert!(false, "Expected Transient({expected_cat:?}) but got Deterministic for: {output}");
                 }
             }
         }
@@ -2665,8 +2663,8 @@ mod docs_runtime_consistency {
     fn load_doc(path: &str) -> serde_json::Value {
         let full = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path,);
         let content =
-            std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("Failed to read {full}: {e}"));
-        serde_json::from_str(&content).unwrap_or_else(|e| panic!("Failed to parse {full}: {e}"))
+            std::fs::read_to_string(&full).unwrap_or_else(|e| assert!(false, "Failed to read {full}: {e}"));
+        serde_json::from_str(&content).unwrap_or_else(|e| assert!(false, "Failed to parse {full}: {e}"))
     }
 
     #[test]
@@ -2838,7 +2836,7 @@ mod docs_runtime_consistency {
             env!("CARGO_MANIFEST_DIR")
         );
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("Failed to read migration guide: {e}"));
+            .unwrap_or_else(|e| assert!(false, "Failed to read migration guide: {e}"));
         // Verify all documented env vars exist in runtime
         let env_vars = [
             ("GROQ_API_KEY", "groq"),

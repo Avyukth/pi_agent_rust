@@ -447,7 +447,7 @@ fn regression_ui_alias_table_completeness() {
             r#"{{"type":"extension_ui_request","id":"req-1","method":"{snake}","data":"test"}}"#
         );
         diff_normalized_jsonl(&expected, &actual, cwd).unwrap_or_else(|e| {
-            panic!("{camel} and {snake} should normalize identically:\n{e}");
+            assert!(false, "{camel} and {snake} should normalize identically:\n{e}");
         });
     }
 }

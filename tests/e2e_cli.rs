@@ -212,7 +212,7 @@ impl CliTestHarness {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
-                Err(err) => panic!("try_wait failed: {err}"),
+                Err(err) => assert!(false, "try_wait failed: {err}"),
             }
 
             if start.elapsed() > timeout {
@@ -221,7 +221,7 @@ impl CliTestHarness {
                     .kill()
                     .ok()
                     .and_then(|()| child.wait().ok())
-                    .unwrap_or_else(|| panic!("timed out after {timeout:?}; failed to kill/wait"));
+                    .unwrap_or_else(|| assert!(false, "timed out after {timeout:?}; failed to kill/wait"));
             }
 
             std::thread::sleep(Duration::from_millis(25));
@@ -2512,7 +2512,7 @@ fn assert_json_mode_lifecycle_shape(lines: &[serde_json::Value]) {
         event_lines
             .iter()
             .position(predicate)
-            .unwrap_or_else(|| panic!("missing required event `{label}` in {event_types:?}"))
+            .unwrap_or_else(|| assert!(false, "missing required event `{label}` in {event_types:?}"))
     };
 
     let agent_start_idx = index_of(&|value| value["type"] == "agent_start", "agent_start");

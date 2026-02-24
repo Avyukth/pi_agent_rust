@@ -33,7 +33,7 @@ fn test_read_large_file_offset() {
 
         let content = match &result.content[0] {
             pi::model::ContentBlock::Text(t) => t.text.clone(),
-            _ => panic!("Expected text content"),
+            _ => assert!(false, "Expected text content"),
         };
 
         println!("Content sample: {content:.100}...");

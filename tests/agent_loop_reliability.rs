@@ -933,7 +933,7 @@ fn abort_mid_stream_preserves_partial_content() {
             Some(Message::Assistant(a)) => {
                 assert_eq!(a.stop_reason, StopReason::Aborted);
             }
-            other => panic!("expected last message to be Assistant, got: {other:?}"),
+            other => assert!(false, "expected last message to be Assistant, got: {other:?}"),
         }
 
         let guard = tl.lock().expect("lock timeline");
@@ -2100,10 +2100,8 @@ fn stream_contract_violation_after_retries_is_fatal() {
 
             match result {
                 Ok(message) => {
-                    panic!(
-                        "fatal stream-contract violation should not recover, got {:?}",
-                        message.stop_reason
-                    );
+                    assert!(false, "fatal stream-contract violation should not recover, got {:?}",
+                    message.stop_reason);
                 }
                 Err(err) => {
                     let err_text = err.to_string();

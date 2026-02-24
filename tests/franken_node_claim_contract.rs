@@ -16,9 +16,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -113,7 +113,7 @@ fn franken_node_claim_contract_tiers_are_evidence_backed_and_fail_closed() {
 
         let required_evidence = tier["required_evidence"]
             .as_array()
-            .unwrap_or_else(|| panic!("{tier_id}: required_evidence must be an array"));
+            .unwrap_or_else(|| assert!(false, "{tier_id}: required_evidence must be an array"));
         assert!(
             !required_evidence.is_empty(),
             "{tier_id}: required_evidence must not be empty"
@@ -121,7 +121,7 @@ fn franken_node_claim_contract_tiers_are_evidence_backed_and_fail_closed() {
 
         let allowed = tier["allowed_claim_language"]
             .as_array()
-            .unwrap_or_else(|| panic!("{tier_id}: allowed_claim_language must be an array"));
+            .unwrap_or_else(|| assert!(false, "{tier_id}: allowed_claim_language must be an array"));
         assert!(
             !allowed.is_empty(),
             "{tier_id}: allowed_claim_language must not be empty"
@@ -129,7 +129,7 @@ fn franken_node_claim_contract_tiers_are_evidence_backed_and_fail_closed() {
 
         let forbidden = tier["forbidden_claim_language"]
             .as_array()
-            .unwrap_or_else(|| panic!("{tier_id}: forbidden_claim_language must be an array"));
+            .unwrap_or_else(|| assert!(false, "{tier_id}: forbidden_claim_language must be an array"));
         assert!(
             !forbidden.is_empty(),
             "{tier_id}: forbidden_claim_language must not be empty"

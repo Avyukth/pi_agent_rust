@@ -847,7 +847,7 @@ fn factory_routes_batch_a1_providers_correctly() {
     for (provider, base_url) in &cases {
         let entry = oai_compat_entry(provider, base_url);
         let p = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "factory should route {provider}: {e}"));
         assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
     }
 }
@@ -869,7 +869,7 @@ fn factory_routes_batch_a2_providers_correctly() {
     for (provider, base_url) in &cases {
         let entry = oai_compat_entry(provider, base_url);
         let p = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "factory should route {provider}: {e}"));
         assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
     }
 }
@@ -892,7 +892,7 @@ fn factory_routes_batch_a3_providers_correctly() {
     for (provider, base_url) in &cases {
         let entry = oai_compat_entry(provider, base_url);
         let p = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "factory should route {provider}: {e}"));
         assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
     }
 }
@@ -915,7 +915,7 @@ fn factory_routes_batch_a4_providers_correctly() {
     for (provider, base_url) in &cases {
         let entry = oai_compat_entry(provider, base_url);
         let p = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("factory should route {provider}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "factory should route {provider}: {e}"));
         assert_eq!(p.api(), "openai-completions", "{provider} api mismatch");
     }
 }

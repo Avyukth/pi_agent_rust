@@ -823,7 +823,7 @@ impl FsFixture {
     pub fn assert_file_content(&self, relative_path: &str, expected: &str) {
         let path = self.root.join(relative_path);
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("File not found: {}", path.display()));
+            .unwrap_or_else(|_| assert!(false, "File not found: {}", path.display()));
         assert_eq!(
             content, expected,
             "File content mismatch at {}",

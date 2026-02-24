@@ -1127,7 +1127,7 @@ fn scenario_jsonl_contract_conformance() {
     // Every line must be valid JSON
     for (i, line) in lines.iter().enumerate() {
         let parsed: serde_json::Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("Line {i} invalid JSON: {e}"));
+            serde_json::from_str(line).unwrap_or_else(|e| assert!(false, "Line {i} invalid JSON: {e}"));
 
         // Every log entry must have schema, type, ts, level, category, message
         assert!(parsed.get("schema").is_some(), "Line {i} missing schema");

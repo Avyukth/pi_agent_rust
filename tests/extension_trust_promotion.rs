@@ -147,7 +147,7 @@ fn promote_without_ack_is_rejected() {
             assert_eq!(from, ExtensionTrustState::Quarantined);
             assert_eq!(to, ExtensionTrustState::Restricted);
         }
-        other => panic!("expected OperatorAckRequired, got: {other}"),
+        other => assert!(false, "expected OperatorAckRequired, got: {other}"),
     }
     // State should not have changed.
     assert_eq!(t.state(), ExtensionTrustState::Quarantined);
@@ -182,7 +182,7 @@ fn promote_to_restricted_blocked_by_low_risk_score() {
             assert_eq!(risk_score, 10);
             assert_eq!(max_allowed, 30);
         }
-        other => panic!("expected RiskTooHigh, got: {other}"),
+        other => assert!(false, "expected RiskTooHigh, got: {other}"),
     }
 }
 
@@ -200,7 +200,7 @@ fn promote_to_trusted_blocked_by_medium_risk_score() {
             assert_eq!(risk_score, 40);
             assert_eq!(max_allowed, 50);
         }
-        other => panic!("expected RiskTooHigh, got: {other}"),
+        other => assert!(false, "expected RiskTooHigh, got: {other}"),
     }
 }
 

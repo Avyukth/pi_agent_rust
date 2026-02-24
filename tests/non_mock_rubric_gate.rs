@@ -16,21 +16,19 @@ use std::path::Path;
 fn load_rubric() -> Value {
     let rubric_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/non-mock-rubric.json");
     let content = std::fs::read_to_string(&rubric_path)
-        .unwrap_or_else(|e| panic!("Failed to read rubric at {}: {e}", rubric_path.display()));
-    serde_json::from_str(&content).unwrap_or_else(|e| panic!("Failed to parse rubric JSON: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to read rubric at {}: {e}", rubric_path.display()));
+    serde_json::from_str(&content).unwrap_or_else(|e| assert!(false, "Failed to parse rubric JSON: {e}"))
 }
 
 /// Load the coverage baseline JSON from docs/coverage-baseline-map.json.
 fn load_coverage_baseline() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/coverage-baseline-map.json");
     let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "Failed to read coverage baseline at {}: {e}",
-            path.display()
-        )
+        assert!(false, "Failed to read coverage baseline at {}: {e}",
+        path.display())
     });
     serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse coverage baseline JSON: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to parse coverage baseline JSON: {e}"))
 }
 
 // ─── Rubric Schema Integrity ─────────────────────────────────────────
@@ -510,7 +508,7 @@ fn testing_policy_allowlist_entries_have_required_info() {
     // with the minimum fields (identifier, location, suite, rationale).
     let policy_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/testing-policy.md");
     let content = std::fs::read_to_string(&policy_path)
-        .unwrap_or_else(|e| panic!("Failed to read testing policy: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to read testing policy: {e}"));
 
     // Check the allowlist table exists.
     assert!(
@@ -538,7 +536,7 @@ fn testing_policy_allowlist_entries_have_required_info() {
 fn suite_classification_file_exists_and_has_all_suites() {
     let toml_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/suite_classification.toml");
     let content = std::fs::read_to_string(&toml_path)
-        .unwrap_or_else(|e| panic!("Failed to read suite classification: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to read suite classification: {e}"));
 
     assert!(
         content.contains("[suite.unit]"),

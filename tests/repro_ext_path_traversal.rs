@@ -31,7 +31,7 @@ fn repro_ext_path_traversal() {
 
         // We expect this to FAIL with "Module path escapes extension root"
         match result {
-            Ok(()) => panic!("Should have failed to import module outside root, but succeeded!"),
+            Ok(()) => assert!(false, "Should have failed to import module outside root, but succeeded!"),
             Err(e) => {
                 println!("Got expected error: {e}");
                 assert!(

@@ -18,9 +18,9 @@ fn project_root() -> PathBuf {
 fn load_json(relative: &str) -> Value {
     let path = project_root().join(relative);
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "Failed to read {}: {e}", path.display()));
     serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse {} as JSON: {e}", path.display()))
+        .unwrap_or_else(|e| assert!(false, "Failed to parse {} as JSON: {e}", path.display()))
 }
 
 fn load_rubric() -> Value {
@@ -34,13 +34,13 @@ fn load_inventory() -> Value {
 fn load_testing_policy() -> String {
     let path = project_root().join("docs/testing-policy.md");
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read testing-policy.md: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to read testing-policy.md: {e}"))
 }
 
 fn load_suite_classification() -> String {
     let path = project_root().join("tests/suite_classification.toml");
     std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read suite_classification.toml: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to read suite_classification.toml: {e}"))
 }
 
 // ─── Exception Time-Boxing Validation ───────────────────────────────
@@ -547,7 +547,7 @@ fn failure_log_schema_env_field_has_redaction() {
 fn no_mock_crate_dependencies() {
     let cargo_toml = project_root().join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_toml)
-        .unwrap_or_else(|e| panic!("Failed to read Cargo.toml: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to read Cargo.toml: {e}"));
 
     let banned_crates = ["mockall", "mockito", "wiremock"];
     for crate_name in banned_crates {

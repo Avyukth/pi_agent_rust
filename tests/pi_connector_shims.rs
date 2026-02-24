@@ -85,7 +85,7 @@ where
         }
         runtime.tick().await.expect("tick");
     }
-    panic!("never saw __report tool call after 50 ticks");
+    assert!(false, "never saw __report tool call after 50 ticks");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -107,7 +107,7 @@ fn exec_produces_correct_hostcall_kind() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Exec { cmd } => assert_eq!(cmd, "ls"),
-            other => panic!("expected Exec, got {other:?}"),
+            other => assert!(false, "expected Exec, got {other:?}"),
         }
     });
 }
@@ -267,7 +267,7 @@ fn exec_no_args_defaults_to_empty() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Exec { cmd } => assert_eq!(cmd, "pwd"),
-            other => panic!("expected Exec, got {other:?}"),
+            other => assert!(false, "expected Exec, got {other:?}"),
         }
     });
 }
@@ -456,7 +456,7 @@ fn session_produces_correct_hostcall_kind_with_op() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Session { op } => assert_eq!(op, "getState"),
-            other => panic!("expected Session, got {other:?}"),
+            other => assert!(false, "expected Session, got {other:?}"),
         }
     });
 }
@@ -476,7 +476,7 @@ fn session_set_model_payload() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Session { op } => assert_eq!(op, "setModel"),
-            other => panic!("expected Session, got {other:?}"),
+            other => assert!(false, "expected Session, got {other:?}"),
         }
         assert_eq!(
             req.payload.get("provider").and_then(Value::as_str),
@@ -639,7 +639,7 @@ fn session_set_thinking_level_payload() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Session { op } => assert_eq!(op, "setThinkingLevel"),
-            other => panic!("expected Session, got {other:?}"),
+            other => assert!(false, "expected Session, got {other:?}"),
         }
         assert_eq!(
             req.payload.get("level").and_then(Value::as_str),
@@ -663,7 +663,7 @@ fn session_append_entry_payload() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Session { op } => assert_eq!(op, "appendEntry"),
-            other => panic!("expected Session, got {other:?}"),
+            other => assert!(false, "expected Session, got {other:?}"),
         }
         assert_eq!(
             req.payload.get("customType").and_then(Value::as_str),
@@ -692,7 +692,7 @@ fn events_produces_correct_hostcall_kind() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Events { op } => assert_eq!(op, "list"),
-            other => panic!("expected Events, got {other:?}"),
+            other => assert!(false, "expected Events, got {other:?}"),
         }
     });
 }
@@ -712,7 +712,7 @@ fn events_emit_payload() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Events { op } => assert_eq!(op, "emit"),
-            other => panic!("expected Events, got {other:?}"),
+            other => assert!(false, "expected Events, got {other:?}"),
         }
         assert_eq!(
             req.payload.get("event").and_then(Value::as_str),
@@ -926,7 +926,7 @@ fn ui_produces_correct_hostcall_kind() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Ui { op } => assert_eq!(op, "select"),
-            other => panic!("expected Ui, got {other:?}"),
+            other => assert!(false, "expected Ui, got {other:?}"),
         }
     });
 }
@@ -946,7 +946,7 @@ fn ui_confirm_payload() {
         let req = drain_one(&runtime);
         match &req.kind {
             HostcallKind::Ui { op } => assert_eq!(op, "confirm"),
-            other => panic!("expected Ui, got {other:?}"),
+            other => assert!(false, "expected Ui, got {other:?}"),
         }
         assert_eq!(
             req.payload.get("message").and_then(Value::as_str),

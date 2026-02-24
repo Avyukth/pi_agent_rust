@@ -81,7 +81,7 @@ async fn run_scenario(scenario: Scenario) {
     if mode == VcrMode::Playback && !cassette_path.exists() {
         let message = format!("Missing cassette {}", cassette_path.display());
         if vcr_strict() {
-            panic!("{message}");
+            assert!(false, "{message}");
         } else {
             harness.log().warn("vcr", message);
             return;
@@ -131,7 +131,7 @@ async fn run_scenario(scenario: Scenario) {
         }
         ScenarioExpectation::Error(expectation) => {
             let Err(err) = provider.stream(&context, &options).await else {
-                panic!("expected error, got success");
+                assert!(false, "expected error, got success");
             };
             let message = err.to_string();
             assert_error_translation(

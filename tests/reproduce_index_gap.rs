@@ -101,7 +101,7 @@ fn rebuild_index_skips_subsequent_segments_on_corruption() -> PiResult<()> {
         println!(
             "Index contains entries from segment 2 after segment 1 corruption. (Regression/Bug)"
         );
-        panic!("Index should NOT contain entries from segment 2 after segment 1 corruption");
+        assert!(false, "Index should NOT contain entries from segment 2 after segment 1 corruption");
     } else {
         println!("Index correctly stopped at segment 1. (Fix Verified)");
     }

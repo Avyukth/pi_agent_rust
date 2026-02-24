@@ -788,7 +788,7 @@ fn streaming_dispatch_denies_blocked_host() {
     let result = run_async(async move { connector.dispatch_streaming(&call).await });
 
     let Err(error_payload) = result else {
-        panic!("streaming should be denied for blocked host")
+        assert!(false, "streaming should be denied for blocked host")
     };
     assert!(error_payload.is_error);
     assert_eq!(
@@ -816,7 +816,7 @@ fn streaming_dispatch_denies_tls_violation() {
     let result = run_async(async move { connector.dispatch_streaming(&call).await });
 
     let Err(error_payload) = result else {
-        panic!("streaming should deny TLS violation")
+        assert!(false, "streaming should deny TLS violation")
     };
     assert_eq!(
         error_payload.error.as_ref().unwrap().code,

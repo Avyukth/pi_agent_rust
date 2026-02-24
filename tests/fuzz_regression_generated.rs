@@ -60,7 +60,7 @@ fn run_regression_case(target: &str, data: &[u8], path: &str) {
             "regression input must not be empty: {path}"
         ),
         "fuzz_sse_parser" => assert_sse_chunking_invariant(data),
-        _ => panic!("missing regression target handler for {target} (file {path})"),
+        _ => assert!(false, "missing regression target handler for {target} (file {path})"),
     }
 }
 

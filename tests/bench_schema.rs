@@ -3850,7 +3850,7 @@ fn phase1_matrix_validator_rejects_phase5_ready_false_when_prerequisites_pass() 
 fn evidence_contract_schema_includes_benchmark_protocol_definition() {
     let schema_path = project_root().join("docs/evidence-contract-schema.json");
     let content = std::fs::read_to_string(&schema_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", schema_path.display()));
+        .unwrap_or_else(|e| assert!(false, "failed to read {}: {e}", schema_path.display()));
     let parsed: Value = serde_json::from_str(&content).expect("valid evidence contract JSON");
     let benchmark_protocol = parsed["definitions"]["benchmark_protocol"]
         .as_object()
@@ -3927,7 +3927,7 @@ fn protocol_is_referenced_by_benchmark_and_conformance_harnesses() {
     for (rel_path, marker) in refs {
         let abs = project_root().join(rel_path);
         let text = std::fs::read_to_string(&abs)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", abs.display()));
+            .unwrap_or_else(|e| assert!(false, "failed to read {}: {e}", abs.display()));
         assert!(
             text.contains(marker),
             "{rel_path} must reference marker `{marker}`"
@@ -3939,7 +3939,7 @@ fn protocol_is_referenced_by_benchmark_and_conformance_harnesses() {
 fn orchestrate_script_emits_extension_stratification_contract() {
     let script_path = project_root().join("scripts/perf/orchestrate.sh");
     let content = fs::read_to_string(&script_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+        .unwrap_or_else(|e| assert!(false, "failed to read {}: {e}", script_path.display()));
 
     for token in &[
         "extension_benchmark_stratification.json",
@@ -3961,7 +3961,7 @@ fn orchestrate_script_emits_extension_stratification_contract() {
 fn orchestrate_script_emits_phase1_matrix_validation_contract() {
     let script_path = project_root().join("scripts/perf/orchestrate.sh");
     let content = fs::read_to_string(&script_path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+        .unwrap_or_else(|e| assert!(false, "failed to read {}: {e}", script_path.display()));
 
     for token in &[
         "phase1_matrix_validation.json",
@@ -4073,7 +4073,7 @@ fn orchestrate_generates_extension_stratification_artifact() {
     .expect("parse extension_benchmark_stratification.json");
 
     if let Err(err) = validate_extension_stratification_record(&stratification) {
-        panic!("stratification artifact violates schema contract: {err}");
+        assert!(false, "stratification artifact violates schema contract: {err}");
     }
 
     assert_eq!(
@@ -4150,7 +4150,7 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
             .expect("parse matrix artifact");
 
     if let Err(err) = validate_phase1_matrix_validation_record(&matrix) {
-        panic!("phase1 matrix artifact violates schema contract: {err}");
+        assert!(false, "phase1 matrix artifact violates schema contract: {err}");
     }
 
     assert_eq!(
@@ -4308,7 +4308,7 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         let consumer = downstream_consumers
             .get(consumer_name)
             .and_then(Value::as_object)
-            .unwrap_or_else(|| panic!("downstream consumer entry missing: {consumer_name}"));
+            .unwrap_or_else(|| assert!(false, "downstream consumer entry missing: {consumer_name}"));
         assert_eq!(
             consumer.get("bead_id").and_then(Value::as_str),
             Some(expected_bead_id),
@@ -4857,7 +4857,7 @@ fn validate_scenario_runner_protocol_contract() {
 
     for (index, event) in events.iter().enumerate() {
         if let Err(err) = validate_protocol_record(event) {
-            panic!("scenario_runner record {index} violates protocol contract: {err}");
+            assert!(false, "scenario_runner record {index} violates protocol contract: {err}");
         }
     }
     eprintln!(

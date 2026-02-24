@@ -257,7 +257,7 @@ fn run_cli(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {}
-            Err(err) => panic!("try_wait failed: {err}"),
+            Err(err) => assert!(false, "try_wait failed: {err}"),
         }
         if start.elapsed() > timeout {
             timed_out = true;

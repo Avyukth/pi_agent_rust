@@ -150,7 +150,7 @@ fn load_synthetic_extensions(sources: &[(String, String)]) -> LoadedExtensions {
 
         match JsExtensionLoadSpec::from_entry_path(&entry_path) {
             Ok(spec) => specs.push(spec),
-            Err(e) => panic!("failed to create spec for {name}: {e}"),
+            Err(e) => assert!(false, "failed to create spec for {name}: {e}"),
         }
     }
 

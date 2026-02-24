@@ -147,10 +147,10 @@ async fn send_recv(
     in_tx
         .send(&cx, cmd.to_string())
         .await
-        .unwrap_or_else(|_| panic!("send {label}"));
+        .unwrap_or_else(|_| assert!(false, "send {label}"));
     let line = recv_line(out_rx, label)
         .await
-        .unwrap_or_else(|err| panic!("{err}"));
+        .unwrap_or_else(|err| assert!(false, "{err}"));
     parse_response(&line)
 }
 
@@ -1122,7 +1122,7 @@ fn rpc_rapid_sequence_of_sync_commands() {
         for (_, label) in &commands {
             let line = recv_line(&out_rx, label)
                 .await
-                .unwrap_or_else(|err| panic!("{err}"));
+                .unwrap_or_else(|err| assert!(false, "{err}"));
             responses.push(parse_response(&line));
         }
 
@@ -1560,9 +1560,7 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
                 // Not our event — keep waiting.
             }
             Err(TryRecvError::Disconnected) => {
-                panic!(
-                    "{label}: output channel disconnected while waiting for extension_ui_request"
-                );
+                assert!(false, "{label}: output channel disconnected while waiting for extension_ui_request");
             }
             Err(TryRecvError::Empty) => {}
         }

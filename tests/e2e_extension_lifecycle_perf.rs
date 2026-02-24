@@ -1091,7 +1091,7 @@ fn interference_single_vs_composed() {
             "interference record must keep schema contract"
         );
         let Some(phase) = record.get("phase").and_then(Value::as_str) else {
-            panic!("interference record missing phase: {record}");
+            assert!(false, "interference record missing phase: {record}");
         };
         *phase_counts.entry(phase.to_string()).or_insert(0) += 1;
     }

@@ -44,9 +44,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -65,7 +65,7 @@ fn as_array<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .pointer(pointer)
         .and_then(Value::as_array)
         .map_or_else(
-            || panic!("expected JSON array at pointer {pointer}"),
+            || assert!(false, "expected JSON array at pointer {pointer}"),
             Vec::as_slice,
         )
 }
@@ -75,7 +75,7 @@ fn non_empty_string_set(value: &Value, pointer: &str) -> HashSet<String> {
     for entry in as_array(value, pointer) {
         let raw = entry
             .as_str()
-            .unwrap_or_else(|| panic!("expected string entry at {pointer}"));
+            .unwrap_or_else(|| assert!(false, "expected string entry at {pointer}"));
         let normalized = raw.trim();
         assert!(
             !normalized.is_empty(),
@@ -189,7 +189,7 @@ fn remove_string_entry(contract: &mut Value, pointer: &str, value: &str) -> bool
     let entries = contract
         .pointer_mut(pointer)
         .and_then(Value::as_array_mut)
-        .unwrap_or_else(|| panic!("expected mutable array at pointer {pointer}"));
+        .unwrap_or_else(|| assert!(false, "expected mutable array at pointer {pointer}"));
     let before = entries.len();
     entries.retain(|entry| entry.as_str().map(str::trim) != Some(value));
     before != entries.len()
@@ -262,13 +262,13 @@ fn package_interop_contract_has_expected_schema_and_bead_linkage() {
         REQUIRED_SUPPORT_BEAD_IDS,
         "support_bead_ids entry",
     )
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn package_interop_contract_scenario_taxonomy_is_complete_and_unique() {
     let contract = load_contract();
-    validate_required_scenarios(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_required_scenarios(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
@@ -317,7 +317,7 @@ fn package_interop_contract_metadata_interpretation_is_fail_closed() {
 #[test]
 fn package_interop_contract_fallback_diagnostics_and_claim_linkage_are_declared() {
     let contract = load_contract();
-    validate_required_diag_codes(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_required_diag_codes(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 
     assert_eq!(
         contract["resolution_engine_policy"]["deterministic_fallback_diagnostics"]["failure_policy"],
@@ -347,28 +347,28 @@ fn package_interop_contract_fallback_diagnostics_and_claim_linkage_are_declared(
         &["bd-3ar8v.7.2", "bd-3ar8v.7.3", "bd-3ar8v.7.4"],
         "claim_tier_linkage.required_beads",
     )
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_or_else(|err| assert!(false, "{err}"));
     validate_required_set(
         &contract,
         "/claim_tier_linkage/required_artifacts",
         REQUIRED_CLAIM_ARTIFACTS,
         "claim_tier_linkage.required_artifacts",
     )
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_or_else(|err| assert!(false, "{err}"));
     validate_required_set(
         &contract,
         "/claim_tier_linkage/required_check_ids",
         REQUIRED_CLAIM_CHECK_IDS,
         "claim_tier_linkage.required_check_ids",
     )
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_or_else(|err| assert!(false, "{err}"));
     validate_required_set(
         &contract,
         "/downstream_dependencies/blocked_beads",
         REQUIRED_BLOCKED_BEADS,
         "downstream_dependencies.blocked_beads",
     )
-    .unwrap_or_else(|err| panic!("{err}"));
+    .unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]

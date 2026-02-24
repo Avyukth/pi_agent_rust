@@ -416,9 +416,9 @@ fn sec_beads_present_in_traceability_matrix_json() {
     let root = repo_root();
     let path = root.join("docs/traceability_matrix.json");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", path.display()));
     let matrix: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or_else(|e| panic!("invalid JSON: {e}"));
+        serde_json::from_str(&content).unwrap_or_else(|e| assert!(false, "invalid JSON: {e}"));
 
     let json_ids: BTreeSet<String> = matrix
         .get("requirements")
@@ -542,7 +542,7 @@ fn all_matrix_files_are_classified_in_suite_toml() {
     let root = repo_root();
     let toml_path = root.join("tests/suite_classification.toml");
     let content = std::fs::read_to_string(&toml_path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", toml_path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", toml_path.display()));
 
     let all_files: BTreeSet<&str> = SEC_MATRIX
         .iter()
@@ -577,7 +577,7 @@ fn extensions_rs_has_security_inline_tests() {
     let root = repo_root();
     let path = root.join("src/extensions.rs");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", path.display()));
 
     let test_count = content.matches("#[test]").count();
 

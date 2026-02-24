@@ -192,7 +192,7 @@ fn credential_status_oauth_valid() {
         CredentialStatus::OAuthValid { expires_in_ms } => {
             assert!(expires_in_ms > 0, "should have positive expiry");
         }
-        other => panic!("expected OAuthValid, got {other:?}"),
+        other => assert!(false, "expected OAuthValid, got {other:?}"),
     }
 }
 
@@ -218,7 +218,7 @@ fn credential_status_oauth_expired() {
         CredentialStatus::OAuthExpired { expired_by_ms } => {
             assert!(expired_by_ms > 0, "should have positive expired_by value");
         }
-        other => panic!("expected OAuthExpired, got {other:?}"),
+        other => assert!(false, "expected OAuthExpired, got {other:?}"),
     }
 }
 
@@ -759,9 +759,9 @@ fn auth_credential_serde_round_trip() {
 
     for (name, cred) in &variants {
         let json =
-            serde_json::to_string(cred).unwrap_or_else(|e| panic!("serialize {name} failed: {e}"));
+            serde_json::to_string(cred).unwrap_or_else(|e| assert!(false, "serialize {name} failed: {e}"));
         let restored: AuthCredential = serde_json::from_str(&json)
-            .unwrap_or_else(|e| panic!("deserialize {name} failed: {e}"));
+            .unwrap_or_else(|e| assert!(false, "deserialize {name} failed: {e}"));
         // Verify type tag round-trips correctly
         let json2 = serde_json::to_string(&restored).unwrap();
         assert_eq!(json, json2, "round-trip mismatch for {name}");
@@ -787,7 +787,7 @@ fn auth_credential_oauth_minimal_serde() {
             assert!(token_url.is_none(), "optional token_url should be None");
             assert!(client_id.is_none(), "optional client_id should be None");
         }
-        other => panic!("expected OAuth, got {other:?}"),
+        other => assert!(false, "expected OAuth, got {other:?}"),
     }
 }
 
@@ -808,7 +808,7 @@ fn auth_credential_service_key_all_none() {
             assert!(token_url.is_none());
             assert!(service_url.is_none());
         }
-        other => panic!("expected ServiceKey, got {other:?}"),
+        other => assert!(false, "expected ServiceKey, got {other:?}"),
     }
 }
 
@@ -829,7 +829,7 @@ fn auth_credential_aws_minimal() {
             assert!(session_token.is_none());
             assert!(region.is_none());
         }
-        other => panic!("expected AwsCredentials, got {other:?}"),
+        other => assert!(false, "expected AwsCredentials, got {other:?}"),
     }
 }
 

@@ -314,7 +314,7 @@ pub(crate) fn assert_stream_expectations(
     if let Some(allowed) = &expectations.allowed_stop_reasons {
         harness.assert_log("assert stop reason");
         let Some(reason) = summary.stop_reason else {
-            panic!("{scenario}: missing stop reason");
+            assert!(false, "{scenario}: missing stop reason");
         };
         assert!(
             allowed.contains(&reason),
@@ -335,25 +335,19 @@ pub(crate) fn assert_tool_schema_fidelity(
 
     for tool_call in tool_calls {
         let Some(tool_def) = tool_defs.iter().find(|tool| tool.name == tool_call.name) else {
-            panic!(
-                "{scenario}: tool call '{}' has no matching schema definition",
-                tool_call.name
-            );
+            assert!(false, "{scenario}: tool call '{}' has no matching schema definition",
+            tool_call.name);
         };
         let validator = jsonschema::draft202012::options()
             .should_validate_formats(true)
             .build(&tool_def.parameters)
             .unwrap_or_else(|err| {
-                panic!(
-                    "{scenario}: invalid JSON schema for tool '{}': {err}",
-                    tool_call.name
-                )
+                assert!(false, "{scenario}: invalid JSON schema for tool '{}': {err}",
+                tool_call.name)
             });
         if let Err(err) = validator.validate(&tool_call.arguments) {
-            panic!(
-                "{scenario}: tool '{}' arguments failed schema validation: {err}; arguments={}",
-                tool_call.name, tool_call.arguments
-            );
+            assert!(false, "{scenario}: tool '{}' arguments failed schema validation: {err}; arguments={}",
+            tool_call.name, tool_call.arguments);
         }
     }
 
@@ -397,7 +391,7 @@ pub(crate) fn record_stream_contract_artifact(
     let serialized = serde_json::to_string_pretty(&payload)
         .unwrap_or_else(|_| "{\"schema\":\"serialization_error\"}".to_string());
     std::fs::write(&path, serialized)
-        .unwrap_or_else(|err| panic!("write stream contract artifact {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "write stream contract artifact {}: {err}", path.display()));
     harness.record_artifact(format!("contract/{file_name}"), &path);
 }
 
@@ -437,7 +431,7 @@ pub(crate) fn assert_error_translation(
     let serialized = serde_json::to_string_pretty(&payload)
         .unwrap_or_else(|_| "{\"schema\":\"serialization_error\"}".to_string());
     std::fs::write(&path, serialized)
-        .unwrap_or_else(|err| panic!("write error translation artifact {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "write error translation artifact {}: {err}", path.display()));
     harness.record_artifact(format!("contract/{file_name}"), &path);
 }
 

@@ -517,7 +517,7 @@ fn sdk_error_invalid_provider() {
         "creating session with invalid provider should fail"
     );
     let err_msg = match result {
-        Ok(_) => panic!("expected invalid provider to fail"),
+        Ok(_) => assert!(false, "expected invalid provider to fail"),
         Err(err) => err.to_string(),
     };
 

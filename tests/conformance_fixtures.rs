@@ -66,7 +66,7 @@ fixture_test!(test_cli_flag_fixtures, "cli_flags");
 #[test]
 fn test_truncation_fixtures() {
     let fixture = load_fixture("truncation")
-        .unwrap_or_else(|e| panic!("Failed to load truncation fixture: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to load truncation fixture: {e}"));
 
     let results: Vec<conformance::TestResult> = fixture_runner::run_truncation_tests(&fixture);
 
@@ -109,7 +109,7 @@ fn test_all_fixtures_exist() {
 
     for fixture_name in &expected_fixtures {
         load_fixture(fixture_name)
-            .unwrap_or_else(|e| panic!("Missing fixture '{fixture_name}': {e}"));
+            .unwrap_or_else(|e| assert!(false, "Missing fixture '{fixture_name}': {e}"));
     }
 
     println!("✓ All {} expected fixtures exist", expected_fixtures.len());

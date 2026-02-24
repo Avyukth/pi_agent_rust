@@ -336,7 +336,7 @@ fn scenario_shard_from_env() -> Option<ScenarioShard> {
     let total = std::env::var("PI_SCENARIO_SHARD_TOTAL").ok();
     let name = std::env::var("PI_SCENARIO_SHARD_NAME").ok();
     parse_scenario_shard(index.as_deref(), total.as_deref(), name.as_deref())
-        .unwrap_or_else(|message| panic!("{message}"))
+        .unwrap_or_else(|message| assert!(false, "{message}"))
 }
 
 fn scenario_matches_filter(

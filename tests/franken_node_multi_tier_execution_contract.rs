@@ -49,9 +49,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -70,7 +70,7 @@ fn as_array<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .pointer(pointer)
         .and_then(Value::as_array)
         .map_or_else(
-            || panic!("expected JSON array at pointer {pointer}"),
+            || assert!(false, "expected JSON array at pointer {pointer}"),
             Vec::as_slice,
         )
 }
@@ -80,7 +80,7 @@ fn non_empty_string_set(value: &Value, pointer: &str) -> HashSet<String> {
     for entry in as_array(value, pointer) {
         let raw = entry
             .as_str()
-            .unwrap_or_else(|| panic!("expected string entry at {pointer}"));
+            .unwrap_or_else(|| assert!(false, "expected string entry at {pointer}"));
         let normalized = raw.trim();
         assert!(
             !normalized.is_empty(),
@@ -295,7 +295,7 @@ fn remove_string_entry(contract: &mut Value, pointer: &str, value: &str) -> bool
     let entries = contract
         .pointer_mut(pointer)
         .and_then(Value::as_array_mut)
-        .unwrap_or_else(|| panic!("expected mutable array at pointer {pointer}"));
+        .unwrap_or_else(|| assert!(false, "expected mutable array at pointer {pointer}"));
     let before = entries.len();
     entries.retain(|entry| entry.as_str().map(str::trim) != Some(value));
     before != entries.len()
@@ -368,7 +368,7 @@ fn multi_tier_execution_contract_has_expected_schema_version_and_linkage() {
 #[test]
 fn multi_tier_execution_contract_tier_map_is_complete_and_unique() {
     let contract = load_contract();
-    let tier_ids = collect_tier_ids(&contract).unwrap_or_else(|err| panic!("{err}"));
+    let tier_ids = collect_tier_ids(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
     for required in REQUIRED_TIER_IDS {
         assert!(
             tier_ids.contains(*required),
@@ -380,19 +380,19 @@ fn multi_tier_execution_contract_tier_map_is_complete_and_unique() {
 #[test]
 fn multi_tier_execution_contract_promotion_policy_is_fail_closed() {
     let contract = load_contract();
-    validate_promotion_policy(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_promotion_policy(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn multi_tier_execution_contract_deopt_and_safety_contracts_are_complete() {
     let contract = load_contract();
-    validate_deopt_and_safety_contract(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_deopt_and_safety_contract(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn multi_tier_execution_contract_telemetry_and_dependency_contracts_are_complete() {
     let contract = load_contract();
-    validate_telemetry_and_dependencies(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_telemetry_and_dependencies(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]

@@ -166,10 +166,10 @@ fn all_vcr_cassettes_have_no_unredacted_secrets() {
             .unwrap_or("unknown");
 
         let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read cassette {filename}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "read cassette {filename}: {e}"));
 
         let cassette: serde_json::Value = serde_json::from_str(&content)
-            .unwrap_or_else(|e| panic!("parse cassette {filename}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "parse cassette {filename}: {e}"));
 
         let violations = scan_cassette(&cassette, filename);
         all_violations.extend(violations);
@@ -184,10 +184,8 @@ fn all_vcr_cassettes_have_no_unredacted_secrets() {
 
     if !all_violations.is_empty() {
         let report = all_violations.join("\n  ");
-        panic!(
-            "Found {} unredacted secret(s) across {cassette_count} cassettes:\n  {report}",
-            all_violations.len()
-        );
+        assert!(false, "Found {} unredacted secret(s) across {cassette_count} cassettes:\n  {report}",
+        all_violations.len());
     }
 
     eprintln!("Scanned {cassette_count} VCR cassettes — all clean");

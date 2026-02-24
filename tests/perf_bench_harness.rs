@@ -864,7 +864,7 @@ fn bench_jsonl_schema_valid() {
             continue;
         }
         let record: Value =
-            serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i}: invalid JSON: {e}"));
+            serde_json::from_str(line).unwrap_or_else(|e| assert!(false, "line {i}: invalid JSON: {e}"));
 
         for field in &required_fields {
             assert!(

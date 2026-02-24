@@ -125,11 +125,11 @@ impl GoldenPathHarness {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) => {}
-                Err(e) => panic!("try_wait: {e}"),
+                Err(e) => assert!(false, "try_wait: {e}"),
             }
             if start.elapsed() > timeout {
                 let _ = child.kill();
-                panic!("pi timed out after {timeout:?}");
+                assert!(false, "pi timed out after {timeout:?}");
             }
             std::thread::sleep(Duration::from_millis(50));
         };

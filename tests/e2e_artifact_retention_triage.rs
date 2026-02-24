@@ -38,12 +38,12 @@ const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
 const RUN_ALL_SCRIPT_PATH: &str = "scripts/e2e/run_all.sh";
 
 fn load_text(path: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|_| panic!("Should read {path}"))
+    std::fs::read_to_string(path).unwrap_or_else(|_| assert!(false, "Should read {path}"))
 }
 
 fn load_json(path: &str) -> Value {
     let content = load_text(path);
-    serde_json::from_str(&content).unwrap_or_else(|_| panic!("Should parse {path} as JSON"))
+    serde_json::from_str(&content).unwrap_or_else(|_| assert!(false, "Should parse {path} as JSON"))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

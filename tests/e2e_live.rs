@@ -284,10 +284,10 @@ fn write_discovery_artifacts(
 fn provider_config_or_skip(provider: &str, harness: &TestHarness) -> Option<LiveProviderConfig> {
     let discovery = match provider_discovery() {
         Ok(discovery) => discovery,
-        Err(err) => panic!("live provider discovery failed: {err}"),
+        Err(err) => assert!(false, "live provider discovery failed: {err}"),
     };
     if let Err(err) = write_discovery_artifacts(harness, &discovery) {
-        panic!("failed to write discovery artifacts: {err}");
+        assert!(false, "failed to write discovery artifacts: {err}");
     }
 
     let Some(row) = discovery.rows.iter().find(|row| row.provider == provider) else {
@@ -419,7 +419,7 @@ fn oai_auth_failure_script_matrix_maps_to_taxonomy() {
         let err = pi::Error::provider(provider, message);
         let diagnostic = err
             .auth_diagnostic()
-            .unwrap_or_else(|| panic!("expected auth diagnostic for {provider}: {message}"));
+            .unwrap_or_else(|| assert!(false, "expected auth diagnostic for {provider}: {message}"));
         assert_eq!(diagnostic.code, expected_code, "provider {provider}");
 
         let hints = err.hints();
@@ -536,10 +536,8 @@ fn build_provider(config: &LiveProviderConfig) -> Box<dyn Provider> {
     match config.api.as_str() {
         "openai-completions" if is_azure_provider(&config.provider) => {
             let runtime = resolve_azure_runtime_config(config).unwrap_or_else(|err| {
-                panic!(
-                    "azure provider '{}' config resolution failed for live e2e: {err}",
-                    config.provider
-                )
+                assert!(false, "azure provider '{}' config resolution failed for live e2e: {err}",
+                config.provider)
             });
             let mut provider = AzureOpenAIProvider::new(runtime.resource, runtime.deployment);
             if let Some(api_version) = runtime.api_version {
@@ -563,10 +561,8 @@ fn build_provider(config: &LiveProviderConfig) -> Box<dyn Provider> {
                 .with_provider_name(config.provider.clone())
                 .with_base_url(normalize_openai_base(&config.base_url)),
         ),
-        other => panic!(
-            "unsupported API '{}' for provider '{}' model '{}'",
-            other, config.provider, config.model_id
-        ),
+        other => assert!(false, "unsupported API '{}' for provider '{}' model '{}'",
+        other, config.provider, config.model_id),
     }
 }
 
@@ -793,7 +789,7 @@ fn assert_basic_stream_success(
         harness
             .log()
             .error("assert", format!("{test_name}: stream error: {err}"));
-        panic!("{test_name}: unexpected stream error: {err}");
+        assert!(false, "{test_name}: unexpected stream error: {err}");
     }
 
     assert!(
@@ -1168,7 +1164,7 @@ mod azure_openai {
 
         common::run_async(async move {
             let azure = resolve_azure_runtime_config(&config)
-                .unwrap_or_else(|err| panic!("resolve azure runtime config: {err}"));
+                .unwrap_or_else(|err| assert!(false, "resolve azure runtime config: {err}"));
             let invalid_deployment = "__pi_e2e_invalid_deployment__";
             let provider = azure.api_version.as_ref().map_or_else(
                 || AzureOpenAIProvider::new(azure.resource.clone(), invalid_deployment),
@@ -1194,10 +1190,8 @@ mod azure_openai {
                 return;
             }
 
-            panic!(
-                "expected invalid deployment to fail with actionable diagnostics, got {} events",
-                events.len()
-            );
+            assert!(false, "expected invalid deployment to fail with actionable diagnostics, got {} events",
+            events.len());
         });
     }
 }
@@ -1347,9 +1341,9 @@ mod cross_provider {
         skip_unless_e2e!();
         let harness = TestHarness::new("e2e_cross_provider_all_respond");
         let discovery = provider_discovery()
-            .unwrap_or_else(|err| panic!("live provider discovery failed: {err}"));
+            .unwrap_or_else(|err| assert!(false, "live provider discovery failed: {err}"));
         if let Err(err) = write_discovery_artifacts(&harness, &discovery) {
-            panic!("failed to write discovery artifacts: {err}");
+            assert!(false, "failed to write discovery artifacts: {err}");
         }
 
         common::run_async(async move {
@@ -1405,7 +1399,7 @@ mod cross_provider {
         skip_unless_e2e!();
         let harness = TestHarness::new("e2e_cross_provider_streaming_parity");
         let discovery = provider_discovery()
-            .unwrap_or_else(|err| panic!("live provider discovery failed: {err}"));
+            .unwrap_or_else(|err| assert!(false, "live provider discovery failed: {err}"));
 
         common::run_async(async move {
             let prompt = "Say just the word hello";
@@ -1536,7 +1530,7 @@ mod cross_provider {
         skip_unless_e2e!();
         let harness = TestHarness::new("e2e_cross_provider_error_parity");
         let discovery = provider_discovery()
-            .unwrap_or_else(|err| panic!("live provider discovery failed: {err}"));
+            .unwrap_or_else(|err| assert!(false, "live provider discovery failed: {err}"));
 
         common::run_async(async move {
             let prompt = "Say hello";

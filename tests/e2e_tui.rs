@@ -3964,7 +3964,7 @@ fn e2e_scenario_exit_strategy_roundtrip() {
                     ExitStrategy::Timeout(_)
                 ));
             }
-            _ => panic!("unexpected exit strategy string: {expected_str}"),
+            _ => assert!(false, "unexpected exit strategy string: {expected_str}"),
         }
     };
 

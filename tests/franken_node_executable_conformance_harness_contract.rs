@@ -11,9 +11,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {

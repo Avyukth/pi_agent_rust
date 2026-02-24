@@ -525,7 +525,7 @@ fn deny_all_matrix_through_dispatch() {
             assert!(result.is_error, "deny_all: {call_id} should be denied");
             let err = result
                 .error
-                .unwrap_or_else(|| panic!("deny_all: {call_id} error payload"));
+                .unwrap_or_else(|| assert!(false, "deny_all: {call_id} error payload"));
             assert_eq!(
                 err.code,
                 HostCallErrorCode::Denied,
@@ -726,7 +726,7 @@ fn case_variants_of_denied_caps_blocked() {
             );
             let result = dispatch_host_call_shared(&ctx, call).await;
             assert!(result.is_error, "case variant {variant} should be denied");
-            let err = result.error.unwrap_or_else(|| panic!("{variant} error"));
+            let err = result.error.unwrap_or_else(|| assert!(false, "{variant} error"));
             assert_eq!(
                 err.code,
                 HostCallErrorCode::Denied,

@@ -20,14 +20,14 @@ fn schema_path() -> PathBuf {
 fn compiled_mock_spec_schema() -> Validator {
     let schema_path = schema_path();
     let raw = fs::read_to_string(&schema_path)
-        .unwrap_or_else(|err| panic!("Failed to read schema {}: {err}", schema_path.display()));
+        .unwrap_or_else(|err| assert!(false, "Failed to read schema {}: {err}", schema_path.display()));
     let schema: Value = serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("Failed to parse schema {}: {err}", schema_path.display()));
+        .unwrap_or_else(|err| assert!(false, "Failed to parse schema {}: {err}", schema_path.display()));
 
     jsonschema::draft202012::options()
         .should_validate_formats(true)
         .build(&schema)
-        .unwrap_or_else(|err| panic!("Failed to compile schema {}: {err}", schema_path.display()))
+        .unwrap_or_else(|err| assert!(false, "Failed to compile schema {}: {err}", schema_path.display()))
 }
 
 fn list_mock_spec_fixtures(dir: &Path) -> Vec<PathBuf> {
@@ -59,12 +59,12 @@ fn mock_spec_fixtures_validate_against_schema() {
 
     for path in files {
         let raw = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("Failed to read fixture {}: {err}", path.display()));
+            .unwrap_or_else(|err| assert!(false, "Failed to read fixture {}: {err}", path.display()));
         let instance: Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|err| panic!("Failed to parse fixture JSON {}: {err}", path.display()));
+            .unwrap_or_else(|err| assert!(false, "Failed to parse fixture JSON {}: {err}", path.display()));
 
         if let Err(err) = schema.validate(&instance) {
-            panic!("Fixture {} does not validate: {err}", path.display());
+            assert!(false, "Fixture {} does not validate: {err}", path.display());
         }
     }
 }

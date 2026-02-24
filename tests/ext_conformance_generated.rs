@@ -4423,7 +4423,7 @@ fn conformance_health_delta() {
             );
         }
         let _ = writeln!(msg, "\nSee: {}", report_path.display());
-        panic!("{msg}");
+        assert!(false, "{msg}");
     }
 }
 

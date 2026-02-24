@@ -219,7 +219,7 @@ fn deny_pattern_blocks_command() {
             assert!(class.is_none(), "Pattern deny should have no command class");
             assert!(reason.contains("deny pattern"));
         }
-        _ => panic!("Expected Deny from deny_pattern, got: {result:?}"),
+        _ => assert!(false, "Expected Deny from deny_pattern, got: {result:?}"),
     }
 }
 
@@ -259,7 +259,7 @@ fn deny_result_includes_class_and_reason() {
             assert!(reason.contains("recursive_delete"));
             assert!(reason.contains("critical"));
         }
-        _ => panic!("Expected Deny, got: {result:?}"),
+        _ => assert!(false, "Expected Deny, got: {result:?}"),
     }
 }
 

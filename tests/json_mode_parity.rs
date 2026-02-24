@@ -53,7 +53,7 @@ fn assert_non_empty_string(value: &Value, field: &str) {
     let s = value
         .get(field)
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("expected string field '{field}' in {value}"));
+        .unwrap_or_else(|| assert!(false, "expected string field '{field}' in {value}"));
     assert!(
         !s.is_empty(),
         "expected non-empty string for '{field}', got empty"

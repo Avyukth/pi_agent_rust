@@ -345,7 +345,7 @@ fn permission_gate_allows_safe_command() {
         }
         Err(e) => {
             // Errors are unexpected for safe commands
-            panic!("safe command should not error: {e}");
+            assert!(false, "safe command should not error: {e}");
         }
     }
 }
@@ -368,7 +368,7 @@ fn permission_gate_ignores_non_bash_tools() {
             assert!(!block, "should not block non-bash tools, got: {val}");
         }
         Err(e) => {
-            panic!("non-bash tool should not error: {e}");
+            assert!(false, "non-bash tool should not error: {e}");
         }
     }
 }
@@ -484,7 +484,7 @@ fn guard_extensions_register_no_flags() {
 
     for (ext_id, entry_file) in &extensions {
         let loaded = load_guard_extension(ext_id, entry_file)
-            .unwrap_or_else(|e| panic!("load {ext_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "load {ext_id}: {e}"));
         let flags = loaded.manager.list_flags();
         assert!(
             flags.is_empty(),
@@ -505,7 +505,7 @@ fn guard_extensions_register_no_shortcuts() {
 
     for (ext_id, entry_file) in &extensions {
         let loaded = load_guard_extension(ext_id, entry_file)
-            .unwrap_or_else(|e| panic!("load {ext_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "load {ext_id}: {e}"));
         let shortcuts = loaded.manager.list_shortcuts();
         assert!(
             shortcuts.is_empty(),

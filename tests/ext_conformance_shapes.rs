@@ -533,7 +533,7 @@ fn shape_harness_emits_valid_jsonl() {
     for event in &result.events {
         let jsonl = event.to_jsonl();
         let parsed: Value = serde_json::from_str(&jsonl)
-            .unwrap_or_else(|e| panic!("Invalid JSONL: {e}\nLine: {jsonl}"));
+            .unwrap_or_else(|e| assert!(false, "Invalid JSONL: {e}\nLine: {jsonl}"));
 
         // Must have required fields
         assert!(parsed.get("timestamp").is_some(), "Missing timestamp");

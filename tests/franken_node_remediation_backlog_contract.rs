@@ -44,9 +44,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -65,7 +65,7 @@ fn as_array<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .pointer(pointer)
         .and_then(Value::as_array)
         .map_or_else(
-            || panic!("expected JSON array at pointer {pointer}"),
+            || assert!(false, "expected JSON array at pointer {pointer}"),
             Vec::as_slice,
         )
 }
@@ -75,7 +75,7 @@ fn non_empty_string_set(value: &Value, pointer: &str) -> HashSet<String> {
     for entry in as_array(value, pointer) {
         let raw = entry
             .as_str()
-            .unwrap_or_else(|| panic!("expected string entry at {pointer}"));
+            .unwrap_or_else(|| assert!(false, "expected string entry at {pointer}"));
         let normalized = raw.trim();
         assert!(
             !normalized.is_empty(),
@@ -223,7 +223,7 @@ fn remove_string_entry(contract: &mut Value, pointer: &str, value: &str) -> bool
     let entries = contract
         .pointer_mut(pointer)
         .and_then(Value::as_array_mut)
-        .unwrap_or_else(|| panic!("expected mutable array at pointer {pointer}"));
+        .unwrap_or_else(|| assert!(false, "expected mutable array at pointer {pointer}"));
     let before = entries.len();
     entries.retain(|entry| entry.as_str().map(str::trim) != Some(value));
     before != entries.len()
@@ -279,31 +279,31 @@ fn remediation_backlog_contract_has_expected_schema_version_and_linkage() {
 #[test]
 fn remediation_backlog_telemetry_ingestion_is_complete() {
     let contract = load_contract();
-    validate_telemetry_ingestion(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_telemetry_ingestion(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn remediation_backlog_prioritization_model_is_sound() {
     let contract = load_contract();
-    validate_prioritization_model(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_prioritization_model(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn remediation_backlog_artifact_requirements_are_complete() {
     let contract = load_contract();
-    validate_backlog_artifact(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_backlog_artifact(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn remediation_backlog_automation_rules_are_complete() {
     let contract = load_contract();
-    validate_automation(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_automation(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn remediation_backlog_dependencies_are_complete() {
     let contract = load_contract();
-    validate_dependencies(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_dependencies(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]

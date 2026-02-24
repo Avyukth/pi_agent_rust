@@ -1076,7 +1076,7 @@ fn e2e_simple_text_all_families() {
                 });
             }
             Err(e) => {
-                panic!("{}: simple text failed: {e}", spec.family);
+                assert!(false, "{}: simple text failed: {e}", spec.family);
             }
         }
     }
@@ -1179,7 +1179,7 @@ fn e2e_tool_call_all_families() {
                 });
             }
             Err(e) => {
-                panic!("{}: tool call failed: {e}", spec.family);
+                assert!(false, "{}: tool call failed: {e}", spec.family);
             }
         }
     }
@@ -1806,7 +1806,7 @@ fn e2e_event_ordering_all_families() {
         };
 
         let events = collect_events(provider, simple_context(), options)
-            .unwrap_or_else(|e| panic!("{}: stream failed: {e}", spec.family));
+            .unwrap_or_else(|e| assert!(false, "{}: stream failed: {e}", spec.family));
 
         let sequence: Vec<&str> = events.iter().map(event_kind).collect();
         let validation = validate_event_sequence(&events);
@@ -1870,7 +1870,7 @@ fn e2e_determinism_proof() {
             let mut entry = make_entry(spec.provider_id, spec.model_id, &base_url);
             entry.model.api.clear();
             let provider = create_provider(&entry, None)
-                .unwrap_or_else(|e| panic!("{}: create failed on run {run}: {e}", spec.family));
+                .unwrap_or_else(|e| assert!(false, "{}: create failed on run {run}: {e}", spec.family));
 
             let options = StreamOptions {
                 api_key: Some(spec.api_key.to_string()),
@@ -1879,7 +1879,7 @@ fn e2e_determinism_proof() {
             };
 
             let events = collect_events(provider, simple_context(), options)
-                .unwrap_or_else(|e| panic!("{}: stream failed on run {run}: {e}", spec.family));
+                .unwrap_or_else(|e| assert!(false, "{}: stream failed on run {run}: {e}", spec.family));
             let sequence: Vec<String> = events.iter().map(|e| event_kind(e).to_string()).collect();
             sequences.push(sequence);
         }
@@ -1959,7 +1959,7 @@ fn e2e_openai_compatible_wave_presets() {
 
         let start = Instant::now();
         let events = collect_events(provider, simple_context(), options)
-            .unwrap_or_else(|e| panic!("{preset_id}: stream failed: {e}"));
+            .unwrap_or_else(|e| assert!(false, "{preset_id}: stream failed: {e}"));
         let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (text_chars, _, stop_reason) = summarize_events(&events);
         let sequence: Vec<String> = events.iter().map(|e| event_kind(e).to_string()).collect();
@@ -2209,7 +2209,7 @@ fn e2e_request_body_stability() {
             let mut entry = make_entry(spec.provider_id, spec.model_id, &base_url);
             entry.model.api.clear();
             let provider = create_provider(&entry, None)
-                .unwrap_or_else(|e| panic!("{}: create failed run {run}: {e}", spec.family));
+                .unwrap_or_else(|e| assert!(false, "{}: create failed run {run}: {e}", spec.family));
 
             let options = StreamOptions {
                 api_key: Some(spec.api_key.to_string()),

@@ -91,7 +91,7 @@ fn load_extension(
 fn expect_load_err(result: Result<(ExtensionManager, JsExtensionRuntimeHandle), String>) -> String {
     match result {
         Err(e) => e,
-        Ok(_) => panic!("Expected error, but load succeeded"),
+        Ok(_) => assert!(false, "Expected error, but load succeeded"),
     }
 }
 

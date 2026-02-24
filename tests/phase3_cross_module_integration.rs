@@ -320,7 +320,7 @@ fn find_control<'a>(
         .controls
         .iter()
         .find(|control| control.shard_id == shard_id)
-        .unwrap_or_else(|| panic!("missing control for shard_id={shard_id}"))
+        .unwrap_or_else(|| assert!(false, "missing control for shard_id={shard_id}"))
 }
 
 #[test]

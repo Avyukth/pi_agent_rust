@@ -441,10 +441,8 @@ fn bench_extension_load_init(c: &mut Criterion) {
 
     for (ext_name, entry_path) in cases {
         let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).unwrap_or_else(|_| {
-            panic!(
-                "expected extension artifact entry at {}",
-                entry_path.display()
-            )
+            assert!(false, "expected extension artifact entry at {}",
+            entry_path.display())
         });
         let cwd = cwd.clone();
         let js_cwd = js_cwd.clone();
@@ -500,7 +498,7 @@ fn bench_extension_tool_call_roundtrip(c: &mut Criterion) {
     let js_cwd = cwd.display().to_string();
     let entry_path = artifact_single_file_entry("hello");
     let spec = JsExtensionLoadSpec::from_entry_path(&entry_path)
-        .unwrap_or_else(|_| panic!("expected hello artifact at {}", entry_path.display()));
+        .unwrap_or_else(|_| assert!(false, "expected hello artifact at {}", entry_path.display()));
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
@@ -566,7 +564,7 @@ fn bench_extension_event_hook_dispatch(c: &mut Criterion) {
     let js_cwd = cwd.display().to_string();
     let entry_path = artifact_single_file_entry("pirate");
     let spec = JsExtensionLoadSpec::from_entry_path(&entry_path)
-        .unwrap_or_else(|_| panic!("expected pirate artifact at {}", entry_path.display()));
+        .unwrap_or_else(|_| assert!(false, "expected pirate artifact at {}", entry_path.display()));
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));

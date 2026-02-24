@@ -79,7 +79,7 @@ fn drive_to_done(
                 return;
             }
         }
-        panic!("provider stream ended before Done event");
+        assert!(false, "provider stream ended before Done event");
     });
 }
 
@@ -235,7 +235,7 @@ fn smoke_route_selection_full_matrix() {
         entry.model.api.clear();
 
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider failed for {}: {e}", meta.canonical_id));
+            .unwrap_or_else(|e| assert!(false, "create_provider failed for {}: {e}", meta.canonical_id));
 
         harness
             .log()
@@ -370,7 +370,7 @@ fn smoke_openai_completions_matrix() {
         entry.model.api.clear();
 
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider failed for {}: {e}", meta.canonical_id));
+            .unwrap_or_else(|e| assert!(false, "create_provider failed for {}: {e}", meta.canonical_id));
         assert_eq!(
             provider.api(),
             "openai-completions",
@@ -423,10 +423,8 @@ fn smoke_openai_completions_matrix() {
 
         // Verify body is valid JSON
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_else(|e| {
-            panic!(
-                "request body for {} is not valid JSON: {e}",
-                meta.canonical_id
-            )
+            assert!(false, "request body for {} is not valid JSON: {e}",
+            meta.canonical_id)
         });
         assert!(
             body.get("messages").is_some(),
@@ -497,7 +495,7 @@ fn smoke_anthropic_messages_matrix() {
         entry.model.api.clear();
 
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider failed for {}: {e}", meta.canonical_id));
+            .unwrap_or_else(|e| assert!(false, "create_provider failed for {}: {e}", meta.canonical_id));
         // Anthropic-messages providers route through the Anthropic impl
         assert_eq!(
             provider.api(),
@@ -548,10 +546,8 @@ fn smoke_anthropic_messages_matrix() {
 
         // Verify body is valid JSON with messages
         let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_else(|e| {
-            panic!(
-                "request body for {} is not valid JSON: {e}",
-                meta.canonical_id
-            )
+            assert!(false, "request body for {} is not valid JSON: {e}",
+            meta.canonical_id)
         });
         assert!(
             body.get("messages").is_some(),

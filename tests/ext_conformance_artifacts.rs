@@ -151,7 +151,7 @@ fn test_ext_conformance_artifacts_match_manifest_checksums() {
         );
 
         let actual =
-            digest_artifact_dir(&artifact_dir).unwrap_or_else(|err| panic!("digest {id}: {err}"));
+            digest_artifact_dir(&artifact_dir).unwrap_or_else(|err| assert!(false, "digest {id}: {err}"));
         assert_eq!(actual, expected, "artifact checksum mismatch for {id}");
     }
 }
@@ -191,7 +191,7 @@ fn test_ext_conformance_artifact_provenance_matches_master_catalog_checksums() {
 
     for (id, master_ext) in master_map {
         let Some(provenance_item) = provenance_map.get(&id) else {
-            panic!("Missing provenance entry for {id}");
+            assert!(false, "Missing provenance entry for {id}");
         };
 
         assert_eq!(
@@ -211,7 +211,7 @@ fn test_ext_conformance_artifact_provenance_matches_master_catalog_checksums() {
         );
 
         let actual = digest_artifact_dir(&artifact_dir)
-            .unwrap_or_else(|err| panic!("digest {id} ({}): {err}", artifact_dir.display()));
+            .unwrap_or_else(|err| assert!(false, "digest {id} ({}): {err}", artifact_dir.display()));
         assert_eq!(
             actual, master_ext.checksum,
             "artifact checksum mismatch for {id}"
@@ -255,7 +255,7 @@ fn test_ext_conformance_pinned_sample_compat_ledger_snapshot() {
         let scanner = CompatibilityScanner::new(artifact_dir);
         let ledger = scanner
             .scan_root()
-            .unwrap_or_else(|err| panic!("scan {id}: {err}"));
+            .unwrap_or_else(|err| assert!(false, "scan {id}: {err}"));
         ledgers.insert(id, ledger);
     }
 
@@ -540,7 +540,7 @@ fn test_scan_all_ts_entry_points() {
     let mut results: Vec<EntryPointScan> = Vec::with_capacity(ts_files.len());
     for path in &ts_files {
         let rel = relative_posix(&artifacts_dir, path);
-        let content = fs::read_to_string(path).unwrap_or_else(|err| panic!("read {rel}: {err}"));
+        let content = fs::read_to_string(path).unwrap_or_else(|err| assert!(false, "read {rel}: {err}"));
         let mut scan = classify_ts_file(&content, &rel);
 
         // Boost confidence if file is declared in a package.json pi.extensions field.
@@ -646,7 +646,7 @@ fn test_known_entry_points_classified_correctly() {
             continue;
         }
         let content =
-            fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {rel_path}: {err}"));
+            fs::read_to_string(&path).unwrap_or_else(|err| assert!(false, "read {rel_path}: {err}"));
         let scan = classify_ts_file(&content, rel_path);
         assert_eq!(
             scan.classification, "entry_point",
@@ -675,7 +675,7 @@ fn test_known_sub_modules_classified_correctly() {
             continue;
         }
         let content =
-            fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {rel_path}: {err}"));
+            fs::read_to_string(&path).unwrap_or_else(|err| assert!(false, "read {rel_path}: {err}"));
         let scan = classify_ts_file(&content, rel_path);
         assert_eq!(
             scan.classification, "sub_module",
@@ -1180,7 +1180,7 @@ fn test_generate_validated_manifest() {
         let scanner = CompatibilityScanner::new(ext_dir.clone());
         let ledger = scanner
             .scan_root()
-            .unwrap_or_else(|err| panic!("scan {id}: {err}"));
+            .unwrap_or_else(|err| assert!(false, "scan {id}: {err}"));
 
         let cap_names: Vec<&str> = ledger
             .capabilities
@@ -1461,7 +1461,7 @@ fn test_snapshot_protocol_provenance_entries_valid() {
 
         // 4. Validate checksum via library function matches provenance
         let actual = lib_digest(&artifact_dir)
-            .unwrap_or_else(|err| panic!("digest {} ({}): {err}", item.id, artifact_dir.display()));
+            .unwrap_or_else(|err| assert!(false, "digest {} ({}): {err}", item.id, artifact_dir.display()));
         if actual != item.checksum.sha256 {
             failures.push(format!(
                 "{}: checksum mismatch: provenance={}, actual={}",
@@ -1496,8 +1496,8 @@ fn test_snapshot_protocol_digest_matches_local_implementation() {
             continue;
         }
         let local =
-            digest_artifact_dir(&dir).unwrap_or_else(|err| panic!("local digest {id}: {err}"));
-        let lib = lib_digest(&dir).unwrap_or_else(|err| panic!("lib digest {id}: {err}"));
+            digest_artifact_dir(&dir).unwrap_or_else(|err| assert!(false, "local digest {id}: {err}"));
+        let lib = lib_digest(&dir).unwrap_or_else(|err| assert!(false, "lib digest {id}: {err}"));
         assert_eq!(
             local, lib,
             "digest mismatch for {id}: local implementation and library must agree"

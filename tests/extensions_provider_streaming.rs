@@ -517,7 +517,7 @@ fn stream_simple_string_chunks_map_to_text_deltas() {
                 StreamEvent::TextDelta { delta, .. } => deltas.push(delta.clone()),
                 StreamEvent::Done { message, .. } => {
                     let ContentBlock::Text(text) = &message.content[0] else {
-                        panic!("expected text content");
+                        assert!(false, "expected text content");
                     };
                     final_text = text.text.clone();
                 }
@@ -595,11 +595,11 @@ fn stream_simple_empty_stream_emits_done() {
                 assert_eq!(*reason, StopReason::Stop);
                 // Done message should have empty text content.
                 let ContentBlock::Text(text) = &message.content[0] else {
-                    panic!("expected text content");
+                    assert!(false, "expected text content");
                 };
                 assert_eq!(text.text, "");
             }
-            other => panic!("expected Done event, got {other:?}"),
+            other => assert!(false, "expected Done event, got {other:?}"),
         }
     });
 }
@@ -878,6 +878,6 @@ fn stream_simple_done_message_contains_model_info() {
                 return;
             }
         }
-        panic!("no Done event found");
+        assert!(false, "no Done event found");
     });
 }

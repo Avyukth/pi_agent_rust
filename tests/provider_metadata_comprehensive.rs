@@ -383,7 +383,7 @@ fn factory_dispatches_every_oai_compatible_provider() {
             .expect("OAI provider must have defaults");
         let entry = oai_entry(meta.canonical_id, defaults.api, defaults.base_url);
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("factory failed for '{}': {e}", meta.canonical_id));
+            .unwrap_or_else(|e| assert!(false, "factory failed for '{}': {e}", meta.canonical_id));
         assert_eq!(
             provider.api(),
             defaults.api,

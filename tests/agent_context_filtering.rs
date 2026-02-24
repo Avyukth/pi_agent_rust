@@ -109,9 +109,9 @@ mod tests {
             match &messages[0] {
                 Message::User(u) => match &u.content {
                     UserContent::Text(text) => assert_eq!(text, "visible"),
-                    UserContent::Blocks(_) => panic!("Expected text user content"),
+                    UserContent::Blocks(_) => assert!(false, "Expected text user content"),
                 },
-                _ => panic!("Expected user message"),
+                _ => assert!(false, "Expected user message"),
             }
 
             match &messages[1] {
@@ -119,7 +119,7 @@ mod tests {
                     assert_eq!(c.content, "visible_custom");
                     assert!(c.display);
                 }
-                _ => panic!("Expected visible custom message"),
+                _ => assert!(false, "Expected visible custom message"),
             }
         });
     }

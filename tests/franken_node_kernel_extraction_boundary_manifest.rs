@@ -43,9 +43,9 @@ fn repo_root() -> PathBuf {
 fn load_manifest() -> Value {
     let path = repo_root().join(MANIFEST_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -64,7 +64,7 @@ fn as_array<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .pointer(pointer)
         .and_then(Value::as_array)
         .map_or_else(
-            || panic!("expected JSON array at pointer {pointer}"),
+            || assert!(false, "expected JSON array at pointer {pointer}"),
             Vec::as_slice,
         )
 }
@@ -74,7 +74,7 @@ fn non_empty_string_set(value: &Value, pointer: &str) -> HashSet<String> {
     for entry in as_array(value, pointer) {
         let raw = entry
             .as_str()
-            .unwrap_or_else(|| panic!("expected string entry at {pointer}"));
+            .unwrap_or_else(|| assert!(false, "expected string entry at {pointer}"));
         let normalized = raw.trim();
         assert!(
             !normalized.is_empty(),
@@ -374,7 +374,7 @@ fn domain_entry_mut<'a>(manifest: &'a mut Value, domain_id: &str) -> &'a mut Val
                 .map(str::trim)
                 == Some(domain_id)
         })
-        .unwrap_or_else(|| panic!("missing boundary domain for mutation: {domain_id}"))
+        .unwrap_or_else(|| assert!(false, "missing boundary domain for mutation: {domain_id}"))
 }
 
 fn remove_string_entry(entries: &mut Vec<Value>, needle: &str) -> bool {
@@ -414,7 +414,7 @@ fn mapping_entry_mut<'a>(manifest: &'a mut Value, source_module: &str) -> &'a mu
                 .map(str::trim)
                 == Some(source_module)
         })
-        .unwrap_or_else(|| panic!("missing module mapping for mutation: {source_module}"))
+        .unwrap_or_else(|| assert!(false, "missing module mapping for mutation: {source_module}"))
 }
 
 fn remove_module_mapping(manifest: &mut Value, source_module: &str) -> bool {
@@ -484,7 +484,7 @@ fn kernel_boundary_manifest_has_expected_schema_and_linkage() {
 #[test]
 fn kernel_boundary_manifest_covers_required_core_modules() {
     let manifest = load_manifest();
-    validate_required_core_module_coverage(&manifest).unwrap_or_else(|err| panic!("{err}"));
+    validate_required_core_module_coverage(&manifest).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
@@ -577,7 +577,7 @@ fn kernel_boundary_manifest_enforces_fail_closed_ownership_rules() {
             );
         }
     }
-    validate_required_banned_cross_boundary_pairs(&manifest).unwrap_or_else(|err| panic!("{err}"));
+    validate_required_banned_cross_boundary_pairs(&manifest).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
@@ -669,7 +669,7 @@ fn kernel_boundary_manifest_declares_drift_checks_reintegration_and_logging_fiel
         Value::String("hard_fail".to_string()),
         "reintegration_linkage.failure_policy must be hard_fail"
     );
-    validate_reintegration_module_mappings(&manifest).unwrap_or_else(|err| panic!("{err}"));
+    validate_reintegration_module_mappings(&manifest).unwrap_or_else(|err| assert!(false, "{err}"));
 
     let logging_fields =
         non_empty_string_set(&manifest, "/structured_logging_contract/required_fields");

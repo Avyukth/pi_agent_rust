@@ -132,7 +132,7 @@ fn drive_provider_stream_to_done(
                 return;
             }
         }
-        panic!("provider stream ended before Done event");
+        assert!(false, "provider stream ended before Done event");
     });
 }
 
@@ -1246,7 +1246,7 @@ fn wave_a_presets_resolve_openai_compat_defaults_and_factory_route() {
         TestHarness::new("wave_a_presets_resolve_openai_compat_defaults_and_factory_route");
     for (provider_id, expected_base_url) in WAVE_A_PRESET_CASES {
         let defaults = provider_routing_defaults(provider_id)
-            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "missing metadata defaults for {provider_id}"));
         harness
             .log()
             .info_ctx("wave_a.defaults", "metadata defaults", |ctx| {
@@ -1262,7 +1262,7 @@ fn wave_a_presets_resolve_openai_compat_defaults_and_factory_route() {
         let mut entry = make_model_entry(provider_id, "wave-a-default-model", expected_base_url);
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         harness
             .log()
             .info_ctx("wave_a.factory", "factory route", |ctx| {
@@ -1298,7 +1298,7 @@ fn wave_a_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should stream-route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should stream-route {provider_id}: {e}"));
 
         let api_key = format!("wave-a-token-{index}");
         let context = Context {
@@ -1353,7 +1353,7 @@ fn wave_b1_presets_resolve_metadata_defaults_and_factory_route() {
     for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_B1_PRESET_CASES
     {
         let defaults = provider_routing_defaults(provider_id)
-            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "missing metadata defaults for {provider_id}"));
         harness
             .log()
             .info_ctx("wave_b1.defaults", "metadata defaults", |ctx| {
@@ -1370,7 +1370,7 @@ fn wave_b1_presets_resolve_metadata_defaults_and_factory_route() {
         let mut entry = make_model_entry(provider_id, "wave-b1-default-model", expected_base_url);
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         harness
             .log()
             .info_ctx("wave_b1.factory", "factory route", |ctx| {
@@ -1468,7 +1468,7 @@ fn wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         assert_eq!(provider.name(), "anthropic");
         assert_eq!(provider.api(), "anthropic-messages");
 
@@ -1568,7 +1568,7 @@ fn wave_b2_presets_resolve_metadata_defaults_and_factory_route() {
     for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_B2_PRESET_CASES
     {
         let defaults = provider_routing_defaults(provider_id)
-            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "missing metadata defaults for {provider_id}"));
         harness
             .log()
             .info_ctx("wave_b2.defaults", "metadata defaults", |ctx| {
@@ -1585,7 +1585,7 @@ fn wave_b2_presets_resolve_metadata_defaults_and_factory_route() {
         let mut entry = make_model_entry(provider_id, "wave-b2-default-model", expected_base_url);
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         harness
             .log()
             .info_ctx("wave_b2.factory", "factory route", |ctx| {
@@ -1622,7 +1622,7 @@ fn wave_b2_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         assert_eq!(provider.api(), expected_api);
 
         let api_key = format!("wave-b2-openai-token-{index}");
@@ -1695,7 +1695,7 @@ fn wave_b3_presets_resolve_metadata_defaults_and_factory_route() {
     for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_B3_PRESET_CASES
     {
         let defaults = provider_routing_defaults(provider_id)
-            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "missing metadata defaults for {provider_id}"));
         harness
             .log()
             .info_ctx("wave_b3.defaults", "metadata defaults", |ctx| {
@@ -1712,7 +1712,7 @@ fn wave_b3_presets_resolve_metadata_defaults_and_factory_route() {
         let mut entry = make_model_entry(provider_id, "wave-b3-default-model", expected_base_url);
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         harness
             .log()
             .info_ctx("wave_b3.factory", "factory route", |ctx| {
@@ -1749,7 +1749,7 @@ fn wave_b3_openai_compat_streams_use_chat_completions_path_and_bearer_auth() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         assert_eq!(provider.api(), expected_api);
 
         let api_key = format!("wave-b3-openai-token-{index}");
@@ -1855,7 +1855,7 @@ fn special_routing_presets_resolve_metadata_defaults_and_factory_route() {
         SPECIAL_ROUTING_CASES
     {
         let defaults = provider_routing_defaults(provider_id)
-            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+            .unwrap_or_else(|| assert!(false, "missing metadata defaults for {provider_id}"));
         harness
             .log()
             .info_ctx("special.defaults", "metadata defaults", |ctx| {
@@ -1876,7 +1876,7 @@ fn special_routing_presets_resolve_metadata_defaults_and_factory_route() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
 
         if expected_api == "anthropic-messages" {
             assert_eq!(provider.name(), "anthropic");
@@ -1916,7 +1916,7 @@ fn special_routing_default_streams_cover_success_paths() {
         );
         entry.model.api.clear();
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "create_provider should route {provider_id}: {e}"));
         assert_eq!(provider.api(), expected_api);
 
         let api_key = format!("special-openai-token-{index}");
@@ -2027,7 +2027,7 @@ fn special_routing_metadata_api_overrides_change_route_kind() {
         entry.model.api = "openai-responses".to_string();
 
         let provider = create_provider(&entry, None)
-            .unwrap_or_else(|e| panic!("override route failed for {provider_id}: {e}"));
+            .unwrap_or_else(|e| assert!(false, "override route failed for {provider_id}: {e}"));
         assert_eq!(provider.api(), "openai-responses");
 
         let context = Context {
@@ -2102,7 +2102,7 @@ fn special_routing_unsupported_api_reports_provider_mismatch() {
         let mut entry = make_model_entry(provider_id, "bad-model", "https://example.invalid/v1");
         entry.model.api = "unsupported-api-family".to_string();
         let Err(err) = create_provider(&entry, None) else {
-            panic!("unsupported api override should fail with route diagnostic");
+            assert!(false, "unsupported api override should fail with route diagnostic");
         };
         let msg = err.to_string();
         assert!(

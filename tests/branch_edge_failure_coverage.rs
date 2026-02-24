@@ -799,7 +799,7 @@ fn build_initial_content_text_only() {
     assert_eq!(blocks.len(), 1);
     match &blocks[0] {
         ContentBlock::Text(tc) => assert_eq!(tc.text, "hello world"),
-        _ => panic!("Expected Text content block"),
+        _ => assert!(false, "Expected Text content block"),
     }
 }
 

@@ -57,10 +57,10 @@ fn write_redacted_snapshot(harness: &TestHarness, src: &Path, name: &str) -> (Pa
 
 fn oauth_entry<'a>(value: &'a Value, provider: &str) -> &'a serde_json::Map<String, Value> {
     let Some(map) = value.as_object() else {
-        panic!("expected auth.json root object");
+        assert!(false, "expected auth.json root object");
     };
     let Some(Value::Object(entry)) = map.get(provider) else {
-        panic!("expected provider entry for {provider}");
+        assert!(false, "expected provider entry for {provider}");
     };
     entry
 }
@@ -69,7 +69,7 @@ fn oauth_field<'a>(entry: &'a serde_json::Map<String, Value>, key: &str) -> &'a 
     entry
         .get(key)
         .and_then(Value::as_str)
-        .unwrap_or_else(|| panic!("expected string field {key}"))
+        .unwrap_or_else(|| assert!(false, "expected string field {key}"))
 }
 
 fn oauth_access_token(path: &Path, provider: &str) -> Option<String> {
@@ -185,7 +185,7 @@ async fn run_refresh_scenario(
     let after_expires = entry
         .get("expires")
         .and_then(Value::as_i64)
-        .unwrap_or_else(|| panic!("expected i64 field expires"));
+        .unwrap_or_else(|| assert!(false, "expected i64 field expires"));
 
     let now = chrono::Utc::now().timestamp_millis();
 
@@ -244,7 +244,7 @@ async fn run_refresh_scenario(
             std::fs::write(&error_path, &message).expect("write error artifact");
             harness.record_artifact("refresh.error.txt", &error_path);
         }
-        _ => panic!("invalid test expectation"),
+        _ => assert!(false, "invalid test expectation"),
     }
 
     let (_, after_redactions) = write_redacted_snapshot(harness, &auth_path, "auth.after.json");
@@ -383,14 +383,14 @@ fn auth_oauth_refresh_api_key_credentials_skip_refresh_vcr() {
 
         let after_json = read_json(&auth_path);
         let Some(root) = after_json.as_object() else {
-            panic!("expected auth.json root object");
+            assert!(false, "expected auth.json root object");
         };
         let google_entry = root.get("google").unwrap_or_else(|| {
-            panic!("expected google API-key credential to remain in auth.json");
+            assert!(false, "expected google API-key credential to remain in auth.json");
         });
         let google_obj = google_entry
             .as_object()
-            .unwrap_or_else(|| panic!("expected google auth entry object"));
+            .unwrap_or_else(|| assert!(false, "expected google auth entry object"));
         assert_eq!(
             google_obj.get("type").and_then(Value::as_str),
             Some("api_key")
@@ -522,7 +522,7 @@ fn auth_oauth_refresh_race_condition_vcr() {
         let after_expires = entry
             .get("expires")
             .and_then(Value::as_i64)
-            .unwrap_or_else(|| panic!("expected i64 field expires"));
+            .unwrap_or_else(|| assert!(false, "expected i64 field expires"));
         let now = chrono::Utc::now().timestamp_millis();
         assert_eq!(after_access, "new-access-success");
         assert_eq!(after_refresh, "new-refresh-success");

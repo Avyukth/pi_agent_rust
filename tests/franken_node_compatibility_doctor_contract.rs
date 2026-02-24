@@ -93,9 +93,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -114,7 +114,7 @@ fn as_array<'a>(value: &'a Value, pointer: &str) -> &'a [Value] {
         .pointer(pointer)
         .and_then(Value::as_array)
         .map_or_else(
-            || panic!("expected JSON array at pointer {pointer}"),
+            || assert!(false, "expected JSON array at pointer {pointer}"),
             Vec::as_slice,
         )
 }
@@ -124,7 +124,7 @@ fn non_empty_string_set(value: &Value, pointer: &str) -> HashSet<String> {
     for entry in as_array(value, pointer) {
         let raw = entry
             .as_str()
-            .unwrap_or_else(|| panic!("expected string entry at {pointer}"));
+            .unwrap_or_else(|| assert!(false, "expected string entry at {pointer}"));
         let normalized = raw.trim();
         assert!(
             !normalized.is_empty(),
@@ -363,7 +363,7 @@ fn remove_string_entry(contract: &mut Value, pointer: &str, value: &str) -> bool
     let entries = contract
         .pointer_mut(pointer)
         .and_then(Value::as_array_mut)
-        .unwrap_or_else(|| panic!("expected mutable array at pointer {pointer}"));
+        .unwrap_or_else(|| assert!(false, "expected mutable array at pointer {pointer}"));
     let before = entries.len();
     entries.retain(|entry| entry.as_str().map(str::trim) != Some(value));
     before != entries.len()
@@ -394,7 +394,7 @@ fn set_metric_weight(contract: &mut Value, metric: &str, new_weight: f64) {
     let row = rows
         .iter_mut()
         .find(|row| row.get("metric").and_then(Value::as_str).map(str::trim) == Some(metric))
-        .unwrap_or_else(|| panic!("missing readiness_scoring metric for mutation: {metric}"));
+        .unwrap_or_else(|| assert!(false, "missing readiness_scoring metric for mutation: {metric}"));
     row["weight"] = Value::from(new_weight);
 }
 
@@ -452,7 +452,7 @@ fn compatibility_doctor_contract_has_expected_schema_version_and_linkage() {
 #[test]
 fn compatibility_doctor_taxonomy_is_complete_and_unique() {
     let contract = load_contract();
-    let class_ids = collect_taxonomy_class_ids(&contract).unwrap_or_else(|err| panic!("{err}"));
+    let class_ids = collect_taxonomy_class_ids(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
     for required in REQUIRED_CLASS_IDS {
         assert!(
             class_ids.contains(*required),
@@ -464,25 +464,25 @@ fn compatibility_doctor_taxonomy_is_complete_and_unique() {
 #[test]
 fn compatibility_doctor_diagnostic_contract_is_fail_closed() {
     let contract = load_contract();
-    validate_diagnostic_contract(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_diagnostic_contract(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn compatibility_doctor_scoring_contract_is_normalized() {
     let contract = load_contract();
-    validate_scoring_contract(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_scoring_contract(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn compatibility_doctor_remediation_and_workflow_contracts_are_complete() {
     let contract = load_contract();
-    validate_remediation_and_workflow_contract(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_remediation_and_workflow_contract(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]
 fn compatibility_doctor_logging_and_dependency_contracts_are_complete() {
     let contract = load_contract();
-    validate_logging_and_dependencies(&contract).unwrap_or_else(|err| panic!("{err}"));
+    validate_logging_and_dependencies(&contract).unwrap_or_else(|err| assert!(false, "{err}"));
 }
 
 #[test]

@@ -20,10 +20,10 @@ fn repo_root() -> PathBuf {
 fn load_suite_classification(root: &Path) -> HashMap<String, Vec<String>> {
     let path = root.join("tests/suite_classification.toml");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", path.display()));
     let table: toml::Table = content
         .parse()
-        .unwrap_or_else(|e| panic!("invalid TOML in {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "invalid TOML in {}: {e}", path.display()));
 
     let mut result = HashMap::new();
     if let Some(suite) = table.get("suite").and_then(|v| v.as_table()) {
@@ -47,9 +47,9 @@ fn load_suite_classification(root: &Path) -> HashMap<String, Vec<String>> {
 fn load_matrix_test_stems(root: &Path) -> BTreeSet<String> {
     let path = root.join("docs/traceability_matrix.json");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", path.display()));
     let matrix: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or_else(|e| panic!("invalid JSON: {e}"));
+        serde_json::from_str(&content).unwrap_or_else(|e| assert!(false, "invalid JSON: {e}"));
 
     let mut stems = BTreeSet::new();
     if let Some(requirements) = matrix.get("requirements").and_then(|v| v.as_array()) {
@@ -76,9 +76,9 @@ fn load_matrix_test_stems(root: &Path) -> BTreeSet<String> {
 fn load_matrix_min_trace_coverage_pct(root: &Path) -> usize {
     let path = root.join("docs/traceability_matrix.json");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        .unwrap_or_else(|e| assert!(false, "cannot read {}: {e}", path.display()));
     let matrix: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or_else(|e| panic!("invalid JSON: {e}"));
+        serde_json::from_str(&content).unwrap_or_else(|e| assert!(false, "invalid JSON: {e}"));
 
     matrix
         .get("ci_policy")
@@ -86,10 +86,8 @@ fn load_matrix_min_trace_coverage_pct(root: &Path) -> usize {
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_else(|| {
-            panic!(
-                "missing ci_policy.min_classified_trace_coverage_pct in {}",
-                path.display()
-            )
+            assert!(false, "missing ci_policy.min_classified_trace_coverage_pct in {}",
+            path.display())
         })
 }
 

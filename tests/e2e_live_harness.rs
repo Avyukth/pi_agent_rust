@@ -234,7 +234,7 @@ fn write_jsonl_records<T: Serialize>(path: &Path, records: &[T]) -> std::io::Res
 
 fn load_jsonl_values(path: &Path, label: &str) -> Vec<Value> {
     let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("read {label} {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "read {label} {}: {err}", path.display()));
     content
         .lines()
         .enumerate()
@@ -244,11 +244,9 @@ fn load_jsonl_values(path: &Path, label: &str) -> Vec<Value> {
                 return None;
             }
             Some(serde_json::from_str::<Value>(line).unwrap_or_else(|err| {
-                panic!(
-                    "parse {label} line {} at {}: {err}",
-                    index + 1,
-                    path.display()
-                )
+                assert!(false, "parse {label} line {} at {}: {err}",
+                index + 1,
+                path.display())
             }))
         })
         .collect()
@@ -259,7 +257,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let content = std::fs::read_to_string(path)
-        .unwrap_or_else(|err| panic!("read {label} {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "read {label} {}: {err}", path.display()));
     content
         .lines()
         .enumerate()
@@ -269,11 +267,9 @@ where
                 return None;
             }
             Some(serde_json::from_str::<T>(line).unwrap_or_else(|err| {
-                panic!(
-                    "decode {label} line {} at {}: {err}",
-                    index + 1,
-                    path.display()
-                )
+                assert!(false, "decode {label} line {} at {}: {err}",
+                index + 1,
+                path.display())
             }))
         })
         .collect()
@@ -285,7 +281,7 @@ fn to_json_values<T: Serialize>(records: &[T], label: &str) -> Vec<Value> {
         .enumerate()
         .map(|(index, record)| {
             serde_json::to_value(record)
-                .unwrap_or_else(|err| panic!("serialize {label} record {}: {err}", index + 1))
+                .unwrap_or_else(|err| assert!(false, "serialize {label} record {}: {err}", index + 1))
         })
         .collect()
 }
@@ -472,7 +468,7 @@ fn e2e_live_provider_harness_smoke() {
     }
 
     let registry = LiveE2eRegistry::load(harness.log())
-        .unwrap_or_else(|err| panic!("failed to load live E2E registry: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to load live E2E registry: {err}"));
 
     asupersync::test_utils::run_test(|| {
         let harness_ref = &harness;
@@ -506,7 +502,7 @@ fn e2e_live_provider_harness_smoke() {
 
             let vcr_dir = harness_ref.temp_path("live_provider_vcr");
             std::fs::create_dir_all(&vcr_dir)
-                .unwrap_or_else(|err| panic!("create live provider vcr dir: {err}"));
+                .unwrap_or_else(|err| assert!(false, "create live provider vcr dir: {err}"));
 
             let mut runs = Vec::with_capacity(filtered_targets.len());
             for target in &filtered_targets {
@@ -516,7 +512,7 @@ fn e2e_live_provider_harness_smoke() {
 
             let raw_results_path =
                 write_live_provider_runs_jsonl(harness_ref, "live_provider_results.jsonl", &runs)
-                    .unwrap_or_else(|err| panic!("write live provider results jsonl: {err}"));
+                    .unwrap_or_else(|err| assert!(false, "write live provider results jsonl: {err}"));
             let raw_result_values =
                 load_jsonl_values(&raw_results_path, "raw live provider results");
 
@@ -552,7 +548,7 @@ fn e2e_live_provider_harness_smoke() {
                 .collect();
             let run_contract_path = harness_ref.temp_path("live_provider_results.contract.jsonl");
             write_jsonl_records(&run_contract_path, &run_records)
-                .unwrap_or_else(|err| panic!("write live provider result contract jsonl: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write live provider result contract jsonl: {err}"));
             harness_ref.record_artifact("live_provider_results.contract.jsonl", &run_contract_path);
 
             let model_cost_lookup = build_model_cost_lookup(&registry);
@@ -665,30 +661,30 @@ fn e2e_live_provider_harness_smoke() {
 
             let cost_path = harness_ref.temp_path("live_provider_costs.jsonl");
             write_jsonl_records(&cost_path, &cost_records)
-                .unwrap_or_else(|err| panic!("write live provider cost jsonl: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write live provider cost jsonl: {err}"));
             harness_ref.record_artifact("live_provider_costs.jsonl", &cost_path);
 
             let log_path = harness_ref.temp_path("live_provider_log.jsonl");
             harness_ref
                 .write_jsonl_logs(&log_path)
-                .unwrap_or_else(|err| panic!("write live provider results jsonl: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write live provider results jsonl: {err}"));
             harness_ref.record_artifact("live_provider_log.jsonl", &log_path);
             let normalized_log_path = normalize_jsonl_path(&log_path);
             harness_ref
                 .write_jsonl_logs_normalized(&normalized_log_path)
-                .unwrap_or_else(|err| panic!("write normalized live provider JSONL log: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write normalized live provider JSONL log: {err}"));
             harness_ref.record_artifact("live_provider_log.normalized.jsonl", &normalized_log_path);
 
             let artifact_path = harness_ref.temp_path("live_provider_artifacts.jsonl");
             harness_ref
                 .write_artifact_index_jsonl(&artifact_path)
-                .unwrap_or_else(|err| panic!("write live provider artifact index: {err}"));
+                .unwrap_or_else(|err| assert!(false, "write live provider artifact index: {err}"));
             harness_ref.record_artifact("live_provider_artifacts.jsonl", &artifact_path);
             let normalized_artifact_path = normalize_jsonl_path(&artifact_path);
             harness_ref
                 .write_artifact_index_jsonl_normalized(&normalized_artifact_path)
                 .unwrap_or_else(|err| {
-                    panic!("write normalized live provider artifact index: {err}")
+                    assert!(false, "write normalized live provider artifact index: {err}")
                 });
             harness_ref.record_artifact(
                 "live_provider_artifacts.normalized.jsonl",
@@ -698,7 +694,7 @@ fn e2e_live_provider_harness_smoke() {
             if let Ok(export_dir) = std::env::var(LIVE_EXPORT_DIR_ENV) {
                 let export_root = PathBuf::from(export_dir);
                 std::fs::create_dir_all(&export_root)
-                    .unwrap_or_else(|err| panic!("create {LIVE_EXPORT_DIR_ENV} dir: {err}"));
+                    .unwrap_or_else(|err| assert!(false, "create {LIVE_EXPORT_DIR_ENV} dir: {err}"));
 
                 let export_pairs = [
                     ("live_provider_results.raw.jsonl", &raw_results_path),
@@ -716,17 +712,15 @@ fn e2e_live_provider_harness_smoke() {
                 for (name, source_path) in export_pairs {
                     let destination = export_root.join(name);
                     std::fs::copy(source_path, &destination).unwrap_or_else(|err| {
-                        panic!(
-                            "export {name} to {} via {LIVE_EXPORT_DIR_ENV}: {err}",
-                            destination.display()
-                        )
+                        assert!(false, "export {name} to {} via {LIVE_EXPORT_DIR_ENV}: {err}",
+                        destination.display())
                     });
                     harness_ref.record_artifact(format!("export/{name}"), &destination);
                 }
             }
 
             let log_content = std::fs::read_to_string(&log_path).unwrap_or_else(|err| {
-                panic!("read live provider log {}: {err}", log_path.display())
+                assert!(false, "read live provider log {}: {err}", log_path.display())
             });
             let log_errors = validate_jsonl(&log_content);
             assert!(
@@ -735,10 +729,8 @@ fn e2e_live_provider_harness_smoke() {
             );
 
             let artifact_content = std::fs::read_to_string(&artifact_path).unwrap_or_else(|err| {
-                panic!(
-                    "read live provider artifact index {}: {err}",
-                    artifact_path.display()
-                )
+                assert!(false, "read live provider artifact index {}: {err}",
+                artifact_path.display())
             });
             let artifact_errors = validate_jsonl(&artifact_content);
             assert!(
@@ -748,10 +740,8 @@ fn e2e_live_provider_harness_smoke() {
 
             let normalized_log_content = std::fs::read_to_string(&normalized_log_path)
                 .unwrap_or_else(|err| {
-                    panic!(
-                        "read normalized live provider log {}: {err}",
-                        normalized_log_path.display()
-                    )
+                    assert!(false, "read normalized live provider log {}: {err}",
+                    normalized_log_path.display())
                 });
             let normalized_log_errors = validate_jsonl(&normalized_log_content);
             assert!(
@@ -761,10 +751,8 @@ fn e2e_live_provider_harness_smoke() {
 
             let normalized_artifact_content = std::fs::read_to_string(&normalized_artifact_path)
                 .unwrap_or_else(|err| {
-                    panic!(
-                        "read normalized live provider artifact index {}: {err}",
-                        normalized_artifact_path.display()
-                    )
+                    assert!(false, "read normalized live provider artifact index {}: {err}",
+                    normalized_artifact_path.display())
                 });
             let normalized_artifact_errors = validate_jsonl(&normalized_artifact_content);
             assert!(

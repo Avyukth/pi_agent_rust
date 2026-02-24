@@ -12,8 +12,8 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {CONTRACT_PATH}: {e}"));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("invalid JSON in {CONTRACT_PATH}: {e}"))
+        .unwrap_or_else(|e| assert!(false, "cannot read {CONTRACT_PATH}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| assert!(false, "invalid JSON in {CONTRACT_PATH}: {e}"))
 }
 
 #[test]

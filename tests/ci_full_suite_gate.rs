@@ -3068,7 +3068,7 @@ fn full_certification() {
         PERF3X_COVERAGE_AUDIT_ARTIFACT_REL,
         &perf3x_coverage_audit_report,
     )
-    .unwrap_or_else(|detail| panic!("fail-closed perf3x coverage audit emission: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed perf3x coverage audit emission: {detail}"));
     let practical_finish_checkpoint_report = build_practical_finish_checkpoint_report(&root);
     let practical_finish_checkpoint_path = report_dir.join("practical_finish_checkpoint.json");
     write_json_artifact(
@@ -3076,7 +3076,7 @@ fn full_certification() {
         PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL,
         &practical_finish_checkpoint_report,
     )
-    .unwrap_or_else(|detail| panic!("fail-closed practical-finish checkpoint emission: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed practical-finish checkpoint emission: {detail}"));
 
     eprintln!("\n=== Full Certification Lane (bd-1f42.8.8.1) ===\n");
 
@@ -3255,7 +3255,7 @@ fn full_certification() {
         "tests/full_suite_gate/certification_verdict.json",
         &report,
     )
-    .unwrap_or_else(|detail| panic!("fail-closed certification verdict emission: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed certification verdict emission: {detail}"));
 
     // Write JSONL events for certification
     let cert_events_path = report_dir.join("certification_events.jsonl");
@@ -3274,7 +3274,7 @@ fn full_certification() {
         });
         lines.push(
             serde_json::to_string(&line).unwrap_or_else(|err| {
-                panic!("fail-closed certification events serialization: {err}")
+                assert!(false, "fail-closed certification events serialization: {err}")
             }),
         );
     }
@@ -3283,7 +3283,7 @@ fn full_certification() {
         "tests/full_suite_gate/certification_events.jsonl",
         &(lines.join("\n") + "\n"),
     )
-    .unwrap_or_else(|detail| panic!("fail-closed certification events emission: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed certification events emission: {detail}"));
 
     // Write certification markdown report
     let mut md = String::new();
@@ -3371,12 +3371,12 @@ fn full_certification() {
         "tests/full_suite_gate/certification_report.md",
         &md,
     )
-    .unwrap_or_else(|detail| panic!("fail-closed certification report emission: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed certification report emission: {detail}"));
     assert_non_empty_text_artifact(
         &cert_md_path,
         "tests/full_suite_gate/certification_report.md",
     )
-    .unwrap_or_else(|detail| panic!("fail-closed certification report verification: {detail}"));
+    .unwrap_or_else(|detail| assert!(false, "fail-closed certification report verification: {detail}"));
 
     // Print summary
     eprintln!("=== Certification Verdict: {} ===", verdict.to_uppercase());
@@ -5183,7 +5183,7 @@ fn assert_non_empty_text_artifact_rejects_whitespace_only_file() {
 
 fn fixed_utc(ts: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(ts)
-        .unwrap_or_else(|err| panic!("invalid fixed RFC3339 timestamp {ts}: {err}"))
+        .unwrap_or_else(|err| assert!(false, "invalid fixed RFC3339 timestamp {ts}: {err}"))
         .with_timezone(&chrono::Utc)
 }
 
@@ -5248,7 +5248,7 @@ fn must_pass_lineage_validator_fails_when_generated_at_stale() {
 #[test]
 fn ci_workflow_publishes_scenario_cell_gate_artifacts() {
     let workflow = std::fs::read_to_string(CI_WORKFLOW_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {CI_WORKFLOW_PATH}: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to read {CI_WORKFLOW_PATH}: {err}"));
 
     for token in [
         "PERF_SCENARIO_CELL_STATUS_JSON",
@@ -5274,7 +5274,7 @@ fn ci_workflow_publishes_scenario_cell_gate_artifacts() {
 #[test]
 fn run_all_wires_scenario_cell_status_artifacts_into_evidence_contract() {
     let script = std::fs::read_to_string(RUN_ALL_SCRIPT_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {RUN_ALL_SCRIPT_PATH}: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to read {RUN_ALL_SCRIPT_PATH}: {err}"));
 
     for token in [
         "CLAIM_INTEGRITY_REQUIRED",
@@ -5362,7 +5362,7 @@ fn run_all_wires_scenario_cell_status_artifacts_into_evidence_contract() {
 #[test]
 fn qa_runbook_contains_perf3x_regression_triage_playbooks() {
     let runbook = std::fs::read_to_string(QA_RUNBOOK_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {QA_RUNBOOK_PATH}: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to read {QA_RUNBOOK_PATH}: {err}"));
 
     for token in [
         "## PERF-3X Regression Triage (bd-3ar8v.6.4)",
@@ -5388,7 +5388,7 @@ fn qa_runbook_contains_perf3x_regression_triage_playbooks() {
 #[test]
 fn qa_runbook_contains_perf3x_final_go_no_go_workflow() {
     let runbook = std::fs::read_to_string(QA_RUNBOOK_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {QA_RUNBOOK_PATH}: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to read {QA_RUNBOOK_PATH}: {err}"));
 
     for token in [
         "### Final >=3x Go/No-Go Decision Workflow (bd-3ar8v.6.5)",
@@ -5411,7 +5411,7 @@ fn qa_runbook_contains_perf3x_final_go_no_go_workflow() {
 #[test]
 fn ci_operator_runbook_contains_perf3x_gate_incident_addendum() {
     let runbook = std::fs::read_to_string(CI_OPERATOR_RUNBOOK_PATH)
-        .unwrap_or_else(|err| panic!("failed to read {CI_OPERATOR_RUNBOOK_PATH}: {err}"));
+        .unwrap_or_else(|err| assert!(false, "failed to read {CI_OPERATOR_RUNBOOK_PATH}: {err}"));
 
     for token in [
         "### PERF-3X Gate Incident Addendum (bd-3ar8v.6.4)",

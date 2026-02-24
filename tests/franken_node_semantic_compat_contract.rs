@@ -11,9 +11,9 @@ fn repo_root() -> PathBuf {
 fn load_contract() -> Value {
     let path = repo_root().join(CONTRACT_PATH);
     let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "failed to read {}: {err}", path.display()));
     serde_json::from_str(&raw)
-        .unwrap_or_else(|err| panic!("failed to parse {} as JSON: {err}", path.display()))
+        .unwrap_or_else(|err| assert!(false, "failed to parse {} as JSON: {err}", path.display()))
 }
 
 fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
@@ -125,7 +125,7 @@ fn semantic_compat_contract_scenario_taxonomy_is_complete_and_unique() {
 
         let required_surfaces = scenario["required_surfaces"]
             .as_array()
-            .unwrap_or_else(|| panic!("{id}: required_surfaces must be an array"));
+            .unwrap_or_else(|| assert!(false, "{id}: required_surfaces must be an array"));
         assert!(
             !required_surfaces.is_empty(),
             "{id}: required_surfaces must not be empty"

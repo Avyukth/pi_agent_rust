@@ -422,7 +422,7 @@ fn write_report(harness: &TestHarness, provider: &str, tag: &str, report: &Value
     let serialized = serde_json::to_string_pretty(report)
         .unwrap_or_else(|_| r#"{"schema":"serialization_error"}"#.to_string());
     std::fs::write(&path, serialized)
-        .unwrap_or_else(|err| panic!("write verify artifact {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "write verify artifact {}: {err}", path.display()));
     harness.record_artifact(format!("verify/{file_name}"), &path);
 }
 
@@ -473,7 +473,7 @@ fn assert_stream_ok(
     if let Some(allowed) = &expectations.allowed_stop_reasons {
         let reason = summary
             .stop_reason
-            .unwrap_or_else(|| panic!("{tag}: missing stop reason"));
+            .unwrap_or_else(|| assert!(false, "{tag}: missing stop reason"));
         assert!(
             allowed.contains(&reason),
             "{tag}: stop reason {reason:?} not in {allowed:?}"
@@ -525,7 +525,7 @@ fn assert_timeline_shape(tag: &str, summary: &StreamSummary) {
             .timeline
             .iter()
             .position(|step| step == "start")
-            .unwrap_or_else(|| panic!("{tag}: has_start=true but no start event in timeline"));
+            .unwrap_or_else(|| assert!(false, "{tag}: has_start=true but no start event in timeline"));
         assert_eq!(
             start_idx, 0,
             "{tag}: start event must appear first, timeline={:?}",
@@ -557,16 +557,14 @@ fn assert_tool_schema_fidelity(
         let tool_def = tool_defs
             .iter()
             .find(|t| t.name == tool_call.name)
-            .unwrap_or_else(|| panic!("{tag}: tool call '{}' has no schema", tool_call.name));
+            .unwrap_or_else(|| assert!(false, "{tag}: tool call '{}' has no schema", tool_call.name));
         let validator = jsonschema::draft202012::options()
             .should_validate_formats(true)
             .build(&tool_def.parameters)
-            .unwrap_or_else(|err| panic!("{tag}: invalid schema for '{}': {err}", tool_call.name));
+            .unwrap_or_else(|err| assert!(false, "{tag}: invalid schema for '{}': {err}", tool_call.name));
         if let Err(err) = validator.validate(&tool_call.arguments) {
-            panic!(
-                "{tag}: tool '{}' args failed schema validation: {err}; args={}",
-                tool_call.name, tool_call.arguments
-            );
+            assert!(false, "{tag}: tool '{}' args failed schema validation: {err}; args={}",
+            tool_call.name, tool_call.arguments);
         }
     }
 }
@@ -1164,7 +1162,7 @@ fn write_cassette(path: &Path, cassette: &Cassette) {
     }
     let serialized = serde_json::to_string_pretty(cassette).expect("Failed to serialize cassette");
     std::fs::write(path, serialized)
-        .unwrap_or_else(|err| panic!("write cassette {}: {err}", path.display()));
+        .unwrap_or_else(|err| assert!(false, "write cassette {}: {err}", path.display()));
 }
 
 // ============================================================================
@@ -1212,7 +1210,7 @@ async fn run_canonical_scenario(
                 .stream(&context, &options)
                 .await
                 .unwrap_or_else(|err| {
-                    panic!("{provider_name}/{tag}: expected stream, got error: {err}")
+                    assert!(false, "{provider_name}/{tag}: expected stream, got error: {err}")
                 });
             let outcome = collect_events(stream).await;
             let summary = summarize_events(&outcome);
@@ -1245,7 +1243,7 @@ async fn run_canonical_scenario(
         CanonicalExpectation::Error(expectation) => {
             let result = provider.stream(&context, &options).await;
             let Err(err) = result else {
-                panic!("{provider_name}/{tag}: expected error, got success");
+                assert!(false, "{provider_name}/{tag}: expected error, got success");
             };
             let message = err.to_string();
             assert_error_ok(&format!("{provider_name}/{tag}"), &message, expectation);
@@ -2543,7 +2541,7 @@ mod wave_b1_smoke {
         canonical_scenarios()
             .into_iter()
             .find(|s| s.tag == tag)
-            .unwrap_or_else(|| panic!("missing canonical scenario: {tag}"))
+            .unwrap_or_else(|| assert!(false, "missing canonical scenario: {tag}"))
     }
 
     fn openai_cassette_name(provider_id: &str, tag: &str) -> String {

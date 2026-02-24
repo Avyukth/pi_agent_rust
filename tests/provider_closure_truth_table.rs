@@ -16,9 +16,9 @@ use std::path::Path;
 fn load_truth_table() -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider-closure-truth-table.json");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read truth table file: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to read truth table file: {e}"));
     serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse truth table JSON: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to parse truth table JSON: {e}"))
 }
 
 // ─── Section 1: Schema and file existence ───────────────────────────────────

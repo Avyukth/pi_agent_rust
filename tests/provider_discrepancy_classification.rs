@@ -16,9 +16,9 @@ fn load_classification() -> Value {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/provider-discrepancy-classification.json");
     let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("Failed to read classification file: {e}"));
+        .unwrap_or_else(|e| assert!(false, "Failed to read classification file: {e}"));
     serde_json::from_str(&content)
-        .unwrap_or_else(|e| panic!("Failed to parse classification JSON: {e}"))
+        .unwrap_or_else(|e| assert!(false, "Failed to parse classification JSON: {e}"))
 }
 
 // ─── Section 1: Schema and file existence ───────────────────────────────────
