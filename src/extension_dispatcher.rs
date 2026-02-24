@@ -4,7 +4,7 @@
 //! hostcall requests (tools, HTTP, session, UI, etc.) from the JS runtime to
 //! Rust implementations.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -72,6 +72,10 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     regime_detector: RefCell<RegimeShiftDetector>,
     /// AMAC batch executor for interleaved hostcall dispatch.
     amac_executor: RefCell<AmacBatchExecutor>,
+
+    /// Test-only counter for policy_lookup calls (O4 guardrail).
+    #[cfg(test)]
+    policy_lookup_count: Cell<u32>,
 }
 
 /// Runtime bridge trait so dispatcher logic is not hardwired to a concrete runtime type.
@@ -1694,6 +1698,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             amac_executor: RefCell::new(
                 AmacBatchExecutor::new(AmacBatchExecutorConfig::from_env()),
             ),
+            #[cfg(test)]
+            policy_lookup_count: Cell::new(0),
         }
     }
 
@@ -1702,6 +1708,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         capability: &str,
         extension_id: Option<&str>,
     ) -> (PolicyCheck, &'static str) {
+        #[cfg(test)]
+        self.policy_lookup_count.set(self.policy_lookup_count.get() + 1);
         (
             self.snapshot.lookup(capability, extension_id),
             policy_lookup_path(capability),
@@ -1868,23 +1876,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         self.js_runtime().drain_hostcall_requests()
     }
 
+    /// Dispatch a hostcall to the appropriate handler.
+    ///
+    /// SAFETY: All callers must check policy via `policy_lookup` before calling
+    /// this function. The redundant policy check was removed as part of O4
+    /// optimization (bd-izy.1.1).
     #[allow(clippy::future_not_send)]
     async fn dispatch_hostcall_fast(&self, request: &HostcallRequest) -> HostcallOutcome {
-        let cap = request.required_capability();
-        let (check, lookup_path) = self.policy_lookup(cap, request.extension_id.as_deref());
-        self.emit_policy_decision_telemetry(
-            cap,
-            request.extension_id.as_deref(),
-            lookup_path,
-            &check,
-        );
-        if check.decision != PolicyDecision::Allow {
-            return HostcallOutcome::Error {
-                code: "denied".to_string(),
-                message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
-            };
-        }
-
         match &request.kind {
             HostcallKind::Tool { name } => {
                 self.dispatch_tool(&request.call_id, name, request.payload.clone())
@@ -13345,6 +13343,71 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.error.is_none());
         assert_eq!(result.output["content"], "file data");
+    }
+
+    // ── O4 guardrail: policy_lookup must be called exactly once per dispatch ──
+
+    #[test]
+    fn policy_lookup_called_once_per_dispatch_and_complete() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            std::fs::write(temp_dir.path().join("test.txt"), "O4 guardrail").expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.tool("read", { path: "test.txt" }).then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["read"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            // Reset counter before the dispatch under test.
+            dispatcher.policy_lookup_count.set(0);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            assert_eq!(
+                dispatcher.policy_lookup_count.get(),
+                1,
+                "O4 guardrail: policy_lookup must be called exactly once per dispatch, \
+                 not twice (redundant check in dispatch_hostcall_fast was removed)"
+            );
+
+            // Verify the dispatch still produced the correct result.
+            let _stats = runtime.tick().await.expect("tick");
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("Promise not resolved");
+                    if (!JSON.stringify(globalThis.result).includes("O4 guardrail")) {
+                        throw new Error("Wrong result: " + JSON.stringify(globalThis.result));
+                    }
+                "#,
+                )
+                .await
+                .expect("O4: dispatch result must be correct after single policy check");
+        });
     }
 
     // ── Property tests ──
