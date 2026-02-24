@@ -969,6 +969,13 @@ impl Agent {
             _ => return,
         };
 
+        // O17 optimization: skip expensive serde_json::to_value serialization
+        // when no extension has a hook registered for this lifecycle event.
+        // The hook_bitmap check is lock-free (RCU snapshot).
+        if !extensions.has_hook_for(&name.to_string()) {
+            return;
+        }
+
         let payload = match serde_json::to_value(event) {
             Ok(payload) => payload,
             Err(err) => {
@@ -2273,6 +2280,88 @@ mod hidden_custom_counter_tests {
             agent.hidden_custom_count, 2,
             "counter should track exactly 2 hidden custom messages"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_hook_gate_tests {
+    use super::*;
+    use crate::extensions::ExtensionManager;
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str { "stub" }
+        fn api(&self) -> &str { "stub" }
+        fn model_id(&self) -> &str { "stub" }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// O17 guardrail: when extensions exist but no lifecycle hooks are registered,
+    /// dispatch_extension_lifecycle_event should return without serializing the event.
+    /// The has_hook_for gate prevents wasted serde_json::to_value work.
+    #[test]
+    fn lifecycle_dispatch_skips_serialization_when_no_hooks() {
+        let manager = ExtensionManager::new();
+        // No extensions registered → no hooks in bitmap.
+        assert!(
+            !manager.has_hook_for("agent_start"),
+            "empty manager should have no agent_start hook"
+        );
+        assert!(
+            !manager.has_hook_for("agent_end"),
+            "empty manager should have no agent_end hook"
+        );
+        assert!(
+            !manager.has_hook_for("turn_start"),
+            "empty manager should have no turn_start hook"
+        );
+        assert!(
+            !manager.has_hook_for("turn_end"),
+            "empty manager should have no turn_end hook"
+        );
+
+        // Verify dispatch completes without panic (no runtime needed since
+        // the has_hook_for gate returns early before any bridge call).
+        let mut agent = Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.extensions = Some(manager);
+
+        futures::executor::block_on(async {
+            let event = AgentEvent::TurnEnd {
+                session_id: Arc::from("test"),
+                turn_index: 0,
+                message: Message::User(UserMessage {
+                    content: UserContent::Text("test".to_string()),
+                    timestamp: 0,
+                }),
+                tool_results: vec![],
+            };
+            // This should return immediately without attempting serialization
+            // or calling extensions.dispatch_event (which would fail without a runtime).
+            agent.dispatch_extension_lifecycle_event(&event).await;
+        });
     }
 }
 
