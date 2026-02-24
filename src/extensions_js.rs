@@ -1423,7 +1423,7 @@ pub fn validate_proposal(
             if let PatchOp::ReplaceModulePath { from, .. } = op {
                 paths_to_check.push(from.clone());
             }
-            
+
             for path_str in paths_to_check {
                 let target = Path::new(&path_str);
                 let resolved = if target.is_absolute() {

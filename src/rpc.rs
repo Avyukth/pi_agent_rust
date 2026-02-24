@@ -43,6 +43,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Maximum number of pending output messages in the RPC output channel.
+/// Bounds memory to ~5 MB max (256 × ~20 KB worst-case per browser tool result).
+const RPC_OUTPUT_CHANNEL_BOUND: usize = 256;
+
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
@@ -257,7 +261,7 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     );
 
     let (in_tx, in_rx) = mpsc::channel::<String>(1024);
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -2959,15 +2963,12 @@ fn session_state(
         .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
         .count();
 
-    let session_name = entries
-        .iter()
-        .rev()
-        .find_map(|entry| {
-            let crate::session::SessionEntry::SessionInfo(info) = entry else {
-                return None;
-            };
-            info.name.clone()
-        });
+    let session_name = entries.iter().rev().find_map(|entry| {
+        let crate::session::SessionEntry::SessionInfo(info) = entry else {
+            return None;
+        };
+        info.name.clone()
+    });
 
     let mut state = serde_json::Map::new();
     state.insert("model".to_string(), model.unwrap_or(Value::Null));
@@ -5002,5 +5003,50 @@ mod tests {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+}
+
+#[cfg(test)]
+mod output_channel_bound_tests {
+    use super::*;
+
+    #[test]
+    fn output_channel_applies_backpressure_at_bound() {
+        // Guardrail: the RPC output channel must be bounded at RPC_OUTPUT_CHANNEL_BOUND.
+        // When the buffer is full, try_send must return Full (backpressure).
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+
+        // Fill the channel to capacity.
+        for i in 0..RPC_OUTPUT_CHANNEL_BOUND {
+            tx.send(format!("msg-{i}")).expect("send within bound should succeed");
+        }
+
+        // The next try_send must report Full — proves the channel is bounded.
+        let err = tx.try_send("overflow".to_string()).unwrap_err();
+        assert!(
+            matches!(err, std::sync::mpsc::TrySendError::Full(_)),
+            "expected TrySendError::Full, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn output_channel_bound_matches_constant() {
+        assert_eq!(RPC_OUTPUT_CHANNEL_BOUND, 256);
+    }
+
+    #[test]
+    fn output_channel_drains_after_backpressure() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+
+        // Fill to capacity.
+        for i in 0..RPC_OUTPUT_CHANNEL_BOUND {
+            tx.send(format!("msg-{i}")).unwrap();
+        }
+
+        // Drain one slot.
+        let _ = rx.recv().unwrap();
+
+        // Now one more send should succeed.
+        tx.send("after-drain".to_string()).expect("send after drain should succeed");
     }
 }

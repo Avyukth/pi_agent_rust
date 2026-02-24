@@ -1709,7 +1709,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         extension_id: Option<&str>,
     ) -> (PolicyCheck, &'static str) {
         #[cfg(test)]
-        self.policy_lookup_count.set(self.policy_lookup_count.get() + 1);
+        self.policy_lookup_count
+            .set(self.policy_lookup_count.get() + 1);
         (
             self.snapshot.lookup(capability, extension_id),
             policy_lookup_path(capability),

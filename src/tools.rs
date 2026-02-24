@@ -1246,9 +1246,7 @@ impl ToolRegistry {
 
     /// Find a tool by name (O(1) HashMap lookup).
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.index
-            .get(name)
-            .map(|&idx| self.tools[idx].as_ref())
+        self.index.get(name).map(|&idx| self.tools[idx].as_ref())
     }
 }
 
