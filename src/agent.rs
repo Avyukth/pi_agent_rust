@@ -251,7 +251,7 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        args: serde_json::Value,
+        args: std::sync::Arc<serde_json::Value>,
     },
     /// Tool execution update.
     ToolExecutionUpdate {
@@ -259,7 +259,7 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        args: serde_json::Value,
+        args: std::sync::Arc<serde_json::Value>,
         #[serde(rename = "partialResult")]
         partial_result: ToolOutput,
     },
@@ -1354,7 +1354,7 @@ impl Agent {
                             msg.content.push(ContentBlock::ToolCall(ToolCall {
                                 id: String::new(),
                                 name: String::new(),
-                                arguments: serde_json::Value::Null,
+                                arguments: std::sync::Arc::new(serde_json::Value::Null),
                                 thought_signature: None,
                             }));
                         }
@@ -1841,7 +1841,7 @@ impl Agent {
         match tool
             .execute(
                 &tool_call.id,
-                tool_call.arguments.clone(),
+                (*tool_call.arguments).clone(),
                 Some(Box::new(update_callback)),
             )
             .await
@@ -2830,13 +2830,13 @@ mod extensions_integration_tests {
                     ToolCall {
                         id: "call-1".to_string(),
                         name: "count_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     },
                     ToolCall {
                         id: "call-2".to_string(),
                         name: "count_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     },
                 ];
@@ -3300,7 +3300,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3362,7 +3362,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3410,7 +3410,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3460,7 +3460,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3511,7 +3511,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "bash".to_string(),
-                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                arguments: std::sync::Arc::new(json!({ "command": "printf 'hi' > blocked.txt" })),
                 thought_signature: None,
             };
 
@@ -3581,7 +3581,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3646,7 +3646,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "missing_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3707,7 +3707,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3779,7 +3779,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -4013,7 +4013,7 @@ mod abort_tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "call-1".to_string(),
                     name: "hanging_tool".to_string(),
-                    arguments: json!({}),
+                    arguments: std::sync::Arc::new(json!({})),
                     thought_signature: None,
                 })],
                 api: "test-api".to_string(),
@@ -4617,7 +4617,7 @@ mod turn_event_tests {
                     vec![ContentBlock::ToolCall(ToolCall {
                         id: "tool-1".to_string(),
                         name: "echo_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     })],
                 )
@@ -6034,14 +6034,14 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "tc1".to_string(),
                 name: "read".to_string(),
-                arguments: serde_json::json!({"path": "file.txt"}),
+                arguments: std::sync::Arc::new(serde_json::json!({"path": "file.txt"})),
                 thought_signature: None,
             }),
             ContentBlock::Text(TextContent::new("World")),
             ContentBlock::ToolCall(ToolCall {
                 id: "tc2".to_string(),
                 name: "bash".to_string(),
-                arguments: serde_json::json!({"command": "ls"}),
+                arguments: std::sync::Arc::new(serde_json::json!({"command": "ls"})),
                 thought_signature: None,
             }),
         ];

@@ -575,7 +575,7 @@ mod tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "hello_tool".to_string(),
-                arguments: json!({ "name": "pi" }),
+                arguments: std::sync::Arc::new(json!({ "name": "pi" })),
                 thought_signature: None,
             };
 

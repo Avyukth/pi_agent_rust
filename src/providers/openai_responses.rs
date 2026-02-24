@@ -531,7 +531,7 @@ where
                     self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                         id: call_id.clone(),
                         name: name.clone(),
-                        arguments: serde_json::Value::Null,
+                        arguments: std::sync::Arc::new(serde_json::Value::Null),
                         thought_signature: None,
                     }));
 
@@ -639,7 +639,7 @@ where
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: call_id.to_string(),
                     name: name.to_string(),
-                    arguments: serde_json::Value::Null,
+                    arguments: std::sync::Arc::new(serde_json::Value::Null),
                     thought_signature: None,
                 }));
                 ToolCallState {
@@ -666,7 +666,7 @@ where
             tool_call: ToolCall {
                 id: tc.call_id.clone(),
                 name: tc.name.clone(),
-                arguments: parsed_args.clone(),
+                arguments: std::sync::Arc::new(parsed_args.clone()),
                 thought_signature: None,
             },
         });
@@ -675,7 +675,7 @@ where
         {
             block.id = tc.call_id;
             block.name = tc.name;
-            block.arguments = parsed_args;
+            block.arguments = std::sync::Arc::new(parsed_args);
         }
     }
 
@@ -1300,7 +1300,7 @@ mod tests {
             .expect("tool call end");
         assert_eq!(tool_end.id, "call_2");
         assert_eq!(tool_end.name, "search");
-        assert_eq!(tool_end.arguments, json!({ "q": "rust" }));
+        assert_eq!(*tool_end.arguments, json!({ "q": "rust" }));
     }
 
     #[test]

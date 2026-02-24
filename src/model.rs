@@ -181,12 +181,16 @@ pub struct ImageContent {
 }
 
 /// Tool call content block.
+///
+/// O13: `arguments` is `Arc<Value>` to avoid deep-cloning large JSON
+/// trees during the 5-step tool-execution lifecycle (event emission,
+/// hook dispatch, callback capture, update relay, tool.execute).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    pub arguments: serde_json::Value,
+    pub arguments: std::sync::Arc<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
 }
@@ -900,7 +904,7 @@ mod tests {
         let block = ContentBlock::ToolCall(ToolCall {
             id: "tc_1".to_string(),
             name: "read".to_string(),
-            arguments: json!({"path": "/tmp/test.txt"}),
+            arguments: std::sync::Arc::new(json!({"path": "/tmp/test.txt"})),
             thought_signature: None,
         });
         let json = serde_json::to_string(&block).expect("serialize");
@@ -913,6 +917,38 @@ mod tests {
             }
             _ => panic!("expected ToolCall"),
         }
+    }
+
+    /// O13 guardrail: ToolCall.arguments is Arc<Value>, so clone is
+    /// a cheap refcount bump, not a deep JSON tree copy.
+    #[test]
+    fn tool_call_arguments_clone_shares_arc() {
+        let tc = ToolCall {
+            id: "t1".to_string(),
+            name: "big_tool".to_string(),
+            arguments: std::sync::Arc::new(json!({"data": "large_payload"})),
+            thought_signature: None,
+        };
+        let cloned = tc.clone();
+        // Arc::ptr_eq proves the clone shares the same heap allocation.
+        assert!(
+            std::sync::Arc::ptr_eq(&tc.arguments, &cloned.arguments),
+            "ToolCall clone should share the same Arc<Value>, not deep-copy"
+        );
+    }
+
+    /// O13 guardrail: serde roundtrip preserves the Value inside Arc.
+    #[test]
+    fn tool_call_arc_arguments_serde_roundtrip() {
+        let tc = ToolCall {
+            id: "t1".to_string(),
+            name: "read".to_string(),
+            arguments: std::sync::Arc::new(json!({"path": "/tmp/x", "nested": [1,2,3]})),
+            thought_signature: None,
+        };
+        let json = serde_json::to_string(&tc).expect("serialize");
+        let parsed: ToolCall = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(*tc.arguments, *parsed.arguments);
     }
 
     #[test]
@@ -1116,7 +1152,7 @@ mod tests {
         let tc = ToolCall {
             id: "t1".to_string(),
             name: "read".to_string(),
-            arguments: json!({}),
+            arguments: std::sync::Arc::new(json!({})),
             thought_signature: None,
         };
         let json = serde_json::to_string(&tc).expect("serialize");
@@ -1464,7 +1500,7 @@ mod tests {
             .prop_map(|(id, name, arguments, thought_signature)| ToolCall {
                 id,
                 name,
-                arguments,
+                arguments: std::sync::Arc::new(arguments),
                 thought_signature,
             })
     }

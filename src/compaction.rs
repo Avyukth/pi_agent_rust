@@ -1212,7 +1212,7 @@ mod tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "call_1".to_string(),
                     name: name.to_string(),
-                    arguments: args,
+                    arguments: std::sync::Arc::new(args),
                     thought_signature: None,
                 })],
                 api: String::new(),
@@ -1904,7 +1904,7 @@ mod tests {
             content: vec![ContentBlock::ToolCall(ToolCall {
                 id: "c1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/main.rs"}),
+                arguments: std::sync::Arc::new(json!({"path": "/main.rs"})),
                 thought_signature: None,
             })],
             api: String::new(),

@@ -48253,7 +48253,7 @@ mod tests {
             let tool_call = crate::model::ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/tmp/test"}),
+                arguments: std::sync::Arc::new(json!({"path": "/tmp/test"})),
                 thought_signature: None,
             };
             let result = mgr.dispatch_tool_call(&tool_call, 5_000).await;
@@ -48269,7 +48269,7 @@ mod tests {
             let tool_call = crate::model::ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/tmp/test"}),
+                arguments: std::sync::Arc::new(json!({"path": "/tmp/test"})),
                 thought_signature: None,
             };
             let output = crate::tools::ToolOutput {

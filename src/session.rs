@@ -6641,7 +6641,7 @@ mod tests {
                 ContentBlock::ToolCall(crate::model::ToolCall {
                     id: "call_abc".to_string(),
                     name: "read".to_string(),
-                    arguments: serde_json::json!({"path": "src/main.rs"}),
+                    arguments: std::sync::Arc::new(serde_json::json!({"path": "src/main.rs"})),
                     thought_signature: None,
                 }),
             ],

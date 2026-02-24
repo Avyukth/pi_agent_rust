@@ -431,7 +431,7 @@ where
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: tc.id.clone(),
                     name: tc.function.name.clone(),
-                    arguments: serde_json::Value::Null,
+                    arguments: std::sync::Arc::new(serde_json::Value::Null),
                     thought_signature: None,
                 }));
 
@@ -482,7 +482,7 @@ where
                         tool_call: ToolCall {
                             id: active.id,
                             name: active.name,
-                            arguments: parsed_args.clone(),
+                            arguments: std::sync::Arc::new(parsed_args.clone()),
                             thought_signature: None,
                         },
                     });
@@ -490,7 +490,7 @@ where
                     if let Some(ContentBlock::ToolCall(block)) =
                         self.partial.content.get_mut(active.content_index)
                     {
-                        block.arguments = parsed_args;
+                        block.arguments = std::sync::Arc::new(parsed_args);
                     }
                 }
             }
@@ -1482,7 +1482,7 @@ mod tests {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
-                        arguments: serde_json::json!({"path": "/tmp/a.txt"}),
+                        arguments: std::sync::Arc::new(serde_json::json!({"path": "/tmp/a.txt"})),
                         thought_signature: None,
                     })],
                     api: "cohere-chat".to_string(),
