@@ -185,7 +185,16 @@ impl ChromeBridge {
             if records.is_empty() {
                 last_error = Some(ChromeBridgeError::NoHostsFound);
             } else {
-                for record in records {
+                let (candidate_records, all_busy) = self.select_connect_candidates(records);
+                if candidate_records.is_empty() {
+                    last_error = Some(if all_busy {
+                        ChromeBridgeError::AllHostsBusy
+                    } else {
+                        ChromeBridgeError::NoHostsFound
+                    });
+                }
+
+                for record in candidate_records {
                     match self.connect_to_record(&record).await {
                         Ok(()) => {
                             self.reset_failure_streak();
@@ -214,8 +223,17 @@ impl ChromeBridge {
             }
         }
 
+        let err = last_error.unwrap_or(ChromeBridgeError::NoHostsFound);
+        if matches!(
+            &err,
+            ChromeBridgeError::AllHostsBusy | ChromeBridgeError::AuthBusy { .. }
+        ) {
+            self.set_state(ConnectionState::Disconnected);
+            return Err(err);
+        }
+
         self.record_failure();
-        Err(last_error.unwrap_or(ChromeBridgeError::NoHostsFound))
+        Err(err)
     }
 
     pub async fn connect_to_record(
@@ -266,11 +284,15 @@ impl ChromeBridge {
     pub fn discover_hosts(&self) -> Result<Vec<DiscoveryRecord>, ChromeBridgeError> {
         let now_ms = unix_time_ms();
         let pinned_host_id = self.status().pinned_host_id;
-        discover_hosts_in_dir(
+        let discovered = discover_hosts_in_dir(
             &self.config.discovery_dir,
             now_ms,
             pinned_host_id.as_deref(),
-        )
+        )?;
+        Ok(discovered
+            .into_iter()
+            .filter(|record| self.discovery_record_is_compatible(record))
+            .collect())
     }
 
     #[must_use]
@@ -503,6 +525,41 @@ impl ChromeBridge {
             .ok_or(ChromeBridgeError::NotConnected)
     }
 
+    fn discovery_record_is_compatible(&self, record: &DiscoveryRecord) -> bool {
+        protocol_ranges_overlap(
+            record.protocol_min,
+            record.protocol_max,
+            protocol::PROTOCOL_MIN_SUPPORTED,
+            protocol::PROTOCOL_MAX_SUPPORTED,
+        ) && self
+            .config
+            .want_capabilities
+            .iter()
+            .all(|cap| record.capabilities.iter().any(|have| have == cap))
+    }
+
+    fn select_connect_candidates(
+        &self,
+        records: Vec<DiscoveryRecord>,
+    ) -> (Vec<DiscoveryRecord>, bool) {
+        let mut candidates = Vec::new();
+        let mut saw_busy = false;
+
+        for record in records {
+            if let Some(claimed_by) = &record.claimed_by {
+                let claimed_by_other = claimed_by.pi_session_id != self.config.pi_session_id
+                    || claimed_by.client_instance_id != self.config.client_instance_id;
+                if claimed_by_other {
+                    saw_busy = true;
+                    continue;
+                }
+            }
+            candidates.push(record);
+        }
+
+        (candidates, saw_busy)
+    }
+
     fn ensure_request_id_fingerprint(
         &self,
         host_epoch: &str,
@@ -712,7 +769,21 @@ pub struct DiscoveryRecord {
 impl DiscoveryRecord {
     #[must_use]
     pub fn is_expired(&self, now_ms: i64) -> bool {
-        self.expires_at_ms.is_some_and(|ts| ts <= now_ms)
+        self.lease_expires_at_ms.is_some_and(|ts| ts <= now_ms)
+            || self.expires_at_ms.is_some_and(|ts| ts <= now_ms)
+    }
+
+    #[must_use]
+    pub fn has_valid_security_fields(&self) -> bool {
+        let ids_valid = !self.host_id.trim().is_empty() && !self.host_epoch.trim().is_empty();
+        let token_valid = !self.token.trim().is_empty();
+        let socket_valid = self.socket_path.is_absolute();
+        let claim_valid = self.claimed_by.as_ref().map_or(true, |claim| {
+            !claim.pi_session_id.trim().is_empty() && !claim.client_instance_id.trim().is_empty()
+        });
+        let protocol_range_valid = self.protocol_min <= self.protocol_max;
+
+        ids_valid && token_valid && socket_valid && claim_valid && protocol_range_valid
     }
 }
 
@@ -730,6 +801,8 @@ pub enum ChromeBridgeError {
     BrowserToolsDisabled,
     #[error("no valid chrome host discovery records found")]
     NoHostsFound,
+    #[error("all discovered chrome hosts are claimed by other sessions")]
+    AllHostsBusy,
     #[error("failed to read discovery directory {path}: {source}")]
     DiscoveryDirRead {
         path: PathBuf,
@@ -807,6 +880,9 @@ fn discover_hosts_in_dir(
         if !name.starts_with(DISCOVERY_PREFIX) || !name.ends_with(DISCOVERY_SUFFIX) {
             continue;
         }
+        if !discovery_file_permissions_are_secure(&path) {
+            continue;
+        }
 
         let raw = fs::read(&path).map_err(|source| ChromeBridgeError::DiscoveryFileRead {
             path: path.clone(),
@@ -818,6 +894,10 @@ fn discover_hosts_in_dir(
                 source,
             }
         })?;
+        if !record.has_valid_security_fields() {
+            tracing::debug!("Skipping invalid discovery record in {:?}", path);
+            continue;
+        }
 
         if record.is_expired(now_ms) {
             continue;
@@ -833,6 +913,51 @@ fn discover_hosts_in_dir(
         discovered.sort_by_key(|record| if record.host_id == pinned { 0_u8 } else { 1_u8 });
     }
     Ok(discovered)
+}
+
+fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
+    if a_min > a_max || b_min > b_max {
+        return false;
+    }
+    a_min <= b_max && b_min <= a_max
+}
+
+fn discovery_file_permissions_are_secure(path: &Path) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::debug!("Skipping discovery file with unreadable metadata {:?}: {err}", path);
+            return false;
+        }
+    };
+
+    if !metadata.file_type().is_file() {
+        tracing::debug!("Skipping non-regular discovery file {:?}", path);
+        return false;
+    }
+
+    discovery_metadata_permissions_are_secure(path, &metadata)
+}
+
+#[cfg(unix)]
+fn discovery_metadata_permissions_are_secure(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        tracing::debug!(
+            "Skipping discovery file with insecure permissions {:?} mode {:o} (expected 600)",
+            path,
+            mode
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn discovery_metadata_permissions_are_secure(_: &Path, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 async fn write_message(
@@ -1034,6 +1159,16 @@ mod tests {
             serde_json::to_vec(record).expect("serialize discovery record"),
         )
         .expect("write discovery record");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(path)
+                .expect("stat discovery record")
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms).expect("chmod discovery record 0600");
+        }
     }
 
     fn make_record(socket_path: &Path, host_id: &str) -> DiscoveryRecord {
@@ -1568,6 +1703,141 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_hosts_filters_expired_lease_dead_socket_and_invalid_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid_socket = dir.path().join("valid.sock");
+        let lease_socket = dir.path().join("lease.sock");
+        let invalid_claim_socket = dir.path().join("invalid-claim.sock");
+        std::fs::write(&valid_socket, []).expect("create valid socket placeholder");
+        std::fs::write(&lease_socket, []).expect("create lease socket placeholder");
+        std::fs::write(&invalid_claim_socket, []).expect("create invalid-claim socket placeholder");
+
+        let valid = make_record(&valid_socket, "host-valid");
+        let mut lease_expired = make_record(&lease_socket, "host-lease-expired");
+        lease_expired.lease_expires_at_ms = Some(unix_time_ms() - 1);
+
+        let dead_socket_record =
+            make_record(&dir.path().join("missing.sock"), "host-dead-socket");
+
+        let mut invalid_claim = make_record(&invalid_claim_socket, "host-invalid-claim");
+        invalid_claim.claimed_by = Some(protocol::ClaimedBy {
+            pi_session_id: String::new(),
+            client_instance_id: "client-2".to_string(),
+        });
+
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-valid.discovery.json"),
+            &valid,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-lease-expired.discovery.json"),
+            &lease_expired,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-dead-socket.discovery.json"),
+            &dead_socket_record,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-invalid-claim.discovery.json"),
+            &invalid_claim,
+        );
+
+        let discovered = discover_hosts_in_dir(dir.path(), unix_time_ms(), None)
+            .expect("discover hosts should succeed");
+        let discovered_ids: Vec<_> = discovered.into_iter().map(|r| r.host_id).collect();
+
+        assert_eq!(
+            discovered_ids,
+            vec!["host-valid".to_string()],
+            "discovery must reject expired lease, dead socket, and invalid claim metadata"
+        );
+    }
+
+    #[test]
+    fn test_discover_hosts_applies_protocol_and_capability_compatibility_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ok_socket = dir.path().join("ok.sock");
+        let proto_socket = dir.path().join("proto.sock");
+        let caps_socket = dir.path().join("caps.sock");
+        std::fs::write(&ok_socket, []).expect("create ok socket placeholder");
+        std::fs::write(&proto_socket, []).expect("create proto socket placeholder");
+        std::fs::write(&caps_socket, []).expect("create caps socket placeholder");
+
+        let ok_record = make_record(&ok_socket, "host-ok");
+        let mut proto_mismatch = make_record(&proto_socket, "host-proto-mismatch");
+        proto_mismatch.protocol_min = protocol::PROTOCOL_MAX_SUPPORTED.saturating_add(1);
+        proto_mismatch.protocol_max = proto_mismatch.protocol_min;
+
+        let mut missing_caps = make_record(&caps_socket, "host-missing-caps");
+        missing_caps.capabilities = vec!["browser_tools".to_string()];
+
+        write_discovery_record(
+            &dir.path().join("pi-chrome-host-host-ok.discovery.json"),
+            &ok_record,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-proto-mismatch.discovery.json"),
+            &proto_mismatch,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-missing-caps.discovery.json"),
+            &missing_caps,
+        );
+
+        let bridge = ChromeBridge::new(ChromeBridgeConfig {
+            pi_session_id: "session-1".to_string(),
+            client_instance_id: "client-1".to_string(),
+            discovery_dir: dir.path().to_path_buf(),
+            want_capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+            max_reconnect_attempts: 1,
+            reconnect_backoff_ms: 1,
+        });
+
+        let discovered = bridge
+            .discover_hosts()
+            .expect("discover_hosts should apply compatibility filtering");
+        let discovered_ids: Vec<_> = discovered.into_iter().map(|r| r.host_id).collect();
+
+        assert_eq!(
+            discovered_ids,
+            vec!["host-ok".to_string()],
+            "protocol/capability incompatible records must be filtered before connect"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_hosts_skips_insecure_permission_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("host.sock");
+        std::fs::write(&socket_path, []).expect("create socket placeholder");
+        let record = make_record(&socket_path, "host-1");
+        let record_path = dir.path().join("pi-chrome-host-host-1.discovery.json");
+        write_discovery_record(&record_path, &record);
+
+        let mut perms = std::fs::metadata(&record_path)
+            .expect("stat discovery file")
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&record_path, perms).expect("chmod insecure");
+
+        let discovered = discover_hosts_in_dir(dir.path(), unix_time_ms(), None)
+            .expect("discovery scan should continue when a file is insecure");
+        assert!(
+            discovered.is_empty(),
+            "discovery must skip files with non-0600 permissions because token is embedded"
+        );
+    }
+
+    #[test]
     fn test_chrome_bridge_connect_success_and_disconnect() {
         run_async(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
@@ -1972,6 +2242,55 @@ mod tests {
             );
 
             server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_connect_returns_all_hosts_busy_when_claimed_by_others() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("busy-only.sock");
+            std::fs::write(&socket_path, []).expect("create placeholder socket");
+            let mut record = make_record(&socket_path, "host-busy-only");
+            record.claimed_by = Some(protocol::ClaimedBy {
+                pi_session_id: "other-session".to_string(),
+                client_instance_id: "other-client".to_string(),
+            });
+            write_discovery_record(
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-busy-only.discovery.json"),
+                &record,
+            );
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 1,
+                reconnect_backoff_ms: 1,
+            });
+
+            let err = bridge
+                .connect()
+                .await
+                .expect_err("all foreign-claimed hosts should return busy without binding");
+            assert!(
+                matches!(err, ChromeBridgeError::AllHostsBusy),
+                "expected AllHostsBusy when no unclaimed compatible hosts are available, got {err:?}"
+            );
+
+            let status = bridge.status();
+            assert_eq!(
+                status.state,
+                ConnectionState::Disconnected,
+                "busy contention should not leave bridge in connecting state"
+            );
+            assert_eq!(
+                status.consecutive_failures, 0,
+                "busy contention should not count as a transport failure"
+            );
         });
     }
 
