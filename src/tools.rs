@@ -1163,9 +1163,19 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    index: HashMap<String, usize>,
 }
 
 impl ToolRegistry {
+    /// Build the name→index HashMap from the current tool Vec.
+    fn build_index(tools: &[Box<dyn Tool>]) -> HashMap<String, usize> {
+        tools
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.name().to_string(), i))
+            .collect()
+    }
+
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
@@ -1197,12 +1207,14 @@ impl ToolRegistry {
             }
         }
 
-        Self { tools }
+        let index = Self::build_index(&tools);
+        Self { tools, index }
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { tools }
+        let index = Self::build_index(&tools);
+        Self { tools, index }
     }
 
     /// Convert the registry into the owned tool list.
@@ -1212,6 +1224,8 @@ impl ToolRegistry {
 
     /// Append a tool.
     pub fn push(&mut self, tool: Box<dyn Tool>) {
+        let idx = self.tools.len();
+        self.index.insert(tool.name().to_string(), idx);
         self.tools.push(tool);
     }
 
@@ -1220,7 +1234,9 @@ impl ToolRegistry {
     where
         I: IntoIterator<Item = Box<dyn Tool>>,
     {
-        self.tools.extend(tools);
+        for tool in tools {
+            self.push(tool);
+        }
     }
 
     /// Get all tools.
@@ -1228,12 +1244,11 @@ impl ToolRegistry {
         &self.tools
     }
 
-    /// Find a tool by name.
+    /// Find a tool by name (O(1) HashMap lookup).
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
-            .map(std::convert::AsRef::as_ref)
+        self.index
+            .get(name)
+            .map(|&idx| self.tools[idx].as_ref())
     }
 }
 
@@ -6735,5 +6750,65 @@ mod tests {
             // Expect: "line1\r\nchanged\r\nline3"
             assert_eq!(new_content, "line1\r\nchanged\r\nline3");
         });
+    }
+
+    #[test]
+    fn test_tool_registry_hashmap_get_returns_same_as_linear_scan() {
+        let registry = ToolRegistry::new(
+            &["read", "bash", "edit", "write", "grep", "find", "ls"],
+            Path::new("."),
+            None,
+        );
+
+        // Every registered tool must be findable by name
+        for tool in registry.tools() {
+            let found = registry.get(tool.name());
+            assert!(
+                found.is_some(),
+                "get({}) returned None for a registered tool",
+                tool.name()
+            );
+            assert_eq!(
+                found.unwrap().name(),
+                tool.name(),
+                "get({}) returned wrong tool",
+                tool.name()
+            );
+        }
+
+        // Non-existent tools must return None
+        assert!(
+            registry.get("nonexistent_tool_xyz").is_none(),
+            "get() should return None for non-existent tool"
+        );
+    }
+
+    #[test]
+    fn test_tool_registry_push_updates_index() {
+        let mut registry = ToolRegistry::new(&["read"], Path::new("."), None);
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("bash").is_none());
+
+        // Push a new tool and verify it's findable
+        registry.push(Box::new(BashTool::with_shell(Path::new("."), None, None)));
+        assert!(
+            registry.get("bash").is_some(),
+            "pushed tool should be findable via get()"
+        );
+        assert_eq!(registry.tools().len(), 2);
+    }
+
+    #[test]
+    fn test_tool_registry_from_tools_builds_index() {
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ReadTool::with_settings(Path::new("."), false, false)),
+            Box::new(EditTool::new(Path::new("."))),
+        ];
+        let registry = ToolRegistry::from_tools(tools);
+
+        assert!(registry.get("read").is_some());
+        assert!(registry.get("edit").is_some());
+        assert!(registry.get("nonexistent").is_none());
+        assert_eq!(registry.tools().len(), 2);
     }
 }
