@@ -1628,4 +1628,153 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_native_host_run_with_io_handles_multiple_request_cycles_with_observations() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let request1 = sample_request();
+            let request2 = protocol::MessageType::Request(protocol::Request {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: "req-e2e-2".to_string(),
+                op: "tabs_context".to_string(),
+                payload: serde_json::json!({"tabId": 456}),
+            });
+
+            let observation1 = protocol::MessageType::Observation(protocol::ObservationEvent {
+                version: protocol::PROTOCOL_VERSION_V1,
+                observer_id: "observer-cycle-1".to_string(),
+                events: vec![protocol::ObservationEntry {
+                    kind: "navigation".to_string(),
+                    message: Some("navigated".to_string()),
+                    source: Some("page".to_string()),
+                    url: Some("https://one.test".to_string()),
+                    ts: unix_time_ms(),
+                }],
+            });
+            let response1 = sample_response_for("req-e2e-1");
+            let observation2 = protocol::MessageType::Observation(protocol::ObservationEvent {
+                version: protocol::PROTOCOL_VERSION_V1,
+                observer_id: "observer-cycle-2".to_string(),
+                events: vec![protocol::ObservationEntry {
+                    kind: "load_complete".to_string(),
+                    message: Some("loaded".to_string()),
+                    source: Some("page".to_string()),
+                    url: Some("https://two.test".to_string()),
+                    ts: unix_time_ms(),
+                }],
+            });
+            let response2 = sample_response_for("req-e2e-2");
+
+            let mut chrome_in = Vec::new();
+            write_native_messaging_message(&mut chrome_in, &observation1)
+                .expect("encode observation1");
+            write_native_messaging_message(&mut chrome_in, &response1).expect("encode response1");
+            write_native_messaging_message(&mut chrome_in, &observation2)
+                .expect("encode observation2");
+            write_native_messaging_message(&mut chrome_in, &response2).expect("encode response2");
+            let mut chrome_reader = std::io::Cursor::new(chrome_in);
+            let mut chrome_writer = Vec::new();
+
+            let socket_path = host.socket_path().to_path_buf();
+            let request1_for_client = request1.clone();
+            let request2_for_client = request2.clone();
+            let observation1_for_client = observation1.clone();
+            let observation2_for_client = observation2.clone();
+            let response1_for_client = response1.clone();
+            let response2_for_client = response2.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone client stream for reads"),
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                let handshake = read_frame(&mut reader);
+
+                send_frame(&mut stream, &request1_for_client);
+                let cycle1_obs = read_frame(&mut reader);
+                let cycle1_resp = read_frame(&mut reader);
+
+                send_frame(&mut stream, &request2_for_client);
+                let cycle2_obs = read_frame(&mut reader);
+                let cycle2_resp = read_frame(&mut reader);
+
+                (
+                    handshake,
+                    cycle1_obs,
+                    cycle1_resp,
+                    cycle2_obs,
+                    cycle2_resp,
+                    observation1_for_client,
+                    response1_for_client,
+                    observation2_for_client,
+                    response2_for_client,
+                )
+            });
+
+            let outcome = host
+                .run_with_io(&mut chrome_reader, &mut chrome_writer)
+                .await
+                .expect("run_with_io should process multiple relay cycles and exit on disconnect");
+            assert_eq!(
+                outcome,
+                NativeHostRunOutcome::AgentConnected,
+                "host should record that an agent connected for multi-cycle relay"
+            );
+
+            let (
+                client_handshake,
+                cycle1_obs,
+                cycle1_resp,
+                cycle2_obs,
+                cycle2_resp,
+                observation1_expected,
+                response1_expected,
+                observation2_expected,
+                response2_expected,
+            ) = client.join().expect("client thread join");
+            assert!(
+                matches!(client_handshake, protocol::MessageType::AuthOk(_)),
+                "client must observe auth_ok before relay cycles begin"
+            );
+            assert_eq!(
+                cycle1_obs, observation1_expected,
+                "cycle 1 observation must be forwarded before cycle 1 response"
+            );
+            assert_eq!(
+                cycle1_resp, response1_expected,
+                "cycle 1 response must be forwarded after cycle 1 observation"
+            );
+            assert_eq!(
+                cycle2_obs, observation2_expected,
+                "cycle 2 observation must be forwarded before cycle 2 response"
+            );
+            assert_eq!(
+                cycle2_resp, response2_expected,
+                "cycle 2 response must be forwarded after cycle 2 observation"
+            );
+
+            let mut chrome_wire_reader = std::io::Cursor::new(chrome_writer);
+            let forwarded1 = read_native_messaging_message(&mut chrome_wire_reader)
+                .expect("decode forwarded request1");
+            let forwarded2 = read_native_messaging_message(&mut chrome_wire_reader)
+                .expect("decode forwarded request2");
+            assert_eq!(
+                forwarded1, request1,
+                "first agent request must be forwarded to chrome in order"
+            );
+            assert_eq!(
+                forwarded2, request2,
+                "second agent request must be forwarded to chrome in order"
+            );
+        });
+    }
 }
