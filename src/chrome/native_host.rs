@@ -209,6 +209,77 @@ impl NativeHost {
         Ok(response)
     }
 
+    pub async fn accept_claim_and_relay_single_exchange_for_test<R: IoRead, W: IoWrite>(
+        &mut self,
+        chrome_reader: &mut R,
+        chrome_writer: &mut W,
+    ) -> Result<
+        (
+            protocol::MessageType,
+            protocol::MessageType,
+            protocol::MessageType,
+        ),
+        NativeHostError,
+    > {
+        self.startup().await?;
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("listener initialized by startup");
+        let (stream, _addr) = listener
+            .accept()
+            .await
+            .map_err(|source| NativeHostError::Io {
+                path: self.socket_path.clone(),
+                source,
+            })?;
+
+        let mut agent_stream =
+            stream
+                .as_std()
+                .try_clone()
+                .map_err(|source| NativeHostError::Io {
+                    path: self.socket_path.clone(),
+                    source,
+                })?;
+        agent_stream
+            .set_nonblocking(false)
+            .map_err(|source| NativeHostError::Io {
+                path: self.socket_path.clone(),
+                source,
+            })?;
+
+        let inbound = read_agent_socket_message_blocking(&mut agent_stream)?;
+        let handshake = match inbound {
+            protocol::MessageType::AuthClaim(claim) => self.handle_auth_claim(claim)?,
+            _ => handshake_error_response(
+                protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                "first socket message must be auth_claim",
+                false,
+            ),
+        };
+        write_agent_socket_message_blocking(&mut agent_stream, &handshake)?;
+        if !matches!(handshake, protocol::MessageType::AuthOk(_)) {
+            return Ok((
+                handshake,
+                handshake_error_response(
+                    protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                    "relay skipped because auth failed",
+                    false,
+                ),
+                handshake_error_response(
+                    protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                    "relay skipped because auth failed",
+                    false,
+                ),
+            ));
+        }
+
+        let agent_message = relay_one_agent_message_to_chrome(&mut agent_stream, chrome_writer)?;
+        let chrome_message = relay_one_chrome_message_to_agent(chrome_reader, &mut agent_stream)?;
+        Ok((handshake, agent_message, chrome_message))
+    }
+
     pub fn handle_auth_claim(
         &mut self,
         claim: protocol::AuthClaim,
@@ -774,6 +845,24 @@ mod tests {
         }
     }
 
+    fn sample_request() -> protocol::MessageType {
+        protocol::MessageType::Request(protocol::Request {
+            version: protocol::PROTOCOL_VERSION_V1,
+            id: "req-e2e-1".to_string(),
+            op: "tabs_context".to_string(),
+            payload: serde_json::json!({"tabId": 123}),
+        })
+    }
+
+    fn sample_response_for(id: &str) -> protocol::MessageType {
+        protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(protocol::Response {
+            version: protocol::PROTOCOL_VERSION_V1,
+            id: id.to_string(),
+            ok: true,
+            result: serde_json::json!({"tabs": [{"id": 123, "url": "https://example.test"}]}),
+        }))
+    }
+
     fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
         let frame = protocol::encode_frame(message).expect("encode frame");
         stream.write_all(&frame).expect("write frame");
@@ -1103,5 +1192,80 @@ mod tests {
             decoded_second, observation,
             "chrome->agent relay must preserve second message ordering and type"
         );
+    }
+
+    #[test]
+    fn test_native_host_agent_to_chrome_roundtrip_relays_request_and_response() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let request = sample_request();
+            let response = sample_response_for("req-e2e-1");
+            let mut chrome_in = Vec::new();
+            write_native_messaging_message(&mut chrome_in, &response)
+                .expect("encode mock chrome response");
+            let mut chrome_reader = std::io::Cursor::new(chrome_in);
+            let mut chrome_writer = Vec::new();
+
+            let socket_path = host.socket_path().to_path_buf();
+            let request_for_client = request.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone client stream for reads"),
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                let handshake = read_frame(&mut reader);
+                send_frame(&mut stream, &request_for_client);
+                let relayed_response = read_frame(&mut reader);
+                (handshake, relayed_response)
+            });
+
+            let (handshake, forwarded_agent, forwarded_chrome) = host
+                .accept_claim_and_relay_single_exchange_for_test(
+                    &mut chrome_reader,
+                    &mut chrome_writer,
+                )
+                .await
+                .expect("host should complete auth + one relay exchange");
+
+            assert!(
+                matches!(handshake, protocol::MessageType::AuthOk(_)),
+                "server handshake should succeed"
+            );
+            assert_eq!(
+                forwarded_agent, request,
+                "host must relay the agent request to Chrome native messaging unchanged"
+            );
+            assert_eq!(
+                forwarded_chrome, response,
+                "host must relay the Chrome response back to the agent unchanged"
+            );
+
+            let mut chrome_wire_reader = std::io::Cursor::new(chrome_writer);
+            let decoded_forwarded_request = read_native_messaging_message(&mut chrome_wire_reader)
+                .expect("decode forwarded request from chrome writer");
+            assert_eq!(
+                decoded_forwarded_request, request,
+                "native messaging outbound bytes must encode the same request sent by agent"
+            );
+
+            let (client_handshake, client_response) = client.join().expect("client thread join");
+            assert!(
+                matches!(client_handshake, protocol::MessageType::AuthOk(_)),
+                "client should observe auth_ok over the socket"
+            );
+            assert_eq!(
+                client_response, response,
+                "client should receive the relayed Chrome response over the socket"
+            );
+        });
     }
 }
