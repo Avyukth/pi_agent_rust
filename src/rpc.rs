@@ -36,7 +36,7 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,9 +67,60 @@ pub struct RpcOptions {
     pub config: Config,
     pub resources: ResourceLoader,
     pub available_models: Vec<ModelEntry>,
+    /// V7-B: O(1) index for model lookup by (canonical_provider, model_id).
+    models_index: HashMap<(String, String), usize>,
     pub scoped_models: Vec<RpcScopedModel>,
     pub auth: AuthStorage,
     pub runtime_handle: RuntimeHandle,
+}
+
+impl RpcOptions {
+    pub fn new(
+        config: Config,
+        resources: ResourceLoader,
+        available_models: Vec<ModelEntry>,
+        scoped_models: Vec<RpcScopedModel>,
+        auth: AuthStorage,
+        runtime_handle: RuntimeHandle,
+    ) -> Self {
+        let models_index = build_models_index(&available_models);
+        Self {
+            config,
+            resources,
+            available_models,
+            models_index,
+            scoped_models,
+            auth,
+            runtime_handle,
+        }
+    }
+
+    /// O(1) model lookup by provider + model_id, using canonical provider normalization.
+    fn find_model(&self, provider: &str, model_id: &str) -> Option<&ModelEntry> {
+        let key = rpc_model_key(provider, model_id);
+        let idx = *self.models_index.get(&key)?;
+        self.available_models.get(idx)
+    }
+}
+
+/// Normalize a (provider, model_id) pair for HashMap lookup.
+/// Uses canonical_provider_id for provider aliasing, case-insensitive.
+fn rpc_model_key(provider: &str, model_id: &str) -> (String, String) {
+    let p = provider.trim();
+    let canonical = canonical_provider_id(p).unwrap_or(p);
+    (
+        canonical.to_ascii_lowercase(),
+        model_id.trim().to_ascii_lowercase(),
+    )
+}
+
+fn build_models_index(models: &[ModelEntry]) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::with_capacity(models.len());
+    for (i, entry) in models.iter().enumerate() {
+        let key = rpc_model_key(&entry.model.provider, &entry.model.id);
+        index.entry(key).or_insert(i);
+    }
+    index
 }
 
 #[derive(Debug, Clone)]
@@ -2593,14 +2644,14 @@ mod retry_tests {
                 .join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("auth load");
 
-            let options = RpcOptions {
+            let options = RpcOptions::new(
                 config,
-                resources: ResourceLoader::empty(false),
-                available_models: Vec::new(),
-                scoped_models: Vec::new(),
+                ResourceLoader::empty(false),
+                Vec::new(),
+                Vec::new(),
                 auth,
                 runtime_handle,
-            };
+            );
 
             run_prompt_with_retry(
                 session,
@@ -2695,14 +2746,14 @@ mod retry_tests {
                 .join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("auth load");
 
-            let options = RpcOptions {
+            let options = RpcOptions::new(
                 config,
-                resources: ResourceLoader::empty(false),
-                available_models: Vec::new(),
-                scoped_models: Vec::new(),
+                ResourceLoader::empty(false),
+                Vec::new(),
+                Vec::new(),
                 auth,
                 runtime_handle,
-            };
+            );
 
             let retry_abort_for_thread = Arc::clone(&retry_abort);
             let abort_thread = std::thread::spawn(move || {
@@ -2943,17 +2994,13 @@ fn session_state(
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
+    // V7-B: O(1) model lookup via HashMap index.
     let model = session
         .header
         .provider
         .as_deref()
         .zip(session.header.model_id.as_deref())
-        .and_then(|(provider, model_id)| {
-            options.available_models.iter().find(|m| {
-                provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-        })
+        .and_then(|(provider, model_id)| options.find_model(provider, model_id))
         .map(rpc_model_from_entry);
 
     // V7-A optimization: reuse a single path snapshot for both queries
@@ -3687,9 +3734,8 @@ fn current_model_entry<'a>(
 ) -> Option<&'a ModelEntry> {
     let provider = session.header.provider.as_deref()?;
     let model_id = session.header.model_id.as_deref()?;
-    options.available_models.iter().find(|m| {
-        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
-    })
+    // V7-B: O(1) lookup via HashMap index.
+    options.find_model(provider, model_id)
 }
 
 async fn apply_thinking_level(
@@ -3936,14 +3982,14 @@ mod tests {
             .join("auth.json");
         let auth = AuthStorage::load(auth_path).expect("auth load");
 
-        RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
+        RpcOptions::new(
+            Config::default(),
+            ResourceLoader::empty(false),
             available_models,
-            scoped_models: Vec::new(),
+            Vec::new(),
             auth,
             runtime_handle,
-        }
+        )
     }
 
     #[test]
@@ -5005,6 +5051,117 @@ mod tests {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+}
+
+#[cfg(test)]
+mod rpc_model_index_tests {
+    use super::*;
+    use crate::provider::{InputType, Model, ModelCost};
+
+    fn make_entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: provider.to_string(),
+                provider: provider.to_string(),
+                base_url: String::new(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 100_000,
+                max_tokens: 4096,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    #[test]
+    fn find_model_exact_match() {
+        let models = vec![
+            make_entry("anthropic", "claude-3-opus"),
+            make_entry("openai", "gpt-4"),
+        ];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("anthropic", "claude-3-opus");
+        assert_eq!(*index.get(&key).unwrap(), 0);
+        let key = rpc_model_key("openai", "gpt-4");
+        assert_eq!(*index.get(&key).unwrap(), 1);
+    }
+
+    #[test]
+    fn find_model_case_insensitive() {
+        let models = vec![make_entry("Anthropic", "Claude-3-Opus")];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("anthropic", "claude-3-opus");
+        assert!(index.contains_key(&key));
+        let key = rpc_model_key("ANTHROPIC", "CLAUDE-3-OPUS");
+        assert!(index.contains_key(&key));
+    }
+
+    #[test]
+    fn find_model_canonical_provider_alias() {
+        // "gemini" canonicalizes to "google"
+        let models = vec![make_entry("google", "gemini-pro")];
+        let index = build_models_index(&models);
+        // Looking up via alias should find it
+        let key = rpc_model_key("gemini", "gemini-pro");
+        assert!(
+            index.contains_key(&key),
+            "alias 'gemini' should match canonical 'google'"
+        );
+    }
+
+    #[test]
+    fn find_model_missing_returns_none() {
+        let models = vec![make_entry("anthropic", "claude-3-opus")];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("openai", "gpt-4");
+        assert!(index.get(&key).is_none());
+    }
+
+    #[test]
+    fn find_model_agrees_with_linear_scan() {
+        let models = vec![
+            make_entry("anthropic", "claude-3-opus"),
+            make_entry("openai", "gpt-4"),
+            make_entry("google", "gemini-pro"),
+        ];
+        let index = build_models_index(&models);
+
+        // Test cases: (lookup_provider, lookup_model_id)
+        let queries = [
+            ("anthropic", "claude-3-opus"),
+            ("ANTHROPIC", "Claude-3-Opus"),
+            ("openai", "GPT-4"),
+            ("gemini", "gemini-pro"), // alias
+            ("unknown", "model-x"),   // missing
+        ];
+
+        for (provider, model_id) in queries {
+            let linear = models.iter().find(|m| {
+                provider_ids_match(&m.model.provider, provider)
+                    && m.model.id.eq_ignore_ascii_case(model_id)
+            });
+            let key = rpc_model_key(provider, model_id);
+            let indexed = index.get(&key).map(|&idx| &models[idx]);
+            assert_eq!(
+                linear.map(|m| &m.model.id),
+                indexed.map(|m| &m.model.id),
+                "linear vs indexed mismatch for ({provider}, {model_id})"
+            );
+        }
     }
 }
 
