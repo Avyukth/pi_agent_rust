@@ -14,8 +14,8 @@ use asupersync::net::unix::{OwnedReadHalf, OwnedWriteHalf, UnixStream};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub mod protocol;
 pub mod native_host;
+pub mod protocol;
 
 const DEFAULT_DISCOVERY_DIR: &str = "/tmp";
 const DISCOVERY_PREFIX: &str = "pi-chrome-host-";

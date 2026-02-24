@@ -151,9 +151,14 @@ impl NativeHost {
         Ok(())
     }
 
-    pub async fn run_until_idle_for_test(&mut self) -> Result<NativeHostRunOutcome, NativeHostError> {
+    pub async fn run_until_idle_for_test(
+        &mut self,
+    ) -> Result<NativeHostRunOutcome, NativeHostError> {
         self.startup().await?;
-        let listener = self.listener.as_ref().expect("listener initialized by startup");
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("listener initialized by startup");
         let timeout = Duration::from_millis(self.config.idle_timeout_ms.max(1));
         let accept_result = asupersync::time::timeout(
             asupersync::time::wall_now(),
@@ -176,11 +181,18 @@ impl NativeHost {
         &mut self,
     ) -> Result<protocol::MessageType, NativeHostError> {
         self.startup().await?;
-        let listener = self.listener.as_ref().expect("listener initialized by startup");
-        let (mut stream, _addr) = listener.accept().await.map_err(|source| NativeHostError::Io {
-            path: self.socket_path.clone(),
-            source,
-        })?;
+        let listener = self
+            .listener
+            .as_ref()
+            .expect("listener initialized by startup");
+        let (mut stream, _addr) =
+            listener
+                .accept()
+                .await
+                .map_err(|source| NativeHostError::Io {
+                    path: self.socket_path.clone(),
+                    source,
+                })?;
 
         let inbound = read_socket_message(&mut stream).await?;
         let response = match inbound {
@@ -274,9 +286,8 @@ impl NativeHost {
 
     fn write_discovery_record(&self) -> Result<(), NativeHostError> {
         let now_ms = unix_time_ms();
-        let lease_expiry = now_ms.saturating_add(
-            i64::try_from(self.config.lease_ttl_ms).unwrap_or(i64::MAX),
-        );
+        let lease_expiry =
+            now_ms.saturating_add(i64::try_from(self.config.lease_ttl_ms).unwrap_or(i64::MAX));
         let discovery_expiry = now_ms.saturating_add(
             i64::try_from(self.config.idle_timeout_ms.max(self.config.lease_ttl_ms))
                 .unwrap_or(i64::MAX),
@@ -294,10 +305,11 @@ impl NativeHost {
             lease_expires_at_ms: Some(lease_expiry),
             expires_at_ms: Some(discovery_expiry),
         };
-        let bytes = serde_json::to_vec(&record).map_err(|source| NativeHostError::DiscoverySerialize {
-            path: self.discovery_path.clone(),
-            source,
-        })?;
+        let bytes =
+            serde_json::to_vec(&record).map_err(|source| NativeHostError::DiscoverySerialize {
+                path: self.discovery_path.clone(),
+                source,
+            })?;
         fs::write(&self.discovery_path, bytes).map_err(|source| NativeHostError::Io {
             path: self.discovery_path.clone(),
             source,
@@ -401,10 +413,13 @@ async fn read_socket_message(
 ) -> Result<protocol::MessageType, NativeHostError> {
     let mut buf = Vec::with_capacity(256);
     loop {
-        let byte = stream.read_u8().await.map_err(|source| NativeHostError::Io {
-            path: PathBuf::from("<agent-socket>"),
-            source,
-        })?;
+        let byte = stream
+            .read_u8()
+            .await
+            .map_err(|source| NativeHostError::Io {
+                path: PathBuf::from("<agent-socket>"),
+                source,
+            })?;
         buf.push(byte);
         if let Some((message, consumed)) = protocol::decode_frame::<protocol::MessageType>(&buf)? {
             if consumed != buf.len() {
@@ -461,7 +476,9 @@ mod tests {
             let tempdir = tempfile::tempdir().expect("tempdir");
             let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
 
-            host.startup().await.expect("startup should bind and publish");
+            host.startup()
+                .await
+                .expect("startup should bind and publish");
 
             assert!(
                 host.socket_path().exists(),
@@ -779,8 +796,8 @@ mod tests {
 
             let socket_path = host.socket_path().to_path_buf();
             let client = std::thread::spawn(move || {
-                let mut stream = std::os::unix::net::UnixStream::connect(&socket_path)
-                    .expect("client connect");
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
                 let mut reader = std::io::BufReader::new(
                     stream
                         .try_clone()
