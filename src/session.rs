@@ -2391,12 +2391,12 @@ impl Session {
                 messages.push(message);
             }
 
-            let has_kept_entry = (0..path_len).any(|idx| {
-                entry_at(idx)
-                    .base_id()
-                    .is_some_and(|id| id == &compaction.first_kept_entry_id)
-            });
-
+            // O14 optimization: merge the has_kept_entry scan into the main
+            // forward loop, eliminating a separate O(n) pass. We look for the
+            // kept entry as we go; if we reach past the compaction point
+            // without finding it, we fall back to including all post-compaction
+            // entries (same behavior as before).
+            let first_kept = &compaction.first_kept_entry_id;
             let mut keep = false;
             let mut past_compaction = false;
             for idx in 0..path_len {
@@ -2405,15 +2405,8 @@ impl Session {
                     past_compaction = true;
                 }
                 if !keep {
-                    if has_kept_entry {
-                        if entry
-                            .base_id()
-                            .is_some_and(|id| id == &compaction.first_kept_entry_id)
-                        {
-                            keep = true;
-                        } else {
-                            continue;
-                        }
+                    if entry.base_id().is_some_and(|id| id == first_kept) {
+                        keep = true;
                     } else if past_compaction {
                         tracing::warn!(
                             first_kept_entry_id = %compaction.first_kept_entry_id,
