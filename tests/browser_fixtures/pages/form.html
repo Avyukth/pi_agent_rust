@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pi Chrome Test: Form</title>
+</head>
+<body>
+  <h1>Form Fixture</h1>
+  <form id="test-form" action="/submit" method="POST">
+    <label for="username">Username:</label>
+    <input type="text" id="username" name="username" placeholder="Enter username">
+
+    <label for="email">Email:</label>
+    <input type="email" id="email" name="email" placeholder="Enter email">
+
+    <label for="password">Password:</label>
+    <input type="password" id="password" name="password">
+
+    <label for="bio">Bio:</label>
+    <textarea id="bio" name="bio" rows="3"></textarea>
+
+    <label for="role">Role:</label>
+    <select id="role" name="role">
+      <option value="user">User</option>
+      <option value="admin">Admin</option>
+      <option value="moderator">Moderator</option>
+    </select>
+
+    <label>
+      <input type="checkbox" id="terms" name="terms"> Accept Terms
+    </label>
+
+    <label>
+      <input type="radio" name="plan" value="free" checked> Free
+    </label>
+    <label>
+      <input type="radio" name="plan" value="pro"> Pro
+    </label>
+
+    <label for="avatar">Avatar:</label>
+    <input type="file" id="avatar" name="avatar" accept="image/*">
+
+    <button type="submit" id="submit-btn">Submit</button>
+    <button type="reset" id="reset-btn">Reset</button>
+  </form>
+  <div id="result" style="display:none"></div>
+  <script>
+    document.getElementById('test-form').addEventListener('submit', function(e) {
+      e.preventDefault();
+      var data = new FormData(e.target);
+      var result = {};
+      data.forEach(function(v, k) { result[k] = v; });
+      var el = document.getElementById('result');
+      el.style.display = 'block';
+      el.textContent = JSON.stringify(result);
+    });
+  </script>
+</body>
+</html>
