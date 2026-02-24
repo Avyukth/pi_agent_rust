@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read as IoRead, Write as IoWrite};
 use std::os::unix::fs::PermissionsExt;
@@ -18,6 +19,12 @@ const SOCKET_PREFIX: &str = "pi-chrome-";
 const SOCKET_SUFFIX: &str = ".sock";
 const DISCOVERY_PREFIX: &str = "pi-chrome-host-";
 const DISCOVERY_SUFFIX: &str = ".discovery.json";
+const DEFAULT_REQUEST_JOURNAL_TTL_MS: i64 = 60_000;
+const MAX_JOURNAL_ENTRIES: usize = 256;
+const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_AGENT_MAX_RECONNECT_ATTEMPTS: i64 = 3;
+const DEFAULT_AGENT_SOCKET_TIMEOUT_MS: i64 = 5_000;
+const JOURNAL_TTL_COUPLING_SAFETY_MARGIN_MS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct NativeHostConfig {
@@ -59,6 +66,264 @@ pub enum NativeHostRunOutcome {
     AgentConnected,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EslJournalKey {
+    pi_session_id: String,
+    request_id: String,
+    host_epoch: String,
+}
+
+#[derive(Debug, Clone)]
+struct EslJournalEntry {
+    fingerprint: protocol::RequestFingerprint,
+    state: EslJournalState,
+    created_at_ms: i64,
+    last_access_ms: i64,
+    approx_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+enum EslJournalState {
+    InProgress,
+    Terminal(protocol::ResponseEnvelope),
+}
+
+#[derive(Debug, Clone)]
+struct EslJournal {
+    ttl_ms: i64,
+    max_entries: usize,
+    max_bytes: usize,
+    current_bytes: usize,
+    entries: HashMap<EslJournalKey, EslJournalEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EslBeginOutcome {
+    Dispatch,
+    Replay(protocol::ResponseEnvelope),
+    Reject(protocol::ResponseEnvelope),
+}
+
+impl EslJournal {
+    fn new(lease_ttl_ms: u64) -> Result<Self, NativeHostError> {
+        let min_ttl_ms = i64::try_from(lease_ttl_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_add(
+                (DEFAULT_AGENT_MAX_RECONNECT_ATTEMPTS + 1)
+                    .saturating_mul(DEFAULT_AGENT_SOCKET_TIMEOUT_MS)
+                    .saturating_add(JOURNAL_TTL_COUPLING_SAFETY_MARGIN_MS),
+            );
+        if DEFAULT_REQUEST_JOURNAL_TTL_MS < min_ttl_ms {
+            return Err(NativeHostError::EslInvariant(format!(
+                "request journal ttl {}ms violates coupling invariant (min {min_ttl_ms}ms)",
+                DEFAULT_REQUEST_JOURNAL_TTL_MS
+            )));
+        }
+        Ok(Self {
+            ttl_ms: DEFAULT_REQUEST_JOURNAL_TTL_MS,
+            max_entries: MAX_JOURNAL_ENTRIES,
+            max_bytes: MAX_JOURNAL_BYTES,
+            current_bytes: 0,
+            entries: HashMap::new(),
+        })
+    }
+
+    #[cfg(test)]
+    fn with_limits_for_test(ttl_ms: i64, max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            ttl_ms,
+            max_entries,
+            max_bytes,
+            current_bytes: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn begin_request(
+        &mut self,
+        pi_session_id: &str,
+        host_epoch: &str,
+        request: &protocol::Request,
+        now_ms: i64,
+    ) -> Result<EslBeginOutcome, NativeHostError> {
+        self.prune_expired_terminal_entries(now_ms);
+
+        let key = EslJournalKey {
+            pi_session_id: pi_session_id.to_string(),
+            request_id: request.id.clone(),
+            host_epoch: host_epoch.to_string(),
+        };
+        let fingerprint = protocol::RequestFingerprint::new(&request.op, &request.payload)
+            .map_err(NativeHostError::Fingerprint)?;
+
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.last_access_ms = now_ms;
+            if entry.fingerprint != fingerprint {
+                return Ok(EslBeginOutcome::Reject(invalid_request_envelope(
+                    &request.id,
+                    "request_id reused with different op/payload",
+                )));
+            }
+            return Ok(match &entry.state {
+                EslJournalState::InProgress => EslBeginOutcome::Reject(in_progress_envelope(
+                    &request.id,
+                    "in_progress: request still executing",
+                )),
+                EslJournalState::Terminal(envelope) => EslBeginOutcome::Replay(envelope.clone()),
+            });
+        }
+
+        let new_entry_bytes = approx_in_progress_entry_bytes(&key, &fingerprint);
+        if !self.ensure_capacity_for_new_entry(new_entry_bytes, now_ms) {
+            tracing::warn!(
+                event = "pi.chrome.esl.reject_indeterminate_capacity",
+                pi_session_id,
+                request_id = %request.id,
+                host_epoch,
+                max_entries = self.max_entries,
+                max_bytes = self.max_bytes,
+                current_entries = self.entries.len(),
+                current_bytes = self.current_bytes,
+                "Rejecting request because ESL caps can only be satisfied by evicting in_progress entries"
+            );
+            return Ok(EslBeginOutcome::Reject(execution_indeterminate_envelope(
+                &request.id,
+                "esl journal capacity reached with only in_progress entries",
+            )));
+        }
+
+        let entry = EslJournalEntry {
+            fingerprint,
+            state: EslJournalState::InProgress,
+            created_at_ms: now_ms,
+            last_access_ms: now_ms,
+            approx_bytes: new_entry_bytes,
+        };
+        self.current_bytes = self.current_bytes.saturating_add(new_entry_bytes);
+        self.entries.insert(key, entry);
+        Ok(EslBeginOutcome::Dispatch)
+    }
+
+    fn record_terminal_response(
+        &mut self,
+        pi_session_id: &str,
+        host_epoch: &str,
+        request: &protocol::Request,
+        response: &protocol::ResponseEnvelope,
+        now_ms: i64,
+    ) -> Result<(), NativeHostError> {
+        let key = EslJournalKey {
+            pi_session_id: pi_session_id.to_string(),
+            request_id: request.id.clone(),
+            host_epoch: host_epoch.to_string(),
+        };
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return Ok(());
+        };
+
+        let fingerprint = protocol::RequestFingerprint::new(&request.op, &request.payload)
+            .map_err(NativeHostError::Fingerprint)?;
+        if entry.fingerprint != fingerprint {
+            tracing::warn!(
+                event = "pi.chrome.esl.record_terminal_fingerprint_mismatch",
+                pi_session_id,
+                request_id = %request.id,
+                host_epoch,
+                "Skipping terminal ESL update because request fingerprint mismatched existing entry"
+            );
+            return Ok(());
+        }
+
+        self.current_bytes = self.current_bytes.saturating_sub(entry.approx_bytes);
+        entry.state = EslJournalState::Terminal(response.clone());
+        entry.last_access_ms = now_ms;
+        entry.approx_bytes = approx_terminal_entry_bytes(&key, &entry.fingerprint, response);
+        self.current_bytes = self.current_bytes.saturating_add(entry.approx_bytes);
+
+        let _ = self.ensure_capacity_for_new_entry(0, now_ms);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, pi_session_id: &str, request_id: &str, host_epoch: &str) -> bool {
+        self.entries.contains_key(&EslJournalKey {
+            pi_session_id: pi_session_id.to_string(),
+            request_id: request_id.to_string(),
+            host_epoch: host_epoch.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    fn terminal_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.state, EslJournalState::Terminal(_)))
+            .count()
+    }
+
+    fn prune_expired_terminal_entries(&mut self, now_ms: i64) {
+        if self.ttl_ms <= 0 {
+            return;
+        }
+        let mut expired = Vec::new();
+        for (key, entry) in &self.entries {
+            let is_terminal = matches!(entry.state, EslJournalState::Terminal(_));
+            if is_terminal && now_ms.saturating_sub(entry.last_access_ms) >= self.ttl_ms {
+                expired.push(key.clone());
+            }
+        }
+        for key in expired {
+            self.remove_entry(&key);
+        }
+    }
+
+    fn ensure_capacity_for_new_entry(&mut self, additional_bytes: usize, now_ms: i64) -> bool {
+        self.prune_expired_terminal_entries(now_ms);
+        while self
+            .entries
+            .len()
+            .saturating_add(usize::from(additional_bytes > 0))
+            > self.max_entries
+            || self.current_bytes.saturating_add(additional_bytes) > self.max_bytes
+        {
+            let Some(evict_key) = self.oldest_terminal_key() else {
+                return false;
+            };
+            tracing::debug!(
+                event = "pi.chrome.esl.evict_terminal",
+                request_id = %evict_key.request_id,
+                host_epoch = %evict_key.host_epoch,
+                "Evicting terminal ESL entry to satisfy caps"
+            );
+            self.remove_entry(&evict_key);
+        }
+        true
+    }
+
+    fn oldest_terminal_key(&self) -> Option<EslJournalKey> {
+        self.entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                if matches!(entry.state, EslJournalState::Terminal(_)) {
+                    Some((key, entry.last_access_ms))
+                } else {
+                    None
+                }
+            })
+            .min_by(|(a_key, a_ts), (b_key, b_ts)| {
+                a_ts.cmp(b_ts)
+                    .then_with(|| a_key.request_id.cmp(&b_key.request_id))
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    fn remove_entry(&mut self, key: &EslJournalKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.current_bytes = self.current_bytes.saturating_sub(entry.approx_bytes);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NativeHost {
     config: NativeHostConfig,
@@ -69,6 +334,7 @@ pub struct NativeHost {
     discovery_path: PathBuf,
     claimed_by: Option<protocol::ClaimedBy>,
     listener: Option<UnixListener>,
+    journal: EslJournal,
 }
 
 impl NativeHost {
@@ -76,6 +342,7 @@ impl NativeHost {
         let host_id = config.host_id.clone().unwrap_or_else(random_id);
         let host_epoch = config.host_epoch.clone().unwrap_or_else(random_id);
         let token = config.token.clone().unwrap_or_else(random_token);
+        let journal = EslJournal::new(config.lease_ttl_ms)?;
         let socket_path = config
             .socket_dir
             .join(format!("{SOCKET_PREFIX}{host_id}{SOCKET_SUFFIX}"));
@@ -92,6 +359,7 @@ impl NativeHost {
             discovery_path,
             claimed_by: None,
             listener: None,
+            journal,
         })
     }
 
@@ -226,6 +494,11 @@ impl NativeHost {
         if !matches!(response, protocol::MessageType::AuthOk(_)) {
             return Ok(NativeHostRunOutcome::AgentConnected);
         }
+        let claimed_by = self
+            .claimed_by
+            .as_ref()
+            .cloned()
+            .expect("auth_ok handshake must set claimed_by");
 
         let mut agent_stream =
             stream
@@ -243,7 +516,15 @@ impl NativeHost {
             })?;
         drop(stream);
 
-        let relay_result = relay_until_disconnect(&mut agent_stream, chrome_reader, chrome_writer);
+        let host_epoch = self.host_epoch.clone();
+        let relay_result = relay_until_disconnect(
+            &mut agent_stream,
+            chrome_reader,
+            chrome_writer,
+            &claimed_by.pi_session_id,
+            &host_epoch,
+            &mut self.journal,
+        );
         let clear_claim_result = self.clear_claim();
         relay_result?;
         clear_claim_result?;
@@ -485,6 +766,10 @@ impl Drop for NativeHost {
 
 #[derive(Debug, Error)]
 pub enum NativeHostError {
+    #[error("ESL invariant violation: {0}")]
+    EslInvariant(String),
+    #[error("failed to fingerprint ESL request: {0}")]
+    Fingerprint(serde_json::Error),
     #[error("native host I/O error for {path}: {source}")]
     Io {
         path: PathBuf,
@@ -550,6 +835,81 @@ fn handshake_error_response(
             retryable,
         },
     }))
+}
+
+fn invalid_request_envelope(
+    request_id: &str,
+    message: impl Into<String>,
+) -> protocol::ResponseEnvelope {
+    protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: request_id.to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code: protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+            message: format!("invalid_request: {}", message.into()),
+            retryable: false,
+        },
+    })
+}
+
+fn in_progress_envelope(
+    request_id: &str,
+    message: impl Into<String>,
+) -> protocol::ResponseEnvelope {
+    protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: request_id.to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code: protocol::ProtocolErrorCode::ChromeBridgeBusy,
+            message: message.into(),
+            retryable: true,
+        },
+    })
+}
+
+fn execution_indeterminate_envelope(
+    request_id: &str,
+    message: impl Into<String>,
+) -> protocol::ResponseEnvelope {
+    protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: request_id.to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code: protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+            message: message.into(),
+            retryable: false,
+        },
+    })
+}
+
+fn approx_in_progress_entry_bytes(
+    key: &EslJournalKey,
+    fingerprint: &protocol::RequestFingerprint,
+) -> usize {
+    key.pi_session_id
+        .len()
+        .saturating_add(key.request_id.len())
+        .saturating_add(key.host_epoch.len())
+        .saturating_add(fingerprint.as_str().len())
+        .saturating_add(128)
+}
+
+fn approx_terminal_entry_bytes(
+    key: &EslJournalKey,
+    fingerprint: &protocol::RequestFingerprint,
+    response: &protocol::ResponseEnvelope,
+) -> usize {
+    let response_bytes = serde_json::to_vec(response).map_or(0, |bytes| bytes.len());
+    key.pi_session_id
+        .len()
+        .saturating_add(key.request_id.len())
+        .saturating_add(key.host_epoch.len())
+        .saturating_add(fingerprint.as_str().len())
+        .saturating_add(response_bytes)
+        .saturating_add(160)
 }
 
 async fn write_socket_message(
@@ -709,16 +1069,92 @@ fn relay_until_disconnect<R: IoRead, W: IoWrite>(
     agent_stream: &mut std::os::unix::net::UnixStream,
     chrome_reader: &mut R,
     chrome_writer: &mut W,
+    pi_session_id: &str,
+    host_epoch: &str,
+    journal: &mut EslJournal,
 ) -> Result<(), NativeHostError> {
     loop {
-        match relay_one_agent_message_to_chrome(agent_stream, chrome_writer) {
-            Ok(_message) => {}
+        let agent_message = match read_agent_socket_message_blocking(agent_stream) {
+            Ok(message) => message,
             Err(err) if is_clean_disconnect_error(&err) => return Ok(()),
             Err(err) => return Err(err),
+        };
+
+        let request = match &agent_message {
+            protocol::MessageType::Request(request) => Some(request.clone()),
+            _ => None,
+        };
+
+        if let Some(request) = request {
+            match journal.begin_request(pi_session_id, host_epoch, &request, unix_time_ms())? {
+                EslBeginOutcome::Dispatch => {
+                    tracing::debug!(
+                        event = "pi.chrome.esl.dispatch",
+                        pi_session_id,
+                        request_id = %request.id,
+                        host_epoch,
+                        op = %request.op,
+                        "Dispatching request after ESL miss"
+                    );
+                    write_native_messaging_message(
+                        chrome_writer,
+                        &protocol::MessageType::Request(request.clone()),
+                    )?;
+                    match relay_chrome_messages_until_response(chrome_reader, agent_stream) {
+                        Ok((_forwarded, terminal_response)) => {
+                            journal.record_terminal_response(
+                                pi_session_id,
+                                host_epoch,
+                                &request,
+                                &terminal_response,
+                                unix_time_ms(),
+                            )?;
+                        }
+                        Err(err) if is_clean_disconnect_error(&err) => return Ok(()),
+                        Err(err) => return Err(err),
+                    }
+                }
+                EslBeginOutcome::Replay(envelope) => {
+                    tracing::debug!(
+                        event = "pi.chrome.esl.replay",
+                        pi_session_id,
+                        request_id = %request.id,
+                        host_epoch,
+                        op = %request.op,
+                        "Replaying terminal ESL response without duplicate execution"
+                    );
+                    let message = protocol::MessageType::Response(envelope);
+                    if let Err(err) = write_agent_socket_message_blocking(agent_stream, &message) {
+                        if is_clean_disconnect_error(&err) {
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                }
+                EslBeginOutcome::Reject(envelope) => {
+                    tracing::warn!(
+                        event = "pi.chrome.esl.reject",
+                        pi_session_id,
+                        request_id = %request.id,
+                        host_epoch,
+                        op = %request.op,
+                        "Rejecting request due to ESL state/fingerprint/capacity rules"
+                    );
+                    let message = protocol::MessageType::Response(envelope);
+                    if let Err(err) = write_agent_socket_message_blocking(agent_stream, &message) {
+                        if is_clean_disconnect_error(&err) {
+                            return Ok(());
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            continue;
         }
 
+        write_native_messaging_message(chrome_writer, &agent_message)?;
         match relay_chrome_messages_until_response(chrome_reader, agent_stream) {
-            Ok(_forwarded) => {}
+            Ok((_forwarded, _terminal)) => {}
             Err(err) if is_clean_disconnect_error(&err) => return Ok(()),
             Err(err) => return Err(err),
         }
@@ -728,13 +1164,13 @@ fn relay_until_disconnect<R: IoRead, W: IoWrite>(
 fn relay_chrome_messages_until_response<R: IoRead, W: IoWrite>(
     chrome_reader: &mut R,
     agent_writer: &mut W,
-) -> Result<usize, NativeHostError> {
+) -> Result<(usize, protocol::ResponseEnvelope), NativeHostError> {
     let mut forwarded = 0_usize;
     loop {
         let message = relay_one_chrome_message_to_agent(chrome_reader, agent_writer)?;
         forwarded = forwarded.saturating_add(1);
-        if matches!(message, protocol::MessageType::Response(_)) {
-            return Ok(forwarded);
+        if let protocol::MessageType::Response(envelope) = message {
+            return Ok((forwarded, envelope));
         }
     }
 }
@@ -970,13 +1406,20 @@ mod tests {
         }
     }
 
-    fn sample_request() -> protocol::MessageType {
-        protocol::MessageType::Request(protocol::Request {
+    fn sample_request_struct(id: &str, payload: serde_json::Value) -> protocol::Request {
+        protocol::Request {
             version: protocol::PROTOCOL_VERSION_V1,
-            id: "req-e2e-1".to_string(),
+            id: id.to_string(),
             op: "tabs_context".to_string(),
-            payload: serde_json::json!({"tabId": 123}),
-        })
+            payload,
+        }
+    }
+
+    fn sample_request() -> protocol::MessageType {
+        protocol::MessageType::Request(sample_request_struct(
+            "req-e2e-1",
+            serde_json::json!({"tabId": 123}),
+        ))
     }
 
     fn sample_response_for(id: &str) -> protocol::MessageType {
@@ -986,6 +1429,13 @@ mod tests {
             ok: true,
             result: serde_json::json!({"tabs": [{"id": 123, "url": "https://example.test"}]}),
         }))
+    }
+
+    fn sample_response_envelope_for(id: &str) -> protocol::ResponseEnvelope {
+        let protocol::MessageType::Response(envelope) = sample_response_for(id) else {
+            unreachable!("sample_response_for must return response");
+        };
+        envelope
     }
 
     fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
@@ -1004,6 +1454,242 @@ mod tests {
             .expect("complete frame");
         assert_eq!(consumed, line.len(), "frame decode must consume full line");
         message
+    }
+
+    #[test]
+    fn test_esl_journal_duplicate_terminal_request_replays_cached_response() {
+        let mut journal = EslJournal::with_limits_for_test(60_000, 8, 1 << 20);
+        let request = sample_request_struct("req-esl-replay", serde_json::json!({"tabId": 1}));
+        let response = sample_response_envelope_for("req-esl-replay");
+        let now_ms = unix_time_ms();
+
+        let first = journal
+            .begin_request("session-1", "epoch-1", &request, now_ms)
+            .expect("first request should initialize in-progress entry");
+        assert_eq!(
+            first,
+            EslBeginOutcome::Dispatch,
+            "first delivery must dispatch to Chrome"
+        );
+
+        journal
+            .record_terminal_response("session-1", "epoch-1", &request, &response, now_ms + 1)
+            .expect("terminal response should be stored");
+
+        let duplicate = journal
+            .begin_request("session-1", "epoch-1", &request, now_ms + 2)
+            .expect("duplicate request lookup should succeed");
+        match duplicate {
+            EslBeginOutcome::Replay(replayed) => assert_eq!(
+                replayed, response,
+                "duplicate request with matching fingerprint must replay cached terminal response"
+            ),
+            other => panic!("expected replay outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_esl_journal_rejects_request_id_reuse_with_mismatched_fingerprint() {
+        let mut journal = EslJournal::with_limits_for_test(60_000, 8, 1 << 20);
+        let original = sample_request_struct("req-esl-fp", serde_json::json!({"tabId": 1}));
+        let mismatched = sample_request_struct("req-esl-fp", serde_json::json!({"tabId": 2}));
+        let now_ms = unix_time_ms();
+
+        let first = journal
+            .begin_request("session-1", "epoch-1", &original, now_ms)
+            .expect("first request should dispatch");
+        assert_eq!(
+            first,
+            EslBeginOutcome::Dispatch,
+            "initial request must dispatch"
+        );
+
+        let duplicate = journal
+            .begin_request("session-1", "epoch-1", &mismatched, now_ms + 1)
+            .expect("fingerprint mismatch should return protocol reject response");
+        match duplicate {
+            EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                assert_eq!(
+                    err.error.code,
+                    protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                    "fingerprint mismatch must fail closed as invalid_request"
+                );
+                assert!(
+                    err.error.message.contains("invalid_request"),
+                    "error should surface invalid_request semantic for debugging"
+                );
+            }
+            other => panic!("expected reject(error) outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_esl_journal_rejects_duplicate_in_progress_request() {
+        let mut journal = EslJournal::with_limits_for_test(60_000, 8, 1 << 20);
+        let request = sample_request_struct("req-esl-busy", serde_json::json!({"tabId": 1}));
+        let now_ms = unix_time_ms();
+
+        let first = journal
+            .begin_request("session-1", "epoch-1", &request, now_ms)
+            .expect("first request should dispatch");
+        assert_eq!(
+            first,
+            EslBeginOutcome::Dispatch,
+            "initial request must dispatch"
+        );
+
+        let duplicate = journal
+            .begin_request("session-1", "epoch-1", &request, now_ms + 1)
+            .expect("duplicate in-progress request should return protocol reject");
+        match duplicate {
+            EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                assert_eq!(
+                    err.error.code,
+                    protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                    "duplicate in-progress request must surface retryable busy state"
+                );
+                assert!(
+                    err.error.retryable,
+                    "in-progress ESL response must be retryable for bridge backoff logic"
+                );
+                assert!(
+                    err.error.message.contains("in_progress"),
+                    "busy error message must identify in_progress ESL state"
+                );
+            }
+            other => panic!("expected reject(error) outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_esl_journal_capacity_evicts_terminal_entries_before_in_progress_entries() {
+        let mut journal = EslJournal::with_limits_for_test(60_000, 2, 1 << 20);
+        let req_terminal =
+            sample_request_struct("req-esl-terminal", serde_json::json!({"tabId": 1}));
+        let req_in_progress =
+            sample_request_struct("req-esl-in-progress", serde_json::json!({"tabId": 2}));
+        let req_new = sample_request_struct("req-esl-new", serde_json::json!({"tabId": 3}));
+        let now_ms = unix_time_ms();
+
+        assert_eq!(
+            journal
+                .begin_request("session-1", "epoch-1", &req_terminal, now_ms)
+                .expect("terminal request begin"),
+            EslBeginOutcome::Dispatch,
+            "first request must dispatch"
+        );
+        journal
+            .record_terminal_response(
+                "session-1",
+                "epoch-1",
+                &req_terminal,
+                &sample_response_envelope_for("req-esl-terminal"),
+                now_ms + 1,
+            )
+            .expect("terminal response stored");
+        assert_eq!(
+            journal
+                .begin_request("session-1", "epoch-1", &req_in_progress, now_ms + 2)
+                .expect("in-progress request begin"),
+            EslBeginOutcome::Dispatch,
+            "second request must dispatch and remain in_progress"
+        );
+
+        let third = journal
+            .begin_request("session-1", "epoch-1", &req_new, now_ms + 3)
+            .expect("third request should dispatch after terminal eviction");
+        assert_eq!(
+            third,
+            EslBeginOutcome::Dispatch,
+            "journal should evict the oldest terminal entry rather than any in_progress entry"
+        );
+        assert!(
+            !journal.contains_key("session-1", "req-esl-terminal", "epoch-1"),
+            "oldest terminal entry should be evicted to satisfy cap"
+        );
+        assert!(
+            journal.contains_key("session-1", "req-esl-in-progress", "epoch-1"),
+            "in_progress entry must be preserved during ESL cap eviction"
+        );
+        assert!(
+            journal.contains_key("session-1", "req-esl-new", "epoch-1"),
+            "new entry should be admitted after terminal eviction"
+        );
+    }
+
+    #[test]
+    fn test_esl_journal_capacity_rejects_when_only_in_progress_entries_can_be_evicted() {
+        let mut journal = EslJournal::with_limits_for_test(60_000, 0, 1 << 20);
+        let request = sample_request_struct("req-esl-indeterminate", serde_json::json!({"x": 1}));
+
+        let outcome = journal
+            .begin_request("session-1", "epoch-1", &request, unix_time_ms())
+            .expect("capacity failure should be encoded as protocol reject");
+        match outcome {
+            EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                assert_eq!(
+                    err.error.code,
+                    protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+                    "unsafe ESL eviction scenario must fail closed as indeterminate"
+                );
+            }
+            other => panic!("expected indeterminate reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_esl_journal_ttl_prunes_terminal_entries_but_keeps_in_progress_entries() {
+        let mut journal = EslJournal::with_limits_for_test(5, 8, 1 << 20);
+        let terminal = sample_request_struct("req-esl-ttl-terminal", serde_json::json!({"x": 1}));
+        let in_progress =
+            sample_request_struct("req-esl-ttl-progress", serde_json::json!({"x": 2}));
+        let now_ms = unix_time_ms();
+
+        assert_eq!(
+            journal
+                .begin_request("session-1", "epoch-1", &terminal, now_ms)
+                .expect("begin terminal"),
+            EslBeginOutcome::Dispatch,
+            "terminal candidate should dispatch"
+        );
+        journal
+            .record_terminal_response(
+                "session-1",
+                "epoch-1",
+                &terminal,
+                &sample_response_envelope_for("req-esl-ttl-terminal"),
+                now_ms,
+            )
+            .expect("store terminal response");
+        assert_eq!(
+            journal
+                .begin_request("session-1", "epoch-1", &in_progress, now_ms)
+                .expect("begin in-progress"),
+            EslBeginOutcome::Dispatch,
+            "in-progress candidate should dispatch"
+        );
+
+        journal.prune_expired_terminal_entries(now_ms + 10);
+
+        assert!(
+            !journal.contains_key("session-1", "req-esl-ttl-terminal", "epoch-1"),
+            "TTL prune must remove expired terminal entries"
+        );
+        assert!(
+            journal.contains_key("session-1", "req-esl-ttl-progress", "epoch-1"),
+            "TTL prune must never evict in_progress entries"
+        );
+    }
+
+    #[test]
+    fn test_esl_journal_enforces_ttl_coupling_invariant() {
+        let err = EslJournal::new(30_001).expect_err(
+            "lease_ttl above the derived bound should violate ESL ttl coupling invariant",
+        );
+        assert!(
+            matches!(err, NativeHostError::EslInvariant(_)),
+            "coupling invariant violation must be explicit and fail closed"
+        );
     }
 
     #[test]
@@ -1774,6 +2460,151 @@ mod tests {
             assert_eq!(
                 forwarded2, request2,
                 "second agent request must be forwarded to chrome in order"
+            );
+        });
+    }
+
+    #[test]
+    fn test_relay_until_disconnect_replays_duplicate_request_without_second_chrome_dispatch() {
+        let (mut host_side, mut client_side) =
+            std::os::unix::net::UnixStream::pair().expect("socket pair");
+        host_side
+            .set_nonblocking(false)
+            .expect("host-side socket should be blocking");
+        client_side
+            .set_nonblocking(false)
+            .expect("client-side socket should be blocking");
+
+        let request = sample_request();
+        let response = sample_response_for("req-e2e-1");
+        let mut chrome_in = Vec::new();
+        write_native_messaging_message(&mut chrome_in, &response)
+            .expect("encode only one chrome response for first execution");
+        let mut chrome_reader = std::io::Cursor::new(chrome_in);
+        let mut chrome_writer = Vec::new();
+        let mut journal = EslJournal::with_limits_for_test(60_000, 8, 1 << 20);
+
+        let request_for_client = request.clone();
+        let response_expected = response.clone();
+        let client = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(
+                client_side
+                    .try_clone()
+                    .expect("clone client stream for buffered reads"),
+            );
+
+            send_frame(&mut client_side, &request_for_client);
+            let first_response = read_frame(&mut reader);
+            send_frame(&mut client_side, &request_for_client);
+            let replayed_response = read_frame(&mut reader);
+            (first_response, replayed_response, response_expected)
+        });
+
+        relay_until_disconnect(
+            &mut host_side,
+            &mut chrome_reader,
+            &mut chrome_writer,
+            "session-1",
+            "epoch-1",
+            &mut journal,
+        )
+        .expect("relay loop should replay duplicate request and exit on client disconnect");
+
+        let (first_response, replayed_response, response_expected) =
+            client.join().expect("client thread join");
+        assert_eq!(
+            first_response, response_expected,
+            "first request should receive the Chrome terminal response"
+        );
+        assert_eq!(
+            replayed_response, response_expected,
+            "duplicate request should replay the cached terminal response"
+        );
+
+        let mut chrome_wire_reader = std::io::Cursor::new(chrome_writer);
+        let forwarded = read_native_messaging_message(&mut chrome_wire_reader)
+            .expect("first request should be forwarded to Chrome");
+        assert_eq!(
+            forwarded, request,
+            "only the first duplicate request should be dispatched to Chrome"
+        );
+        let err = read_native_messaging_message(&mut chrome_wire_reader)
+            .expect_err("duplicate request replay should avoid a second Chrome dispatch");
+        match err {
+            NativeHostError::Io { source, .. } => assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "Chrome wire should contain exactly one dispatched request frame"
+            ),
+            other => panic!("expected EOF after one Chrome dispatch, got {other:?}"),
+        }
+        assert_eq!(
+            journal.terminal_count(),
+            1,
+            "journal should retain one terminal entry for the replayed request"
+        );
+    }
+
+    #[test]
+    fn test_native_host_run_with_io_returns_indeterminate_when_esl_caps_are_unsafely_exhausted() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.journal = EslJournal::with_limits_for_test(60_000, 0, 1 << 20);
+            host.startup().await.expect("startup should succeed");
+
+            let request = sample_request();
+            let mut chrome_reader = std::io::Cursor::new(Vec::<u8>::new());
+            let mut chrome_writer = Vec::new();
+
+            let socket_path = host.socket_path().to_path_buf();
+            let request_for_client = request.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone client stream for reads"),
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                let handshake = read_frame(&mut reader);
+                send_frame(&mut stream, &request_for_client);
+                let reject = read_frame(&mut reader);
+                (handshake, reject)
+            });
+
+            let outcome = host
+                .run_with_io(&mut chrome_reader, &mut chrome_writer)
+                .await
+                .expect("indeterminate ESL reject should still exit run loop cleanly");
+            assert_eq!(
+                outcome,
+                NativeHostRunOutcome::AgentConnected,
+                "host should still report successful agent connection before ESL reject"
+            );
+
+            let (handshake, reject) = client.join().expect("client thread join");
+            assert!(
+                matches!(handshake, protocol::MessageType::AuthOk(_)),
+                "client must observe auth_ok before ESL indeterminate reject"
+            );
+            match reject {
+                protocol::MessageType::Response(protocol::ResponseEnvelope::Error(err)) => {
+                    assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+                        "unsafe ESL cap exhaustion must fail closed as indeterminate"
+                    );
+                }
+                other => panic!("expected ESL indeterminate error response, got {other:?}"),
+            }
+
+            assert!(
+                chrome_writer.is_empty(),
+                "indeterminate ESL reject must not dispatch the request to Chrome"
             );
         });
     }
