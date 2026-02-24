@@ -1227,6 +1227,7 @@ mod tests {
     use super::*;
 
     use asupersync::runtime::RuntimeBuilder;
+    use proptest::prelude::*;
     use std::io::{BufRead, Write};
 
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -1436,6 +1437,28 @@ mod tests {
             unreachable!("sample_response_for must return response");
         };
         envelope
+    }
+
+    fn esl_json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            "[a-zA-Z0-9 _./:-]{0,64}".prop_map(serde_json::Value::String),
+        ];
+
+        leaf.prop_recursive(4, 128, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(serde_json::Value::Array),
+                prop::collection::btree_map("[a-zA-Z0-9_]{1,16}", inner, 0..6).prop_map(|map| {
+                    let mut obj = serde_json::Map::with_capacity(map.len());
+                    for (key, value) in map {
+                        obj.insert(key, value);
+                    }
+                    serde_json::Value::Object(obj)
+                }),
+            ]
+        })
     }
 
     fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
@@ -1690,6 +1713,119 @@ mod tests {
             matches!(err, NativeHostError::EslInvariant(_)),
             "coupling invariant violation must be explicit and fail closed"
         );
+    }
+
+    proptest! {
+        #[test]
+        fn test_esl_proptest_duplicate_delivery_is_at_most_once_with_terminal_replay(
+            payload in esl_json_value_strategy(),
+            in_progress_duplicates in 0_usize..4,
+            replay_duplicates in 0_usize..4,
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let request = sample_request_struct("req-esl-prop", payload);
+            let response = protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: "req-esl-prop".to_string(),
+                ok: true,
+                result: serde_json::json!({"ok": true}),
+            });
+            let now_ms = unix_time_ms();
+            let mut dispatches = 0_usize;
+
+            match journal.begin_request("session-prop", "epoch-prop", &request, now_ms)? {
+                EslBeginOutcome::Dispatch => dispatches = dispatches.saturating_add(1),
+                other => prop_assert!(false, "first delivery must dispatch, got {other:?}"),
+            }
+
+            for i in 0..in_progress_duplicates {
+                let outcome = journal.begin_request(
+                    "session-prop",
+                    "epoch-prop",
+                    &request,
+                    now_ms + 1 + i as i64,
+                )?;
+                match outcome {
+                    EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                        prop_assert_eq!(
+                            err.error.code,
+                            protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                            "duplicate while in-progress must be busy/retryable"
+                        );
+                    }
+                    other => prop_assert!(false, "duplicate in-progress must reject, got {other:?}"),
+                }
+            }
+
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                &response,
+                now_ms + 50,
+            )?;
+
+            for i in 0..replay_duplicates {
+                let outcome = journal.begin_request(
+                    "session-prop",
+                    "epoch-prop",
+                    &request,
+                    now_ms + 100 + i as i64,
+                )?;
+                match outcome {
+                    EslBeginOutcome::Replay(replayed) => {
+                        prop_assert_eq!(
+                            replayed,
+                            response.clone(),
+                            "terminal duplicates must replay"
+                        );
+                    }
+                    other => prop_assert!(false, "terminal duplicate must replay, got {other:?}"),
+                }
+            }
+
+            prop_assert_eq!(
+                dispatches,
+                1,
+                "same-epoch duplicate deliveries with stable fingerprint must dispatch at most once"
+            );
+        }
+
+        #[test]
+        fn test_esl_proptest_epoch_bump_invalidates_replay_scope_and_requires_new_dispatch(
+            payload in esl_json_value_strategy(),
+            epoch_suffix in 1_u16..2000,
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let request = sample_request_struct("req-esl-epoch", payload);
+            let response = protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: "req-esl-epoch".to_string(),
+                ok: true,
+                result: serde_json::json!({"epoch": "a"}),
+            });
+            let epoch_a = "epoch-a";
+            let epoch_b = format!("epoch-b-{epoch_suffix}");
+            let now_ms = unix_time_ms();
+
+            let first = journal.begin_request("session-prop", epoch_a, &request, now_ms)?;
+            prop_assert_eq!(first, EslBeginOutcome::Dispatch, "first epoch delivery must dispatch");
+
+            journal.record_terminal_response("session-prop", epoch_a, &request, &response, now_ms + 1)?;
+
+            let replay_same_epoch = journal.begin_request("session-prop", epoch_a, &request, now_ms + 2)?;
+            match replay_same_epoch {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(replayed, response),
+                other => prop_assert!(false, "same-epoch duplicate must replay, got {other:?}"),
+            }
+
+            let new_epoch = journal.begin_request("session-prop", &epoch_b, &request, now_ms + 3)?;
+            prop_assert_eq!(
+                new_epoch,
+                EslBeginOutcome::Dispatch,
+                "host_epoch bump must create a distinct ESL key and require a new dispatch"
+            );
+        }
     }
 
     #[test]
