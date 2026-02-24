@@ -777,11 +777,13 @@ impl Agent {
                     return Ok(abort_message);
                 }
 
-                let assistant_message = match self
+                // O7: stream_assistant_response returns Arc<AssistantMessage> directly,
+                // eliminating a guaranteed deep clone in finalize_assistant_message.
+                let assistant_arc = match self
                     .stream_assistant_response(Arc::clone(&on_event), abort.clone())
                     .await
                 {
-                    Ok(msg) => msg,
+                    Ok(arc) => arc,
                     Err(err) => {
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
@@ -794,9 +796,6 @@ impl Agent {
                         return Err(err);
                     }
                 };
-                // Wrap in Arc once; share via Arc::clone (O(1)) instead of deep
-                // cloning the full AssistantMessage for every consumer.
-                let assistant_arc = Arc::new(assistant_message);
                 last_assistant = Some(Arc::clone(&assistant_arc));
 
                 let assistant_event_message = Message::Assistant(Arc::clone(&assistant_arc));
@@ -1010,12 +1009,14 @@ impl Agent {
     }
 
     /// Stream an assistant response and emit message events.
+    ///
+    /// Returns `Arc<AssistantMessage>` to avoid a guaranteed deep clone (O7).
     #[allow(clippy::too_many_lines)]
     async fn stream_assistant_response(
         &mut self,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
-    ) -> Result<AssistantMessage> {
+    ) -> Result<Arc<AssistantMessage>> {
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
         let stream_options = self.config.stream_options.clone();
@@ -1395,12 +1396,17 @@ impl Agent {
         }
     }
 
+    /// Finalize an assistant message: store in history, emit events, return Arc.
+    ///
+    /// O7 optimization: returns `Arc<AssistantMessage>` directly instead of
+    /// attempting `Arc::try_unwrap` (which always fails since `self.messages`
+    /// holds a clone, forcing a guaranteed deep clone).
     fn finalize_assistant_message(
         &mut self,
         message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
-    ) -> AssistantMessage {
+    ) -> Arc<AssistantMessage> {
         let arc = Arc::new(message);
         if added_partial {
             if let Some(last @ Message::Assistant(_)) = self.messages.last_mut() {
@@ -1424,7 +1430,7 @@ impl Agent {
         on_event(AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&arc)),
         });
-        Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+        arc
     }
 
     async fn execute_parallel_batch(
