@@ -121,7 +121,7 @@ impl NativeHost {
     }
 
     #[must_use]
-    pub fn claimed_by(&self) -> Option<&protocol::ClaimedBy> {
+    pub const fn claimed_by(&self) -> Option<&protocol::ClaimedBy> {
         self.claimed_by.as_ref()
     }
 
@@ -449,7 +449,7 @@ fn set_owner_only_permissions(path: &Path) -> Result<(), NativeHostError> {
     })
 }
 
-fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
+const fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
     if a_min > a_max || b_min > b_max {
         return false;
     }

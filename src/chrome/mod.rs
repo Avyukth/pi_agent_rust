@@ -206,7 +206,6 @@ impl ChromeBridge {
                                 host_id: record.host_id.clone(),
                                 claimed_by: record.claimed_by.clone(),
                             });
-                            continue;
                         }
                         Err(err) => {
                             last_error = Some(err);
@@ -261,6 +260,8 @@ impl ChromeBridge {
         };
 
         let (read_half, write_half) = stream.into_split();
+        let host_id = auth_ok.host_id;
+        let host_epoch = auth_ok.host_epoch;
         {
             let mut writer_guard = self
                 .writer
@@ -271,8 +272,8 @@ impl ChromeBridge {
         let connection_token = self.connection_seq.fetch_add(1, Ordering::Relaxed);
         {
             let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
-            guard.pinned_host_id = Some(auth_ok.host_id.clone());
-            guard.host_epoch = Some(auth_ok.host_epoch.clone());
+            guard.pinned_host_id = Some(host_id);
+            guard.host_epoch = Some(host_epoch);
             guard.consecutive_failures = 0;
             guard.browser_tools_disabled = false;
             guard.connection_token = connection_token;
@@ -302,15 +303,18 @@ impl ChromeBridge {
         format!("chrome-{seq}")
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn send_request(
         &self,
         op: impl Into<String>,
         payload: serde_json::Value,
     ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
-        self.send_request_with_id(self.next_request_id(), op.into(), payload)
+        let op = op.into();
+        self.send_request_with_id(self.next_request_id(), op, payload)
             .await
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn execute_request_with_esl(
         &self,
         op: impl Into<String>,
@@ -322,6 +326,7 @@ impl ChromeBridge {
             .await
     }
 
+    #[allow(clippy::future_not_send)]
     async fn execute_request_with_esl_id(
         &self,
         request_id: String,
@@ -464,6 +469,11 @@ impl ChromeBridge {
         Ok(true)
     }
 
+    #[allow(
+        clippy::await_holding_lock,
+        clippy::future_not_send,
+        clippy::significant_drop_tightening
+    )]
     async fn send_request_with_id(
         &self,
         request_id: String,
@@ -578,16 +588,22 @@ impl ChromeBridge {
 
         match guard.get(&key) {
             Some(existing) if existing != &fingerprint => {
-                Err(ChromeBridgeError::RequestIdPayloadMismatch {
+                let err = ChromeBridgeError::RequestIdPayloadMismatch {
                     host_epoch: host_epoch.to_string(),
                     request_id: request_id.to_string(),
                     expected_fingerprint: existing.as_str().to_string(),
                     actual_fingerprint: fingerprint.as_str().to_string(),
-                })
+                };
+                drop(guard);
+                Err(err)
             }
-            Some(_) => Ok(()),
+            Some(_) => {
+                drop(guard);
+                Ok(())
+            }
             None => {
                 guard.insert(key, fingerprint);
+                drop(guard);
                 Ok(())
             }
         }
@@ -779,7 +795,7 @@ impl DiscoveryRecord {
         let ids_valid = !self.host_id.trim().is_empty() && !self.host_epoch.trim().is_empty();
         let token_valid = !self.token.trim().is_empty();
         let socket_valid = self.socket_path.is_absolute();
-        let claim_valid = self.claimed_by.as_ref().map_or(true, |claim| {
+        let claim_valid = self.claimed_by.as_ref().is_none_or(|claim| {
             !claim.pi_session_id.trim().is_empty() && !claim.client_instance_id.trim().is_empty()
         });
         let protocol_range_valid = self.protocol_min <= self.protocol_max;
@@ -911,12 +927,12 @@ fn discover_hosts_in_dir(
 
     discovered.sort_by(|a, b| a.host_id.cmp(&b.host_id));
     if let Some(pinned) = pinned_host_id {
-        discovered.sort_by_key(|record| if record.host_id == pinned { 0_u8 } else { 1_u8 });
+        discovered.sort_by_key(|record| u8::from(record.host_id != pinned));
     }
     Ok(discovered)
 }
 
-fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
+const fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
     if a_min > a_max || b_min > b_max {
         return false;
     }
@@ -999,14 +1015,14 @@ fn finalize_reader_shutdown(
 ) {
     let should_finalize = {
         let mut guard = inner.lock().expect("chrome bridge mutex poisoned");
-        if guard.connection_token != connection_token {
-            false
-        } else {
+        if guard.connection_token == connection_token {
             guard.connection_token = 0;
             if guard.state != ConnectionState::Disabled {
                 guard.state = ConnectionState::Disconnected;
             }
             true
+        } else {
+            false
         }
     };
 
@@ -1035,11 +1051,11 @@ async fn reader_loop(
         buf.push(byte);
 
         if let Some((message, consumed)) = protocol::decode_frame::<protocol::MessageType>(&buf)? {
-            if consumed != buf.len() {
+            if consumed == buf.len() {
+                buf.clear();
+            } else {
                 let trailing = buf.split_off(consumed);
                 buf = trailing;
-            } else {
-                buf.clear();
             }
 
             match message {
@@ -1048,11 +1064,11 @@ async fn reader_loop(
                         protocol::ResponseEnvelope::Ok(resp) => resp.id.clone(),
                         protocol::ResponseEnvelope::Error(resp) => resp.id.clone(),
                     };
-                    if let Some(sender) = pending
+                    let sender = pending
                         .lock()
                         .expect("pending responses mutex poisoned")
-                        .remove(&id)
-                    {
+                        .remove(&id);
+                    if let Some(sender) = sender {
                         let _ = sender.send(&cx, envelope);
                     }
                 }
@@ -1097,7 +1113,7 @@ fn classify_execution_class(op: &str) -> ExecutionClass {
     }
 }
 
-fn is_timeout_or_disconnect_error_code(code: protocol::ProtocolErrorCode) -> bool {
+const fn is_timeout_or_disconnect_error_code(code: protocol::ProtocolErrorCode) -> bool {
     matches!(
         code,
         protocol::ProtocolErrorCode::ChromeBridgeTimeout
@@ -1115,7 +1131,7 @@ fn is_esl_in_progress_error(err: &protocol::ErrorResponse) -> bool {
             .contains("in_progress")
 }
 
-fn is_ambiguous_transport_error(err: &ChromeBridgeError) -> bool {
+const fn is_ambiguous_transport_error(err: &ChromeBridgeError) -> bool {
     matches!(
         err,
         ChromeBridgeError::ResponseChannelClosed { .. }
@@ -1142,6 +1158,12 @@ fn execution_indeterminate_envelope(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::bool_assert_comparison,
+        clippy::match_wildcard_for_single_variants,
+        clippy::needless_pass_by_value
+    )]
+
     use super::*;
 
     use asupersync::runtime::RuntimeBuilder;
