@@ -133,6 +133,8 @@ pub struct CompatConfig {
 pub struct ModelRegistry {
     models: Vec<ModelEntry>,
     error: Option<String>,
+    /// O(1) lookup index: `(canonical_provider_lc, canonical_model_id_lc)` → Vec index.
+    find_index: HashMap<(String, String), usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +211,17 @@ fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
         canonical_provider.to_ascii_lowercase(),
         canonical_model_id.to_ascii_lowercase(),
     )
+}
+
+/// Build a HashMap index for O(1) `find()` lookups.
+fn build_find_index(models: &[ModelEntry]) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::with_capacity(models.len());
+    for (i, entry) in models.iter().enumerate() {
+        let key = normalized_registry_key(&entry.model.provider, &entry.model.id);
+        // First entry wins (consistent with linear scan finding first match).
+        index.entry(key).or_insert(i);
+    }
+    index
 }
 
 fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
@@ -480,7 +493,12 @@ impl ModelRegistry {
             }
         }
 
-        Self { models, error }
+        let find_index = build_find_index(&models);
+        Self {
+            models,
+            error,
+            find_index,
+        }
     }
 
     pub fn models(&self) -> &[ModelEntry] {
@@ -503,37 +521,9 @@ impl ModelRegistry {
     }
 
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
-        let provider = provider.trim();
-        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
-        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
-        let openrouter_ids = if is_openrouter {
-            openrouter_model_lookup_ids(id)
-        } else {
-            Vec::new()
-        };
-        let trimmed_id = id.trim();
-
-        self.models
-            .iter()
-            .find(|m| {
-                let model_provider = m.model.provider.as_str();
-                let model_provider_canonical =
-                    canonical_provider_id(model_provider).unwrap_or(model_provider);
-                let provider_matches = model_provider.eq_ignore_ascii_case(provider)
-                    || model_provider.eq_ignore_ascii_case(canonical_provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(provider)
-                    || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
-                provider_matches
-                    && if is_openrouter {
-                        openrouter_ids
-                            .iter()
-                            .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
-                    } else {
-                        m.model.id.eq_ignore_ascii_case(trimmed_id)
-                    }
-            })
-            .cloned()
+        let key = normalized_registry_key(provider, id);
+        let idx = *self.find_index.get(&key)?;
+        self.models.get(idx).cloned()
     }
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
@@ -549,15 +539,14 @@ impl ModelRegistry {
     /// Merge extension-provided model entries into the registry.
     pub fn merge_entries(&mut self, entries: Vec<ModelEntry>) {
         for entry in entries {
-            // Skip duplicates (canonical provider + canonical model id, case-insensitive).
             let entry_key = normalized_registry_key(&entry.model.provider, &entry.model.id);
-            let exists = self
-                .models
-                .iter()
-                .any(|m| normalized_registry_key(&m.model.provider, &m.model.id) == entry_key);
-            if !exists {
-                self.models.push(entry);
+            // Skip duplicates — the find_index already tracks all canonical keys.
+            if self.find_index.contains_key(&entry_key) {
+                continue;
             }
+            let idx = self.models.len();
+            self.find_index.insert(entry_key, idx);
+            self.models.push(entry);
         }
     }
 }
@@ -3047,9 +3036,11 @@ mod tests {
         };
 
         apply_custom_models(&auth, &mut models, &config);
+        let find_index = build_find_index(&models);
         let registry = ModelRegistry {
             models,
             error: None,
+            find_index,
         };
 
         assert!(
