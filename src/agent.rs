@@ -264,12 +264,15 @@ pub enum AgentEvent {
         partial_result: ToolOutput,
     },
     /// Tool execution end.
+    ///
+    /// O6: `result` is `Arc<ToolOutput>` to avoid deep-cloning large
+    /// browser tool outputs (a11y trees, screenshots) into the event.
     ToolExecutionEnd {
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        result: ToolOutput,
+        result: Arc<ToolOutput>,
         #[serde(rename = "isError")]
         is_error: bool,
     },
@@ -1678,9 +1681,21 @@ impl Agent {
             // If `None`, the tool was skipped/aborted.
             if let Some((output, is_error)) = tool_outputs[index].take() {
                 // Tool executed normally.
-                // Build ToolResultMessage first and wrap in Arc; the message
-                // clone below is O(1) Arc refcount bump since ToolResult is
-                // already Arc-wrapped in the Message enum.
+                // O6: Wrap output in Arc first so the ToolExecutionEnd event
+                // gets a cheap Arc clone instead of deep-copying content/details
+                // (which can be 50-200KB for browser tools).
+                let output_arc = Arc::new(output);
+
+                on_event(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
+                    result: Arc::clone(&output_arc),
+                    is_error,
+                });
+
+                // Unwrap the Arc to move content/details into ToolResultMessage.
+                // If the event handler already dropped its ref, this is free.
+                let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
@@ -1688,19 +1703,6 @@ impl Agent {
                     details: output.details,
                     is_error,
                     timestamp: Utc::now().timestamp_millis(),
-                });
-
-                // Emit ToolExecutionEnd. We clone content/details from the
-                // Arc'd result — same data, no extra source clone.
-                on_event(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tool_result.tool_call_id.clone(),
-                    tool_name: tool_result.tool_name.clone(),
-                    result: ToolOutput {
-                        content: tool_result.content.clone(),
-                        details: tool_result.details.clone(),
-                        is_error,
-                    },
-                    is_error,
                 });
 
                 let msg = Message::ToolResult(Arc::clone(&tool_result));
@@ -1736,16 +1738,15 @@ impl Agent {
                     },
                 });
 
+                // O6: wrap abort output in Arc for cheap event sharing.
+                let output_arc = Arc::new(output);
                 on_event(AgentEvent::ToolExecutionEnd {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
-                    result: ToolOutput {
-                        content: output.content.clone(),
-                        details: output.details.clone(),
-                        is_error: true,
-                    },
+                    result: Arc::clone(&output_arc),
                     is_error: true,
                 });
+                let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
 
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
@@ -1949,12 +1950,14 @@ impl Agent {
             args: tool_call.arguments.clone(),
             partial_result: output.clone(),
         });
+        let output_arc = Arc::new(output);
         on_event(AgentEvent::ToolExecutionEnd {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            result: output.clone(),
+            result: Arc::clone(&output_arc),
             is_error: true,
         });
+        let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
 
         let tool_result = Arc::new(ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -6574,5 +6577,51 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["finalError"], "max retries exceeded");
+    }
+
+    /// O6 guardrail: ToolExecutionEnd.result is Arc<ToolOutput>,
+    /// so cloning the event shares the output without deep-copying content.
+    #[test]
+    fn tool_execution_end_result_is_arc_shared() {
+        use crate::tools::ToolOutput;
+        let output = Arc::new(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("large_result"))],
+            details: None,
+            is_error: false,
+        });
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc_1".to_string(),
+            tool_name: "read".to_string(),
+            result: Arc::clone(&output),
+            is_error: false,
+        };
+        // Verify the event holds the same Arc (not a deep copy).
+        if let AgentEvent::ToolExecutionEnd { result, .. } = &event {
+            assert!(Arc::ptr_eq(result, &output));
+        } else {
+            panic!("expected ToolExecutionEnd");
+        }
+    }
+
+    /// O6 guardrail: ToolExecutionEnd serializes identically to the
+    /// pre-Arc wire format (Arc<T> has transparent serde).
+    #[test]
+    fn tool_execution_end_arc_serializes_transparently() {
+        use crate::tools::ToolOutput;
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc_1".to_string(),
+            tool_name: "read".to_string(),
+            result: Arc::new(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
+                details: None,
+                is_error: false,
+            }),
+            is_error: false,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool_execution_end");
+        assert_eq!(json["toolCallId"], "tc_1");
+        assert!(json["result"]["content"].is_array());
+        assert_eq!(json["isError"], false);
     }
 }
