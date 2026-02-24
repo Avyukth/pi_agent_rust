@@ -13,6 +13,7 @@
 //! 5. If done: return final message
 
 use crate::auth::AuthStorage;
+use crate::chrome::ChromeBridge;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::error::{Error, Result};
@@ -409,6 +410,9 @@ pub struct Agent {
     /// Count of hidden custom messages (display: false) in the message history.
     /// Maintained incrementally to avoid O(n) scans in build_context().
     hidden_custom_count: usize,
+
+    /// Optional ChromeBridge for browser automation observation draining.
+    chrome_bridge: Option<Arc<ChromeBridge>>,
 }
 
 impl Agent {
@@ -425,6 +429,7 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             hidden_custom_count: 0,
+            chrome_bridge: None,
         }
     }
 
@@ -486,6 +491,76 @@ impl Agent {
     {
         self.tools.extend(tools);
         self.cached_tool_defs = None; // Invalidate cache when tools change
+    }
+
+    /// Set the ChromeBridge for browser observation draining.
+    pub fn set_chrome_bridge(&mut self, bridge: Arc<ChromeBridge>) {
+        self.chrome_bridge = Some(bridge);
+    }
+
+    /// Drain browser observations from the ChromeBridge, format as a summary,
+    /// and return as a hidden custom message for LLM context injection.
+    ///
+    /// Returns `None` if no bridge is set, or no observations are pending.
+    /// This enables the verify loop: the LLM sees observation summaries
+    /// in its next turn and can act on them.
+    fn drain_observations(&self) -> Option<Message> {
+        let bridge = self.chrome_bridge.as_ref()?;
+        let events = bridge.take_observations();
+        if events.is_empty() {
+            return None;
+        }
+
+        // Format protocol-level observation batches into a text summary.
+        // Each protocol ObservationEvent contains a batch of ObservationEntries.
+        let mut lines = Vec::new();
+        let mut total_entries = 0;
+        for batch in &events {
+            for entry in &batch.events {
+                let msg = entry.message.as_deref().unwrap_or("");
+                let url = entry.url.as_deref().unwrap_or("");
+                let detail = if !msg.is_empty() {
+                    msg
+                } else if !url.is_empty() {
+                    url
+                } else {
+                    ""
+                };
+                let suffix = if detail.is_empty() {
+                    String::new()
+                } else if detail.len() > 80 {
+                    format!(": {}...", &detail[..77])
+                } else {
+                    format!(": {}", detail)
+                };
+                lines.push(format!("- {}{}", entry.kind, suffix));
+                total_entries += 1;
+                // Budget: cap at ~20 lines to avoid prompt bloat
+                if lines.len() >= 20 {
+                    break;
+                }
+            }
+            if lines.len() >= 20 {
+                break;
+            }
+        }
+
+        if lines.is_empty() {
+            return None;
+        }
+
+        let summary = format!("[Browser Observation]\n{}", lines.join("\n"));
+
+        Some(Message::Custom(CustomMessage {
+            content: summary,
+            custom_type: "browser_observations".to_string(),
+            display: false,
+            details: Some(json!({
+                "events_processed": total_entries,
+                "batches": events.len(),
+            })),
+            timestamp: Utc::now().timestamp_millis(),
+        }))
     }
 
     /// Queue a steering message (delivered after tool completion).
@@ -903,6 +978,14 @@ impl Agent {
                     .iter()
                     .map(|r| Message::ToolResult(Arc::clone(r)))
                     .collect::<Vec<_>>();
+
+                // Drain browser observations and inject as hidden context note.
+                // This enables the verify loop: the LLM sees observation summaries
+                // (console errors, load events, etc.) in its next turn context.
+                if let Some(obs_message) = self.drain_observations() {
+                    self.add_message(obs_message.clone());
+                    new_messages.push(obs_message);
+                }
 
                 let turn_end_event = AgentEvent::TurnEnd {
                     session_id: session_id.clone(),
@@ -2292,6 +2375,227 @@ mod hidden_custom_counter_tests {
         assert_eq!(
             agent.hidden_custom_count, 2,
             "counter should track exactly 2 hidden custom messages"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_observations_tests {
+    use super::*;
+    use crate::chrome::ChromeBridge;
+    use crate::chrome::protocol::{ObservationEntry, ObservationEvent};
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn api(&self) -> &str {
+            "stub"
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn make_agent() -> Agent {
+        Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        )
+    }
+
+    fn sample_observation(kind: &str, message: Option<&str>) -> ObservationEvent {
+        ObservationEvent {
+            version: 1,
+            observer_id: "obs-1".to_string(),
+            events: vec![ObservationEntry {
+                kind: kind.to_string(),
+                message: message.map(|s| s.to_string()),
+                source: None,
+                url: None,
+                ts: 1000,
+            }],
+        }
+    }
+
+    #[test]
+    fn drain_observations_returns_none_without_bridge() {
+        let agent = make_agent();
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_returns_none_with_empty_buffer() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        agent.set_chrome_bridge(bridge);
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_returns_custom_message_with_events() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation(
+            "console_error",
+            Some("TypeError: cannot read property 'x' of null"),
+        ));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "browser_observations");
+                assert!(!cm.display, "observation messages should be hidden");
+                assert!(cm.content.contains("[Browser Observation]"));
+                assert!(cm.content.contains("console_error"));
+                assert!(cm.content.contains("TypeError"));
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_clears_buffer_after_take() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation(
+            "navigation",
+            Some("https://example.com"),
+        ));
+        agent.set_chrome_bridge(bridge.clone());
+
+        // First drain should produce a message
+        assert!(agent.drain_observations().is_some());
+        // Second drain should be empty (buffer was cleared)
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_caps_at_20_lines() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        // Push 25 events in a single batch
+        let entries: Vec<ObservationEntry> = (0..25)
+            .map(|i| ObservationEntry {
+                kind: "console_warn".to_string(),
+                message: Some(format!("warning {i}")),
+                source: None,
+                url: None,
+                ts: 1000 + i,
+            })
+            .collect();
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "obs-1".to_string(),
+            events: entries,
+        });
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                let line_count = cm.content.lines().count();
+                // Header "[Browser Observation]" + at most 20 event lines = 21
+                assert!(
+                    line_count <= 21,
+                    "should cap at 20 event lines + header, got {line_count}"
+                );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_truncates_long_details() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let long_message = "a".repeat(200);
+        bridge.push_observation(sample_observation("console_error", Some(&long_message)));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                // Detail should be truncated to ~80 chars + "..."
+                assert!(
+                    cm.content.contains("..."),
+                    "long details should be truncated"
+                );
+                assert!(
+                    cm.content.len() < 200,
+                    "output should be shorter than the raw 200-char input"
+                );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_includes_metadata_in_details() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation("load_complete", None));
+        bridge.push_observation(sample_observation("console_error", Some("err")));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                let details = cm.details.as_ref().expect("should have details");
+                assert_eq!(details["events_processed"], 2);
+                assert_eq!(details["batches"], 2);
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_message_added_to_history() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation("dom_mutation", Some("element added")));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        agent.add_message(msg);
+
+        // Verify it's in the message history
+        let last = agent.messages().last().expect("should have messages");
+        match last {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "browser_observations");
+                assert!(!cm.display);
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+
+        // Verify hidden_custom_count was incremented
+        assert_eq!(
+            agent.hidden_custom_count, 1,
+            "hidden observation message should increment counter"
         );
     }
 }
