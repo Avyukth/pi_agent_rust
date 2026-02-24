@@ -1558,4 +1558,74 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_native_host_run_with_io_error_path_clears_claim_and_updates_discovery() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+            host.startup().await.expect("startup should succeed");
+
+            let request = sample_request();
+            let mut chrome_in = Vec::new();
+            write_native_messaging_frame(&mut chrome_in, b"{not-json")
+                .expect("encode malformed chrome frame");
+            let mut chrome_reader = std::io::Cursor::new(chrome_in);
+            let mut chrome_writer = Vec::new();
+
+            let socket_path = host.socket_path().to_path_buf();
+            let request_for_client = request.clone();
+            let client = std::thread::spawn(move || {
+                let mut stream =
+                    std::os::unix::net::UnixStream::connect(&socket_path).expect("client connect");
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone client stream for reads"),
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthClaim(sample_auth_claim("secret-test-token")),
+                );
+                let handshake = read_frame(&mut reader);
+                assert!(
+                    matches!(handshake, protocol::MessageType::AuthOk(_)),
+                    "client must receive auth_ok before relay error is triggered"
+                );
+                send_frame(&mut stream, &request_for_client);
+                // Drop connection after sending request; host should fail on malformed chrome payload.
+            });
+
+            let err = host
+                .run_with_io(&mut chrome_reader, &mut chrome_writer)
+                .await
+                .expect_err("malformed chrome payload must surface as relay error");
+            assert!(
+                matches!(err, NativeHostError::NativeMessageJson(_)),
+                "run loop should report malformed chrome payload as NativeMessageJson"
+            );
+
+            client.join().expect("client thread join");
+
+            assert!(
+                host.claimed_by().is_none(),
+                "host must clear exclusive claim state even when relay exits with error"
+            );
+
+            let raw = fs::read(host.discovery_path()).expect("read discovery after relay error");
+            let record: DiscoveryRecord =
+                serde_json::from_slice(&raw).expect("parse discovery after relay error");
+            assert!(
+                record.claimed_by.is_none(),
+                "discovery record must clear claimed_by after relay error"
+            );
+
+            let mut chrome_wire_reader = std::io::Cursor::new(chrome_writer);
+            let decoded_forwarded_request = read_native_messaging_message(&mut chrome_wire_reader)
+                .expect("decode forwarded request");
+            assert_eq!(
+                decoded_forwarded_request, request,
+                "request should still be forwarded to Chrome before the malformed response error"
+            );
+        });
+    }
 }
