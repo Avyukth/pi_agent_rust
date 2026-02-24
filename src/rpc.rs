@@ -311,7 +311,7 @@ pub async fn run(
     session: AgentSession,
     options: RpcOptions,
     in_rx: mpsc::Receiver<String>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_request();
     let session_handle = Arc::clone(&session.session);
@@ -1729,7 +1729,7 @@ async fn run_prompt_with_retry(
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
     retry_abort: Arc<AtomicBool>,
     options: RpcOptions,
     message: String,
@@ -1992,7 +1992,7 @@ fn rpc_emit_extension_ui_request(
     runtime_handle: &RuntimeHandle,
     ui_state: Arc<Mutex<RpcUiBridgeState>>,
     manager: ExtensionManager,
-    out_tx_ui: std::sync::mpsc::Sender<String>,
+    out_tx_ui: std::sync::mpsc::SyncSender<String>,
     request: ExtensionUiRequest,
 ) {
     // Emit the UI request as a JSON notification to the client.
@@ -2584,7 +2584,7 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -2685,7 +2685,7 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -2780,7 +2780,7 @@ async fn maybe_auto_compact(
     session: Arc<Mutex<AgentSession>>,
     options: RpcOptions,
     is_compacting: Arc<AtomicBool>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
 ) {
     let cx = AgentCx::for_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
