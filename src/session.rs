@@ -593,6 +593,9 @@ pub struct Session {
     /// Offset to add to `cached_message_count` to account for messages not loaded in memory
     /// (e.g. when using V2 tail hydration).
     v2_message_count_offset: u64,
+    /// Test-only counter: number of times `rebuild_all_caches` was invoked.
+    #[cfg(test)]
+    rebuild_cache_count: u32,
 }
 
 impl Clone for Session {
@@ -623,6 +626,8 @@ impl Clone for Session {
             v2_partial_hydration: self.v2_partial_hydration,
             v2_resume_mode: self.v2_resume_mode,
             v2_message_count_offset: self.v2_message_count_offset,
+            #[cfg(test)]
+            rebuild_cache_count: self.rebuild_cache_count,
         }
     }
 }
@@ -1011,6 +1016,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            #[cfg(test)]
+            rebuild_cache_count: 0,
         }
     }
 
@@ -1050,6 +1057,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            #[cfg(test)]
+            rebuild_cache_count: 0,
         }
     }
 
@@ -1201,6 +1210,8 @@ impl Session {
                 v2_partial_hydration: !matches!(mode, V2OpenMode::Full),
                 v2_resume_mode: Some(mode),
                 v2_message_count_offset,
+                #[cfg(test)]
+                rebuild_cache_count: 0,
             },
             diagnostics,
         ))
@@ -1266,6 +1277,8 @@ impl Session {
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            #[cfg(test)]
+            rebuild_cache_count: 0,
         })
     }
 
@@ -1519,10 +1532,31 @@ impl Session {
         false
     }
 
+    /// Returns true when all derived caches appear consistent with
+    /// `self.entries`, meaning `rebuild_all_caches` can be skipped.
+    fn caches_consistent(&self) -> bool {
+        let n = self.entries.len();
+        if self.entry_ids.len() != n || self.entry_index.len() != n {
+            return false;
+        }
+        // Verify leaf_id matches the last entry's ID.
+        match (self.leaf_id.as_deref(), self.entries.last()) {
+            (Some(leaf), Some(last)) => last.base_id().is_some_and(|id| id == leaf),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Save the session to disk.
     #[allow(clippy::too_many_lines)]
     async fn save_inner(&mut self) -> Result<()> {
-        self.ensure_entry_ids();
+        // V9-A: skip expensive O(n) rebuild when caches are already consistent.
+        if self.caches_consistent() {
+            // Caches are up-to-date; only ensure entry IDs are filled (no-op
+            // when entry_ids.len() == entries.len()).
+        } else {
+            self.ensure_entry_ids();
+        }
 
         let store_kind = match self
             .path
@@ -1999,6 +2033,10 @@ impl Session {
     /// Called after bulk mutations (save round-trip, ensure_entry_ids) where
     /// incremental maintenance is impractical.
     fn rebuild_all_caches(&mut self) {
+        #[cfg(test)]
+        {
+            self.rebuild_cache_count += 1;
+        }
         let finalized = finalize_loaded_entries(&mut self.entries);
         self.entry_ids = finalized.entry_ids;
         self.entry_index = finalized.entry_index;
@@ -3741,6 +3779,8 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             v2_partial_hydration: false,
             v2_resume_mode: None,
             v2_message_count_offset: 0,
+            #[cfg(test)]
+            rebuild_cache_count: 0,
         },
         diagnostics,
     ))
@@ -9126,5 +9166,48 @@ mod tests {
         let plan_entry_count = plan.entries.len();
         session.append_message(make_test_message("third message"));
         assert_eq!(plan.entries.len(), plan_entry_count);
+    }
+
+    // -------------------------------------------------------------------
+    // V9-A: Gate ensure_entry_ids/rebuild_all_caches in save_inner
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn save_inner_skips_rebuild_when_caches_consistent() {
+        // After normal appends, caches are incrementally maintained and
+        // save_inner should skip the expensive rebuild_all_caches.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(dir.path().to_path_buf()));
+        session.append_message(make_test_message("hello"));
+        session.append_message(make_test_message("world"));
+
+        // Reset counter after any initial rebuilds from creation.
+        session.rebuild_cache_count = 0;
+
+        run_async(session.save_inner());
+
+        assert_eq!(
+            session.rebuild_cache_count, 0,
+            "save_inner should skip rebuild when caches are already consistent"
+        );
+    }
+
+    #[test]
+    fn save_inner_rebuilds_when_caches_inconsistent() {
+        // If caches are manually invalidated, save_inner must rebuild.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(dir.path().to_path_buf()));
+        session.append_message(make_test_message("hello"));
+
+        // Simulate cache inconsistency: clear entry_ids but keep entries.
+        session.entry_ids.clear();
+        session.rebuild_cache_count = 0;
+
+        run_async(session.save_inner());
+
+        assert_eq!(
+            session.rebuild_cache_count, 1,
+            "save_inner should rebuild when entry_ids.len() != entries.len()"
+        );
     }
 }
