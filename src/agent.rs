@@ -405,6 +405,10 @@ pub struct Agent {
 
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
     cached_tool_defs: Option<Vec<ToolDef>>,
+
+    /// Count of hidden custom messages (display: false) in the message history.
+    /// Maintained incrementally to avoid O(n) scans in build_context().
+    hidden_custom_count: usize,
 }
 
 impl Agent {
@@ -420,6 +424,7 @@ impl Agent {
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
+            hidden_custom_count: 0,
         }
     }
 
@@ -432,15 +437,23 @@ impl Agent {
     /// Clear the message history.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.hidden_custom_count = 0;
     }
 
     /// Add a message to the history.
     pub fn add_message(&mut self, message: Message) {
+        if matches!(&message, Message::Custom(c) if !c.display) {
+            self.hidden_custom_count += 1;
+        }
         self.messages.push(message);
     }
 
     /// Replace the message history.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.hidden_custom_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::Custom(c) if !c.display))
+            .count();
         self.messages = messages;
     }
 
@@ -527,11 +540,8 @@ impl Agent {
             }
             Cow::Owned(msgs)
         } else {
-            // Check if we need to filter hidden custom messages to avoid cloning if not needed.
-            let has_hidden = self.messages.iter().any(|m| match m {
-                Message::Custom(c) => !c.display,
-                _ => false,
-            });
+            // O(1) check via incrementally maintained counter (O12 optimization).
+            let has_hidden = self.hidden_custom_count > 0;
 
             if has_hidden {
                 let mut msgs = self.messages.clone();
@@ -690,7 +700,7 @@ impl Agent {
         on_event(agent_start_event);
 
         for prompt in prompts {
-            self.messages.push(prompt.clone());
+            self.add_message(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
             });
@@ -719,7 +729,7 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
-                    self.messages.push(message.clone());
+                    self.add_message(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
                     });
@@ -2110,6 +2120,159 @@ mod message_queue_tests {
                 if matches!(content, UserContent::Text(text) if text == "f2")
         ));
         assert!(queue.pop_follow_up().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hidden_custom_counter_tests {
+    use super::*;
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str { "stub" }
+        fn api(&self) -> &str { "stub" }
+        fn model_id(&self) -> &str { "stub" }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn make_agent() -> Agent {
+        Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        )
+    }
+
+    fn hidden_custom(text: &str) -> Message {
+        Message::Custom(CustomMessage {
+            content: text.to_string(),
+            custom_type: "test".to_string(),
+            display: false,
+            details: None,
+            timestamp: 0,
+        })
+    }
+
+    fn visible_custom(text: &str) -> Message {
+        Message::Custom(CustomMessage {
+            content: text.to_string(),
+            custom_type: "test".to_string(),
+            display: true,
+            details: None,
+            timestamp: 0,
+        })
+    }
+
+    fn user_msg(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn test_hidden_counter_starts_at_zero() {
+        let agent = make_agent();
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "new agent should have zero hidden messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_increments_on_hidden_custom() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret"));
+        assert_eq!(
+            agent.hidden_custom_count, 1,
+            "counter should be 1 after adding a hidden custom message"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_unchanged_for_visible_custom() {
+        let mut agent = make_agent();
+        agent.add_message(visible_custom("visible"));
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should be 0 for visible custom messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_unchanged_for_user_message() {
+        let mut agent = make_agent();
+        agent.add_message(user_msg("hello"));
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should be 0 for user messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_resets_on_clear() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret1"));
+        agent.add_message(hidden_custom("secret2"));
+        assert_eq!(agent.hidden_custom_count, 2);
+
+        agent.clear_messages();
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should reset to 0 on clear"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_recounts_on_replace() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret"));
+        assert_eq!(agent.hidden_custom_count, 1);
+
+        // Replace with a mix of messages
+        agent.replace_messages(vec![
+            user_msg("hi"),
+            hidden_custom("new_secret"),
+            visible_custom("visible"),
+            hidden_custom("another_secret"),
+        ]);
+        assert_eq!(
+            agent.hidden_custom_count, 2,
+            "counter should reflect the new message set after replace"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_multiple_adds() {
+        let mut agent = make_agent();
+        agent.add_message(user_msg("a"));
+        agent.add_message(hidden_custom("b"));
+        agent.add_message(visible_custom("c"));
+        agent.add_message(hidden_custom("d"));
+        agent.add_message(user_msg("e"));
+        assert_eq!(
+            agent.hidden_custom_count, 2,
+            "counter should track exactly 2 hidden custom messages"
+        );
     }
 }
 
