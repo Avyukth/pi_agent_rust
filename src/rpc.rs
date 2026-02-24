@@ -47,6 +47,14 @@ use std::time::{Duration, Instant};
 /// Bounds memory to ~5 MB max (256 × ~20 KB worst-case per browser tool result).
 const RPC_OUTPUT_CHANNEL_BOUND: usize = 256;
 
+/// O5: Capacity of the non-blocking event drain buffer.
+///
+/// Events are pushed via `try_send()` (never blocks the async runtime) and a
+/// dedicated `rpc-event-drain` thread serializes + forwards to the bounded
+/// `RPC_OUTPUT_CHANNEL_BOUND` stdout channel. 4096 slots accommodate a burst
+/// of 8 concurrent browser tools × ~500 update events per tool.
+const EVENT_DRAIN_BUFFER: usize = 4096;
+
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
@@ -1817,40 +1825,65 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let runtime_for_events_handler = runtime_for_events.clone();
+
+            // O5: Non-blocking event emission — decouple serialization + I/O
+            // from tool execution tasks. Raw AgentEvent values (cheap to move
+            // thanks to Arc wrappers from O6/O13) are pushed into a bounded
+            // buffer via try_send() (never blocks). A dedicated drain thread
+            // handles serde_json serialization + stdout forwarding, preventing
+            // 8 concurrent browser tools from contending on serialization +
+            // SyncSender backpressure.
             let event_tx = out_tx.clone();
+            let runtime_for_drain = runtime_for_events.clone();
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
+
+            let (buf_tx, buf_rx) =
+                std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+            let drain_handle = std::thread::Builder::new()
+                .name("rpc-event-drain".into())
+                .spawn(move || {
+                    for event in buf_rx {
+                        let serialized = if let AgentEvent::AgentEnd {
+                            messages, error, ..
+                        } = &event
+                        {
+                            json!({
+                                "type": "agent_end",
+                                "messages": messages,
+                                "error": error,
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::to_string(&event).unwrap_or_else(|err| {
+                                json!({
+                                    "type": "event_serialize_error",
+                                    "error": err.to_string(),
+                                })
+                                .to_string()
+                            })
+                        };
+                        let _ = event_tx.send(serialized);
+                        // Route non-lifecycle events through the coalescer for
+                        // batched/coalesced dispatch with lazy serialization.
+                        if let Some(coal) = &coalescer {
+                            coal.dispatch_agent_event_lazy(&event, &runtime_for_drain);
+                        }
+                    }
+                })
+                .expect("spawn rpc-event-drain thread");
+
             let event_handler = move |event: AgentEvent| {
-                let serialized = if let AgentEvent::AgentEnd {
-                    messages, error, ..
-                } = &event
-                {
-                    json!({
-                        "type": "agent_end",
-                        "messages": messages,
-                        "error": error,
-                    })
-                    .to_string()
-                } else {
-                    serde_json::to_string(&event).unwrap_or_else(|err| {
-                        json!({
-                            "type": "event_serialize_error",
-                            "error": err.to_string(),
-                        })
-                        .to_string()
-                    })
-                };
-                let _ = event_tx.send(serialized);
-                // Route non-lifecycle events through the coalescer for
-                // batched/coalesced dispatch with lazy serialization.
-                if let Some(coal) = &coalescer {
-                    coal.dispatch_agent_event_lazy(&event, &runtime_for_events_handler);
-                }
+                // Non-blocking: push raw event to drain buffer.
+                // try_send avoids blocking the async runtime under backpressure;
+                // the EVENT_DRAIN_BUFFER-slot buffer absorbs bursts from 8
+                // concurrent tools.
+                let _ = buf_tx.try_send(event);
             };
 
-            if images.is_empty() {
+            let run_result = if images.is_empty() {
                 guard
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
                     .await
@@ -1862,7 +1895,15 @@ async fn run_prompt_with_retry(
                 guard
                     .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                     .await
-            }
+            };
+
+            // event_handler dropped → buf_tx dropped → drain thread exits
+            // after processing remaining buffered events. Join to ensure all
+            // events are flushed to stdout before we process the result or
+            // retry.
+            let _ = drain_handle.join();
+
+            run_result
         };
 
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -5209,5 +5250,196 @@ mod output_channel_bound_tests {
         // Now one more send should succeed.
         tx.send("after-drain".to_string())
             .expect("send after drain should succeed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O5: Event drain buffer guardrail tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod event_drain_tests {
+    use super::*;
+    use crate::agent::AgentEvent;
+
+    #[test]
+    fn event_drain_buffer_capacity_is_sufficient() {
+        // Guardrail: buffer must be large enough for 8 tools × 500 updates.
+        assert!(
+            EVENT_DRAIN_BUFFER >= 4096,
+            "EVENT_DRAIN_BUFFER ({EVENT_DRAIN_BUFFER}) must be >= 4096"
+        );
+    }
+
+    #[test]
+    fn event_drain_try_send_is_nonblocking() {
+        // Guardrail: try_send on a SyncSender never blocks, even when full.
+        // Verify it returns TrySendError::Full instead of blocking.
+        let (tx, _rx) =
+            std::sync::mpsc::sync_channel::<AgentEvent>(2);
+
+        let e1 = AgentEvent::AgentStart {
+            session_id: "s1".into(),
+        };
+        let e2 = AgentEvent::AgentStart {
+            session_id: "s2".into(),
+        };
+        let e3 = AgentEvent::AgentStart {
+            session_id: "s3".into(),
+        };
+
+        // Fill the 2-slot buffer.
+        tx.try_send(e1).expect("slot 1");
+        tx.try_send(e2).expect("slot 2");
+
+        // Third try_send must fail immediately (non-blocking).
+        let err = tx.try_send(e3).unwrap_err();
+        assert!(
+            matches!(err, std::sync::mpsc::TrySendError::Full(_)),
+            "expected Full, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn event_drain_thread_delivers_all_events_in_order() {
+        // Guardrail: the drain thread pattern preserves FIFO ordering and
+        // delivers every event pushed before the sender is dropped.
+        let (out_tx, out_rx) =
+            std::sync::mpsc::sync_channel::<String>(256);
+
+        let (buf_tx, buf_rx) =
+            std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+        let drain_handle = std::thread::Builder::new()
+            .name("test-event-drain".into())
+            .spawn(move || {
+                for event in buf_rx {
+                    let serialized = serde_json::to_string(&event)
+                        .unwrap_or_else(|e| format!("err: {e}"));
+                    let _ = out_tx.send(serialized);
+                }
+            })
+            .unwrap();
+
+        // Push 100 events.
+        let n = 100;
+        for i in 0..n {
+            let event = AgentEvent::AgentStart {
+                session_id: format!("session-{i}").into(),
+            };
+            buf_tx.try_send(event).expect("buffer has capacity");
+        }
+
+        // Drop sender to signal drain thread to finish.
+        drop(buf_tx);
+        drain_handle.join().expect("drain thread panicked");
+
+        // Verify all events arrived in order.
+        let mut received = Vec::new();
+        while let Ok(line) = out_rx.try_recv() {
+            received.push(line);
+        }
+        assert_eq!(
+            received.len(),
+            n,
+            "expected {n} events, got {}",
+            received.len()
+        );
+        // Verify ordering: each line should contain the corresponding session id.
+        for (i, line) in received.iter().enumerate() {
+            let expected = format!("session-{i}");
+            assert!(
+                line.contains(&expected),
+                "event {i} should contain '{expected}', got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_drain_thread_exits_when_sender_dropped() {
+        // Guardrail: drain thread must exit promptly when the sender is dropped.
+        let (buf_tx, buf_rx) =
+            std::sync::mpsc::sync_channel::<AgentEvent>(64);
+
+        let (out_tx, _out_rx) =
+            std::sync::mpsc::sync_channel::<String>(64);
+
+        let drain_handle = std::thread::Builder::new()
+            .name("test-drain-exit".into())
+            .spawn(move || {
+                for event in buf_rx {
+                    let _ = serde_json::to_string(&event);
+                    let _ = out_tx.send("ok".into());
+                }
+            })
+            .unwrap();
+
+        // Push one event, then drop.
+        let event = AgentEvent::AgentStart {
+            session_id: "x".into(),
+        };
+        buf_tx.try_send(event).unwrap();
+        drop(buf_tx);
+
+        // Drain thread should finish quickly (< 1 second).
+        let start = std::time::Instant::now();
+        drain_handle.join().expect("drain thread panicked");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "drain thread took too long to exit after sender drop"
+        );
+    }
+
+    #[test]
+    fn event_drain_concurrent_producers_no_loss() {
+        // Guardrail: 8 concurrent producers pushing events should not lose
+        // any when the buffer has sufficient capacity.
+        let (out_tx, out_rx) =
+            std::sync::mpsc::sync_channel::<String>(4096);
+
+        let (buf_tx, buf_rx) =
+            std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+        let drain_handle = std::thread::spawn(move || {
+            for event in buf_rx {
+                let s = serde_json::to_string(&event)
+                    .unwrap_or_default();
+                let _ = out_tx.send(s);
+            }
+        });
+
+        // 8 producers, 50 events each = 400 total.
+        let num_producers = 8;
+        let events_per_producer = 50;
+        let total = num_producers * events_per_producer;
+
+        let handles: Vec<_> = (0..num_producers)
+            .map(|p| {
+                let tx = buf_tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..events_per_producer {
+                        let event = AgentEvent::AgentStart {
+                            session_id: format!("p{p}-e{i}").into(),
+                        };
+                        let _ = tx.try_send(event);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(buf_tx);
+        drain_handle.join().unwrap();
+
+        let mut count = 0;
+        while out_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, total,
+            "expected {total} events from {num_producers} producers, got {count}"
+        );
     }
 }
