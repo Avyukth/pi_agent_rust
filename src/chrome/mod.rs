@@ -926,7 +926,10 @@ fn discovery_file_permissions_are_secure(path: &Path) -> bool {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) => {
-            tracing::debug!("Skipping discovery file with unreadable metadata {:?}: {err}", path);
+            tracing::debug!(
+                "Skipping discovery file with unreadable metadata {:?}: {err}",
+                path
+            );
             return false;
         }
     };
@@ -1716,8 +1719,7 @@ mod tests {
         let mut lease_expired = make_record(&lease_socket, "host-lease-expired");
         lease_expired.lease_expires_at_ms = Some(unix_time_ms() - 1);
 
-        let dead_socket_record =
-            make_record(&dir.path().join("missing.sock"), "host-dead-socket");
+        let dead_socket_record = make_record(&dir.path().join("missing.sock"), "host-dead-socket");
 
         let mut invalid_claim = make_record(&invalid_claim_socket, "host-invalid-claim");
         invalid_claim.claimed_by = Some(protocol::ClaimedBy {
@@ -1726,8 +1728,7 @@ mod tests {
         });
 
         write_discovery_record(
-            &dir.path()
-                .join("pi-chrome-host-host-valid.discovery.json"),
+            &dir.path().join("pi-chrome-host-host-valid.discovery.json"),
             &valid,
         );
         write_discovery_record(
