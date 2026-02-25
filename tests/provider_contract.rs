@@ -156,7 +156,7 @@ async fn collect_and_summarize(
                         StreamEvent::ToolCallEnd { tool_call, .. } => {
                             summary.tool_call_count += 1;
                             summary.tool_call_names.push(tool_call.name.clone());
-                            summary.tool_call_args.push(tool_call.arguments.clone());
+                            summary.tool_call_args.push((*tool_call.arguments).clone());
                             summary.timeline.push("tool_call_end".into());
                         }
                         StreamEvent::Done { reason, .. } => {

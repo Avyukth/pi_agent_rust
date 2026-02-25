@@ -963,13 +963,14 @@ fn abort_during_tool_execution_preserves_completed_tools() {
                 name: "read".to_string(),
                 arguments: json!({
                     "path": harness.temp_path("testfile.txt").display().to_string()
-                }),
+                })
+                .into(),
                 thought_signature: None,
             },
             ToolCall {
                 id: "bash-1".to_string(),
                 name: "bash".to_string(),
-                arguments: json!({ "command": "sleep 300" }),
+                arguments: json!({ "command": "sleep 300" }).into(),
                 thought_signature: None,
             },
         ];
@@ -1206,7 +1207,7 @@ fn max_tool_iterations_exceeded_returns_clean_stop() {
         let tool_call = ToolCall {
             id: "read-1".to_string(),
             name: "read".to_string(),
-            arguments: json!({ "path": data_path }),
+            arguments: json!({ "path": data_path }).into(),
             thought_signature: None,
         };
 
@@ -1664,7 +1665,7 @@ fn tool_call_followed_by_normal_completion() {
         let tool_calls = vec![ToolCall {
             id: "read-1".to_string(),
             name: "read".to_string(),
-            arguments: json!({ "path": sample_path }),
+            arguments: json!({ "path": sample_path }).into(),
             thought_signature: None,
         }];
 
@@ -1884,7 +1885,8 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
                     arguments: json!({
                         "path": target_path.clone(),
                         "content": "this payload should never persist"
-                    }),
+                    })
+                    .into(),
                     thought_signature: None,
                 },
                 ToolCall {
@@ -1892,7 +1894,8 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
                     name: "read".to_string(),
                     arguments: json!({
                         "path": target_path.clone()
-                    }),
+                    })
+                    .into(),
                     thought_signature: None,
                 },
             ],

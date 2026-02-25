@@ -67,7 +67,7 @@ fn callback_ordering_tool_hooks_fire_before_generic_subscribers() {
     listeners.notify(&AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-1".to_string(),
         tool_name: "read".to_string(),
-        args,
+        args: args.into(),
     });
 
     let hook_order = *tool_hook_order.lock().expect("lock");

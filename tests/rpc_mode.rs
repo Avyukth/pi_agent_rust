@@ -450,7 +450,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "tc1".to_string(),
                     name: "read".to_string(),
-                    arguments: serde_json::json!({ "path": "test.txt" }),
+                    arguments: serde_json::json!({ "path": "test.txt" }).into(),
                     thought_signature: None,
                 })],
                 api: "test".to_string(),

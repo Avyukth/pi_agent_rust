@@ -1839,8 +1839,7 @@ async fn run_prompt_with_retry(
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
 
-            let (buf_tx, buf_rx) =
-                std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+            let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
 
             let drain_handle = std::thread::Builder::new()
                 .name("rpc-event-drain".into())
@@ -5275,8 +5274,7 @@ mod event_drain_tests {
     fn event_drain_try_send_is_nonblocking() {
         // Guardrail: try_send on a SyncSender never blocks, even when full.
         // Verify it returns TrySendError::Full instead of blocking.
-        let (tx, _rx) =
-            std::sync::mpsc::sync_channel::<AgentEvent>(2);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<AgentEvent>(2);
 
         let e1 = AgentEvent::AgentStart {
             session_id: "s1".into(),
@@ -5304,18 +5302,16 @@ mod event_drain_tests {
     fn event_drain_thread_delivers_all_events_in_order() {
         // Guardrail: the drain thread pattern preserves FIFO ordering and
         // delivers every event pushed before the sender is dropped.
-        let (out_tx, out_rx) =
-            std::sync::mpsc::sync_channel::<String>(256);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
 
-        let (buf_tx, buf_rx) =
-            std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
 
         let drain_handle = std::thread::Builder::new()
             .name("test-event-drain".into())
             .spawn(move || {
                 for event in buf_rx {
-                    let serialized = serde_json::to_string(&event)
-                        .unwrap_or_else(|e| format!("err: {e}"));
+                    let serialized =
+                        serde_json::to_string(&event).unwrap_or_else(|e| format!("err: {e}"));
                     let _ = out_tx.send(serialized);
                 }
             })
@@ -5358,11 +5354,9 @@ mod event_drain_tests {
     #[test]
     fn event_drain_thread_exits_when_sender_dropped() {
         // Guardrail: drain thread must exit promptly when the sender is dropped.
-        let (buf_tx, buf_rx) =
-            std::sync::mpsc::sync_channel::<AgentEvent>(64);
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(64);
 
-        let (out_tx, _out_rx) =
-            std::sync::mpsc::sync_channel::<String>(64);
+        let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(64);
 
         let drain_handle = std::thread::Builder::new()
             .name("test-drain-exit".into())
@@ -5394,16 +5388,13 @@ mod event_drain_tests {
     fn event_drain_concurrent_producers_no_loss() {
         // Guardrail: 8 concurrent producers pushing events should not lose
         // any when the buffer has sufficient capacity.
-        let (out_tx, out_rx) =
-            std::sync::mpsc::sync_channel::<String>(4096);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
 
-        let (buf_tx, buf_rx) =
-            std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
 
         let drain_handle = std::thread::spawn(move || {
             for event in buf_rx {
-                let s = serde_json::to_string(&event)
-                    .unwrap_or_default();
+                let s = serde_json::to_string(&event).unwrap_or_default();
                 let _ = out_tx.send(s);
             }
         });

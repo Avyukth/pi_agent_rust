@@ -217,7 +217,7 @@ pub fn browser_error_to_tool_output(
 /// This is host guidance only — ESL/execution-class policy may override.
 /// `CHROME_BRIDGE_EXECUTION_INDETERMINATE` is always non-retryable for
 /// non-idempotent operations (fail-closed).
-pub fn is_retryable(code: ProtocolErrorCode) -> bool {
+pub const fn is_retryable(code: ProtocolErrorCode) -> bool {
     matches!(
         code,
         ProtocolErrorCode::ChromeBridgeDisconnected
@@ -227,7 +227,7 @@ pub fn is_retryable(code: ProtocolErrorCode) -> bool {
 }
 
 /// Display string for a protocol error code (SCREAMING_SNAKE_CASE).
-fn error_code_display(code: ProtocolErrorCode) -> &'static str {
+const fn error_code_display(code: ProtocolErrorCode) -> &'static str {
     match code {
         ProtocolErrorCode::ChromeNotFound => "CHROME_NOT_FOUND",
         ProtocolErrorCode::ExtensionNotInstalled => "EXTENSION_NOT_INSTALLED",

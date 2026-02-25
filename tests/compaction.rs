@@ -218,7 +218,7 @@ fn assistant_with_tool_calls(calls: Vec<(&str, Value)>) -> SessionMessage {
             ContentBlock::ToolCall(ToolCall {
                 id: format!("call-{idx}"),
                 name: name.to_string(),
-                arguments: args,
+                arguments: args.into(),
                 thought_signature: None,
             })
         })

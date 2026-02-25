@@ -176,7 +176,6 @@ impl ChromeBridge {
                                 host_id: record.host_id.clone(),
                                 claimed_by: record.claimed_by.clone(),
                             });
-                            continue;
                         }
                         Err(err) => {
                             last_error = Some(err);
@@ -222,11 +221,12 @@ impl ChromeBridge {
 
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
         guard.pinned_host_id = Some(auth_ok.host_id.clone());
-        guard.host_epoch = Some(auth_ok.host_epoch.clone());
+        guard.host_epoch = Some(auth_ok.host_epoch);
         guard.consecutive_failures = 0;
         guard.browser_tools_disabled = false;
         guard.stream = Some(stream);
         guard.state = ConnectionState::Connected;
+        drop(guard);
         Ok(())
     }
 
@@ -482,7 +482,7 @@ fn discover_hosts_in_dir(
 
     discovered.sort_by(|a, b| a.host_id.cmp(&b.host_id));
     if let Some(pinned) = pinned_host_id {
-        discovered.sort_by_key(|record| if record.host_id == pinned { 0_u8 } else { 1_u8 });
+        discovered.sort_by_key(|record| u8::from(record.host_id != pinned));
     }
     Ok(discovered)
 }
@@ -528,11 +528,11 @@ async fn reader_loop(
         buf.push(byte);
 
         if let Some((message, consumed)) = protocol::decode_frame::<protocol::MessageType>(&buf)? {
-            if consumed != buf.len() {
+            if consumed == buf.len() {
+                buf.clear();
+            } else {
                 let trailing = buf.split_off(consumed);
                 buf = trailing;
-            } else {
-                buf.clear();
             }
 
             match message {
@@ -541,11 +541,11 @@ async fn reader_loop(
                         protocol::ResponseEnvelope::Ok(resp) => resp.id.clone(),
                         protocol::ResponseEnvelope::Error(resp) => resp.id.clone(),
                     };
-                    if let Some(sender) = pending
+                    let sender = pending
                         .lock()
                         .expect("pending responses mutex poisoned")
-                        .remove(&id)
-                    {
+                        .remove(&id);
+                    if let Some(sender) = sender {
                         let _ = sender.send(&cx, envelope);
                     }
                 }

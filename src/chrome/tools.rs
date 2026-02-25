@@ -33,6 +33,11 @@
 //! - `ShortcutsListTool`: list available shortcuts (read-only)
 //! - `UploadImageTool`: upload image to file input
 
+// All Tool trait impls return `&'static str` from name/label/description but the
+// trait signature uses `&str` tied to `&self`. Clippy flags this as
+// `unnecessary_literal_bound` but the signature is trait-constrained.
+#![allow(clippy::unnecessary_literal_bound)]
+
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -81,7 +86,7 @@ pub struct ObserveTool {
 }
 
 impl ObserveTool {
-    pub fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
+    pub const fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
         Self { registry }
     }
 }
@@ -180,10 +185,9 @@ impl Tool for ObserveTool {
                 None => {
                     return Ok(ToolOutput {
                         content: vec![ContentBlock::Text(TextContent::new(format!(
-                            "Error: unknown event kind '{}'. Valid kinds: \
+                            "Error: unknown event kind '{event_str}'. Valid kinds: \
                                  console_error, console_warn, network_error, \
-                                 dom_mutation, navigation, load_complete",
-                            event_str
+                                 dom_mutation, navigation, load_complete"
                         )))],
                         details: None,
                         is_error: true,
@@ -215,8 +219,9 @@ impl Tool for ObserveTool {
                 is_error: true,
             });
         }
+        drop(registry);
 
-        let event_names: Vec<&str> = event_kinds.iter().map(|k| event_kind_str(k)).collect();
+        let event_names: Vec<&str> = event_kinds.iter().map(|k| event_kind_str(*k)).collect();
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
                 "Observer '{}' registered on tab {} for events [{}] with throttle {}ms",
@@ -249,7 +254,7 @@ pub struct UnobserveTool {
 }
 
 impl UnobserveTool {
-    pub fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
+    pub const fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
         Self { registry }
     }
 }
@@ -343,7 +348,7 @@ pub struct ObserversTool {
 }
 
 impl ObserversTool {
-    pub fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
+    pub const fn new(registry: Arc<StdMutex<ObserverRegistry>>) -> Self {
         Self { registry }
     }
 }
@@ -380,11 +385,11 @@ impl Tool for ObserversTool {
         _input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let registry = self
+        let observers = self
             .registry
             .lock()
-            .expect("observer registry mutex poisoned");
-        let observers = registry.list();
+            .expect("observer registry mutex poisoned")
+            .list();
 
         if observers.is_empty() {
             return Ok(ToolOutput {
@@ -401,7 +406,7 @@ impl Tool for ObserversTool {
         lines.push(format!("{} active observer(s):", observers.len()));
 
         for obs in &observers {
-            let event_names: Vec<&str> = obs.events.iter().map(|k| event_kind_str(k)).collect();
+            let event_names: Vec<&str> = obs.events.iter().map(|k| event_kind_str(*k)).collect();
             lines.push(format!(
                 "  - {} (tab {}, events=[{}], throttle={}ms, pending={}, total={})",
                 obs.id,
@@ -419,7 +424,7 @@ impl Tool for ObserversTool {
                 serde_json::json!({
                     "id": obs.id,
                     "tab_id": obs.tab_id,
-                    "events": obs.events.iter().map(|k| event_kind_str(k)).collect::<Vec<_>>(),
+                    "events": obs.events.iter().map(|k| event_kind_str(*k)).collect::<Vec<_>>(),
                     "throttle_ms": obs.throttle_ms,
                     "pending_count": obs.pending_count,
                     "total_events": obs.total_events,
@@ -456,7 +461,7 @@ fn parse_event_kind(s: &str) -> Option<ObservableEventKind> {
 }
 
 /// Convert an ObservableEventKind to its wire string.
-fn event_kind_str(kind: &ObservableEventKind) -> &'static str {
+const fn event_kind_str(kind: ObservableEventKind) -> &'static str {
     match kind {
         ObservableEventKind::ConsoleError => "console_error",
         ObservableEventKind::ConsoleWarn => "console_warn",
@@ -619,7 +624,7 @@ pub struct NavigateTool {
 }
 
 impl NavigateTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -726,7 +731,7 @@ pub struct TabsCreateTool {
 }
 
 impl TabsCreateTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -792,7 +797,7 @@ pub struct TabsContextTool {
 }
 
 impl TabsContextTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -848,7 +853,7 @@ pub struct SwitchBrowserTool {
 }
 
 impl SwitchBrowserTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -915,7 +920,7 @@ pub struct ReadPageTool {
 }
 
 impl ReadPageTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1003,7 +1008,7 @@ pub struct GetPageTextTool {
 }
 
 impl GetPageTextTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1070,7 +1075,7 @@ pub struct FindTool {
 }
 
 impl FindTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1183,7 +1188,7 @@ pub struct ComputerTool {
 }
 
 impl ComputerTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1361,7 +1366,7 @@ pub struct FormInputTool {
 }
 
 impl FormInputTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1432,7 +1437,7 @@ pub struct ScreenshotTool {
 }
 
 impl ScreenshotTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1502,7 +1507,7 @@ pub struct GifCreatorTool {
 }
 
 impl GifCreatorTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1576,7 +1581,7 @@ pub struct JavascriptTool {
 }
 
 impl JavascriptTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1653,7 +1658,7 @@ pub struct ReadConsoleTool {
 }
 
 impl ReadConsoleTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1723,7 +1728,7 @@ pub struct ReadNetworkTool {
 }
 
 impl ReadNetworkTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1793,7 +1798,7 @@ pub struct ResizeWindowTool {
 }
 
 impl ResizeWindowTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1875,7 +1880,7 @@ pub struct ShortcutsExecuteTool {
 }
 
 impl ShortcutsExecuteTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -1948,7 +1953,7 @@ pub struct ShortcutsListTool {
 }
 
 impl ShortcutsListTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -2004,7 +2009,7 @@ pub struct UploadImageTool {
 }
 
 impl UploadImageTool {
-    pub fn new(bridge: Arc<ChromeBridge>) -> Self {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
         Self { bridge }
     }
 }
@@ -2618,7 +2623,7 @@ mod tests {
             ObservableEventKind::LoadComplete,
         ];
         for kind in &kinds {
-            let s = event_kind_str(kind);
+            let s = event_kind_str(*kind);
             let parsed = parse_event_kind(s).expect("roundtrip should succeed");
             assert_eq!(&parsed, kind);
         }

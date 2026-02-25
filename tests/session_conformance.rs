@@ -936,7 +936,7 @@ fn make_assistant_with_tool_use(
             content: vec![ContentBlock::ToolCall(ToolCall {
                 id: tool_call_id.to_string(),
                 name: tool_name.to_string(),
-                arguments: serde_json::json!({"path": "/test/file"}),
+                arguments: serde_json::json!({"path": "/test/file"}).into(),
                 thought_signature: None,
             })],
             api: "test".to_string(),

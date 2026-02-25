@@ -67,7 +67,7 @@ fn make_tool_call(name: &str, args: Value) -> ToolCall {
     ToolCall {
         id: format!("call-{name}"),
         name: name.to_string(),
-        arguments: args,
+        arguments: args.into(),
         thought_signature: None,
     }
 }
@@ -622,7 +622,7 @@ fn event_ordering_startup_then_tool_call_then_agent_end() {
             let tool = ToolCall {
                 id: "call-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({}),
+                arguments: json!({}).into(),
                 thought_signature: None,
             };
 

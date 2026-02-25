@@ -114,6 +114,9 @@ pub struct Config {
     // Runtime Risk Controller
     #[serde(alias = "extensionRisk")]
     pub extension_risk: Option<ExtensionRiskConfig>,
+
+    // Chrome Browser Tools (PLAN §4.7)
+    pub chrome: Option<crate::chrome::config::ChromeConfig>,
 }
 
 /// Extension capability policy configuration.
@@ -505,6 +508,9 @@ impl Config {
 
             // Runtime Risk Controller
             extension_risk: merge_extension_risk(base.extension_risk, other.extension_risk),
+
+            // Chrome / browser automation
+            chrome: other.chrome.or(base.chrome),
         }
     }
 

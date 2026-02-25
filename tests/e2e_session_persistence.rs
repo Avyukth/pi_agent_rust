@@ -669,7 +669,7 @@ fn multi_turn_persistence() {
                 ToolCall {
                     id: "read-1".to_string(),
                     name: "read".to_string(),
-                    arguments: json!({ "path": fixture.display().to_string() }),
+                    arguments: json!({ "path": fixture.display().to_string() }).into(),
                     thought_signature: None,
                 },
                 3,

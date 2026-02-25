@@ -460,7 +460,7 @@ pub(crate) fn assistant_tool_call_message(
         content: vec![ContentBlock::ToolCall(ToolCall {
             id: id.to_string(),
             name: name.to_string(),
-            arguments,
+            arguments: arguments.into(),
             thought_signature: None,
         })],
         api: api.to_string(),

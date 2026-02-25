@@ -38,26 +38,23 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameCodecErro
 pub fn decode_frame<T: DeserializeOwned>(
     input: &[u8],
 ) -> Result<Option<(T, usize)>, FrameCodecError> {
-    match memchr(b'\n', input) {
-        Some(newline_idx) => {
-            if newline_idx > MAX_SOCKET_FRAME_BYTES {
-                return Err(FrameCodecError::FrameTooLarge {
-                    frame_bytes: newline_idx,
-                    max_bytes: MAX_SOCKET_FRAME_BYTES,
-                });
-            }
-            let decoded = serde_json::from_slice::<T>(&input[..newline_idx])?;
-            Ok(Some((decoded, newline_idx + 1)))
+    if let Some(newline_idx) = memchr(b'\n', input) {
+        if newline_idx > MAX_SOCKET_FRAME_BYTES {
+            return Err(FrameCodecError::FrameTooLarge {
+                frame_bytes: newline_idx,
+                max_bytes: MAX_SOCKET_FRAME_BYTES,
+            });
         }
-        None => {
-            if input.len() > MAX_SOCKET_FRAME_BYTES {
-                return Err(FrameCodecError::FrameTooLarge {
-                    frame_bytes: input.len(),
-                    max_bytes: MAX_SOCKET_FRAME_BYTES,
-                });
-            }
-            Ok(None)
+        let decoded = serde_json::from_slice::<T>(&input[..newline_idx])?;
+        Ok(Some((decoded, newline_idx + 1)))
+    } else {
+        if input.len() > MAX_SOCKET_FRAME_BYTES {
+            return Err(FrameCodecError::FrameTooLarge {
+                frame_bytes: input.len(),
+                max_bytes: MAX_SOCKET_FRAME_BYTES,
+            });
         }
+        Ok(None)
     }
 }
 
@@ -135,7 +132,7 @@ pub struct AuthBusy {
     pub claimed_by: ClaimedBy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Request {
     pub version: u16,
     pub id: String,
@@ -143,7 +140,7 @@ pub struct Request {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Response {
     pub version: u16,
     pub id: String,
@@ -166,7 +163,7 @@ pub struct ErrorResponse {
     pub error: ProtocolErrorDetail,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservationEntry {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,21 +175,21 @@ pub struct ObservationEntry {
     pub ts: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservationEvent {
     pub version: u16,
     pub observer_id: String,
     pub events: Vec<ObservationEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ResponseEnvelope {
     Ok(Response),
     Error(ErrorResponse),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageType {
     AuthClaim(AuthClaim),

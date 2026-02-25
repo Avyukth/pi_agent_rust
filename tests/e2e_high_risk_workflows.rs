@@ -407,7 +407,7 @@ impl Provider for InfiniteToolProvider {
             vec![ContentBlock::ToolCall(ToolCall {
                 id: format!("loop-tool-{index}"),
                 name: "bash".to_string(),
-                arguments: json!({ "command": "echo iteration" }),
+                arguments: json!({ "command": "echo iteration" }).into(),
                 thought_signature: None,
             })],
             10,
@@ -495,13 +495,13 @@ impl Provider for MixedToolErrorProvider {
                     ContentBlock::ToolCall(ToolCall {
                         id: "good-1".to_string(),
                         name: "bash".to_string(),
-                        arguments: json!({ "command": "echo ok" }),
+                        arguments: json!({ "command": "echo ok" }).into(),
                         thought_signature: None,
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         id: "bad-1".to_string(),
                         name: "nonexistent_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: json!({}).into(),
                         thought_signature: None,
                     }),
                 ],
@@ -1480,7 +1480,7 @@ impl Provider for InvalidToolArgsProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     id: "bad-args-1".to_string(),
                     name: "read".to_string(),
-                    arguments: json!({ "nonexistent_param": 42 }),
+                    arguments: json!({ "nonexistent_param": 42 }).into(),
                     thought_signature: None,
                 })],
                 15,
@@ -1574,7 +1574,7 @@ fn agent_tool_read_nonexistent_file_surfaces_error() {
                     vec![ContentBlock::ToolCall(ToolCall {
                         id: "read-missing".to_string(),
                         name: "read".to_string(),
-                        arguments: json!({ "path": self.missing_path }),
+                        arguments: json!({ "path": self.missing_path }).into(),
                         thought_signature: None,
                     })],
                     15,

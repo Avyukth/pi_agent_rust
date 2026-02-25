@@ -265,13 +265,13 @@ impl Provider for MixedToolCallProvider {
                     ContentBlock::ToolCall(ToolCall {
                         id: "good-1".to_string(),
                         name: self.good_tool_name.clone(),
-                        arguments: json!({ "path": self.good_tool_path }),
+                        arguments: json!({ "path": self.good_tool_path }).into(),
                         thought_signature: None,
                     }),
                     ContentBlock::ToolCall(ToolCall {
                         id: "bad-1".to_string(),
                         name: self.bad_tool_name.clone(),
-                        arguments: json!({}),
+                        arguments: json!({}).into(),
                         thought_signature: None,
                     }),
                 ],
@@ -1006,7 +1006,7 @@ impl Provider for FailingToolProvider {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "fail-1".to_string(),
                     name: "failing_tool".to_string(),
-                    arguments: json!({}),
+                    arguments: json!({}).into(),
                     thought_signature: None,
                 })],
                 api: self.api().to_string(),

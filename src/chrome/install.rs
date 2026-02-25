@@ -87,10 +87,10 @@ impl NativeHostManifest {
     /// Pass `None` to allow all origins (development mode).
     #[must_use]
     pub fn new(wrapper_path: &Path, extension_id: Option<&str>) -> Self {
-        let allowed_origins = match extension_id {
-            Some(id) => vec![format!("chrome-extension://{id}/")],
-            None => vec!["chrome-extension://*/*".to_string()],
-        };
+        let allowed_origins = extension_id.map_or_else(
+            || vec!["chrome-extension://*/*".to_string()],
+            |id| vec![format!("chrome-extension://{id}/")],
+        );
 
         Self {
             name: NATIVE_HOST_NAME.to_string(),

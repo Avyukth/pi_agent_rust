@@ -253,7 +253,7 @@ impl Provider for ToolThenFinalizeProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     id: "tool-1".to_string(),
                     name: "bash".to_string(),
-                    arguments: json!({ "command": "echo tool-output" }),
+                    arguments: json!({ "command": "echo tool-output" }).into(),
                     thought_signature: None,
                 })],
                 15,

@@ -1814,6 +1814,8 @@ pub enum Capability {
     Tool,
     /// Logging (always allowed, included for completeness).
     Log,
+    /// Browser automation via Chrome extension (dangerous).
+    Browser,
 }
 
 /// All known capabilities in definition order.
@@ -1828,6 +1830,7 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::Env,
     Capability::Tool,
     Capability::Log,
+    Capability::Browser,
 ];
 
 impl Capability {
@@ -1845,6 +1848,7 @@ impl Capability {
             "env" => Some(Self::Env),
             "tool" => Some(Self::Tool),
             "log" => Some(Self::Log),
+            "browser" => Some(Self::Browser),
             _ => None,
         }
     }
@@ -1862,6 +1866,7 @@ impl Capability {
             Self::Env => "env",
             Self::Tool => "tool",
             Self::Log => "log",
+            Self::Browser => "browser",
         }
     }
 
@@ -1870,12 +1875,12 @@ impl Capability {
     /// Dangerous capabilities default to Deny in Strict/Prompt modes and
     /// require explicit opt-in or user confirmation.
     pub const fn is_dangerous(self) -> bool {
-        matches!(self, Self::Exec | Self::Env)
+        matches!(self, Self::Exec | Self::Env | Self::Browser)
     }
 
     /// List of all dangerous capabilities.
     pub const fn dangerous_list() -> &'static [Self] {
-        &[Self::Exec, Self::Env]
+        &[Self::Exec, Self::Env, Self::Browser]
     }
 
     /// Ordinal index for array-based snapshot lookups.
@@ -1891,12 +1896,13 @@ impl Capability {
             Self::Env => 7,
             Self::Tool => 8,
             Self::Log => 9,
+            Self::Browser => 10,
         }
     }
 }
 
 /// Number of known capabilities (must match [`ALL_CAPABILITIES`] length).
-pub const NUM_CAPABILITIES: usize = 10;
+pub const NUM_CAPABILITIES: usize = 11;
 
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1939,7 +1945,7 @@ impl PolicyProfile {
                     "events".to_string(),
                     "session".to_string(),
                 ],
-                deny_caps: vec!["exec".to_string(), "env".to_string()],
+                deny_caps: vec!["exec".to_string(), "env".to_string(), "browser".to_string()],
                 per_extension: HashMap::new(),
                 exec_mediation: ExecMediationPolicy::strict(),
                 secret_broker: SecretBrokerPolicy::default(),
@@ -2039,7 +2045,7 @@ impl Default for ExtensionPolicy {
                 "events".to_string(),
                 "session".to_string(),
             ],
-            deny_caps: vec!["exec".to_string(), "env".to_string()],
+            deny_caps: vec!["exec".to_string(), "env".to_string(), "browser".to_string()],
             per_extension: HashMap::new(),
             exec_mediation: ExecMediationPolicy::default(),
             secret_broker: SecretBrokerPolicy::default(),
@@ -6421,7 +6427,7 @@ impl EnforcementStateMachine {
 }
 
 fn runtime_risk_is_dangerous(capability: &str) -> bool {
-    matches!(capability, "exec" | "env" | "http")
+    matches!(capability, "exec" | "env" | "http" | "browser")
 }
 
 fn runtime_risk_harden_should_block_dangerous(decision: &RuntimeRiskDecision) -> bool {
@@ -6447,6 +6453,7 @@ fn runtime_risk_harden_should_block_dangerous(decision: &RuntimeRiskDecision) ->
 fn runtime_risk_base_score(capability: &str, method: &str, policy_reason: &str) -> f64 {
     let capability_score = match capability {
         "exec" => 0.48,
+        "browser" => 0.44,
         "env" => 0.40,
         "http" => 0.32,
         "write" => 0.28,
@@ -9606,6 +9613,8 @@ fn required_capability_for_host_call_static_legacy(call: &HostCallPayload) -> Op
         Some("events")
     } else if method.eq_ignore_ascii_case("log") {
         Some("log")
+    } else if method.eq_ignore_ascii_case("browser") {
+        Some("browser")
     } else {
         None
     }
@@ -45493,6 +45502,7 @@ mod tests {
         assert!(runtime_risk_is_dangerous("exec"));
         assert!(runtime_risk_is_dangerous("env"));
         assert!(runtime_risk_is_dangerous("http"));
+        assert!(runtime_risk_is_dangerous("browser"));
         assert!(!runtime_risk_is_dangerous("log"));
         assert!(!runtime_risk_is_dangerous("read"));
         assert!(!runtime_risk_is_dangerous("write"));

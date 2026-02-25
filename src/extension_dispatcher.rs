@@ -835,6 +835,7 @@ const fn hostcall_capability_label(capability: HostcallCapabilityClass) -> &'sta
         HostcallCapabilityClass::Tool => "tool",
         HostcallCapabilityClass::Ui => "ui",
         HostcallCapabilityClass::Telemetry => "telemetry",
+        HostcallCapabilityClass::Browser => "browser",
         HostcallCapabilityClass::Unknown => "unknown",
     }
 }
