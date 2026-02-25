@@ -1181,5 +1181,71 @@ mod tests {
                 "OSC cannot process more events than provided input"
             );
         }
+
+        #[test]
+        fn test_osc_proptest_single_event_perturbation_has_bounded_summary_impact(
+            counts in prop::array::uniform6(2_u8..9_u8),
+            kind_to_perturb in 0_u8..6_u8,
+        ) {
+            let kinds = all_observable_kinds();
+            let mut base_events = Vec::new();
+
+            for (idx, kind) in kinds.iter().copied().enumerate() {
+                let count = usize::from(counts[idx]);
+                for seq in 0..count {
+                    base_events.push(ObservationEvent::with_timestamp(
+                        "obs-prop".to_string(),
+                        1,
+                        kind,
+                        30_000 + u64::try_from(idx).unwrap_or(0),
+                        payload_for_kind(kind, u64::try_from(seq).unwrap_or(0)),
+                    ));
+                }
+            }
+
+            let mut perturbed_events = base_events.clone();
+            let target_kind = kinds[usize::from(kind_to_perturb % 6)];
+            perturbed_events.push(ObservationEvent::with_timestamp(
+                "obs-prop".to_string(),
+                1,
+                target_kind,
+                31_000 + u64::from(kind_to_perturb % 6),
+                payload_for_kind(target_kind, 999),
+            ));
+
+            let base = compile_observations(&base_events, 10_000);
+            let perturbed = compile_observations(&perturbed_events, 10_000);
+
+            prop_assert_eq!(
+                perturbed.events_processed,
+                base.events_processed.saturating_add(1),
+                "adding one event should increase OSC processed count by exactly one under non-truncating budget"
+            );
+
+            let base_lines = summary_lines(&base);
+            let perturbed_lines = summary_lines(&perturbed);
+            prop_assert_eq!(
+                base_lines.len(),
+                perturbed_lines.len(),
+                "adding a duplicate event should not change line count when all kinds are already present"
+            );
+
+            let differing_lines = base_lines
+                .iter()
+                .zip(&perturbed_lines)
+                .filter(|(a, b)| a != b)
+                .count();
+            prop_assert_eq!(
+                differing_lines,
+                1,
+                "single-event perturbation should affect exactly one rendered OSC line under stable-budget conditions"
+            );
+
+            prop_assert_eq!(
+                perturbed.token_estimate,
+                base.token_estimate,
+                "single-digit count perturbation should preserve token estimate under the current heuristic"
+            );
+        }
     }
 }
