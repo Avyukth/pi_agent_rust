@@ -600,17 +600,18 @@ impl AuthStorage {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to refresh OAuth token for {provider}: {e}");
-                    failed_providers.push(provider);
+                    failed_providers.push(format!("{provider}: {e}"));
                 }
             }
         }
 
         if !failed_providers.is_empty() {
             // Return an error to signal that at least some refreshes failed,
-            // but only after attempting all of them.
+            // but only after attempting all of them. Include per-provider
+            // error details so callers can distinguish failure reasons.
             return Err(Error::auth(format!(
                 "OAuth token refresh failed for: {}",
-                failed_providers.join(", ")
+                failed_providers.join("; ")
             )));
         }
 

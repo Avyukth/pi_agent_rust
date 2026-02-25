@@ -614,7 +614,7 @@ fn tool_edit_permission_denied() {
 // Truncation edge cases
 // ===========================================================================
 
-/// truncate_head: first line exceeds max_bytes → returns empty content
+/// truncate_head: first line exceeds max_bytes → truncates to max_bytes
 /// with first_line_exceeds_limit flag set.
 #[test]
 fn truncate_head_first_line_exceeds_byte_limit() {
@@ -627,12 +627,15 @@ fn truncate_head_first_line_exceeds_byte_limit() {
         result.first_line_exceeds_limit,
         "first_line_exceeds_limit should be true"
     );
+    // Implementation truncates the first line to max_bytes, not empties it.
     assert_eq!(
-        result.content, "",
-        "content should be empty when first line exceeds limit"
+        result.content.len(),
+        400,
+        "content should be truncated to max_bytes"
     );
-    assert_eq!(result.output_lines, 0);
-    assert_eq!(result.output_bytes, 0);
+    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_bytes, 400);
+    assert!(result.last_line_partial, "should be a partial line");
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
 }
 
@@ -737,9 +740,10 @@ fn truncate_head_empty_lines() {
 
     assert!(result.truncated, "should truncate");
     assert_eq!(result.output_lines, 3);
-    // First 3 lines should be empty strings
-    let lines: Vec<&str> = result.content.split('\n').collect();
-    assert!(lines.len() <= 3, "should have at most 3 lines");
+    // Content is "\n\n\n" (3 newlines = 3 empty lines).
+    // split('\n') produces N+1 parts for N newlines, so 4 parts for 3 lines.
+    assert_eq!(result.content, "\n\n\n", "first 3 empty lines preserved");
+    assert_eq!(result.output_bytes, 3);
 }
 
 /// truncate_tail: content ending with newline.
