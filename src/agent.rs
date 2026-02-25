@@ -1781,6 +1781,13 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
+        tracing::debug!(
+            event = "pi.tool.execute.start",
+            tool_name = %tool_call.name,
+            tool_id = %tool_call.id,
+            "Tool execution starting"
+        );
+
         let extensions = self.extensions.clone();
 
         let (mut output, is_error) = if let Some(extensions) = &extensions {
@@ -1800,6 +1807,12 @@ impl Agent {
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
         }
 
+        tracing::debug!(
+            event = "pi.tool.execute.done",
+            tool_name = %tool_call.name,
+            is_error = is_error,
+            "Tool execution completed"
+        );
         (output, is_error)
     }
 
@@ -5635,6 +5648,12 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        tracing::debug!(
+            event = "pi.agent.run_text.start",
+            input_len = input.len(),
+            "Agent run_text starting"
+        );
+
         let on_event: AgentEventHandler = Arc::new(on_event);
         let session_model = {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -5706,6 +5725,11 @@ impl AgentSession {
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
+        tracing::debug!(
+            event = "pi.agent.run_text.done",
+            stop_reason = ?result.stop_reason,
+            "Agent run_text completed"
+        );
         Ok(result)
     }
 
@@ -5715,6 +5739,12 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        tracing::debug!(
+            event = "pi.agent.run_content.start",
+            content_blocks = content.len(),
+            "Agent run_content starting"
+        );
+
         let on_event: AgentEventHandler = Arc::new(on_event);
         let session_model = {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -5786,6 +5816,11 @@ impl AgentSession {
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
+        tracing::debug!(
+            event = "pi.agent.run_content.done",
+            stop_reason = ?result.stop_reason,
+            "Agent run_content completed"
+        );
         Ok(result)
     }
 
