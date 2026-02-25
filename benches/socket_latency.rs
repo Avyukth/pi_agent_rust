@@ -277,7 +277,7 @@ fn measure_payload_latency(
     })
 }
 
-fn build_request_frame(payload_bytes: usize) -> Result<Vec<u8>, protocol::ProtocolError> {
+fn build_request_frame(payload_bytes: usize) -> Result<Vec<u8>, protocol::FrameCodecError> {
     let message = protocol::MessageType::Request(protocol::Request {
         version: protocol::PROTOCOL_VERSION_V1,
         id: "oq2-bench-request".to_string(),
@@ -290,7 +290,7 @@ fn build_request_frame(payload_bytes: usize) -> Result<Vec<u8>, protocol::Protoc
     protocol::encode_frame(&message)
 }
 
-fn build_response_frame(payload_bytes: usize) -> Result<Vec<u8>, protocol::ProtocolError> {
+fn build_response_frame(payload_bytes: usize) -> Result<Vec<u8>, protocol::FrameCodecError> {
     let message =
         protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(protocol::Response {
             version: protocol::PROTOCOL_VERSION_V1,
@@ -308,7 +308,7 @@ fn measure_encode_costs(
     request_frame: &[u8],
     payload_bytes: usize,
     samples: usize,
-) -> Result<Vec<u64>, protocol::ProtocolError> {
+) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
     let message = protocol::MessageType::Request(protocol::Request {
         version: protocol::PROTOCOL_VERSION_V1,
         id: "oq2-bench-request".to_string(),
@@ -323,29 +323,26 @@ fn measure_encode_costs(
         let started = Instant::now();
         let encoded = protocol::encode_frame(&message)?;
         if encoded.len() != request_frame.len() {
-            return Err(protocol::ProtocolError::MalformedFrame(
-                "encode benchmark frame length drift".to_string(),
-            ));
+            return Err(std::io::Error::other("encode benchmark frame length drift").into());
         }
         out.push(duration_ns_u64(started.elapsed()));
     }
     Ok(out)
 }
 
-fn measure_decode_costs(frame: &[u8], samples: usize) -> Result<Vec<u64>, protocol::ProtocolError> {
+fn measure_decode_costs(
+    frame: &[u8],
+    samples: usize,
+) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
     let mut out = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
         let (_message, consumed) = protocol::decode_frame::<protocol::MessageType>(frame)?
-            .ok_or_else(|| {
-                protocol::ProtocolError::MalformedFrame(
-                    "partial frame in decode benchmark".to_string(),
-                )
-            })?;
+            .ok_or_else(|| std::io::Error::other("partial frame in decode benchmark"))?;
         if consumed != frame.len() {
-            return Err(protocol::ProtocolError::MalformedFrame(
-                "decode benchmark did not consume full frame".to_string(),
-            ));
+            return Err(
+                std::io::Error::other("decode benchmark did not consume full frame").into(),
+            );
         }
         out.push(duration_ns_u64(started.elapsed()));
     }
