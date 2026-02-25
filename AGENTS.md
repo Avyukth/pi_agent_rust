@@ -61,6 +61,19 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `crossterm` | Low-level terminal control |
 | `thiserror` | Error type definitions |
 
+### GitHub Authentication
+
+**The `GITHUB_TOKEN` environment variable is stale/invalid on this system.** All `git fetch`, `git push`, `gh` CLI, and other GitHub operations must unset it first:
+
+```bash
+# CORRECT — unset stale token in a subshell so keyring credential is used
+(unset GITHUB_TOKEN; git fetch origin)
+(unset GITHUB_TOKEN; git push origin main)
+(unset GITHUB_TOKEN; gh pr create --title "..." --body "...")
+```
+
+**Always wrap git/gh commands in `(unset GITHUB_TOKEN; ...)`.**
+
 ### Release Profile
 
 The release build optimizes for runtime speed:
