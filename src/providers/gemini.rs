@@ -225,7 +225,7 @@ fn build_google_cli_request(
 
 fn decode_project_scoped_access_payload(payload: &str) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let token /*_*/= value
+    let token  = value
         .get("token")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)

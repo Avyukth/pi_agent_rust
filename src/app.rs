@@ -1117,7 +1117,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
         let mut entry = test_model_entry("llama3.2", "ollama", false);
-        entry.api_key /*_*/= None;
+        entry.api_key  = None;
         entry.auth_header = false;
 
         let cli = cli::Cli::parse_from(["pi"]);
@@ -1130,7 +1130,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
         let mut entry = test_model_entry("gpt-4o-mini", "openai", true);
-        entry.api_key /*_*/= None;
+        entry.api_key  = None;
         entry.auth_header = true;
 
         let cli = cli::Cli::parse_from(["pi"]);
@@ -1281,11 +1281,11 @@ mod tests {
         let session = Session::in_memory();
 
         let mut unready_remote = test_model_entry("cloud-model", "acme", true);
-        unready_remote.api_key /*_*/= None;
+        unready_remote.api_key  = None;
         unready_remote.auth_header = true;
 
         let mut keyless_ready = test_model_entry("local-model", "acme", false);
-        keyless_ready.api_key /*_*/= None;
+        keyless_ready.api_key  = None;
         keyless_ready.auth_header = false;
 
         let registry = registry_with_entries(vec![unready_remote, keyless_ready]);

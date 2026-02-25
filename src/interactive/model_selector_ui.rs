@@ -468,7 +468,7 @@ mod tests {
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
-            guard.stream_options_mut().api_key /*_*/= Some("stale-key".to_string());
+            guard.stream_options_mut().api_key  = Some("stale-key".to_string());
             guard
                 .stream_options_mut()
                 .headers
@@ -508,7 +508,7 @@ mod tests {
 
         {
             let mut guard = app.agent.try_lock().expect("agent lock");
-            guard.stream_options_mut().api_key /*_*/= Some("stale-key".to_string());
+            guard.stream_options_mut().api_key  = Some("stale-key".to_string());
         }
 
         app.apply_model_selection(&crate::model_selector::ModelKey {

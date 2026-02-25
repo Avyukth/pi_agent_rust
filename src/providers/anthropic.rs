@@ -47,7 +47,7 @@ fn is_anthropic_bearer_token(provider: &str, token: &str) -> bool {
     if !is_anthropic_provider(provider) {
         return false;
     }
-    let token /*_*/= token.trim();
+    let token  = token.trim();
     if token.is_empty() {
         return false;
     }
@@ -372,7 +372,7 @@ impl Provider for AnthropicProvider {
                     "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
                 )
             })?;
-        let forced_bearer_token /*_*/= if is_anthropic_provider(&self.provider) {
+        let forced_bearer_token  = if is_anthropic_provider(&self.provider) {
             unmark_anthropic_oauth_bearer_token(&raw_auth_value).map(ToString::to_string)
         } else {
             None
@@ -381,9 +381,9 @@ impl Provider for AnthropicProvider {
         let auth_value = forced_bearer_token.unwrap_or(raw_auth_value);
 
         let request_body = self.build_request(context, options);
-        let anthropic_bearer_token /*_*/=
+        let anthropic_bearer_token  =
             force_bearer || is_anthropic_bearer_token(&self.provider, &auth_value);
-        let kimi_oauth_token /*_*/= is_kimi_oauth_token(&self.provider, &auth_value);
+        let kimi_oauth_token  = is_kimi_oauth_token(&self.provider, &auth_value);
 
         // Build request with headers (Content-Type set by .json() below)
         let mut request = self

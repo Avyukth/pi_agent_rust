@@ -149,7 +149,7 @@ fn run(args: Args) -> Result<()> {
     );
     let npm_map = snapshot_npm_packages(&client, &npm_packages, &mut logger, &mut stats);
 
-    let github_token /*_*/= resolve_github_token(&args.github_token_env);
+    let github_token  = resolve_github_token(&args.github_token_env);
 
     let github_refs = collect_github_refs(
         &pool.items,

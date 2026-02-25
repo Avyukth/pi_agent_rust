@@ -645,7 +645,7 @@ fn append_upstream_nonlegacy_models(
             continue;
         };
 
-        let api_key /*_*/= resolve_provider_api_key_cached(
+        let api_key  = resolve_provider_api_key_cached(
             auth,
             canonical_provider,
             provider,
@@ -766,7 +766,7 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
         };
 
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let api_key /*_*/= resolve_provider_api_key_cached(
+        let api_key  = resolve_provider_api_key_cached(
             auth,
             canonical_provider,
             provider,

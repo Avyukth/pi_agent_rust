@@ -85,8 +85,8 @@ impl AuthDiagnosticCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::MissingApiKey/*_*/=> "auth.missing_api_key",
-            Self::InvalidApiKey/*_*/=> "auth.invalid_api_key",
+            Self::MissingApiKey => "auth.missing_api_key",
+            Self::InvalidApiKey => "auth.invalid_api_key",
             Self::QuotaExceeded => "auth.quota_exceeded",
             Self::MissingOAuthAuthorizationCode => "auth.oauth.missing_authorization_code",
             Self::OAuthTokenExchangeFailed => "auth.oauth.token_exchange_failed",
@@ -104,8 +104,8 @@ impl AuthDiagnosticCode {
     #[must_use]
     pub const fn remediation(self) -> &'static str {
         match self {
-            Self::MissingApiKey/*_*/=> "Set the provider API key env var or run `/login <provider>`.",
-            Self::InvalidApiKey/*_*/=> "Rotate or replace the API key and verify provider permissions.",
+            Self::MissingApiKey => "Set the provider API key env var or run `/login <provider>`.",
+            Self::InvalidApiKey => "Rotate or replace the API key and verify provider permissions.",
             Self::QuotaExceeded => {
                 "Verify billing/quota limits for this API key or organization, then retry."
             }

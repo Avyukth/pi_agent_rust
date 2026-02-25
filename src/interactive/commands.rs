@@ -725,7 +725,7 @@ impl PiApp {
             };
 
             let credential = match kind {
-                PendingLoginKind::ApiKey/*_*/=> normalize_api_key_input(&code_input)
+                PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
                     .map(|key| crate::auth::AuthCredential::ApiKey { key })
                     .map_err(crate::error::Error::auth),
                 PendingLoginKind::OAuth => {
@@ -859,7 +859,7 @@ impl PiApp {
             });
 
             let status = match kind {
-                PendingLoginKind::ApiKey/*_*/=> {
+                PendingLoginKind::ApiKey => {
                     format!("API key saved for {provider}. Credentials saved to auth.json.")
                 }
                 PendingLoginKind::OAuth | PendingLoginKind::DeviceFlow => {
@@ -2431,7 +2431,7 @@ mod tests {
         );
 
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key /*_*/= Some("inline-model-key".to_string());
+        entry.api_key  = Some("inline-model-key".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),
@@ -2443,7 +2443,7 @@ mod tests {
     fn resolve_model_key_with_auth_falls_back_to_inline_key() {
         let auth = empty_auth_storage();
         let mut entry = test_model_entry("openai", "gpt-4o-mini");
-        entry.api_key /*_*/= Some("inline-model-key".to_string());
+        entry.api_key  = Some("inline-model-key".to_string());
 
         assert_eq!(
             super::resolve_model_key_with_auth(&auth, &entry).as_deref(),

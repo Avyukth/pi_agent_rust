@@ -1485,7 +1485,7 @@ mod tests {
                 // The case-insensitivity is on the *entry* fields, not tokens.
                 let lower_entry = make_entry("id", &name);
                 let upper_entry = make_entry("id", &name.to_uppercase());
-                let token /*_*/= vec![name];
+                let token  = vec![name];
                 assert_eq!(score_entry(&lower_entry, &token), score_entry(&upper_entry, &token));
             }
 

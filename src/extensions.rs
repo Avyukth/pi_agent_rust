@@ -4405,7 +4405,7 @@ pub fn redact_command_for_logging(policy: &SecretBrokerPolicy, cmd: &str) -> Str
     }
 
     // 1. Redact -p/--password arguments
-    // Handles: -p password, -p 'pass word', --password /*_*/=password
+    // Handles: -p password, -p 'pass word', --password  =password
     let mut redacted = cmd.to_string();
     let password_regex = PASSWORD_RE.get_or_init(|| {
         Regex::new(r#"(?i)(--password|-p)(\s+|=)(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s]+)"#)
@@ -6910,7 +6910,7 @@ const fn runtime_hostcall_script_language_to_ast_lang(
 }
 
 fn runtime_hostcall_matches_interpreter(base: &str, token: &str) -> bool {
-    if token /*_*/== base {
+    if token  == base {
         return true;
     }
     token.strip_prefix(base).is_some_and(|suffix| {
@@ -6962,7 +6962,7 @@ fn runtime_hostcall_script_language_from_invocation(
     for segment in invocation_prefix.split('|').rev() {
         let mut tokens = segment.split_whitespace().peekable();
         while let Some(raw) = tokens.next() {
-            let token /*_*/= raw.trim_matches(['\'', '"', '(', ')']);
+            let token  = raw.trim_matches(['\'', '"', '(', ')']);
             if token.is_empty() {
                 continue;
             }
@@ -7152,7 +7152,7 @@ fn runtime_hostcall_extract_heredoc_blocks(command: &str) -> Vec<RuntimeExtracte
             i += 1;
             continue;
         };
-        let token /*_*/= raw_token.trim_matches('\'').trim_matches('"').to_string();
+        let token  = raw_token.trim_matches('\'').trim_matches('"').to_string();
         if token.is_empty() {
             i += 1;
             continue;
@@ -46353,20 +46353,20 @@ mod tests {
     #[test]
     fn redact_command_env_assignment_lowercase_key() {
         let broker = SecretBrokerPolicy::default();
-        let cmd = "anthropic_api_key /*_*/=sk-ant-xxx my_script";
+        let cmd = "anthropic_api_key  =sk-ant-xxx my_script";
         let result = redact_command_for_logging(&broker, cmd);
-        assert!(result.contains("anthropic_api_key /*_*/=[REDACTED]"));
+        assert!(result.contains("anthropic_api_key  =[REDACTED]"));
         assert!(!result.contains("sk-ant-xxx"));
     }
 
     #[test]
     fn redact_command_password_flags() {
         let broker = SecretBrokerPolicy::default();
-        let cmd = "mysql -u root -p hunter2 --password swordfish --password /*_*/=opensesame";
+        let cmd = "mysql -u root -p hunter2 --password swordfish --password  =opensesame";
         let result = redact_command_for_logging(&broker, cmd);
         assert!(result.contains("-p [REDACTED]"));
         assert!(result.contains("--password [REDACTED]"));
-        assert!(result.contains("--password /*_*/=[REDACTED]"));
+        assert!(result.contains("--password  =[REDACTED]"));
         assert!(!result.contains("hunter2"));
         assert!(!result.contains("swordfish"));
         assert!(!result.contains("opensesame"));

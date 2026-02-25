@@ -956,7 +956,7 @@ pub fn create_provider(
             ))
         }
         ProviderRouteKind::NativeCopilot => {
-            let github_token /*_*/= resolve_copilot_token(entry)?;
+            let github_token  = resolve_copilot_token(entry)?;
             let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
                 .with_provider_name(&entry.model.provider)
                 .with_compat(entry.compat.clone())
@@ -1711,9 +1711,9 @@ export default function init(pi) {
     #[test]
     fn resolve_copilot_token_prefers_inline_model_api_key() {
         let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
-        entry.api_key /*_*/= Some("inline-copilot-token".to_string());
+        entry.api_key  = Some("inline-copilot-token".to_string());
 
-        let token /*_*/= resolve_copilot_token_with_env(&entry, |_| None)
+        let token  = resolve_copilot_token_with_env(&entry, |_| None)
             .expect("inline token should be accepted");
         assert_eq!(token, "inline-copilot-token");
     }
@@ -1721,9 +1721,9 @@ export default function init(pi) {
     #[test]
     fn resolve_copilot_token_falls_back_to_env() {
         let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
-        entry.api_key /*_*/= None;
+        entry.api_key  = None;
 
-        let token /*_*/= resolve_copilot_token_with_env(&entry, |name| match name {
+        let token  = resolve_copilot_token_with_env(&entry, |name| match name {
             "GITHUB_COPILOT_API_KEY" => Some("env-copilot-token".to_string()),
             _ => None,
         })
@@ -1734,7 +1734,7 @@ export default function init(pi) {
     #[test]
     fn resolve_copilot_token_errors_when_missing_everywhere() {
         let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
-        entry.api_key /*_*/= None;
+        entry.api_key  = None;
 
         let err = resolve_copilot_token_with_env(&entry, |_| None).expect_err("expected error");
         assert!(

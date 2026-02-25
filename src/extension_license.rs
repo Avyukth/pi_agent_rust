@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn security_scan_cookie() {
-        let content = "const token /*_*/= document.cookie;";
+        let content = "const token  = document.cookie;";
         let findings = scan_security(content);
         assert!(
             findings

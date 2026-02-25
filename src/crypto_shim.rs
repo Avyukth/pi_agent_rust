@@ -349,7 +349,7 @@ export function pbkdf2Sync(password, salt, iterations, keylen, digest) {
   // bytes derived from the inputs.  Real PBKDF2 requires a native hostcall
   // (not yet implemented), so this is a best-effort placeholder.
   const out = new Uint8Array(keylen);
-  const pw = typeof password /*_*/=== 'string' ? password : '';
+  const pw = typeof password  === 'string' ? password : '';
   const sl = typeof salt === 'string' ? salt : '';
   const seed = pw + sl + String(iterations);
   let h = 0;

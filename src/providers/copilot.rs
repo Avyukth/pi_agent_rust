@@ -246,7 +246,7 @@ impl Provider for CopilotProvider {
         // Override the authorization: Copilot uses the session token,
         // not the GitHub OAuth token.
         let mut copilot_options = options.clone();
-        copilot_options.api_key /*_*/= Some(session.token);
+        copilot_options.api_key  = Some(session.token);
 
         // Add Copilot-specific headers.
         copilot_options
