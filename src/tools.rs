@@ -1254,6 +1254,44 @@ impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.index.get(name).map(|&idx| self.tools[idx].as_ref())
     }
+
+    /// Register all Chrome browser automation tools.
+    ///
+    /// Requires `--chrome` opt-in (S1 security invariant). Tools are split into
+    /// two groups: observer tools (need the ObserverRegistry) and bridge tools
+    /// (need the ChromeBridge for extension communication).
+    pub fn register_chrome_tools(
+        &mut self,
+        bridge: std::sync::Arc<crate::chrome::ChromeBridge>,
+        registry: std::sync::Arc<std::sync::Mutex<crate::chrome::observer::ObserverRegistry>>,
+    ) {
+        use crate::chrome::tools::*;
+
+        // Observer tools (local ring buffer, no bridge needed)
+        self.push(Box::new(ObserveTool::new(registry.clone())));
+        self.push(Box::new(UnobserveTool::new(registry.clone())));
+        self.push(Box::new(ObserversTool::new(registry)));
+
+        // Bridge tools (communicate with Chrome extension)
+        self.push(Box::new(NavigateTool::new(bridge.clone())));
+        self.push(Box::new(TabsCreateTool::new(bridge.clone())));
+        self.push(Box::new(TabsContextTool::new(bridge.clone())));
+        self.push(Box::new(SwitchBrowserTool::new(bridge.clone())));
+        self.push(Box::new(ReadPageTool::new(bridge.clone())));
+        self.push(Box::new(GetPageTextTool::new(bridge.clone())));
+        self.push(Box::new(FindTool::new(bridge.clone())));
+        self.push(Box::new(ComputerTool::new(bridge.clone())));
+        self.push(Box::new(FormInputTool::new(bridge.clone())));
+        self.push(Box::new(ScreenshotTool::new(bridge.clone())));
+        self.push(Box::new(GifCreatorTool::new(bridge.clone())));
+        self.push(Box::new(JavascriptTool::new(bridge.clone())));
+        self.push(Box::new(ReadConsoleTool::new(bridge.clone())));
+        self.push(Box::new(ReadNetworkTool::new(bridge.clone())));
+        self.push(Box::new(ResizeWindowTool::new(bridge.clone())));
+        self.push(Box::new(ShortcutsExecuteTool::new(bridge.clone())));
+        self.push(Box::new(ShortcutsListTool::new(bridge.clone())));
+        self.push(Box::new(UploadImageTool::new(bridge)));
+    }
 }
 
 // ============================================================================

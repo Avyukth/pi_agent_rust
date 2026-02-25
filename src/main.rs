@@ -1148,7 +1148,25 @@ async fn run(
         block_images: config.image_block_images(),
     };
 
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let mut tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+
+    // Chrome browser automation: when --chrome is set, create the ChromeBridge
+    // and register all 21 browser tools (S1 opt-in security invariant).
+    let chrome_bridge = if cli.chrome {
+        let bridge_config = pi::chrome::ChromeBridgeConfig::new(
+            format!("pi-{}", std::process::id()),
+            format!("cli-{}", std::process::id()),
+        );
+        let bridge = std::sync::Arc::new(pi::chrome::ChromeBridge::new(bridge_config));
+        let observer_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            pi::chrome::observer::ObserverRegistry::new(),
+        ));
+        tools.register_chrome_tools(bridge.clone(), observer_registry);
+        Some(bridge)
+    } else {
+        None
+    };
+
     let session_arc = Arc::new(Mutex::new(session));
     let context_window_tokens = if selection.model_entry.model.context_window == 0 {
         tracing::warn!(
@@ -1165,8 +1183,15 @@ async fn run(
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
         context_window_tokens,
     };
+    let mut agent = Agent::new(provider, tools, agent_config);
+
+    // Wire ChromeBridge into the agent for observation draining between turns.
+    if let Some(ref bridge) = chrome_bridge {
+        agent.set_chrome_bridge(bridge.clone());
+    }
+
     let mut agent_session = AgentSession::new(
-        Agent::new(provider, tools, agent_config),
+        agent,
         session_arc,
         !cli.no_session,
         compaction_settings,
