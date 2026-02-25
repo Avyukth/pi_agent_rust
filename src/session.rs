@@ -8075,6 +8075,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8174,6 +8179,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let parent = path.parent().unwrap();
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if tempfile::NamedTempFile::new_in(parent).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8216,6 +8226,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8329,6 +8344,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
