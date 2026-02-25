@@ -526,10 +526,8 @@ pub(crate) fn delete_session_file(path: &Path) -> Result<()> {
 fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()> {
     // Delete the sidecar directory first if it exists
     let sidecar_path = crate::session_store_v2::v2_sidecar_path(path);
-    if sidecar_path.exists() {
-        if !try_trash_with_cmd(&sidecar_path, trash_cmd) {
-            let _ = fs::remove_dir_all(&sidecar_path);
-        }
+    if sidecar_path.exists() && !try_trash_with_cmd(&sidecar_path, trash_cmd) {
+        let _ = fs::remove_dir_all(&sidecar_path);
     }
 
     if try_trash_with_cmd(path, trash_cmd) {
