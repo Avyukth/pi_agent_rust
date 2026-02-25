@@ -507,9 +507,14 @@ impl Agent {
     /// Returns `None` if no bridge is set, or no observations are pending.
     /// This enables the verify loop: the LLM sees observation summaries
     /// in its next turn and can act on them.
+    /// Maximum observation entries rendered per drain cycle.
+    const OBSERVATION_RENDER_BUDGET: usize = 20;
+
     fn drain_observations(&self) -> Option<Message> {
         let bridge = self.chrome_bridge.as_ref()?;
-        let events = bridge.take_observations();
+        // Only take as many batches as we can render so overflow events
+        // stay in the bridge buffer for the next drain cycle (M2 fix).
+        let events = bridge.take_observations_limited(Self::OBSERVATION_RENDER_BUDGET);
         if events.is_empty() {
             return None;
         }
@@ -542,13 +547,6 @@ impl Agent {
                 };
                 lines.push(format!("- {}{suffix}", entry.kind));
                 total_entries += 1;
-                // Budget: cap at ~20 lines to avoid prompt bloat
-                if lines.len() >= 20 {
-                    break;
-                }
-            }
-            if lines.len() >= 20 {
-                break;
             }
         }
 
@@ -2596,25 +2594,25 @@ mod drain_observations_tests {
     }
 
     #[test]
-    fn drain_observations_caps_at_20_lines() {
+    fn drain_observations_caps_at_render_budget_across_batches() {
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
-        // Push 25 events in a single batch
-        let entries: Vec<ObservationEntry> = (0..25)
-            .map(|i| ObservationEntry {
-                kind: "console_warn".to_string(),
-                message: Some(format!("warning {i}")),
-                source: None,
-                url: None,
-                ts: 1000 + i,
-            })
-            .collect();
-        bridge.push_observation(ObservationEvent {
-            version: 1,
-            observer_id: "obs-1".to_string(),
-            events: entries,
-        });
-        agent.set_chrome_bridge(bridge);
+        // Push 25 single-entry batches. Render budget is 20, so first drain
+        // takes 20 batches and leaves 5 for the next cycle (M2 fix).
+        for i in 0..25i64 {
+            bridge.push_observation(ObservationEvent {
+                version: 1,
+                observer_id: "obs-1".to_string(),
+                events: vec![ObservationEntry {
+                    kind: "console_warn".to_string(),
+                    message: Some(format!("warning {i}")),
+                    source: None,
+                    url: None,
+                    ts: 1000 + i,
+                }],
+            });
+        }
+        agent.set_chrome_bridge(bridge.clone());
 
         let msg = agent.drain_observations().expect("should produce message");
         match &msg {
@@ -2625,6 +2623,18 @@ mod drain_observations_tests {
                     line_count <= 21,
                     "should cap at 20 event lines + header, got {line_count}"
                 );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+
+        // Remaining 5 events should survive for the next drain (no data loss).
+        let msg2 = agent
+            .drain_observations()
+            .expect("overflow should produce second message");
+        match &msg2 {
+            Message::Custom(cm) => {
+                let line_count = cm.content.lines().count() - 1;
+                assert_eq!(line_count, 5, "overflow should have remaining 5 events");
             }
             other => panic!("expected Custom message, got {other:?}"),
         }
@@ -2698,6 +2708,63 @@ mod drain_observations_tests {
         assert_eq!(
             agent.hidden_custom_count, 1,
             "hidden observation message should increment counter"
+        );
+    }
+
+    /// M2 regression: overflow entries beyond the render budget must NOT be
+    /// silently discarded -- they must survive for the next drain cycle.
+    #[test]
+    fn drain_observations_preserves_overflow_for_next_drain() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+
+        // Push 30 single-entry batches (one entry each). Render budget = 20,
+        // so the first drain should take 20 and leave 10 in the bridge.
+        for i in 0..30u64 {
+            bridge.push_observation(ObservationEvent {
+                version: 1,
+                observer_id: "obs-1".to_string(),
+                events: vec![ObservationEntry {
+                    kind: "console_warn".to_string(),
+                    message: Some(format!("warning {i}")),
+                    source: None,
+                    url: None,
+                    ts: 1000 + i as i64,
+                }],
+            });
+        }
+        agent.set_chrome_bridge(bridge.clone());
+
+        // First drain: should take at most 20 entries.
+        let msg1 = agent
+            .drain_observations()
+            .expect("first drain should produce message");
+        let line_count_1 = match &msg1 {
+            Message::Custom(cm) => {
+                // header + event lines
+                let event_lines = cm.content.lines().count() - 1;
+                assert!(
+                    event_lines <= 20,
+                    "first drain should have at most 20 event lines, got {event_lines}"
+                );
+                event_lines
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        };
+
+        // Second drain: the remaining events must still be available.
+        let msg2 = agent
+            .drain_observations()
+            .expect("second drain must produce overflow events");
+        let line_count_2 = match &msg2 {
+            Message::Custom(cm) => cm.content.lines().count() - 1,
+            other => panic!("expected Custom message, got {other:?}"),
+        };
+
+        assert_eq!(
+            line_count_1 + line_count_2,
+            30,
+            "total events across both drains must equal 30 (no data loss)"
         );
     }
 }

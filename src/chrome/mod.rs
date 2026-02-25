@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod config;
+pub mod esl_journal;
 pub mod gif;
 pub mod install;
 pub mod native_host;
@@ -70,17 +71,31 @@ type WriteLane = Arc<AsyncMutex<()>>;
 struct WriteLaneRegistry {
     global: WriteLane,
     by_tab: HashMap<u32, Weak<AsyncMutex<()>>>,
+    /// Counter for periodic stale-entry cleanup (every `WRITE_LANE_CLEANUP_INTERVAL` calls).
+    call_count: u64,
 }
+
+/// Run stale-entry `retain` every Nth `lane_for` call to bound memory growth
+/// without adding per-call overhead.
+const WRITE_LANE_CLEANUP_INTERVAL: u64 = 64;
 
 impl WriteLaneRegistry {
     fn new() -> Self {
         Self {
             global: Arc::new(AsyncMutex::new(())),
             by_tab: HashMap::new(),
+            call_count: 0,
         }
     }
 
     fn lane_for(&mut self, tab_id: Option<u32>) -> WriteLane {
+        self.call_count += 1;
+
+        // Periodic cleanup: purge dead Weak entries every N calls.
+        if self.call_count % WRITE_LANE_CLEANUP_INTERVAL == 0 {
+            self.by_tab.retain(|_, lane| lane.upgrade().is_some());
+        }
+
         match tab_id {
             None => Arc::clone(&self.global),
             Some(tab_id) => {
@@ -88,6 +103,7 @@ impl WriteLaneRegistry {
                     return existing;
                 }
 
+                // Also clean on miss (existing behavior, cheap when periodic cleanup runs).
                 self.by_tab.retain(|_, lane| lane.upgrade().is_some());
                 let lane = Arc::new(AsyncMutex::new(()));
                 self.by_tab.insert(tab_id, Arc::downgrade(&lane));
@@ -798,6 +814,39 @@ impl ChromeBridge {
         std::mem::take(&mut *guard)
     }
 
+    /// Take observation batches up to `max_entries` total entries.
+    ///
+    /// Batches that would push the total over the limit are left in the
+    /// buffer for the next drain cycle so events are never silently lost.
+    pub fn take_observations_limited(
+        &self,
+        max_entries: usize,
+    ) -> Vec<protocol::ObservationEvent> {
+        let mut guard = self
+            .observations
+            .lock()
+            .expect("observations mutex poisoned");
+
+        let mut taken = Vec::new();
+        let mut total = 0usize;
+        let mut remaining = Vec::new();
+
+        for batch in guard.drain(..) {
+            let batch_size = batch.events.len();
+            if total + batch_size <= max_entries || taken.is_empty() {
+                // Always take at least one batch to avoid starvation when
+                // a single batch exceeds the budget.
+                total += batch_size;
+                taken.push(batch);
+            } else {
+                remaining.push(batch);
+            }
+        }
+
+        *guard = remaining;
+        taken
+    }
+
     /// Push a pre-built observation event into the buffer (test-only).
     #[cfg(test)]
     pub fn push_observation(&self, event: protocol::ObservationEvent) {
@@ -1282,9 +1331,9 @@ fn unix_time_ms() -> i64 {
 pub fn chrome_memory_bound_caps() -> ChromeMemoryBoundCaps {
     ChromeMemoryBoundCaps {
         socket_frame_max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
-        esl_journal_max_entries: native_host::MAX_JOURNAL_ENTRIES,
-        esl_journal_max_bytes: native_host::MAX_JOURNAL_BYTES,
-        esl_journal_ttl_ms: native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+        esl_journal_max_entries: esl_journal::MAX_JOURNAL_ENTRIES,
+        esl_journal_max_bytes: esl_journal::MAX_JOURNAL_BYTES,
+        esl_journal_ttl_ms: esl_journal::DEFAULT_REQUEST_JOURNAL_TTL_MS,
         observer_max_observers: observer::MAX_OBSERVERS,
         observer_ring_buffer_capacity: observer::RING_BUFFER_CAPACITY,
         observer_max_events_per_drain: observer::MAX_EVENTS_PER_DRAIN,
@@ -2529,7 +2578,7 @@ mod tests {
         );
         assert_eq!(
             caps.esl_journal_max_entries,
-            native_host::MAX_JOURNAL_ENTRIES,
+            esl_journal::MAX_JOURNAL_ENTRIES,
             "caps snapshot must reflect ESL journal entry cap"
         );
         assert_eq!(
@@ -2538,7 +2587,7 @@ mod tests {
         );
         assert_eq!(
             caps.esl_journal_max_bytes,
-            native_host::MAX_JOURNAL_BYTES,
+            esl_journal::MAX_JOURNAL_BYTES,
             "caps snapshot must reflect ESL journal byte cap"
         );
         assert_eq!(
@@ -2548,7 +2597,7 @@ mod tests {
         );
         assert_eq!(
             caps.esl_journal_ttl_ms,
-            native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+            esl_journal::DEFAULT_REQUEST_JOURNAL_TTL_MS,
             "caps snapshot must expose ESL journal TTL"
         );
         assert_eq!(
@@ -3237,6 +3286,79 @@ mod tests {
         assert!(
             !discovery_file_permissions_are_secure(&symlink_path),
             "symlinks must be rejected by discovery_file_permissions_are_secure"
+        );
+    }
+
+    // ===================================================================
+    // WriteLaneRegistry tests (M3 fix)
+    // ===================================================================
+
+    /// M3 regression: stale `Weak` entries must not accumulate unbounded.
+    /// After `WRITE_LANE_CLEANUP_INTERVAL` calls via the global-lane path
+    /// (no cache miss), dead entries are purged by periodic cleanup.
+    #[test]
+    fn write_lane_registry_periodic_cleanup_purges_stale_entries() {
+        let mut reg = WriteLaneRegistry::new();
+
+        // Directly insert stale Weak entries to simulate accumulated dead tabs
+        // (bypassing lane_for which cleans on cache miss).
+        for tab_id in 0..100u32 {
+            let lane = Arc::new(AsyncMutex::new(()));
+            reg.by_tab.insert(tab_id, Arc::downgrade(&lane));
+            drop(lane); // Weak is now stale
+        }
+
+        // All 100 entries are stale but still present.
+        assert_eq!(
+            reg.by_tab.len(),
+            100,
+            "precondition: stale entries should accumulate"
+        );
+
+        // Drive call_count up to a cleanup interval boundary using global lane
+        // (None path — no cache miss, only periodic cleanup triggers).
+        let calls_needed =
+            WRITE_LANE_CLEANUP_INTERVAL - (reg.call_count % WRITE_LANE_CLEANUP_INTERVAL);
+        for _ in 0..calls_needed {
+            let _ = reg.lane_for(None);
+        }
+
+        // After hitting the interval boundary, stale entries should be purged.
+        assert_eq!(
+            reg.by_tab.len(),
+            0,
+            "periodic cleanup must purge all stale Weak entries"
+        );
+    }
+
+    /// The cleanup must NOT purge entries that still have live strong refs.
+    #[test]
+    fn write_lane_registry_periodic_cleanup_preserves_live_entries() {
+        let mut reg = WriteLaneRegistry::new();
+
+        // Create a lane and keep the Arc alive.
+        let _live_lane = reg.lane_for(Some(42));
+        // Create a stale lane.
+        let dead_lane = reg.lane_for(Some(99));
+        drop(dead_lane);
+
+        assert_eq!(reg.by_tab.len(), 2, "precondition: 2 entries");
+
+        // Drive to cleanup interval.
+        let calls_needed =
+            WRITE_LANE_CLEANUP_INTERVAL - (reg.call_count % WRITE_LANE_CLEANUP_INTERVAL);
+        for _ in 0..calls_needed {
+            let _ = reg.lane_for(None);
+        }
+
+        assert_eq!(
+            reg.by_tab.len(),
+            1,
+            "periodic cleanup must only purge dead entries, not live ones"
+        );
+        assert!(
+            reg.by_tab.contains_key(&42),
+            "live lane for tab 42 must survive cleanup"
         );
     }
 }

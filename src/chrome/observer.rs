@@ -288,9 +288,22 @@ pub enum ObserverError {
 /// Registry managing active observers.
 ///
 /// Enforces MAX_OBSERVERS limit and provides drain API for the agent loop.
-#[derive(Debug, Default)]
+/// Tracks `last_drain_start` to rotate which observer is drained first,
+/// ensuring fair access when the global `MAX_EVENTS_PER_DRAIN` cap is hit.
+#[derive(Debug)]
 pub struct ObserverRegistry {
     observers: HashMap<String, Observer>,
+    /// Index into the sorted key list where the next `drain_all` begins.
+    last_drain_start: usize,
+}
+
+impl Default for ObserverRegistry {
+    fn default() -> Self {
+        Self {
+            observers: HashMap::new(),
+            last_drain_start: 0,
+        }
+    }
 }
 
 impl ObserverRegistry {
@@ -299,6 +312,7 @@ impl ObserverRegistry {
     pub fn new() -> Self {
         Self {
             observers: HashMap::new(),
+            last_drain_start: 0,
         }
     }
 
@@ -361,17 +375,36 @@ impl ObserverRegistry {
 
     /// Drain events from all observers, up to MAX_EVENTS_PER_DRAIN total.
     ///
-    /// Returns events in no particular order. Each observer's buffer is cleared
-    /// after draining. Events beyond the global cap are retained in their
-    /// observer's buffer for the next drain cycle.
+    /// Rotates the starting observer each call so that when the global cap
+    /// is hit, no observer is consistently starved. Observer keys are sorted
+    /// for deterministic ordering; `last_drain_start` advances after each
+    /// cycle to ensure fairness.
+    ///
+    /// Events beyond the global cap are retained in their observer's buffer
+    /// for the next drain cycle.
     pub fn drain_all(&mut self) -> Vec<ObservationEvent> {
+        let n = self.observers.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // Sort keys for deterministic iteration across calls.
+        let mut keys: Vec<String> = self.observers.keys().cloned().collect();
+        keys.sort();
+
+        // Clamp start index in case observers were removed since last call.
+        let start = self.last_drain_start % n;
+
         let mut all_events = Vec::new();
         let mut remaining = MAX_EVENTS_PER_DRAIN;
 
-        for observer in self.observers.values_mut() {
+        for offset in 0..n {
             if remaining == 0 {
                 break;
             }
+            let idx = (start + offset) % n;
+            let key = &keys[idx];
+            let observer = self.observers.get_mut(key).expect("key from keys()");
 
             let mut events = observer.drain();
             if events.len() > remaining {
@@ -384,6 +417,9 @@ impl ObserverRegistry {
             remaining -= events.len();
             all_events.extend(events);
         }
+
+        // Advance starting point for next drain cycle.
+        self.last_drain_start = (start + 1) % n;
 
         all_events
     }
@@ -1254,5 +1290,78 @@ mod tests {
                 "single-digit count perturbation should preserve token estimate under the current heuristic"
             );
         }
+    }
+
+    /// M1 regression: drain_all must rotate the starting observer so that
+    /// under the MAX_EVENTS_PER_DRAIN cap, no observer is permanently starved.
+    #[test]
+    fn test_drain_all_fairness_rotation() {
+        let mut registry = ObserverRegistry::new();
+
+        // Create 4 observers, each with RING_BUFFER_CAPACITY events.
+        // Total = 4 * 128 = 512, cap = 256, so each drain can only serve ~2 observers.
+        for i in 0..4u32 {
+            registry
+                .observe(
+                    format!("obs-{i}"),
+                    i,
+                    vec![ObservableEventKind::ConsoleError],
+                    500,
+                )
+                .unwrap();
+
+            for j in 0..RING_BUFFER_CAPACITY {
+                let event = ObservationEvent::with_timestamp(
+                    format!("obs-{i}"),
+                    i,
+                    ObservableEventKind::ConsoleError,
+                    j as u64,
+                    json!({ "obs": i, "seq": j }),
+                );
+                registry.push_event(&event);
+            }
+        }
+
+        // First drain — should serve some subset.
+        let first = registry.drain_all();
+        assert!(!first.is_empty());
+        assert!(first.len() <= MAX_EVENTS_PER_DRAIN);
+
+        // Collect which observer IDs appeared in the first drain.
+        let first_ids: std::collections::HashSet<String> =
+            first.iter().map(|e| e.observer_id.clone()).collect();
+
+        // Refill the drained observers so every observer has events again.
+        for i in 0..4u32 {
+            let obs = registry.get_mut(&format!("obs-{i}")).unwrap();
+            while obs.buffer.len() < RING_BUFFER_CAPACITY {
+                let event = ObservationEvent::with_timestamp(
+                    format!("obs-{i}"),
+                    i,
+                    ObservableEventKind::ConsoleError,
+                    1000 + obs.buffer.len() as u64,
+                    json!({ "obs": i, "refill": true }),
+                );
+                obs.push_event(event);
+            }
+        }
+
+        // Second drain — the starting observer should have rotated.
+        let second = registry.drain_all();
+        assert!(!second.is_empty());
+        let second_ids: std::collections::HashSet<String> =
+            second.iter().map(|e| e.observer_id.clone()).collect();
+
+        // The union across both drains must include more observers than a
+        // single drain, proving rotation happened.
+        let union: std::collections::HashSet<String> =
+            first_ids.union(&second_ids).cloned().collect();
+        assert!(
+            union.len() > first_ids.len() || union.len() == 4,
+            "drain rotation must eventually serve all observers; \
+             first served {:?}, second served {:?}",
+            first_ids,
+            second_ids,
+        );
     }
 }
