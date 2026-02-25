@@ -84,14 +84,14 @@ fn make_rpc_options(
     handle: &asupersync::runtime::RuntimeHandle,
 ) -> RpcOptions {
     let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
-    RpcOptions {
-        config: Config::default(),
-        resources: ResourceLoader::empty(false),
-        available_models: Vec::new(),
-        scoped_models: Vec::new(),
+    RpcOptions::new(
+        Config::default(),
+        ResourceLoader::empty(false),
+        Vec::new(),
+        Vec::new(),
         auth,
-        runtime_handle: handle.clone(),
-    }
+        handle.clone(),
+    )
 }
 
 fn assert_rpc_success(line: &str, command: &str) -> Value {
@@ -126,7 +126,7 @@ fn rpc_get_state_returns_initial_state() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -189,7 +189,7 @@ fn rpc_get_session_stats_returns_stats() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -229,7 +229,7 @@ fn rpc_get_available_models_returns_list() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -275,7 +275,7 @@ fn rpc_set_session_name_success() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -335,7 +335,7 @@ fn rpc_get_last_assistant_text_with_messages() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -378,7 +378,7 @@ fn rpc_get_last_assistant_text_empty_session() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -421,7 +421,7 @@ fn rpc_get_commands_returns_command_list() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -467,7 +467,7 @@ fn rpc_export_html_with_messages() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -506,7 +506,7 @@ fn rpc_set_steering_mode_accepts_valid_mode() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -546,7 +546,7 @@ fn rpc_set_auto_compaction_toggle() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -586,7 +586,7 @@ fn rpc_set_auto_retry_toggle() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -626,7 +626,7 @@ fn rpc_multiple_commands_preserve_id_ordering() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -686,7 +686,7 @@ fn rpc_steer_missing_message_returns_error() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -727,7 +727,7 @@ fn rpc_follow_up_missing_message_returns_error() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -766,7 +766,7 @@ fn rpc_follow_up_aliases_missing_message_return_error() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -812,7 +812,7 @@ fn rpc_kebab_and_camel_aliases_dispatch_to_canonical_commands() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -912,7 +912,7 @@ fn rpc_empty_line_is_skipped_gracefully() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -976,7 +976,7 @@ fn rpc_server_exits_cleanly_when_input_channel_closes() {
         let options = make_rpc_options(&harness, &handle);
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let _out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });

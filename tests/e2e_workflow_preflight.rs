@@ -269,7 +269,7 @@ fn workflow_safe_mode_denies_exec_and_env() {
     assert_eq!(exec_check.decision, PolicyDecision::Deny);
     harness.log().info_ctx("safe_mode", "exec check", |ctx| {
         ctx.push(("decision".to_string(), format!("{:?}", exec_check.decision)));
-        ctx.push(("reason".to_string(), exec_check.reason.clone()));
+        ctx.push(("reason".to_string(), exec_check.reason.clone().into_owned()));
     });
 
     // env should be denied

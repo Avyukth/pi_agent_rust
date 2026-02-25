@@ -106,17 +106,17 @@ fn setup_rpc(
 
     let auth_dir = tempfile::tempdir().unwrap();
     let auth = AuthStorage::load(auth_dir.path().join("auth.json")).unwrap();
-    let options = RpcOptions {
-        config: Config::default(),
-        resources: ResourceLoader::empty(false),
-        available_models: Vec::new(),
-        scoped_models: Vec::new(),
+    let options = RpcOptions::new(
+        Config::default(),
+        ResourceLoader::empty(false),
+        Vec::new(),
+        Vec::new(),
         auth,
-        runtime_handle: runtime_handle.clone(),
-    };
+        runtime_handle.clone(),
+    );
 
     let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
     let out_rx = Arc::new(Mutex::new(out_rx));
 
     let server =

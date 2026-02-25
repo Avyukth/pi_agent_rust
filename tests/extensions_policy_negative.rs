@@ -812,7 +812,7 @@ fn negative_conformance_report() {
                 mode: mode_name.to_string(),
                 expected_decision: "deny".to_string(),
                 actual_decision: format!("{:?}", check.decision),
-                reason: check.reason.clone(),
+                reason: check.reason.clone().into_owned(),
                 status: if pass { "pass" } else { "fail" }.to_string(),
                 duration_ms: u64::try_from(elapsed).unwrap_or(0),
             });
@@ -830,7 +830,7 @@ fn negative_conformance_report() {
                 mode: mode_name.to_string(),
                 expected_decision: "allow".to_string(),
                 actual_decision: format!("{:?}", check.decision),
-                reason: check.reason.clone(),
+                reason: check.reason.clone().into_owned(),
                 status: if pass { "pass" } else { "fail" }.to_string(),
                 duration_ms: u64::try_from(elapsed).unwrap_or(0),
             });
@@ -854,7 +854,7 @@ fn negative_conformance_report() {
                 mode: mode_name.to_string(),
                 expected_decision: format!("{expected:?}").to_lowercase(),
                 actual_decision: format!("{:?}", check.decision),
-                reason: check.reason.clone(),
+                reason: check.reason.clone().into_owned(),
                 status: if pass { "pass" } else { "fail" }.to_string(),
                 duration_ms: u64::try_from(elapsed).unwrap_or(0),
             });
@@ -877,7 +877,7 @@ fn negative_conformance_report() {
             mode: mode_name.to_string(),
             expected_decision: "deny".to_string(),
             actual_decision: format!("{:?}", check.decision),
-            reason: check.reason.clone(),
+            reason: check.reason.clone().into_owned(),
             status: if pass { "pass" } else { "fail" }.to_string(),
             duration_ms: u64::try_from(elapsed).unwrap_or(0),
         });

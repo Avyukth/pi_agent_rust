@@ -86,17 +86,17 @@ fn rpc_rejects_invalid_json_and_missing_type() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
 
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
-        let options = RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
-            available_models: Vec::new(),
-            scoped_models: Vec::new(),
+        let options = RpcOptions::new(
+            Config::default(),
+            ResourceLoader::empty(false),
+            Vec::new(),
+            Vec::new(),
             auth,
-            runtime_handle: handle.clone(),
-        };
+            handle.clone(),
+        );
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -157,17 +157,17 @@ fn rpc_errors_on_unknown_command_and_missing_params() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
 
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
-        let options = RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
-            available_models: Vec::new(),
-            scoped_models: Vec::new(),
+        let options = RpcOptions::new(
+            Config::default(),
+            ResourceLoader::empty(false),
+            Vec::new(),
+            Vec::new(),
             auth,
-            runtime_handle: handle.clone(),
-        };
+            handle.clone(),
+        );
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -278,17 +278,17 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
         let agent_session = build_agent_session(session, &cassette_dir);
 
         let auth = AuthStorage::load(harness.temp_path("auth.json")).expect("load auth storage");
-        let options = RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
-            available_models: Vec::new(),
-            scoped_models: Vec::new(),
+        let options = RpcOptions::new(
+            Config::default(),
+            ResourceLoader::empty(false),
+            Vec::new(),
+            Vec::new(),
             auth,
-            runtime_handle: handle.clone(),
-        };
+            handle.clone(),
+        );
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });

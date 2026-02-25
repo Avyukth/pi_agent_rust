@@ -98,14 +98,14 @@ fn build_options(
     scoped_models: Vec<RpcScopedModel>,
 ) -> RpcOptions {
     let auth = AuthStorage::load(auth_path).expect("load auth storage");
-    RpcOptions {
-        config: Config::default(),
-        resources: ResourceLoader::empty(false),
+    RpcOptions::new(
+        Config::default(),
+        ResourceLoader::empty(false),
         available_models,
         scoped_models,
         auth,
-        runtime_handle: handle.clone(),
-    }
+        handle.clone(),
+    )
 }
 
 async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<String, String> {
@@ -188,7 +188,7 @@ fn rpc_set_steering_mode_valid() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -233,7 +233,7 @@ fn rpc_set_steering_mode_invalid() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -279,7 +279,7 @@ fn rpc_set_follow_up_mode_valid_and_invalid() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -335,7 +335,7 @@ fn rpc_set_auto_compaction_and_retry() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -415,7 +415,7 @@ fn rpc_get_available_models_empty() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -454,7 +454,7 @@ fn rpc_get_available_models_populated() {
         ];
         let options = build_options(&handle, harness.temp_path("auth.json"), models, vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -493,7 +493,7 @@ fn rpc_set_thinking_level_success() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -537,7 +537,7 @@ fn rpc_set_thinking_level_errors() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -590,7 +590,7 @@ fn rpc_get_messages_empty_session() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -636,7 +636,7 @@ fn rpc_get_messages_with_user_messages() {
         let agent_session = build_agent_session(session, &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -673,7 +673,7 @@ fn rpc_get_last_assistant_text_empty() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -726,7 +726,7 @@ fn rpc_get_last_assistant_text_with_assistant() {
         let agent_session = build_agent_session(session, &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -760,7 +760,7 @@ fn rpc_get_commands_empty() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -801,7 +801,7 @@ fn rpc_set_session_name_success() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -834,7 +834,7 @@ fn rpc_set_session_name_missing_name() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -872,7 +872,7 @@ fn rpc_bash_echo() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -911,7 +911,7 @@ fn rpc_bash_missing_command() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -945,7 +945,7 @@ fn rpc_bash_nonzero_exit() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -983,7 +983,7 @@ fn rpc_request_id_preserved() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1032,7 +1032,7 @@ fn rpc_request_without_id() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1076,7 +1076,7 @@ fn rpc_rapid_sequence_of_sync_commands() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), models, vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(32);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1184,7 +1184,7 @@ fn rpc_get_state_reflects_session_stats() {
         let agent_session = build_agent_session(session, &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1253,7 +1253,7 @@ fn rpc_prompt_missing_message() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1287,7 +1287,7 @@ fn rpc_steer_missing_message() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1321,7 +1321,7 @@ fn rpc_follow_up_missing_message() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1355,7 +1355,7 @@ fn rpc_set_model_missing_model_id() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1417,7 +1417,7 @@ fn rpc_fork_missing_entry_id() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1451,7 +1451,7 @@ fn rpc_export_html_empty_session() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1490,7 +1490,7 @@ fn rpc_abort_when_idle() {
         let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
         let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1598,7 +1598,7 @@ fn rpc_extension_ui_confirm_roundtrip() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1673,7 +1673,7 @@ fn rpc_extension_ui_confirm_denied() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1738,7 +1738,7 @@ fn rpc_extension_ui_select_roundtrip() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1810,7 +1810,7 @@ fn rpc_extension_ui_input_roundtrip() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1880,7 +1880,7 @@ fn rpc_extension_ui_editor_roundtrip() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -1950,7 +1950,7 @@ fn rpc_extension_ui_cancel_response() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2014,7 +2014,7 @@ fn rpc_extension_ui_response_without_extensions() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2059,7 +2059,7 @@ fn rpc_extension_ui_mismatched_request_id() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2133,7 +2133,7 @@ fn rpc_extension_ui_missing_request_id() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2183,7 +2183,7 @@ fn rpc_extension_ui_id_alias_roundtrip() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2252,7 +2252,7 @@ fn rpc_extension_ui_sequential_ordering() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2355,7 +2355,7 @@ fn rpc_extension_ui_no_active_request() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
@@ -2403,7 +2403,7 @@ fn rpc_extension_ui_notify_fire_and_forget() {
             vec![],
         );
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
         let out_rx = Arc::new(Mutex::new(out_rx));
 
         let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
