@@ -2015,6 +2015,10 @@ pub struct AgentSession {
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
+    /// V8-B: Cached session generation from the last `to_messages_for_current_path()`.
+    /// When the session's generation matches, the agent's current messages are
+    /// already in sync and the expensive rebuild can be skipped.
+    cached_history_gen: u64,
 }
 
 #[derive(Debug, Default)]
@@ -4900,6 +4904,7 @@ impl AgentSession {
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
+            cached_history_gen: 0,
         }
     }
 
@@ -5649,16 +5654,24 @@ impl AgentSession {
         }
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
+
+        // V8-B: skip the expensive to_messages_for_current_path() + replace_messages()
+        // when the session has not been mutated since the last time we rebuilt.
+        {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
-        self.agent.replace_messages(history);
+            let session_gen = session.generation();
+            if session_gen != self.cached_history_gen {
+                let history = session.to_messages_for_current_path();
+                drop(session);
+                self.agent.replace_messages(history);
+                self.cached_history_gen = session_gen;
+            }
+        }
 
         let start_len = self.agent.messages().len();
 
@@ -5721,16 +5734,24 @@ impl AgentSession {
         }
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
+
+        // V8-B: skip the expensive to_messages_for_current_path() + replace_messages()
+        // when the session has not been mutated since the last time we rebuilt.
+        {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
-        self.agent.replace_messages(history);
+            let session_gen = session.generation();
+            if session_gen != self.cached_history_gen {
+                let history = session.to_messages_for_current_path();
+                drop(session);
+                self.agent.replace_messages(history);
+                self.cached_history_gen = session_gen;
+            }
+        }
 
         let start_len = self.agent.messages().len();
 

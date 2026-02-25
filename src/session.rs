@@ -570,6 +570,11 @@ pub struct Session {
     cached_message_count: u64,
     /// Most recent session name from `SessionInfo` entries.
     cached_name: Option<String>,
+    /// Monotonically increasing counter bumped on every mutation that changes
+    /// the message path (append, navigate, reset, rehydrate, rebuild).
+    /// Consumers (e.g. `AgentSession`) can cache expensive derived state and
+    /// skip recomputation when the generation has not changed.  (V8-B)
+    generation: u64,
     /// Write-behind autosave queue state and lifecycle counters.
     autosave_queue: AutosaveQueue,
     /// Current durability policy for shutdown final flush behavior.
@@ -612,6 +617,7 @@ impl Clone for Session {
             entry_index: self.entry_index.clone(),
             cached_message_count: self.cached_message_count,
             cached_name: self.cached_name.clone(),
+            generation: self.generation,
             autosave_queue: self.autosave_queue.clone(),
             autosave_durability: self.autosave_durability,
             // Deep copy the atomic value to preserve value semantics for clones.
@@ -1007,6 +1013,7 @@ impl Session {
             entry_index: HashMap::new(),
             cached_message_count: 0,
             cached_name: None,
+            generation: 0,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(0)),
@@ -1048,6 +1055,7 @@ impl Session {
             entry_index: HashMap::new(),
             cached_message_count: 0,
             cached_name: None,
+            generation: 0,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(0)),
@@ -1201,6 +1209,7 @@ impl Session {
                     .message_count
                     .saturating_add(v2_message_count_offset),
                 cached_name: finalized.name,
+                generation: 0,
                 autosave_queue: AutosaveQueue::new(),
                 autosave_durability: AutosaveDurabilityMode::from_env(),
                 persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
@@ -1268,6 +1277,7 @@ impl Session {
             entry_index: finalized.entry_index,
             cached_message_count: finalized.message_count,
             cached_name: finalized.name,
+            generation: 0,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
@@ -1493,6 +1503,7 @@ impl Session {
         self.entry_index = finalized.entry_index;
         self.cached_message_count = finalized.message_count;
         self.cached_name = finalized.name;
+        self.generation = self.generation.wrapping_add(1);
         self.persisted_entry_count
             .store(persisted_entry_count, Ordering::SeqCst);
         self.v2_partial_hydration = false;
@@ -1853,6 +1864,7 @@ impl Session {
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
         self.cached_message_count += 1;
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Message);
         id
     }
@@ -1874,6 +1886,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -1889,6 +1902,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -1904,6 +1918,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -1925,6 +1940,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -1958,6 +1974,7 @@ impl Session {
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
         self.cached_message_count += 1;
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Message);
         id
     }
@@ -1965,6 +1982,13 @@ impl Session {
     /// Get the current session name from the cached value (Gap C).
     pub fn get_name(&self) -> Option<String> {
         self.cached_name.clone()
+    }
+
+    /// Monotonic generation counter (V8-B).  Incremented on every mutation
+    /// that could change the output of `to_messages_for_current_path()`.
+    /// Consumers can compare generations to skip expensive rebuilds.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Set the session name by appending a `SessionInfo` entry.
@@ -1994,6 +2018,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -2018,6 +2043,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
         id
     }
@@ -2049,6 +2075,7 @@ impl Session {
         // to a mid-chain entry before saving, the leaf differs from the tip
         // and the fast path would return wrong results.
         self.is_linear = finalized.is_linear && self.leaf_id == finalized.leaf_id;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Convert session entries to model messages (for provider context).
@@ -2291,6 +2318,7 @@ impl Session {
                 self.is_linear = false;
             }
             self.leaf_id = Some(entry_id.to_string());
+            self.generation = self.generation.wrapping_add(1);
             true
         } else {
             false
@@ -2305,6 +2333,7 @@ impl Session {
     pub fn reset_leaf(&mut self) {
         self.leaf_id = None;
         self.is_linear = false;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Create a new branch starting from a specific entry.
@@ -2625,6 +2654,7 @@ impl Session {
         self.entries.push(entry);
         self.entry_index.insert(id.clone(), self.entries.len() - 1);
         self.entry_ids.insert(id.clone());
+        self.generation = self.generation.wrapping_add(1);
         self.enqueue_autosave_mutation(AutosaveMutationKind::Label);
         Some(id)
     }
@@ -3770,6 +3800,7 @@ fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnos
             entry_index: finalized.entry_index,
             cached_message_count: finalized.message_count,
             cached_name: finalized.name,
+            generation: 0,
             autosave_queue: AutosaveQueue::new(),
             autosave_durability: AutosaveDurabilityMode::from_env(),
             persisted_entry_count: Arc::new(AtomicUsize::new(entry_count)),
@@ -9209,5 +9240,80 @@ mod tests {
             session.rebuild_cache_count, 1,
             "save_inner should rebuild when entry_ids.len() != entries.len()"
         );
+    }
+
+    // ── V8-B: generation counter tests ──────────────────────────────
+
+    #[test]
+    fn generation_starts_at_zero() {
+        let session = Session::in_memory();
+        assert_eq!(session.generation(), 0);
+    }
+
+    #[test]
+    fn generation_increments_on_append_message() {
+        let mut session = Session::in_memory();
+        assert_eq!(session.generation(), 0);
+        session.append_message(make_test_message("hello"));
+        assert_eq!(session.generation(), 1);
+        session.append_message(make_test_message("world"));
+        assert_eq!(session.generation(), 2);
+    }
+
+    #[test]
+    fn generation_increments_on_model_change() {
+        let mut session = Session::in_memory();
+        session.append_model_change("anthropic".to_string(), "claude-sonnet-4-5".to_string());
+        assert_eq!(session.generation(), 1);
+    }
+
+    #[test]
+    fn generation_increments_on_custom_entry() {
+        let mut session = Session::in_memory();
+        session.append_custom_entry("test".to_string(), None);
+        assert_eq!(session.generation(), 1);
+    }
+
+    #[test]
+    fn generation_increments_on_navigate_and_reset() {
+        let mut session = Session::in_memory();
+        let id = session.append_message(make_test_message("first"));
+        assert_eq!(session.generation(), 1);
+        session.append_message(make_test_message("second"));
+        assert_eq!(session.generation(), 2);
+        session.navigate_to(&id);
+        assert_eq!(session.generation(), 3);
+        session.reset_leaf();
+        assert_eq!(session.generation(), 4);
+    }
+
+    #[test]
+    fn generation_increments_on_rebuild_all_caches() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("msg"));
+        let before = session.generation();
+        session.rebuild_all_caches();
+        assert_eq!(session.generation(), before + 1);
+    }
+
+    #[test]
+    fn generation_preserved_by_clone() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("a"));
+        session.append_message(make_test_message("b"));
+        let cloned = session.clone();
+        assert_eq!(cloned.generation(), session.generation());
+    }
+
+    #[test]
+    fn generation_stable_when_no_mutations() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("first"));
+        let g = session.generation();
+        // Reading operations must not change generation.
+        let _ = session.to_messages_for_current_path();
+        let _ = session.entries.len();
+        let _ = session.get_name();
+        assert_eq!(session.generation(), g);
     }
 }

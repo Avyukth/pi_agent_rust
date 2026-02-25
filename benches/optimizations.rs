@@ -1,6 +1,6 @@
 //! Criterion benchmark suite for accepted optimization findings (bd-izy.3).
 //!
-//! Covers O1, O2, O5, O6, O8/O9, O13, O15, V7-B, V8-A, and observer
+//! Covers O1, O2, O5, O6, O8/O9, O13, O15, V7-B, V8-A, V8-B, and observer
 //! ring-buffer drain. Each benchmark has a specific performance budget
 //! from PLAN §1.2.2.
 //!
@@ -18,6 +18,7 @@
 //! - `bench_tool_call_args_arc`: Arc<Value> access (O13)
 //! - `bench_event_drain_buffer`: non-blocking try_send vs blocking send (O5)
 //! - `bench_rpc_model_lookup`: HashMap vs linear scan (V7-B)
+//! - `bench_session_generation`: generation counter skip vs full rebuild (V8-B)
 
 #[path = "bench_env.rs"]
 mod bench_env;
@@ -573,6 +574,60 @@ fn bench_rpc_model_lookup(c: &mut Criterion) {
 }
 
 // ============================================================================
+// V8-B: Session generation counter — skip redundant history rebuilds
+// ============================================================================
+
+/// Benchmark the Session generation counter and to_messages_for_current_path()
+/// rebuild cost.  Measures:
+///   • generation() read — should be < 10ns (plain field read)
+///   • to_messages_for_current_path with 100 messages — baseline cost
+///   • skipped rebuild via generation check — ~0ns amortized
+fn bench_session_generation(c: &mut Criterion) {
+    use pi::model::{Message, UserContent, UserMessage};
+    use pi::session::Session;
+
+    let mut group = c.benchmark_group("v8b_session_generation");
+
+    // Build a session with 100 messages.
+    let mut session = Session::in_memory();
+    for i in 0..100 {
+        let msg = Message::User(UserMessage {
+            content: UserContent::Text(format!("message {i}")),
+            timestamp: 0,
+        });
+        session.append_model_message(msg);
+    }
+
+    // Bench: reading the generation counter (should be trivially fast).
+    group.bench_function("generation_read", |b| {
+        b.iter(|| {
+            black_box(session.generation());
+        });
+    });
+
+    // Bench: full to_messages_for_current_path (the expensive operation we skip).
+    group.bench_function("to_messages_100", |b| {
+        b.iter(|| {
+            black_box(session.to_messages_for_current_path());
+        });
+    });
+
+    // Bench: generation-guarded skip (simulating the V8-B fast path).
+    let cached_gen = session.generation();
+    group.bench_function("generation_guard_hit", |b| {
+        b.iter(|| {
+            let current_gen = session.generation();
+            if black_box(current_gen) != black_box(cached_gen) {
+                // Would rebuild — but generation matches, so skip.
+                black_box(session.to_messages_for_current_path());
+            }
+        });
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Harness
 // ============================================================================
 
@@ -590,6 +645,7 @@ criterion_group! {
         bench_policy_lookup,
         bench_event_drain_buffer,
         bench_rpc_model_lookup,
+        bench_session_generation,
 }
 
 criterion_main!(optimization_benches);
