@@ -2036,6 +2036,80 @@ mod tests {
                 ),
             }
         }
+
+        #[test]
+        fn test_esl_proptest_terminal_replay_expires_at_ttl_boundary(
+            payload in esl_json_value_strategy(),
+            ttl_ms in 1_i64..5_000_i64,
+        ) {
+            let request = sample_request_struct("req-esl-ttl-boundary", payload);
+            let response = sample_response_envelope_for("req-esl-ttl-boundary");
+            let now_ms = unix_time_ms();
+            let terminal_ms = now_ms + 1;
+
+            let mut before_boundary = EslJournal::with_limits_for_test(ttl_ms, 64, 1 << 20);
+            let first_before = before_boundary.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                now_ms,
+            )?;
+            prop_assert_eq!(
+                first_before,
+                EslBeginOutcome::Dispatch,
+                "first request must dispatch"
+            );
+            before_boundary.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                &response,
+                terminal_ms,
+            )?;
+            let replay_before_boundary = before_boundary.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                terminal_ms + ttl_ms.saturating_sub(1),
+            )?;
+            match replay_before_boundary {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response.clone(),
+                    "terminal entry must replay strictly before TTL boundary"
+                ),
+                other => prop_assert!(
+                    false,
+                    "expected replay before TTL boundary, got {other:?}"
+                ),
+            }
+
+            let mut at_boundary = EslJournal::with_limits_for_test(ttl_ms, 64, 1 << 20);
+            let first_at = at_boundary.begin_request("session-prop", "epoch-prop", &request, now_ms)?;
+            prop_assert_eq!(
+                first_at,
+                EslBeginOutcome::Dispatch,
+                "first request must dispatch in independent journal"
+            );
+            at_boundary.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                &response,
+                terminal_ms,
+            )?;
+            let dispatch_at_boundary = at_boundary.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                terminal_ms + ttl_ms,
+            )?;
+            prop_assert_eq!(
+                dispatch_at_boundary,
+                EslBeginOutcome::Dispatch,
+                "terminal replay cache must expire at TTL boundary (>= ttl)"
+            );
+        }
     }
 
     #[test]
