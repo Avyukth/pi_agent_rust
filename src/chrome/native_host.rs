@@ -115,8 +115,7 @@ impl EslJournal {
             );
         if DEFAULT_REQUEST_JOURNAL_TTL_MS < min_ttl_ms {
             return Err(NativeHostError::EslInvariant(format!(
-                "request journal ttl {}ms violates coupling invariant (min {min_ttl_ms}ms)",
-                DEFAULT_REQUEST_JOURNAL_TTL_MS
+                "request journal ttl {DEFAULT_REQUEST_JOURNAL_TTL_MS}ms violates coupling invariant (min {min_ttl_ms}ms)"
             )));
         }
         Ok(Self {
@@ -496,8 +495,7 @@ impl NativeHost {
         }
         let claimed_by = self
             .claimed_by
-            .as_ref()
-            .cloned()
+            .clone()
             .expect("auth_ok handshake must set claimed_by");
 
         let mut agent_stream =
@@ -1781,7 +1779,7 @@ mod tests {
                     "session-prop",
                     "epoch-prop",
                     &request,
-                    now_ms + 1 + i as i64,
+                    now_ms + 1 + i64::try_from(i).unwrap_or(i64::MAX),
                 )?;
                 match outcome {
                     EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
@@ -1808,7 +1806,7 @@ mod tests {
                     "session-prop",
                     "epoch-prop",
                     &request,
-                    now_ms + 100 + i as i64,
+                    now_ms + 100 + i64::try_from(i).unwrap_or(i64::MAX),
                 )?;
                 match outcome {
                     EslBeginOutcome::Replay(replayed) => {
@@ -1878,7 +1876,7 @@ mod tests {
 
             for (kind, slot_raw, variant_raw) in trace {
                 match kind % 6 {
-                    0 | 1 | 2 => {
+                    0..=2 => {
                         let request = trace_request_for_slot(slot_raw, variant_raw);
                         let key = (session.to_string(), request.id.clone(), epoch.clone());
                         let outcome = journal.begin_request(session, &epoch, &request, now_ms)?;
@@ -2544,6 +2542,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_native_host_run_with_io_handles_multiple_request_cycles_with_observations() {
         run_async(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
