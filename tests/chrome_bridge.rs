@@ -76,11 +76,19 @@ fn make_record(socket_path: &Path, host_id: &str) -> pi::chrome::DiscoveryRecord
 
 fn write_discovery(dir: &Path, record: &pi::chrome::DiscoveryRecord) {
     let filename = format!("pi-chrome-host-{}.discovery.json", record.host_id);
+    let path = dir.join(filename);
     std::fs::write(
-        dir.join(filename),
+        &path,
         serde_json::to_vec(record).expect("serialize discovery record"),
     )
     .expect("write discovery record");
+    // LavenderCastle's Wave 1A added a permission check (0o600) in discover_hosts_in_dir.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod discovery record");
+    }
 }
 
 fn bridge_config(discovery_dir: &Path, session_id: &str, client_id: &str) -> ChromeBridgeConfig {
@@ -496,12 +504,13 @@ fn test_auth_token_validation_bad_token_rejected() {
             .await
             .expect_err("bad token must be rejected");
 
-        // The host sends an error Response, which ChromeBridge interprets as
-        // UnexpectedHandshakeMessage (since it expects AuthOk/AuthBusy).
+        // The host sends an error Response with ChromeBridgeAuthFailed code.
+        // Wave 1A's authenticate_stream now handles this explicitly as AuthRejected.
         assert!(
             matches!(
                 err,
-                ChromeBridgeError::UnexpectedHandshakeMessage(_)
+                ChromeBridgeError::AuthRejected(_)
+                    | ChromeBridgeError::UnexpectedHandshakeMessage(_)
                     | ChromeBridgeError::ProtocolMismatch(_)
             ),
             "expected rejection error, got {err:?}"

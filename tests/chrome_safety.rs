@@ -78,11 +78,19 @@ fn make_record(socket_path: &Path, host_id: &str) -> pi::chrome::DiscoveryRecord
 
 fn write_discovery(dir: &Path, record: &pi::chrome::DiscoveryRecord) {
     let filename = format!("pi-chrome-host-{}.discovery.json", record.host_id);
+    let path = dir.join(filename);
     std::fs::write(
-        dir.join(filename),
+        &path,
         serde_json::to_vec(record).expect("serialize discovery record"),
     )
     .expect("write discovery record");
+    // Wave 1A added permission check (0o600) in discover_hosts_in_dir.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod discovery record");
+    }
 }
 
 fn bridge_config(discovery_dir: &Path, session_id: &str, client_id: &str) -> ChromeBridgeConfig {
