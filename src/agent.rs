@@ -531,10 +531,14 @@ impl Agent {
                 };
                 let suffix = if detail.is_empty() {
                     String::new()
-                } else if detail.len() > 80 {
-                    format!(": {}...", &detail[..77])
                 } else {
-                    format!(": {detail}")
+                    let mut chars = detail.chars();
+                    let preview: String = chars.by_ref().take(77).collect();
+                    if chars.next().is_some() {
+                        format!(": {preview}...")
+                    } else {
+                        format!(": {detail}")
+                    }
                 };
                 lines.push(format!("- {}{suffix}", entry.kind));
                 total_entries += 1;

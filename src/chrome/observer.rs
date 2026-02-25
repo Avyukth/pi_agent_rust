@@ -362,7 +362,8 @@ impl ObserverRegistry {
     /// Drain events from all observers, up to MAX_EVENTS_PER_DRAIN total.
     ///
     /// Returns events in no particular order. Each observer's buffer is cleared
-    /// after draining.
+    /// after draining. Events beyond the global cap are retained in their
+    /// observer's buffer for the next drain cycle.
     pub fn drain_all(&mut self) -> Vec<ObservationEvent> {
         let mut all_events = Vec::new();
         let mut remaining = MAX_EVENTS_PER_DRAIN;
@@ -372,10 +373,16 @@ impl ObserverRegistry {
                 break;
             }
 
-            let events = observer.drain();
-            let take = events.len().min(remaining);
-            all_events.extend(events.into_iter().take(take));
-            remaining -= take;
+            let mut events = observer.drain();
+            if events.len() > remaining {
+                // Re-queue undelivered events for the next drain cycle.
+                let overflow = events.split_off(remaining);
+                for event in overflow {
+                    observer.push_event(event);
+                }
+            }
+            remaining -= events.len();
+            all_events.extend(events);
         }
 
         all_events

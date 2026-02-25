@@ -1873,7 +1873,20 @@ async fn run_prompt_with_retry(
                 // try_send avoids blocking the async runtime under backpressure;
                 // the EVENT_DRAIN_BUFFER-slot buffer absorbs bursts from 8
                 // concurrent tools.
-                let _ = buf_tx.try_send(event);
+                // Lifecycle events (AgentStart, AgentEnd) use blocking send to
+                // guarantee delivery — dropping AgentEnd leaves clients hanging.
+                match buf_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(evt))
+                        if matches!(
+                            evt,
+                            AgentEvent::AgentStart { .. } | AgentEvent::AgentEnd { .. }
+                        ) =>
+                    {
+                        let _ = buf_tx.send(evt);
+                    }
+                    Err(_) => {}
+                }
             };
 
             let run_result = if images.is_empty() {
@@ -1889,6 +1902,10 @@ async fn run_prompt_with_retry(
                     .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                     .await
             };
+
+            // Release session lock before waiting for drain thread completion
+            // to avoid blocking unrelated RPC operations under backpressure.
+            drop(guard);
 
             // event_handler dropped → buf_tx dropped → drain thread exits
             // after processing remaining buffered events. Join to ensure all
