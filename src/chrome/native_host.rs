@@ -2305,16 +2305,13 @@ mod tests {
                         continue;
                     }
 
-                    let entry = match journal.entries.get(&key) {
-                        Some(entry) => entry,
-                        None => {
-                            prop_assert!(
-                                false,
-                                "capacity/ttl handling must never evict unrelated in_progress entry: {:?}",
-                                key
-                            );
-                            continue;
-                        }
+                    let Some(entry) = journal.entries.get(&key) else {
+                        prop_assert!(
+                            false,
+                            "capacity/ttl handling must never evict unrelated in_progress entry: {:?}",
+                            key
+                        );
+                        continue;
                     };
                     prop_assert!(
                         matches!(entry.state, EslJournalState::InProgress),
