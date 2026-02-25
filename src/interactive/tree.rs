@@ -400,11 +400,7 @@ impl PiApp {
                 (fork_plan, parent_path, session_dir)
             };
 
-            let crate::session::ForkPlan {
-                entries,
-                leaf_id,
-                selected_text,
-            } = fork_plan;
+            let selected_text = fork_plan.selected_text.clone();
 
             let mut new_session = Session::create_with_dir(session_dir);
             new_session.header.provider = Some(model_provider);

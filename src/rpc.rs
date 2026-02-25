@@ -1500,11 +1500,7 @@ pub async fn run(
                         };
 
                         // Phase 2: Build new session without holding any lock.
-                        let crate::session::ForkPlan {
-                            entries,
-                            leaf_id,
-                            selected_text,
-                        } = fork_plan;
+                        let selected_text = fork_plan.selected_text.clone();
 
                         let mut new_session = if save_enabled {
                             crate::session::Session::create_with_dir(session_dir)
