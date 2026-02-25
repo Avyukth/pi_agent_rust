@@ -1,17 +1,17 @@
 # Extension Conformance Report
 
-> Generated: 2026-02-16T20:45:35Z
+> Generated: 2026-02-25T13:20:24Z
 
 ## Summary
 
 | Metric | Value |
 |----|----|
-| Total extensions | 223 |
-| PASS | 60 |
+| Total extensions | 224 |
+| PASS | 0 |
 | FAIL | 0 |
-| N/A (not yet tested) | 163 |
-| Pass rate (tested only) | 100.0% |
-| Coverage (tested/total) | 26.9% |
+| N/A (not yet tested) | 224 |
+| Pass rate (tested only) | 0.0% |
+| Coverage (tested/total) | 0.0% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
 
@@ -68,10 +68,10 @@
 | [`community/prateekmedia-ralph-loop`](tests/ext_conformance/artifacts/community/prateekmedia-ralph-loop/ralph-loop.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`community/prateekmedia-repeat`](tests/ext_conformance/artifacts/community/prateekmedia-repeat/repeat.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`community/prateekmedia-token-rate`](tests/ext_conformance/artifacts/community/prateekmedia-token-rate/token-rate.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`community/qualisero-background-notify`](tests/ext_conformance/artifacts/community/qualisero-background-notify/index.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
+| [`community/qualisero-background-notify`](tests/ext_conformance/artifacts/community/qualisero-background-notify/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`community/qualisero-compact-config`](tests/ext_conformance/artifacts/community/qualisero-compact-config/compact-config.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`community/qualisero-pi-agent-scip`](tests/ext_conformance/artifacts/community/qualisero-pi-agent-scip/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
-| [`community/qualisero-safe-git`](tests/ext_conformance/artifacts/community/qualisero-safe-git/index.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
+| [`community/qualisero-safe-git`](tests/ext_conformance/artifacts/community/qualisero-safe-git/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`community/qualisero-safe-rm`](tests/ext_conformance/artifacts/community/qualisero-safe-rm/index.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`community/qualisero-session-color`](tests/ext_conformance/artifacts/community/qualisero-session-color/index.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`community/qualisero-session-emoji`](tests/ext_conformance/artifacts/community/qualisero-session-emoji/index.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
@@ -90,10 +90,11 @@
 
 ## npm-registry
 
-75 extensions (0 pass, 0 fail, 75 untested)
+76 extensions (0 pass, 0 fail, 76 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
+| [`npm/agentsbox`](tests/ext_conformance/artifacts/npm/agentsbox/dist/pi.js) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/aliou-pi-extension-dev`](tests/ext_conformance/artifacts/npm/aliou-pi-extension-dev/index.ts) | `0.2.0` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/aliou-pi-guardrails`](tests/ext_conformance/artifacts/npm/aliou-pi-guardrails/index.ts) | `0.6.1` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/aliou-pi-linkup`](tests/ext_conformance/artifacts/npm/aliou-pi-linkup/src/index.ts) | `0.3.1` | T3 (multi-file) | N/A | - | - | - |  |
@@ -108,7 +109,7 @@
 | [`npm/juanibiapina-pi-extension-settings`](tests/ext_conformance/artifacts/npm/juanibiapina-pi-extension-settings/dist/index.js) | `0.4.0` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/juanibiapina-pi-files`](tests/ext_conformance/artifacts/npm/juanibiapina-pi-files/dist/index.js) | `0.1.0` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/juanibiapina-pi-gob`](tests/ext_conformance/artifacts/npm/juanibiapina-pi-gob/dist/index.js) | `0.2.0` | T3 (multi-file) | N/A | - | - | - |  |
-| [`npm/lsp-pi`](tests/ext_conformance/artifacts/npm/lsp-pi/lsp.ts) | `1.0.1` | T3 (multi-file) | N/A | - | - | - |  |
+| [`npm/lsp-pi`](tests/ext_conformance/artifacts/npm/lsp-pi/lsp-tool.ts) | `1.0.1` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/marckrenn-pi-sub-bar`](tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-bar/index.ts) | `1.0.4` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/marckrenn-pi-sub-core`](tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-core/index.ts) | `1.0.4` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/mitsupi`](tests/ext_conformance/artifacts/npm/mitsupi/pi-extensions/answer.ts) | - | T5 (exec/network) | N/A | - | - | - |  |
@@ -158,7 +159,7 @@
 | [`npm/ralph-loop-pi`](tests/ext_conformance/artifacts/npm/ralph-loop-pi/ralph-loop.ts) | `1.0.1` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/repeat-pi`](tests/ext_conformance/artifacts/npm/repeat-pi/repeat.ts) | `0.50.0` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/shitty-extensions`](tests/ext_conformance/artifacts/npm/shitty-extensions/extensions/clipboard.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
-| [`npm/tmustier-pi-arcade`](tests/ext_conformance/artifacts/npm/tmustier-pi-arcade/spice-invaders.ts) | `0.1.5` | T3 (multi-file) | N/A | - | - | - |  |
+| [`npm/tmustier-pi-arcade`](tests/ext_conformance/artifacts/npm/tmustier-pi-arcade/mario-not/mario-not.ts) | `0.1.5` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/token-rate-pi`](tests/ext_conformance/artifacts/npm/token-rate-pi/token-rate.ts) | `1.0.2` | T2 (multi-registration) | N/A | - | - | - |  |
 | [`npm/vaayne-agent-kit`](tests/ext_conformance/artifacts/npm/vaayne-agent-kit/extensions/mcp/index.ts) | `1.0.0` | T3 (multi-file) | N/A | - | - | - |  |
 | [`npm/vaayne-pi-mcp`](tests/ext_conformance/artifacts/npm/vaayne-pi-mcp/index.ts) | `0.2.0` | T3 (multi-file) | N/A | - | - | - |  |
@@ -172,76 +173,76 @@
 
 ## official-pi-mono
 
-66 extensions (60 pass, 0 fail, 6 untested)
+66 extensions (0 pass, 0 fail, 66 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
-| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 2/2 pass |  |
-| [`auto-commit-on-exit`](tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/auto-commit-on-exit.json) | 98ms | - |  |
+| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) | - | - |  |
+| [`auto-commit-on-exit`](tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/auto-commit-on-exit.json) | - | - |  |
 | [`base_fixtures`](tests/ext_conformance/artifacts/base_fixtures/minimal_command/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
-| [`bash-spawn-hook`](tests/ext_conformance/artifacts/bash-spawn-hook/bash-spawn-hook.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/bash-spawn-hook.json) | 99ms | - |  |
-| [`bookmark`](tests/ext_conformance/artifacts/bookmark/bookmark.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/bookmark.json) | 98ms | - |  |
-| [`claude-rules`](tests/ext_conformance/artifacts/claude-rules/claude-rules.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/claude-rules.json) | 99ms | - |  |
-| [`confirm-destructive`](tests/ext_conformance/artifacts/confirm-destructive/confirm-destructive.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/confirm-destructive.json) | 98ms | - |  |
-| [`custom-compaction`](tests/ext_conformance/artifacts/custom-compaction/custom-compaction.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/custom-compaction.json) | 103ms | - |  |
-| [`custom-footer`](tests/ext_conformance/artifacts/custom-footer/custom-footer.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/custom-footer.json) | 101ms | - |  |
-| [`custom-header`](tests/ext_conformance/artifacts/custom-header/custom-header.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/custom-header.json) | 101ms | - |  |
-| [`custom-provider-anthropic`](tests/ext_conformance/artifacts/custom-provider-anthropic/index.ts) | `1.2.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/custom-provider-anthropic.json) [smoke](tests/ext_conformance/reports/extensions/custom-provider-anthropic.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/custom-provider-anthropic.jsonl) | 113ms | 1/1 pass |  |
-| [`custom-provider-gitlab-duo`](tests/ext_conformance/artifacts/custom-provider-gitlab-duo/index.ts) | `1.2.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/custom-provider-gitlab-duo.json) | 103ms | - |  |
-| [`custom-provider-qwen-cli`](tests/ext_conformance/artifacts/custom-provider-qwen-cli/index.ts) | `1.1.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/custom-provider-qwen-cli.json) [smoke](tests/ext_conformance/reports/extensions/custom-provider-qwen-cli.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/custom-provider-qwen-cli.jsonl) | 105ms | 1/1 pass |  |
+| [`bash-spawn-hook`](tests/ext_conformance/artifacts/bash-spawn-hook/bash-spawn-hook.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/bash-spawn-hook.json) | - | - |  |
+| [`bookmark`](tests/ext_conformance/artifacts/bookmark/bookmark.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/bookmark.json) | - | - |  |
+| [`claude-rules`](tests/ext_conformance/artifacts/claude-rules/claude-rules.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/claude-rules.json) | - | - |  |
+| [`confirm-destructive`](tests/ext_conformance/artifacts/confirm-destructive/confirm-destructive.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/confirm-destructive.json) | - | - |  |
+| [`custom-compaction`](tests/ext_conformance/artifacts/custom-compaction/custom-compaction.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/custom-compaction.json) | - | - |  |
+| [`custom-footer`](tests/ext_conformance/artifacts/custom-footer/custom-footer.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/custom-footer.json) | - | - |  |
+| [`custom-header`](tests/ext_conformance/artifacts/custom-header/custom-header.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/custom-header.json) | - | - |  |
+| [`custom-provider-anthropic`](tests/ext_conformance/artifacts/custom-provider-anthropic/index.ts) | `1.2.0` | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/custom-provider-anthropic.json) | - | - |  |
+| [`custom-provider-gitlab-duo`](tests/ext_conformance/artifacts/custom-provider-gitlab-duo/index.ts) | `1.2.0` | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/custom-provider-gitlab-duo.json) | - | - |  |
+| [`custom-provider-qwen-cli`](tests/ext_conformance/artifacts/custom-provider-qwen-cli/index.ts) | `1.1.0` | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/custom-provider-qwen-cli.json) | - | - |  |
 | [`diff`](tests/ext_conformance/artifacts/diff/diff.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`dirty-repo-guard`](tests/ext_conformance/artifacts/dirty-repo-guard/dirty-repo-guard.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/dirty-repo-guard.json) | 99ms | - |  |
-| [`doom-overlay`](tests/ext_conformance/artifacts/doom-overlay/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/doom-overlay.json) [smoke](tests/ext_conformance/reports/extensions/doom-overlay.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/doom-overlay.jsonl) | 118ms | 0/0 pass |  |
-| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) [smoke](tests/ext_conformance/reports/extensions/dynamic-resources.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/dynamic-resources.jsonl) | 104ms | 1/1 pass |  |
-| [`event-bus`](tests/ext_conformance/artifacts/event-bus/event-bus.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/event-bus.json) | 99ms | - |  |
-| [`file-trigger`](tests/ext_conformance/artifacts/file-trigger/file-trigger.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/file-trigger.json) | 98ms | - |  |
+| [`dirty-repo-guard`](tests/ext_conformance/artifacts/dirty-repo-guard/dirty-repo-guard.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/dirty-repo-guard.json) | - | - |  |
+| [`doom-overlay`](tests/ext_conformance/artifacts/doom-overlay/index.ts) | - | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/doom-overlay.json) | - | - |  |
+| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) | - | - |  |
+| [`event-bus`](tests/ext_conformance/artifacts/event-bus/event-bus.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/event-bus.json) | - | - |  |
+| [`file-trigger`](tests/ext_conformance/artifacts/file-trigger/file-trigger.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/file-trigger.json) | - | - |  |
 | [`files`](tests/ext_conformance/artifacts/files/files.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) [smoke](tests/ext_conformance/reports/extensions/git-checkpoint.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/git-checkpoint.jsonl) | 101ms | 1/1 pass |  |
-| [`handoff`](tests/ext_conformance/artifacts/handoff/handoff.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/handoff.json) | 103ms | - |  |
-| [`hello`](tests/ext_conformance/artifacts/hello/hello.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/hello.json) [smoke](tests/ext_conformance/reports/extensions/hello.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/hello.jsonl) | 96ms | 1/1 pass |  |
-| [`inline-bash`](tests/ext_conformance/artifacts/inline-bash/inline-bash.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/inline-bash.json) [smoke](tests/ext_conformance/reports/extensions/inline-bash.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/inline-bash.jsonl) | 100ms | 1/1 pass |  |
-| [`input-transform`](tests/ext_conformance/artifacts/input-transform/input-transform.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/input-transform.json) | 105ms | - |  |
-| [`interactive-shell`](tests/ext_conformance/artifacts/interactive-shell/interactive-shell.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/interactive-shell.json) | 110ms | - |  |
-| [`mac-system-theme`](tests/ext_conformance/artifacts/mac-system-theme/mac-system-theme.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/mac-system-theme.json) | 98ms | - |  |
-| [`message-renderer`](tests/ext_conformance/artifacts/message-renderer/message-renderer.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/message-renderer.json) | 98ms | - |  |
-| [`modal-editor`](tests/ext_conformance/artifacts/modal-editor/modal-editor.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/modal-editor.json) | 102ms | - |  |
-| [`model-status`](tests/ext_conformance/artifacts/model-status/model-status.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/model-status.json) | 98ms | - |  |
+| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) | - | - |  |
+| [`handoff`](tests/ext_conformance/artifacts/handoff/handoff.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/handoff.json) | - | - |  |
+| [`hello`](tests/ext_conformance/artifacts/hello/hello.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/hello.json) | - | - |  |
+| [`inline-bash`](tests/ext_conformance/artifacts/inline-bash/inline-bash.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/inline-bash.json) | - | - |  |
+| [`input-transform`](tests/ext_conformance/artifacts/input-transform/input-transform.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/input-transform.json) | - | - |  |
+| [`interactive-shell`](tests/ext_conformance/artifacts/interactive-shell/interactive-shell.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/interactive-shell.json) | - | - |  |
+| [`mac-system-theme`](tests/ext_conformance/artifacts/mac-system-theme/mac-system-theme.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/mac-system-theme.json) | - | - |  |
+| [`message-renderer`](tests/ext_conformance/artifacts/message-renderer/message-renderer.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/message-renderer.json) | - | - |  |
+| [`modal-editor`](tests/ext_conformance/artifacts/modal-editor/modal-editor.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/modal-editor.json) | - | - |  |
+| [`model-status`](tests/ext_conformance/artifacts/model-status/model-status.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/model-status.json) | - | - |  |
 | [`negative-denied-caps`](tests/ext_conformance/artifacts/negative-denied-caps/negative-denied-caps.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`notify`](tests/ext_conformance/artifacts/notify/notify.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/notify.json) | 97ms | - |  |
-| [`overlay-qa-tests`](tests/ext_conformance/artifacts/overlay-qa-tests/overlay-qa-tests.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/overlay-qa-tests.json) | 118ms | - |  |
-| [`overlay-test`](tests/ext_conformance/artifacts/overlay-test/overlay-test.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/overlay-test.json) | 103ms | - |  |
-| [`permission-gate`](tests/ext_conformance/artifacts/permission-gate/permission-gate.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/permission-gate.json) [smoke](tests/ext_conformance/reports/extensions/permission-gate.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/permission-gate.jsonl) | 102ms | 2/2 pass |  |
-| [`pirate`](tests/ext_conformance/artifacts/pirate/pirate.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/pirate.json) | 98ms | - |  |
-| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/plan-mode.json) [smoke](tests/ext_conformance/reports/extensions/plan-mode.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/plan-mode.jsonl) | 109ms | 3/3 pass |  |
-| [`preset`](tests/ext_conformance/artifacts/preset/preset.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/preset.json) | 113ms | - |  |
+| [`notify`](tests/ext_conformance/artifacts/notify/notify.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/notify.json) | - | - |  |
+| [`overlay-qa-tests`](tests/ext_conformance/artifacts/overlay-qa-tests/overlay-qa-tests.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/overlay-qa-tests.json) | - | - |  |
+| [`overlay-test`](tests/ext_conformance/artifacts/overlay-test/overlay-test.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/overlay-test.json) | - | - |  |
+| [`permission-gate`](tests/ext_conformance/artifacts/permission-gate/permission-gate.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/permission-gate.json) | - | - |  |
+| [`pirate`](tests/ext_conformance/artifacts/pirate/pirate.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/pirate.json) | - | - |  |
+| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/plan-mode.json) | - | - |  |
+| [`preset`](tests/ext_conformance/artifacts/preset/preset.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/preset.json) | - | - |  |
 | [`prompt-url-widget`](tests/ext_conformance/artifacts/prompt-url-widget/prompt-url-widget.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`protected-paths`](tests/ext_conformance/artifacts/protected-paths/protected-paths.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/protected-paths.json) [smoke](tests/ext_conformance/reports/extensions/protected-paths.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/protected-paths.jsonl) | 105ms | 1/1 pass |  |
-| [`qna`](tests/ext_conformance/artifacts/qna/qna.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/qna.json) | 103ms | - |  |
-| [`question`](tests/ext_conformance/artifacts/question/question.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/question.json) | 105ms | - |  |
-| [`questionnaire`](tests/ext_conformance/artifacts/questionnaire/questionnaire.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/questionnaire.json) | 108ms | - |  |
-| [`rainbow-editor`](tests/ext_conformance/artifacts/rainbow-editor/rainbow-editor.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/rainbow-editor.json) | 101ms | - |  |
+| [`protected-paths`](tests/ext_conformance/artifacts/protected-paths/protected-paths.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/protected-paths.json) | - | - |  |
+| [`qna`](tests/ext_conformance/artifacts/qna/qna.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/qna.json) | - | - |  |
+| [`question`](tests/ext_conformance/artifacts/question/question.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/question.json) | - | - |  |
+| [`questionnaire`](tests/ext_conformance/artifacts/questionnaire/questionnaire.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/questionnaire.json) | - | - |  |
+| [`rainbow-editor`](tests/ext_conformance/artifacts/rainbow-editor/rainbow-editor.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/rainbow-editor.json) | - | - |  |
 | [`redraws`](tests/ext_conformance/artifacts/redraws/redraws.ts) | - | T1 (simple single-file) | N/A | - | - | - |  |
-| [`rpc-demo`](tests/ext_conformance/artifacts/rpc-demo/rpc-demo.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/rpc-demo.json) | 103ms | - |  |
-| [`sandbox`](tests/ext_conformance/artifacts/sandbox/index.ts) | `1.0.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/sandbox.json) [smoke](tests/ext_conformance/reports/extensions/sandbox.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/sandbox.jsonl) | 104ms | 4/4 pass |  |
-| [`send-user-message`](tests/ext_conformance/artifacts/send-user-message/send-user-message.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/send-user-message.json) | 100ms | - |  |
-| [`session-name`](tests/ext_conformance/artifacts/session-name/session-name.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/session-name.json) | 99ms | - |  |
-| [`shutdown-command`](tests/ext_conformance/artifacts/shutdown-command/shutdown-command.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/shutdown-command.json) | 100ms | - |  |
-| [`snake`](tests/ext_conformance/artifacts/snake/snake.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/snake.json) | 105ms | - |  |
-| [`space-invaders`](tests/ext_conformance/artifacts/space-invaders/space-invaders.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/space-invaders.json) | 112ms | - |  |
-| [`ssh`](tests/ext_conformance/artifacts/ssh/ssh.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/ssh.json) | 106ms | - |  |
-| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/status-line.json) [smoke](tests/ext_conformance/reports/extensions/status-line.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/status-line.jsonl) | 101ms | 1/1 pass |  |
-| [`subagent`](tests/ext_conformance/artifacts/subagent/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/subagent.json) [smoke](tests/ext_conformance/reports/extensions/subagent.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/subagent.jsonl) | 131ms | 1/1 pass |  |
-| [`summarize`](tests/ext_conformance/artifacts/summarize/summarize.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/summarize.json) | 105ms | - |  |
-| [`system-prompt-header`](tests/ext_conformance/artifacts/system-prompt-header/system-prompt-header.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/system-prompt-header.json) | 98ms | - |  |
-| [`timed-confirm`](tests/ext_conformance/artifacts/timed-confirm/timed-confirm.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/timed-confirm.json) | 98ms | - |  |
-| [`titlebar-spinner`](tests/ext_conformance/artifacts/titlebar-spinner/titlebar-spinner.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/titlebar-spinner.json) | 97ms | - |  |
-| [`todo`](tests/ext_conformance/artifacts/todo/todo.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/todo.json) [smoke](tests/ext_conformance/reports/extensions/todo.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/todo.jsonl) | 106ms | 3/3 pass |  |
-| [`tool-override`](tests/ext_conformance/artifacts/tool-override/tool-override.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/tool-override.json) | 103ms | - |  |
-| [`tools`](tests/ext_conformance/artifacts/tools/tools.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/tools.json) | 107ms | - |  |
-| [`trigger-compact`](tests/ext_conformance/artifacts/trigger-compact/trigger-compact.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/trigger-compact.json) | 106ms | - |  |
-| [`truncated-tool`](tests/ext_conformance/artifacts/truncated-tool/truncated-tool.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/truncated-tool.json) | 104ms | - |  |
-| [`widget-placement`](tests/ext_conformance/artifacts/widget-placement/widget-placement.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/widget-placement.json) | 97ms | - |  |
-| [`with-deps`](tests/ext_conformance/artifacts/with-deps/index.ts) | `1.15.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/with-deps.json) [smoke](tests/ext_conformance/reports/extensions/with-deps.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/with-deps.jsonl) | 98ms | 1/1 pass |  |
+| [`rpc-demo`](tests/ext_conformance/artifacts/rpc-demo/rpc-demo.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/rpc-demo.json) | - | - |  |
+| [`sandbox`](tests/ext_conformance/artifacts/sandbox/index.ts) | `1.0.0` | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/sandbox.json) | - | - |  |
+| [`send-user-message`](tests/ext_conformance/artifacts/send-user-message/send-user-message.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/send-user-message.json) | - | - |  |
+| [`session-name`](tests/ext_conformance/artifacts/session-name/session-name.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/session-name.json) | - | - |  |
+| [`shutdown-command`](tests/ext_conformance/artifacts/shutdown-command/shutdown-command.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/shutdown-command.json) | - | - |  |
+| [`snake`](tests/ext_conformance/artifacts/snake/snake.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/snake.json) | - | - |  |
+| [`space-invaders`](tests/ext_conformance/artifacts/space-invaders/space-invaders.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/space-invaders.json) | - | - |  |
+| [`ssh`](tests/ext_conformance/artifacts/ssh/ssh.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/ssh.json) | - | - |  |
+| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/status-line.json) | - | - |  |
+| [`subagent`](tests/ext_conformance/artifacts/subagent/index.ts) | - | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/subagent.json) | - | - |  |
+| [`summarize`](tests/ext_conformance/artifacts/summarize/summarize.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/summarize.json) | - | - |  |
+| [`system-prompt-header`](tests/ext_conformance/artifacts/system-prompt-header/system-prompt-header.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/system-prompt-header.json) | - | - |  |
+| [`timed-confirm`](tests/ext_conformance/artifacts/timed-confirm/timed-confirm.ts) | - | T1 (simple single-file) | N/A | [fixture](tests/ext_conformance/fixtures/timed-confirm.json) | - | - |  |
+| [`titlebar-spinner`](tests/ext_conformance/artifacts/titlebar-spinner/titlebar-spinner.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/titlebar-spinner.json) | - | - |  |
+| [`todo`](tests/ext_conformance/artifacts/todo/todo.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/todo.json) | - | - |  |
+| [`tool-override`](tests/ext_conformance/artifacts/tool-override/tool-override.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/tool-override.json) | - | - |  |
+| [`tools`](tests/ext_conformance/artifacts/tools/tools.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/tools.json) | - | - |  |
+| [`trigger-compact`](tests/ext_conformance/artifacts/trigger-compact/trigger-compact.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/trigger-compact.json) | - | - |  |
+| [`truncated-tool`](tests/ext_conformance/artifacts/truncated-tool/truncated-tool.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/truncated-tool.json) | - | - |  |
+| [`widget-placement`](tests/ext_conformance/artifacts/widget-placement/widget-placement.ts) | - | T2 (multi-registration) | N/A | [fixture](tests/ext_conformance/fixtures/widget-placement.json) | - | - |  |
+| [`with-deps`](tests/ext_conformance/artifacts/with-deps/index.ts) | `1.15.0` | T3 (multi-file) | N/A | [fixture](tests/ext_conformance/fixtures/with-deps.json) | - | - |  |
 
 ## third-party-github
 
@@ -278,16 +279,16 @@
 | Evidence Type | Count | Location |
 |---|---|---|
 | Golden fixtures | 60 | `tests/ext_conformance/fixtures/*.json` |
-| Smoke test logs | 16 | `tests/ext_conformance/reports/extensions/` (legacy fallback: `tests/ext_conformance/reports/smoke/extensions/`) |
-| Parity diff logs | 16 | `tests/ext_conformance/reports/parity/extensions/` |
-| Load time benchmarks | 60 | `tests/ext_conformance/reports/load_time_benchmark.json` |
+| Smoke test logs | 0 | `tests/ext_conformance/reports/extensions/` (legacy fallback: `tests/ext_conformance/reports/smoke/extensions/`) |
+| Parity diff logs | 0 | `tests/ext_conformance/reports/parity/extensions/` |
+| Load time benchmarks | 0 | `tests/ext_conformance/reports/load_time_benchmark.json` |
 | Negative policy tests | 30 | `tests/ext_conformance/reports/negative/` |
 
 ## Coverage Gaps
 
-163 extensions have not been tested yet.
+224 extensions have not been tested yet.
 
-**Multi-file extension (T3)** (82 extensions):
+**Multi-file extension (T3)** (93 extensions):
 - `base_fixtures`
 - `community/jyaunches-canvas`
 - `community/nicobailon-interactive-shell`
@@ -299,9 +300,16 @@
 - `community/prateekmedia-permission`
 - `community/prateekmedia-ralph-loop`
 - `community/prateekmedia-repeat`
+- `community/qualisero-background-notify`
 - `community/qualisero-pi-agent-scip`
+- `community/qualisero-safe-git`
 - `community/tmustier-code-actions`
 - `community/tmustier-files-widget`
+- `custom-provider-anthropic`
+- `custom-provider-gitlab-duo`
+- `custom-provider-qwen-cli`
+- `doom-overlay`
+- `npm/agentsbox`
 - `npm/aliou-pi-extension-dev`
 - `npm/aliou-pi-guardrails`
 - `npm/aliou-pi-linkup`
@@ -357,6 +365,9 @@
 - `npm/walterra-pi-charts`
 - `npm/walterra-pi-graphviz`
 - `npm/zenobius-pi-dcp`
+- `plan-mode`
+- `sandbox`
+- `subagent`
 - `third-party/aliou-pi-extensions`
 - `third-party/ben-vargas-pi-packages`
 - `third-party/charles-cooper-pi-extensions`
@@ -370,8 +381,14 @@
 - `third-party/rytswd-slow-mode`
 - `third-party/w-winter-dot314`
 - `third-party/zenobi-us-pi-dcp`
+- `with-deps`
 
-**Not yet scheduled** (73 extensions):
+**Not yet scheduled** (123 extensions):
+- `antigravity-image-gen`
+- `auto-commit-on-exit`
+- `bash-spawn-hook`
+- `bookmark`
+- `claude-rules`
 - `community/ferologics-notify`
 - `community/hjanuschka-clipboard`
 - `community/hjanuschka-cost-tracker`
@@ -399,9 +416,7 @@
 - `community/nicobailon-rewind-hook`
 - `community/ogulcancelik-ghostty-theme-sync`
 - `community/prateekmedia-token-rate`
-- `community/qualisero-background-notify`
 - `community/qualisero-compact-config`
-- `community/qualisero-safe-git`
 - `community/qualisero-safe-rm`
 - `community/qualisero-session-color`
 - `community/qualisero-session-emoji`
@@ -415,9 +430,28 @@
 - `community/tmustier-raw-paste`
 - `community/tmustier-tab-status`
 - `community/tmustier-usage-extension`
+- `confirm-destructive`
+- `custom-compaction`
+- `custom-footer`
+- `custom-header`
 - `diff`
+- `dirty-repo-guard`
+- `dynamic-resources`
+- `event-bus`
+- `file-trigger`
 - `files`
+- `git-checkpoint`
+- `handoff`
+- `hello`
+- `inline-bash`
+- `input-transform`
+- `interactive-shell`
+- `mac-system-theme`
+- `message-renderer`
+- `modal-editor`
+- `model-status`
 - `negative-denied-caps`
+- `notify`
 - `npm/benvargas-pi-ancestor-discovery`
 - `npm/benvargas-pi-antigravity-image-gen`
 - `npm/ogulcancelik-pi-sketch`
@@ -435,8 +469,28 @@
 - `npm/pi-voice-of-god`
 - `npm/token-rate-pi`
 - `npm/vpellegrino-pi-skills`
+- `overlay-qa-tests`
+- `overlay-test`
+- `permission-gate`
+- `pirate`
+- `preset`
 - `prompt-url-widget`
+- `protected-paths`
+- `qna`
+- `question`
+- `questionnaire`
+- `rainbow-editor`
 - `redraws`
+- `rpc-demo`
+- `send-user-message`
+- `session-name`
+- `shutdown-command`
+- `snake`
+- `space-invaders`
+- `ssh`
+- `status-line`
+- `summarize`
+- `system-prompt-header`
 - `third-party/graffioh-pi-screenshots-picker`
 - `third-party/graffioh-pi-super-curl`
 - `third-party/jyaunches-pi-canvas`
@@ -445,6 +499,14 @@
 - `third-party/raunovillberg-pi-stuffed`
 - `third-party/rytswd-direnv`
 - `third-party/rytswd-questionnaire`
+- `timed-confirm`
+- `titlebar-spinner`
+- `todo`
+- `tool-override`
+- `tools`
+- `trigger-compact`
+- `truncated-tool`
+- `widget-placement`
 
 **Requires exec/network access (T5)** (5 extensions):
 - `agents-mikeastock/extensions`

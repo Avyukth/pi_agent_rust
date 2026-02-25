@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-02-17T08:44:46.054Z",
-  "verdict": "pass",
+  "generated_at": "2026-02-25T13:20:20.191Z",
+  "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
     {
@@ -26,27 +26,30 @@
       "id": "ext_must_pass",
       "name": "Extension must-pass gate (208 extensions)",
       "bead": "bd-1f42.4.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+      "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-02-17T03:06:08.928Z' is stale (older than 7 days)",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
     },
     {
       "id": "ext_provider_compat",
       "name": "Extension provider compatibility matrix",
       "bead": "bd-1f42.4.6",
-      "status": "pass",
+      "status": "skip",
       "blocking": false,
       "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"
     },
     {
       "id": "evidence_bundle",
       "name": "Unified evidence bundle",
       "bead": "bd-1f42.6.8",
-      "status": "pass",
+      "status": "fail",
       "blocking": false,
       "artifact_path": "tests/evidence_bundle/index.json",
+      "detail": "summary.verdict = 'insufficient' (expected one of: [\"complete\", \"partial\"])",
       "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
     },
     {
@@ -54,26 +57,28 @@
       "name": "Cross-platform matrix validation",
       "bead": "bd-1f42.6.7",
       "status": "pass",
-      "blocking": true,
-      "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
+      "blocking": false,
+      "artifact_path": "tests/cross_platform_reports/macos/platform_report.json",
       "reproduce_command": "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"
     },
     {
       "id": "conformance_regression",
       "name": "Conformance regression gate",
       "bead": "bd-1f42.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/regression_verdict.json; fail-closed policy: blocking gates cannot remain in skip state",
       "reproduce_command": "cargo test --test conformance_regression_gate -- --nocapture"
     },
     {
       "id": "conformance_pass_rate",
       "name": "Conformance pass rate >= 80%",
       "bead": "bd-1f42.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
+      "detail": "Pass rate 0.0% < 80% threshold",
       "reproduce_command": "cargo test --test conformance_report -- --nocapture"
     },
     {
@@ -188,7 +193,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-02-17T08:44:45.910Z",
+    "generated_at": "2026-02-25T13:20:20.191Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
@@ -200,21 +205,25 @@
   "waivers_applied": [],
   "summary": {
     "total_gates": 20,
-    "passed": 20,
-    "failed": 0,
+    "passed": 15,
+    "failed": 4,
     "warned": 0,
-    "skipped": 0,
+    "skipped": 1,
     "waived": 0,
-    "blocking_pass": 14,
-    "blocking_total": 14,
-    "all_blocking_pass": true
+    "blocking_pass": 10,
+    "blocking_total": 13,
+    "all_blocking_pass": false
   },
   "promotion_rules": {
-    "can_promote": true,
-    "blocker_gates": [],
+    "can_promote": false,
+    "blocker_gates": [
+      "ext_must_pass",
+      "conformance_regression",
+      "conformance_pass_rate"
+    ],
     "waiver_gates": [],
     "conditions": [
-      "All blocking gates pass (including waivers)"
+      "Blocking gates still failing: ext_must_pass, conformance_regression, conformance_pass_rate"
     ]
   },
   "rerun_guidance": {
