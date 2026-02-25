@@ -4,10 +4,12 @@
 //! - Verbose logging infrastructure with auto-dump on test failure
 //! - Test harness for consistent setup/teardown
 //! - Timing utilities for performance analysis
+//! - Structured artifact bundles with correlated trace IDs (bd-1xz.2)
 
 use std::future::Future;
 use std::sync::OnceLock;
 
+pub mod artifact_bundle;
 pub mod harness;
 pub mod logging;
 #[allow(
@@ -26,6 +28,11 @@ pub mod tmux;
 #[allow(dead_code)]
 pub mod transcript_diff;
 
+#[allow(unused_imports)]
+pub use artifact_bundle::{
+    ArtifactBundle, BUNDLE_MANIFEST_SCHEMA_V1, BundleFile, BundleManifest,
+    PROTOCOL_TRACE_SCHEMA_V1, ProtocolDirection, ProtocolTraceEntry,
+};
 #[allow(unused_imports)]
 pub use harness::TestHarness;
 #[allow(unused_imports)]
