@@ -835,7 +835,12 @@ impl Agent {
 
                         // Keep in-memory transcript and event payloads aligned with the
                         // error stop result returned to callers.
-                        if let Some(last @ Message::Assistant(_)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                        if let Some(last @ Message::Assistant(_)) = self
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| matches!(m, Message::Assistant(_)))
+                        {
                             *last = stop_event_message.clone();
                         }
                         if let Some(last @ Message::Assistant(_)) = new_messages.last_mut() {
@@ -1019,7 +1024,12 @@ impl Agent {
                 match futures::future::select(abort_fut, event_fut).await {
                     futures::future::Either::Left(((), _event_fut)) => {
                         let last_partial = if added_partial {
-                            match self.messages.iter().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                            match self
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|m| matches!(m, Message::Assistant(_)))
+                            {
                                 Some(Message::Assistant(a)) => Some(a.as_ref()),
                                 _ => None,
                             }
@@ -1076,7 +1086,12 @@ impl Agent {
                     });
                 }
                 StreamEvent::TextStart { content_index, .. } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         let msg = Arc::make_mut(msg_arc);
                         if content_index == msg.content.len() {
                             msg.content.push(ContentBlock::Text(TextContent::new("")));
@@ -1102,7 +1117,12 @@ impl Agent {
                     delta,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         {
                             let msg = Arc::make_mut(msg_arc);
                             if let Some(ContentBlock::Text(text)) =
@@ -1133,7 +1153,12 @@ impl Agent {
                     content,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         {
                             let msg = Arc::make_mut(msg_arc);
                             if let Some(ContentBlock::Text(text)) =
@@ -1160,7 +1185,12 @@ impl Agent {
                     }
                 }
                 StreamEvent::ThinkingStart { content_index, .. } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         let msg = Arc::make_mut(msg_arc);
                         if content_index == msg.content.len() {
                             msg.content.push(ContentBlock::Thinking(ThinkingContent {
@@ -1189,7 +1219,12 @@ impl Agent {
                     delta,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         {
                             let msg = Arc::make_mut(msg_arc);
                             if let Some(ContentBlock::Thinking(thinking)) =
@@ -1220,7 +1255,12 @@ impl Agent {
                     content,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         {
                             let msg = Arc::make_mut(msg_arc);
                             if let Some(ContentBlock::Thinking(thinking)) =
@@ -1247,7 +1287,12 @@ impl Agent {
                     }
                 }
                 StreamEvent::ToolCallStart { content_index, .. } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         let msg = Arc::make_mut(msg_arc);
                         if content_index == msg.content.len() {
                             msg.content.push(ContentBlock::ToolCall(ToolCall {
@@ -1278,7 +1323,12 @@ impl Agent {
                     delta,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         // No mutation needed for ToolCallDelta – args stay Null until ToolCallEnd.
                         // Just share the current Arc (O(1) refcount bump, zero deep copies).
                         let shared = Arc::clone(msg_arc);
@@ -1303,7 +1353,12 @@ impl Agent {
                     tool_call,
                     ..
                 } => {
-                    if let Some(Message::Assistant(msg_arc)) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+                    if let Some(Message::Assistant(msg_arc)) = self
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::Assistant(_)))
+                    {
                         {
                             let msg = Arc::make_mut(msg_arc);
                             if let Some(ContentBlock::ToolCall(tc)) =
@@ -1342,7 +1397,12 @@ impl Agent {
         // Instead of discarding it, we finalize it with an error state so the user/session
         // retains the partial content.
         if added_partial {
-            if let Some(Message::Assistant(last_msg)) = self.messages.iter().rev().find(|m| matches!(m, Message::Assistant(_))) {
+            if let Some(Message::Assistant(last_msg)) = self
+                .messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant(_)))
+            {
                 let mut final_msg = (**last_msg).clone();
                 final_msg.stop_reason = StopReason::Error;
                 final_msg.error_message = Some("Stream ended without Done event".to_string());
@@ -1362,7 +1422,12 @@ impl Agent {
         added_partial: &mut bool,
     ) -> bool {
         if *added_partial {
-            if let Some(target) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+            if let Some(target) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant(_)))
+            {
                 *target = Message::Assistant(partial);
             } else {
                 // Defensive: added_partial is true but no Assistant message found.
@@ -1386,12 +1451,19 @@ impl Agent {
     ) -> AssistantMessage {
         let arc = Arc::new(message);
         if added_partial {
-            if let Some(target) = self.messages.iter_mut().rev().find(|m| matches!(m, Message::Assistant(_))) {
+            if let Some(target) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant(_)))
+            {
                 *target = Message::Assistant(Arc::clone(&arc));
             } else {
                 // Defensive: added_partial is true but no Assistant message found.
                 // Push as new message rather than overwriting an unrelated message.
-                tracing::warn!("finalize_assistant_message: expected an Assistant message in history");
+                tracing::warn!(
+                    "finalize_assistant_message: expected an Assistant message in history"
+                );
                 self.messages.push(Message::Assistant(Arc::clone(&arc)));
                 on_event(AgentEvent::MessageStart {
                     message: Message::Assistant(Arc::clone(&arc)),
