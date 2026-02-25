@@ -2233,6 +2233,96 @@ mod tests {
                 }
             }
         }
+
+        #[test]
+        fn test_esl_proptest_capacity_and_ttl_never_evict_unrelated_in_progress_entries(
+            trace in prop::collection::vec((0_u8..8_u8, 0_u8..8_u8, 0_u16..512_u16), 0..96)
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(32, 6, 8 << 10);
+            let session = "session-progress-survival";
+            let mut epoch = "epoch-progress-survival-a".to_string();
+            let mut now_ms = unix_time_ms();
+
+            for (kind, slot_raw, advance_raw) in trace {
+                now_ms = now_ms.saturating_add(i64::from(advance_raw % 7));
+                let prior_in_progress: Vec<EslJournalKey> = journal
+                    .entries
+                    .iter()
+                    .filter_map(|(key, entry)| {
+                        if matches!(entry.state, EslJournalState::InProgress) {
+                            Some(key.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let terminal_target = match kind % 8 {
+                    0..=3 => {
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let _ = journal.begin_request(session, &epoch, &request, now_ms)?;
+                        None
+                    }
+                    4 => {
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, true);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                        Some(EslJournalKey {
+                            pi_session_id: session.to_string(),
+                            request_id: request.id,
+                            host_epoch: epoch.clone(),
+                        })
+                    }
+                    5 => {
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, false);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                        Some(EslJournalKey {
+                            pi_session_id: session.to_string(),
+                            request_id: request.id,
+                            host_epoch: epoch.clone(),
+                        })
+                    }
+                    6 => {
+                        journal.prune_expired_terminal_entries(
+                            now_ms.saturating_add(i64::from(advance_raw % 128)),
+                        );
+                        None
+                    }
+                    7 => {
+                        epoch = if epoch == "epoch-progress-survival-a" {
+                            "epoch-progress-survival-b".to_string()
+                        } else {
+                            "epoch-progress-survival-a".to_string()
+                        };
+                        None
+                    }
+                    _ => unreachable!("kind % 8 constrains action space"),
+                };
+
+                for key in prior_in_progress {
+                    if terminal_target.as_ref() == Some(&key) {
+                        continue;
+                    }
+
+                    let entry = match journal.entries.get(&key) {
+                        Some(entry) => entry,
+                        None => {
+                            prop_assert!(
+                                false,
+                                "capacity/ttl handling must never evict unrelated in_progress entry: {:?}",
+                                key
+                            );
+                            continue;
+                        }
+                    };
+                    prop_assert!(
+                        matches!(entry.state, EslJournalState::InProgress),
+                        "unrelated in_progress entry must remain in_progress under capacity/ttl pressure"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
