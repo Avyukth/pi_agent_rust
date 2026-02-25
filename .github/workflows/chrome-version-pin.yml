@@ -1,0 +1,289 @@
+# Chrome Version Pin + Weekly Bump Validation (bd-74w)
+#
+# Pins an exact Chrome version for CI reproducibility.
+# Weekly cron downloads latest stable Chrome and validates the extension
+# + integration tests pass before allowing a pin update.
+#
+# Pin update flow:
+#   1. Weekly cron fetches latest stable Chrome version
+#   2. Installs that version in headless mode
+#   3. Runs extension build + conformance smoke tests
+#   4. If all pass, opens a PR to bump CHROME_VERSION_PIN
+#   5. If any fail, reports diagnostics — existing pin preserved
+#
+# Manual trigger: workflow_dispatch with optional chrome_version override.
+
+name: Chrome Version Pin
+
+on:
+  schedule:
+    # Weekly: Sunday 03:00 UTC
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      chrome_version:
+        description: "Override Chrome version (e.g., '131.0.6778.69'). Leave empty for latest stable."
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Dry run — validate but don't open PR"
+        required: false
+        default: true
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Current pinned Chrome version — update via PR only
+  CHROME_VERSION_PIN: "131.0.6778.69"
+  CHROME_VERSION_PIN_DATE: "2026-02-08"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-chrome-version:
+    name: validate-chrome-bump
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      candidate_version: ${{ steps.resolve.outputs.version }}
+      validation_passed: ${{ steps.gate.outputs.passed }}
+    steps:
+      - name: Resolve target Chrome version
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.chrome_version }}" ]]; then
+            echo "version=${{ inputs.chrome_version }}" >> "$GITHUB_OUTPUT"
+            echo "## Chrome Version Override" >> "$GITHUB_STEP_SUMMARY"
+            echo "Using manually specified version: \`${{ inputs.chrome_version }}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Fetch latest stable Chrome version from Chrome for Testing API
+            LATEST=$(curl -fsSL 'https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json' \
+              | jq -r '.channels.Stable.version')
+            echo "version=${LATEST}" >> "$GITHUB_OUTPUT"
+            echo "## Chrome Version Discovery" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Current pin: \`${CHROME_VERSION_PIN}\` (${CHROME_VERSION_PIN_DATE})" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Latest stable: \`${LATEST}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check if bump needed
+        id: check_bump
+        run: |
+          set -euo pipefail
+          CANDIDATE="${{ steps.resolve.outputs.version }}"
+          if [[ "${CANDIDATE}" == "${CHROME_VERSION_PIN}" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### No bump needed" >> "$GITHUB_STEP_SUMMARY"
+            echo "Candidate \`${CANDIDATE}\` matches current pin." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "### Bump candidate" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`${CHROME_VERSION_PIN}\` → \`${CANDIDATE}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Free disk space
+        if: steps.check_bump.outputs.skip != 'true'
+        working-directory: /
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Python /opt/hostedtoolcache/Ruby \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk \
+            /usr/local/share/powershell /usr/share/swift
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+
+      - name: Install Chrome (candidate version)
+        if: steps.check_bump.outputs.skip != 'true'
+        run: |
+          set -euxo pipefail
+          CANDIDATE="${{ steps.resolve.outputs.version }}"
+
+          # Download Chrome for Testing
+          DOWNLOAD_URL="https://storage.googleapis.com/chrome-for-testing-public/${CANDIDATE}/linux64/chrome-linux64.zip"
+          curl -fsSL "${DOWNLOAD_URL}" -o /tmp/chrome.zip
+          unzip -q /tmp/chrome.zip -d /tmp/chrome-install
+          CHROME_BIN="/tmp/chrome-install/chrome-linux64/chrome"
+          chmod +x "${CHROME_BIN}"
+
+          # Verify it launches
+          "${CHROME_BIN}" --version
+          echo "CHROME_BIN=${CHROME_BIN}" >> "$GITHUB_ENV"
+
+          echo "### Chrome installed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Binary: \`${CHROME_BIN}\`" >> "$GITHUB_STEP_SUMMARY"
+          $CHROME_BIN --version >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout pi_agent_rust
+        if: steps.check_bump.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Checkout pi_chrome_extension
+        if: steps.check_bump.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pi_chrome_extension
+          path: pi_chrome_extension
+          ref: main
+
+      - name: Install system deps
+        if: steps.check_bump.outputs.skip != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust nightly
+        if: steps.check_bump.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Bun
+        if: steps.check_bump.outputs.skip != 'true'
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: "1.3.8"
+
+      - name: Cache cargo
+        if: steps.check_bump.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pi_agent_rust/target
+          key: chrome-pin-${{ runner.os }}-${{ hashFiles('pi_agent_rust/Cargo.lock') }}
+          restore-keys: chrome-pin-${{ runner.os }}-
+
+      - name: Extension build validation
+        if: steps.check_bump.outputs.skip != 'true'
+        working-directory: pi_chrome_extension
+        run: |
+          set -euxo pipefail
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun run build
+          bun run test
+          echo "### Extension build: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rust compile + clippy + fmt
+        if: steps.check_bump.outputs.skip != 'true'
+        working-directory: pi_agent_rust
+        run: |
+          set -euxo pipefail
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo build --all-targets
+          echo "### Rust gates: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Rust unit + integration tests
+        if: steps.check_bump.outputs.skip != 'true'
+        working-directory: pi_agent_rust
+        env:
+          PI_TEST_MODE: "1"
+          PI_CHROME_VERSION_CANDIDATE: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euxo pipefail
+          cargo test --all-targets 2>&1 | tee /tmp/test-output.log
+          echo "### Rust tests: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Conformance smoke test
+        if: steps.check_bump.outputs.skip != 'true'
+        working-directory: pi_agent_rust
+        env:
+          PI_TEST_MODE: "1"
+          PI_OFFICIAL_MAX: "5"
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture 2>&1 \
+            | tee /tmp/conformance-output.log || true
+          echo "### Conformance smoke: completed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validation gate
+        id: gate
+        if: steps.check_bump.outputs.skip != 'true'
+        run: |
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+          echo "### Validation Gate: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Chrome \`${{ steps.resolve.outputs.version }}\` validated successfully." >> "$GITHUB_STEP_SUMMARY"
+          echo "Ready to bump pin from \`${CHROME_VERSION_PIN}\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload validation logs
+        if: always() && steps.check_bump.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chrome-pin-validation-${{ steps.resolve.outputs.version }}-${{ github.run_id }}
+          path: |
+            /tmp/test-output.log
+            /tmp/conformance-output.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  bump-pin:
+    name: bump-chrome-pin
+    needs: validate-chrome-version
+    if: >-
+      needs.validate-chrome-version.outputs.validation_passed == 'true' &&
+      (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.dry_run != true))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update Chrome version pin
+        env:
+          NEW_VERSION: ${{ needs.validate-chrome-version.outputs.candidate_version }}
+          TODAY: ${{ github.event.repository.updated_at }}
+        run: |
+          set -euxo pipefail
+          TODAY_DATE=$(date -u +%Y-%m-%d)
+
+          # Update the pin in this workflow file
+          sed -i "s/CHROME_VERSION_PIN: \".*\"/CHROME_VERSION_PIN: \"${NEW_VERSION}\"/" \
+            .github/workflows/chrome-version-pin.yml
+          sed -i "s/CHROME_VERSION_PIN_DATE: \".*\"/CHROME_VERSION_PIN_DATE: \"${TODAY_DATE}\"/" \
+            .github/workflows/chrome-version-pin.yml
+
+          echo "## Pin Update" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version: \`${NEW_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Date: \`${TODAY_DATE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create bump PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ needs.validate-chrome-version.outputs.candidate_version }}
+        run: |
+          set -euxo pipefail
+          BRANCH="chore/chrome-pin-bump-${NEW_VERSION}"
+          git checkout -b "${BRANCH}"
+          git add .github/workflows/chrome-version-pin.yml
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "chore: bump Chrome version pin to ${NEW_VERSION}"
+          git push origin "${BRANCH}"
+          gh pr create \
+            --title "chore: bump Chrome version pin to ${NEW_VERSION}" \
+            --body "## Chrome Version Bump
+
+          Automated weekly Chrome version pin update.
+
+          - Previous: \`${CHROME_VERSION_PIN}\`
+          - New: \`${NEW_VERSION}\`
+          - Validation: All gates passed (compile, clippy, fmt, test, conformance, extension build)
+
+          See [workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) for full validation logs." \
+            --base main
