@@ -2153,6 +2153,89 @@ mod tests {
         }
 
         #[test]
+        fn test_esl_proptest_in_progress_fingerprint_mismatch_rejects_without_corrupting_in_flight_state(
+            canonical_payload in esl_json_value_strategy(),
+            mismatched_payload in esl_json_value_strategy(),
+        ) {
+            prop_assume!(canonical_payload != mismatched_payload);
+
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let canonical = sample_request_struct("req-esl-inprogress-mismatch", canonical_payload);
+            let mismatched =
+                sample_request_struct("req-esl-inprogress-mismatch", mismatched_payload);
+            let response = sample_response_envelope_for("req-esl-inprogress-mismatch");
+            let now_ms = unix_time_ms();
+
+            let first = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms)?;
+            prop_assert_eq!(
+                first,
+                EslBeginOutcome::Dispatch,
+                "initial canonical request must dispatch and create in_progress entry"
+            );
+
+            let mismatched_outcome =
+                journal.begin_request("session-prop", "epoch-prop", &mismatched, now_ms + 1)?;
+            match mismatched_outcome {
+                EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                    prop_assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                        "fingerprint-mismatched duplicate must fail closed before busy handling"
+                    );
+                    prop_assert!(
+                        !err.error.retryable,
+                        "fingerprint mismatch must not be marked retryable"
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "in-progress fingerprint mismatch must reject invalid_request-style, got {other:?}"
+                ),
+            }
+
+            let canonical_duplicate =
+                journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms + 2)?;
+            match canonical_duplicate {
+                EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                    prop_assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                        "mismatched duplicate must not corrupt canonical in_progress state"
+                    );
+                    prop_assert!(
+                        err.error.retryable,
+                        "canonical in-progress duplicate should remain retryable busy"
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "canonical duplicate should still be busy while request is in flight, got {other:?}"
+                ),
+            }
+
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &canonical,
+                &response,
+                now_ms + 3,
+            )?;
+
+            let replay = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms + 4)?;
+            match replay {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response,
+                    "mismatched in-progress duplicate must not corrupt canonical terminal replay"
+                ),
+                other => prop_assert!(
+                    false,
+                    "canonical duplicate after terminal record must replay, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
         fn test_esl_proptest_mismatched_terminal_record_is_noop_and_preserves_replay(
             canonical_payload in esl_json_value_strategy(),
             mismatched_payload in esl_json_value_strategy(),
