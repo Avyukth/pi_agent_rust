@@ -1,16 +1,19 @@
 //! Chrome integration modules (Pi Chrome).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asupersync::channel::oneshot;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::unix::{OwnedReadHalf, OwnedWriteHalf, UnixStream};
+use futures::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -33,6 +36,45 @@ const ESL_IN_PROGRESS_BACKOFF_MS: u64 = 5;
 
 type PendingResponses = HashMap<String, oneshot::Sender<protocol::ResponseEnvelope>>;
 type RequestFingerprintRegistry = HashMap<(String, String), protocol::RequestFingerprint>;
+type WriteLane = Arc<AsyncMutex<()>>;
+
+struct WriteLaneRegistry {
+    global: WriteLane,
+    by_tab: HashMap<u32, Weak<AsyncMutex<()>>>,
+}
+
+impl WriteLaneRegistry {
+    fn new() -> Self {
+        Self {
+            global: Arc::new(AsyncMutex::new(())),
+            by_tab: HashMap::new(),
+        }
+    }
+
+    fn lane_for(&mut self, tab_id: Option<u32>) -> WriteLane {
+        match tab_id {
+            None => Arc::clone(&self.global),
+            Some(tab_id) => {
+                if let Some(existing) = self.by_tab.get(&tab_id).and_then(Weak::upgrade) {
+                    return existing;
+                }
+
+                self.by_tab.retain(|_, lane| lane.upgrade().is_some());
+                let lane = Arc::new(AsyncMutex::new(()));
+                self.by_tab.insert(tab_id, Arc::downgrade(&lane));
+                lane
+            }
+        }
+    }
+}
+
+impl fmt::Debug for WriteLaneRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteLaneRegistry")
+            .field("tab_lane_entries", &self.by_tab.len())
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -97,6 +139,7 @@ pub struct ChromeBridge {
     pending: Arc<StdMutex<PendingResponses>>,
     observations: Arc<StdMutex<Vec<protocol::ObservationEvent>>>,
     request_fingerprints: StdMutex<RequestFingerprintRegistry>,
+    write_lanes: StdMutex<WriteLaneRegistry>,
     request_seq: AtomicU64,
     connection_seq: AtomicU64,
 }
@@ -128,6 +171,7 @@ impl ChromeBridge {
             pending: Arc::new(StdMutex::new(HashMap::new())),
             observations: Arc::new(StdMutex::new(Vec::new())),
             request_fingerprints: StdMutex::new(HashMap::new()),
+            write_lanes: StdMutex::new(WriteLaneRegistry::new()),
             request_seq: AtomicU64::new(1),
             connection_seq: AtomicU64::new(1),
         }
@@ -490,6 +534,11 @@ impl ChromeBridge {
         }
         let host_epoch = self.current_host_epoch()?;
         self.ensure_request_id_fingerprint(&host_epoch, &request_id, &op, &payload)?;
+        let write_lane = self.write_lane_for_request(&op, &payload);
+        let _write_lane_guard = match write_lane.as_ref() {
+            Some(lane) => Some(lane.lock().await),
+            None => None,
+        };
 
         let request = protocol::Request {
             version: protocol::PROTOCOL_VERSION_V1,
@@ -612,6 +661,20 @@ impl ChromeBridge {
                 Ok(())
             }
         }
+    }
+
+    fn write_lane_for_request(&self, op: &str, payload: &serde_json::Value) -> Option<WriteLane> {
+        if classify_execution_class(op) == ExecutionClass::ReadOnlyReplayable {
+            return None;
+        }
+
+        let tab_id = extract_tab_id_from_payload(payload);
+        Some(
+            self.write_lanes
+                .lock()
+                .expect("write lanes mutex poisoned")
+                .lane_for(tab_id),
+        )
     }
 
     #[must_use]
@@ -1118,6 +1181,18 @@ fn unix_time_ms() -> i64 {
     i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
 }
 
+fn extract_tab_id_from_payload(payload: &serde_json::Value) -> Option<u32> {
+    let object = payload.as_object()?;
+    let tab_value = object.get("tab_id").or_else(|| object.get("tabId"))?;
+    match tab_value {
+        serde_json::Value::Number(number) => {
+            let raw = number.as_u64()?;
+            u32::try_from(raw).ok()
+        }
+        _ => None,
+    }
+}
+
 fn classify_execution_class(op: &str) -> ExecutionClass {
     match op {
         "read_page" | "get_page_text" | "tabs_context" | "read_console" | "read_network" => {
@@ -1368,6 +1443,142 @@ mod tests {
                     )),
                 );
             }
+        })
+    }
+
+    fn spawn_mock_host_requires_two_requests_before_any_response(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-two-before-response".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set short read timeout");
+            let first = read_request_frame(&mut reader);
+            let second = read_request_frame(&mut reader);
+
+            for request in [first, second] {
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                        protocol::Response {
+                            version: protocol::PROTOCOL_VERSION_V1,
+                            id: request.id,
+                            ok: true,
+                            result: json!({
+                                "echo": request.payload,
+                                "op": request.op,
+                            }),
+                        },
+                    )),
+                );
+            }
+        })
+    }
+
+    fn spawn_mock_host_blocks_second_request_until_first_response(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-serialized".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set short read timeout");
+            let mut blocked_probe = Vec::new();
+            match reader.read_until(b'\n', &mut blocked_probe) {
+                Ok(0) => panic!("client disconnected before first response"),
+                Ok(bytes) => panic!(
+                    "same-tab write requests must serialize; unexpectedly read {bytes} bytes before first response"
+                ),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => panic!("unexpected blocked-read probe error: {err}"),
+            }
+            stream.set_read_timeout(None).expect("clear read timeout");
+
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id,
+                        ok: true,
+                        result: json!({
+                            "echo": first.payload,
+                            "op": first.op,
+                            "phase": "first",
+                        }),
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({
+                            "echo": second.payload,
+                            "op": second.op,
+                            "phase": "second",
+                        }),
+                    },
+                )),
+            );
         })
     }
 
@@ -2016,9 +2227,10 @@ mod tests {
                 .await
                 .expect("connect/auth handshake should succeed");
 
-            let responses =
-                future::join_all((0..8).map(|n| bridge.send_request("echo", json!({ "n": n }))))
-                    .await;
+            let responses = future::join_all(
+                (0..8).map(|n| bridge.send_request("read_page", json!({ "n": n }))),
+            )
+            .await;
 
             for (n, response) in (0..8).zip(responses) {
                 let envelope = response.expect("request must complete");
@@ -2035,6 +2247,152 @@ mod tests {
                 0,
                 "pending map must drain after concurrent request completion"
             );
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_serializes_same_tab_mutating_requests() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("same-tab-serialized.sock");
+            let record = make_record(&socket_path, "host-serialized");
+            let server = spawn_mock_host_blocks_second_request_until_first_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (first, second) = future::join(
+                bridge.send_request("browser.click", json!({ "tab_id": 7, "seq": 1 })),
+                bridge.send_request("browser.type", json!({ "tab_id": 7, "seq": 2 })),
+            )
+            .await;
+
+            for response in [first, second] {
+                let envelope = response.expect("same-tab write request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        assert_eq!(
+                            ok.result["echo"]["tab_id"],
+                            json!(7),
+                            "same-tab write requests must retain tab_id"
+                        );
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_allows_cross_tab_mutating_requests_to_overlap() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("cross-tab-overlap.sock");
+            let record = make_record(&socket_path, "host-two-before-response");
+            let server = spawn_mock_host_requires_two_requests_before_any_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (r1, r2) = future::join(
+                bridge.send_request("browser.click", json!({ "tab_id": 11, "seq": 1 })),
+                bridge.send_request("browser.click", json!({ "tab_id": 22, "seq": 2 })),
+            )
+            .await;
+
+            let mut seen_tab_ids = vec![];
+            for response in [r1, r2] {
+                let envelope = response.expect("cross-tab write request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        let tab_id = ok.result["echo"]["tab_id"]
+                            .as_u64()
+                            .expect("echoed tab_id must be numeric");
+                        seen_tab_ids.push(tab_id);
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+            seen_tab_ids.sort_unstable();
+            assert_eq!(
+                seen_tab_ids,
+                vec![11, 22],
+                "cross-tab writes must both dispatch before any response"
+            );
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_read_only_requests_are_not_serialized_by_tab() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("same-tab-read-overlap.sock");
+            let record = make_record(&socket_path, "host-two-before-response");
+            let server = spawn_mock_host_requires_two_requests_before_any_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (r1, r2) = future::join(
+                bridge.send_request("read_page", json!({ "tab_id": 42, "seq": 1 })),
+                bridge.send_request("read_page", json!({ "tab_id": 42, "seq": 2 })),
+            )
+            .await;
+
+            for response in [r1, r2] {
+                let envelope = response.expect("read-only request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        assert_eq!(
+                            ok.result["op"],
+                            json!("read_page"),
+                            "read-only requests must roundtrip unchanged"
+                        );
+                        assert_eq!(
+                            ok.result["echo"]["tab_id"],
+                            json!(42),
+                            "same-tab read-only requests should not require serialization"
+                        );
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+
             server.join().expect("mock host thread join");
         });
     }
