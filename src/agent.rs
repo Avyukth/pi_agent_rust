@@ -1512,8 +1512,9 @@ impl Agent {
                 // long-running (or hanging) tool is cancelled promptly.
                 if let Some(signal) = abort.as_ref() {
                     use futures::future::{Either, select};
-                    let tool_fut =
-                        self.execute_tool(tool_call.clone(), Arc::clone(&on_event)).fuse();
+                    let tool_fut = self
+                        .execute_tool(tool_call.clone(), Arc::clone(&on_event))
+                        .fuse();
                     let abort_fut = signal.wait().fuse();
                     futures::pin_mut!(tool_fut, abort_fut);
                     match select(tool_fut, abort_fut).await {
