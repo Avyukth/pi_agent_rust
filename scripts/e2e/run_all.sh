@@ -127,9 +127,9 @@ run_cargo() {
         fi
 
         if [[ ${#env_overrides[@]} -gt 0 ]]; then
-            "${CARGO_RUNNER_ARGS[@]}" env "${env_overrides[@]}" cargo "$@"
+            env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" env "${env_overrides[@]}" cargo "$@"
         else
-            "${CARGO_RUNNER_ARGS[@]}" cargo "$@"
+            env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" cargo "$@"
         fi
     else
         cargo "$@"
