@@ -744,9 +744,8 @@ fn validate_chrome_native_host_mode_args(cli: &cli::Cli) -> Result<()> {
     if cli.print {
         bail!("--mode chrome-native-host cannot be combined with --print");
     }
-    if !cli.message_args().is_empty() {
-        bail!("--mode chrome-native-host does not accept positional messages");
-    }
+    // Chrome passes the extension origin (e.g. "chrome-extension://...") as a
+    // positional argument — silently ignore it rather than rejecting.
     if cli.export.is_some() {
         bail!("--mode chrome-native-host cannot be combined with --export");
     }
