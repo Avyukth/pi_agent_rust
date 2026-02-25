@@ -209,7 +209,7 @@ fn main_impl() -> Result<()> {
     // --setup-chrome: install native host manifest and wrapper script, then exit.
     // Ultra-fast path — no async runtime, no logging needed.
     if cli.setup_chrome {
-        match pi::chrome::install::setup_chrome(None, None) {
+        match pi::chrome::install::setup_chrome(cli.chrome_extension_id.as_deref(), None) {
             Ok(result) => {
                 println!("Chrome native host setup successful:");
                 println!("  Manifest: {}", result.manifest_path.display());

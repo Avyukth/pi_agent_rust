@@ -366,6 +366,10 @@ pub struct Cli {
     #[arg(long)]
     pub setup_chrome: bool,
 
+    /// Chrome extension ID for native messaging allowed_origins (used with --setup-chrome)
+    #[arg(long)]
+    pub chrome_extension_id: Option<String>,
+
     // === Extensions ===
     /// Load extension file (can use multiple times)
     #[arg(short = 'e', long, action = clap::ArgAction::Append)]

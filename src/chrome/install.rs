@@ -22,6 +22,14 @@ pub const MANIFEST_FILENAME: &str = "com.franken.pi_rust_browser_extension.json"
 /// Wrapper script name.
 pub const WRAPPER_SCRIPT_NAME: &str = "pi-chrome-native-host.sh";
 
+/// Default Chrome extension ID for the Pi Chrome extension.
+/// Derived from the `key` field in `pi_chrome_extension/manifest.json` — stable
+/// across machines and load methods (unpacked, CRX, sideload).
+/// Override with `--chrome-extension-id` for forks or custom builds.
+/// When published to Chrome Web Store, CWS assigns a second ID — add it to
+/// `allowed_origins` via `--chrome-extension-id` or update this constant.
+pub const DEFAULT_CHROME_EXTENSION_ID: &str = "fndheanlhfcfggmeilfedkcjkhibgmlp";
+
 // ---------------------------------------------------------------------------
 // Error types
 // ---------------------------------------------------------------------------
@@ -84,29 +92,11 @@ pub struct NativeHostManifest {
 impl NativeHostManifest {
     /// Create a manifest pointing to the given wrapper script path.
     /// `extension_id` is the Chrome extension ID for the allowed_origins field.
-    /// Pass `None` to allow all origins (development mode).
-    ///
-    /// # Security
-    ///
-    /// When `extension_id` is `None`, the manifest uses a wildcard origin
-    /// (`chrome-extension://*/*`) that allows **any** Chrome extension to
-    /// connect to the native host. This is acceptable for local development
-    /// but should never be used in production. A warning is emitted via
-    /// `tracing::warn!` when this path is taken.
+    /// Pass `None` to use the default Pi Chrome extension ID.
     #[must_use]
     pub fn new(wrapper_path: &Path, extension_id: Option<&str>) -> Self {
-        let allowed_origins = extension_id.map_or_else(
-            || {
-                tracing::warn!(
-                    event = "pi.chrome.install.wildcard_origins",
-                    "native host manifest uses wildcard allowed_origins — \
-                     any Chrome extension can connect. \
-                     Pass --extension-id for production use."
-                );
-                vec!["chrome-extension://*/*".to_string()]
-            },
-            |id| vec![format!("chrome-extension://{id}/")],
-        );
+        let id = extension_id.unwrap_or(DEFAULT_CHROME_EXTENSION_ID);
+        let allowed_origins = vec![format!("chrome-extension://{id}/")];
 
         Self {
             name: NATIVE_HOST_NAME.to_string(),
@@ -389,14 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_dev_mode_allows_all_origins() {
+    fn test_manifest_default_uses_known_extension_id() {
         let wrapper_path = Path::new("/tmp/wrapper.sh");
         let manifest = NativeHostManifest::new(wrapper_path, None);
 
         assert_eq!(
             manifest.allowed_origins,
-            vec!["chrome-extension://*/*"],
-            "dev mode must use wildcard origin pattern"
+            vec![format!("chrome-extension://{DEFAULT_CHROME_EXTENSION_ID}/")],
+            "default must use the known Pi Chrome extension ID"
         );
     }
 
@@ -585,7 +575,7 @@ mod tests {
         let m2 = m1.clone();
         assert_eq!(m1, m2, "cloned manifest must equal original");
 
-        let m3 = NativeHostManifest::new(wrapper_path, None);
+        let m3 = NativeHostManifest::new(wrapper_path, Some("different456"));
         assert_ne!(m1, m3, "different allowed_origins must not be equal");
     }
 
