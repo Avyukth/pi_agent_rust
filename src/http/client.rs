@@ -277,6 +277,15 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
+    tracing::debug!(
+        event = "pi.http.request.start",
+        method = ?method,
+        host = %parsed.host,
+        port = parsed.port,
+        path = %parsed.path,
+        body_bytes = body.len(),
+        "HTTP request starting"
+    );
     let pool_key: PoolKey = (parsed.host.clone(), parsed.port);
 
     // O16: try pooled transport first, fall back to fresh connection.
@@ -312,6 +321,13 @@ async fn send_parts(
     }
 
     let (status, response_headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+    tracing::debug!(
+        event = "pi.http.response.head",
+        status = status,
+        header_count = response_headers.len(),
+        leftover_bytes = leftover.len(),
+        "HTTP response head received"
+    );
     let body_kind = body_kind_from_headers(&response_headers);
 
     // O16: determine if the connection can be returned to the pool after
