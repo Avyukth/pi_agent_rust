@@ -4,7 +4,9 @@
 //! hostcall requests (tools, HTTP, session, UI, etc.) from the JS runtime to
 //! Rust implementations.
 
-use std::cell::{Cell, RefCell};
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;

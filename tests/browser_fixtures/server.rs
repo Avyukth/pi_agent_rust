@@ -20,6 +20,7 @@ pub struct FixtureServer {
     port: u16,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    #[allow(dead_code)]
     pages_dir: PathBuf,
 }
 
@@ -52,7 +53,7 @@ impl FixtureServer {
         let handle = thread::Builder::new()
             .name(format!("fixture-server-{port}"))
             .spawn(move || {
-                serve_loop(listener, &pages_dir_clone, &shutdown_clone);
+                serve_loop(&listener, &pages_dir_clone, &shutdown_clone);
             })
             .map_err(|e| FixtureServerError::Bind(e.to_string()))?;
 
@@ -73,7 +74,7 @@ impl FixtureServer {
     }
 
     /// Server port number.
-    pub fn port(&self) -> u16 {
+    pub const fn port(&self) -> u16 {
         self.port
     }
 
@@ -83,6 +84,7 @@ impl FixtureServer {
     }
 
     /// Path to the fixture pages directory.
+    #[allow(dead_code)]
     pub fn pages_dir(&self) -> &Path {
         &self.pages_dir
     }
@@ -155,7 +157,7 @@ fn find_pages_dir() -> Result<PathBuf, FixtureServerError> {
     )))
 }
 
-fn serve_loop(listener: TcpListener, pages_dir: &Path, shutdown: &AtomicBool) {
+fn serve_loop(listener: &TcpListener, pages_dir: &Path, shutdown: &AtomicBool) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -270,56 +272,60 @@ fn route_request(path: &str, pages_dir: &Path) -> (&'static str, &'static str, V
                 return ("403 Forbidden", "text/plain", b"Forbidden".to_vec());
             }
             let file_path = pages_dir.join(clean_path);
-            match std::fs::read(&file_path) {
-                Ok(content) => {
+            std::fs::read(&file_path).map_or_else(
+                |_| {
+                    (
+                        "404 Not Found",
+                        "text/plain",
+                        format!("Not Found: {path}").into_bytes(),
+                    )
+                },
+                |content| {
                     let content_type = guess_content_type(clean_path);
                     ("200 OK", content_type, content)
-                }
-                Err(_) => (
-                    "404 Not Found",
-                    "text/plain",
-                    format!("Not Found: {path}").into_bytes(),
-                ),
-            }
+                },
+            )
         }
     }
 }
 
 fn guess_content_type(path: &str) -> &'static str {
-    if path.ends_with(".html") {
-        "text/html; charset=utf-8"
-    } else if path.ends_with(".js") {
-        "application/javascript"
-    } else if path.ends_with(".css") {
-        "text/css"
-    } else if path.ends_with(".json") {
-        "application/json"
-    } else if path.ends_with(".png") {
-        "image/png"
-    } else if path.ends_with(".svg") {
-        "image/svg+xml"
-    } else {
-        "application/octet-stream"
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "html" => "text/html; charset=utf-8",
+        "js" => "application/javascript",
+        "css" => "text/css",
+        "json" => "application/json",
+        "png" => "image/png",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
     }
 }
 
 fn generate_index_page(pages_dir: &Path) -> Vec<u8> {
+    use std::fmt::Write as _;
     let mut links = String::new();
     if let Ok(entries) = std::fs::read_dir(pages_dir) {
         let mut files: Vec<String> = entries
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".html") {
+                if Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext == "html")
+                {
                     Some(name)
                 } else {
                     None
                 }
             })
             .collect();
-        files.sort();
+        files.sort_unstable();
         for file in &files {
-            links.push_str(&format!("  <li><a href=\"/{file}\">{file}</a></li>\n"));
+            let _ = writeln!(links, "  <li><a href=\"/{file}\">{file}</a></li>");
         }
     }
 
@@ -508,7 +514,11 @@ mod tests {
             assert!(!fixture.path().is_empty());
             assert!(!fixture.name().is_empty());
             assert!(fixture.path().starts_with('/'));
-            assert!(fixture.path().ends_with(".html"));
+            assert!(
+                Path::new(fixture.path())
+                    .extension()
+                    .is_some_and(|e| e == "html")
+            );
         }
     }
 }

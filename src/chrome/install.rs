@@ -549,11 +549,15 @@ mod tests {
             "manifest filename must derive from host name"
         );
         assert!(
-            MANIFEST_FILENAME.ends_with(".json"),
+            Path::new(MANIFEST_FILENAME)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("json")),
             "manifest filename must end with .json"
         );
         assert!(
-            WRAPPER_SCRIPT_NAME.ends_with(".sh"),
+            Path::new(WRAPPER_SCRIPT_NAME)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("sh")),
             "wrapper script must end with .sh"
         );
     }
@@ -641,7 +645,7 @@ mod tests {
             "CreateDir display: {msg}"
         );
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "disk full");
+        let io_err = std::io::Error::other("disk full");
         let err = InstallError::WriteFile {
             path: PathBuf::from("/tmp/file"),
             source: io_err,
@@ -652,7 +656,7 @@ mod tests {
             "WriteFile display: {msg}"
         );
 
-        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "bad perms");
+        let io_err = std::io::Error::other("bad perms");
         let err = InstallError::SetPermissions {
             path: PathBuf::from("/tmp/script"),
             source: io_err,

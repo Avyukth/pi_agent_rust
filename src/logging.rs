@@ -315,13 +315,15 @@ struct StringVisitor {
 }
 
 #[cfg(test)]
+use std::fmt::Write as _;
+
+#[cfg(test)]
 impl tracing::field::Visit for StringVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if !self.output.is_empty() {
             self.output.push(' ');
         }
-        self.output
-            .push_str(&format!("{}={:?}", field.name(), value));
+        let _ = write!(self.output, "{}={:?}", field.name(), value);
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -329,8 +331,7 @@ impl tracing::field::Visit for StringVisitor {
             self.output.push(' ');
         }
         let redacted = redact_if_sensitive(field.name(), value);
-        self.output
-            .push_str(&format!("{}=\"{}\"", field.name(), redacted));
+        let _ = write!(self.output, "{}=\"{}\"", field.name(), redacted);
     }
 }
 
@@ -406,7 +407,7 @@ mod tests {
 
     #[test]
     fn max_log_files_is_reasonable() {
-        assert!(MAX_LOG_FILES >= 3);
-        assert!(MAX_LOG_FILES <= 30);
+        const { assert!(MAX_LOG_FILES >= 3) };
+        const { assert!(MAX_LOG_FILES <= 30) };
     }
 }

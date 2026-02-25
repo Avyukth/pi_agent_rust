@@ -9,11 +9,11 @@
 //!
 //! | Scenario | URL Path | Purpose |
 //! |----------|----------|---------|
-//! | navigation | `/navigation.html` | Back/forward/reload, pushState, link clicks |
+//! | navigation | `/navigation.html` | Back/forward/reload, `pushState`, link clicks |
 //! | form | `/form.html` | Text inputs, select, checkbox, radio, file upload |
-//! | console_errors | `/console_errors.html` | Console error/warn observation pipeline |
-//! | network_failure | `/network_failure.html` | Fetch success/404/500/timeout/CORS |
-//! | hot_reload | `/hot_reload.html` | DOM mutation, SSE updates, dynamic elements |
+//! | `console_errors` | `/console_errors.html` | Console error/warn observation pipeline |
+//! | `network_failure` | `/network_failure.html` | Fetch success/404/500/timeout/CORS |
+//! | `hot_reload` | `/hot_reload.html` | DOM mutation, SSE updates, dynamic elements |
 //!
 //! # Usage
 //!
@@ -47,7 +47,7 @@ pub enum Fixture {
 
 impl Fixture {
     /// URL path for this fixture (relative to server root).
-    pub fn path(self) -> &'static str {
+    pub const fn path(self) -> &'static str {
         match self {
             Self::Navigation => "/navigation.html",
             Self::Form => "/form.html",
@@ -58,7 +58,7 @@ impl Fixture {
     }
 
     /// Human-readable scenario name.
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Navigation => "navigation",
             Self::Form => "form",
@@ -69,7 +69,7 @@ impl Fixture {
     }
 
     /// All available fixtures.
-    pub fn all() -> &'static [Fixture] {
+    pub const fn all() -> &'static [Self] {
         &[
             Self::Navigation,
             Self::Form,

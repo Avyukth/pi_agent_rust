@@ -133,7 +133,7 @@ pub fn encode_gif(
         path: output_path.to_path_buf(),
         frame_count: png_frames.len(),
         file_size_bytes: metadata.len(),
-        elapsed_ms: elapsed.as_millis() as u64,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     })
 }
 
@@ -165,7 +165,7 @@ pub fn encode_single_frame(
         path: output_path.to_path_buf(),
         frame_count: 1,
         file_size_bytes: metadata.len(),
-        elapsed_ms: elapsed.as_millis() as u64,
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     })
 }
 
@@ -178,6 +178,7 @@ fn decode_png(png_bytes: &[u8], index: usize) -> Result<DynamicImage, GifError> 
         .map_err(|source| GifError::DecodePng { index, source })
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn maybe_resize(img: DynamicImage, max_dim: u32) -> RgbaImage {
     let (w, h) = (img.width(), img.height());
     if w <= max_dim && h <= max_dim {
@@ -231,9 +232,9 @@ mod tests {
     fn test_encode_multi_frame() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("multi.gif");
-        let frames: Vec<Vec<u8>> = (0..5)
+        let frames: Vec<Vec<u8>> = (0..5u8)
             .map(|i| {
-                let c = (i * 50) as u8;
+                let c = i * 50;
                 tiny_png(20, 20, [c, 255 - c, 128, 255])
             })
             .collect();
@@ -259,7 +260,7 @@ mod tests {
     fn test_too_many_frames_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("too_many.gif");
-        let frames: Vec<Vec<u8>> = (0..MAX_FRAMES + 1).map(|_| vec![0u8; 0]).collect();
+        let frames: Vec<Vec<u8>> = (0..=MAX_FRAMES).map(|_| vec![0u8; 0]).collect();
 
         let result = encode_gif(&frames, &out, &GifConfig::default());
         assert!(matches!(result, Err(GifError::TooManyFrames(_))));
@@ -322,10 +323,10 @@ mod tests {
 
     #[test]
     fn test_constants_are_sane() {
-        assert!(DEFAULT_FRAME_DELAY_MS > 0, "frame delay must be positive");
-        assert!(MAX_FRAMES > 10, "must allow at least 10 frames");
-        assert!(MAX_DIMENSION >= 640, "must allow at least 640px");
-        assert!(BUDGET_10_FRAMES_MS >= 1000, "budget must be at least 1s");
+        const { assert!(DEFAULT_FRAME_DELAY_MS > 0, "frame delay must be positive") };
+        const { assert!(MAX_FRAMES > 10, "must allow at least 10 frames") };
+        const { assert!(MAX_DIMENSION >= 640, "must allow at least 640px") };
+        const { assert!(BUDGET_10_FRAMES_MS >= 1000, "budget must be at least 1s") };
     }
 
     #[test]
@@ -366,9 +367,9 @@ mod tests {
     fn test_encode_10_frames_within_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
         let out = dir.path().join("budget.gif");
-        let frames: Vec<Vec<u8>> = (0..10)
+        let frames: Vec<Vec<u8>> = (0..10u8)
             .map(|i| {
-                let c = (i * 25) as u8;
+                let c = i * 25;
                 tiny_png(100, 100, [c, c, c, 255])
             })
             .collect();
