@@ -31,37 +31,92 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 // O16: Connection pool — reuse TCP+TLS connections across requests to the
 // same (host, port, scheme) to avoid the 40-150ms per-connection overhead.
-const MAX_IDLE_PER_HOST: usize = 1;
+const DEFAULT_MAX_IDLE_PER_HOST: usize = 1;
+const DEFAULT_MAX_HOSTS: usize = 8;
+const POOL_CONFIG_ENV: &str = "PI_HTTP_POOL_MAX_IDLE_PER_HOST";
+const POOL_MAX_HOSTS_ENV: &str = "PI_HTTP_POOL_MAX_HOSTS";
 
 /// Key for connection pool: (host, port, is_https).
 type PoolKey = (String, u16, bool);
 
 /// Process-wide pool of idle HTTP/1.1 transports.
+///
+/// Stores up to `max_idle_per_host` idle connections per (host, port, scheme)
+/// key, with a hard cap of `max_hosts` distinct hosts to prevent unbounded
+/// growth.
 struct ConnectionPool {
-    idle: HashMap<PoolKey, Transport>,
+    idle: HashMap<PoolKey, Vec<Transport>>,
+    max_idle_per_host: usize,
+    max_hosts: usize,
 }
 
 impl ConnectionPool {
     fn new() -> Self {
+        Self::with_limits(
+            pool_max_idle_per_host_from_env(),
+            pool_max_hosts_from_env(),
+        )
+    }
+
+    fn with_limits(max_idle_per_host: usize, max_hosts: usize) -> Self {
         Self {
             idle: HashMap::new(),
+            max_idle_per_host: max_idle_per_host.max(1),
+            max_hosts: max_hosts.max(1),
         }
     }
 
     /// Take an idle transport for the given (host, port, is_https), if one exists.
+    /// Returns the most recently added connection (LIFO) to favour warm connections.
     fn take(&mut self, key: &PoolKey) -> Option<Transport> {
-        self.idle.remove(key)
+        let conns = self.idle.get_mut(key)?;
+        let transport = conns.pop();
+        if conns.is_empty() {
+            self.idle.remove(key);
+        }
+        transport
     }
 
-    /// Return a transport to the pool. Silently drops if the pool slot is full.
+    /// Return a transport to the pool.
+    ///
+    /// If the per-host slot is full the oldest idle connection is dropped to
+    /// make room.  If the total number of distinct hosts exceeds `max_hosts`,
+    /// the connection is silently dropped to prevent unbounded growth.
     fn return_conn(&mut self, key: PoolKey, transport: Transport) {
-        if self.idle.len() >= MAX_IDLE_PER_HOST * 8 {
-            // Hard cap to prevent unbounded growth if many hosts are contacted.
+        // If this key already exists, respect per-host limit.
+        if let Some(conns) = self.idle.get_mut(&key) {
+            if conns.len() >= self.max_idle_per_host {
+                // Drop the oldest (front) to make room for the fresh one.
+                conns.remove(0);
+            }
+            conns.push(transport);
             return;
         }
-        // Only keep one idle connection per host.
-        let _prev = self.idle.insert(key, transport);
+        // New host — check hard cap on total distinct hosts.
+        if self.idle.len() >= self.max_hosts {
+            return;
+        }
+        self.idle.insert(key, vec![transport]);
     }
+
+    /// Total number of idle connections across all hosts.
+    fn total_idle(&self) -> usize {
+        self.idle.values().map(Vec::len).sum()
+    }
+}
+
+fn pool_max_idle_per_host_from_env() -> usize {
+    std::env::var(POOL_CONFIG_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_IDLE_PER_HOST)
+}
+
+fn pool_max_hosts_from_env() -> usize {
+    std::env::var(POOL_MAX_HOSTS_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_HOSTS)
 }
 
 static CONNECTION_POOL: OnceLock<StdMutex<ConnectionPool>> = OnceLock::new();
@@ -1855,6 +1910,177 @@ mod tests {
                 "closed transport should not be pooled"
             );
         });
+    }
+
+    // ── M5: Configurable pool + Vec per host ────────────────────────
+
+    #[test]
+    fn connection_pool_with_limits_respects_max_idle_per_host() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::with_limits(3, 16);
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = (addr.ip().to_string(), addr.port(), false);
+
+            // Insert 3 connections — all should be kept.
+            for _ in 0..3 {
+                let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                    .await
+                    .unwrap();
+                pool.return_conn(key.clone(), Transport::Tcp(tcp));
+            }
+            assert_eq!(pool.total_idle(), 3);
+
+            // 4th connection should evict the oldest.
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            pool.return_conn(key.clone(), Transport::Tcp(tcp));
+            assert_eq!(pool.total_idle(), 3, "per-host cap should be enforced");
+
+            // All 3 should be retrievable via take.
+            assert!(pool.take(&key).is_some());
+            assert!(pool.take(&key).is_some());
+            assert!(pool.take(&key).is_some());
+            assert!(pool.take(&key).is_none());
+        });
+    }
+
+    #[test]
+    fn connection_pool_total_idle_counts_all_hosts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::with_limits(2, 16);
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let key_a = ("a.example.com".to_string(), 443, true);
+            let key_b = ("b.example.com".to_string(), 443, true);
+
+            for key in [&key_a, &key_b] {
+                for _ in 0..2 {
+                    let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                        .await
+                        .unwrap();
+                    pool.return_conn(key.clone(), Transport::Tcp(tcp));
+                }
+            }
+
+            assert_eq!(pool.total_idle(), 4, "2 hosts x 2 conns = 4 total");
+            assert_eq!(pool.idle.len(), 2, "2 distinct hosts");
+        });
+    }
+
+    #[test]
+    fn connection_pool_take_is_lifo() {
+        // Verify that take() returns the most recently added connection (LIFO).
+        // We can't inspect the Transport identity directly, but we can verify
+        // that after returning 2 and taking 1, there is still 1 remaining.
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::with_limits(4, 16);
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = (addr.ip().to_string(), addr.port(), false);
+
+            for _ in 0..3 {
+                let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                    .await
+                    .unwrap();
+                pool.return_conn(key.clone(), Transport::Tcp(tcp));
+            }
+
+            // Take one (should be LIFO — most recent).
+            assert!(pool.take(&key).is_some());
+            assert_eq!(pool.total_idle(), 2, "one taken, two remain");
+        });
+    }
+
+    #[test]
+    fn connection_pool_max_hosts_cap_rejects_new_host() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::with_limits(1, 2);
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Fill 2 hosts (the cap).
+            for i in 0..2u16 {
+                let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                    .await
+                    .unwrap();
+                pool.return_conn(
+                    (format!("host{i}.example.com"), 443, true),
+                    Transport::Tcp(tcp),
+                );
+            }
+            assert_eq!(pool.idle.len(), 2);
+
+            // 3rd host should be silently dropped.
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            pool.return_conn(
+                ("host2.example.com".to_string(), 443, true),
+                Transport::Tcp(tcp),
+            );
+            assert_eq!(pool.idle.len(), 2, "max_hosts cap prevents new host entry");
+        });
+    }
+
+    #[test]
+    fn connection_pool_return_conn_evicts_oldest_when_full() {
+        // When per-host slots are full, the oldest connection is evicted (not silently lost).
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::with_limits(2, 16);
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = (addr.ip().to_string(), addr.port(), false);
+
+            // Fill to capacity.
+            for _ in 0..2 {
+                let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                    .await
+                    .unwrap();
+                pool.return_conn(key.clone(), Transport::Tcp(tcp));
+            }
+            assert_eq!(pool.total_idle(), 2);
+
+            // Add one more — oldest should be evicted, count stays at 2.
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            pool.return_conn(key.clone(), Transport::Tcp(tcp));
+            assert_eq!(
+                pool.total_idle(),
+                2,
+                "eviction should keep count at max_idle_per_host"
+            );
+        });
+    }
+
+    #[test]
+    fn connection_pool_with_limits_clamps_to_minimum_one() {
+        let pool = ConnectionPool::with_limits(0, 0);
+        assert_eq!(pool.max_idle_per_host, 1, "min per-host must be 1");
+        assert_eq!(pool.max_hosts, 1, "min hosts must be 1");
     }
 
     #[test]
