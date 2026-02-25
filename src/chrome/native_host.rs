@@ -2110,6 +2110,48 @@ mod tests {
                 "terminal replay cache must expire at TTL boundary (>= ttl)"
             );
         }
+
+        #[test]
+        fn test_esl_proptest_in_progress_entries_do_not_expire_via_ttl(
+            payload in esl_json_value_strategy(),
+            ttl_ms in 1_i64..5_000_i64,
+            extra_idle_ms in 0_i64..5_000_i64,
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(ttl_ms, 64, 1 << 20);
+            let request = sample_request_struct("req-esl-inprogress-ttl", payload);
+            let now_ms = unix_time_ms();
+
+            let first = journal.begin_request("session-prop", "epoch-prop", &request, now_ms)?;
+            prop_assert_eq!(
+                first,
+                EslBeginOutcome::Dispatch,
+                "initial request must dispatch and create in_progress entry"
+            );
+
+            let duplicate = journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                now_ms + ttl_ms + extra_idle_ms,
+            )?;
+            match duplicate {
+                EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                    prop_assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                        "TTL pruning must never evict in_progress entries"
+                    );
+                    prop_assert!(
+                        err.error.retryable,
+                        "in_progress duplicate rejects must remain retryable after long idle"
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "long-idle duplicate of in_progress request must reject busy, got {other:?}"
+                ),
+            }
+        }
     }
 
     #[test]
