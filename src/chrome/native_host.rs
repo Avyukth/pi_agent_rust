@@ -2320,6 +2320,82 @@ mod tests {
                 }
             }
         }
+
+        #[test]
+        fn test_esl_proptest_terminal_replay_refreshes_lru_and_protects_recent_entry(
+            payload_a in esl_json_value_strategy(),
+            payload_b in esl_json_value_strategy(),
+            payload_c in esl_json_value_strategy(),
+            refresh_a in any::<bool>(),
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(60_000, 2, 1 << 20);
+            let req_a = sample_request_struct("req-esl-lru-a", payload_a);
+            let req_b = sample_request_struct("req-esl-lru-b", payload_b);
+            let req_c = sample_request_struct("req-esl-lru-c", payload_c);
+            let resp_a = sample_response_envelope_for("req-esl-lru-a");
+            let resp_b = sample_response_envelope_for("req-esl-lru-b");
+            let now_ms = unix_time_ms();
+
+            let first_a = journal.begin_request("session-prop", "epoch-prop", &req_a, now_ms)?;
+            prop_assert_eq!(first_a, EslBeginOutcome::Dispatch, "A must dispatch initially");
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &req_a,
+                &resp_a,
+                now_ms + 1,
+            )?;
+
+            let first_b = journal.begin_request("session-prop", "epoch-prop", &req_b, now_ms + 2)?;
+            prop_assert_eq!(first_b, EslBeginOutcome::Dispatch, "B must dispatch initially");
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &req_b,
+                &resp_b,
+                now_ms + 3,
+            )?;
+
+            let (replayed_req, replayed_resp, should_survive_id, should_evict_id) = if refresh_a {
+                (&req_a, &resp_a, "req-esl-lru-a", "req-esl-lru-b")
+            } else {
+                (&req_b, &resp_b, "req-esl-lru-b", "req-esl-lru-a")
+            };
+
+            let replay_outcome =
+                journal.begin_request("session-prop", "epoch-prop", replayed_req, now_ms + 4)?;
+            match replay_outcome {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    replayed_resp.clone(),
+                    "terminal duplicate must replay cached response before LRU pressure"
+                ),
+                other => prop_assert!(
+                    false,
+                    "expected terminal replay when refreshing LRU recency, got {other:?}"
+                ),
+            }
+
+            let c_outcome = journal.begin_request("session-prop", "epoch-prop", &req_c, now_ms + 5)?;
+            prop_assert_eq!(
+                c_outcome,
+                EslBeginOutcome::Dispatch,
+                "new request should dispatch after evicting one terminal entry under entry-cap pressure"
+            );
+
+            prop_assert!(
+                journal.contains_key("session-prop", should_survive_id, "epoch-prop"),
+                "replayed terminal entry should survive LRU eviction because replay refreshes recency"
+            );
+            prop_assert!(
+                !journal.contains_key("session-prop", should_evict_id, "epoch-prop"),
+                "non-replayed terminal entry should be evicted first as oldest terminal"
+            );
+            prop_assert!(
+                journal.contains_key("session-prop", "req-esl-lru-c", "epoch-prop"),
+                "new request should be inserted after terminal eviction"
+            );
+        }
     }
 
     #[test]
