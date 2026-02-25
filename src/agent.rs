@@ -534,9 +534,9 @@ impl Agent {
                 } else if detail.len() > 80 {
                     format!(": {}...", &detail[..77])
                 } else {
-                    format!(": {}", detail)
+                    format!(": {detail}")
                 };
-                lines.push(format!("- {}{}", entry.kind, suffix));
+                lines.push(format!("- {}{suffix}", entry.kind));
                 total_entries += 1;
                 // Budget: cap at ~20 lines to avoid prompt bloat
                 if lines.len() >= 20 {

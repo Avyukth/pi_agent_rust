@@ -1647,7 +1647,6 @@ mod tests {
         let rt = RuntimeBuilder::current_thread().build().unwrap();
         rt.block_on(async {
             let mut pool = ConnectionPool::new();
-            let key = ("127.0.0.1".to_string(), 80);
 
             // Create a real TCP listener + connection for a valid Transport.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1716,9 +1715,7 @@ mod tests {
         // Verify the global pool OnceLock initializes correctly.
         let pool = global_pool();
         let guard = pool.lock().unwrap();
-        // Fresh pool should be empty.
-        let key = ("test.example.com".to_string(), 443);
-        // Can't easily test take without a Transport, but we can verify no panic.
+        // Fresh pool should be empty — verify no panic on init.
         drop(guard);
     }
 

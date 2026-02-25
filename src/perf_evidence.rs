@@ -86,8 +86,8 @@ impl EnvFingerprint {
             .map_or_else(|| "unknown".to_string(), |c| c.brand().to_string());
         let cpu_cores = sys.cpus().len() as u32;
         let mem_total_mb = sys.total_memory() / 1024 / 1024;
-        let os = sysinfo::System::long_os_version()
-            .unwrap_or_else(|| std::env::consts::OS.to_string());
+        let os =
+            sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
         let arch = std::env::consts::ARCH.to_string();
         let build_profile = crate::perf_build::detect_build_profile();
         let git_commit = option_env!("VERGEN_GIT_SHA")
@@ -464,11 +464,7 @@ impl BaselineStore {
             .map(|s| s.unit.clone())
             .or_else(|| record.value_unit.clone())
             .unwrap_or_default();
-        let sample_count = record
-            .stats
-            .as_ref()
-            .map(|s| s.sample_count)
-            .unwrap_or(1);
+        let sample_count = record.stats.as_ref().map(|s| s.sample_count).unwrap_or(1);
 
         Some(BaselineEntry {
             name: record.name.clone(),
@@ -1054,7 +1050,11 @@ mod tests {
             sample_count: 60,
         });
 
-        assert_eq!(store.entries.len(), 1, "upsert should replace, not duplicate");
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "upsert should replace, not duplicate"
+        );
         assert!(
             (store.find(&machine_id, "bench").unwrap().reference_value - 110.0).abs()
                 < f64::EPSILON
@@ -1424,11 +1424,7 @@ mod tests {
 
     #[test]
     fn artifact_metadata_missing_file_has_no_hash() {
-        let meta = ArtifactMetadata::for_file(
-            "test",
-            PathBuf::from("/nonexistent/file.jsonl"),
-            30,
-        );
+        let meta = ArtifactMetadata::for_file("test", PathBuf::from("/nonexistent/file.jsonl"), 30);
         assert!(meta.content_hash.is_none());
         assert_eq!(meta.retention_days, 30);
     }
