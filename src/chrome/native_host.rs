@@ -1985,6 +1985,57 @@ mod tests {
                 ),
             }
         }
+
+        #[test]
+        fn test_esl_proptest_mismatched_terminal_record_is_noop_and_preserves_replay(
+            canonical_payload in esl_json_value_strategy(),
+            mismatched_payload in esl_json_value_strategy(),
+            alt_terminal_ok in any::<bool>(),
+        ) {
+            prop_assume!(canonical_payload != mismatched_payload);
+
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let canonical = sample_request_struct("req-esl-record-mismatch", canonical_payload);
+            let mismatched = sample_request_struct("req-esl-record-mismatch", mismatched_payload);
+            let canonical_response = sample_response_envelope_for("req-esl-record-mismatch");
+            let mismatched_response = trace_terminal_response_for(&mismatched, alt_terminal_ok);
+            let now_ms = unix_time_ms();
+
+            let first = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms)?;
+            prop_assert_eq!(
+                first,
+                EslBeginOutcome::Dispatch,
+                "initial request must dispatch before terminal state can be recorded"
+            );
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &canonical,
+                &canonical_response,
+                now_ms + 1,
+            )?;
+
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &mismatched,
+                &mismatched_response,
+                now_ms + 2,
+            )?;
+
+            let replay = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms + 3)?;
+            match replay {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    canonical_response,
+                    "fingerprint-mismatched terminal record must be a no-op"
+                ),
+                other => prop_assert!(
+                    false,
+                    "canonical duplicate after mismatched terminal record must replay, got {other:?}"
+                ),
+            }
+        }
     }
 
     #[test]
