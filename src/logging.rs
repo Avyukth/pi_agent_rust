@@ -2,13 +2,47 @@
 //!
 //! Provides a layered `tracing` subscriber with:
 //! - **stderr** output for interactive terminal use (respects `RUST_LOG`).
-//! - **file appender** writing to `~/.pi/logs/pi-chrome.log` with daily rotation
-//!   and bounded retention.
+//! - **file appender** writing to `~/.pi/logs/pi-chrome.YYYY-MM-DD.log` with
+//!   daily rotation and 7-day retention.
 //! - **Redaction** of sensitive fields (`api_key`, `token`, `secret`, `password`,
 //!   `authorization`, `credential`) at INFO level and below.
 //! - **Correlation fields** via `tracing::Span` for `pi_session_id`, `host_id`,
 //!   `host_epoch`, and `request_id`.
 //! - **Test capture** helpers for asserting on log output in tests.
+//!
+//! # `RUST_LOG` Configuration
+//!
+//! The stderr layer defaults to `warn`. Override via the `RUST_LOG` environment
+//! variable using [`tracing_subscriber::EnvFilter`] syntax:
+//!
+//! ```text
+//! # Show all debug logs:
+//! RUST_LOG=debug pi
+//!
+//! # Show agent loop events only:
+//! RUST_LOG=pi_agent_rust::agent=debug pi
+//!
+//! # Show HTTP request/response lifecycle:
+//! RUST_LOG=pi_agent_rust::http=debug pi
+//!
+//! # Show tool execution tracing:
+//! RUST_LOG="pi_agent_rust::agent=debug" pi
+//!
+//! # Combine multiple targets:
+//! RUST_LOG="pi_agent_rust::agent=debug,pi_agent_rust::http=trace" pi
+//! ```
+//!
+//! The file appender always logs at `debug` level regardless of `RUST_LOG`.
+//!
+//! # Structured Event Namespaces
+//!
+//! | Namespace | Description |
+//! |-----------|-------------|
+//! | `pi.agent.run_text.*` | Agent text input lifecycle |
+//! | `pi.agent.run_content.*` | Agent content block lifecycle |
+//! | `pi.tool.execute.*` | Tool call execution |
+//! | `pi.http.request.*` | HTTP request initiation |
+//! | `pi.http.response.*` | HTTP response head received |
 
 use std::path::PathBuf;
 use tracing::Span;
