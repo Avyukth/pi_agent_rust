@@ -33,6 +33,8 @@ const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 1000;
 const MAX_ESL_RETRY_ATTEMPTS: u8 = 3;
 const MAX_ESL_IN_PROGRESS_RETRIES: u8 = 3;
 const ESL_IN_PROGRESS_BACKOFF_MS: u64 = 5;
+pub const MEMORY_SOAK_RSS_TARGET_MB: u64 = 150;
+pub const MEMORY_SOAK_ACCEPTANCE_HANDOFF_BEAD: &str = "bd-11p.3";
 
 type PendingResponses = HashMap<String, oneshot::Sender<protocol::ResponseEnvelope>>;
 type RequestFingerprintRegistry = HashMap<(String, String), protocol::RequestFingerprint>;
@@ -99,6 +101,30 @@ pub struct ChromeBridgeStatus {
     pub host_epoch: Option<String>,
     pub consecutive_failures: u8,
     pub browser_tools_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChromeMemoryBoundCaps {
+    pub socket_frame_max_bytes: usize,
+    pub esl_journal_max_entries: usize,
+    pub esl_journal_max_bytes: usize,
+    pub esl_journal_ttl_ms: i64,
+    pub observer_max_observers: usize,
+    pub observer_ring_buffer_capacity: usize,
+    pub observer_max_events_per_drain: usize,
+    pub observer_max_event_bytes: usize,
+    pub worst_case_observer_buffer_bytes: usize,
+    pub soak_rss_target_mb: u64,
+    pub soak_acceptance_handoff_bead: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChromeMemoryBoundMeasurement {
+    pub phase: String,
+    pub measured_rss_bytes: Option<u64>,
+    pub pending_response_count: usize,
+    pub observation_buffer_len: usize,
+    pub caps: ChromeMemoryBoundCaps,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +213,48 @@ impl ChromeBridge {
             consecutive_failures: guard.consecutive_failures,
             browser_tools_disabled: guard.browser_tools_disabled,
         }
+    }
+
+    /// Emit a structured memory-bound snapshot for soak/edge evidence collection.
+    ///
+    /// Final RSS/leak acceptance remains delegated to `bd-11p.3`; this provides the
+    /// stable structured measurement shape and cap metadata used by downstream tests.
+    #[must_use]
+    pub fn record_memory_bound_measurement(
+        &self,
+        phase: impl Into<String>,
+        measured_rss_bytes: Option<u64>,
+    ) -> ChromeMemoryBoundMeasurement {
+        let measurement = ChromeMemoryBoundMeasurement {
+            phase: phase.into(),
+            measured_rss_bytes,
+            pending_response_count: self.pending_response_count(),
+            observation_buffer_len: self.observation_buffer_len(),
+            caps: chrome_memory_bound_caps(),
+        };
+
+        tracing::info!(
+            event = "pi.chrome.memory_bound_measurement",
+            phase = %measurement.phase,
+            measured_rss_bytes = measurement.measured_rss_bytes.unwrap_or(0),
+            has_measured_rss = measurement.measured_rss_bytes.is_some(),
+            pending_response_count = measurement.pending_response_count,
+            observation_buffer_len = measurement.observation_buffer_len,
+            socket_frame_max_bytes = measurement.caps.socket_frame_max_bytes,
+            esl_journal_max_entries = measurement.caps.esl_journal_max_entries,
+            esl_journal_max_bytes = measurement.caps.esl_journal_max_bytes,
+            esl_journal_ttl_ms = measurement.caps.esl_journal_ttl_ms,
+            observer_max_observers = measurement.caps.observer_max_observers,
+            observer_ring_buffer_capacity = measurement.caps.observer_ring_buffer_capacity,
+            observer_max_events_per_drain = measurement.caps.observer_max_events_per_drain,
+            observer_max_event_bytes = measurement.caps.observer_max_event_bytes,
+            worst_case_observer_buffer_bytes = measurement.caps.worst_case_observer_buffer_bytes,
+            soak_rss_target_mb = measurement.caps.soak_rss_target_mb,
+            soak_acceptance_handoff_bead = measurement.caps.soak_acceptance_handoff_bead,
+            "chrome memory-bound measurement"
+        );
+
+        measurement
     }
 
     pub fn disconnect(&self) -> Result<(), ChromeBridgeError> {
@@ -1179,6 +1247,25 @@ fn unix_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0));
     i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
+}
+
+#[must_use]
+pub fn chrome_memory_bound_caps() -> ChromeMemoryBoundCaps {
+    ChromeMemoryBoundCaps {
+        socket_frame_max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
+        esl_journal_max_entries: native_host::MAX_JOURNAL_ENTRIES,
+        esl_journal_max_bytes: native_host::MAX_JOURNAL_BYTES,
+        esl_journal_ttl_ms: native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+        observer_max_observers: observer::MAX_OBSERVERS,
+        observer_ring_buffer_capacity: observer::RING_BUFFER_CAPACITY,
+        observer_max_events_per_drain: observer::MAX_EVENTS_PER_DRAIN,
+        observer_max_event_bytes: observer::MAX_EVENT_BYTES,
+        worst_case_observer_buffer_bytes: observer::MAX_OBSERVERS
+            .saturating_mul(observer::RING_BUFFER_CAPACITY)
+            .saturating_mul(observer::MAX_EVENT_BYTES),
+        soak_rss_target_mb: MEMORY_SOAK_RSS_TARGET_MB,
+        soak_acceptance_handoff_bead: MEMORY_SOAK_ACCEPTANCE_HANDOFF_BEAD,
+    }
 }
 
 fn extract_tab_id_from_payload(payload: &serde_json::Value) -> Option<u32> {
@@ -2395,6 +2482,131 @@ mod tests {
 
             server.join().expect("mock host thread join");
         });
+    }
+
+    #[test]
+    fn test_chrome_memory_bound_caps_match_component_limits_and_handoff() {
+        let caps = chrome_memory_bound_caps();
+
+        assert_eq!(
+            caps.socket_frame_max_bytes,
+            protocol::MAX_SOCKET_FRAME_BYTES,
+            "caps snapshot must reflect protocol socket frame cap"
+        );
+        assert_eq!(
+            caps.socket_frame_max_bytes,
+            1024 * 1024,
+            "socket frame cap must remain interview-locked at 1 MiB"
+        );
+        assert_eq!(
+            caps.esl_journal_max_entries,
+            native_host::MAX_JOURNAL_ENTRIES,
+            "caps snapshot must reflect ESL journal entry cap"
+        );
+        assert_eq!(
+            caps.esl_journal_max_entries, 256,
+            "ESL journal entry cap must remain bounded"
+        );
+        assert_eq!(
+            caps.esl_journal_max_bytes,
+            native_host::MAX_JOURNAL_BYTES,
+            "caps snapshot must reflect ESL journal byte cap"
+        );
+        assert_eq!(
+            caps.esl_journal_max_bytes,
+            16 * 1024 * 1024,
+            "ESL journal byte cap must remain 16 MiB"
+        );
+        assert_eq!(
+            caps.esl_journal_ttl_ms,
+            native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+            "caps snapshot must expose ESL journal TTL"
+        );
+        assert_eq!(
+            caps.observer_max_observers,
+            observer::MAX_OBSERVERS,
+            "caps snapshot must reflect observer count cap"
+        );
+        assert_eq!(
+            caps.observer_ring_buffer_capacity,
+            observer::RING_BUFFER_CAPACITY,
+            "caps snapshot must reflect ring buffer cap"
+        );
+        assert_eq!(
+            caps.observer_max_events_per_drain,
+            observer::MAX_EVENTS_PER_DRAIN,
+            "caps snapshot must reflect drain cap"
+        );
+        assert_eq!(
+            caps.observer_max_event_bytes,
+            observer::MAX_EVENT_BYTES,
+            "caps snapshot must reflect per-event byte cap"
+        );
+        assert_eq!(
+            caps.worst_case_observer_buffer_bytes,
+            observer::MAX_OBSERVERS * observer::RING_BUFFER_CAPACITY * observer::MAX_EVENT_BYTES,
+            "derived observer buffer bound must match component caps"
+        );
+        assert_eq!(
+            caps.soak_rss_target_mb, MEMORY_SOAK_RSS_TARGET_MB,
+            "caps snapshot must surface soak RSS target"
+        );
+        assert_eq!(
+            caps.soak_acceptance_handoff_bead, "bd-11p.3",
+            "bd-18m.8 must explicitly record the soak handoff bead"
+        );
+    }
+
+    #[test]
+    fn test_chrome_memory_bound_measurement_is_structured_for_soak_evidence() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+        bridge.push_observation(protocol::ObservationEvent {
+            version: protocol::PROTOCOL_VERSION_V1,
+            observer_id: "obs-1".to_string(),
+            events: vec![protocol::ObservationEntry {
+                kind: "console".to_string(),
+                message: Some("test".to_string()),
+                source: None,
+                url: None,
+                ts: unix_time_ms(),
+            }],
+        });
+
+        let measurement = bridge.record_memory_bound_measurement("unit-test", Some(12_345_678));
+        assert_eq!(
+            measurement.phase, "unit-test",
+            "measurement must keep caller-provided phase label"
+        );
+        assert_eq!(
+            measurement.measured_rss_bytes,
+            Some(12_345_678),
+            "measurement must preserve supplied RSS reading"
+        );
+        assert_eq!(
+            measurement.observation_buffer_len, 1,
+            "measurement must expose current buffered observations"
+        );
+        assert_eq!(
+            measurement.pending_response_count, 0,
+            "new bridge must start with zero pending responses"
+        );
+        assert_eq!(
+            measurement.caps.soak_acceptance_handoff_bead, "bd-11p.3",
+            "measurement metadata must carry explicit soak handoff"
+        );
+
+        let json = serde_json::to_value(&measurement).expect("serialize memory measurement");
+        assert_eq!(
+            json["phase"],
+            serde_json::Value::String("unit-test".to_string()),
+            "measurement JSON must expose a stable phase field"
+        );
+        assert!(
+            json.get("caps")
+                .and_then(|caps_json| caps_json.get("socket_frame_max_bytes"))
+                .is_some(),
+            "measurement JSON must include nested cap metadata for downstream soak artifacts"
+        );
     }
 
     #[test]
