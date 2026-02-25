@@ -1161,6 +1161,14 @@ async fn run(
             pi::chrome::observer::ObserverRegistry::new(),
         ));
         tools.register_chrome_tools(bridge.clone(), observer_registry);
+
+        // Discover and connect to the Chrome native host (non-fatal on failure —
+        // bridge tools will return "not connected" errors until a host appears).
+        match bridge.connect().await {
+            Ok(()) => tracing::info!("ChromeBridge connected to native host"),
+            Err(err) => tracing::warn!("ChromeBridge initial connect failed (will retry on tool use): {err}"),
+        }
+
         Some(bridge)
     } else {
         None
