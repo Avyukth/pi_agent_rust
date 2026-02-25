@@ -319,7 +319,7 @@ fn json_parity_tool_execution_start_schema() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-1".to_string(),
         tool_name: "read".to_string(),
-        args: json!({"path": "/tmp/test.txt"}),
+        args: Arc::new(json!({"path": "/tmp/test.txt"})),
     };
     let json = event_to_json(&event);
 
@@ -352,7 +352,7 @@ fn json_parity_tool_execution_update_schema() {
     let event = AgentEvent::ToolExecutionUpdate {
         tool_call_id: "tc-1".to_string(),
         tool_name: "bash".to_string(),
-        args: json!({"command": "ls"}),
+        args: Arc::new(json!({"command": "ls"})),
         partial_result: test_tool_output(),
     };
     let json = event_to_json(&event);
@@ -383,7 +383,7 @@ fn json_parity_tool_execution_end_schema() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-1".to_string(),
         tool_name: "read".to_string(),
-        result: test_tool_output(),
+        result: Arc::new(test_tool_output()),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -402,11 +402,11 @@ fn json_parity_tool_execution_end_schema() {
     let event_err = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-2".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("error msg"))],
             details: None,
             is_error: true,
-        },
+        }),
         is_error: true,
     };
     let json_err = event_to_json(&event_err);
@@ -788,7 +788,7 @@ fn json_parity_assistant_message_event_all_subtypes() {
                 tool_call: ToolCall {
                     id: "tc-1".to_string(),
                     name: "read".to_string(),
-                    arguments: json!({"path": "/tmp"}),
+                    arguments: Arc::new(json!({"path": "/tmp"})),
                     thought_signature: None,
                 },
                 partial: Arc::clone(&partial),
@@ -884,18 +884,18 @@ fn json_parity_no_snake_case_leak() {
         AgentEvent::ToolExecutionStart {
             tool_call_id: "tc".to_string(),
             tool_name: "read".to_string(),
-            args: json!({}),
+            args: Arc::new(json!({})),
         },
         AgentEvent::ToolExecutionUpdate {
             tool_call_id: "tc".to_string(),
             tool_name: "bash".to_string(),
-            args: json!({}),
+            args: Arc::new(json!({})),
             partial_result: test_tool_output(),
         },
         AgentEvent::ToolExecutionEnd {
             tool_call_id: "tc".to_string(),
             tool_name: "read".to_string(),
-            result: test_tool_output(),
+            result: Arc::new(test_tool_output()),
             is_error: false,
         },
         AgentEvent::AutoCompactionStart {
@@ -1077,7 +1077,7 @@ fn json_parity_all_event_type_strings() {
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "t".to_string(),
                 tool_name: "r".to_string(),
-                args: json!({}),
+                args: Arc::new(json!({})),
             },
             "tool_execution_start",
         ),
@@ -1085,7 +1085,7 @@ fn json_parity_all_event_type_strings() {
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "t".to_string(),
                 tool_name: "r".to_string(),
-                args: json!({}),
+                args: Arc::new(json!({})),
                 partial_result: test_tool_output(),
             },
             "tool_execution_update",
@@ -1094,7 +1094,7 @@ fn json_parity_all_event_type_strings() {
             AgentEvent::ToolExecutionEnd {
                 tool_call_id: "t".to_string(),
                 tool_name: "r".to_string(),
-                result: test_tool_output(),
+                result: Arc::new(test_tool_output()),
                 is_error: false,
             },
             "tool_execution_end",
@@ -1721,12 +1721,12 @@ fn json_parity_complete_lifecycle_with_extension_ui() {
     let tool_start = event_to_json(&AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-1".to_string(),
         tool_name: "bash".to_string(),
-        args: json!({"command": "echo hi"}),
+        args: Arc::new(json!({"command": "echo hi"})),
     });
     let tool_end = event_to_json(&AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-1".to_string(),
         tool_name: "bash".to_string(),
-        result: test_tool_output(),
+        result: Arc::new(test_tool_output()),
         is_error: false,
     });
     let ui_req = ExtensionUiRequest::new(
@@ -1822,7 +1822,7 @@ fn json_parity_extension_event_from_agent_mapping() {
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "tc".to_string(),
                 tool_name: "read".to_string(),
-                args: json!({}),
+                args: Arc::new(json!({})),
             },
             ExtensionEventName::ToolExecutionStart,
         ),
@@ -1830,7 +1830,7 @@ fn json_parity_extension_event_from_agent_mapping() {
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "tc".to_string(),
                 tool_name: "bash".to_string(),
-                args: json!({}),
+                args: Arc::new(json!({})),
                 partial_result: test_tool_output(),
             },
             ExtensionEventName::ToolExecutionUpdate,
@@ -1839,7 +1839,7 @@ fn json_parity_extension_event_from_agent_mapping() {
             AgentEvent::ToolExecutionEnd {
                 tool_call_id: "tc".to_string(),
                 tool_name: "read".to_string(),
-                result: test_tool_output(),
+                result: Arc::new(test_tool_output()),
                 is_error: false,
             },
             ExtensionEventName::ToolExecutionEnd,
@@ -1932,7 +1932,7 @@ fn json_parity_extension_event_payload_camel_case() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-1".to_string(),
         tool_name: "bash".to_string(),
-        args: json!({"command": "ls"}),
+        args: Arc::new(json!({"command": "ls"})),
     };
 
     let (_, payload) = extension_event_from_agent(&event).expect("should be forwarded");
@@ -1969,7 +1969,7 @@ fn json_parity_tool_execution_extension_tool() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-ext-1".to_string(),
         tool_name: "my-extension__custom_tool".to_string(),
-        args: json!({"input": "test data", "mode": "fast"}),
+        args: Arc::new(json!({"input": "test data", "mode": "fast"})),
     };
     let json = event_to_json(&event);
 
@@ -1981,11 +1981,11 @@ fn json_parity_tool_execution_extension_tool() {
     let event_end = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-ext-1".to_string(),
         tool_name: "my-extension__custom_tool".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("extension error"))],
             details: None,
             is_error: true,
-        },
+        }),
         is_error: true,
     };
     let json_end = event_to_json(&event_end);
@@ -2015,11 +2015,11 @@ fn json_parity_tool_error_consistency() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-err".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("command not found"))],
             details: Some(json!({"exitCode": 127})),
             is_error: true,
-        },
+        }),
         is_error: true,
     };
     let json = event_to_json(&event);
@@ -2042,7 +2042,7 @@ fn json_parity_all_builtin_tool_names() {
         let event = AgentEvent::ToolExecutionStart {
             tool_call_id: format!("tc-{name}"),
             tool_name: (*name).to_string(),
-            args: json!({}),
+            args: Arc::new(json!({})),
         };
         let json = event_to_json(&event);
         assert_eq!(json["toolName"].as_str(), Some(*name));
@@ -2063,11 +2063,11 @@ fn json_parity_tool_result_no_details() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-nd".to_string(),
         tool_name: "write".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("written"))],
             details: None,
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -2127,7 +2127,7 @@ fn json_parity_tool_args_preserve_arbitrary_json() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-cplx".to_string(),
         tool_name: "read".to_string(),
-        args: complex_args.clone(),
+        args: Arc::new(complex_args.clone()),
     };
     let json = event_to_json(&event);
     assert_eq!(json["args"], complex_args);
@@ -2149,7 +2149,7 @@ fn json_parity_extension_event_round_trip() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-rt".to_string(),
         tool_name: "edit".to_string(),
-        args: json!({"path": "/tmp/f.rs", "old_string": "foo", "new_string": "bar"}),
+        args: Arc::new(json!({"path": "/tmp/f.rs", "old_string": "foo", "new_string": "bar"})),
     };
 
     let direct = event_to_json(&event);
@@ -2315,7 +2315,7 @@ fn json_parity_tool_details_rich_data() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-bash-det".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("output"))],
             details: Some(json!({
                 "exitCode": 0,
@@ -2324,7 +2324,7 @@ fn json_parity_tool_details_rich_data() {
                 "executionTimeMs": 42
             })),
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -2337,14 +2337,14 @@ fn json_parity_tool_details_rich_data() {
     let event_read = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-read-det".to_string(),
         tool_name: "read".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new("file contents"))],
             details: Some(json!({
                 "size": 1024,
                 "lineCount": 50
             })),
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json_read = event_to_json(&event_read);
@@ -2369,12 +2369,12 @@ fn json_parity_tool_lifecycle_ordering() {
         AgentEvent::ToolExecutionStart {
             tool_call_id: "tc-life".to_string(),
             tool_name: "bash".to_string(),
-            args: json!({"command": "sleep 1 && echo done"}),
+            args: Arc::new(json!({"command": "sleep 1 && echo done"})),
         },
         AgentEvent::ToolExecutionUpdate {
             tool_call_id: "tc-life".to_string(),
             tool_name: "bash".to_string(),
-            args: json!({"command": "sleep 1 && echo done"}),
+            args: Arc::new(json!({"command": "sleep 1 && echo done"})),
             partial_result: ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(""))],
                 details: None,
@@ -2384,11 +2384,11 @@ fn json_parity_tool_lifecycle_ordering() {
         AgentEvent::ToolExecutionEnd {
             tool_call_id: "tc-life".to_string(),
             tool_name: "bash".to_string(),
-            result: ToolOutput {
+            result: Arc::new(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("done"))],
                 details: Some(json!({"exitCode": 0})),
                 is_error: false,
-            },
+            }),
             is_error: false,
         },
     ];
@@ -2440,11 +2440,11 @@ fn json_parity_empty_text_content() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-empty".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(""))],
             details: None,
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -2480,11 +2480,11 @@ fn json_parity_unicode_content() {
         let event = AgentEvent::ToolExecutionEnd {
             tool_call_id: format!("tc-{label}"),
             tool_name: "bash".to_string(),
-            result: ToolOutput {
+            result: Arc::new(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(*text))],
                 details: None,
                 is_error: false,
-            },
+            }),
             is_error: false,
         };
         let json = event_to_json(&event);
@@ -2525,7 +2525,7 @@ fn json_parity_large_payload_tool_args() {
     let event = AgentEvent::ToolExecutionStart {
         tool_call_id: "tc-large".to_string(),
         tool_name: "write".to_string(),
-        args: json!({"path": "/tmp/big.txt", "content": large_text}),
+        args: Arc::new(json!({"path": "/tmp/big.txt", "content": large_text})),
     };
     let json = event_to_json(&event);
 
@@ -2554,7 +2554,7 @@ fn json_parity_tool_output_multiple_content_blocks() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-multi".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![
                 ContentBlock::Text(TextContent::new("stdout: hello")),
                 ContentBlock::Text(TextContent::new("stderr: warning")),
@@ -2562,7 +2562,7 @@ fn json_parity_tool_output_multiple_content_blocks() {
             ],
             details: Some(json!({"exitCode": 0})),
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -2596,11 +2596,11 @@ fn json_parity_tool_output_empty_content() {
     let event = AgentEvent::ToolExecutionEnd {
         tool_call_id: "tc-empty-content".to_string(),
         tool_name: "bash".to_string(),
-        result: ToolOutput {
+        result: Arc::new(ToolOutput {
             content: vec![],
             details: None,
             is_error: false,
-        },
+        }),
         is_error: false,
     };
     let json = event_to_json(&event);
@@ -2984,7 +2984,7 @@ fn json_parity_ame_toolcall_lifecycle() {
         tool_call: ToolCall {
             id: "toolu_01xyz".to_string(),
             name: "read".to_string(),
-            arguments: json!({"path": "/tmp/test.txt"}),
+            arguments: Arc::new(json!({"path": "/tmp/test.txt"})),
             thought_signature: Some("sig_abc".to_string()),
         },
         partial: Arc::clone(&partial),
@@ -3199,7 +3199,7 @@ fn json_parity_content_block_type_tags() {
             ContentBlock::ToolCall(ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({}),
+                arguments: Arc::new(json!({})),
                 thought_signature: None,
             }),
             "toolCall",
@@ -3242,7 +3242,7 @@ fn json_parity_assistant_message_mixed_content() {
             ContentBlock::ToolCall(ToolCall {
                 id: "toolu_01abc".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/tmp/test.txt"}),
+                arguments: Arc::new(json!({"path": "/tmp/test.txt"})),
                 thought_signature: None,
             }),
         ],
@@ -3336,7 +3336,7 @@ fn json_parity_full_lifecycle_with_tool_turn() {
                 tool_call: ToolCall {
                     id: "tc-1".to_string(),
                     name: "bash".to_string(),
-                    arguments: json!({"command": "echo hello"}),
+                    arguments: Arc::new(json!({"command": "echo hello"})),
                     thought_signature: None,
                 },
                 partial: Arc::clone(&partial),
@@ -3356,16 +3356,16 @@ fn json_parity_full_lifecycle_with_tool_turn() {
         AgentEvent::ToolExecutionStart {
             tool_call_id: "tc-1".to_string(),
             tool_name: "bash".to_string(),
-            args: json!({"command": "echo hello"}),
+            args: Arc::new(json!({"command": "echo hello"})),
         },
         AgentEvent::ToolExecutionEnd {
             tool_call_id: "tc-1".to_string(),
             tool_name: "bash".to_string(),
-            result: ToolOutput {
+            result: Arc::new(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("hello\n"))],
                 details: Some(json!({"exitCode": 0})),
                 is_error: false,
-            },
+            }),
             is_error: false,
         },
         // Turn end with tool results.
@@ -3698,13 +3698,13 @@ fn json_parity_ndjson_single_line() {
         AgentEvent::ToolExecutionEnd {
             tool_call_id: "tc-nl".to_string(),
             tool_name: "bash".to_string(),
-            result: ToolOutput {
+            result: Arc::new(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(
                     "line1\nline2\nline3\n",
                 ))],
                 details: None,
                 is_error: false,
-            },
+            }),
             is_error: false,
         },
         // Tab and carriage return in delta.
@@ -3880,7 +3880,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "read".to_string(),
-                args: json!({"path": "/tmp/file"}),
+                args: Arc::new(json!({"path": "/tmp/file"})),
             },
             "toolCallId",
         ),
@@ -3888,7 +3888,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
             AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "bash".to_string(),
-                args: json!({}),
+                args: Arc::new(json!({})),
                 partial_result: test_tool_output(),
             },
             "toolCallId",
@@ -3897,7 +3897,7 @@ fn json_parity_extension_event_payload_all_forwarded() {
             AgentEvent::ToolExecutionEnd {
                 tool_call_id: "tc-1".to_string(),
                 tool_name: "read".to_string(),
-                result: test_tool_output(),
+                result: Arc::new(test_tool_output()),
                 is_error: false,
             },
             "toolCallId",
@@ -4003,11 +4003,11 @@ fn json_parity_tool_details_edge_cases() {
         let event = AgentEvent::ToolExecutionEnd {
             tool_call_id: format!("tc-{label}"),
             tool_name: "bash".to_string(),
-            result: ToolOutput {
+            result: Arc::new(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("output"))],
                 details: details.clone(),
                 is_error: false,
-            },
+            }),
             is_error: false,
         };
         let json = event_to_json(&event);
@@ -4086,12 +4086,12 @@ fn json_parity_multi_tool_turn() {
         all_events.push(event_to_json(&AgentEvent::ToolExecutionStart {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
-            args: args.clone(),
+            args: Arc::new(args.clone()),
         }));
         all_events.push(event_to_json(&AgentEvent::ToolExecutionEnd {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
-            result: test_tool_output(),
+            result: Arc::new(test_tool_output()),
             is_error: false,
         }));
     }
@@ -4187,7 +4187,7 @@ fn json_parity_tool_call_camel_case() {
     let tc = ToolCall {
         id: "toolu_01abc".to_string(),
         name: "read".to_string(),
-        arguments: json!({"path": "/tmp/x"}),
+        arguments: Arc::new(json!({"path": "/tmp/x"})),
         thought_signature: Some("sig_thought_xyz".to_string()),
     };
     let json = serde_json::to_value(&tc).expect("serialize");
@@ -4201,7 +4201,7 @@ fn json_parity_tool_call_camel_case() {
     let tc_no_sig = ToolCall {
         id: "toolu_02".to_string(),
         name: "bash".to_string(),
-        arguments: json!({}),
+        arguments: Arc::new(json!({})),
         thought_signature: None,
     };
     let json_no_sig = serde_json::to_value(&tc_no_sig).expect("serialize");
@@ -4233,7 +4233,7 @@ fn json_parity_special_chars_in_tool_args() {
         let event = AgentEvent::ToolExecutionStart {
             tool_call_id: format!("tc-{label}"),
             tool_name: "bash".to_string(),
-            args: args.clone(),
+            args: Arc::new(args.clone()),
         };
         let json = event_to_json(&event);
 
