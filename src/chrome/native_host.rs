@@ -10,9 +10,7 @@ use asupersync::net::unix::UnixListener;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{DiscoveryRecord, protocol};
-
-const DEFAULT_NATIVE_HOST_DIR: &str = "/tmp";
+use super::{DiscoveryRecord, default_runtime_dir, protocol};
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 const SOCKET_PREFIX: &str = "pi-chrome-";
@@ -41,9 +39,11 @@ pub struct NativeHostConfig {
 impl NativeHostConfig {
     #[must_use]
     pub fn new() -> Self {
+        let runtime_dir = default_runtime_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         Self {
-            discovery_dir: PathBuf::from(DEFAULT_NATIVE_HOST_DIR),
-            socket_dir: PathBuf::from(DEFAULT_NATIVE_HOST_DIR),
+            discovery_dir: runtime_dir.clone(),
+            socket_dir: runtime_dir,
             host_id: None,
             host_epoch: None,
             token: None,
@@ -397,14 +397,8 @@ impl NativeHost {
             return Ok(());
         }
 
-        fs::create_dir_all(&self.config.socket_dir).map_err(|source| NativeHostError::Io {
-            path: self.config.socket_dir.clone(),
-            source,
-        })?;
-        fs::create_dir_all(&self.config.discovery_dir).map_err(|source| NativeHostError::Io {
-            path: self.config.discovery_dir.clone(),
-            source,
-        })?;
+        create_dir_owner_only(&self.config.socket_dir)?;
+        create_dir_owner_only(&self.config.discovery_dir)?;
 
         let listener = UnixListener::bind(&self.socket_path)
             .await
@@ -740,11 +734,7 @@ impl NativeHost {
                 path: self.discovery_path.clone(),
                 source,
             })?;
-        fs::write(&self.discovery_path, bytes).map_err(|source| NativeHostError::Io {
-            path: self.discovery_path.clone(),
-            source,
-        })?;
-        set_owner_only_permissions(&self.discovery_path)?;
+        write_file_owner_only(&self.discovery_path, &bytes)?;
         Ok(())
     }
 }
@@ -797,6 +787,56 @@ fn random_token() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
+/// Create directory (and parents) with owner-only (0o700) permissions.
+///
+/// Uses `create_dir_all` then sets 0o700 on the leaf. Parent directories
+/// inherit the process umask (typically 0o755), which is acceptable because
+/// the leaf directory is the security boundary.
+fn create_dir_owner_only(path: &Path) -> Result<(), NativeHostError> {
+    fs::create_dir_all(path).map_err(|source| NativeHostError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut perms = fs::metadata(path)
+        .map_err(|source| NativeHostError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(path, perms).map_err(|source| NativeHostError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Write `data` to `path` with owner-only (0o600) permissions set **at creation
+/// time**, avoiding the TOCTOU race of write-then-chmod.
+///
+/// Uses `O_CREAT | O_WRONLY | O_TRUNC` with `.mode(0o600)` via
+/// `std::os::unix::fs::OpenOptionsExt` so the file is never world-readable,
+/// even briefly.
+fn write_file_owner_only(path: &Path, data: &[u8]) -> Result<(), NativeHostError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| NativeHostError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(data).map_err(|source| NativeHostError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Set 0o600 permissions on an already-existing path (e.g. a Unix socket
+/// created by `bind`).
 fn set_owner_only_permissions(path: &Path) -> Result<(), NativeHostError> {
     let mut perms = fs::metadata(path)
         .map_err(|source| NativeHostError::Io {
@@ -3668,6 +3708,135 @@ mod tests {
             assert!(
                 chrome_writer.is_empty(),
                 "indeterminate ESL reject must not dispatch the request to Chrome"
+            );
+        });
+    }
+
+    // ── C1/H1 security tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_runtime_dir_is_not_tmp() {
+        // C1: default_runtime_dir must NOT return /tmp.
+        let dir = super::super::default_runtime_dir();
+        assert!(dir.is_some(), "default_runtime_dir should resolve on dev machines");
+        let dir = dir.unwrap();
+        assert_ne!(
+            dir,
+            PathBuf::from("/tmp"),
+            "C1: discovery dir must not be world-readable /tmp"
+        );
+        assert!(
+            !dir.starts_with("/tmp"),
+            "C1: discovery dir must not be under /tmp"
+        );
+    }
+
+    #[test]
+    fn test_native_host_config_default_dir_is_not_tmp() {
+        // C1: NativeHostConfig::new() must not default to /tmp.
+        let config = NativeHostConfig::new();
+        assert_ne!(
+            config.discovery_dir,
+            PathBuf::from("/tmp"),
+            "C1: default NativeHostConfig discovery_dir must not be /tmp"
+        );
+        assert_ne!(
+            config.socket_dir,
+            PathBuf::from("/tmp"),
+            "C1: default NativeHostConfig socket_dir must not be /tmp"
+        );
+    }
+
+    #[test]
+    fn test_discovery_file_created_with_0o600_at_creation_time() {
+        // H1: Discovery file must be created with 0o600 from the start,
+        // not written first and then chmod'd.
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut host = NativeHost::new(test_config(tempdir.path())).expect("host init");
+
+            host.startup().await.expect("startup");
+
+            // Verify the discovery file has 0o600 permissions.
+            let mode = fs::metadata(host.discovery_path())
+                .expect("stat discovery file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "H1: discovery file must have 0o600 permissions set at creation time"
+            );
+        });
+    }
+
+    #[test]
+    fn test_write_file_owner_only_creates_with_correct_mode() {
+        // H1: write_file_owner_only must create files with 0o600 from the start.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let path = tempdir.path().join("secure-test-file.json");
+
+        write_file_owner_only(&path, b"secret-data").expect("write_file_owner_only");
+
+        let mode = fs::metadata(&path)
+            .expect("stat file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "H1: write_file_owner_only must set 0o600 at creation time"
+        );
+
+        // Verify the content is correct.
+        let content = fs::read(&path).expect("read file");
+        assert_eq!(content, b"secret-data");
+    }
+
+    #[test]
+    fn test_create_dir_owner_only_sets_0o700() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir.path().join("secure-dir");
+
+        create_dir_owner_only(&dir).expect("create_dir_owner_only");
+
+        let mode = fs::metadata(&dir)
+            .expect("stat dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "create_dir_owner_only must set 0o700 on the directory"
+        );
+    }
+
+    #[test]
+    fn test_startup_creates_dirs_with_0o700() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let runtime_dir = tempdir.path().join("pi-runtime");
+            let config = NativeHostConfig {
+                discovery_dir: runtime_dir.clone(),
+                socket_dir: runtime_dir.clone(),
+                host_id: Some("host-dirtest".to_string()),
+                host_epoch: Some("epoch-dirtest".to_string()),
+                token: Some("token-dirtest".to_string()),
+                lease_ttl_ms: 30_000,
+                idle_timeout_ms: 25,
+                capabilities: vec!["browser_tools".to_string()],
+            };
+            let mut host = NativeHost::new(config).expect("host init");
+            host.startup().await.expect("startup");
+
+            let dir_mode = fs::metadata(&runtime_dir)
+                .expect("stat runtime dir")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                dir_mode, 0o700,
+                "startup must create runtime dir with 0o700 permissions"
             );
         });
     }

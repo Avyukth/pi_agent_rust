@@ -25,7 +25,6 @@ pub mod observer;
 pub mod protocol;
 pub mod tools;
 
-const DEFAULT_DISCOVERY_DIR: &str = "/tmp";
 const DISCOVERY_PREFIX: &str = "pi-chrome-host-";
 const DISCOVERY_SUFFIX: &str = ".discovery.json";
 const DEFAULT_MAX_RECONNECT_ATTEMPTS: u8 = 3;
@@ -35,6 +34,34 @@ const MAX_ESL_IN_PROGRESS_RETRIES: u8 = 3;
 const ESL_IN_PROGRESS_BACKOFF_MS: u64 = 5;
 pub const MEMORY_SOAK_RSS_TARGET_MB: u64 = 150;
 pub const MEMORY_SOAK_ACCEPTANCE_HANDOFF_BEAD: &str = "bd-11p.3";
+
+/// Returns the per-user runtime directory for Pi discovery/socket files.
+///
+/// **Security:** Discovery files contain authentication tokens and MUST NOT be
+/// written to world-accessible directories like `/tmp`.
+///
+/// Platform strategy:
+/// - **macOS:** `~/Library/Application Support/Pi/run/`
+/// - **Linux:** `$XDG_RUNTIME_DIR/pi/` (fallback: `~/.local/run/pi/`)
+///
+/// Returns `None` only if the home directory cannot be determined.
+#[must_use]
+pub fn default_runtime_dir() -> Option<PathBuf> {
+    default_runtime_dir_inner()
+}
+
+#[cfg(target_os = "macos")]
+fn default_runtime_dir_inner() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join("Library/Application Support/Pi/run"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_runtime_dir_inner() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return Some(PathBuf::from(xdg).join("pi"));
+    }
+    dirs::home_dir().map(|h| h.join(".local/run/pi"))
+}
 
 type PendingResponses = HashMap<String, oneshot::Sender<protocol::ResponseEnvelope>>;
 type RequestFingerprintRegistry = HashMap<(String, String), protocol::RequestFingerprint>;
@@ -140,10 +167,12 @@ pub struct ChromeBridgeConfig {
 impl ChromeBridgeConfig {
     #[must_use]
     pub fn new(pi_session_id: impl Into<String>, client_instance_id: impl Into<String>) -> Self {
+        let discovery_dir = default_runtime_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         Self {
             pi_session_id: pi_session_id.into(),
             client_instance_id: client_instance_id.into(),
-            discovery_dir: PathBuf::from(DEFAULT_DISCOVERY_DIR),
+            discovery_dir,
             want_capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
             max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
             reconnect_backoff_ms: DEFAULT_RECONNECT_BACKOFF_MS,
@@ -3152,6 +3181,62 @@ mod tests {
             json!({"ok": true})["ok"],
             true,
             "serde_json smoke for test module"
+        );
+    }
+
+    // ── C1 security tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_runtime_dir_not_tmp() {
+        // C1: default_runtime_dir must not return /tmp.
+        let dir = default_runtime_dir();
+        assert!(dir.is_some(), "default_runtime_dir should succeed on dev machines");
+        let dir = dir.unwrap();
+        assert_ne!(
+            dir,
+            PathBuf::from("/tmp"),
+            "C1: default runtime dir must not be world-readable /tmp"
+        );
+    }
+
+    #[test]
+    fn test_chrome_bridge_config_default_discovery_dir_not_tmp() {
+        // C1: ChromeBridgeConfig default must not use /tmp.
+        let config = ChromeBridgeConfig::default();
+        assert_ne!(
+            config.discovery_dir,
+            PathBuf::from("/tmp"),
+            "C1: ChromeBridgeConfig default discovery_dir must not be /tmp"
+        );
+        assert!(
+            !config.discovery_dir.starts_with("/tmp"),
+            "C1: ChromeBridgeConfig default discovery_dir must not be under /tmp"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_default_runtime_dir_macos_path() {
+        let dir = default_runtime_dir().expect("should resolve on macOS");
+        assert!(
+            dir.to_string_lossy().contains("Library/Application Support/Pi/run"),
+            "macOS runtime dir should be under ~/Library/Application Support/Pi/run, got {dir:?}"
+        );
+    }
+
+    #[test]
+    fn test_discovery_file_permissions_reject_symlinks() {
+        // Verify that discovery_file_permissions_are_secure rejects symlinks.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let real_file = tempdir.path().join("real-file.json");
+        std::fs::write(&real_file, b"{}").expect("write real file");
+
+        let symlink_path = tempdir.path().join("link-file.json");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).expect("create symlink");
+
+        assert!(
+            !discovery_file_permissions_are_secure(&symlink_path),
+            "symlinks must be rejected by discovery_file_permissions_are_secure"
         );
     }
 }
