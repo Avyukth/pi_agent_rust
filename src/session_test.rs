@@ -6,9 +6,14 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use asupersync::sync::Mutex;
 
-#[tokio::test]
-async fn test_session_save_persistence() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
+#[test]
+fn test_session_save_persistence() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+
+    runtime.block_on(async move {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
     let session_path = temp_dir.path().join("test_session.jsonl");
     
     // Create a new session
@@ -48,4 +53,5 @@ async fn test_session_save_persistence() {
     } else {
         panic!("Unexpected entry type");
     }
+    });
 }
