@@ -336,6 +336,18 @@ esac
 exit 0
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
+
+    // Stub for `rch` — orchestrate.sh defaults to PERF_CARGO_RUNNER=rch and
+    // verifies `rch check --quiet` before proceeding. Provide a no-op stub so
+    // the fake-toolchain tests pass without a real rch binary.
+    let rch_stub = r#"#!/usr/bin/env bash
+case "$1" in
+  check) exit 0 ;;
+  exec)  shift; shift; exec "$@" ;;
+  *)     exit 0 ;;
+esac
+"#;
+    write_executable(&bin_dir.join("rch"), rch_stub);
 }
 
 fn canonical_protocol_contract() -> Value {

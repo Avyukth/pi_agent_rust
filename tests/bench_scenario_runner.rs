@@ -291,6 +291,11 @@ async fn run_bench_js(
 }
 
 async fn load_extension(runtime: &PiJsRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
+    // Register extension root so the module resolver allows imports from this directory.
+    if let Some(root) = spec.entry_path.parent() {
+        runtime.add_extension_root_with_id(root.to_path_buf(), Some(&spec.extension_id));
+    }
+
     let ext_id = js_literal(&spec.extension_id)?;
     let entry = js_literal(&spec.entry_path.display().to_string().replace('\\', "/"))?;
     let meta = js_literal(&json!({
