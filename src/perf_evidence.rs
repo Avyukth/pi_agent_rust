@@ -50,7 +50,7 @@ pub const DEFAULT_IMPROVEMENT_THRESHOLD_PCT: f64 = 10.0;
 /// Provides enough context to compare baselines across machines without
 /// requiring identical hardware. The [`machine_id`](Self::machine_id) groups
 /// results by hardware tier for per-machine baseline comparison.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvFingerprint {
     /// Operating system name and version.
     pub os: String,
@@ -84,7 +84,7 @@ impl EnvFingerprint {
             .cpus()
             .first()
             .map_or_else(|| "unknown".to_string(), |c| c.brand().to_string());
-        let cpu_cores = sys.cpus().len() as u32;
+        let cpu_cores = u32::try_from(sys.cpus().len()).unwrap_or(u32::MAX);
         let mem_total_mb = sys.total_memory() / 1024 / 1024;
         let os =
             sysinfo::System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
@@ -176,8 +176,10 @@ impl PercentileStats {
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = samples.len();
         let sum: f64 = samples.iter().sum();
-        let mean = sum / n as f64;
-        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let nf = n as f64;
+        let mean = sum / nf;
+        let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / nf;
 
         Some(Self {
             sample_count: n as u64,
@@ -198,6 +200,11 @@ fn percentile_sorted(sorted: &[f64], pct: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     let idx = (pct / 100.0 * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
 }
@@ -271,12 +278,14 @@ impl BenchmarkRecord {
     }
 
     /// Attach percentile stats to this record.
+    #[must_use]
     pub fn with_stats(mut self, stats: PercentileStats) -> Self {
         self.stats = Some(stats);
         self
     }
 
     /// Attach a scalar value to this record.
+    #[must_use]
     pub fn with_value(mut self, value: f64, unit: &str) -> Self {
         self.value = Some(value);
         self.value_unit = Some(unit.to_string());
@@ -284,6 +293,7 @@ impl BenchmarkRecord {
     }
 
     /// Add a metadata key-value pair.
+    #[must_use]
     pub fn with_metadata(mut self, key: &str, value: serde_json::Value) -> Self {
         self.metadata.insert(key.to_string(), value);
         self
@@ -378,8 +388,7 @@ impl BaselineStore {
 
     /// Save to a JSON file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -464,7 +473,7 @@ impl BaselineStore {
             .map(|s| s.unit.clone())
             .or_else(|| record.value_unit.clone())
             .unwrap_or_default();
-        let sample_count = record.stats.as_ref().map(|s| s.sample_count).unwrap_or(1);
+        let sample_count = record.stats.as_ref().map_or(1, |s| s.sample_count);
 
         Some(BaselineEntry {
             name: record.name.clone(),
@@ -555,11 +564,7 @@ fn parse_criterion_estimates(
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/");
 
-    let stddev = estimates
-        .std_dev
-        .as_ref()
-        .map(|s| s.point_estimate)
-        .unwrap_or(0.0);
+    let stddev = estimates.std_dev.as_ref().map_or(0.0, |s| s.point_estimate);
 
     // Criterion reports in nanoseconds by default.
     let mut record = BenchmarkRecord::new(&name, "latency", EvidenceSource::Criterion);
@@ -567,8 +572,8 @@ fn parse_criterion_estimates(
         sample_count: 0, // criterion doesn't expose sample count in estimates.json
         min: estimates.mean.confidence_interval.lower_bound,
         p50: estimates.median.point_estimate,
-        p95: estimates.mean.point_estimate + 1.645 * stddev,
-        p99: estimates.mean.point_estimate + 2.326 * stddev,
+        p95: 1.645f64.mul_add(stddev, estimates.mean.point_estimate),
+        p99: 2.326f64.mul_add(stddev, estimates.mean.point_estimate),
         max: estimates.mean.confidence_interval.upper_bound,
         mean: estimates.mean.point_estimate,
         stddev,
@@ -637,11 +642,9 @@ pub struct ReportSummary {
 impl EvidenceReport {
     /// Generate a report from records and a baseline store.
     pub fn generate(records: Vec<BenchmarkRecord>, baselines: &BaselineStore) -> Self {
-        let env = if let Some(first) = records.first() {
-            first.env.clone()
-        } else {
-            EnvFingerprint::collect()
-        };
+        let env = records
+            .first()
+            .map_or_else(EnvFingerprint::collect, |first| first.env.clone());
         let machine_id = env.machine_id();
 
         let comparisons: Vec<BaselineComparison> =

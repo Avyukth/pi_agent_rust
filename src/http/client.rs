@@ -649,7 +649,7 @@ struct BodyStreamState {
 }
 
 impl BodyStreamState {
-    fn new(
+    const fn new(
         transport: Transport,
         kind: BodyKind,
         leftover: Vec<u8>,

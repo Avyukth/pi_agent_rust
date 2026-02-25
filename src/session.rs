@@ -1987,7 +1987,7 @@ impl Session {
     /// Monotonic generation counter (V8-B).  Incremented on every mutation
     /// that could change the output of `to_messages_for_current_path()`.
     /// Consumers can compare generations to skip expensive rebuilds.
-    pub fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 
