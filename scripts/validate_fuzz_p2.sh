@@ -53,7 +53,7 @@ count_files() {
 
 run_cmd() {
     if [ "$RCH_MODE" = "enabled" ]; then
-        rch exec -- "$@"
+        env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" rch exec -- "$@"
     else
         "$@"
     fi

@@ -498,7 +498,7 @@ mod tests {
                     assert_eq!(tool, "broken_tool");
                     assert!(message.contains("Invalid extension tool output"));
                 }
-                other => panic!("expected tool error, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -550,7 +550,7 @@ mod tests {
             if let Some(result) = tool_result {
                 match result.content.as_slice() {
                     [ContentBlock::Text(text)] => assert_eq!(text.text, "hello pi"),
-                    other => panic!("Expected single text content block, got: {other:?}"),
+                    other => panic!(),
                 }
 
                 let events = vec![
@@ -671,7 +671,7 @@ mod tests {
 
             match message.content.as_slice() {
                 [ContentBlock::Text(text)] => assert_eq!(text.text, "done"),
-                other => panic!("Expected single text content block, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -956,7 +956,7 @@ mod tests {
                         "Expected error message to reference the thrown error, got: {message}"
                     );
                 }
-                other => panic!("expected tool error, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -1027,7 +1027,7 @@ mod tests {
                 [ContentBlock::Text(text)] => {
                     assert_eq!(text.text, "something went wrong");
                 }
-                other => panic!("expected text content, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -1067,7 +1067,7 @@ mod tests {
                         serde_json::from_str(&text.text).expect("parse JSON");
                     assert_eq!(parsed["msg"], "hello world");
                 }
-                other => panic!("expected text content, got {other:?}"),
+                other => panic!(),
             }
         });
     }

@@ -1073,7 +1073,7 @@ mod tests {
                     // Day rolled over to 1 — month or year changed
                     assert!(m2 != m1 || y2 != y1);
                 } else {
-                    panic!("unexpected day sequence: {y1}-{m1}-{d1} -> {y2}-{m2}-{d2}");
+                    assert!(false, "unexpected day sequence: {y1}-{m1}-{d1} -> {y2}-{m2}-{d2}");
                 }
             }
 

@@ -2679,13 +2679,13 @@ mod tests {
         if let MacrotaskKind::InboundEvent { event_id, .. } = task1.kind {
             assert_eq!(event_id, "E1");
         } else {
-            panic!("Expected InboundEvent first, got {:?}", task1.kind);
+            panic!();
         }
 
         if let MacrotaskKind::TimerFired { timer_id } = task2.kind {
             assert_eq!(timer_id, t1_id);
         } else {
-            panic!("Expected TimerFired second, got {:?}", task2.kind);
+            panic!();
         }
     }
 
@@ -3756,7 +3756,7 @@ mod tests {
                 MacrotaskKind::HostcallComplete { ref call_id, .. } => {
                     assert_eq!(call_id, expected);
                 }
-                _ => panic!("expected HostcallComplete"),
+                _ => panic!(),
             }
         }
         assert!(sched.tick().is_none());

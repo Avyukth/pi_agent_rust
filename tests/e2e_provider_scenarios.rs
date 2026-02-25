@@ -2036,7 +2036,7 @@ fn e2e_comprehensive_report() {
                 "error_auth" => (spec.error_response)(),
                 "error_rate_limit" => (spec.rate_limit_response)(),
                 "schema_drift" => text_event_stream((spec.schema_drift_sse)()),
-                _ => unreachable!(),
+                _ => panic!(),
             };
             let base_url = setup_mock_route(spec, &server, response);
             let mut entry = make_entry(spec.provider_id, spec.model_id, &base_url);

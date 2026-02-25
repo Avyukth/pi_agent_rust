@@ -575,7 +575,7 @@ fn shape_harness_nonexistent_fixture_reports_load_error() {
     }
 
     assert!(result.is_err(), "Should fail on nonexistent fixture");
-    let Err(err) = result else { unreachable!() };
+    let Err(err) = result else { panic!() };
 
     let failure = ShapeFailure::new(FailureClass::LoadError, &err);
     assert_eq!(failure.class, FailureClass::LoadError);

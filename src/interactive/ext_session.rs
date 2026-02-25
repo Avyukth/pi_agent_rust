@@ -130,7 +130,10 @@ pub(super) struct InteractiveExtensionSession {
 impl ExtensionSession for InteractiveExtensionSession {
     async fn get_state(&self) -> Value {
         let model = {
-            let guard = self.model_entry.lock().unwrap();
+            let guard = self
+                .model_entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             extension_model_from_entry(&guard)
         };
 

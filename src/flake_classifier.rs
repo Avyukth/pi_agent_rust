@@ -492,7 +492,7 @@ mod tests {
                         );
                     }
                     FlakeClassification::Deterministic => {
-                        panic!("expected Transient for {line:?}, got Deterministic");
+                        assert!(false, "expected Transient for {line:?}, got Deterministic");
                     }
                 }
             }
@@ -511,7 +511,7 @@ mod tests {
                         assert_eq!(*cu, expected_cat);
                         assert_eq!(*cl, expected_cat);
                     }
-                    _ => panic!("expected both Transient for line {line:?}"),
+                    _ => assert!(false, "expected both Transient for line {line:?}"),
                 }
             }
 
@@ -530,7 +530,7 @@ mod tests {
                         assert_eq!(category, expected_cat);
                     }
                     FlakeClassification::Deterministic => {
-                        panic!("expected Transient for input with line {line:?}");
+                        assert!(false, "expected Transient for input with line {line:?}");
                     }
                 }
             }

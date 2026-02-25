@@ -3541,14 +3541,14 @@ export default function init(pi) {
 
     #[test]
     fn detect_hardcoded_secret() {
-        let report = scan(r#"const api_key = "sk-ant-api03-abc123";"#);
+        let report = scan(r#"const api_key  = "sk-ant-api03-abc123";"#);
         assert!(has_rule(&report, SecurityRuleId::HardcodedSecret));
         assert!(report.needs_review());
     }
 
     #[test]
     fn detect_hardcoded_password() {
-        let report = scan(r#"const password = "s3cretP@ss";"#);
+        let report = scan(r#"const password  = "s3cretP@ss";"#);
         assert!(has_rule(&report, SecurityRuleId::HardcodedSecret));
     }
 
@@ -3562,13 +3562,13 @@ export default function init(pi) {
 
     #[test]
     fn empty_secret_not_flagged() {
-        let report = scan(r#"const api_key = "";"#);
+        let report = scan(r#"const api_key  = "";"#);
         assert!(!has_rule(&report, SecurityRuleId::HardcodedSecret));
     }
 
     #[test]
     fn detect_token_prefix() {
-        let report = scan(r#"const token = "ghp_abc123def456";"#);
+        let report = scan(r#"const token  = "ghp_abc123def456";"#);
         assert!(has_rule(&report, SecurityRuleId::HardcodedSecret));
     }
 
@@ -3694,7 +3694,7 @@ export default function init(pi) {
         let report = scan(
             r#"
 eval('bad');
-const api_key = "sk-ant-secret";
+const api_key  = "sk-ant-secret";
 process.env.KEY;
 debugger;
 "#,
@@ -3770,7 +3770,7 @@ process.env.KEY;
     fn scan_is_deterministic() {
         let source = r#"
 eval('x');
-const api_key = "sk-ant-test";
+const api_key  = "sk-ant-test";
 process.env.HOME;
 debugger;
 "#;
@@ -3803,7 +3803,7 @@ debugger;
     #[test]
     fn needs_review_for_critical_and_high() {
         assert!(scan("eval('x');").needs_review());
-        assert!(scan(r#"const api_key = "sk-ant-test";"#).needs_review());
+        assert!(scan(r#"const api_key  = "sk-ant-test";"#).needs_review());
         assert!(!scan("process.env.X;").needs_review());
     }
 
@@ -4324,7 +4324,7 @@ const c = arguments.callee;
                 ]),
                 suffix in "[a-zA-Z0-9]{10,20}",
             ) {
-                let text = format!("const token = \"{prefix}{suffix}\";");
+                let text = format!("const token  = \"{prefix}{suffix}\";");
                 assert!(
                     contains_hardcoded_secret(&text),
                     "token prefix '{prefix}' should be detected: {text}"

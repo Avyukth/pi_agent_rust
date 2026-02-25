@@ -997,7 +997,7 @@ fn to_messages_for_current_path_inserts_compaction_summary_before_kept_region() 
         message_entry("a1", Some("u1"), assistant_text("keep", 0)),
         compaction_entry("c1", Some("a1"), "SUM", "u1", 123, None, None),
     ];
-    session.leaf_id = Some("c1".to_string());
+    session._test_set_leaf_id(Some("c1".to_string()));
 
     dump_timeline(&harness, "setup", &session.entries);
     let messages = session.to_messages_for_current_path();
@@ -1030,7 +1030,7 @@ fn to_messages_for_current_path_with_missing_first_kept_entry_id_keeps_only_summ
         message_entry("a0", Some("u0"), assistant_text("old", 0)),
         compaction_entry("c1", Some("a0"), "SUM", "does-not-exist", 123, None, None),
     ];
-    session.leaf_id = Some("c1".to_string());
+    session._test_set_leaf_id(Some("c1".to_string()));
 
     dump_timeline(&harness, "setup", &session.entries);
     let messages = session.to_messages_for_current_path();
@@ -1061,7 +1061,7 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
         message_entry("a1", Some("u1"), assistant_text("keep", 100)),
         message_entry("u2", Some("a1"), user_text(text_of_tokens(1))),
     ];
-    session.leaf_id = Some("u2".to_string());
+    session._test_set_leaf_id(Some("u2".to_string()));
 
     dump_timeline(&harness, "before", &session.entries);
 
@@ -1098,7 +1098,7 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
         Some(details),
         None,
     ));
-    session.leaf_id = Some("c1".to_string());
+    session._test_set_leaf_id(Some("c1".to_string()));
 
     dump_timeline(&harness, "after", &session.entries);
     let messages = session.to_messages_for_current_path();
@@ -1262,7 +1262,7 @@ fn compaction_pipeline_second_pass_seeds_previous_details_and_updates_summary() 
         Some(details2),
         None,
     ));
-    session.leaf_id = Some("c2".to_string());
+    session._test_set_leaf_id(Some("c2".to_string()));
 
     let messages = session.to_messages_for_current_path();
     assert!(!messages.is_empty());

@@ -388,7 +388,7 @@ fn run() -> Result<()> {
             Mode::PrepareRealistic => {
                 seed_realistic_session(&mut session, &args);
             }
-            Mode::Workload | Mode::WorkloadRealistic => unreachable!(),
+            Mode::Workload | Mode::WorkloadRealistic => panic!(),
         }
         let append_ms = append_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -447,7 +447,7 @@ fn run() -> Result<()> {
         Mode::WorkloadRealistic => {
             run_realistic_ops(&mut session, &args)?;
         }
-        Mode::Prepare | Mode::PrepareRealistic => unreachable!(),
+        Mode::Prepare | Mode::PrepareRealistic => panic!(),
     }
     let append_ms = append_started.elapsed().as_secs_f64() * 1000.0;
 

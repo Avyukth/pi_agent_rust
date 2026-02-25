@@ -2089,7 +2089,7 @@ export default function init(pi) {
             "https://example.com",
         );
         let Err(err) = create_provider(&entry, None) else {
-            panic!("unknown should fail");
+            panic!();
         };
         let msg = err.to_string();
         assert!(

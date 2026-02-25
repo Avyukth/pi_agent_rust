@@ -208,11 +208,14 @@ impl EventListeners {
 
     /// Dispatch an [`AgentEvent`] to all registered subscribers.
     pub fn notify(&self, event: &AgentEvent) {
-        let subs = self
-            .subscribers
-            .lock()
-            .expect("EventListeners lock poisoned");
-        for listener in subs.values() {
+        let listeners: Vec<_> = {
+            let subs = self
+                .subscribers
+                .lock()
+                .expect("EventListeners lock poisoned");
+            subs.values().cloned().collect()
+        };
+        for listener in listeners {
             listener(event.clone());
         }
     }
@@ -1999,7 +2002,7 @@ mod tests {
                 assert_eq!(content_index, 2);
                 assert_eq!(delta, "chunk");
             }
-            other => panic!("unexpected variant: {other:?}"),
+            other => panic!(),
         }
     }
 

@@ -121,7 +121,7 @@ cmd_minimize() {
     # Determine runner prefix
     local runner=""
     if command -v rch &>/dev/null; then
-        runner="rch exec --"
+        runner="env RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true} rch exec --"
     fi
 
     $runner cargo fuzz tmin "$target" "$artifact" -- 2>&1 | tee /dev/stderr

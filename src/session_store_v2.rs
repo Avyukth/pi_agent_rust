@@ -987,16 +987,21 @@ impl SessionStoreV2 {
                         // If line exceeds limit, we treat it as corruption and truncate.
                         // However, we can't easily recover the offset without reading past the bad data.
                         // For safety, we truncate at the start of this bad frame.
-                        tracing::warn!(
-                            segment = %seg_path.display(),
-                            line_number,
-                            error = %e,
-                            "SessionStoreV2 encountered oversized line during index rebuild; truncating segment"
-                        );
-                        drop(reader);
-                        truncate_file_to(seg_path, byte_offset)?;
-                        remove_orphaned_segments(&segment_files[i + 1..])?;
-                        break 'segments;
+                        if i == segment_files.len() - 1 {
+                            tracing::warn!(
+                                segment = %seg_path.display(),
+                                line_number,
+                                error = %e,
+                                "SessionStoreV2 encountered oversized line during index rebuild; truncating trailing segment"
+                            );
+                            drop(reader);
+                            truncate_file_to(seg_path, byte_offset)?;
+                            break 'segments;
+                        }
+                        return Err(Error::session(format!(
+                            "oversized line encountered in intermediate segment file: segment={} line={line_number}",
+                            seg_path.display()
+                        )));
                     }
                     Err(e) => return Err(Error::Io(Box::new(e))),
                 };
@@ -1021,21 +1026,28 @@ impl SessionStoreV2 {
                             // If we successfully parsed the JSON but the line is missing a newline,
                             // the atomic write (which includes the newline) did not complete.
                             // We must discard this frame to ensure the file ends cleanly for future appends.
-                            tracing::warn!(
-                                segment = %seg_path.display(),
-                                line_number,
-                                "SessionStoreV2 dropping valid but newline-missing trailing segment frame during index rebuild"
-                            );
-                            drop(reader);
-                            truncate_file_to(seg_path, byte_offset)?;
-                            remove_orphaned_segments(&segment_files[i + 1..])?;
-                            break 'segments;
+                            // Only safe to do this if it's the absolutely last segment file.
+                            if i == segment_files.len() - 1 {
+                                tracing::warn!(
+                                    segment = %seg_path.display(),
+                                    line_number,
+                                    "SessionStoreV2 dropping valid but newline-missing trailing segment frame during index rebuild"
+                                );
+                                drop(reader);
+                                truncate_file_to(seg_path, byte_offset)?;
+                                break 'segments;
+                            }
+                            return Err(Error::session(format!(
+                                "missing newline at EOF of intermediate segment file: segment={} line={line_number}",
+                                seg_path.display()
+                            )));
                         }
                         frame
                     }
                     Err(err) => {
                         let at_eof = reader.fill_buf()?.is_empty();
-                        if at_eof && missing_newline {
+                        let is_last_segment = i == segment_files.len() - 1;
+                        if at_eof && is_last_segment {
                             tracing::warn!(
                                 segment = %seg_path.display(),
                                 line_number,
@@ -1045,10 +1057,9 @@ impl SessionStoreV2 {
                             // Trim the incomplete tail so subsequent reads and appends remain valid.
                             drop(reader);
                             truncate_file_to(seg_path, byte_offset)?;
-                            remove_orphaned_segments(&segment_files[i + 1..])?;
                             break 'segments;
                         }
-                        // Non-EOF corruption: fail closed to prevent silent data loss.
+                        // Non-EOF corruption (or corruption in intermediate file): fail closed to prevent silent data loss.
                         return Err(Error::session(format!(
                             "failed to parse segment frame while rebuilding index: \
                                                              segment={} line={line_number}: {err}",
@@ -1058,17 +1069,23 @@ impl SessionStoreV2 {
                 };
 
                 if frame.entry_seq <= last_observed_seq {
-                    tracing::warn!(
-                        segment = %seg_path.display(),
-                        line_number,
-                        entry_seq = frame.entry_seq,
-                        last_seq = last_observed_seq,
-                        "SessionStoreV2 detected non-monotonic entry sequence during rebuild; truncating segment"
-                    );
-                    drop(reader);
-                    truncate_file_to(seg_path, byte_offset)?;
-                    remove_orphaned_segments(&segment_files[i + 1..])?;
-                    break 'segments;
+                    if i == segment_files.len() - 1 {
+                        tracing::warn!(
+                            segment = %seg_path.display(),
+                            line_number,
+                            entry_seq = frame.entry_seq,
+                            last_seq = last_observed_seq,
+                            "SessionStoreV2 detected non-monotonic entry sequence during rebuild; truncating segment"
+                        );
+                        drop(reader);
+                        truncate_file_to(seg_path, byte_offset)?;
+                        break 'segments;
+                    }
+                    return Err(Error::session(format!(
+                        "non-monotonic entry sequence in intermediate segment file: segment={} line={line_number} seq={} last_seq={last_observed_seq}",
+                        seg_path.display(),
+                        frame.entry_seq
+                    )));
                 }
                 last_observed_seq = frame.entry_seq;
 

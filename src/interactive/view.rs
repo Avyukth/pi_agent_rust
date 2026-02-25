@@ -1046,7 +1046,7 @@ impl PiApp {
 
         for (idx, item) in self.autocomplete.items[offset..end].iter().enumerate() {
             let global_idx = offset + idx;
-            let is_selected = global_idx == self.autocomplete.selected;
+            let is_selected = self.autocomplete.selected == Some(global_idx);
 
             let kind_icon = match item.kind {
                 AutocompleteItemKind::SlashCommand => "⚡",

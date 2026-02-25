@@ -763,7 +763,7 @@ mod tests {
                 assert_eq!(repo, "https://github.com/owner/repo.git");
                 assert_eq!(path, Some("packages/core".to_string()));
             }
-            _ => panic!("expected Git variant"),
+            _ => panic!(),
         }
     }
 
@@ -787,7 +787,7 @@ mod tests {
                 assert_eq!(version, "1.2.3");
                 assert!(url.contains("registry.npmjs.org"));
             }
-            _ => panic!("expected Npm variant"),
+            _ => panic!(),
         }
     }
 
@@ -803,7 +803,7 @@ mod tests {
             CandidateSource::Url { url } => {
                 assert_eq!(url, "https://example.com/ext.tgz");
             }
-            _ => panic!("expected Url variant"),
+            _ => panic!(),
         }
     }
 
@@ -819,7 +819,7 @@ mod tests {
             CandidateSource::Git { path, .. } => {
                 assert_eq!(path, None);
             }
-            _ => panic!("expected Git variant"),
+            _ => panic!(),
         }
     }
 

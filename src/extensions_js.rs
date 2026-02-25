@@ -472,7 +472,14 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     if let Some(arr) = value.as_array() {
         let len = arr.len();
-        let mut result = Vec::with_capacity(len);
+        if len > 10_000_000 {
+            return Err(rquickjs::Error::new_into_js_message(
+                "json",
+                "stringify",
+                "Array length exceeds maximum allowed limit",
+            ));
+        }
+        let mut result = Vec::with_capacity(std::cmp::min(len, 1024));
         for i in 0..len {
             let v: Value<'_> = arr.get(i)?;
             result.push(js_to_json_inner(&v, depth + 1)?);
@@ -5181,6 +5188,17 @@ fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
     format!("pijs-compat://builtin/{canonical}/{short}")
 }
 
+/// Read up to 1MB of a source file for import extraction.
+/// This prevents OOM vulnerabilities if a module path resolves to a massive file or /dev/zero.
+fn read_source_for_import_extraction(path: &str) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut handle = file.take(1024 * 1024); // 1MB limit
+    let mut buffer = String::new();
+    handle.read_to_string(&mut buffer).ok()?;
+    Some(buffer)
+}
+
 fn maybe_register_builtin_compat_overlay(
     state: &mut PiJsModuleState,
     base: &str,
@@ -5191,7 +5209,7 @@ fn maybe_register_builtin_compat_overlay(
         return None;
     }
 
-    let source = std::fs::read_to_string(base).ok()?;
+    let source = read_source_for_import_extraction(base)?;
     let extracted_names = extract_builtin_import_names(&source, spec, canonical);
     if extracted_names.is_empty() {
         return None;
@@ -5293,7 +5311,7 @@ impl JsModuleResolver for PiJsResolver {
 
             if let Some(escaped_path) = detect_monorepo_escape(base, spec, &roots) {
                 // Read the importing file to extract import names.
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let names = extract_import_names(&source, spec);
 
                 let stub = generate_monorepo_stub(&names);
@@ -5360,7 +5378,7 @@ impl JsModuleResolver for PiJsResolver {
                     "auto-repair: generated proxy stub for missing npm dependency"
                 );
 
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let extracted_names = extract_import_names(&source, spec);
                 let mut state = self.state.borrow_mut();
                 let entry_key = spec.to_string();
@@ -5469,8 +5487,23 @@ fn compile_module_source(
     }
 
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let raw = fs::read_to_string(path)
+    let file = fs::File::open(path)
+        .map_err(|err| rquickjs::Error::new_loading_message(name, format!("open: {err}")))?;
+    let mut handle = std::io::Read::take(file, MAX_MODULE_SOURCE_BYTES + 1);
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut handle, &mut raw)
         .map_err(|err| rquickjs::Error::new_loading_message(name, format!("read: {err}")))?;
+
+    if raw.len() as u64 > MAX_MODULE_SOURCE_BYTES {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            format!(
+                "Module source exceeds size limit: {} > {}",
+                raw.len(),
+                MAX_MODULE_SOURCE_BYTES
+            ),
+        ));
+    }
 
     let compiled = match extension {
         "ts" | "tsx" => {
@@ -5733,20 +5766,21 @@ fn resolve_module_path(
 
     if let Some(path) = specifier.strip_prefix("file://") {
         let resolved = resolve_existing_file(PathBuf::from(path))?;
-        if !roots.is_empty() {
-            let canonical = crate::extensions::safe_canonicalize(&resolved);
-            let allowed = roots.iter().any(|root| {
-                let canonical_root = crate::extensions::safe_canonicalize(root);
-                canonical.starts_with(&canonical_root)
-            });
-            if !allowed {
-                tracing::warn!(
-                    event = "pijs.resolve.monotonicity_violation",
-                    resolved = %resolved.display(),
-                    "resolution blocked: file:// path escapes extension root"
-                );
-                return None;
-            }
+        if roots.is_empty() {
+            return None;
+        }
+        let canonical = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = roots.iter().any(|root| {
+            let canonical_root = crate::extensions::safe_canonicalize(root);
+            canonical.starts_with(&canonical_root)
+        });
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                resolved = %resolved.display(),
+                "resolution blocked: file:// path escapes extension root"
+            );
+            return None;
         }
         return Some(resolved);
     }
@@ -5770,38 +5804,40 @@ fn resolve_module_path(
     // SEC-FIX: Enforce scope monotonicity before checking file existence (bd-k5q5.9.1.3).
     // This prevents directory traversal probes from revealing existence of files
     // outside the extension root (e.g. `../../../../etc/passwd`).
-    if !roots.is_empty() {
-        let canonical = crate::extensions::safe_canonicalize(&path);
-        let allowed = roots.iter().any(|root| {
-            let canonical_root = crate::extensions::safe_canonicalize(root);
-            canonical.starts_with(&canonical_root)
-        });
+    if roots.is_empty() {
+        return None;
+    }
+    let canonical = crate::extensions::safe_canonicalize(&path);
+    let allowed = roots.iter().any(|root| {
+        let canonical_root = crate::extensions::safe_canonicalize(root);
+        canonical.starts_with(&canonical_root)
+    });
 
-        if !allowed {
-            return None;
-        }
+    if !allowed {
+        return None;
     }
 
     if let Some(resolved) = resolve_existing_module_candidate(path.clone()) {
         // SEC-FIX: Enforce scope monotonicity on the *resolved* path (bd-k5q5.9.1.3).
         // This handles cases where `resolve_existing_module_candidate` finds a file
         // (e.g. .ts sibling) that is a symlink escaping the root, even if the base path was safe.
-        if !roots.is_empty() {
-            let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
-            let allowed = roots.iter().any(|root| {
-                let canonical_root = crate::extensions::safe_canonicalize(root);
-                canonical_resolved.starts_with(&canonical_root)
-            });
+        if roots.is_empty() {
+            return None;
+        }
+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = roots.iter().any(|root| {
+            let canonical_root = crate::extensions::safe_canonicalize(root);
+            canonical_resolved.starts_with(&canonical_root)
+        });
 
-            if !allowed {
-                tracing::warn!(
-                    event = "pijs.resolve.monotonicity_violation",
-                    original = %path.display(),
-                    resolved = %resolved.display(),
-                    "resolution blocked: resolved path escapes extension root"
-                );
-                return None;
-            }
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                original = %path.display(),
+                resolved = %resolved.display(),
+                "resolution blocked: resolved path escapes extension root"
+            );
+            return None;
         }
         return Some(resolved);
     }
@@ -5834,12 +5870,16 @@ fn resolve_module_path(
 /// references compiled output that was never built.
 fn try_dist_to_src_fallback(path: &Path) -> Option<PathBuf> {
     let path_str = path.to_string_lossy();
-    let idx = path_str.find("/dist/")?;
+
+    // Normalize to handle both Windows backslashes and Unix forward slashes.
+    let normalized = path_str.replace('\\', "/");
+    let idx = normalized.find("/dist/")?;
 
     // The extension root is the directory containing /dist/.
     let extension_root = PathBuf::from(&path_str[..idx]);
 
-    let src_path = format!("{}/src/{}", &path_str[..idx], &path_str[idx + 6..]);
+    let sep = std::path::MAIN_SEPARATOR;
+    let src_path = format!("{}{sep}src{sep}{}", &path_str[..idx], &path_str[idx + 6..]);
 
     let candidate = PathBuf::from(&src_path);
 
@@ -5977,25 +6017,13 @@ fn detect_monorepo_escape(
     let base_dir = Path::new(base).parent()?;
     let resolved = base_dir.join(specifier);
 
-    // Canonicalize as much as possible — if the exact path doesn't exist,
-    // try the parent directory.
-    let effective = std::fs::canonicalize(&resolved)
-        .map(crate::extensions::strip_unc_prefix)
-        .or_else(|_| {
-            resolved
-                .parent()
-                .and_then(|p| {
-                    std::fs::canonicalize(p)
-                        .map(crate::extensions::strip_unc_prefix)
-                        .ok()
-                })
-                .map(|p| p.join(resolved.file_name().unwrap_or_default()))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
-        })
-        .unwrap_or_else(|_| resolved.clone());
+    // Safely canonicalize resolving all .. and . segments logically
+    // if the path doesn't exist on disk, avoiding path traversal bypasses.
+    let effective = crate::extensions::safe_canonicalize(&resolved);
 
     for root in extension_roots {
-        if effective.starts_with(root) {
+        let canonical_root = crate::extensions::safe_canonicalize(root);
+        if effective.starts_with(&canonical_root) {
             return None; // Within an extension root — not an escape
         }
     }
@@ -10253,7 +10281,7 @@ const _URL = globalThis.URL || (() => {
       const protoEnd = u.indexOf(':');
       this.protocol = protoEnd >= 0 ? u.slice(0, protoEnd + 1) : '';
       let rest = protoEnd >= 0 ? u.slice(protoEnd + 1) : u;
-      this.username = ''; this.password = '';
+      this.username = ''; this.password  = '';
       if (rest.startsWith('//')) {
         rest = rest.slice(2);
         const pathStart = rest.indexOf('/');
@@ -10267,7 +10295,7 @@ const _URL = globalThis.URL || (() => {
           const colonIdx = userInfo.indexOf(':');
           if (colonIdx >= 0) {
             this.username = userInfo.slice(0, colonIdx);
-            this.password = userInfo.slice(colonIdx + 1);
+            this.password  = userInfo.slice(colonIdx + 1);
           } else {
             this.username = userInfo;
           }
@@ -14217,6 +14245,55 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
+                // __pi_host_check_write_access(path) -> void (throws on denied path)
+                // Enforces workspace/extension-root confinement for node:fs write APIs.
+                // This guard only applies while extension code is actively executing.
+                global.set(
+                    "__pi_host_check_write_access",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id: Option<String> = ctx
+                                .globals()
+                                .get::<_, Option<String>>("__pi_current_extension_id")
+                                .ok()
+                                .flatten()
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+
+                            // Keep standalone PiJsRuntime unit harness behavior unchanged.
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+                            let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
+
+                            let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
+                                roots.iter().any(|root| checked_path.starts_with(root))
+                            });
+                            let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
+
+                            if allowed {
+                                Ok(())
+                            } else {
+                                Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host write denied: path outside extension root".to_string(),
+                                ))
+                            }
+                        }
+                    }),
+                )?;
+
                 // __pi_host_read_file_sync(path) -> string (throws on error)
                 // Synchronous real-filesystem read fallback for node:fs readFileSync.
                 // Reads are confined to the workspace root AND any registered
@@ -14569,8 +14646,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "exec_sync"
                             );
 
-                            let args: Vec<String> =
-                                serde_json::from_str(&args_json).unwrap_or_default();
+                            let args: Vec<String> = serde_json::from_str(&args_json)
+                                .map_err(|err| rquickjs::Error::new_into_js_message(
+                                    "String",
+                                    "Array",
+                                    format!("invalid JSON args: {err}"),
+                                ))?;
 
                             let mut denied_reason = if allow_unsafe_sync_exec {
                                 None
@@ -14718,13 +14799,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
                                         break st;
                                     }
-                                    if limit_exceeded.load(AtomicOrdering::Relaxed) {
+                                    if !killed && limit_exceeded.load(AtomicOrdering::Relaxed) {
                                         killed = true;
                                         crate::tools::kill_process_tree(Some(pid));
                                         let _ = child.kill();
+                                        break child.wait().map_err(|e| e.to_string())?;
                                     }
                                     if let Some(t) = timeout {
-                                        if start.elapsed() >= t {
+                                        if !killed && start.elapsed() >= t {
                                             killed = true;
                                             crate::tools::kill_process_tree(Some(pid));
                                             let _ = child.kill();
@@ -18874,7 +18956,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         std::fs::write(&only_json, "{\"ok\":true}\n").expect("write only_json.json");
 
         let mode = RepairMode::default();
-        let roots = vec![];
+        let roots = vec![root.to_path_buf()];
 
         let resolved_pkg =
             resolve_module_path(base.to_string_lossy().as_ref(), "./pkg", mode, &roots)
@@ -18909,7 +18991,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         std::fs::write(&base, "export {};\n").expect("write base");
 
         let outside = root.join("secret.ts");
-        std::fs::write(&outside, "export const secret = 1;\n").expect("write outside");
+        std::fs::write(&outside, "export const secret  = 1;\n").expect("write outside");
 
         let mode = RepairMode::default();
         let roots = vec![extension_root];

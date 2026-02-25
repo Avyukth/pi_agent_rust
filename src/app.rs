@@ -1143,7 +1143,7 @@ mod tests {
                 assert_eq!(provider, "openai");
             }
             StartupError::NoModelsAvailable { .. } => {
-                panic!("unexpected startup error: {startup:?}");
+                panic!();
             }
         }
     }

@@ -2416,7 +2416,7 @@ mod tests {
         assert!(auth.get("gemini").is_none());
         match auth.get("google") {
             Some(AuthCredential::ApiKey { key }) => assert_eq!(key, "new-google-key"),
-            other => panic!("expected google api key credential, got: {other:?}"),
+            other => panic!(),
         }
     }
 

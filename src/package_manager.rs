@@ -607,7 +607,9 @@ impl PackageManager {
         let accumulator = std::sync::Mutex::new(accumulator);
 
         thread::spawn(move || {
-            let mut accumulator = accumulator.lock().unwrap();
+            let mut accumulator = accumulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // 2) Local entries from settings (global and project)
             for resource_type in ResourceType::all() {
@@ -3307,27 +3309,28 @@ fn list_packages_in_settings(path: &Path) -> Result<Vec<PackageEntry>> {
 }
 
 fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Result<()> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(Error::Config(
+            "settings package source cannot be empty".to_string(),
+        ));
+    }
+
     let mut root = read_settings_json(path)?;
     if !root.is_object() {
         root = serde_json::json!({});
     }
 
-    let packages_value = root.get_mut("packages");
-    let packages = match packages_value {
-        Some(Value::Array(arr)) => arr,
-        Some(_) => {
-            *packages_value.unwrap() = Value::Array(Vec::new());
-            root.get_mut("packages")
-                .and_then(Value::as_array_mut)
-                .unwrap()
-        }
-        None => {
-            root["packages"] = Value::Array(Vec::new());
-            root.get_mut("packages")
-                .and_then(Value::as_array_mut)
-                .unwrap()
-        }
-    };
+    if !matches!(root.get("packages"), Some(Value::Array(_))) {
+        root["packages"] = Value::Array(Vec::new());
+    }
+
+    let packages = root
+        .get_mut("packages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            Error::Config("failed to initialize settings 'packages' as an array".to_string())
+        })?;
 
     match action {
         UpdateAction::Add => {
@@ -3571,7 +3574,7 @@ mod tests {
 
         match parse_source("checkpoint-pi", dir.path()) {
             ParsedSource::Local { path } => assert_eq!(path, local),
-            other => panic!("expected local source, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4497,6 +4500,57 @@ mod tests {
         assert!(packages.is_empty());
     }
 
+    #[test]
+    fn update_package_sources_normalizes_non_array_packages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let malformed = json!({
+            "packages": { "source": "npm:legacy" }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string(&malformed).expect("serialize malformed settings"),
+        )
+        .expect("write malformed settings");
+
+        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(packages, &vec![json!("npm:foo")]);
+    }
+
+    #[test]
+    fn update_package_sources_normalizes_non_object_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "[]").expect("write malformed root");
+
+        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(packages, &vec![json!("npm:foo")]);
+    }
+
+    #[test]
+    fn update_package_sources_rejects_empty_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        let err = update_package_sources(&path, "   ", UpdateAction::Add).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("settings package source cannot be empty"),
+            "unexpected error: {err}"
+        );
+
+        let settings = read_settings_json(&path).expect("read");
+        assert!(
+            settings.get("packages").is_none(),
+            "failed update must not mutate packages"
+        );
+    }
+
     // ======================================================================
     // list_packages_in_settings
     // ======================================================================
@@ -4629,7 +4683,7 @@ mod tests {
                 assert_eq!(name, "@scope/pkg");
                 assert!(pinned);
             }
-            other => panic!("expected Npm, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4640,7 +4694,7 @@ mod tests {
             ParsedSource::Npm { pinned, .. } => {
                 assert!(!pinned);
             }
-            other => panic!("expected Npm, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4661,7 +4715,7 @@ mod tests {
                 assert_eq!(r#ref, Some("v2".to_string()));
                 assert!(pinned);
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4673,7 +4727,7 @@ mod tests {
                 assert_eq!(repo, "github.com/user/repo");
                 assert_eq!(host, "github.com");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4684,7 +4738,7 @@ mod tests {
             ParsedSource::Local { path } => {
                 assert_eq!(path, dir.path().join("my-ext"));
             }
-            other => panic!("expected Local, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4696,7 +4750,7 @@ mod tests {
             ParsedSource::Local { path } => {
                 assert_eq!(path, PathBuf::from("/abs/my-ext"));
             }
-            other => panic!("expected Local, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4713,7 +4767,7 @@ mod tests {
             (ParsedSource::Git { path: p1, .. }, ParsedSource::Git { path: p2, .. }) => {
                 assert_eq!(p1, p2, "same local source should produce same hash");
             }
-            _ => panic!("expected Git for both"),
+            _ => panic!(),
         }
     }
 
@@ -5217,7 +5271,7 @@ mod tests {
                 // After sanitization, traversal segments are filtered out.
                 assert_eq!(host, "local");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
 
         // Case 2: Traversal in middle
@@ -5227,7 +5281,7 @@ mod tests {
                 assert_eq!(host, "github.com");
                 assert_eq!(path, "user/repo");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
 
         // Case 3: Just dots
@@ -5236,7 +5290,7 @@ mod tests {
                 // ".." starts with ".." -> looks_like_local_path -> local hash
                 assert_eq!(host, "local");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
     }
 

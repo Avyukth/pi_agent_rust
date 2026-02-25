@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
             AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
-            other => panic!("expected text content, got {other:?}"),
+            other => panic!(),
         }
 
         let tools = request.tools.expect("tools");
@@ -1376,7 +1376,7 @@ mod tests {
             assert_eq!(tool_call.name, "search");
             assert_eq!(*tool_call.arguments, json!({ "q": "rust" }));
         } else {
-            panic!("expected ToolCallEnd event, got {:?}", out[7]);
+            panic!();
         }
         assert!(matches!(
             &out[8],
@@ -1405,7 +1405,7 @@ mod tests {
             assert_eq!(*reason, StopReason::ToolUse);
             assert_eq!(message.stop_reason, StopReason::ToolUse);
         } else {
-            panic!("expected Done event, got {:?}", out[11]);
+            panic!();
         }
     }
 
@@ -1435,7 +1435,7 @@ mod tests {
             assert_eq!(message.usage.output, 7);
             assert_eq!(message.usage.total_tokens, 12);
         } else {
-            panic!("expected Done event, got {:?}", out[1]);
+            panic!();
         }
     }
 
@@ -1467,7 +1467,7 @@ mod tests {
         if let StreamEvent::Done { message, .. } = &out[1] {
             assert_eq!(message.usage.total_tokens, u64::MAX);
         } else {
-            panic!("expected Done event, got {:?}", out[1]);
+            panic!();
         }
     }
 
@@ -1570,7 +1570,7 @@ mod tests {
         assert_eq!(out.len(), 2, "parse error should stop further events");
         assert!(matches!(out[0], Ok(StreamEvent::Start { .. })));
         match &out[1] {
-            Ok(event) => panic!("expected parse error item, got event: {event:?}"),
+            Ok(event) => panic!(),
             Err(err) => assert!(err.to_string().contains("JSON parse error")),
         }
     }
@@ -1755,7 +1755,7 @@ mod tests {
             .expect("runtime build");
         let result = runtime.block_on(async { provider.stream(&context, &options).await });
         let Err(err) = result else {
-            panic!("expected HTTP error");
+            panic!();
         };
         let message = err.to_string();
         assert!(message.contains("Anthropic API error (HTTP 401)"));
@@ -1904,7 +1904,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
@@ -1930,7 +1930,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 

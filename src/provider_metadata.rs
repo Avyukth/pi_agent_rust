@@ -1655,8 +1655,7 @@ mod tests {
             ("nanogpt", "nano-gpt"),
         ];
         for &(alias, expected_canonical) in cases {
-            let meta =
-                provider_metadata(alias).unwrap_or_else(|| panic!("alias '{alias}' not found"));
+            let meta = provider_metadata(alias).unwrap_or_else(|| panic!());
             assert_eq!(
                 meta.canonical_id, expected_canonical,
                 "alias '{alias}' should resolve to '{expected_canonical}', got '{}'",
@@ -1844,7 +1843,7 @@ mod tests {
             "fastrouter",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -1881,8 +1880,7 @@ mod tests {
             "fastrouter",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions", "{id} api mismatch");
             assert!(defaults.auth_header, "{id} must use auth header");
         }
@@ -1902,8 +1900,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -1933,7 +1930,7 @@ mod tests {
             "inference",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -1967,8 +1964,7 @@ mod tests {
             "inference",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions", "{id} api mismatch");
             assert!(defaults.auth_header, "{id} must use auth header");
         }
@@ -1988,8 +1984,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2021,7 +2016,7 @@ mod tests {
             "nvidia",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} not found"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2085,8 +2080,7 @@ mod tests {
             "nvidia",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(
                 defaults.api, "openai-completions",
                 "{id} api should be openai-completions"
@@ -2110,8 +2104,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2151,7 +2144,7 @@ mod tests {
             "xiaomi",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} not found"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2215,8 +2208,7 @@ mod tests {
             "xiaomi",
         ];
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(
                 defaults.api, "openai-completions",
                 "{id} api should be openai-completions"
@@ -2240,8 +2232,7 @@ mod tests {
         ];
         let mut urls: Vec<&str> = Vec::new();
         for id in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert!(
                 !defaults.base_url.is_empty(),
                 "{id} base_url must not be empty"
@@ -2271,7 +2262,7 @@ mod tests {
             "minimax-cn-coding-plan",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2330,8 +2321,7 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
         }
@@ -2378,7 +2368,7 @@ mod tests {
             "stackit",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2429,8 +2419,7 @@ mod tests {
             ),
         ];
         for (id, expected_host) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert!(defaults.base_url.contains(expected_host));
@@ -2475,7 +2464,7 @@ mod tests {
             "zhipuai-coding-plan",
         ];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2535,8 +2524,7 @@ mod tests {
             ("zhipuai-coding-plan", "open.bigmodel.cn"),
         ];
         for (id, expected_host) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert!(defaults.base_url.contains(expected_host));
@@ -2566,7 +2554,7 @@ mod tests {
     fn batch_c1_metadata_resolves_all_five_providers() {
         let ids = ["baseten", "llama", "lmstudio", "ollama", "ollama-cloud"];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2611,8 +2599,7 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1", true),
         ];
         for (id, expected_base_url, expected_auth_header) in &ids {
-            let defaults =
-                provider_routing_defaults(id).unwrap_or_else(|| panic!("{id} defaults missing"));
+            let defaults = provider_routing_defaults(id).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert_eq!(defaults.auth_header, *expected_auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2623,7 +2610,7 @@ mod tests {
     fn special_routing_metadata_resolves_all_three_providers() {
         let ids = ["opencode", "vercel", "zenmux"];
         for id in &ids {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("{id} metadata missing"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(meta.canonical_id, *id);
             assert_eq!(
                 meta.onboarding,
@@ -2704,7 +2691,7 @@ mod tests {
             ("lmstudio", "LM Studio"),
         ];
         for &(id, expected_name) in cases {
-            let meta = provider_metadata(id).unwrap_or_else(|| panic!("provider '{id}' not found"));
+            let meta = provider_metadata(id).unwrap_or_else(|| panic!());
             assert_eq!(
                 meta.display_name,
                 Some(expected_name),
@@ -2831,7 +2818,7 @@ mod tests {
                         assert_eq!(d.api, m.api);
                     }
                     (None, None) => {}
-                    _ => panic!(
+                    _ => assert!(false,
                         "mismatch for '{}': fn={:?} meta={:?}",
                         meta.canonical_id, defaults, meta.routing_defaults
                     ),

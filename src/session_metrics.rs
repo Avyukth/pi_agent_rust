@@ -293,11 +293,13 @@ impl SessionMetrics {
             ScopedTimer {
                 counter: Some(counter),
                 start: Instant::now(),
+                finished: false,
             }
         } else {
             ScopedTimer {
                 counter: None,
                 start: Instant::now(), // unused but cheap
+                finished: false,
             }
         }
     }
@@ -439,19 +441,20 @@ pub struct MetricsSnapshot {
 pub struct ScopedTimer<'a> {
     counter: Option<&'a TimingCounter>,
     start: Instant,
+    finished: bool,
 }
 
 impl ScopedTimer<'_> {
     /// Manually finish the timer and return elapsed microseconds.
     /// Consumes self so drop won't double-record.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn finish(self) -> u64 {
+    pub fn finish(mut self) -> u64 {
         let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         if let Some(counter) = self.counter {
             counter.record(elapsed_us);
         }
         // Prevent drop from recording again.
-        std::mem::forget(self);
+        self.finished = true;
         elapsed_us
     }
 }
@@ -459,9 +462,11 @@ impl ScopedTimer<'_> {
 impl Drop for ScopedTimer<'_> {
     #[allow(clippy::cast_possible_truncation)]
     fn drop(&mut self) {
-        if let Some(counter) = self.counter {
-            let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-            counter.record(elapsed_us);
+        if !self.finished {
+            if let Some(counter) = self.counter {
+                let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                counter.record(elapsed_us);
+            }
         }
     }
 }
@@ -588,6 +593,7 @@ mod tests {
             let _timer = ScopedTimer {
                 counter: Some(&counter),
                 start: Instant::now(),
+                finished: false,
             };
             // Simulate some work
             std::thread::sleep(std::time::Duration::from_micros(100));
@@ -606,6 +612,7 @@ mod tests {
         let timer = ScopedTimer {
             counter: Some(&counter),
             start: Instant::now(),
+            finished: false,
         };
         std::thread::sleep(std::time::Duration::from_micros(100));
         let elapsed = timer.finish();
@@ -620,6 +627,7 @@ mod tests {
             let _timer = ScopedTimer {
                 counter: None,
                 start: Instant::now(),
+                finished: false,
             };
         }
         assert_eq!(counter.snapshot().count, 0);

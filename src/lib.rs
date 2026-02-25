@@ -19,6 +19,17 @@
 
 #![forbid(unsafe_code)]
 #![allow(dead_code, clippy::unused_async, unused_attributes)]
+#![cfg_attr(
+    test,
+    allow(
+        unused_variables,
+        clippy::assertions_on_constants,
+        clippy::match_same_arms,
+        clippy::uninlined_format_args,
+        clippy::missing_const_for_fn,
+        clippy::collapsible_if
+    )
+)]
 // Allow pedantic lints during early development - can tighten later
 #![allow(
     clippy::must_use_candidate,

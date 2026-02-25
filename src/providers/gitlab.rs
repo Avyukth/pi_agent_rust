@@ -259,7 +259,7 @@ impl Provider for GitLabProvider {
         let request_body = Self::build_request(context);
         let url = self.chat_url();
 
-        let api_key = options.api_key.as_deref().ok_or_else(|| {
+        let api_key  = options.api_key.as_deref().ok_or_else(|| {
             Error::auth(
                 "GitLab API token is required. Set GITLAB_TOKEN or GITLAB_API_KEY environment variable.",
             )

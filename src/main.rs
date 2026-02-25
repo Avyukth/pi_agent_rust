@@ -4044,6 +4044,9 @@ where
                 )
                 .await;
 
+                // Revert the failed user message before retrying to prevent context duplication.
+                let _ = session.revert_last_user_message().await;
+
                 // Re-send the same prompt (matches RPC retry behaviour).
                 current_result = match &input {
                     PromptInput::Text(text) => {
@@ -4218,17 +4221,17 @@ fn read_piped_stdin() -> Result<Option<String>> {
 
 fn format_token_count(count: u32) -> String {
     if count >= 1_000_000 {
-        let millions = f64::from(count) / 1_000_000.0;
-        if millions.fract() == 0.0 {
-            format!("{millions:.0}M")
+        if count % 1_000_000 == 0 {
+            format!("{}M", count / 1_000_000)
         } else {
+            let millions = f64::from(count) / 1_000_000.0;
             format!("{millions:.1}M")
         }
     } else if count >= 1_000 {
-        let thousands = f64::from(count) / 1_000.0;
-        if thousands.fract() == 0.0 {
-            format!("{thousands:.0}K")
+        if count % 1_000 == 0 {
+            format!("{}K", count / 1_000)
         } else {
+            let thousands = f64::from(count) / 1_000.0;
             format!("{thousands:.1}K")
         }
     } else {

@@ -252,14 +252,20 @@ pub fn truncate_head(
 
     let mut iter = content.split('\n').peekable();
     let mut i = 0;
+    let ends_with_newline = content.ends_with('\n');
     while let Some(line) = iter.next() {
+        let is_last = iter.peek().is_none();
+        if is_last && line.is_empty() && ends_with_newline {
+            break;
+        }
+
         if i >= max_lines {
             truncated_by = Some(TruncatedBy::Lines);
             break;
         }
 
         // If there is a next part, it means the current part was followed by a newline.
-        let has_newline = iter.peek().is_some();
+        let has_newline = !is_last;
         let line_len = line.len() + usize::from(has_newline);
 
         if byte_count + line_len > max_bytes {
@@ -1663,9 +1669,9 @@ impl Tool for ReadTool {
             let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
             let first_line_size = format_size(first_line.len());
             output_text = format!(
-                "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' \"{}\" | head -c {DEFAULT_MAX_BYTES}]",
+                "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' '{}' | head -c {DEFAULT_MAX_BYTES}]",
                 format_size(DEFAULT_MAX_BYTES),
-                input.path.replace('"', "\\\"")
+                input.path.replace('\'', "'\\''")
             );
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else if truncation.truncated {
@@ -2174,7 +2180,10 @@ fn map_normalized_range_to_original(
     for line in content.split_inclusive('\n') {
         let line_content = line.strip_suffix('\n').unwrap_or(line);
         let has_newline = line.ends_with('\n');
-        let trimmed_len = line_content.trim_end().len();
+        let trimmed_len = line_content
+            .strip_suffix('\r')
+            .unwrap_or(line_content)
+            .len();
 
         for (char_offset, c) in line_content.char_indices() {
             // match_end can be detected at any position including trailing
@@ -2255,7 +2264,7 @@ fn build_normalized_content(content: &str) -> String {
     let mut lines = content.split('\n').peekable();
 
     while let Some(line) = lines.next() {
-        let trimmed_len = line.trim_end().len();
+        let trimmed_len = line.strip_suffix('\r').unwrap_or(line).len();
         for (char_offset, c) in line.char_indices() {
             if char_offset >= trimmed_len {
                 continue;
@@ -2402,115 +2411,194 @@ fn diff_parts(old_content: &str, new_content: &str) -> Vec<DiffPart> {
     parts
 }
 
-fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option<usize>) {
-    let parts = diff_parts(old_content, new_content);
-
+fn diff_line_num_width(old_content: &str, new_content: &str) -> usize {
     // Count newlines with memchr (avoids iterator-item overhead of split().count())
     let old_line_count = memchr::memchr_iter(b'\n', old_content.as_bytes()).count() + 1;
     let new_line_count = memchr::memchr_iter(b'\n', new_content.as_bytes()).count() + 1;
     let max_line_num = old_line_count.max(new_line_count).max(1);
-    let line_num_width = max_line_num.ilog10() as usize + 1;
+    max_line_num.ilog10() as usize + 1
+}
 
-    // Single String buffer instead of Vec<String> + join — eliminates per-line
-    // String allocations and the final join copy.
-    let mut output = String::new();
-    let mut old_line_num: usize = 1;
-    let mut new_line_num: usize = 1;
-    let mut last_was_change = false;
-    let mut first_changed_line: Option<usize> = None;
-    let context_lines: usize = 4;
+fn split_diff_lines(value: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = value.split('\n').collect();
+    if lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
 
-    for (i, part) in parts.iter().enumerate() {
-        let collected: Vec<&str> = part.value.split('\n').collect();
-        // Trim trailing empty element from split
-        let raw = if collected.last().is_some_and(|l| l.is_empty()) {
-            &collected[..collected.len() - 1]
-        } else {
-            &collected[..]
-        };
+#[inline]
+const fn is_change_tag(tag: DiffTag) -> bool {
+    matches!(tag, DiffTag::Added | DiffTag::Removed)
+}
 
-        match part.tag {
-            DiffTag::Added | DiffTag::Removed => {
-                if first_changed_line.is_none() {
-                    first_changed_line = Some(new_line_num);
-                }
+#[derive(Debug)]
+struct DiffRenderState {
+    output: String,
+    old_line_num: usize,
+    new_line_num: usize,
+    last_was_change: bool,
+    first_changed_line: Option<usize>,
+    line_num_width: usize,
+    context_lines: usize,
+}
 
-                for line in raw {
-                    if !output.is_empty() {
-                        output.push('\n');
-                    }
-                    match part.tag {
-                        DiffTag::Added => {
-                            let _ = write!(output, "+{new_line_num:>line_num_width$} {line}");
-                            new_line_num = new_line_num.saturating_add(1);
-                        }
-                        DiffTag::Removed => {
-                            let _ = write!(output, "-{old_line_num:>line_num_width$} {line}");
-                            old_line_num = old_line_num.saturating_add(1);
-                        }
-                        DiffTag::Equal => {}
-                    }
-                }
-
-                last_was_change = true;
-            }
-            DiffTag::Equal => {
-                let next_part_is_change = i < parts.len().saturating_sub(1)
-                    && matches!(parts[i + 1].tag, DiffTag::Added | DiffTag::Removed);
-
-                if last_was_change || next_part_is_change {
-                    // Compute slice bounds directly instead of cloning Vecs
-                    let start = if last_was_change {
-                        0
-                    } else {
-                        raw.len().saturating_sub(context_lines)
-                    };
-                    let lines_after_start = raw.len() - start;
-                    let (end, skip_end) =
-                        if !next_part_is_change && lines_after_start > context_lines {
-                            (start + context_lines, lines_after_start - context_lines)
-                        } else {
-                            (raw.len(), 0)
-                        };
-                    let skip_start = start;
-
-                    if skip_start > 0 {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        let _ = write!(output, " {:>line_num_width$} ...", " ");
-                        old_line_num = old_line_num.saturating_add(skip_start);
-                        new_line_num = new_line_num.saturating_add(skip_start);
-                    }
-
-                    for line in &raw[start..end] {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        let _ = write!(output, " {old_line_num:>line_num_width$} {line}");
-                        old_line_num = old_line_num.saturating_add(1);
-                        new_line_num = new_line_num.saturating_add(1);
-                    }
-
-                    if skip_end > 0 {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        let _ = write!(output, " {:>line_num_width$} ...", " ");
-                        old_line_num = old_line_num.saturating_add(skip_end);
-                        new_line_num = new_line_num.saturating_add(skip_end);
-                    }
-                } else {
-                    old_line_num = old_line_num.saturating_add(raw.len());
-                    new_line_num = new_line_num.saturating_add(raw.len());
-                }
-
-                last_was_change = false;
-            }
+impl DiffRenderState {
+    const fn new(line_num_width: usize, context_lines: usize) -> Self {
+        Self {
+            output: String::new(),
+            old_line_num: 1,
+            new_line_num: 1,
+            last_was_change: false,
+            first_changed_line: None,
+            line_num_width,
+            context_lines,
         }
     }
 
-    (output, first_changed_line)
+    #[inline]
+    fn ensure_line_break(&mut self) {
+        if !self.output.is_empty() {
+            self.output.push('\n');
+        }
+    }
+
+    const fn mark_first_change(&mut self) {
+        if self.first_changed_line.is_none() {
+            self.first_changed_line = Some(self.new_line_num);
+        }
+    }
+
+    fn push_added_line(&mut self, line: &str) {
+        self.ensure_line_break();
+        let _ = write!(
+            self.output,
+            "+{line_num:>width$} {line}",
+            line_num = self.new_line_num,
+            width = self.line_num_width
+        );
+        self.new_line_num = self.new_line_num.saturating_add(1);
+    }
+
+    fn push_removed_line(&mut self, line: &str) {
+        self.ensure_line_break();
+        let _ = write!(
+            self.output,
+            "-{line_num:>width$} {line}",
+            line_num = self.old_line_num,
+            width = self.line_num_width
+        );
+        self.old_line_num = self.old_line_num.saturating_add(1);
+    }
+
+    fn push_context_line(&mut self, line: &str) {
+        self.ensure_line_break();
+        let _ = write!(
+            self.output,
+            " {line_num:>width$} {line}",
+            line_num = self.old_line_num,
+            width = self.line_num_width
+        );
+        self.old_line_num = self.old_line_num.saturating_add(1);
+        self.new_line_num = self.new_line_num.saturating_add(1);
+    }
+
+    fn push_skip_marker(&mut self, skip: usize) {
+        if skip == 0 {
+            return;
+        }
+        self.ensure_line_break();
+        let _ = write!(
+            self.output,
+            " {:>width$} ...",
+            " ",
+            width = self.line_num_width
+        );
+        self.old_line_num = self.old_line_num.saturating_add(skip);
+        self.new_line_num = self.new_line_num.saturating_add(skip);
+    }
+}
+
+fn render_changed_part(tag: DiffTag, raw: &[&str], state: &mut DiffRenderState) {
+    state.mark_first_change();
+    for line in raw {
+        match tag {
+            DiffTag::Added => state.push_added_line(line),
+            DiffTag::Removed => state.push_removed_line(line),
+            DiffTag::Equal => {}
+        }
+    }
+    state.last_was_change = true;
+}
+
+fn render_equal_part(raw: &[&str], next_part_is_change: bool, state: &mut DiffRenderState) {
+    if !(state.last_was_change || next_part_is_change) {
+        let raw_len = raw.len();
+        state.old_line_num = state.old_line_num.saturating_add(raw_len);
+        state.new_line_num = state.new_line_num.saturating_add(raw_len);
+        state.last_was_change = false;
+        return;
+    }
+
+    if state.last_was_change
+        && next_part_is_change
+        && raw.len() > state.context_lines.saturating_mul(2)
+    {
+        for line in raw.iter().take(state.context_lines) {
+            state.push_context_line(line);
+        }
+
+        let skip = raw.len().saturating_sub(state.context_lines * 2);
+        state.push_skip_marker(skip);
+
+        for line in raw
+            .iter()
+            .skip(raw.len().saturating_sub(state.context_lines))
+        {
+            state.push_context_line(line);
+        }
+    } else {
+        // Compute slice bounds directly instead of cloning Vecs
+        let start = if state.last_was_change {
+            0
+        } else {
+            raw.len().saturating_sub(state.context_lines)
+        };
+        let lines_after_start = raw.len().saturating_sub(start);
+        let (end, skip_end) = if !next_part_is_change && lines_after_start > state.context_lines {
+            (
+                start + state.context_lines,
+                lines_after_start - state.context_lines,
+            )
+        } else {
+            (raw.len(), 0)
+        };
+
+        state.push_skip_marker(start);
+        for line in &raw[start..end] {
+            state.push_context_line(line);
+        }
+        state.push_skip_marker(skip_end);
+    }
+
+    state.last_was_change = false;
+}
+
+fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option<usize>) {
+    let parts = diff_parts(old_content, new_content);
+    let mut state = DiffRenderState::new(diff_line_num_width(old_content, new_content), 4);
+
+    for (i, part) in parts.iter().enumerate() {
+        let raw = split_diff_lines(&part.value);
+        let next_part_is_change = parts.get(i + 1).is_some_and(|next| is_change_tag(next.tag));
+
+        match part.tag {
+            DiffTag::Added | DiffTag::Removed => render_changed_part(part.tag, &raw, &mut state),
+            DiffTag::Equal => render_equal_part(&raw, next_part_is_change, &mut state),
+        }
+    }
+
+    (state.output, state.first_changed_line)
 }
 
 #[async_trait]
@@ -3203,10 +3291,11 @@ impl Tool for GrepTool {
         });
 
         let stderr_thread = std::thread::spawn(move || {
-            let mut reader = std::io::BufReader::new(stderr);
+            let reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
             let _ = stderr_tx.send(
                 reader
+                    .take(READ_TOOL_MAX_BYTES)
                     .read_to_end(&mut buf)
                     .map(|_| buf)
                     .map_err(|err| err.to_string()),
@@ -3289,7 +3378,7 @@ impl Tool for GrepTool {
                 )?;
             }
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
-            std::thread::sleep(Duration::from_millis(1));
+            sleep(wall_now(), Duration::from_millis(1)).await;
         }
 
         // Ensure stdout/stderr reader threads have fully drained the pipes before
@@ -3339,40 +3428,75 @@ impl Tool for GrepTool {
         let mut output_lines: Vec<String> = Vec::new();
         let mut lines_truncated = false;
 
+        // Group matches by file to merge overlapping context windows
+        let mut file_order: Vec<PathBuf> = Vec::new();
+        let mut matches_by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
         for (file_path, line_number) in &matches {
-            let relative_path = format_grep_path(file_path, &self.cwd);
-            let lines = get_file_lines_async(file_path, &mut file_cache).await;
+            if !matches_by_file.contains_key(file_path) {
+                file_order.push(file_path.clone());
+            }
+            matches_by_file
+                .entry(file_path.clone())
+                .or_default()
+                .push(*line_number);
+        }
+
+        for file_path in file_order {
+            let mut match_lines = matches_by_file.remove(&file_path).unwrap();
+            let relative_path = format_grep_path(&file_path, &self.cwd);
+            let lines = get_file_lines_async(&file_path, &mut file_cache).await;
 
             if lines.is_empty() {
-                output_lines.push(format!(
-                    "{relative_path}:{line_number}: (unable to read file or too large)"
-                ));
+                if let Some(first_match) = match_lines.first() {
+                    output_lines.push(format!(
+                        "{relative_path}:{first_match}: (unable to read file or too large)"
+                    ));
+                }
                 continue;
             }
 
-            let start = if context_value > 0 {
-                line_number.saturating_sub(context_value).max(1)
-            } else {
-                *line_number
-            };
-            let end = if context_value > 0 {
-                line_number.saturating_add(context_value).min(lines.len())
-            } else {
-                *line_number
-            };
+            match_lines.sort_unstable();
+            match_lines.dedup();
 
-            for current in start..=end {
-                let line_text = lines.get(current - 1).map_or("", String::as_str);
-                let sanitized = line_text.replace('\r', "");
-                let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
-                if truncated.was_truncated {
-                    lines_truncated = true;
-                }
-
-                if current == *line_number {
-                    output_lines.push(format!("{relative_path}:{current}: {}", truncated.text));
+            let mut blocks: Vec<(usize, usize)> = Vec::new();
+            for &line_number in &match_lines {
+                let start = if context_value > 0 {
+                    line_number.saturating_sub(context_value).max(1)
                 } else {
-                    output_lines.push(format!("{relative_path}-{current}- {}", truncated.text));
+                    line_number
+                };
+                let end = if context_value > 0 {
+                    line_number.saturating_add(context_value).min(lines.len())
+                } else {
+                    line_number
+                };
+
+                if let Some(last_block) = blocks.last_mut() {
+                    if start <= last_block.1.saturating_add(1) {
+                        last_block.1 = last_block.1.max(end);
+                        continue;
+                    }
+                }
+                blocks.push((start, end));
+            }
+
+            for (i, (start, end)) in blocks.into_iter().enumerate() {
+                if i > 0 {
+                    output_lines.push("--".to_string());
+                }
+                for current in start..=end {
+                    let line_text = lines.get(current - 1).map_or("", String::as_str);
+                    let sanitized = line_text.replace('\r', "");
+                    let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+                    if truncated.was_truncated {
+                        lines_truncated = true;
+                    }
+
+                    if match_lines.binary_search(&current).is_ok() {
+                        output_lines.push(format!("{relative_path}:{current}: {}", truncated.text));
+                    } else {
+                        output_lines.push(format!("{relative_path}-{current}- {}", truncated.text));
+                    }
                 }
             }
         }
@@ -3547,11 +3671,11 @@ impl Tool for FindTool {
             .spawn()
             .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
 
-        let mut stdout_pipe = child
+        let stdout_pipe = child
             .stdout
             .take()
             .ok_or_else(|| Error::tool("find", "Missing stdout"))?;
-        let mut stderr_pipe = child
+        let stderr_pipe = child
             .stderr
             .take()
             .ok_or_else(|| Error::tool("find", "Missing stderr"))?;
@@ -3561,6 +3685,7 @@ impl Tool for FindTool {
         let stdout_handle = std::thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             stdout_pipe
+                .take(READ_TOOL_MAX_BYTES)
                 .read_to_end(&mut buf)
                 .map_err(|err| err.to_string())?;
             Ok(buf)
@@ -3569,6 +3694,7 @@ impl Tool for FindTool {
         let stderr_handle = std::thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
             let mut buf = Vec::new();
             stderr_pipe
+                .take(READ_TOOL_MAX_BYTES)
                 .read_to_end(&mut buf)
                 .map_err(|err| err.to_string())?;
             Ok(buf)
@@ -4277,12 +4403,15 @@ impl Drop for ProcessGuard {
                 Ok(None) => {}
                 Ok(Some(_)) | Err(_) => return,
             }
-            if self.kill_tree {
-                let pid = child.id();
-                kill_process_tree(Some(pid));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            let kill_tree = self.kill_tree;
+            std::thread::spawn(move || {
+                if kill_tree {
+                    let pid = child.id();
+                    kill_process_tree(Some(pid));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
         }
     }
 }
@@ -4725,7 +4854,7 @@ mod tests {
 
     #[test]
     fn test_map_normalized_with_trailing_whitespace() {
-        // "A   \nB" -> "A\nB" (normalized strips trailing spaces)
+        // "A   \nB" -> "A   \nB" (normalized preserves trailing spaces now)
         let content = "A   \nB";
 
         // Find "A" (norm idx 0)
@@ -4734,23 +4863,20 @@ mod tests {
         assert_eq!(len, 1);
         assert_eq!(&content[start..start + len], "A");
 
-        // Find "\n" (norm idx 1)
-        // Original: "A" (0) + "   " (1,2,3) + "\n" (4)
-        // map_normalized_range_to_original logic:
-        // Line 1: "A   ". trimmed len 1 ("A").
-        // "A" (0): norm 0 matches. match_start=0. norm 1.
-        // loop ends. orig_idx -> 4.
-        // has_newline: true.
-        // norm 1 matches? Yes. match_start = orig_idx(4).
-        // norm 2. orig_idx 5.
-        // The test above asserted start=4.
-        let (start, len) = map_normalized_range_to_original(content, 1, 1);
+        // Find "   " (norm idx 1..4)
+        let (start, len) = map_normalized_range_to_original(content, 1, 3);
+        assert_eq!(start, 1);
+        assert_eq!(len, 3);
+        assert_eq!(&content[start..start + len], "   ");
+
+        // Find "\n" (norm idx 4)
+        let (start, len) = map_normalized_range_to_original(content, 4, 1);
         assert_eq!(start, 4);
         assert_eq!(len, 1);
         assert_eq!(&content[start..start + len], "\n");
 
-        // Find "B" (norm idx 2)
-        let (start, len) = map_normalized_range_to_original(content, 2, 1);
+        // Find "B" (norm idx 5)
+        let (start, len) = map_normalized_range_to_original(content, 5, 1);
         assert_eq!(start, 5);
         assert_eq!(len, 1);
         assert_eq!(&content[start..start + len], "B");

@@ -1203,7 +1203,7 @@ fn opportunity_matrix_contract_links_phase1_matrix_and_readiness() {
                 "opportunity_matrix.ranked_opportunities must be empty when readiness.status=no_decision in {artifact}"
             );
         }
-        _ => unreachable!(),
+        _ => panic!(),
     }
 }
 
@@ -1334,7 +1334,7 @@ fn parameter_sweeps_contract_links_phase1_matrix_and_readiness() {
                 "parameter_sweeps.readiness.blocking_reasons must be non-empty when status=blocked in {artifact}"
             );
         }
-        _ => unreachable!(),
+        _ => panic!(),
     }
 
     let phase1_ready = phase1_matrix

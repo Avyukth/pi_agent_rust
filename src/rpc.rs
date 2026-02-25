@@ -1563,11 +1563,7 @@ pub async fn run(
                         };
 
                         // Phase 2: Build new session without holding any lock.
-                        let crate::session::ForkPlan {
-                            entries,
-                            leaf_id,
-                            selected_text,
-                        } = fork_plan;
+                        let selected_text = fork_plan.selected_text.clone();
 
                         let mut new_session = if save_enabled {
                             crate::session::Session::create_with_dir(session_dir)
@@ -1587,9 +1583,7 @@ pub async fn run(
                             .header
                             .thinking_level
                             .clone_from(&header_snapshot.thinking_level);
-                        new_session.entries = entries;
-                        new_session.leaf_id = leaf_id;
-                        new_session.ensure_entry_ids();
+                        new_session.init_from_fork_plan(fork_plan);
 
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
@@ -1992,6 +1986,11 @@ async fn run_prompt_with_retry(
         if retry_abort.load(Ordering::SeqCst) {
             final_error = Some("Retry aborted".to_string());
             break;
+        }
+
+        // Revert the failed user message before retrying to prevent context duplication.
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+            let _ = guard.revert_last_user_message().await;
         }
     }
 
@@ -3606,9 +3605,11 @@ async fn run_bash_rpc(
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            if let Ok(Some(status)) = guard.kill() {
-                break status.code().unwrap_or(-1);
-            }
+            let status_code = match guard.kill() {
+                Ok(Some(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            };
+            break status_code;
         }
 
         match guard.try_wait_child() {
@@ -4257,7 +4258,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, "hello"),
-            other => panic!("expected text user message, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4277,7 +4278,7 @@ mod tests {
                 assert!(matches!(&blocks[0], ContentBlock::Text(_)));
                 assert!(matches!(&blocks[1], ContentBlock::Image(_)));
             }
-            other => panic!("expected blocks user message, got {other:?}"),
+            other => panic!(),
         }
     }
 

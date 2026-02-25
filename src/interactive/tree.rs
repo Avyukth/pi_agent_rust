@@ -400,11 +400,7 @@ impl PiApp {
                 (fork_plan, parent_path, session_dir)
             };
 
-            let crate::session::ForkPlan {
-                entries,
-                leaf_id,
-                selected_text,
-            } = fork_plan;
+            let selected_text = fork_plan.selected_text.clone();
 
             let mut new_session = Session::create_with_dir(session_dir);
             new_session.header.provider = Some(model_provider);
@@ -413,9 +409,7 @@ impl PiApp {
             if let Some(parent_path) = parent_path {
                 new_session.set_branched_from(Some(parent_path));
             }
-            new_session.entries = entries;
-            new_session.leaf_id = leaf_id;
-            new_session.ensure_entry_ids();
+            new_session.init_from_fork_plan(fork_plan);
             let new_session_id = new_session.header.id.clone();
 
             if let Err(err) = new_session.save().await {

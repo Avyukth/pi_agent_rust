@@ -349,7 +349,7 @@ where
                     let valid_len = err.valid_up_to();
                     if valid_len > 0 {
                         let s = std::str::from_utf8(&bytes[processed..processed + valid_len])
-                            .expect("valid utf8 prefix");
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                         self.feed_to_pending(s);
                         processed += valid_len;
                     }
@@ -387,7 +387,7 @@ where
                         let s = std::str::from_utf8(
                             &self.utf8_buffer[processed..processed + valid_len],
                         )
-                        .expect("valid utf8 prefix");
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                         Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
                         processed += valid_len;
                     }

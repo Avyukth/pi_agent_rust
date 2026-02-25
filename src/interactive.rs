@@ -445,7 +445,7 @@ impl PiApp {
                     self.config.editor_padding_x = u32::try_from(next).ok();
                     self.editor_padding_x = next;
                     self.input
-                        .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+                        .set_width(self.term_width.saturating_sub(5 + self.editor_padding_x));
                     self.scroll_to_bottom();
                     self.status_message = Some(format!("Updated editorPaddingX: {next}"));
                 }
@@ -838,7 +838,7 @@ impl PiApp {
         self.term_width = width.max(1);
         self.term_height = height.max(1);
         self.input
-            .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+            .set_width(self.term_width.saturating_sub(5 + self.editor_padding_x));
 
         if !test_mode
             && self.term_height < previous_height
@@ -1427,7 +1427,7 @@ impl PiApp {
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
-        input.set_width(term_width.saturating_sub(4 + editor_padding_x));
+        input.set_width(term_width.saturating_sub(5 + editor_padding_x));
         input.max_height = 10; // Allow expansion up to 10 lines
         input.focus();
 
@@ -2058,6 +2058,11 @@ impl PiApp {
                         return None;
                     }
                     KeyType::Tab => {
+                        // If nothing is selected yet, select the first item
+                        // so Tab always accepts something when the popup is open.
+                        if self.autocomplete.selected.is_none() {
+                            self.autocomplete.select_next();
+                        }
                         // Accept the selected item
                         if let Some(item) = self.autocomplete.selected_item().cloned() {
                             self.accept_autocomplete(&item);

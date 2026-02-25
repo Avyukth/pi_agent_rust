@@ -167,7 +167,7 @@ impl TranscriptDiff {
                         severity: DiffSeverity::Extra,
                     });
                 }
-                (None, None) => unreachable!(),
+                (None, None) => panic!(),
             }
         }
 

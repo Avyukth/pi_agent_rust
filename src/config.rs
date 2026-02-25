@@ -2488,7 +2488,7 @@ mod tests {
                     prop_assert_eq!(merged.fail_closed, other.fail_closed.or(base.fail_closed));
                     prop_assert_eq!(merged.enforce, other.enforce.or(base.enforce));
                 }
-                _ => panic!("merge_extension_risk must preserve Option-shape semantics"),
+                _ => assert!(false, "merge_extension_risk must preserve Option-shape semantics"),
             }
         }
 

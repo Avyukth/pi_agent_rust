@@ -2323,8 +2323,7 @@ mod tests {
     #[test]
     fn ad_hoc_alibaba_aliases() {
         for alias in ["alibaba", "dashscope", "qwen"] {
-            let defaults = ad_hoc_provider_defaults(alias)
-                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
             assert!(defaults.base_url.contains("dashscope"));
         }
     }
@@ -2332,8 +2331,7 @@ mod tests {
     #[test]
     fn ad_hoc_moonshot_aliases() {
         for alias in ["moonshotai", "moonshot", "kimi"] {
-            let defaults = ad_hoc_provider_defaults(alias)
-                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
             assert!(defaults.base_url.contains("moonshot"));
         }
     }
@@ -2358,8 +2356,7 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
             assert!(defaults.base_url.contains("api.minimax"));
@@ -2379,8 +2376,7 @@ mod tests {
             ("scaleway", "https://api.scaleway.ai/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2403,8 +2399,7 @@ mod tests {
             ),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2456,8 +2451,7 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);

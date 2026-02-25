@@ -117,8 +117,9 @@ pub(super) struct AutocompleteState {
     pub(super) open: bool,
     /// Current list of suggestions.
     pub(super) items: Vec<AutocompleteItem>,
-    /// Index of the currently selected item.
-    pub(super) selected: usize,
+    /// Index of the currently selected item, or `None` when the popup is open
+    /// but the user has not yet navigated with arrow keys / Tab.
+    pub(super) selected: Option<usize>,
     /// The range of text to replace when accepting a suggestion.
     pub(super) replace_range: std::ops::Range<usize>,
     /// Maximum number of items to display in the dropdown.
@@ -131,7 +132,7 @@ impl AutocompleteState {
             provider: AutocompleteProvider::new(cwd, catalog),
             open: false,
             items: Vec::new(),
-            selected: 0,
+            selected: None,
             replace_range: 0..0,
             max_visible: 10,
         }
@@ -140,7 +141,7 @@ impl AutocompleteState {
     pub(super) fn close(&mut self) {
         self.open = false;
         self.items.clear();
-        self.selected = 0;
+        self.selected = None;
         self.replace_range = 0..0;
     }
 
@@ -149,34 +150,55 @@ impl AutocompleteState {
             self.close();
             return;
         }
+
+        // Preserve the selected item across periodic refreshes when the edit
+        // target range is unchanged. This keeps arrow-key navigation stable
+        // while typing (e.g. `/model ...`) even if suggestions are recomputed.
+        let previous_selection = if response.replace == self.replace_range {
+            self.selected_item().cloned()
+        } else {
+            None
+        };
+
         self.open = true;
         self.items = response.items;
-        self.selected = 0;
+        self.selected = previous_selection.and_then(|selected| {
+            self.items.iter().position(|candidate| {
+                candidate.kind == selected.kind
+                    && candidate.insert == selected.insert
+                    && candidate.label == selected.label
+            })
+        });
         self.replace_range = response.replace;
     }
 
     pub(super) fn select_next(&mut self) {
         if !self.items.is_empty() {
-            self.selected = (self.selected + 1) % self.items.len();
+            self.selected = Some(match self.selected {
+                Some(idx) => (idx + 1) % self.items.len(),
+                None => 0,
+            });
         }
     }
 
     pub(super) fn select_prev(&mut self) {
         if !self.items.is_empty() {
-            self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
+            self.selected = Some(match self.selected {
+                Some(idx) => idx.checked_sub(1).unwrap_or(self.items.len() - 1),
+                None => self.items.len() - 1,
+            });
         }
     }
 
     pub(super) fn selected_item(&self) -> Option<&AutocompleteItem> {
-        self.items.get(self.selected)
+        self.selected.and_then(|idx| self.items.get(idx))
     }
 
     /// Returns the scroll offset for the dropdown view.
     pub(super) const fn scroll_offset(&self) -> usize {
-        if self.selected < self.max_visible {
-            0
-        } else {
-            self.selected - self.max_visible + 1
+        match self.selected {
+            Some(idx) if idx >= self.max_visible => idx - self.max_visible + 1,
+            _ => 0,
         }
     }
 }
@@ -929,5 +951,81 @@ pub(super) fn format_count(n: usize) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_item(id: &str) -> AutocompleteItem {
+        AutocompleteItem {
+            kind: crate::autocomplete::AutocompleteItemKind::Model,
+            label: id.to_string(),
+            insert: id.to_string(),
+            description: None,
+        }
+    }
+
+    fn response(
+        replace_range: std::ops::Range<usize>,
+        items: impl IntoIterator<Item = &'static str>,
+    ) -> AutocompleteResponse {
+        AutocompleteResponse {
+            replace: replace_range,
+            items: items.into_iter().map(model_item).collect(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_refresh_preserves_selected_item_when_replace_range_unchanged() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2", "claude-opus-4-5"]));
+
+        state.select_next();
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+
+        // Recompute suggestions (same replace range) in a different order.
+        state.open_with(response(0..6, ["claude-opus-4-5", "gpt-5.2", "gpt-4o"]));
+
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+    }
+
+    #[test]
+    fn autocomplete_refresh_clears_selection_when_replace_range_changes() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2"]));
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-4o")
+        );
+
+        // Cursor/token moved: replace range changed, so selection should reset.
+        state.open_with(response(2..8, ["gpt-4o", "gpt-5.2"]));
+        assert!(state.selected_item().is_none());
+    }
+
+    #[test]
+    fn autocomplete_refresh_clears_selection_when_selected_item_disappears() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(0..6, ["gpt-4o", "gpt-5.2"]));
+        state.select_next();
+        state.select_next();
+        assert_eq!(
+            state.selected_item().map(|item| item.label.as_str()),
+            Some("gpt-5.2")
+        );
+
+        // Selected suggestion no longer present after refresh.
+        state.open_with(response(0..6, ["gpt-4o"]));
+        assert!(state.selected_item().is_none());
     }
 }

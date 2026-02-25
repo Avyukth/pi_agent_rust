@@ -30,7 +30,7 @@ fn sqlite_session_round_trip_smoke() {
 
     let id1 = session.append_message(make_test_message("Hello"));
     let id2 = session.append_message(make_test_message("World"));
-    assert_eq!(session.leaf_id.as_deref(), Some(id2.as_str()));
+    assert_eq!(session.leaf_id(), Some(id2.as_str()));
 
     run_async(async { session.save().await }).expect("save session");
     let path = session
@@ -49,7 +49,7 @@ fn sqlite_session_round_trip_smoke() {
 
     assert_eq!(loaded.header.id, session.header.id);
     assert_eq!(loaded.entries.len(), session.entries.len());
-    assert_eq!(loaded.leaf_id.as_deref(), Some(id2.as_str()));
+    assert_eq!(loaded.leaf_id(), Some(id2.as_str()));
     assert!(
         loaded
             .entries
@@ -84,7 +84,7 @@ fn migrate_jsonl_to_sqlite_round_trip_smoke() {
     );
     sqlite.header = loaded.header.clone();
     sqlite.entries = loaded.entries.clone();
-    sqlite.leaf_id = loaded.leaf_id.clone();
+    sqlite._test_set_leaf_id(loaded.leaf_id().map(String::from));
 
     run_async(async { sqlite.save().await }).expect("save sqlite");
     let sqlite_path = sqlite

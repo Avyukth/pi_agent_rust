@@ -266,9 +266,9 @@ proptest! {
             parent_session: None,
         };
         session.entries = decoded_entries;
-        session.leaf_id = leaf_id;
+        session._test_set_leaf_id(leaf_id);
 
-        if let Some(leaf_id) = session.leaf_id.clone() {
+        if let Some(leaf_id) = session.leaf_id().map(String::from) {
             // Path should always end at the requested entry.
             let path = session.get_path_to_entry(&leaf_id);
             prop_assert_eq!(path.last().map(String::as_str), Some(leaf_id.as_str()));
@@ -312,7 +312,7 @@ fn load_session_accepts_parent_session_alias_and_fills_ids() {
                 .all(|entry| entry.base().id.as_ref().is_some())
         );
 
-        let leaf = session.leaf_id.as_deref();
+        let leaf = session.leaf_id();
         let last_id = session
             .entries
             .last()
@@ -381,7 +381,7 @@ fn open_header_only_session_succeeds_with_no_entries() {
 
         let loaded = open_session(&path).await.expect("open header-only session");
         assert!(loaded.entries.is_empty());
-        assert!(loaded.leaf_id.is_none());
+        assert!(loaded.leaf_id().is_none());
     });
 }
 
@@ -438,7 +438,7 @@ fn plan_fork_from_user_message_branches_from_parent_and_returns_selected_text() 
     } = plan;
     let mut forked = Session::create();
     forked.entries = entries;
-    forked.leaf_id = leaf_id;
+    forked._test_set_leaf_id(leaf_id);
 
     let appended = forked.append_message(make_user_message("Followup"));
     let appended_entry = forked.get_entry(&appended).expect("appended entry");
@@ -522,7 +522,7 @@ fn save_and_open_round_trip_linear_messages_preserves_leaf_id() {
         let loaded = save_and_reopen(&harness, &mut session).await;
 
         assert_eq!(loaded.entries.len(), 2);
-        assert_eq!(loaded.leaf_id.as_deref(), Some(id2.as_str()));
+        assert_eq!(loaded.leaf_id(), Some(id2.as_str()));
 
         let path = loaded.get_path_to_entry(&id2);
         assert_eq!(path, vec![id1, id2]);
@@ -755,13 +755,13 @@ fn save_round_trips_custom_entry() {
         session.append_message(make_user_message("Hello"));
 
         let custom_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        let base = EntryBase::new(session.leaf_id.clone(), custom_id.clone());
+        let base = EntryBase::new(session.leaf_id().map(String::from), custom_id.clone());
         session.entries.push(SessionEntry::Custom(CustomEntry {
             base,
             custom_type: "note".to_string(),
             data: Some(json!({"tag":"demo"})),
         }));
-        session.leaf_id = Some(custom_id.clone());
+        session._test_set_leaf_id(Some(custom_id.clone()));
 
         let loaded = save_and_reopen(&harness, &mut session).await;
         assert_contains_entry(

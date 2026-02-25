@@ -1221,8 +1221,8 @@ fn compute_control_for_shard(
     );
     let target_routing = baseline.routing_weight - instability;
     let mut routing_delta = target_routing - baseline.routing_weight;
-    let oscillation_guarded = if baseline.last_routing_delta.signum() != 0.0
-        && routing_delta.signum() != 0.0
+    let oscillation_guarded = if baseline.last_routing_delta.abs() > f64::EPSILON
+        && routing_delta.abs() > f64::EPSILON
         && baseline.last_routing_delta.signum() != routing_delta.signum()
     {
         routing_delta *= 0.5;

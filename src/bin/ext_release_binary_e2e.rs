@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(unused_variables, clippy::uninlined_format_args))]
 
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -947,7 +948,7 @@ mod tests {
         match fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => panic!("cleanup failed: {err}"),
+            Err(err) => panic!(),
         }
         fs::create_dir_all(&dir).expect("create temp report dir");
 

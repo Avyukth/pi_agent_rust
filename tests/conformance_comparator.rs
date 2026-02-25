@@ -189,7 +189,7 @@ fn deep_compare(expected: &Value, actual: &Value, path: &str, diffs: &mut Vec<Di
                             actual: Some(b_val.clone()),
                         });
                     }
-                    (None, None) => unreachable!(),
+                    (None, None) => panic!(),
                 }
             }
         }
@@ -512,7 +512,7 @@ fn compare_hostcalls(expected: &Value, actual: &Value, diffs: &mut Vec<DiffEntry
                     actual: Some(act.clone()),
                 });
             }
-            (None, None) => unreachable!(),
+            (None, None) => panic!(),
         }
     }
 }

@@ -241,7 +241,7 @@ impl Provider for OpenAIResponsesProvider {
         }
 
         if self.codex_mode {
-            let codex_token = authorization_header_value
+            let codex_token  = authorization_header_value
                 .as_deref()
                 .and_then(bearer_token_from_authorization_header)
                 .or_else(|| auth_value.clone())
@@ -1516,7 +1516,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
@@ -1542,7 +1542,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 

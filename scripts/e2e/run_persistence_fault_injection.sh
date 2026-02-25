@@ -77,7 +77,7 @@ run_cargo() {
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
         cargo "$@"
     else
-        "${CARGO_RUNNER_PREFIX[@]}" env "RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE" cargo "$@"
+        env "RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE" "${CARGO_RUNNER_PREFIX[@]}" cargo "$@"
     fi
 }
 
@@ -191,7 +191,7 @@ echo "[fault-injection] TMPDIR=$TMPDIR"
 if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
     echo "[fault-injection] Cargo runner: local cargo"
 else
-    echo "[fault-injection] Cargo runner: ${CARGO_RUNNER_PREFIX[*]} env RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE cargo"
+    echo "[fault-injection] Cargo runner: env RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE ${CARGO_RUNNER_PREFIX[*]} cargo"
 fi
 
 jsonl_exit=0

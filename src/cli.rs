@@ -673,7 +673,7 @@ mod tests {
                 assert_eq!(source, "npm:@org/pkg");
                 assert!(!local);
             }
-            other => panic!("expected Install, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -685,7 +685,7 @@ mod tests {
                 assert_eq!(source, "git:https://example.com");
                 assert!(local);
             }
-            other => panic!("expected Install --local, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -694,7 +694,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "install", "-l", "./local-ext"]);
         match cli.command {
             Some(Commands::Install { local, .. }) => assert!(local),
-            other => panic!("expected Install -l, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -706,7 +706,7 @@ mod tests {
                 assert_eq!(source, "npm:pkg");
                 assert!(!local);
             }
-            other => panic!("expected Remove, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -715,7 +715,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "remove", "--local", "npm:pkg"]);
         match cli.command {
             Some(Commands::Remove { local, .. }) => assert!(local),
-            other => panic!("expected Remove --local, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -726,7 +726,7 @@ mod tests {
             Some(Commands::Update { source }) => {
                 assert_eq!(source.as_deref(), Some("npm:pkg"));
             }
-            other => panic!("expected Update with source, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -735,7 +735,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "update"]);
         match cli.command {
             Some(Commands::Update { source }) => assert!(source.is_none()),
-            other => panic!("expected Update (all), got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -754,7 +754,7 @@ mod tests {
                 assert!(!paths);
                 assert!(!json);
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -767,7 +767,7 @@ mod tests {
                 assert!(!paths);
                 assert!(!json);
             }
-            other => panic!("expected Config --show, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -780,7 +780,7 @@ mod tests {
                 assert!(paths);
                 assert!(!json);
             }
-            other => panic!("expected Config --paths, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -793,7 +793,7 @@ mod tests {
                 assert!(!paths);
                 assert!(json);
             }
-            other => panic!("expected Config --json, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -810,7 +810,7 @@ mod tests {
             Some(Commands::Info { name }) => {
                 assert_eq!(name, "auto-commit-on-exit");
             }
-            other => panic!("expected Info, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -840,7 +840,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "--list-models", "claude*"]);
         match cli.list_models {
             Some(Some(ref pat)) => assert_eq!(pat, "claude*"),
-            other => panic!("expected Some(Some(\"claude*\")), got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -1427,7 +1427,7 @@ mod tests {
             fn is_known_short_flag_rejects_unknown_chars(
                 c in prop::sample::select(vec!['a', 'b', 'd', 'f', 'g', 'h', 'x', 'z']),
             ) {
-                let token = format!("-{c}");
+                let token  = format!("-{c}");
                 assert!(
                     !is_known_short_flag(&token),
                     "'-{c}' should not be a known short flag"
@@ -1448,7 +1448,7 @@ mod tests {
             fn is_known_short_flag_rejects_double_dash(
                 body in "[vcr]{1,5}",
             ) {
-                let token = format!("--{body}");
+                let token  = format!("--{body}");
                 assert!(
                     !is_known_short_flag(&token),
                     "'--{body}' should not be a short flag"
@@ -1459,7 +1459,7 @@ mod tests {
             fn is_negative_numeric_token_accepts_negative_integers(
                 n in 1..10_000i64,
             ) {
-                let token = format!("-{n}");
+                let token  = format!("-{n}");
                 assert!(
                     is_negative_numeric_token(&token),
                     "'{token}' should be a negative numeric token"
@@ -1471,7 +1471,7 @@ mod tests {
                 whole in 0..100u32,
                 frac in 1..100u32,
             ) {
-                let token = format!("-{whole}.{frac}");
+                let token  = format!("-{whole}.{frac}");
                 assert!(
                     is_negative_numeric_token(&token),
                     "'{token}' should be a negative numeric token"
@@ -1482,7 +1482,7 @@ mod tests {
             fn is_negative_numeric_token_rejects_positive_numbers(
                 n in 0..10_000u64,
             ) {
-                let token = n.to_string();
+                let token  = n.to_string();
                 assert!(
                     !is_negative_numeric_token(&token),
                     "'{token}' (positive) should not be a negative numeric token"
@@ -1493,7 +1493,7 @@ mod tests {
             fn is_negative_numeric_token_rejects_non_numeric(
                 s in "[a-z]{1,5}",
             ) {
-                let token = format!("-{s}");
+                let token  = format!("-{s}");
                 assert!(
                     !is_negative_numeric_token(&token),
                     "'-{s}' should not be a negative numeric token"

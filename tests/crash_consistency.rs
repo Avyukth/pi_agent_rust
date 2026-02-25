@@ -432,7 +432,7 @@ fn crash_corrupt_mid_file_then_continue_operation() {
     assert_eq!(session.entries.len(), 1);
     assert_eq!(diagnostics.skipped_entries.len(), 1);
     assert!(
-        session.leaf_id.is_some(),
+        session.leaf_id().is_some(),
         "leaf should point to surviving entry"
     );
 }

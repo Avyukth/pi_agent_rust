@@ -353,7 +353,7 @@ mod tests {
                 }
             }
             InputEventOutcome::Block { reason } => {
-                panic!("expected continue, got block: {reason:?}");
+                panic!();
             }
         }
     }
@@ -585,7 +585,7 @@ mod tests {
                     assert_eq!(reason.as_deref(), Some("Denied by policy"));
                 }
                 InputEventOutcome::Continue { .. } => {
-                    panic!("expected block for action={action}");
+                    panic!();
                 }
             }
         }
@@ -667,7 +667,7 @@ mod tests {
             InputEventOutcome::Block { reason } => {
                 assert_eq!(reason.as_deref(), Some("Policy denied"));
             }
-            InputEventOutcome::Continue { .. } => panic!("expected block"),
+            InputEventOutcome::Continue { .. } => panic!(),
         }
     }
 
@@ -790,7 +790,7 @@ mod tests {
                 assert_eq!(images.len(), 1);
                 assert_eq!(images[0].data, "ATT_BASE64");
             }
-            InputEventOutcome::Block { .. } => panic!("expected continue"),
+            InputEventOutcome::Block { .. } => panic!(),
         }
     }
 
@@ -858,7 +858,7 @@ mod tests {
                         assert_eq!(t, text);
                         assert!(images.is_empty());
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -870,7 +870,7 @@ mod tests {
                         assert_eq!(t, text);
                         assert!(images.is_empty());
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -889,7 +889,7 @@ mod tests {
                         assert_eq!(text, replacement);
                         assert!(images.is_empty());
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -904,7 +904,7 @@ mod tests {
                 match apply_input_event_response(Some(response), text, Vec::new()) {
                     InputEventOutcome::Block { .. } => {}
                     InputEventOutcome::Continue { .. } => {
-                        panic!("expected Block for action '{}'", actions[action_idx]);
+                        assert!(false, "expected Block for action '{}'", actions[action_idx]);
                     }
                 }
             }
@@ -917,7 +917,7 @@ mod tests {
                     InputEventOutcome::Continue { text: t, .. } => {
                         assert_eq!(t, text);
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -932,7 +932,7 @@ mod tests {
                     InputEventOutcome::Continue { text, .. } => {
                         assert_eq!(text, new_text);
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -942,7 +942,7 @@ mod tests {
                 let response = json!({"block": true});
                 match apply_input_event_response(Some(response), text, Vec::new()) {
                     InputEventOutcome::Block { .. } => {}
-                    InputEventOutcome::Continue { .. } => panic!("expected Block"),
+                    InputEventOutcome::Continue { .. } => assert!(false, "expected Block"),
                 }
             }
 
@@ -954,7 +954,7 @@ mod tests {
                     InputEventOutcome::Continue { text: t, .. } => {
                         assert_eq!(t, text);
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -966,7 +966,7 @@ mod tests {
                     InputEventOutcome::Continue { text: t, .. } => {
                         assert_eq!(t, text);
                     }
-                    InputEventOutcome::Block { .. } => panic!("expected Continue"),
+                    InputEventOutcome::Block { .. } => assert!(false, "expected Continue"),
                 }
             }
 
@@ -982,7 +982,7 @@ mod tests {
                     InputEventOutcome::Block { reason: r } => {
                         assert_eq!(r.as_deref(), Some(reason.as_str()));
                     }
-                    InputEventOutcome::Continue { .. } => panic!("expected Block"),
+                    InputEventOutcome::Continue { .. } => assert!(false, "expected Block"),
                 }
             }
 

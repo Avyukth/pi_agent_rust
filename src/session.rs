@@ -551,8 +551,9 @@ pub struct Session {
     pub entries: Vec<SessionEntry>,
     /// Path to the session file (None for in-memory)
     pub path: Option<PathBuf>,
-    /// Current leaf entry ID
-    pub leaf_id: Option<String>,
+    /// Current leaf entry ID. Direct modification outside of `session.rs`
+    /// is forbidden because it can desynchronize the `is_linear` optimization cache.
+    pub(crate) leaf_id: Option<String>,
     /// Base directory for session storage (optional override)
     pub session_dir: Option<PathBuf>,
     store_kind: SessionStoreKind,
@@ -2323,6 +2324,48 @@ impl Session {
         } else {
             false
         }
+    }
+
+    /// Get the current leaf entry ID.
+    pub fn leaf_id(&self) -> Option<&str> {
+        self.leaf_id.as_deref()
+    }
+
+    /// Initialize the session entries and leaf from a `ForkPlan`.
+    ///
+    /// This safely applies the new entries and leaf, and rebuilds
+    /// all internal caches (including the `is_linear` optimization flag).
+    pub fn init_from_fork_plan(&mut self, plan: ForkPlan) {
+        self.entries = plan.entries;
+        self.leaf_id = plan.leaf_id;
+        self.rebuild_all_caches();
+    }
+
+    /// Set the leaf ID directly (for tests only).
+    pub fn _test_set_leaf_id(&mut self, id: Option<String>) {
+        self.leaf_id = id;
+        self.rebuild_all_caches();
+    }
+
+    /// Revert the last user message on the current path, effectively abandoning it.
+    /// This is used during API retries to prevent duplicating the user prompt in the session history.
+    pub fn revert_last_user_message(&mut self) -> bool {
+        if let Some(leaf_id) = self.leaf_id.clone() {
+            if let Some(SessionEntry::Message(msg_entry)) = self.get_entry(&leaf_id) {
+                if matches!(msg_entry.message, SessionMessage::User { .. }) {
+                    if let Some(parent_id) = msg_entry.base.parent_id.clone() {
+                        self.leaf_id = Some(parent_id);
+                    } else {
+                        self.leaf_id = None;
+                    }
+                    self.is_linear = false;
+                    // We intentionally don't remove from self.entries so it remains an abandoned branch
+                    // which is safely ignored by `to_messages_for_current_path`.
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Reset the leaf pointer to root (before any entries).
@@ -5265,7 +5308,7 @@ mod tests {
             if let SessionMessage::ToolResult { is_error, .. } = &msg.message {
                 assert!(is_error);
             } else {
-                panic!("expected ToolResult");
+                panic!();
             }
         }
     }
@@ -5293,7 +5336,7 @@ mod tests {
                 assert_eq!(command, "echo hello");
                 assert_eq!(*exit_code, 0);
             } else {
-                panic!("expected BashExecution");
+                panic!();
             }
         }
 
@@ -5359,7 +5402,7 @@ mod tests {
                 assert_eq!(custom_type, "extension_state");
                 assert!(!display);
             } else {
-                panic!("expected Custom");
+                panic!();
             }
         }
     }
@@ -5378,7 +5421,7 @@ mod tests {
             assert_eq!(custom.data, Some(serde_json::json!(42)));
             assert_eq!(custom.base.parent_id.as_deref(), Some(root_id.as_str()));
         } else {
-            panic!("expected Custom entry");
+            panic!();
         }
     }
 
@@ -5423,7 +5466,7 @@ mod tests {
             assert_eq!(mc.provider, "openai");
             assert_eq!(mc.model_id, "gpt-4");
         } else {
-            panic!("expected ModelChange");
+            panic!();
         }
     }
 
@@ -5439,7 +5482,7 @@ mod tests {
         if let SessionEntry::ThinkingLevelChange(tlc) = entry {
             assert_eq!(tlc.thinking_level, "high");
         } else {
-            panic!("expected ThinkingLevelChange");
+            panic!();
         }
     }
 
@@ -5486,7 +5529,7 @@ mod tests {
             assert_eq!(label.target_id, msg_id);
             assert_eq!(label.label.as_deref(), Some("important"));
         } else {
-            panic!("expected Label entry");
+            panic!();
         }
     }
 
@@ -6260,10 +6303,10 @@ mod tests {
             if let SessionMessage::User { content, .. } = &msg.message {
                 match content {
                     UserContent::Text(t) => assert_eq!(t, "Modified"),
-                    UserContent::Blocks(_) => panic!("expected Text content"),
+                    UserContent::Blocks(_) => panic!(),
                 }
             } else {
-                panic!("expected user message");
+                panic!();
             }
         }
     }
@@ -6485,7 +6528,7 @@ mod tests {
                 if let SessionMessage::User { content, .. } = &msg.message {
                     match content {
                         UserContent::Text(t) => assert_eq!(t, unicode_texts[i]),
-                        UserContent::Blocks(_) => panic!("expected Text content at index {i}"),
+                        UserContent::Blocks(_) => panic!(),
                     }
                 }
             }
@@ -8096,6 +8139,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8195,6 +8243,11 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let parent = path.parent().unwrap();
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if tempfile::NamedTempFile::new_in(parent).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8237,6 +8290,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
@@ -8350,6 +8408,11 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Some environments (for example root-run test runners) bypass chmod restrictions.
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                return;
+            }
         }
         #[cfg(not(unix))]
         {
