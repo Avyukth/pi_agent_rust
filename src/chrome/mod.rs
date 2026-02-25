@@ -468,7 +468,6 @@ impl ChromeBridge {
         format!("chrome-{seq}")
     }
 
-    #[allow(clippy::future_not_send)]
     pub async fn send_request(
         &self,
         op: impl Into<String>,
@@ -479,7 +478,6 @@ impl ChromeBridge {
             .await
     }
 
-    #[allow(clippy::future_not_send)]
     pub async fn execute_request_with_esl(
         &self,
         op: impl Into<String>,
@@ -491,7 +489,6 @@ impl ChromeBridge {
             .await
     }
 
-    #[allow(clippy::future_not_send)]
     async fn execute_request_with_esl_id(
         &self,
         request_id: String,
@@ -634,11 +631,7 @@ impl ChromeBridge {
         Ok(true)
     }
 
-    #[allow(
-        clippy::await_holding_lock,
-        clippy::future_not_send,
-        clippy::significant_drop_tightening
-    )]
+    #[allow(clippy::significant_drop_tightening)]
     async fn send_request_with_id(
         &self,
         request_id: String,
@@ -668,17 +661,27 @@ impl ChromeBridge {
             .expect("pending responses mutex poisoned")
             .insert(request_id.clone(), tx);
 
-        let write_result = async {
-            let mut writer_guard = self
-                .writer
-                .lock()
-                .expect("chrome bridge writer mutex poisoned");
-            let writer = writer_guard
-                .as_mut()
-                .ok_or(ChromeBridgeError::NotConnected)?;
-            write_request_frame(writer, &protocol::MessageType::Request(request)).await
-        }
-        .await;
+        // Take the writer out of the Option while the MutexGuard is held,
+        // then drop the guard *before* the async write.  This keeps the
+        // future Send (no std::sync::MutexGuard alive across an await).
+        // The write-lane guard ensures at most one write is in flight per
+        // serialisation group, so no concurrent code will observe the
+        // temporarily-empty Option.
+        let mut writer = self
+            .writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take()
+            .ok_or(ChromeBridgeError::NotConnected)?;
+
+        let write_result =
+            write_request_frame(&mut writer, &protocol::MessageType::Request(request)).await;
+
+        // Put the writer back (even on error, so disconnect can close it).
+        *self
+            .writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned") = Some(writer);
 
         if let Err(err) = write_result {
             self.pending

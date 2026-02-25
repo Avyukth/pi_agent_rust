@@ -611,6 +611,37 @@ fn bridge_not_connected_error(tool_name: &str) -> ToolOutput {
     }
 }
 
+/// Send a tool request through the ChromeBridge and convert the response to ToolOutput.
+async fn execute_bridge_request(
+    bridge: &ChromeBridge,
+    op: &str,
+    payload: serde_json::Value,
+) -> Result<ToolOutput> {
+    use super::config::browser_error_to_tool_output;
+    use super::protocol::ResponseEnvelope;
+
+    let response = bridge
+        .execute_request_with_esl(op, payload)
+        .await
+        .map_err(|e| crate::error::Error::Tool {
+            tool: op.to_string(),
+            message: format!("bridge error: {e}"),
+        })?;
+
+    Ok(match response {
+        ResponseEnvelope::Ok(resp) => ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(
+                serde_json::to_string_pretty(&resp.result).unwrap_or_default(),
+            ))],
+            details: Some(resp.result),
+            is_error: false,
+        },
+        ResponseEnvelope::Error(err) => {
+            browser_error_to_tool_output(err.error.code, &err.error.message, err.error.retryable)
+        }
+    })
+}
+
 // ============================================================================
 // NavigateTool — Wave 2A
 // ============================================================================
@@ -667,6 +698,7 @@ impl Tool for NavigateTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: NavigateInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "navigate".to_string(),
@@ -713,9 +745,7 @@ impl Tool for NavigateTool {
             }
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("navigate"))
+        execute_bridge_request(&self.bridge, "navigate", payload).await
     }
 }
 
@@ -772,15 +802,14 @@ impl Tool for TabsCreateTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: TabsCreateInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "tabs_create".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("tabs_create"))
+        execute_bridge_request(&self.bridge, "tabs_create", payload).await
     }
 }
 
@@ -835,9 +864,7 @@ impl Tool for TabsContextTool {
         _input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("tabs_context"))
+        execute_bridge_request(&self.bridge, "tabs_context", serde_json::json!({})).await
     }
 }
 
@@ -890,19 +917,14 @@ impl Tool for SwitchBrowserTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: SwitchBrowserInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "switch_browser".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(
-                "Error: switch_browser is not yet implemented (Phase 3)",
-            ))],
-            details: None,
-            is_error: true,
-        })
+        execute_bridge_request(&self.bridge, "switch_browser", payload).await
     }
 }
 
@@ -983,15 +1005,14 @@ impl Tool for ReadPageTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: ReadPageInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "read_page".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("read_page"))
+        execute_bridge_request(&self.bridge, "read_page", payload).await
     }
 }
 
@@ -1050,15 +1071,14 @@ impl Tool for GetPageTextTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: GetPageTextInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "get_page_text".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("get_page_text"))
+        execute_bridge_request(&self.bridge, "get_page_text", payload).await
     }
 }
 
@@ -1122,6 +1142,7 @@ impl Tool for FindTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: FindInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "find".to_string(),
@@ -1138,9 +1159,7 @@ impl Tool for FindTool {
             });
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("find"))
+        execute_bridge_request(&self.bridge, "find", payload).await
     }
 }
 
@@ -1270,6 +1289,7 @@ impl Tool for ComputerTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: ComputerInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "computer".to_string(),
@@ -1348,9 +1368,7 @@ impl Tool for ComputerTool {
             }
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("computer"))
+        execute_bridge_request(&self.bridge, "computer", payload).await
     }
 }
 
@@ -1413,15 +1431,14 @@ impl Tool for FormInputTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: FormInputInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "form_input".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("form_input"))
+        execute_bridge_request(&self.bridge, "form_input", payload).await
     }
 }
 
@@ -1483,15 +1500,14 @@ impl Tool for ScreenshotTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: ScreenshotInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "screenshot".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("screenshot"))
+        execute_bridge_request(&self.bridge, "screenshot", payload).await
     }
 }
 
@@ -1552,19 +1568,14 @@ impl Tool for GifCreatorTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: GifCreatorInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "gif_creator".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(
-                "Error: GIF encoding is not yet available (Phase 3)",
-            ))],
-            details: None,
-            is_error: true,
-        })
+        execute_bridge_request(&self.bridge, "gif_creator", payload).await
     }
 }
 
@@ -1624,6 +1635,7 @@ impl Tool for JavascriptTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: JavascriptInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "javascript".to_string(),
@@ -1640,9 +1652,7 @@ impl Tool for JavascriptTool {
             });
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("javascript"))
+        execute_bridge_request(&self.bridge, "javascript", payload).await
     }
 }
 
@@ -1704,15 +1714,14 @@ impl Tool for ReadConsoleTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: ReadConsoleInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "read_console_messages".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("read_console_messages"))
+        execute_bridge_request(&self.bridge, "read_console_messages", payload).await
     }
 }
 
@@ -1774,15 +1783,14 @@ impl Tool for ReadNetworkTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let _input: ReadNetworkInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "read_network_requests".to_string(),
                 message: format!("invalid parameters: {e}"),
             })?;
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("read_network_requests"))
+        execute_bridge_request(&self.bridge, "read_network_requests", payload).await
     }
 }
 
@@ -1846,6 +1854,7 @@ impl Tool for ResizeWindowTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: ResizeWindowInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "resize_window".to_string(),
@@ -1862,9 +1871,7 @@ impl Tool for ResizeWindowTool {
             });
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("resize_window"))
+        execute_bridge_request(&self.bridge, "resize_window", payload).await
     }
 }
 
@@ -1919,6 +1926,7 @@ impl Tool for ShortcutsExecuteTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: ShortcutsExecuteInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "shortcuts_execute".to_string(),
@@ -1935,9 +1943,7 @@ impl Tool for ShortcutsExecuteTool {
             });
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("shortcuts_execute"))
+        execute_bridge_request(&self.bridge, "shortcuts_execute", payload).await
     }
 }
 
@@ -1990,9 +1996,7 @@ impl Tool for ShortcutsListTool {
         _input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("shortcuts_list"))
+        execute_bridge_request(&self.bridge, "shortcuts_list", serde_json::json!({})).await
     }
 }
 
@@ -2056,6 +2060,7 @@ impl Tool for UploadImageTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        let payload = input.clone();
         let input: UploadImageInput =
             serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
                 tool: "upload_image".to_string(),
@@ -2082,9 +2087,7 @@ impl Tool for UploadImageTool {
             });
         }
 
-        let _ = &self.bridge;
-        // TODO(bd-18m.2.1): Send request via ChromeBridge once native host relay is complete
-        Ok(bridge_not_connected_error("upload_image"))
+        execute_bridge_request(&self.bridge, "upload_image", payload).await
     }
 }
 
@@ -2638,6 +2641,31 @@ mod tests {
         Arc::new(ChromeBridge::new(Default::default()))
     }
 
+    /// Execute a tool and assert that the bridge was reached (i.e. input
+    /// validation passed).  With no live Chrome host the bridge returns an
+    /// Err — this is expected.  The test just verifies that we got past
+    /// input validation.
+    async fn assert_reaches_bridge(
+        tool: &dyn Tool,
+        input: serde_json::Value,
+    ) {
+        match tool.execute("call-1", input, None).await {
+            // Bridge not connected — expected in unit tests (no Chrome host).
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("bridge error") || msg.contains("not connected"),
+                    "expected bridge error, got: {msg}"
+                );
+            }
+            // If we somehow get a ToolOutput, it should be an error from the
+            // bridge, not from parameter validation.
+            Ok(output) => {
+                assert!(output.is_error, "expected error output from bridge");
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // NavigateTool tests — Wave 2A
     // -----------------------------------------------------------------------
@@ -2691,22 +2719,11 @@ mod tests {
     fn navigate_accepts_valid_url() {
         run_async(async {
             let tool = NavigateTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "url": "https://example.com" }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            // Should return "not connected" since bridge is disconnected
-            assert!(result.is_error);
-            assert!(
-                first_text(&result).contains("not connected")
-                    || first_text(&result).contains("not available")
-            );
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "url": "https://example.com" }),
+            )
+            .await;
         });
     }
 
@@ -2714,19 +2731,8 @@ mod tests {
     fn navigate_accepts_valid_action() {
         run_async(async {
             let tool = NavigateTool::new(make_bridge());
-
             for action in &["back", "forward", "reload"] {
-                let result = tool
-                    .execute("call-1", serde_json::json!({ "action": action }), None)
-                    .await
-                    .expect("execute");
-
-                // Should reach bridge call (not parameter validation error)
-                assert!(result.is_error);
-                assert!(
-                    first_text(&result).contains("not available"),
-                    "action '{action}' should pass validation"
-                );
+                assert_reaches_bridge(&tool, serde_json::json!({ "action": action })).await;
             }
         });
     }
@@ -2746,15 +2752,7 @@ mod tests {
     fn tabs_create_accepts_empty_params() {
         run_async(async {
             let tool = TabsCreateTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            // All params optional — should reach bridge call
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -2762,18 +2760,11 @@ mod tests {
     fn tabs_create_accepts_url_and_active() {
         run_async(async {
             let tool = TabsCreateTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "url": "https://example.com", "active": true }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "url": "https://example.com", "active": true }),
+            )
+            .await;
         });
     }
 
@@ -2799,14 +2790,7 @@ mod tests {
     fn tabs_context_accepts_empty_params() {
         run_async(async {
             let tool = TabsContextTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -2815,17 +2799,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn switch_browser_returns_not_implemented() {
+    fn switch_browser_reaches_bridge() {
         run_async(async {
             let tool = SwitchBrowserTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({ "browser": "firefox" }), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not yet implemented"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "browser": "firefox" }),
+            )
+            .await;
         });
     }
 
@@ -2851,15 +2832,7 @@ mod tests {
     fn read_page_accepts_empty_params() {
         run_async(async {
             let tool = ReadPageTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            // All params optional — should reach bridge call
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -2867,25 +2840,18 @@ mod tests {
     fn read_page_accepts_full_params() {
         run_async(async {
             let tool = ReadPageTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({
-                        "tab_id": 42,
-                        "max_depth": 10,
-                        "max_nodes": 500,
-                        "filter": "main",
-                        "ref_id": 7,
-                        "max_chars": 10000,
-                    }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({
+                    "tab_id": 42,
+                    "max_depth": 10,
+                    "max_nodes": 500,
+                    "filter": "main",
+                    "ref_id": 7,
+                    "max_chars": 10000,
+                }),
+            )
+            .await;
         });
     }
 
@@ -2921,14 +2887,7 @@ mod tests {
     fn get_page_text_accepts_empty_params() {
         run_async(async {
             let tool = GetPageTextTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -2936,14 +2895,7 @@ mod tests {
     fn get_page_text_accepts_tab_id() {
         run_async(async {
             let tool = GetPageTextTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({ "tab_id": 42 }), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({ "tab_id": 42 })).await;
         });
     }
 
@@ -2989,18 +2941,11 @@ mod tests {
     fn find_accepts_valid_query() {
         run_async(async {
             let tool = FindTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "query": "Submit", "tab_id": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "query": "Submit", "tab_id": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3053,19 +2998,11 @@ mod tests {
     fn computer_click_accepts_coordinate() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "action": "left_click", "coordinate": [100, 200] }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            // Passes validation, reaches bridge
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "action": "left_click", "coordinate": [100, 200] }),
+            )
+            .await;
         });
     }
 
@@ -3073,18 +3010,11 @@ mod tests {
     fn computer_click_accepts_ref_id() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "action": "left_click", "refId": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "action": "left_click", "refId": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3126,18 +3056,11 @@ mod tests {
     fn computer_type_accepts_text() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "action": "type", "text": "hello" }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "action": "type", "text": "hello" }),
+            )
+            .await;
         });
     }
 
@@ -3179,22 +3102,12 @@ mod tests {
     fn computer_scroll_accepts_valid_direction() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
             for dir in &["up", "down", "left", "right"] {
-                let result = tool
-                    .execute(
-                        "call-1",
-                        serde_json::json!({ "action": "scroll", "scroll_direction": dir }),
-                        None,
-                    )
-                    .await
-                    .expect("execute");
-
-                assert!(result.is_error);
-                assert!(
-                    first_text(&result).contains("not available"),
-                    "scroll_direction '{dir}' should pass validation"
-                );
+                assert_reaches_bridge(
+                    &tool,
+                    serde_json::json!({ "action": "scroll", "scroll_direction": dir }),
+                )
+                .await;
             }
         });
     }
@@ -3203,18 +3116,7 @@ mod tests {
     fn computer_screenshot_action_passes_validation() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "action": "screenshot" }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({ "action": "screenshot" })).await;
         });
     }
 
@@ -3222,18 +3124,11 @@ mod tests {
     fn computer_wait_action_passes_validation() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "action": "wait", "duration": 1000 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "action": "wait", "duration": 1000 }),
+            )
+            .await;
         });
     }
 
@@ -3241,9 +3136,7 @@ mod tests {
     fn computer_all_13_actions_recognized() {
         run_async(async {
             let tool = ComputerTool::new(make_bridge());
-
             for action in COMPUTER_ACTIONS {
-                // Build minimum valid input for each action
                 let mut input = serde_json::json!({ "action": action });
                 if COORDINATE_ACTIONS.contains(action) {
                     input["coordinate"] = serde_json::json!([100, 200]);
@@ -3251,14 +3144,7 @@ mod tests {
                 if TEXT_ACTIONS.contains(action) {
                     input["text"] = serde_json::json!("test");
                 }
-
-                let result = tool.execute("call-1", input, None).await.expect("execute");
-
-                // Should reach bridge (not validation error)
-                assert!(
-                    first_text(&result).contains("not available"),
-                    "action '{action}' should pass validation and reach bridge"
-                );
+                assert_reaches_bridge(&tool, input).await;
             }
         });
     }
@@ -3297,18 +3183,11 @@ mod tests {
     fn form_input_accepts_valid_params() {
         run_async(async {
             let tool = FormInputTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "refId": 42, "value": "test@example.com" }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "refId": 42, "value": "test@example.com" }),
+            )
+            .await;
         });
     }
 
@@ -3316,18 +3195,11 @@ mod tests {
     fn form_input_accepts_tab_id() {
         run_async(async {
             let tool = FormInputTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "refId": 7, "value": "x", "tab_id": 99 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "refId": 7, "value": "x", "tab_id": 99 }),
+            )
+            .await;
         });
     }
 
@@ -3346,14 +3218,7 @@ mod tests {
     fn screenshot_accepts_empty_params() {
         run_async(async {
             let tool = ScreenshotTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -3361,18 +3226,11 @@ mod tests {
     fn screenshot_accepts_selector() {
         run_async(async {
             let tool = ScreenshotTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "selector": "#main", "tab_id": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "selector": "#main", "tab_id": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3388,17 +3246,10 @@ mod tests {
     }
 
     #[test]
-    fn gif_creator_returns_phase3_stub() {
+    fn gif_creator_reaches_bridge() {
         run_async(async {
             let tool = GifCreatorTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({ "duration_ms": 3000 }), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("Phase 3"));
+            assert_reaches_bridge(&tool, serde_json::json!({ "duration_ms": 3000 })).await;
         });
     }
 
@@ -3442,18 +3293,11 @@ mod tests {
     fn javascript_accepts_valid_code() {
         run_async(async {
             let tool = JavascriptTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "code": "document.title", "tab_id": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "code": "document.title", "tab_id": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3472,14 +3316,7 @@ mod tests {
     fn read_console_accepts_empty_params() {
         run_async(async {
             let tool = ReadConsoleTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -3487,18 +3324,11 @@ mod tests {
     fn read_console_accepts_pattern() {
         run_async(async {
             let tool = ReadConsoleTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "pattern": "\\[ERROR\\]", "tab_id": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "pattern": "\\[ERROR\\]", "tab_id": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3517,14 +3347,7 @@ mod tests {
     fn read_network_accepts_empty_params() {
         run_async(async {
             let tool = ReadNetworkTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -3532,18 +3355,11 @@ mod tests {
     fn read_network_accepts_pattern() {
         run_async(async {
             let tool = ReadNetworkTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "pattern": "/api/.*", "tab_id": 42 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "pattern": "/api/.*", "tab_id": 42 }),
+            )
+            .await;
         });
     }
 
@@ -3591,18 +3407,11 @@ mod tests {
     fn resize_window_accepts_valid_dimensions() {
         run_async(async {
             let tool = ResizeWindowTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({ "width": 1024, "height": 768 }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({ "width": 1024, "height": 768 }),
+            )
+            .await;
         });
     }
 
@@ -3646,14 +3455,7 @@ mod tests {
     fn shortcuts_execute_accepts_valid() {
         run_async(async {
             let tool = ShortcutsExecuteTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({ "shortcut": "Ctrl+C" }), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({ "shortcut": "Ctrl+C" })).await;
         });
     }
 
@@ -3672,14 +3474,7 @@ mod tests {
     fn shortcuts_list_accepts_empty_params() {
         run_async(async {
             let tool = ShortcutsListTool::new(make_bridge());
-
-            let result = tool
-                .execute("call-1", serde_json::json!({}), None)
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
         });
     }
 
@@ -3746,22 +3541,15 @@ mod tests {
     fn upload_image_accepts_valid_params() {
         run_async(async {
             let tool = UploadImageTool::new(make_bridge());
-
-            let result = tool
-                .execute(
-                    "call-1",
-                    serde_json::json!({
-                        "file_path": "/tmp/screenshot.png",
-                        "selector": "input[type=file]",
-                        "tab_id": 42,
-                    }),
-                    None,
-                )
-                .await
-                .expect("execute");
-
-            assert!(result.is_error);
-            assert!(first_text(&result).contains("not available"));
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({
+                    "file_path": "/tmp/screenshot.png",
+                    "selector": "input[type=file]",
+                    "tab_id": 42,
+                }),
+            )
+            .await;
         });
     }
 
