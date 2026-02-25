@@ -520,6 +520,9 @@ mod tests {
                 noise in "[a-zA-Z0-9 ]{0,50}",
                 (line, expected_cat) in arb_transient_line(),
             ) {
+                // Reject noise strings that themselves match flake patterns
+                // (e.g. random "eBUsy" matching the FsContention pattern).
+                prop_assume!(matches!(classify_failure(&noise), FlakeClassification::Deterministic));
                 let input = format!("{noise}\n{line}");
                 let result = classify_failure(&input);
                 match result {

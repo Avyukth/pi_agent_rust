@@ -561,7 +561,7 @@ where
             if let Some(ContentBlock::ToolCall(block)) =
                 self.partial.content.get_mut(tc.content_index)
             {
-                block.arguments = arguments;
+                block.arguments = std::sync::Arc::new(arguments);
             }
         }
     }
@@ -684,7 +684,7 @@ where
 
                         name: String::new(),
 
-                        arguments: serde_json::Value::Null,
+                        arguments: std::sync::Arc::new(serde_json::Value::Null),
 
                         thought_signature: None,
                     }));
@@ -1284,7 +1284,7 @@ mod tests {
             .expect("assembled tool call content");
         assert_eq!(tool_call.id, "call_1");
         assert_eq!(tool_call.name, "search");
-        assert_eq!(tool_call.arguments, json!({ "q": "rust" }));
+        assert_eq!(*tool_call.arguments, json!({ "q": "rust" }));
         assert!(out.iter().any(|e| matches!(
             e,
             StreamEvent::Done {
@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_sparse");
         assert_eq!(tool_calls[0].name, "lookup");
-        assert_eq!(tool_calls[0].arguments, json!({ "q": "sparse" }));
+        assert_eq!(*tool_calls[0].arguments, json!({ "q": "sparse" }));
         assert!(
             out.iter()
                 .any(|event| matches!(event, StreamEvent::ToolCallStart { .. })),

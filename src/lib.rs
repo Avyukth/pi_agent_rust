@@ -84,12 +84,14 @@ pub mod http;
 pub mod http_shim;
 pub mod interactive;
 pub mod keybindings;
+pub mod logging;
 pub mod migrations;
 pub mod model;
 pub mod model_selector;
 pub mod models;
 pub mod package_manager;
 pub mod perf_build;
+pub mod perf_evidence;
 pub mod permissions;
 #[cfg(feature = "wasm-host")]
 pub mod pi_wasm;

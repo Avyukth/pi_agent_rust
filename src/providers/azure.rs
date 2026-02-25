@@ -358,7 +358,7 @@ where
             if let Some(ContentBlock::ToolCall(block)) =
                 self.partial.content.get_mut(tc.content_index)
             {
-                block.arguments = arguments;
+                block.arguments = std::sync::Arc::new(arguments);
             }
         }
     }
@@ -460,7 +460,7 @@ where
                             .push(ContentBlock::ToolCall(crate::model::ToolCall {
                                 id: String::new(),
                                 name: String::new(),
-                                arguments: serde_json::Value::Null,
+                                arguments: std::sync::Arc::new(serde_json::Value::Null),
                                 thought_signature: None,
                             }));
 
@@ -914,7 +914,7 @@ mod tests {
                         ContentBlock::ToolCall(ToolCall {
                             id: "tool_1".to_string(),
                             name: "echo".to_string(),
-                            arguments: json!({"text":"ping"}),
+                            arguments: std::sync::Arc::new(json!({"text":"ping"})),
                             thought_signature: None,
                         }),
                     ],
@@ -1108,7 +1108,7 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_sparse");
         assert_eq!(tool_calls[0].name, "lookup");
-        assert_eq!(tool_calls[0].arguments, json!({ "q": "azure" }));
+        assert_eq!(*tool_calls[0].arguments, json!({ "q": "azure" }));
         assert!(
             out.iter()
                 .any(|event| matches!(event, StreamEvent::ToolCallStart { .. })),

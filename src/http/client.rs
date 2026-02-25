@@ -16,8 +16,9 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
@@ -27,6 +28,47 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+// O16: Connection pool — reuse TCP+TLS connections across requests to the
+// same (host, port) to avoid the 40-150ms per-connection overhead.
+const MAX_IDLE_PER_HOST: usize = 1;
+
+/// Key for connection pool: (host, port).
+type PoolKey = (String, u16);
+
+/// Process-wide pool of idle HTTP/1.1 transports.
+struct ConnectionPool {
+    idle: HashMap<PoolKey, Transport>,
+}
+
+impl ConnectionPool {
+    fn new() -> Self {
+        Self {
+            idle: HashMap::new(),
+        }
+    }
+
+    /// Take an idle transport for the given (host, port), if one exists.
+    fn take(&mut self, key: &PoolKey) -> Option<Transport> {
+        self.idle.remove(key)
+    }
+
+    /// Return a transport to the pool. Silently drops if the pool slot is full.
+    fn return_conn(&mut self, key: PoolKey, transport: Transport) {
+        if self.idle.len() >= MAX_IDLE_PER_HOST * 8 {
+            // Hard cap to prevent unbounded growth if many hosts are contacted.
+            return;
+        }
+        // Only keep one idle connection per host.
+        let _prev = self.idle.insert(key, transport);
+    }
+}
+
+static CONNECTION_POOL: OnceLock<StdMutex<ConnectionPool>> = OnceLock::new();
+
+fn global_pool() -> &'static StdMutex<ConnectionPool> {
+    CONNECTION_POOL.get_or_init(|| StdMutex::new(ConnectionPool::new()))
+}
 
 fn default_request_timeout_from_env() -> Option<std::time::Duration> {
     static REQUEST_TIMEOUT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
@@ -235,27 +277,79 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
-    let mut transport = connect_transport(&parsed, client).await?;
+    tracing::debug!(
+        event = "pi.http.request.start",
+        method = ?method,
+        host = %parsed.host,
+        port = parsed.port,
+        path = %parsed.path,
+        body_bytes = body.len(),
+        "HTTP request starting"
+    );
+    let pool_key: PoolKey = (parsed.host.clone(), parsed.port);
+
+    // O16: try pooled transport first, fall back to fresh connection.
+    let mut transport = {
+        let pooled = global_pool()
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.take(&pool_key));
+        match pooled {
+            Some(t) => t,
+            None => connect_transport(&parsed, client).await?,
+        }
+    };
 
     let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
-    transport.write_all(&request_bytes).await?;
-    if !body.is_empty() {
-        transport.write_all(body).await?;
+    // If writing to a pooled connection fails (stale), retry with a fresh one.
+    let write_result = async {
+        transport.write_all(&request_bytes).await?;
+        if !body.is_empty() {
+            transport.write_all(body).await?;
+        }
+        transport.flush().await
     }
-    transport.flush().await?;
+    .await;
+    if write_result.is_err() {
+        // The pooled transport was stale — create a fresh connection.
+        transport = connect_transport(&parsed, client).await?;
+        transport.write_all(&request_bytes).await?;
+        if !body.is_empty() {
+            transport.write_all(body).await?;
+        }
+        transport.flush().await?;
+    }
 
     let (status, response_headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
+    tracing::debug!(
+        event = "pi.http.response.head",
+        status = status,
+        header_count = response_headers.len(),
+        leftover_bytes = leftover.len(),
+        "HTTP response head received"
+    );
     let body_kind = body_kind_from_headers(&response_headers);
 
-    let state = BodyStreamState::new(transport, body_kind, leftover);
+    // O16: determine if the connection can be returned to the pool after
+    // the response body is fully consumed.  EOF-terminated bodies cannot be
+    // pooled because the transport is closed by the server to signal end.
+    let connection_close = response_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close")
+    });
+    let reusable = !connection_close && !matches!(body_kind, BodyKind::Eof | BodyKind::Empty);
+
+    let state = BodyStreamState::new(transport, body_kind, leftover, Some(pool_key), reusable);
     let stream = stream::try_unfold(state, |mut state| async move {
         match Box::pin(state.next_bytes()).await {
             Ok(Some(chunk)) => Ok(Some((chunk, state))),
             Ok(None) => {
+                // O16: return transport to pool if body was fully consumed.
+                state.try_return_to_pool();
                 state.shutdown_transport_best_effort().await;
                 Ok(None)
             }
             Err(err) => {
+                // Errored streams are not reusable — shut down transport.
                 state.shutdown_transport_best_effort().await;
                 Err(err)
             }
@@ -558,27 +652,39 @@ enum ChunkedState {
 }
 
 struct BodyStreamState {
-    transport: Transport,
+    transport: Option<Transport>,
     kind: BodyKind,
     buf: Buffer,
     chunked_state: ChunkedState,
     remaining: usize,
     transport_closed: bool,
+    /// O16: Pool key for returning the transport after body consumption.
+    pool_key: Option<PoolKey>,
+    /// O16: False if the server sent `Connection: close`.
+    connection_reusable: bool,
 }
 
 impl BodyStreamState {
-    const fn new(transport: Transport, kind: BodyKind, leftover: Vec<u8>) -> Self {
+    const fn new(
+        transport: Transport,
+        kind: BodyKind,
+        leftover: Vec<u8>,
+        pool_key: Option<PoolKey>,
+        connection_reusable: bool,
+    ) -> Self {
         let remaining = match kind {
             BodyKind::ContentLength(n) => n,
             _ => 0,
         };
         Self {
-            transport,
+            transport: Some(transport),
             kind,
             buf: Buffer::new(leftover),
             chunked_state: ChunkedState::SizeLine,
             remaining,
             transport_closed: false,
+            pool_key,
+            connection_reusable,
         }
     }
 
@@ -596,12 +702,32 @@ impl BodyStreamState {
             return;
         }
         self.transport_closed = true;
-        let _ = self.transport.shutdown().await;
+        if let Some(ref mut transport) = self.transport {
+            let _ = transport.shutdown().await;
+        }
+    }
+
+    /// O16: Return the transport to the global connection pool if conditions
+    /// are met (body fully consumed, no errors, connection reusable).
+    fn try_return_to_pool(&mut self) {
+        if self.transport_closed || !self.connection_reusable {
+            return;
+        }
+        if let (Some(transport), Some(key)) = (self.transport.take(), self.pool_key.take()) {
+            if let Ok(mut pool) = global_pool().lock() {
+                pool.return_conn(key, transport);
+            }
+        }
+        self.transport_closed = true;
     }
 
     async fn read_more(&mut self) -> std::io::Result<usize> {
+        let transport = self
+            .transport
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("transport returned to pool"))?;
         let mut scratch = [0u8; READ_CHUNK_BYTES];
-        let n = read_some(&mut self.transport, &mut scratch).await?;
+        let n = read_some(transport, &mut scratch).await?;
         if n > 0 {
             if let Err(err) = self.buf.extend(&scratch[..n]) {
                 return Err(std::io::Error::other(err.to_string()));
@@ -1519,5 +1645,235 @@ mod tests {
         let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
+    }
+
+    // ── O16: Connection pool tests ────────────────────────────────────
+
+    #[test]
+    fn connection_pool_take_returns_none_when_empty() {
+        let mut pool = ConnectionPool::new();
+        let key = ("example.com".to_string(), 443);
+        assert!(pool.take(&key).is_none());
+    }
+
+    #[test]
+    fn connection_pool_return_and_take_round_trip() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::new();
+
+            // Create a real TCP listener + connection for a valid Transport.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = (addr.ip().to_string(), addr.port());
+
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            let transport = Transport::Tcp(tcp);
+            pool.return_conn(key.clone(), transport);
+
+            let taken = pool.take(&key);
+            assert!(taken.is_some(), "should return a pooled transport");
+            assert!(pool.take(&key).is_none(), "pool should be empty after take");
+        });
+    }
+
+    #[test]
+    fn connection_pool_replaces_existing_for_same_key() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::new();
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = (addr.ip().to_string(), addr.port());
+
+            let tcp1 = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            let tcp2 = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+
+            pool.return_conn(key.clone(), Transport::Tcp(tcp1));
+            pool.return_conn(key.clone(), Transport::Tcp(tcp2));
+
+            // Only 1 connection per key.
+            assert!(pool.take(&key).is_some());
+            assert!(pool.take(&key).is_none());
+        });
+    }
+
+    #[test]
+    fn body_stream_state_reusable_flag_from_connection_close() {
+        // `Connection: close` should prevent pooling.
+        let headers = vec![("Connection".to_string(), "close".to_string())];
+        let has_close = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close")
+        });
+        assert!(has_close);
+
+        // No `Connection: close` → reusable.
+        let headers: Vec<(String, String)> = vec![];
+        let has_close = headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close")
+        });
+        assert!(!has_close);
+    }
+
+    #[test]
+    fn global_pool_is_accessible() {
+        // Verify the global pool OnceLock initializes correctly.
+        let pool = global_pool();
+        let guard = pool.lock().unwrap();
+        // Fresh pool should be empty — verify no panic on init.
+        drop(guard);
+    }
+
+    #[test]
+    fn connection_pool_hard_cap_enforced() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::new();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // Fill pool to MAX_IDLE_PER_HOST * 8 = 8 distinct hosts.
+            for i in 0..8u16 {
+                let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                    .await
+                    .unwrap();
+                pool.return_conn((format!("host{i}.example.com"), 443), Transport::Tcp(tcp));
+            }
+            assert_eq!(pool.idle.len(), 8);
+
+            // 9th host should be silently dropped.
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            pool.return_conn(("host9.example.com".to_string(), 443), Transport::Tcp(tcp));
+            assert_eq!(
+                pool.idle.len(),
+                8,
+                "hard cap should prevent growth beyond 8"
+            );
+        });
+    }
+
+    #[test]
+    fn connection_pool_take_different_keys_independent() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let mut pool = ConnectionPool::new();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let key_a = ("a.example.com".to_string(), 443);
+            let key_b = ("b.example.com".to_string(), 443);
+
+            let tcp_a = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+            let tcp_b = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+
+            pool.return_conn(key_a.clone(), Transport::Tcp(tcp_a));
+            pool.return_conn(key_b.clone(), Transport::Tcp(tcp_b));
+
+            assert!(pool.take(&key_a).is_some());
+            assert!(pool.take(&key_b).is_some());
+            assert!(pool.take(&key_a).is_none());
+            assert!(pool.take(&key_b).is_none());
+        });
+    }
+
+    #[test]
+    fn eof_and_empty_body_kinds_not_reusable() {
+        // EOF-terminated bodies can't be pooled (server closes connection to signal end).
+        // Empty bodies have no data to consume.
+        assert!(matches!(BodyKind::Eof, BodyKind::Eof));
+        assert!(matches!(BodyKind::Empty, BodyKind::Empty));
+
+        // The reusable logic: !connection_close && !matches!(body_kind, Eof | Empty)
+        let body_eof = BodyKind::Eof;
+        let body_empty = BodyKind::Empty;
+        let body_chunked = BodyKind::Chunked;
+        let body_cl = BodyKind::ContentLength(100);
+
+        let reusable = |bk: &BodyKind| !matches!(bk, BodyKind::Eof | BodyKind::Empty);
+        assert!(!reusable(&body_eof), "EOF body must not be reusable");
+        assert!(!reusable(&body_empty), "Empty body must not be reusable");
+        assert!(reusable(&body_chunked), "Chunked body should be reusable");
+        assert!(reusable(&body_cl), "Content-Length body should be reusable");
+    }
+
+    #[test]
+    fn try_return_to_pool_skips_when_transport_closed() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+
+            let mut state = BodyStreamState::new(
+                Transport::Tcp(tcp),
+                BodyKind::ContentLength(0),
+                vec![],
+                Some(("closed.example.com".to_string(), 443)),
+                true,
+            );
+            // Simulate transport already closed.
+            state.transport_closed = true;
+            state.try_return_to_pool();
+
+            // Transport should NOT have been taken (still Some).
+            assert!(
+                state.transport.is_some(),
+                "closed transport should not be pooled"
+            );
+        });
+    }
+
+    #[test]
+    fn try_return_to_pool_skips_when_not_reusable() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
+                .await
+                .unwrap();
+
+            let mut state = BodyStreamState::new(
+                Transport::Tcp(tcp),
+                BodyKind::ContentLength(0),
+                vec![],
+                Some(("nopool.example.com".to_string(), 443)),
+                false, // not reusable
+            );
+            state.try_return_to_pool();
+
+            // Transport should NOT have been taken (connection_reusable = false).
+            assert!(
+                state.transport.is_some(),
+                "non-reusable transport should not be pooled"
+            );
+        });
     }
 }

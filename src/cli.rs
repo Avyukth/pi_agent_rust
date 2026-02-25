@@ -55,7 +55,9 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-skills"
         | "no-prompt-templates"
         | "no-themes"
-        | "list-providers" => (false, false),
+        | "list-providers"
+        | "chrome"
+        | "setup-chrome" => (false, false),
         "provider"
         | "model"
         | "api-key"
@@ -354,6 +356,15 @@ pub struct Cli {
     /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls)
     #[arg(long, default_value = "read,bash,edit,write")]
     pub tools: String,
+
+    // === Chrome Browser Automation ===
+    /// Enable Chrome browser automation tools for this session (S1 opt-in)
+    #[arg(long)]
+    pub chrome: bool,
+
+    /// Install Chrome native host manifest and wrapper script, then exit
+    #[arg(long)]
+    pub setup_chrome: bool,
 
     // === Extensions ===
     /// Load extension file (can use multiple times)
@@ -1084,6 +1095,8 @@ mod tests {
         assert!(!cli.no_session);
         assert!(!cli.no_migrations);
         assert!(!cli.no_tools);
+        assert!(!cli.chrome);
+        assert!(!cli.setup_chrome);
         assert!(!cli.no_extensions);
         assert!(!cli.no_skills);
         assert!(!cli.no_prompt_templates);
@@ -1309,6 +1322,82 @@ mod tests {
 
         let cli = Cli::parse_from(["pi", "--list-models", "sonnet"]);
         assert_eq!(cli.list_models, Some(Some("sonnet".to_string())));
+    }
+
+    // ── 15. Chrome browser automation flags ──────────────────────────
+
+    #[test]
+    fn chrome_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.chrome);
+        assert!(!cli.setup_chrome);
+    }
+
+    #[test]
+    fn chrome_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--chrome"]);
+        assert!(cli.chrome);
+        assert!(!cli.setup_chrome);
+    }
+
+    #[test]
+    fn setup_chrome_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--setup-chrome"]);
+        assert!(cli.setup_chrome);
+        assert!(!cli.chrome);
+    }
+
+    #[test]
+    fn chrome_and_setup_chrome_can_coexist() {
+        let cli = Cli::parse_from(["pi", "--chrome", "--setup-chrome"]);
+        assert!(cli.chrome);
+        assert!(cli.setup_chrome);
+    }
+
+    #[test]
+    fn s1_safety_invariant_no_browser_tools_without_chrome_flag() {
+        // S1: browser tools must NEVER be available without explicit --chrome opt-in
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.chrome, "S1 violation: chrome must default to false");
+        let tools = cli.enabled_tools();
+        assert!(
+            !tools
+                .iter()
+                .any(|t| *t == "navigate" || *t == "screenshot" || *t == "computer"),
+            "S1 violation: browser tools must not appear in default enabled_tools()"
+        );
+    }
+
+    #[test]
+    fn chrome_flag_recognized_by_extension_flag_parser() {
+        // --chrome should be recognized as a built-in flag, not an extension flag
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--chrome".to_string(),
+            "--print".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse with --chrome flag");
+
+        assert!(parsed.cli.chrome);
+        assert!(parsed.cli.print);
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--chrome should not be treated as an extension flag"
+        );
+    }
+
+    #[test]
+    fn setup_chrome_flag_recognized_by_extension_flag_parser() {
+        let parsed =
+            parse_with_extension_flags(vec!["pi".to_string(), "--setup-chrome".to_string()])
+                .expect("parse with --setup-chrome flag");
+
+        assert!(parsed.cli.setup_chrome);
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--setup-chrome should not be treated as an extension flag"
+        );
     }
 
     // ── Property tests ──────────────────────────────────────────────────

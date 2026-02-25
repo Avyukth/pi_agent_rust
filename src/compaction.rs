@@ -894,6 +894,46 @@ async fn generate_turn_prefix_summary(
 // Public API
 // =============================================================================
 
+/// Fast-path threshold check operating on references only (O18).
+///
+/// Replicates the early-exit and token estimation logic of
+/// `prepare_compaction` without requiring the caller to deep-clone
+/// all session entries first. Returns `true` when the session exceeds
+/// the compaction threshold and a full `prepare_compaction` pass should
+/// be attempted.
+pub fn should_prepare_compaction(
+    path_entries: &[&SessionEntry],
+    settings: &ResolvedCompactionSettings,
+) -> bool {
+    if !settings.enabled || path_entries.is_empty() {
+        return false;
+    }
+    if path_entries
+        .last()
+        .is_some_and(|entry| matches!(entry, SessionEntry::Compaction(_)))
+    {
+        return false;
+    }
+
+    let prev_compaction_index = path_entries
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, e)| matches!(e, SessionEntry::Compaction(_)).then_some(idx));
+
+    let usage_start = prev_compaction_index.unwrap_or(0);
+    let boundary_end = path_entries.len();
+
+    let mut usage_messages = Vec::new();
+    for entry in &path_entries[usage_start..boundary_end] {
+        if let Some(msg) = message_from_entry(entry) {
+            usage_messages.push(msg);
+        }
+    }
+    let tokens_before = estimate_context_tokens(&usage_messages).tokens;
+    should_compact(tokens_before, settings.context_window_tokens, settings)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn prepare_compaction(
     path_entries: &[SessionEntry],
@@ -1172,7 +1212,7 @@ mod tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "call_1".to_string(),
                     name: name.to_string(),
-                    arguments: args,
+                    arguments: std::sync::Arc::new(args),
                     thought_signature: None,
                 })],
                 api: String::new(),
@@ -1864,7 +1904,7 @@ mod tests {
             content: vec![ContentBlock::ToolCall(ToolCall {
                 id: "c1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/main.rs"}),
+                arguments: std::sync::Arc::new(json!({"path": "/main.rs"})),
                 thought_signature: None,
             })],
             api: String::new(),
@@ -2350,6 +2390,57 @@ mod tests {
                     assert!(pair[0] <= pair[1]);
                 }
             }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // O18: should_prepare_compaction fast-path tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn should_prepare_compaction_returns_false_for_empty_entries() {
+        let settings = ResolvedCompactionSettings::default();
+        assert!(!should_prepare_compaction(&[], &settings));
+    }
+
+    #[test]
+    fn should_prepare_compaction_returns_false_when_disabled() {
+        let settings = ResolvedCompactionSettings {
+            enabled: false,
+            ..Default::default()
+        };
+        let entry = user_entry("u1", "hello");
+        assert!(!should_prepare_compaction(&[&entry], &settings));
+    }
+
+    #[test]
+    fn should_prepare_compaction_returns_false_under_threshold() {
+        // Small session well under the default 200k context window.
+        let entries: Vec<SessionEntry> = (0..5)
+            .map(|i| user_entry(&format!("u{i}"), &format!("msg {i}")))
+            .collect();
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        let settings = ResolvedCompactionSettings::default();
+        assert!(
+            !should_prepare_compaction(&refs, &settings),
+            "5 short messages should be under compaction threshold"
+        );
+    }
+
+    #[test]
+    fn should_prepare_compaction_agrees_with_prepare_compaction() {
+        // Verify the fast-path check agrees with the full prepare_compaction.
+        let entries: Vec<SessionEntry> = (0..5)
+            .map(|i| user_entry(&format!("u{i}"), &format!("msg {i}")))
+            .collect();
+        let refs: Vec<&SessionEntry> = entries.iter().collect();
+        let settings = ResolvedCompactionSettings::default();
+
+        let fast = should_prepare_compaction(&refs, &settings);
+        let full = prepare_compaction(&entries, settings);
+        // If fast-path says no, full should also return None.
+        if !fast {
+            assert!(full.is_none(), "fast-path false → full should be None");
         }
     }
 }

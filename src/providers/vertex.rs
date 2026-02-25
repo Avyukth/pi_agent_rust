@@ -474,7 +474,7 @@ where
                         let tool_call = ToolCall {
                             id,
                             name,
-                            arguments: args,
+                            arguments: std::sync::Arc::new(args),
                             thought_signature: None,
                         };
 

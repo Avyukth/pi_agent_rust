@@ -292,7 +292,7 @@ impl BedrockProvider {
                         content.push(ContentBlock::ToolCall(ToolCall {
                             id: tool_use.tool_use_id,
                             name: tool_use.name,
-                            arguments: tool_use.input,
+                            arguments: std::sync::Arc::new(tool_use.input),
                             thought_signature: None,
                         }));
                     }
@@ -643,7 +643,7 @@ fn convert_assistant_message(message: &AssistantMessage) -> Option<BedrockMessag
                     tool_use: BedrockToolUse {
                         tool_use_id: tool_call.id.clone(),
                         name: tool_call.name.clone(),
-                        input: tool_call.arguments.clone(),
+                        input: (*tool_call.arguments).clone(),
                     },
                 });
             }
@@ -1002,7 +1002,7 @@ mod tests {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         id: "tool_1".to_string(),
                         name: "search".to_string(),
-                        arguments: json!({ "q": "rust" }),
+                        arguments: std::sync::Arc::new(json!({ "q": "rust" })),
                         thought_signature: None,
                     })],
                     api: "bedrock-converse-stream".to_string(),

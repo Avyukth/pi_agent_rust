@@ -55,7 +55,6 @@ use pi::tui::PiConsole;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
 const EXIT_CODE_USAGE: i32 = 2;
@@ -207,6 +206,25 @@ fn main_impl() -> Result<()> {
         return Ok(());
     }
 
+    // --setup-chrome: install native host manifest and wrapper script, then exit.
+    // Ultra-fast path — no async runtime, no logging needed.
+    if cli.setup_chrome {
+        match pi::chrome::install::setup_chrome(None, None) {
+            Ok(result) => {
+                println!("Chrome native host setup successful:");
+                println!("  Manifest: {}", result.manifest_path.display());
+                println!("  Wrapper:  {}", result.wrapper_path.display());
+                if let Some(ref chrome_path) = result.chrome_path {
+                    println!("  Chrome:   {}", chrome_path.display());
+                } else {
+                    println!("  Chrome:   (not found — install Chrome to enable browser tools)");
+                }
+                return Ok(());
+            }
+            Err(err) => bail!("Chrome setup failed: {err}"),
+        }
+    }
+
     // List-models is an offline query; avoid loading resources or booting the runtime when possible.
     //
     // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
@@ -275,12 +293,9 @@ fn main_impl() -> Result<()> {
         }
     }
 
-    // Initialize logging (skip for ultra-fast paths like --version)
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .with_writer(io::stderr)
-        .init();
+    // Initialize structured logging: stderr + file appender with rotation.
+    pi::logging::init_logging();
+    pi::logging::prune_old_logs();
 
     // Run the application
     let reactor = create_reactor()?;
@@ -3735,14 +3750,14 @@ async fn run_rpc_mode(
     }
     let rpc_task = pi::rpc::run_stdio(
         session,
-        pi::rpc::RpcOptions {
+        pi::rpc::RpcOptions::new(
             config,
             resources,
             available_models,
             scoped_models,
             auth,
             runtime_handle,
-        },
+        ),
     )
     .fuse();
 

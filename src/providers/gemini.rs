@@ -624,7 +624,7 @@ where
                         let tool_call = ToolCall {
                             id,
                             name,
-                            arguments: args,
+                            arguments: std::sync::Arc::new(args),
                             thought_signature: None,
                         };
 
@@ -875,7 +875,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                         parts.push(GeminiPart::FunctionCall {
                             function_call: GeminiFunctionCall {
                                 name: tc.name.clone(),
-                                args: tc.arguments.clone(),
+                                args: (*tc.arguments).clone(),
                             },
                         });
                     }
@@ -1378,7 +1378,7 @@ mod tests {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_123".to_string(),
                     name: "read".to_string(),
-                    arguments: serde_json::json!({"path": "/tmp/test.txt"}),
+                    arguments: std::sync::Arc::new(serde_json::json!({"path": "/tmp/test.txt"})),
                     thought_signature: None,
                 }),
             ],
@@ -1578,7 +1578,7 @@ mod tests {
                     content: vec![ContentBlock::ToolCall(ToolCall {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
-                        arguments: serde_json::json!({"path": "/tmp/a.txt"}),
+                        arguments: std::sync::Arc::new(serde_json::json!({"path": "/tmp/a.txt"})),
                         thought_signature: None,
                     })],
                     api: "google".to_string(),

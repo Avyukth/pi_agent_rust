@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pi Chrome Test: Network Failure</title>
+</head>
+<body>
+  <h1>Network Failure Fixture</h1>
+  <p id="status">ready</p>
+  <button id="fetch-ok" onclick="fetchOk()">Fetch OK</button>
+  <button id="fetch-404" onclick="fetch404()">Fetch 404</button>
+  <button id="fetch-500" onclick="fetch500()">Fetch 500</button>
+  <button id="fetch-timeout" onclick="fetchTimeout()">Fetch Timeout</button>
+  <button id="fetch-cors" onclick="fetchCors()">Fetch CORS Fail</button>
+  <div id="result"></div>
+  <script>
+    function showResult(text) {
+      document.getElementById('result').textContent = text;
+    }
+
+    function fetchOk() {
+      document.getElementById('status').textContent = 'fetching';
+      fetch('/api/ok')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('status').textContent = 'ok';
+          showResult(JSON.stringify(data));
+        })
+        .catch(function(e) {
+          document.getElementById('status').textContent = 'error';
+          showResult('Error: ' + e.message);
+        });
+    }
+
+    function fetch404() {
+      document.getElementById('status').textContent = 'fetching';
+      fetch('/api/not-found')
+        .then(function(r) {
+          document.getElementById('status').textContent = 'status:' + r.status;
+          showResult('Status: ' + r.status);
+        })
+        .catch(function(e) {
+          document.getElementById('status').textContent = 'error';
+          showResult('Error: ' + e.message);
+        });
+    }
+
+    function fetch500() {
+      document.getElementById('status').textContent = 'fetching';
+      fetch('/api/error')
+        .then(function(r) {
+          document.getElementById('status').textContent = 'status:' + r.status;
+          showResult('Status: ' + r.status);
+        })
+        .catch(function(e) {
+          document.getElementById('status').textContent = 'error';
+          showResult('Error: ' + e.message);
+        });
+    }
+
+    function fetchTimeout() {
+      document.getElementById('status').textContent = 'fetching';
+      fetch('/api/slow')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('status').textContent = 'ok';
+          showResult(JSON.stringify(data));
+        })
+        .catch(function(e) {
+          document.getElementById('status').textContent = 'timeout';
+          showResult('Error: ' + e.message);
+        });
+    }
+
+    function fetchCors() {
+      document.getElementById('status').textContent = 'fetching';
+      fetch('http://localhost:1/invalid-cors')
+        .catch(function(e) {
+          document.getElementById('status').textContent = 'cors-error';
+          showResult('CORS Error: ' + e.message);
+        });
+    }
+  </script>
+</body>
+</html>

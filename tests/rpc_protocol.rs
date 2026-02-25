@@ -249,7 +249,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "tc1".to_string(),
                     name: "read".to_string(),
-                    arguments: serde_json::json!({ "path": "test.txt" }),
+                    arguments: serde_json::json!({ "path": "test.txt" }).into(),
                     thought_signature: None,
                 })],
                 api: "test".to_string(),

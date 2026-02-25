@@ -1814,6 +1814,8 @@ pub enum Capability {
     Tool,
     /// Logging (always allowed, included for completeness).
     Log,
+    /// Browser automation via Chrome extension (dangerous).
+    Browser,
 }
 
 /// All known capabilities in definition order.
@@ -1828,6 +1830,7 @@ pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::Env,
     Capability::Tool,
     Capability::Log,
+    Capability::Browser,
 ];
 
 impl Capability {
@@ -1845,6 +1848,7 @@ impl Capability {
             "env" => Some(Self::Env),
             "tool" => Some(Self::Tool),
             "log" => Some(Self::Log),
+            "browser" => Some(Self::Browser),
             _ => None,
         }
     }
@@ -1862,6 +1866,7 @@ impl Capability {
             Self::Env => "env",
             Self::Tool => "tool",
             Self::Log => "log",
+            Self::Browser => "browser",
         }
     }
 
@@ -1870,12 +1875,12 @@ impl Capability {
     /// Dangerous capabilities default to Deny in Strict/Prompt modes and
     /// require explicit opt-in or user confirmation.
     pub const fn is_dangerous(self) -> bool {
-        matches!(self, Self::Exec | Self::Env)
+        matches!(self, Self::Exec | Self::Env | Self::Browser)
     }
 
     /// List of all dangerous capabilities.
     pub const fn dangerous_list() -> &'static [Self] {
-        &[Self::Exec, Self::Env]
+        &[Self::Exec, Self::Env, Self::Browser]
     }
 
     /// Ordinal index for array-based snapshot lookups.
@@ -1891,12 +1896,13 @@ impl Capability {
             Self::Env => 7,
             Self::Tool => 8,
             Self::Log => 9,
+            Self::Browser => 10,
         }
     }
 }
 
 /// Number of known capabilities (must match [`ALL_CAPABILITIES`] length).
-pub const NUM_CAPABILITIES: usize = 10;
+pub const NUM_CAPABILITIES: usize = 11;
 
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1939,7 +1945,7 @@ impl PolicyProfile {
                     "events".to_string(),
                     "session".to_string(),
                 ],
-                deny_caps: vec!["exec".to_string(), "env".to_string()],
+                deny_caps: vec!["exec".to_string(), "env".to_string(), "browser".to_string()],
                 per_extension: HashMap::new(),
                 exec_mediation: ExecMediationPolicy::strict(),
                 secret_broker: SecretBrokerPolicy::default(),
@@ -2039,7 +2045,7 @@ impl Default for ExtensionPolicy {
                 "events".to_string(),
                 "session".to_string(),
             ],
-            deny_caps: vec!["exec".to_string(), "env".to_string()],
+            deny_caps: vec!["exec".to_string(), "env".to_string(), "browser".to_string()],
             per_extension: HashMap::new(),
             exec_mediation: ExecMediationPolicy::default(),
             secret_broker: SecretBrokerPolicy::default(),
@@ -6421,7 +6427,7 @@ impl EnforcementStateMachine {
 }
 
 fn runtime_risk_is_dangerous(capability: &str) -> bool {
-    matches!(capability, "exec" | "env" | "http")
+    matches!(capability, "exec" | "env" | "http" | "browser")
 }
 
 fn runtime_risk_harden_should_block_dangerous(decision: &RuntimeRiskDecision) -> bool {
@@ -6447,6 +6453,7 @@ fn runtime_risk_harden_should_block_dangerous(decision: &RuntimeRiskDecision) ->
 fn runtime_risk_base_score(capability: &str, method: &str, policy_reason: &str) -> f64 {
     let capability_score = match capability {
         "exec" => 0.48,
+        "browser" => 0.44,
         "env" => 0.40,
         "http" => 0.32,
         "write" => 0.28,
@@ -8956,7 +8963,9 @@ pub enum PolicyDecision {
 pub struct PolicyCheck {
     pub decision: PolicyDecision,
     pub capability: String,
-    pub reason: String,
+    /// O2: Cow avoids allocating a String for the static reason on the
+    /// hot PolicySnapshot::lookup path (saves 1 alloc per browser tool call).
+    pub reason: std::borrow::Cow<'static, str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -9067,12 +9076,13 @@ impl ExtensionPolicy {
     /// Applies the full precedence chain documented above.
     #[allow(clippy::too_many_lines)]
     pub fn evaluate_for(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
+        use std::borrow::Cow;
         let normalized = capability.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             return PolicyCheck {
                 decision: PolicyDecision::Deny,
                 capability: String::new(),
-                reason: "empty_capability".to_string(),
+                reason: Cow::Borrowed("empty_capability"),
             };
         }
 
@@ -9088,7 +9098,7 @@ impl ExtensionPolicy {
                 return PolicyCheck {
                     decision: PolicyDecision::Deny,
                     capability: normalized,
-                    reason: "extension_deny".to_string(),
+                    reason: Cow::Borrowed("extension_deny"),
                 };
             }
         }
@@ -9102,7 +9112,7 @@ impl ExtensionPolicy {
             return PolicyCheck {
                 decision: PolicyDecision::Deny,
                 capability: normalized,
-                reason: "deny_caps".to_string(),
+                reason: Cow::Borrowed("deny_caps"),
             };
         }
 
@@ -9116,7 +9126,7 @@ impl ExtensionPolicy {
                 return PolicyCheck {
                     decision: PolicyDecision::Allow,
                     capability: normalized,
-                    reason: "extension_allow".to_string(),
+                    reason: Cow::Borrowed("extension_allow"),
                 };
             }
         }
@@ -9138,11 +9148,11 @@ impl ExtensionPolicy {
                     PolicyDecision::Deny
                 },
                 capability: normalized,
-                reason: if in_default_caps {
-                    "default_caps".to_string()
+                reason: Cow::Borrowed(if in_default_caps {
+                    "default_caps"
                 } else {
-                    "not_in_default_caps".to_string()
-                },
+                    "not_in_default_caps"
+                }),
             },
             ExtensionPolicyMode::Prompt => PolicyCheck {
                 decision: if in_default_caps {
@@ -9151,16 +9161,16 @@ impl ExtensionPolicy {
                     PolicyDecision::Prompt
                 },
                 capability: normalized,
-                reason: if in_default_caps {
-                    "default_caps".to_string()
+                reason: Cow::Borrowed(if in_default_caps {
+                    "default_caps"
                 } else {
-                    "prompt_required".to_string()
-                },
+                    "prompt_required"
+                }),
             },
             ExtensionPolicyMode::Permissive => PolicyCheck {
                 decision: PolicyDecision::Allow,
                 capability: normalized,
-                reason: "permissive".to_string(),
+                reason: Cow::Borrowed("permissive"),
             },
         }
     }
@@ -9187,7 +9197,7 @@ impl ExtensionPolicy {
                 CapabilityExplanation {
                     capability: cap.as_str().to_string(),
                     decision: check.decision,
-                    reason: check.reason,
+                    reason: check.reason.into_owned(),
                     is_dangerous: cap.is_dangerous(),
                 }
             })
@@ -9320,10 +9330,12 @@ impl PolicySnapshot {
                 let entry = extension_id
                     .and_then(|id| self.per_extension.get(id))
                     .map_or(&self.global[idx], |arr| &arr[idx]);
+                // O2: reason is &'static str from SnapshotEntry, so
+                // Cow::Borrowed avoids 1 String allocation per lookup.
                 PolicyCheck {
                     decision: entry.decision,
                     capability: capability.to_string(),
-                    reason: entry.reason.to_string(),
+                    reason: std::borrow::Cow::Borrowed(entry.reason),
                 }
             },
         )
@@ -9497,6 +9509,51 @@ mod policy_snapshot_tests {
         let ext = snapshot.lookup("exec", Some("ext.special"));
         assert_eq!(ext.decision, PolicyDecision::Deny);
     }
+
+    // O2 guardrail: verify lookup returns Cow::Borrowed (zero-alloc) reasons.
+    #[test]
+    fn lookup_reason_is_borrowed_cow() {
+        let policy = make_policy_with_per_extension();
+        let snapshot = PolicySnapshot::compile(&policy);
+
+        // Allow path (hot): reason must be Cow::Borrowed
+        let check = snapshot.lookup("read", None);
+        assert_eq!(check.decision, PolicyDecision::Allow);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "Allow reason should be Cow::Borrowed, got Owned(\"{}\")",
+            check.reason
+        );
+
+        // Deny path: reason must also be Cow::Borrowed
+        let check = snapshot.lookup("exec", None);
+        assert_eq!(check.decision, PolicyDecision::Deny);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "Deny reason should be Cow::Borrowed, got Owned(\"{}\")",
+            check.reason
+        );
+    }
+
+    // O2 guardrail: evaluate_for also returns Cow::Borrowed reasons.
+    #[test]
+    fn evaluate_for_reason_is_borrowed_cow() {
+        let policy = make_policy_with_per_extension();
+
+        let check = policy.evaluate_for("read", None);
+        assert_eq!(check.decision, PolicyDecision::Allow);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "evaluate_for Allow should be Cow::Borrowed"
+        );
+
+        let check = policy.evaluate_for("exec", None);
+        assert_eq!(check.decision, PolicyDecision::Deny);
+        assert!(
+            matches!(&check.reason, std::borrow::Cow::Borrowed(_)),
+            "evaluate_for Deny should be Cow::Borrowed"
+        );
+    }
 }
 
 fn required_capability_for_host_call_static_legacy(call: &HostCallPayload) -> Option<&'static str> {
@@ -9556,6 +9613,8 @@ fn required_capability_for_host_call_static_legacy(call: &HostCallPayload) -> Op
         Some("events")
     } else if method.eq_ignore_ascii_case("log") {
         Some("log")
+    } else if method.eq_ignore_ascii_case("browser") {
+        Some("browser")
     } else {
         None
     }
@@ -13182,7 +13241,7 @@ mod wasm_host {
             } = self.policy.evaluate(required);
 
             if decision != PolicyDecision::Prompt {
-                return (decision, reason, capability);
+                return (decision, reason.into_owned(), capability);
             }
 
             let Some(manager) = self.manager() else {
@@ -20027,12 +20086,18 @@ async fn resolve_js_hostcall_policy_decision(
     let PolicyCheck {
         mut decision,
         capability,
-        mut reason,
+        reason,
     } = host.policy.evaluate(required);
 
     if decision != PolicyDecision::Prompt {
-        return (decision, reason, capability);
+        return (decision, reason.into_owned(), capability);
     }
+
+    // Original Cow<str> reason is unused on the Prompt path — all branches
+    // below assign their own reason string before reading.
+    drop(reason);
+    #[allow(unused_assignments)]
+    let mut reason = String::new();
 
     if let Some(extension_id) = extension_id {
         if let Some(allow) = host
@@ -20329,7 +20394,8 @@ pub async fn dispatch_host_call_shared(
         PolicyDecision::Deny => (PolicyDecision::Deny, policy_check.reason),
         PolicyDecision::Prompt => {
             // Check prompt cache, then prompt the user.
-            resolve_shared_policy_prompt(ctx, capability).await
+            let (d, r) = resolve_shared_policy_prompt(ctx, capability).await;
+            (d, std::borrow::Cow::Owned(r))
         }
     };
 
@@ -20642,9 +20708,9 @@ pub async fn dispatch_host_call_shared(
                 severity: SecurityAlertSeverity::Error,
                 capability: capability.to_string(),
                 method: method.to_string(),
-                reason_codes: vec![reason.clone()],
+                reason_codes: vec![reason.to_string()],
                 summary: format!("Capability '{capability}' denied by policy ({reason})"),
-                policy_source: reason.clone(),
+                policy_source: reason.to_string(),
                 action: SecurityAlertAction::Deny,
                 remediation: format!(
                     "Grant '{capability}' in extension policy or switch to a more permissive profile."
@@ -20724,7 +20790,7 @@ pub async fn dispatch_host_call_shared(
                 crate::extension_replay::ReplayEventKind::PolicyDecision,
                 std::collections::BTreeMap::from([
                     ("decision".to_string(), format!("{decision:?}")),
-                    ("reason".to_string(), reason.clone()),
+                    ("reason".to_string(), reason.to_string()),
                 ]),
             );
             recorder.tick();
@@ -45436,6 +45502,7 @@ mod tests {
         assert!(runtime_risk_is_dangerous("exec"));
         assert!(runtime_risk_is_dangerous("env"));
         assert!(runtime_risk_is_dangerous("http"));
+        assert!(runtime_risk_is_dangerous("browser"));
         assert!(!runtime_risk_is_dangerous("log"));
         assert!(!runtime_risk_is_dangerous("read"));
         assert!(!runtime_risk_is_dangerous("write"));
@@ -48196,7 +48263,7 @@ mod tests {
             let tool_call = crate::model::ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/tmp/test"}),
+                arguments: std::sync::Arc::new(json!({"path": "/tmp/test"})),
                 thought_signature: None,
             };
             let result = mgr.dispatch_tool_call(&tool_call, 5_000).await;
@@ -48212,7 +48279,7 @@ mod tests {
             let tool_call = crate::model::ToolCall {
                 id: "tc-1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/tmp/test"}),
+                arguments: std::sync::Arc::new(json!({"path": "/tmp/test"})),
                 thought_signature: None,
             };
             let output = crate::tools::ToolOutput {

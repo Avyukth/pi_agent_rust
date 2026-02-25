@@ -320,7 +320,7 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "tc_1".to_string(),
                 name: "bash".to_string(),
-                arguments: serde_json::json!({"cmd": "ls"}),
+                arguments: std::sync::Arc::new(serde_json::json!({"cmd": "ls"})),
                 thought_signature: None,
             }),
             ContentBlock::Text(TextContent::new("done".to_string())),
@@ -356,7 +356,7 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "tc_1".to_string(),
                 name: "bash".to_string(),
-                arguments: serde_json::json!({}),
+                arguments: std::sync::Arc::new(serde_json::json!({})),
                 thought_signature: None,
             }),
         ];
@@ -422,7 +422,7 @@ mod tests {
         let blocks = vec![ContentBlock::ToolCall(ToolCall {
             id: "tc_1".to_string(),
             name: "read".to_string(),
-            arguments: serde_json::json!({}),
+            arguments: std::sync::Arc::new(serde_json::json!({})),
             thought_signature: None,
         })];
         let result = tool_content_blocks_to_text(&blocks, true);

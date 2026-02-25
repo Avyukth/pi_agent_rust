@@ -430,6 +430,296 @@ mod tests {
         assert_ne!(fp_a, fp_c, "fingerprint must change when payload changes");
     }
 
+    // -----------------------------------------------------------------------
+    // ProtocolErrorCode serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_all_error_codes_serialize_screaming_snake_case() {
+        let codes = [
+            (ProtocolErrorCode::ChromeNotFound, "CHROME_NOT_FOUND"),
+            (
+                ProtocolErrorCode::ExtensionNotInstalled,
+                "EXTENSION_NOT_INSTALLED",
+            ),
+            (
+                ProtocolErrorCode::ChromeBridgeDisconnected,
+                "CHROME_BRIDGE_DISCONNECTED",
+            ),
+            (
+                ProtocolErrorCode::ChromeBridgeAuthFailed,
+                "CHROME_BRIDGE_AUTH_FAILED",
+            ),
+            (ProtocolErrorCode::ChromeBridgeBusy, "CHROME_BRIDGE_BUSY"),
+            (
+                ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                "CHROME_BRIDGE_PROTOCOL_MISMATCH",
+            ),
+            (
+                ProtocolErrorCode::ChromeBridgeTimeout,
+                "CHROME_BRIDGE_TIMEOUT",
+            ),
+            (
+                ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+                "CHROME_BRIDGE_EXECUTION_INDETERMINATE",
+            ),
+            (ProtocolErrorCode::TabNotFound, "TAB_NOT_FOUND"),
+            (ProtocolErrorCode::ElementNotFound, "ELEMENT_NOT_FOUND"),
+            (ProtocolErrorCode::NavigationFailed, "NAVIGATION_FAILED"),
+            (ProtocolErrorCode::ScreenshotFailed, "SCREENSHOT_FAILED"),
+            (ProtocolErrorCode::JavascriptError, "JAVASCRIPT_ERROR"),
+            (ProtocolErrorCode::ObserverTabClosed, "OBSERVER_TAB_CLOSED"),
+            (
+                ProtocolErrorCode::ObserverLimitReached,
+                "OBSERVER_LIMIT_REACHED",
+            ),
+        ];
+
+        for (code, expected_str) in &codes {
+            let serialized = serde_json::to_string(code).expect("serialize error code");
+            assert_eq!(
+                serialized,
+                format!("\"{expected_str}\""),
+                "code {code:?} must serialize to {expected_str}"
+            );
+
+            let deserialized: ProtocolErrorCode =
+                serde_json::from_str(&serialized).expect("deserialize error code");
+            assert_eq!(
+                &deserialized, code,
+                "error code roundtrip must preserve variant"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Auth message roundtrips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_auth_claim_frame_roundtrip() {
+        let claim = MessageType::AuthClaim(AuthClaim {
+            version: PROTOCOL_VERSION_V1,
+            host_id: "host-1".to_string(),
+            pi_session_id: "session-1".to_string(),
+            client_instance_id: "client-1".to_string(),
+            token: "tok_abc".to_string(),
+            protocol_min: PROTOCOL_MIN_SUPPORTED,
+            protocol_max: PROTOCOL_MAX_SUPPORTED,
+            want_capabilities: vec!["browser_tools".to_string()],
+        });
+
+        let encoded = encode_frame(&claim).expect("encode auth_claim");
+        let (decoded, consumed) = decode_frame::<MessageType>(&encoded)
+            .expect("decode auth_claim")
+            .expect("complete auth_claim frame");
+
+        assert_eq!(decoded, claim);
+        assert_eq!(consumed, encoded.len());
+    }
+
+    #[test]
+    fn test_auth_ok_frame_roundtrip() {
+        let auth_ok = MessageType::AuthOk(AuthOk {
+            version: PROTOCOL_VERSION_V1,
+            host_id: "host-1".to_string(),
+            claimed_by: ClaimedBy {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+            },
+            host_epoch: "epoch-abc".to_string(),
+            protocol: PROTOCOL_VERSION_V1,
+            capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+            lease_ttl_ms: 30_000,
+        });
+
+        let encoded = encode_frame(&auth_ok).expect("encode auth_ok");
+        let (decoded, _) = decode_frame::<MessageType>(&encoded)
+            .expect("decode auth_ok")
+            .expect("complete auth_ok frame");
+
+        assert_eq!(decoded, auth_ok);
+    }
+
+    #[test]
+    fn test_auth_busy_frame_roundtrip() {
+        let busy = MessageType::AuthBusy(AuthBusy {
+            version: PROTOCOL_VERSION_V1,
+            host_id: "host-1".to_string(),
+            claimed_by: ClaimedBy {
+                pi_session_id: "other-session".to_string(),
+                client_instance_id: "other-client".to_string(),
+            },
+        });
+
+        let encoded = encode_frame(&busy).expect("encode auth_busy");
+        let (decoded, _) = decode_frame::<MessageType>(&encoded)
+            .expect("decode auth_busy")
+            .expect("complete auth_busy frame");
+
+        assert_eq!(decoded, busy);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fingerprint edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fingerprint_different_ops_produce_different_fingerprints() {
+        let payload = json!({"url": "https://example.com"});
+        let fp_nav = RequestFingerprint::new("navigate", &payload).expect("fp navigate");
+        let fp_click = RequestFingerprint::new("click", &payload).expect("fp click");
+        assert_ne!(
+            fp_nav, fp_click,
+            "different ops must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_empty_payload() {
+        let fp1 = RequestFingerprint::new("navigate", &json!({})).expect("fp empty obj");
+        let fp2 = RequestFingerprint::new("navigate", &json!(null)).expect("fp null");
+        assert_ne!(fp1, fp2, "empty object vs null should differ");
+    }
+
+    #[test]
+    fn test_fingerprint_nested_array_order_matters() {
+        let fp1 = RequestFingerprint::new("op", &json!([1, 2, 3])).expect("fp 1,2,3");
+        let fp2 = RequestFingerprint::new("op", &json!([3, 2, 1])).expect("fp 3,2,1");
+        assert_ne!(fp1, fp2, "array element order must affect fingerprint");
+    }
+
+    // -----------------------------------------------------------------------
+    // ObservationEntry optional fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_observation_entry_minimal() {
+        let entry: ObservationEntry =
+            serde_json::from_value(json!({"kind": "console_error", "ts": 1000}))
+                .expect("minimal entry");
+        assert_eq!(entry.kind, "console_error");
+        assert!(entry.message.is_none());
+        assert!(entry.source.is_none());
+        assert!(entry.url.is_none());
+    }
+
+    #[test]
+    fn test_observation_entry_full() {
+        let entry: ObservationEntry = serde_json::from_value(json!({
+            "kind": "network_error",
+            "message": "404",
+            "source": "fetch",
+            "url": "https://api.example.com/data",
+            "ts": 2000
+        }))
+        .expect("full entry");
+        assert_eq!(entry.message.as_deref(), Some("404"));
+        assert_eq!(entry.source.as_deref(), Some("fetch"));
+        assert_eq!(entry.url.as_deref(), Some("https://api.example.com/data"));
+    }
+
+    #[test]
+    fn test_observation_entry_serialization_skips_none_fields() {
+        let entry = ObservationEntry {
+            kind: "console_error".to_string(),
+            message: None,
+            source: None,
+            url: None,
+            ts: 1000,
+        };
+        let serialized = serde_json::to_value(&entry).expect("serialize");
+        assert!(!serialized.as_object().unwrap().contains_key("message"));
+        assert!(!serialized.as_object().unwrap().contains_key("source"));
+        assert!(!serialized.as_object().unwrap().contains_key("url"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-frame buffer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_frame_handles_trailing_data_after_newline() {
+        let msg1 = sample_request_message(json!({"a": 1}));
+        let encoded1 = encode_frame(&msg1).expect("encode msg1");
+
+        // Append partial second message
+        let mut buf = encoded1.clone();
+        buf.extend_from_slice(b"{\"partial\":true");
+
+        let (decoded, consumed) = decode_frame::<MessageType>(&buf)
+            .expect("decode first frame")
+            .expect("first frame is complete");
+
+        assert_eq!(decoded, msg1);
+        assert_eq!(consumed, encoded1.len(), "should only consume first frame");
+        assert!(buf.len() > consumed, "trailing data should remain");
+    }
+
+    #[test]
+    fn test_decode_two_frames_in_sequence() {
+        let msg1 = sample_request_message(json!({"x": 1}));
+        let msg2 = sample_request_message(json!({"x": 2}));
+        let mut buf = encode_frame(&msg1).expect("encode msg1");
+        buf.extend(encode_frame(&msg2).expect("encode msg2"));
+
+        let (decoded1, consumed1) = decode_frame::<MessageType>(&buf)
+            .expect("decode first")
+            .expect("first complete");
+        assert_eq!(decoded1, msg1);
+
+        let (decoded2, consumed2) = decode_frame::<MessageType>(&buf[consumed1..])
+            .expect("decode second")
+            .expect("second complete");
+        assert_eq!(decoded2, msg2);
+        assert_eq!(consumed1 + consumed2, buf.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty buffer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_empty_buffer_returns_none() {
+        let result = decode_frame::<MessageType>(&[]).expect("empty buffer is not error");
+        assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ResponseEnvelope disambiguation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_response_envelope_ok_vs_error_disambiguation() {
+        let ok_raw = json!({"version": 1, "id": "r1", "ok": true, "result": {}});
+        let err_raw = json!({
+            "version": 1, "id": "r1", "ok": false,
+            "error": {"code": "TAB_NOT_FOUND", "message": "no tab", "retryable": false}
+        });
+
+        let ok_envelope: ResponseEnvelope = serde_json::from_value(ok_raw).expect("ok envelope");
+        let err_envelope: ResponseEnvelope = serde_json::from_value(err_raw).expect("err envelope");
+
+        assert!(matches!(ok_envelope, ResponseEnvelope::Ok(_)));
+        assert!(matches!(err_envelope, ResponseEnvelope::Error(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Constants verification
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_protocol_constants_match_plan() {
+        assert_eq!(MAX_SOCKET_FRAME_BYTES, 1024 * 1024);
+        assert_eq!(PROTOCOL_VERSION_V1, 1);
+        assert_eq!(PROTOCOL_MIN_SUPPORTED, PROTOCOL_VERSION_V1);
+        assert_eq!(PROTOCOL_MAX_SUPPORTED, PROTOCOL_VERSION_V1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest
+    // -----------------------------------------------------------------------
+
     proptest! {
         #[test]
         fn test_protocol_proptest_frame_roundtrip_arbitrary_payloads(

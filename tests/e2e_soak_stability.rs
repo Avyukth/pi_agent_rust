@@ -388,7 +388,7 @@ impl Provider for RepeatedToolProvider {
                 vec![ContentBlock::ToolCall(ToolCall {
                     id: format!("read-{index}"),
                     name: "read".to_string(),
-                    arguments: json!({ "path": path }),
+                    arguments: json!({ "path": path }).into(),
                     thought_signature: None,
                 })],
                 self.tokens_per_turn,
@@ -514,7 +514,7 @@ impl Provider for MixedWorkloadProvider {
                     vec![ContentBlock::ToolCall(ToolCall {
                         id: format!("mixed-read-{index}"),
                         name: "read".to_string(),
-                        arguments: json!({ "path": path }),
+                        arguments: json!({ "path": path }).into(),
                         thought_signature: None,
                     })],
                     self.tokens_per_turn,

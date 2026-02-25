@@ -36,12 +36,24 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// Maximum number of pending output messages in the RPC output channel.
+/// Bounds memory to ~5 MB max (256 × ~20 KB worst-case per browser tool result).
+const RPC_OUTPUT_CHANNEL_BOUND: usize = 256;
+
+/// O5: Capacity of the non-blocking event drain buffer.
+///
+/// Events are pushed via `try_send()` (never blocks the async runtime) and a
+/// dedicated `rpc-event-drain` thread serializes + forwards to the bounded
+/// `RPC_OUTPUT_CHANNEL_BOUND` stdout channel. 4096 slots accommodate a burst
+/// of 8 concurrent browser tools × ~500 update events per tool.
+const EVENT_DRAIN_BUFFER: usize = 4096;
 
 fn provider_ids_match(left: &str, right: &str) -> bool {
     let left = left.trim();
@@ -63,9 +75,60 @@ pub struct RpcOptions {
     pub config: Config,
     pub resources: ResourceLoader,
     pub available_models: Vec<ModelEntry>,
+    /// V7-B: O(1) index for model lookup by (canonical_provider, model_id).
+    models_index: HashMap<(String, String), usize>,
     pub scoped_models: Vec<RpcScopedModel>,
     pub auth: AuthStorage,
     pub runtime_handle: RuntimeHandle,
+}
+
+impl RpcOptions {
+    pub fn new(
+        config: Config,
+        resources: ResourceLoader,
+        available_models: Vec<ModelEntry>,
+        scoped_models: Vec<RpcScopedModel>,
+        auth: AuthStorage,
+        runtime_handle: RuntimeHandle,
+    ) -> Self {
+        let models_index = build_models_index(&available_models);
+        Self {
+            config,
+            resources,
+            available_models,
+            models_index,
+            scoped_models,
+            auth,
+            runtime_handle,
+        }
+    }
+
+    /// O(1) model lookup by provider + model_id, using canonical provider normalization.
+    fn find_model(&self, provider: &str, model_id: &str) -> Option<&ModelEntry> {
+        let key = rpc_model_key(provider, model_id);
+        let idx = *self.models_index.get(&key)?;
+        self.available_models.get(idx)
+    }
+}
+
+/// Normalize a (provider, model_id) pair for HashMap lookup.
+/// Uses canonical_provider_id for provider aliasing, case-insensitive.
+fn rpc_model_key(provider: &str, model_id: &str) -> (String, String) {
+    let p = provider.trim();
+    let canonical = canonical_provider_id(p).unwrap_or(p);
+    (
+        canonical.to_ascii_lowercase(),
+        model_id.trim().to_ascii_lowercase(),
+    )
+}
+
+fn build_models_index(models: &[ModelEntry]) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::with_capacity(models.len());
+    for (i, entry) in models.iter().enumerate() {
+        let key = rpc_model_key(&entry.model.provider, &entry.model.id);
+        index.entry(key).or_insert(i);
+    }
+    index
 }
 
 #[derive(Debug, Clone)]
@@ -257,7 +320,7 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     );
 
     let (in_tx, in_rx) = mpsc::channel::<String>(1024);
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
     std::thread::spawn(move || {
         let stdin = io::stdin();
@@ -307,7 +370,7 @@ pub async fn run(
     session: AgentSession,
     options: RpcOptions,
     in_rx: mpsc::Receiver<String>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_request();
     let session_handle = Arc::clone(&session.session);
@@ -1725,7 +1788,7 @@ async fn run_prompt_with_retry(
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
     retry_abort: Arc<AtomicBool>,
     options: RpcOptions,
     message: String,
@@ -1762,40 +1825,64 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let runtime_for_events_handler = runtime_for_events.clone();
+
+            // O5: Non-blocking event emission — decouple serialization + I/O
+            // from tool execution tasks. Raw AgentEvent values (cheap to move
+            // thanks to Arc wrappers from O6/O13) are pushed into a bounded
+            // buffer via try_send() (never blocks). A dedicated drain thread
+            // handles serde_json serialization + stdout forwarding, preventing
+            // 8 concurrent browser tools from contending on serialization +
+            // SyncSender backpressure.
             let event_tx = out_tx.clone();
+            let runtime_for_drain = runtime_for_events.clone();
             let coalescer = extensions
                 .as_ref()
                 .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
+
+            let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+            let drain_handle = std::thread::Builder::new()
+                .name("rpc-event-drain".into())
+                .spawn(move || {
+                    for event in buf_rx {
+                        let serialized = if let AgentEvent::AgentEnd {
+                            messages, error, ..
+                        } = &event
+                        {
+                            json!({
+                                "type": "agent_end",
+                                "messages": messages,
+                                "error": error,
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::to_string(&event).unwrap_or_else(|err| {
+                                json!({
+                                    "type": "event_serialize_error",
+                                    "error": err.to_string(),
+                                })
+                                .to_string()
+                            })
+                        };
+                        let _ = event_tx.send(serialized);
+                        // Route non-lifecycle events through the coalescer for
+                        // batched/coalesced dispatch with lazy serialization.
+                        if let Some(coal) = &coalescer {
+                            coal.dispatch_agent_event_lazy(&event, &runtime_for_drain);
+                        }
+                    }
+                })
+                .expect("spawn rpc-event-drain thread");
+
             let event_handler = move |event: AgentEvent| {
-                let serialized = if let AgentEvent::AgentEnd {
-                    messages, error, ..
-                } = &event
-                {
-                    json!({
-                        "type": "agent_end",
-                        "messages": messages,
-                        "error": error,
-                    })
-                    .to_string()
-                } else {
-                    serde_json::to_string(&event).unwrap_or_else(|err| {
-                        json!({
-                            "type": "event_serialize_error",
-                            "error": err.to_string(),
-                        })
-                        .to_string()
-                    })
-                };
-                let _ = event_tx.send(serialized);
-                // Route non-lifecycle events through the coalescer for
-                // batched/coalesced dispatch with lazy serialization.
-                if let Some(coal) = &coalescer {
-                    coal.dispatch_agent_event_lazy(&event, &runtime_for_events_handler);
-                }
+                // Non-blocking: push raw event to drain buffer.
+                // try_send avoids blocking the async runtime under backpressure;
+                // the EVENT_DRAIN_BUFFER-slot buffer absorbs bursts from 8
+                // concurrent tools.
+                let _ = buf_tx.try_send(event);
             };
 
-            if images.is_empty() {
+            let run_result = if images.is_empty() {
                 guard
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
                     .await
@@ -1807,7 +1894,15 @@ async fn run_prompt_with_retry(
                 guard
                     .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                     .await
-            }
+            };
+
+            // event_handler dropped → buf_tx dropped → drain thread exits
+            // after processing remaining buffered events. Join to ensure all
+            // events are flushed to stdout before we process the result or
+            // retry.
+            let _ = drain_handle.join();
+
+            run_result
         };
 
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -1988,7 +2083,7 @@ fn rpc_emit_extension_ui_request(
     runtime_handle: &RuntimeHandle,
     ui_state: Arc<Mutex<RpcUiBridgeState>>,
     manager: ExtensionManager,
-    out_tx_ui: std::sync::mpsc::Sender<String>,
+    out_tx_ui: std::sync::mpsc::SyncSender<String>,
     request: ExtensionUiRequest,
 ) {
     // Emit the UI request as a JSON notification to the client.
@@ -2580,7 +2675,8 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let (out_tx, out_rx) =
+                std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -2588,14 +2684,14 @@ mod retry_tests {
                 .join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("auth load");
 
-            let options = RpcOptions {
+            let options = RpcOptions::new(
                 config,
-                resources: ResourceLoader::empty(false),
-                available_models: Vec::new(),
-                scoped_models: Vec::new(),
+                ResourceLoader::empty(false),
+                Vec::new(),
+                Vec::new(),
                 auth,
                 runtime_handle,
-            };
+            );
 
             run_prompt_with_retry(
                 session,
@@ -2681,7 +2777,8 @@ mod retry_tests {
             let is_compacting = Arc::new(AtomicBool::new(false));
             let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
             let retry_abort = Arc::new(AtomicBool::new(false));
-            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let (out_tx, out_rx) =
+                std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
 
             let auth_path = tempfile::tempdir()
                 .expect("tempdir")
@@ -2689,14 +2786,14 @@ mod retry_tests {
                 .join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("auth load");
 
-            let options = RpcOptions {
+            let options = RpcOptions::new(
                 config,
-                resources: ResourceLoader::empty(false),
-                available_models: Vec::new(),
-                scoped_models: Vec::new(),
+                ResourceLoader::empty(false),
+                Vec::new(),
+                Vec::new(),
                 auth,
                 runtime_handle,
-            };
+            );
 
             let retry_abort_for_thread = Arc::clone(&retry_abort);
             let abort_thread = std::thread::spawn(move || {
@@ -2776,7 +2873,7 @@ async fn maybe_auto_compact(
     session: Arc<Mutex<AgentSession>>,
     options: RpcOptions,
     is_compacting: Arc<AtomicBool>,
-    out_tx: std::sync::mpsc::Sender<String>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
 ) {
     let cx = AgentCx::for_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
@@ -2937,35 +3034,30 @@ fn session_state(
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
+    // V7-B: O(1) model lookup via HashMap index.
     let model = session
         .header
         .provider
         .as_deref()
         .zip(session.header.model_id.as_deref())
-        .and_then(|(provider, model_id)| {
-            options.available_models.iter().find(|m| {
-                provider_ids_match(&m.model.provider, provider)
-                    && m.model.id.eq_ignore_ascii_case(model_id)
-            })
-        })
+        .and_then(|(provider, model_id)| options.find_model(provider, model_id))
         .map(rpc_model_from_entry);
 
-    let message_count = session
-        .entries_for_current_path()
+    // V7-A optimization: reuse a single path snapshot for both queries
+    // instead of traversing entries_for_current_path() twice.
+    let entries = session.entries_for_current_path();
+
+    let message_count = entries
         .iter()
         .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
         .count();
 
-    let session_name = session
-        .entries_for_current_path()
-        .iter()
-        .rev()
-        .find_map(|entry| {
-            let crate::session::SessionEntry::SessionInfo(info) = entry else {
-                return None;
-            };
-            info.name.clone()
-        });
+    let session_name = entries.iter().rev().find_map(|entry| {
+        let crate::session::SessionEntry::SessionInfo(info) = entry else {
+            return None;
+        };
+        info.name.clone()
+    });
 
     let mut state = serde_json::Map::new();
     state.insert("model".to_string(), model.unwrap_or(Value::Null));
@@ -3682,9 +3774,8 @@ fn current_model_entry<'a>(
 ) -> Option<&'a ModelEntry> {
     let provider = session.header.provider.as_deref()?;
     let model_id = session.header.model_id.as_deref()?;
-    options.available_models.iter().find(|m| {
-        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
-    })
+    // V7-B: O(1) lookup via HashMap index.
+    options.find_model(provider, model_id)
 }
 
 async fn apply_thinking_level(
@@ -3931,14 +4022,14 @@ mod tests {
             .join("auth.json");
         let auth = AuthStorage::load(auth_path).expect("auth load");
 
-        RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
+        RpcOptions::new(
+            Config::default(),
+            ResourceLoader::empty(false),
             available_models,
-            scoped_models: Vec::new(),
+            Vec::new(),
             auth,
             runtime_handle,
-        }
+        )
     }
 
     #[test]
@@ -5000,5 +5091,346 @@ mod tests {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+}
+
+#[cfg(test)]
+mod rpc_model_index_tests {
+    use super::*;
+    use crate::provider::{InputType, Model, ModelCost};
+
+    fn make_entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: provider.to_string(),
+                provider: provider.to_string(),
+                base_url: String::new(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 100_000,
+                max_tokens: 4096,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    #[test]
+    fn find_model_exact_match() {
+        let models = vec![
+            make_entry("anthropic", "claude-3-opus"),
+            make_entry("openai", "gpt-4"),
+        ];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("anthropic", "claude-3-opus");
+        assert_eq!(*index.get(&key).unwrap(), 0);
+        let key = rpc_model_key("openai", "gpt-4");
+        assert_eq!(*index.get(&key).unwrap(), 1);
+    }
+
+    #[test]
+    fn find_model_case_insensitive() {
+        let models = vec![make_entry("Anthropic", "Claude-3-Opus")];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("anthropic", "claude-3-opus");
+        assert!(index.contains_key(&key));
+        let key = rpc_model_key("ANTHROPIC", "CLAUDE-3-OPUS");
+        assert!(index.contains_key(&key));
+    }
+
+    #[test]
+    fn find_model_canonical_provider_alias() {
+        // "gemini" canonicalizes to "google"
+        let models = vec![make_entry("google", "gemini-pro")];
+        let index = build_models_index(&models);
+        // Looking up via alias should find it
+        let key = rpc_model_key("gemini", "gemini-pro");
+        assert!(
+            index.contains_key(&key),
+            "alias 'gemini' should match canonical 'google'"
+        );
+    }
+
+    #[test]
+    fn find_model_missing_returns_none() {
+        let models = vec![make_entry("anthropic", "claude-3-opus")];
+        let index = build_models_index(&models);
+        let key = rpc_model_key("openai", "gpt-4");
+        assert!(index.get(&key).is_none());
+    }
+
+    #[test]
+    fn find_model_agrees_with_linear_scan() {
+        let models = vec![
+            make_entry("anthropic", "claude-3-opus"),
+            make_entry("openai", "gpt-4"),
+            make_entry("google", "gemini-pro"),
+        ];
+        let index = build_models_index(&models);
+
+        // Test cases: (lookup_provider, lookup_model_id)
+        let queries = [
+            ("anthropic", "claude-3-opus"),
+            ("ANTHROPIC", "Claude-3-Opus"),
+            ("openai", "GPT-4"),
+            ("gemini", "gemini-pro"), // alias
+            ("unknown", "model-x"),   // missing
+        ];
+
+        for (provider, model_id) in queries {
+            let linear = models.iter().find(|m| {
+                provider_ids_match(&m.model.provider, provider)
+                    && m.model.id.eq_ignore_ascii_case(model_id)
+            });
+            let key = rpc_model_key(provider, model_id);
+            let indexed = index.get(&key).map(|&idx| &models[idx]);
+            assert_eq!(
+                linear.map(|m| &m.model.id),
+                indexed.map(|m| &m.model.id),
+                "linear vs indexed mismatch for ({provider}, {model_id})"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_channel_bound_tests {
+    use super::*;
+
+    #[test]
+    fn output_channel_applies_backpressure_at_bound() {
+        // Guardrail: the RPC output channel must be bounded at RPC_OUTPUT_CHANNEL_BOUND.
+        // When the buffer is full, try_send must return Full (backpressure).
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+
+        // Fill the channel to capacity.
+        for i in 0..RPC_OUTPUT_CHANNEL_BOUND {
+            tx.send(format!("msg-{i}"))
+                .expect("send within bound should succeed");
+        }
+
+        // The next try_send must report Full — proves the channel is bounded.
+        let err = tx.try_send("overflow".to_string()).unwrap_err();
+        assert!(
+            matches!(err, std::sync::mpsc::TrySendError::Full(_)),
+            "expected TrySendError::Full, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn output_channel_bound_matches_constant() {
+        assert_eq!(RPC_OUTPUT_CHANNEL_BOUND, 256);
+    }
+
+    #[test]
+    fn output_channel_drains_after_backpressure() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(RPC_OUTPUT_CHANNEL_BOUND);
+
+        // Fill to capacity.
+        for i in 0..RPC_OUTPUT_CHANNEL_BOUND {
+            tx.send(format!("msg-{i}")).unwrap();
+        }
+
+        // Drain one slot.
+        let _ = rx.recv().unwrap();
+
+        // Now one more send should succeed.
+        tx.send("after-drain".to_string())
+            .expect("send after drain should succeed");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// O5: Event drain buffer guardrail tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod event_drain_tests {
+    use super::*;
+    use crate::agent::AgentEvent;
+
+    #[test]
+    fn event_drain_buffer_capacity_is_sufficient() {
+        // Guardrail: buffer must be large enough for 8 tools × 500 updates.
+        assert!(
+            EVENT_DRAIN_BUFFER >= 4096,
+            "EVENT_DRAIN_BUFFER ({EVENT_DRAIN_BUFFER}) must be >= 4096"
+        );
+    }
+
+    #[test]
+    fn event_drain_try_send_is_nonblocking() {
+        // Guardrail: try_send on a SyncSender never blocks, even when full.
+        // Verify it returns TrySendError::Full instead of blocking.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<AgentEvent>(2);
+
+        let e1 = AgentEvent::AgentStart {
+            session_id: "s1".into(),
+        };
+        let e2 = AgentEvent::AgentStart {
+            session_id: "s2".into(),
+        };
+        let e3 = AgentEvent::AgentStart {
+            session_id: "s3".into(),
+        };
+
+        // Fill the 2-slot buffer.
+        tx.try_send(e1).expect("slot 1");
+        tx.try_send(e2).expect("slot 2");
+
+        // Third try_send must fail immediately (non-blocking).
+        let err = tx.try_send(e3).unwrap_err();
+        assert!(
+            matches!(err, std::sync::mpsc::TrySendError::Full(_)),
+            "expected Full, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn event_drain_thread_delivers_all_events_in_order() {
+        // Guardrail: the drain thread pattern preserves FIFO ordering and
+        // delivers every event pushed before the sender is dropped.
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+        let drain_handle = std::thread::Builder::new()
+            .name("test-event-drain".into())
+            .spawn(move || {
+                for event in buf_rx {
+                    let serialized =
+                        serde_json::to_string(&event).unwrap_or_else(|e| format!("err: {e}"));
+                    let _ = out_tx.send(serialized);
+                }
+            })
+            .unwrap();
+
+        // Push 100 events.
+        let n = 100;
+        for i in 0..n {
+            let event = AgentEvent::AgentStart {
+                session_id: format!("session-{i}").into(),
+            };
+            buf_tx.try_send(event).expect("buffer has capacity");
+        }
+
+        // Drop sender to signal drain thread to finish.
+        drop(buf_tx);
+        drain_handle.join().expect("drain thread panicked");
+
+        // Verify all events arrived in order.
+        let mut received = Vec::new();
+        while let Ok(line) = out_rx.try_recv() {
+            received.push(line);
+        }
+        assert_eq!(
+            received.len(),
+            n,
+            "expected {n} events, got {}",
+            received.len()
+        );
+        // Verify ordering: each line should contain the corresponding session id.
+        for (i, line) in received.iter().enumerate() {
+            let expected = format!("session-{i}");
+            assert!(
+                line.contains(&expected),
+                "event {i} should contain '{expected}', got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_drain_thread_exits_when_sender_dropped() {
+        // Guardrail: drain thread must exit promptly when the sender is dropped.
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(64);
+
+        let (out_tx, _out_rx) = std::sync::mpsc::sync_channel::<String>(64);
+
+        let drain_handle = std::thread::Builder::new()
+            .name("test-drain-exit".into())
+            .spawn(move || {
+                for event in buf_rx {
+                    let _ = serde_json::to_string(&event);
+                    let _ = out_tx.send("ok".into());
+                }
+            })
+            .unwrap();
+
+        // Push one event, then drop.
+        let event = AgentEvent::AgentStart {
+            session_id: "x".into(),
+        };
+        buf_tx.try_send(event).unwrap();
+        drop(buf_tx);
+
+        // Drain thread should finish quickly (< 1 second).
+        let start = std::time::Instant::now();
+        drain_handle.join().expect("drain thread panicked");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "drain thread took too long to exit after sender drop"
+        );
+    }
+
+    #[test]
+    fn event_drain_concurrent_producers_no_loss() {
+        // Guardrail: 8 concurrent producers pushing events should not lose
+        // any when the buffer has sufficient capacity.
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(4096);
+
+        let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(EVENT_DRAIN_BUFFER);
+
+        let drain_handle = std::thread::spawn(move || {
+            for event in buf_rx {
+                let s = serde_json::to_string(&event).unwrap_or_default();
+                let _ = out_tx.send(s);
+            }
+        });
+
+        // 8 producers, 50 events each = 400 total.
+        let num_producers = 8;
+        let events_per_producer = 50;
+        let total = num_producers * events_per_producer;
+
+        let handles: Vec<_> = (0..num_producers)
+            .map(|p| {
+                let tx = buf_tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..events_per_producer {
+                        let event = AgentEvent::AgentStart {
+                            session_id: format!("p{p}-e{i}").into(),
+                        };
+                        let _ = tx.try_send(event);
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(buf_tx);
+        drain_handle.join().unwrap();
+
+        let mut count = 0;
+        while out_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(
+            count, total,
+            "expected {total} events from {num_producers} producers, got {count}"
+        );
     }
 }

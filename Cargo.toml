@@ -86,7 +86,8 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Utilities
 uuid = { version = "1.21.0", features = ["v4"] }
@@ -153,6 +154,10 @@ harness = false
 
 [[bench]]
 name = "tui_perf"
+harness = false
+
+[[bench]]
+name = "optimizations"
 harness = false
 
 # Gap H: jemalloc for 10-20% allocation-heavy path improvement.

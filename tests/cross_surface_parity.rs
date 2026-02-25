@@ -547,7 +547,7 @@ mod message_serde_invariants {
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_123".to_string(),
                     name: "read".to_string(),
-                    arguments: json!({"file_path": "/tmp/test.txt"}),
+                    arguments: json!({"file_path": "/tmp/test.txt"}).into(),
                     thought_signature: None,
                 }),
             ],

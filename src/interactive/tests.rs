@@ -738,7 +738,7 @@ fn tool_content_blocks_tool_call() {
     let blocks = vec![ContentBlock::ToolCall(crate::model::ToolCall {
         id: "tc-1".to_string(),
         name: "bash".to_string(),
-        arguments: json!({"command": "ls"}),
+        arguments: std::sync::Arc::new(json!({"command": "ls"})),
         thought_signature: None,
     })];
     let result = tool_content_blocks_to_text(&blocks, false);
@@ -869,7 +869,7 @@ fn content_blocks_to_text_mixed() {
         ContentBlock::ToolCall(crate::model::ToolCall {
             id: "tc-1".to_string(),
             name: "read".to_string(),
-            arguments: json!({}),
+            arguments: std::sync::Arc::new(json!({})),
             thought_signature: None,
         }),
     ];

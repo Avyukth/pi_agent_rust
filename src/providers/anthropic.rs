@@ -656,7 +656,7 @@ where
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: self.current_tool_id.clone().unwrap_or_default(),
                     name: self.current_tool_name.clone().unwrap_or_default(),
-                    arguments: serde_json::Value::Null,
+                    arguments: std::sync::Arc::new(serde_json::Value::Null),
                     thought_signature: None,
                 }));
                 StreamEvent::ToolCallStart { content_index }
@@ -761,10 +761,10 @@ where
                 let tool_call = ToolCall {
                     id: self.current_tool_id.take().unwrap_or_default(),
                     name: self.current_tool_name.take().unwrap_or_default(),
-                    arguments: arguments.clone(),
+                    arguments: std::sync::Arc::new(arguments.clone()),
                     thought_signature: None,
                 };
-                tc.arguments = arguments;
+                tc.arguments = std::sync::Arc::new(arguments);
                 self.current_tool_json.clear();
 
                 Some(StreamEvent::ToolCallEnd {
@@ -1374,7 +1374,7 @@ mod tests {
             assert_eq!(*content_index, 1);
             assert_eq!(tool_call.id, "tool_123");
             assert_eq!(tool_call.name, "search");
-            assert_eq!(tool_call.arguments, json!({ "q": "rust" }));
+            assert_eq!(*tool_call.arguments, json!({ "q": "rust" }));
         } else {
             panic!("expected ToolCallEnd event, got {:?}", out[7]);
         }

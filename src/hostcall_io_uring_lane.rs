@@ -55,6 +55,7 @@ pub enum HostcallCapabilityClass {
     Tool,
     Ui,
     Telemetry,
+    Browser,
     Unknown,
 }
 
@@ -71,6 +72,7 @@ impl HostcallCapabilityClass {
             "tool" => Self::Tool,
             "ui" => Self::Ui,
             "log" | "telemetry" => Self::Telemetry,
+            "browser" => Self::Browser,
             _ => Self::Unknown,
         }
     }
@@ -701,6 +703,7 @@ mod tests {
         assert!(!config.allow_for_capability(HostcallCapabilityClass::Tool));
         assert!(!config.allow_for_capability(HostcallCapabilityClass::Ui));
         assert!(!config.allow_for_capability(HostcallCapabilityClass::Telemetry));
+        assert!(!config.allow_for_capability(HostcallCapabilityClass::Browser));
         assert!(!config.allow_for_capability(HostcallCapabilityClass::Unknown));
     }
 
@@ -790,6 +793,10 @@ mod tests {
             HostcallCapabilityClass::from_capability("telemetry"),
             HostcallCapabilityClass::Telemetry
         );
+        assert_eq!(
+            HostcallCapabilityClass::from_capability("browser"),
+            HostcallCapabilityClass::Browser
+        );
         // Case insensitivity
         assert_eq!(
             HostcallCapabilityClass::from_capability("READ"),
@@ -876,6 +883,7 @@ mod tests {
                 HostcallCapabilityClass::Tool,
                 HostcallCapabilityClass::Ui,
                 HostcallCapabilityClass::Telemetry,
+                HostcallCapabilityClass::Browser,
                 HostcallCapabilityClass::Unknown,
             ])
         }

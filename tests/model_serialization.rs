@@ -496,7 +496,8 @@ fn test_content_block_tool_call() {
             "path": "/tmp/test.txt",
             "offset": 0,
             "limit": 100
-        }),
+        })
+        .into(),
         thought_signature: Some("thought_sig".to_string()),
     });
 
@@ -534,7 +535,8 @@ fn test_content_block_tool_call_complex_args() {
                     "value": [1, 2, 3]
                 }
             }
-        }),
+        })
+        .into(),
         thought_signature: None,
     });
 
@@ -843,7 +845,7 @@ fn test_assistant_message_event_tool_call_end() {
     let tool_call = ToolCall {
         id: "call_test".to_string(),
         name: "bash".to_string(),
-        arguments: json!({"command": "ls -la"}),
+        arguments: json!({"command": "ls -la"}).into(),
         thought_signature: None,
     };
 
@@ -877,7 +879,7 @@ fn test_assistant_message_event_all_variants_round_trip() {
     let tool_call = ToolCall {
         id: "call_roundtrip".to_string(),
         name: "read".to_string(),
-        arguments: json!({ "path": "Cargo.toml" }),
+        arguments: json!({ "path": "Cargo.toml" }).into(),
         thought_signature: Some("sig".to_string()),
     };
 
@@ -1050,7 +1052,8 @@ fn test_special_characters_in_tool_args() {
         name: "bash".to_string(),
         arguments: json!({
             "command": "echo \"Hello, World!\" && ls -la | grep 'test'"
-        }),
+        })
+        .into(),
         thought_signature: None,
     });
 
@@ -1081,7 +1084,8 @@ fn test_large_tool_arguments() {
         arguments: json!({
             "path": "/tmp/large.txt",
             "content": large_payload
-        }),
+        })
+        .into(),
         thought_signature: None,
     });
 
@@ -1119,13 +1123,13 @@ fn test_mixed_content_sequence() {
             ContentBlock::ToolCall(ToolCall {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
-                arguments: json!({"path": "/src/main.rs"}),
+                arguments: json!({"path": "/src/main.rs"}).into(),
                 thought_signature: None,
             }),
             ContentBlock::ToolCall(ToolCall {
                 id: "call_2".to_string(),
                 name: "grep".to_string(),
-                arguments: json!({"pattern": "fn main", "path": "/src"}),
+                arguments: json!({"pattern": "fn main", "path": "/src"}).into(),
                 thought_signature: None,
             }),
         ],

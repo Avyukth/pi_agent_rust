@@ -13,6 +13,7 @@
 //! 5. If done: return final message
 
 use crate::auth::AuthStorage;
+use crate::chrome::ChromeBridge;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::error::{Error, Result};
@@ -250,7 +251,7 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        args: serde_json::Value,
+        args: std::sync::Arc<serde_json::Value>,
     },
     /// Tool execution update.
     ToolExecutionUpdate {
@@ -258,17 +259,20 @@ pub enum AgentEvent {
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        args: serde_json::Value,
+        args: std::sync::Arc<serde_json::Value>,
         #[serde(rename = "partialResult")]
         partial_result: ToolOutput,
     },
     /// Tool execution end.
+    ///
+    /// O6: `result` is `Arc<ToolOutput>` to avoid deep-cloning large
+    /// browser tool outputs (a11y trees, screenshots) into the event.
     ToolExecutionEnd {
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
         #[serde(rename = "toolName")]
         tool_name: String,
-        result: ToolOutput,
+        result: Arc<ToolOutput>,
         #[serde(rename = "isError")]
         is_error: bool,
     },
@@ -405,6 +409,13 @@ pub struct Agent {
 
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
     cached_tool_defs: Option<Vec<ToolDef>>,
+
+    /// Count of hidden custom messages (display: false) in the message history.
+    /// Maintained incrementally to avoid O(n) scans in build_context().
+    hidden_custom_count: usize,
+
+    /// Optional ChromeBridge for browser automation observation draining.
+    chrome_bridge: Option<Arc<ChromeBridge>>,
 }
 
 impl Agent {
@@ -420,6 +431,8 @@ impl Agent {
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
+            hidden_custom_count: 0,
+            chrome_bridge: None,
         }
     }
 
@@ -432,15 +445,23 @@ impl Agent {
     /// Clear the message history.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.hidden_custom_count = 0;
     }
 
     /// Add a message to the history.
     pub fn add_message(&mut self, message: Message) {
+        if matches!(&message, Message::Custom(c) if !c.display) {
+            self.hidden_custom_count += 1;
+        }
         self.messages.push(message);
     }
 
     /// Replace the message history.
     pub fn replace_messages(&mut self, messages: Vec<Message>) {
+        self.hidden_custom_count = messages
+            .iter()
+            .filter(|m| matches!(m, Message::Custom(c) if !c.display))
+            .count();
         self.messages = messages;
     }
 
@@ -473,6 +494,76 @@ impl Agent {
     {
         self.tools.extend(tools);
         self.cached_tool_defs = None; // Invalidate cache when tools change
+    }
+
+    /// Set the ChromeBridge for browser observation draining.
+    pub fn set_chrome_bridge(&mut self, bridge: Arc<ChromeBridge>) {
+        self.chrome_bridge = Some(bridge);
+    }
+
+    /// Drain browser observations from the ChromeBridge, format as a summary,
+    /// and return as a hidden custom message for LLM context injection.
+    ///
+    /// Returns `None` if no bridge is set, or no observations are pending.
+    /// This enables the verify loop: the LLM sees observation summaries
+    /// in its next turn and can act on them.
+    fn drain_observations(&self) -> Option<Message> {
+        let bridge = self.chrome_bridge.as_ref()?;
+        let events = bridge.take_observations();
+        if events.is_empty() {
+            return None;
+        }
+
+        // Format protocol-level observation batches into a text summary.
+        // Each protocol ObservationEvent contains a batch of ObservationEntries.
+        let mut lines = Vec::new();
+        let mut total_entries = 0;
+        for batch in &events {
+            for entry in &batch.events {
+                let msg = entry.message.as_deref().unwrap_or("");
+                let url = entry.url.as_deref().unwrap_or("");
+                let detail = if !msg.is_empty() {
+                    msg
+                } else if !url.is_empty() {
+                    url
+                } else {
+                    ""
+                };
+                let suffix = if detail.is_empty() {
+                    String::new()
+                } else if detail.len() > 80 {
+                    format!(": {}...", &detail[..77])
+                } else {
+                    format!(": {detail}")
+                };
+                lines.push(format!("- {}{suffix}", entry.kind));
+                total_entries += 1;
+                // Budget: cap at ~20 lines to avoid prompt bloat
+                if lines.len() >= 20 {
+                    break;
+                }
+            }
+            if lines.len() >= 20 {
+                break;
+            }
+        }
+
+        if lines.is_empty() {
+            return None;
+        }
+
+        let summary = format!("[Browser Observation]\n{}", lines.join("\n"));
+
+        Some(Message::Custom(CustomMessage {
+            content: summary,
+            custom_type: "browser_observations".to_string(),
+            display: false,
+            details: Some(json!({
+                "events_processed": total_entries,
+                "batches": events.len(),
+            })),
+            timestamp: Utc::now().timestamp_millis(),
+        }))
     }
 
     /// Queue a steering message (delivered after tool completion).
@@ -527,11 +618,8 @@ impl Agent {
             }
             Cow::Owned(msgs)
         } else {
-            // Check if we need to filter hidden custom messages to avoid cloning if not needed.
-            let has_hidden = self.messages.iter().any(|m| match m {
-                Message::Custom(c) => !c.display,
-                _ => false,
-            });
+            // O(1) check via incrementally maintained counter (O12 optimization).
+            let has_hidden = self.hidden_custom_count > 0;
 
             if has_hidden {
                 let mut msgs = self.messages.clone();
@@ -690,7 +778,7 @@ impl Agent {
         on_event(agent_start_event);
 
         for prompt in prompts {
-            self.messages.push(prompt.clone());
+            self.add_message(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
             });
@@ -719,7 +807,7 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
-                    self.messages.push(message.clone());
+                    self.add_message(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
                     });
@@ -767,11 +855,13 @@ impl Agent {
                     return Ok(abort_message);
                 }
 
-                let assistant_message = match self
+                // O7: stream_assistant_response returns Arc<AssistantMessage> directly,
+                // eliminating a guaranteed deep clone in finalize_assistant_message.
+                let assistant_arc = match self
                     .stream_assistant_response(Arc::clone(&on_event), abort.clone())
                     .await
                 {
-                    Ok(msg) => msg,
+                    Ok(arc) => arc,
                     Err(err) => {
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
@@ -784,9 +874,6 @@ impl Agent {
                         return Err(err);
                     }
                 };
-                // Wrap in Arc once; share via Arc::clone (O(1)) instead of deep
-                // cloning the full AssistantMessage for every consumer.
-                let assistant_arc = Arc::new(assistant_message);
                 last_assistant = Some(Arc::clone(&assistant_arc));
 
                 let assistant_event_message = Message::Assistant(Arc::clone(&assistant_arc));
@@ -895,6 +982,14 @@ impl Agent {
                     .map(|r| Message::ToolResult(Arc::clone(r)))
                     .collect::<Vec<_>>();
 
+                // Drain browser observations and inject as hidden context note.
+                // This enables the verify loop: the LLM sees observation summaries
+                // (console errors, load events, etc.) in its next turn context.
+                if let Some(obs_message) = self.drain_observations() {
+                    self.add_message(obs_message.clone());
+                    new_messages.push(obs_message);
+                }
+
                 let turn_end_event = AgentEvent::TurnEnd {
                     session_id: session_id.clone(),
                     turn_index: current_turn_index,
@@ -959,6 +1054,13 @@ impl Agent {
             _ => return,
         };
 
+        // O17 optimization: skip expensive serde_json::to_value serialization
+        // when no extension has a hook registered for this lifecycle event.
+        // The hook_bitmap check is lock-free (RCU snapshot).
+        if !extensions.has_hook_for(&name.to_string()) {
+            return;
+        }
+
         let payload = match serde_json::to_value(event) {
             Ok(payload) => payload,
             Err(err) => {
@@ -993,12 +1095,14 @@ impl Agent {
     }
 
     /// Stream an assistant response and emit message events.
+    ///
+    /// Returns `Arc<AssistantMessage>` to avoid a guaranteed deep clone (O7).
     #[allow(clippy::too_many_lines)]
     async fn stream_assistant_response(
         &mut self,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
-    ) -> Result<AssistantMessage> {
+    ) -> Result<Arc<AssistantMessage>> {
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
         let stream_options = self.config.stream_options.clone();
@@ -1253,7 +1357,7 @@ impl Agent {
                             msg.content.push(ContentBlock::ToolCall(ToolCall {
                                 id: String::new(),
                                 name: String::new(),
-                                arguments: serde_json::Value::Null,
+                                arguments: std::sync::Arc::new(serde_json::Value::Null),
                                 thought_signature: None,
                             }));
                         }
@@ -1378,12 +1482,17 @@ impl Agent {
         }
     }
 
+    /// Finalize an assistant message: store in history, emit events, return Arc.
+    ///
+    /// O7 optimization: returns `Arc<AssistantMessage>` directly instead of
+    /// attempting `Arc::try_unwrap` (which always fails since `self.messages`
+    /// holds a clone, forcing a guaranteed deep clone).
     fn finalize_assistant_message(
         &mut self,
         message: AssistantMessage,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         added_partial: bool,
-    ) -> AssistantMessage {
+    ) -> Arc<AssistantMessage> {
         let arc = Arc::new(message);
         if added_partial {
             if let Some(last @ Message::Assistant(_)) = self.messages.last_mut() {
@@ -1407,7 +1516,7 @@ impl Agent {
         on_event(AgentEvent::MessageEnd {
             message: Message::Assistant(Arc::clone(&arc)),
         });
-        Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone())
+        arc
     }
 
     async fn execute_parallel_batch(
@@ -1572,9 +1681,21 @@ impl Agent {
             // If `None`, the tool was skipped/aborted.
             if let Some((output, is_error)) = tool_outputs[index].take() {
                 // Tool executed normally.
-                // Build ToolResultMessage first and wrap in Arc; the message
-                // clone below is O(1) Arc refcount bump since ToolResult is
-                // already Arc-wrapped in the Message enum.
+                // O6: Wrap output in Arc first so the ToolExecutionEnd event
+                // gets a cheap Arc clone instead of deep-copying content/details
+                // (which can be 50-200KB for browser tools).
+                let output_arc = Arc::new(output);
+
+                on_event(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.name.clone(),
+                    result: Arc::clone(&output_arc),
+                    is_error,
+                });
+
+                // Unwrap the Arc to move content/details into ToolResultMessage.
+                // If the event handler already dropped its ref, this is free.
+                let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
@@ -1582,19 +1703,6 @@ impl Agent {
                     details: output.details,
                     is_error,
                     timestamp: Utc::now().timestamp_millis(),
-                });
-
-                // Emit ToolExecutionEnd. We clone content/details from the
-                // Arc'd result — same data, no extra source clone.
-                on_event(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: tool_result.tool_call_id.clone(),
-                    tool_name: tool_result.tool_name.clone(),
-                    result: ToolOutput {
-                        content: tool_result.content.clone(),
-                        details: tool_result.details.clone(),
-                        is_error,
-                    },
-                    is_error,
                 });
 
                 let msg = Message::ToolResult(Arc::clone(&tool_result));
@@ -1630,16 +1738,15 @@ impl Agent {
                     },
                 });
 
+                // O6: wrap abort output in Arc for cheap event sharing.
+                let output_arc = Arc::new(output);
                 on_event(AgentEvent::ToolExecutionEnd {
                     tool_call_id: tool_call.id.clone(),
                     tool_name: tool_call.name.clone(),
-                    result: ToolOutput {
-                        content: output.content.clone(),
-                        details: output.details.clone(),
-                        is_error: true,
-                    },
+                    result: Arc::clone(&output_arc),
                     is_error: true,
                 });
+                let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
 
                 let tool_result = Arc::new(ToolResultMessage {
                     tool_call_id: tool_call.id.clone(),
@@ -1674,6 +1781,13 @@ impl Agent {
         tool_call: ToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
+        tracing::debug!(
+            event = "pi.tool.execute.start",
+            tool_name = %tool_call.name,
+            tool_id = %tool_call.id,
+            "Tool execution starting"
+        );
+
         let extensions = self.extensions.clone();
 
         let (mut output, is_error) = if let Some(extensions) = &extensions {
@@ -1693,6 +1807,12 @@ impl Agent {
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
         }
 
+        tracing::debug!(
+            event = "pi.tool.execute.done",
+            tool_name = %tool_call.name,
+            is_error = is_error,
+            "Tool execution completed"
+        );
         (output, is_error)
     }
 
@@ -1735,7 +1855,7 @@ impl Agent {
         match tool
             .execute(
                 &tool_call.id,
-                tool_call.arguments.clone(),
+                (*tool_call.arguments).clone(),
                 Some(Box::new(update_callback)),
             )
             .await
@@ -1843,12 +1963,14 @@ impl Agent {
             args: tool_call.arguments.clone(),
             partial_result: output.clone(),
         });
+        let output_arc = Arc::new(output);
         on_event(AgentEvent::ToolExecutionEnd {
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            result: output.clone(),
+            result: Arc::clone(&output_arc),
             is_error: true,
         });
+        let output = Arc::try_unwrap(output_arc).unwrap_or_else(|arc| (*arc).clone());
 
         let tool_result = Arc::new(ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -1906,6 +2028,10 @@ pub struct AgentSession {
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
     auth_storage: Option<AuthStorage>,
+    /// V8-B: Cached session generation from the last `to_messages_for_current_path()`.
+    /// When the session's generation matches, the agent's current messages are
+    /// already in sync and the expensive rebuild can be skipped.
+    cached_history_gen: u64,
 }
 
 #[derive(Debug, Default)]
@@ -2115,6 +2241,474 @@ mod message_queue_tests {
 }
 
 #[cfg(test)]
+mod hidden_custom_counter_tests {
+    use super::*;
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn api(&self) -> &str {
+            "stub"
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn make_agent() -> Agent {
+        Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        )
+    }
+
+    fn hidden_custom(text: &str) -> Message {
+        Message::Custom(CustomMessage {
+            content: text.to_string(),
+            custom_type: "test".to_string(),
+            display: false,
+            details: None,
+            timestamp: 0,
+        })
+    }
+
+    fn visible_custom(text: &str) -> Message {
+        Message::Custom(CustomMessage {
+            content: text.to_string(),
+            custom_type: "test".to_string(),
+            display: true,
+            details: None,
+            timestamp: 0,
+        })
+    }
+
+    fn user_msg(text: &str) -> Message {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn test_hidden_counter_starts_at_zero() {
+        let agent = make_agent();
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "new agent should have zero hidden messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_increments_on_hidden_custom() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret"));
+        assert_eq!(
+            agent.hidden_custom_count, 1,
+            "counter should be 1 after adding a hidden custom message"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_unchanged_for_visible_custom() {
+        let mut agent = make_agent();
+        agent.add_message(visible_custom("visible"));
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should be 0 for visible custom messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_unchanged_for_user_message() {
+        let mut agent = make_agent();
+        agent.add_message(user_msg("hello"));
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should be 0 for user messages"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_resets_on_clear() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret1"));
+        agent.add_message(hidden_custom("secret2"));
+        assert_eq!(agent.hidden_custom_count, 2);
+
+        agent.clear_messages();
+        assert_eq!(
+            agent.hidden_custom_count, 0,
+            "counter should reset to 0 on clear"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_recounts_on_replace() {
+        let mut agent = make_agent();
+        agent.add_message(hidden_custom("secret"));
+        assert_eq!(agent.hidden_custom_count, 1);
+
+        // Replace with a mix of messages
+        agent.replace_messages(vec![
+            user_msg("hi"),
+            hidden_custom("new_secret"),
+            visible_custom("visible"),
+            hidden_custom("another_secret"),
+        ]);
+        assert_eq!(
+            agent.hidden_custom_count, 2,
+            "counter should reflect the new message set after replace"
+        );
+    }
+
+    #[test]
+    fn test_hidden_counter_multiple_adds() {
+        let mut agent = make_agent();
+        agent.add_message(user_msg("a"));
+        agent.add_message(hidden_custom("b"));
+        agent.add_message(visible_custom("c"));
+        agent.add_message(hidden_custom("d"));
+        agent.add_message(user_msg("e"));
+        assert_eq!(
+            agent.hidden_custom_count, 2,
+            "counter should track exactly 2 hidden custom messages"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_observations_tests {
+    use super::*;
+    use crate::chrome::ChromeBridge;
+    use crate::chrome::protocol::{ObservationEntry, ObservationEvent};
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn api(&self) -> &str {
+            "stub"
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn make_agent() -> Agent {
+        Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        )
+    }
+
+    fn sample_observation(kind: &str, message: Option<&str>) -> ObservationEvent {
+        ObservationEvent {
+            version: 1,
+            observer_id: "obs-1".to_string(),
+            events: vec![ObservationEntry {
+                kind: kind.to_string(),
+                message: message.map(|s| s.to_string()),
+                source: None,
+                url: None,
+                ts: 1000,
+            }],
+        }
+    }
+
+    #[test]
+    fn drain_observations_returns_none_without_bridge() {
+        let agent = make_agent();
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_returns_none_with_empty_buffer() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        agent.set_chrome_bridge(bridge);
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_returns_custom_message_with_events() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation(
+            "console_error",
+            Some("TypeError: cannot read property 'x' of null"),
+        ));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "browser_observations");
+                assert!(!cm.display, "observation messages should be hidden");
+                assert!(cm.content.contains("[Browser Observation]"));
+                assert!(cm.content.contains("console_error"));
+                assert!(cm.content.contains("TypeError"));
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_clears_buffer_after_take() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation(
+            "navigation",
+            Some("https://example.com"),
+        ));
+        agent.set_chrome_bridge(bridge.clone());
+
+        // First drain should produce a message
+        assert!(agent.drain_observations().is_some());
+        // Second drain should be empty (buffer was cleared)
+        assert!(agent.drain_observations().is_none());
+    }
+
+    #[test]
+    fn drain_observations_caps_at_20_lines() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        // Push 25 events in a single batch
+        let entries: Vec<ObservationEntry> = (0..25)
+            .map(|i| ObservationEntry {
+                kind: "console_warn".to_string(),
+                message: Some(format!("warning {i}")),
+                source: None,
+                url: None,
+                ts: 1000 + i,
+            })
+            .collect();
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "obs-1".to_string(),
+            events: entries,
+        });
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                let line_count = cm.content.lines().count();
+                // Header "[Browser Observation]" + at most 20 event lines = 21
+                assert!(
+                    line_count <= 21,
+                    "should cap at 20 event lines + header, got {line_count}"
+                );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_truncates_long_details() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let long_message = "a".repeat(200);
+        bridge.push_observation(sample_observation("console_error", Some(&long_message)));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                // Detail should be truncated to ~80 chars + "..."
+                assert!(
+                    cm.content.contains("..."),
+                    "long details should be truncated"
+                );
+                assert!(
+                    cm.content.len() < 200,
+                    "output should be shorter than the raw 200-char input"
+                );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_includes_metadata_in_details() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation("load_complete", None));
+        bridge.push_observation(sample_observation("console_error", Some("err")));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        match &msg {
+            Message::Custom(cm) => {
+                let details = cm.details.as_ref().expect("should have details");
+                assert_eq!(details["events_processed"], 2);
+                assert_eq!(details["batches"], 2);
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_message_added_to_history() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        bridge.push_observation(sample_observation("dom_mutation", Some("element added")));
+        agent.set_chrome_bridge(bridge);
+
+        let msg = agent.drain_observations().expect("should produce message");
+        agent.add_message(msg);
+
+        // Verify it's in the message history
+        let last = agent.messages().last().expect("should have messages");
+        match last {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "browser_observations");
+                assert!(!cm.display);
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+
+        // Verify hidden_custom_count was incremented
+        assert_eq!(
+            agent.hidden_custom_count, 1,
+            "hidden observation message should increment counter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_hook_gate_tests {
+    use super::*;
+    use crate::extensions::ExtensionManager;
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn api(&self) -> &str {
+            "stub"
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    /// O17 guardrail: when extensions exist but no lifecycle hooks are registered,
+    /// dispatch_extension_lifecycle_event should return without serializing the event.
+    /// The has_hook_for gate prevents wasted serde_json::to_value work.
+    #[test]
+    fn lifecycle_dispatch_skips_serialization_when_no_hooks() {
+        let manager = ExtensionManager::new();
+        // No extensions registered → no hooks in bitmap.
+        assert!(
+            !manager.has_hook_for("agent_start"),
+            "empty manager should have no agent_start hook"
+        );
+        assert!(
+            !manager.has_hook_for("agent_end"),
+            "empty manager should have no agent_end hook"
+        );
+        assert!(
+            !manager.has_hook_for("turn_start"),
+            "empty manager should have no turn_start hook"
+        );
+        assert!(
+            !manager.has_hook_for("turn_end"),
+            "empty manager should have no turn_end hook"
+        );
+
+        // Verify dispatch completes without panic (no runtime needed since
+        // the has_hook_for gate returns early before any bridge call).
+        let mut agent = Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.extensions = Some(manager);
+
+        futures::executor::block_on(async {
+            let event = AgentEvent::TurnEnd {
+                session_id: Arc::from("test"),
+                turn_index: 0,
+                message: Message::User(UserMessage {
+                    content: UserContent::Text("test".to_string()),
+                    timestamp: 0,
+                }),
+                tool_results: vec![],
+            };
+            // This should return immediately without attempting serialization
+            // or calling extensions.dispatch_event (which would fail without a runtime).
+            agent.dispatch_extension_lifecycle_event(&event).await;
+        });
+    }
+}
+
+#[cfg(test)]
 mod extensions_integration_tests {
     use super::*;
 
@@ -2256,13 +2850,13 @@ mod extensions_integration_tests {
                     ToolCall {
                         id: "call-1".to_string(),
                         name: "count_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     },
                     ToolCall {
                         id: "call-2".to_string(),
                         name: "count_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     },
                 ];
@@ -2726,7 +3320,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -2788,7 +3382,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -2836,7 +3430,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -2886,7 +3480,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -2937,7 +3531,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "bash".to_string(),
-                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                arguments: std::sync::Arc::new(json!({ "command": "printf 'hi' > blocked.txt" })),
                 thought_signature: None,
             };
 
@@ -3007,7 +3601,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3072,7 +3666,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "missing_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3133,7 +3727,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3205,7 +3799,7 @@ mod extensions_integration_tests {
             let tool_call = ToolCall {
                 id: "call-1".to_string(),
                 name: "count_tool".to_string(),
-                arguments: json!({}),
+                arguments: std::sync::Arc::new(json!({})),
                 thought_signature: None,
             };
 
@@ -3439,7 +4033,7 @@ mod abort_tests {
                 content: vec![ContentBlock::ToolCall(ToolCall {
                     id: "call-1".to_string(),
                     name: "hanging_tool".to_string(),
-                    arguments: json!({}),
+                    arguments: std::sync::Arc::new(json!({})),
                     thought_signature: None,
                 })],
                 api: "test-api".to_string(),
@@ -4043,7 +4637,7 @@ mod turn_event_tests {
                     vec![ContentBlock::ToolCall(ToolCall {
                         id: "tool-1".to_string(),
                         name: "echo_tool".to_string(),
-                        arguments: json!({}),
+                        arguments: std::sync::Arc::new(json!({})),
                         thought_signature: None,
                     })],
                 )
@@ -4323,6 +4917,7 @@ impl AgentSession {
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
             auth_storage: None,
+            cached_history_gen: 0,
         }
     }
 
@@ -4479,12 +5074,15 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let entries_ref = session.entries_for_current_path();
+            // O18: fast-path threshold check on references avoids deep-cloning
+            // all entries when compaction won't trigger (~99% of turns).
+            if compaction::should_prepare_compaction(&entries_ref, &self.compaction_settings) {
+                let entries: Vec<_> = entries_ref.into_iter().cloned().collect();
+                compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(prep) = preparation {
@@ -4559,12 +5157,15 @@ impl AgentSession {
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            let entries = session
-                .entries_for_current_path()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            let entries_ref = session.entries_for_current_path();
+            // O18: fast-path threshold check on references avoids deep-cloning
+            // all entries when compaction won't trigger (~99% of turns).
+            if compaction::should_prepare_compaction(&entries_ref, &self.compaction_settings) {
+                let entries: Vec<_> = entries_ref.into_iter().cloned().collect();
+                compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            } else {
+                None
+            }
         };
 
         if let Some(prep) = preparation {
@@ -5047,6 +5648,12 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        tracing::debug!(
+            event = "pi.agent.run_text.start",
+            input_len = input.len(),
+            "Agent run_text starting"
+        );
+
         let on_event: AgentEventHandler = Arc::new(on_event);
         let session_model = {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -5066,16 +5673,24 @@ impl AgentSession {
         }
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
+
+        // V8-B: skip the expensive to_messages_for_current_path() + replace_messages()
+        // when the session has not been mutated since the last time we rebuilt.
+        {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
-        self.agent.replace_messages(history);
+            let session_gen = session.generation();
+            if session_gen != self.cached_history_gen {
+                let history = session.to_messages_for_current_path();
+                drop(session);
+                self.agent.replace_messages(history);
+                self.cached_history_gen = session_gen;
+            }
+        }
 
         let start_len = self.agent.messages().len();
 
@@ -5110,6 +5725,11 @@ impl AgentSession {
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
+        tracing::debug!(
+            event = "pi.agent.run_text.done",
+            stop_reason = ?result.stop_reason,
+            "Agent run_text completed"
+        );
         Ok(result)
     }
 
@@ -5119,6 +5739,12 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        tracing::debug!(
+            event = "pi.agent.run_content.start",
+            content_blocks = content.len(),
+            "Agent run_content starting"
+        );
+
         let on_event: AgentEventHandler = Arc::new(on_event);
         let session_model = {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -5138,16 +5764,24 @@ impl AgentSession {
         }
 
         self.maybe_compact(Arc::clone(&on_event)).await?;
-        let history = {
+
+        // V8-B: skip the expensive to_messages_for_current_path() + replace_messages()
+        // when the session has not been mutated since the last time we rebuilt.
+        {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
-            session.to_messages_for_current_path()
-        };
-        self.agent.replace_messages(history);
+            let session_gen = session.generation();
+            if session_gen != self.cached_history_gen {
+                let history = session.to_messages_for_current_path();
+                drop(session);
+                self.agent.replace_messages(history);
+                self.cached_history_gen = session_gen;
+            }
+        }
 
         let start_len = self.agent.messages().len();
 
@@ -5182,6 +5816,11 @@ impl AgentSession {
         let result = result?;
         // Persist only NEW messages (assistant/tools), skipping the user message we already saved.
         self.persist_new_messages(start_len + 1).await?;
+        tracing::debug!(
+            event = "pi.agent.run_content.done",
+            stop_reason = ?result.stop_reason,
+            "Agent run_content completed"
+        );
         Ok(result)
     }
 
@@ -5454,14 +6093,14 @@ mod tests {
             ContentBlock::ToolCall(ToolCall {
                 id: "tc1".to_string(),
                 name: "read".to_string(),
-                arguments: serde_json::json!({"path": "file.txt"}),
+                arguments: std::sync::Arc::new(serde_json::json!({"path": "file.txt"})),
                 thought_signature: None,
             }),
             ContentBlock::Text(TextContent::new("World")),
             ContentBlock::ToolCall(ToolCall {
                 id: "tc2".to_string(),
                 name: "bash".to_string(),
-                arguments: serde_json::json!({"command": "ls"}),
+                arguments: std::sync::Arc::new(serde_json::json!({"command": "ls"})),
                 thought_signature: None,
             }),
         ];
@@ -5994,5 +6633,51 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["finalError"], "max retries exceeded");
+    }
+
+    /// O6 guardrail: ToolExecutionEnd.result is Arc<ToolOutput>,
+    /// so cloning the event shares the output without deep-copying content.
+    #[test]
+    fn tool_execution_end_result_is_arc_shared() {
+        use crate::tools::ToolOutput;
+        let output = Arc::new(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("large_result"))],
+            details: None,
+            is_error: false,
+        });
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc_1".to_string(),
+            tool_name: "read".to_string(),
+            result: Arc::clone(&output),
+            is_error: false,
+        };
+        // Verify the event holds the same Arc (not a deep copy).
+        if let AgentEvent::ToolExecutionEnd { result, .. } = &event {
+            assert!(Arc::ptr_eq(result, &output));
+        } else {
+            panic!("expected ToolExecutionEnd");
+        }
+    }
+
+    /// O6 guardrail: ToolExecutionEnd serializes identically to the
+    /// pre-Arc wire format (Arc<T> has transparent serde).
+    #[test]
+    fn tool_execution_end_arc_serializes_transparently() {
+        use crate::tools::ToolOutput;
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "tc_1".to_string(),
+            tool_name: "read".to_string(),
+            result: Arc::new(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
+                details: None,
+                is_error: false,
+            }),
+            is_error: false,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "tool_execution_end");
+        assert_eq!(json["toolCallId"], "tc_1");
+        assert!(json["result"]["content"].is_array());
+        assert_eq!(json["isError"], false);
     }
 }

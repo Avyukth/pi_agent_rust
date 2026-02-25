@@ -152,7 +152,7 @@ impl Provider for ScriptedProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "read-1".to_string(),
                             name: "read".to_string(),
-                            arguments: json!({ "path": read_path }),
+                            arguments: json!({ "path": read_path }).into(),
                             thought_signature: None,
                         })],
                         30,
@@ -202,7 +202,7 @@ impl Provider for ScriptedProvider {
                             arguments: json!({
                                 "path": file_path,
                                 "content": content,
-                            }),
+                            }).into(),
                             thought_signature: None,
                         })],
                         40,
@@ -227,7 +227,7 @@ impl Provider for ScriptedProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "read-1".to_string(),
                             name: "read".to_string(),
-                            arguments: json!({ "path": file_path }),
+                            arguments: json!({ "path": file_path }).into(),
                             thought_signature: None,
                         })],
                         30,
@@ -275,7 +275,7 @@ impl Provider for ScriptedProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "bash-1".to_string(),
                             name: "bash".to_string(),
-                            arguments: json!({ "command": "echo hello-agent-loop" }),
+                            arguments: json!({ "command": "echo hello-agent-loop" }).into(),
                             thought_signature: None,
                         })],
                         32,
@@ -323,7 +323,7 @@ impl Provider for ScriptedProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "bad-1".to_string(),
                             name: "missing_tool".to_string(),
-                            arguments: json!({}),
+                            arguments: json!({}).into(),
                             thought_signature: None,
                         })],
                         18,

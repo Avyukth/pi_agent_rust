@@ -836,7 +836,7 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "missing-1".to_string(),
                             name: "nonexistent_tool_xyz".to_string(),
-                            arguments: json!({}),
+                            arguments: Arc::new(json!({})),
                             thought_signature: None,
                         })],
                         10,
@@ -870,7 +870,7 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "bad-args-1".to_string(),
                             name: "read".to_string(),
-                            arguments: json!({ "wrong_field": true }),
+                            arguments: Arc::new(json!({ "wrong_field": true })),
                             thought_signature: None,
                         })],
                         10,
@@ -903,7 +903,7 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "fnf-1".to_string(),
                             name: "read".to_string(),
-                            arguments: json!({ "path": path }),
+                            arguments: Arc::new(json!({ "path": path })),
                             thought_signature: None,
                         })],
                         10,
@@ -937,13 +937,13 @@ impl Provider for ToolFailurePropagationProvider {
                             ContentBlock::ToolCall(ToolCall {
                                 id: "good-1".to_string(),
                                 name: "bash".to_string(),
-                                arguments: json!({ "command": "echo success" }),
+                                arguments: Arc::new(json!({ "command": "echo success" })),
                                 thought_signature: None,
                             }),
                             ContentBlock::ToolCall(ToolCall {
                                 id: "bad-1".to_string(),
                                 name: "nonexistent_tool".to_string(),
-                                arguments: json!({}),
+                                arguments: Arc::new(json!({})),
                                 thought_signature: None,
                             }),
                         ],
@@ -988,7 +988,7 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "fail-1".to_string(),
                             name: "nonexistent_tool".to_string(),
-                            arguments: json!({}),
+                            arguments: Arc::new(json!({})),
                             thought_signature: None,
                         })],
                         10,
@@ -1003,7 +1003,7 @@ impl Provider for ToolFailurePropagationProvider {
                         vec![ContentBlock::ToolCall(ToolCall {
                             id: "recover-1".to_string(),
                             name: "bash".to_string(),
-                            arguments: json!({ "command": "echo recovered" }),
+                            arguments: Arc::new(json!({ "command": "echo recovered" })),
                             thought_signature: None,
                         })],
                         10,
