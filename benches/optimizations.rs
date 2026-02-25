@@ -168,10 +168,27 @@ fn bench_observer_ring_drain(c: &mut Criterion) {
     group.throughput(Throughput::Elements(RING_BUFFER_CAPACITY as u64));
 
     // Fill and drain the full 128-event buffer
-    group.bench_function(
-        BenchmarkId::new("push_drain", RING_BUFFER_CAPACITY),
-        |b| {
-            b.iter(|| {
+    group.bench_function(BenchmarkId::new("push_drain", RING_BUFFER_CAPACITY), |b| {
+        b.iter(|| {
+            let mut buffer = ObservationRingBuffer::new();
+            for i in 0..RING_BUFFER_CAPACITY {
+                buffer.push(ObservationEvent::with_timestamp(
+                    format!("obs-{i}"),
+                    1,
+                    ObservableEventKind::ConsoleError,
+                    1000 + i as u64,
+                    json!({"seq": i}),
+                ));
+            }
+            let events = buffer.drain();
+            black_box(events);
+        });
+    });
+
+    // Drain only (pre-filled buffer)
+    group.bench_function(BenchmarkId::new("drain_only", RING_BUFFER_CAPACITY), |b| {
+        b.iter_batched(
+            || {
                 let mut buffer = ObservationRingBuffer::new();
                 for i in 0..RING_BUFFER_CAPACITY {
                     buffer.push(ObservationEvent::with_timestamp(
@@ -182,38 +199,15 @@ fn bench_observer_ring_drain(c: &mut Criterion) {
                         json!({"seq": i}),
                     ));
                 }
+                buffer
+            },
+            |mut buffer| {
                 let events = buffer.drain();
                 black_box(events);
-            });
-        },
-    );
-
-    // Drain only (pre-filled buffer)
-    group.bench_function(
-        BenchmarkId::new("drain_only", RING_BUFFER_CAPACITY),
-        |b| {
-            b.iter_batched(
-                || {
-                    let mut buffer = ObservationRingBuffer::new();
-                    for i in 0..RING_BUFFER_CAPACITY {
-                        buffer.push(ObservationEvent::with_timestamp(
-                            format!("obs-{i}"),
-                            1,
-                            ObservableEventKind::ConsoleError,
-                            1000 + i as u64,
-                            json!({"seq": i}),
-                        ));
-                    }
-                    buffer
-                },
-                |mut buffer| {
-                    let events = buffer.drain();
-                    black_box(events);
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        },
-    );
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
 
     // Push with eviction (buffer already full, measures overwrite path)
     group.bench_function("push_with_eviction", |b| {
@@ -257,23 +251,20 @@ fn bench_rpc_channel_throughput(c: &mut Criterion) {
     group.throughput(Throughput::Elements(CHANNEL_BOUND as u64));
 
     // Send + receive full channel capacity
-    group.bench_function(
-        BenchmarkId::new("send_recv_cycle", CHANNEL_BOUND),
-        |b| {
-            b.iter(|| {
-                let (tx, rx) = mpsc::sync_channel::<String>(CHANNEL_BOUND);
-                for i in 0..CHANNEL_BOUND {
-                    tx.send(format!("{{\"id\":{i}}}")).unwrap();
-                }
-                drop(tx);
-                let mut count = 0;
-                while rx.recv().is_ok() {
-                    count += 1;
-                }
-                black_box(count);
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("send_recv_cycle", CHANNEL_BOUND), |b| {
+        b.iter(|| {
+            let (tx, rx) = mpsc::sync_channel::<String>(CHANNEL_BOUND);
+            for i in 0..CHANNEL_BOUND {
+                tx.send(format!("{{\"id\":{i}}}")).unwrap();
+            }
+            drop(tx);
+            let mut count = 0;
+            while rx.recv().is_ok() {
+                count += 1;
+            }
+            black_box(count);
+        });
+    });
 
     // Single send latency (channel not full)
     group.bench_function("single_send", |b| {
@@ -412,8 +403,7 @@ fn bench_policy_lookup(c: &mut Criterion) {
     group.bench_function("reason_is_borrowed", |b| {
         b.iter(|| {
             let check = snapshot.lookup(black_box("read"), None);
-            let is_borrowed =
-                matches!(check.reason, std::borrow::Cow::Borrowed(_));
+            let is_borrowed = matches!(check.reason, std::borrow::Cow::Borrowed(_));
             black_box(is_borrowed);
         });
     });
@@ -434,12 +424,9 @@ fn bench_event_drain_buffer(c: &mut Criterion) {
 
     // Non-blocking try_send to SyncSender (the O5 hot path)
     group.bench_function("try_send_nonblocking", |b| {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<AgentEvent>(DRAIN_BUFFER);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<AgentEvent>(DRAIN_BUFFER);
         // Spawn consumer to prevent buffer from filling
-        let _consumer = std::thread::spawn(move || {
-            while rx.recv().is_ok() {}
-        });
+        let _consumer = std::thread::spawn(move || while rx.recv().is_ok() {});
 
         b.iter(|| {
             let event = AgentEvent::AgentStart {
@@ -451,11 +438,8 @@ fn bench_event_drain_buffer(c: &mut Criterion) {
 
     // Blocking send for comparison (the pre-O5 path)
     group.bench_function("send_blocking", |b| {
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<String>(256);
-        let _consumer = std::thread::spawn(move || {
-            while rx.recv().is_ok() {}
-        });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let _consumer = std::thread::spawn(move || while rx.recv().is_ok() {});
 
         b.iter(|| {
             let _ = tx.send(black_box("test".to_string()));
@@ -465,10 +449,8 @@ fn bench_event_drain_buffer(c: &mut Criterion) {
     // Full pipeline: try_send + serialize on drain thread (O5 pattern)
     group.bench_function("drain_pipeline_100_events", |b| {
         b.iter(|| {
-            let (out_tx, out_rx) =
-                std::sync::mpsc::sync_channel::<String>(256);
-            let (buf_tx, buf_rx) =
-                std::sync::mpsc::sync_channel::<AgentEvent>(DRAIN_BUFFER);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+            let (buf_tx, buf_rx) = std::sync::mpsc::sync_channel::<AgentEvent>(DRAIN_BUFFER);
 
             let drain = std::thread::spawn(move || {
                 for event in buf_rx {
@@ -526,37 +508,28 @@ fn bench_rpc_model_lookup(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     // HashMap O(1) lookup (V7-B path)
-    group.bench_function(
-        BenchmarkId::new("hashmap_hit", model_count),
-        |b| {
-            b.iter(|| {
-                let key = (
-                    black_box("provider-5").to_lowercase(),
-                    black_box("model-55").to_lowercase(),
-                );
-                let idx = index.get(&key);
-                black_box(idx);
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("hashmap_hit", model_count), |b| {
+        b.iter(|| {
+            let key = (
+                black_box("provider-5").to_lowercase(),
+                black_box("model-55").to_lowercase(),
+            );
+            let idx = index.get(&key);
+            black_box(idx);
+        });
+    });
 
     // Linear scan O(n) for comparison (pre-V7-B path)
-    group.bench_function(
-        BenchmarkId::new("linear_scan", model_count),
-        |b| {
-            b.iter(|| {
-                let target_p = black_box("provider-5");
-                let target_m = black_box("model-55");
-                let found = models
-                    .iter()
-                    .position(|(p, m)| {
-                        p.eq_ignore_ascii_case(target_p)
-                            && m.eq_ignore_ascii_case(target_m)
-                    });
-                black_box(found);
+    group.bench_function(BenchmarkId::new("linear_scan", model_count), |b| {
+        b.iter(|| {
+            let target_p = black_box("provider-5");
+            let target_m = black_box("model-55");
+            let found = models.iter().position(|(p, m)| {
+                p.eq_ignore_ascii_case(target_p) && m.eq_ignore_ascii_case(target_m)
             });
-        },
-    );
+            black_box(found);
+        });
+    });
 
     // HashMap miss (should be O(1) still)
     group.bench_function("hashmap_miss", |b| {
@@ -628,6 +601,84 @@ fn bench_session_generation(c: &mut Criterion) {
 }
 
 // ============================================================================
+// O16: HTTP connection pool — measure pool take/return overhead
+// ============================================================================
+
+/// Benchmark the connection pool management overhead.  The actual savings
+/// is 40-150ms per TCP+TLS handshake avoided; this measures only the
+/// pool management overhead (OnceLock + Mutex + HashMap take/insert)
+/// which should be < 1µs per operation.
+fn bench_http_connection_pool(c: &mut Criterion) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    // Mirror the pool structure from http/client.rs without exposing internals.
+    type PoolKey = (String, u16);
+    struct SimPool {
+        idle: HashMap<PoolKey, u64>, // u64 placeholder for Transport
+    }
+    static SIM_POOL: OnceLock<Mutex<SimPool>> = OnceLock::new();
+    fn sim_pool() -> &'static Mutex<SimPool> {
+        SIM_POOL.get_or_init(|| {
+            Mutex::new(SimPool {
+                idle: HashMap::new(),
+            })
+        })
+    }
+
+    let mut group = c.benchmark_group("o16_http_connection_pool");
+
+    // OnceLock access (the fast path after first init)
+    group.bench_function("oncelock_access", |b| {
+        let _ = sim_pool(); // ensure initialized
+        b.iter(|| {
+            let pool = sim_pool();
+            black_box(pool);
+        });
+    });
+
+    // Mutex lock + HashMap miss (pool empty, new connection needed)
+    group.bench_function("pool_miss", |b| {
+        b.iter(|| {
+            let mut pool = sim_pool().lock().unwrap();
+            let key = (black_box("api.anthropic.com").to_string(), 443u16);
+            let result = pool.idle.remove(&key);
+            black_box(result);
+        });
+    });
+
+    // Mutex lock + HashMap insert (returning connection to pool)
+    group.bench_function("pool_return", |b| {
+        b.iter(|| {
+            let mut pool = sim_pool().lock().unwrap();
+            let key = (black_box("api.anthropic.com").to_string(), 443u16);
+            pool.idle.insert(key, 42);
+        });
+    });
+
+    // Mutex lock + HashMap hit (reusing pooled connection)
+    group.bench_function("pool_hit", |b| {
+        // Pre-seed the pool
+        {
+            let mut pool = sim_pool().lock().unwrap();
+            pool.idle.insert(("api.anthropic.com".to_string(), 443), 42);
+        }
+        b.iter(|| {
+            let mut pool = sim_pool().lock().unwrap();
+            let key = (black_box("api.anthropic.com").to_string(), 443u16);
+            let conn = pool.idle.remove(&key);
+            // Put it back for the next iteration
+            if let Some(c) = conn {
+                pool.idle.insert(key, c);
+            }
+            black_box(conn);
+        });
+    });
+
+    group.finish();
+}
+
+// ============================================================================
 // Criterion Harness
 // ============================================================================
 
@@ -646,6 +697,7 @@ criterion_group! {
         bench_event_drain_buffer,
         bench_rpc_model_lookup,
         bench_session_generation,
+        bench_http_connection_pool,
 }
 
 criterion_main!(optimization_benches);
