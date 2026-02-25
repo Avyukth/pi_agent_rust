@@ -1916,6 +1916,75 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn test_esl_proptest_fingerprint_mismatch_rejects_without_corrupting_terminal_replay(
+            canonical_payload in esl_json_value_strategy(),
+            mismatched_payload in esl_json_value_strategy(),
+        ) {
+            prop_assume!(canonical_payload != mismatched_payload);
+
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let canonical = sample_request_struct("req-esl-fingerprint", canonical_payload);
+            let mismatched = sample_request_struct("req-esl-fingerprint", mismatched_payload);
+            let response = sample_response_envelope_for("req-esl-fingerprint");
+            let now_ms = unix_time_ms();
+
+            let first = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms)?;
+            prop_assert_eq!(
+                first,
+                EslBeginOutcome::Dispatch,
+                "initial request must dispatch before a terminal replay can exist"
+            );
+            journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &canonical,
+                &response,
+                now_ms + 1,
+            )?;
+
+            let mismatched_outcome = journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &mismatched,
+                now_ms + 2,
+            )?;
+            match mismatched_outcome {
+                EslBeginOutcome::Reject(protocol::ResponseEnvelope::Error(err)) => {
+                    prop_assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeProtocolMismatch,
+                        "fingerprint mismatch must fail closed as invalid_request-class error"
+                    );
+                    prop_assert!(
+                        err.error.message.starts_with("invalid_request:"),
+                        "fingerprint mismatch reject should preserve invalid_request prefix"
+                    );
+                    prop_assert!(
+                        !err.error.retryable,
+                        "fingerprint mismatch reject must not be retryable"
+                    );
+                }
+                other => prop_assert!(
+                    false,
+                    "fingerprint-mismatched duplicate must reject, got {other:?}"
+                ),
+            }
+
+            let replay = journal.begin_request("session-prop", "epoch-prop", &canonical, now_ms + 3)?;
+            match replay {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response,
+                    "mismatched duplicate must not corrupt canonical terminal replay"
+                ),
+                other => prop_assert!(
+                    false,
+                    "canonical duplicate after mismatch must still replay terminal response, got {other:?}"
+                ),
+            }
+        }
     }
 
     #[test]
