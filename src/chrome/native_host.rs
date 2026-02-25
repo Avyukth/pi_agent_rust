@@ -2278,6 +2278,113 @@ mod tests {
         }
 
         #[test]
+        fn test_esl_proptest_terminal_replay_refresh_extends_ttl_window(
+            payload in esl_json_value_strategy(),
+            ttl_ms in 2_i64..5_000_i64,
+        ) {
+            let request = sample_request_struct("req-esl-ttl-refresh", payload);
+            let response = sample_response_envelope_for("req-esl-ttl-refresh");
+            let now_ms = unix_time_ms();
+            let terminal_ms = now_ms + 1;
+            let replay_refresh_ms = terminal_ms + ttl_ms - 1;
+
+            let mut extension_journal = EslJournal::with_limits_for_test(ttl_ms, 64, 1 << 20);
+            let first = extension_journal.begin_request("session-prop", "epoch-prop", &request, now_ms)?;
+            prop_assert_eq!(
+                first,
+                EslBeginOutcome::Dispatch,
+                "first request must dispatch before terminal replay cache exists"
+            );
+            extension_journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                &response,
+                terminal_ms,
+            )?;
+
+            let replay_before_original_boundary = extension_journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                replay_refresh_ms,
+            )?;
+            match replay_before_original_boundary {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response.clone(),
+                    "terminal duplicate just before TTL boundary must replay"
+                ),
+                other => prop_assert!(
+                    false,
+                    "expected replay before original TTL boundary, got {other:?}"
+                ),
+            }
+
+            let replay_after_original_boundary = extension_journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                terminal_ms + ttl_ms,
+            )?;
+            match replay_after_original_boundary {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response.clone(),
+                    "terminal replay should refresh TTL eligibility past the original boundary"
+                ),
+                other => prop_assert!(
+                    false,
+                    "terminal replay refresh must extend TTL window, got {other:?}"
+                ),
+            }
+
+            let mut expiry_journal = EslJournal::with_limits_for_test(ttl_ms, 64, 1 << 20);
+            let first_expiry = expiry_journal.begin_request("session-prop", "epoch-prop", &request, now_ms)?;
+            prop_assert_eq!(
+                first_expiry,
+                EslBeginOutcome::Dispatch,
+                "independent journal setup must dispatch initially"
+            );
+            expiry_journal.record_terminal_response(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                &response,
+                terminal_ms,
+            )?;
+            let replay_for_refresh = expiry_journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                replay_refresh_ms,
+            )?;
+            match replay_for_refresh {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response.clone(),
+                    "independent journal must replay at refresh point"
+                ),
+                other => prop_assert!(
+                    false,
+                    "independent journal expected replay at refresh point, got {other:?}"
+                ),
+            }
+
+            let dispatch_at_refreshed_boundary = expiry_journal.begin_request(
+                "session-prop",
+                "epoch-prop",
+                &request,
+                replay_refresh_ms + ttl_ms,
+            )?;
+            prop_assert_eq!(
+                dispatch_at_refreshed_boundary,
+                EslBeginOutcome::Dispatch,
+                "terminal replay cache must expire at the refreshed TTL boundary"
+            );
+        }
+
+        #[test]
         fn test_esl_proptest_in_progress_entries_do_not_expire_via_ttl(
             payload in esl_json_value_strategy(),
             ttl_ms in 1_i64..5_000_i64,
