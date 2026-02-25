@@ -592,7 +592,42 @@ pub fn compile_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use serde_json::json;
+
+    fn all_observable_kinds() -> [ObservableEventKind; 6] {
+        [
+            ObservableEventKind::ConsoleError,
+            ObservableEventKind::NetworkError,
+            ObservableEventKind::ConsoleWarn,
+            ObservableEventKind::LoadComplete,
+            ObservableEventKind::Navigation,
+            ObservableEventKind::DomMutation,
+        ]
+    }
+
+    fn payload_for_kind(kind: ObservableEventKind, seq: u64) -> serde_json::Value {
+        match kind {
+            ObservableEventKind::ConsoleError | ObservableEventKind::ConsoleWarn => {
+                json!({ "message": format!("{kind}-msg-{seq}") })
+            }
+            ObservableEventKind::NetworkError
+            | ObservableEventKind::LoadComplete
+            | ObservableEventKind::Navigation => {
+                json!({ "url": format!("https://example.test/{kind}/{seq}") })
+            }
+            ObservableEventKind::DomMutation => json!({ "mutation": seq }),
+        }
+    }
+
+    fn summary_lines(compiled: &CompiledObservations) -> Vec<&str> {
+        compiled
+            .summary
+            .lines()
+            .skip(1) // skip header
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
 
     #[test]
     fn test_ring_buffer_push_and_drain() {
@@ -1056,5 +1091,95 @@ mod tests {
 
         assert!(error_pos < warn_pos);
         assert!(warn_pos < load_pos);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+        #[test]
+        fn test_osc_proptest_order_perturbation_robust_for_identical_per_kind_events(
+            counts in prop::array::uniform6(0_u8..8_u8)
+        ) {
+            prop_assume!(counts.iter().any(|count| *count > 0));
+
+            let kinds = all_observable_kinds();
+            let mut events = Vec::new();
+
+            for (idx, kind) in kinds.iter().copied().enumerate() {
+                let count = usize::from(counts[idx]);
+                for _ in 0..count {
+                    events.push(ObservationEvent::with_timestamp(
+                        "obs-prop".to_string(),
+                        1,
+                        kind,
+                        10_000 + u64::try_from(idx).unwrap_or(0),
+                        payload_for_kind(kind, u64::try_from(idx).unwrap_or(0)),
+                    ));
+                }
+            }
+
+            let mut reversed = events.clone();
+            reversed.reverse();
+
+            let forward = compile_observations(&events, 10_000);
+            let backward = compile_observations(&reversed, 10_000);
+
+            prop_assert_eq!(
+                forward.summary,
+                backward.summary,
+                "OSC summary should be order-robust for identical per-kind duplicates"
+            );
+            prop_assert_eq!(
+                forward.token_estimate,
+                backward.token_estimate,
+                "OSC token estimate should be order-robust for identical per-kind duplicates"
+            );
+            prop_assert_eq!(
+                forward.events_processed,
+                backward.events_processed,
+                "OSC processed count should be order-robust for identical per-kind duplicates"
+            );
+        }
+
+        #[test]
+        fn test_osc_proptest_events_processed_monotonic_with_token_budget(
+            kinds_raw in prop::collection::vec(0_u8..6_u8, 0..96),
+            budget_a in 0_u16..512_u16,
+            budget_b in 0_u16..512_u16,
+        ) {
+            let mut events = Vec::with_capacity(kinds_raw.len());
+            for (idx, kind_raw) in kinds_raw.iter().copied().enumerate() {
+                let kind = all_observable_kinds()[usize::from(kind_raw % 6)];
+                events.push(ObservationEvent::with_timestamp(
+                    "obs-prop".to_string(),
+                    1,
+                    kind,
+                    20_000 + u64::try_from(idx).unwrap_or(0),
+                    payload_for_kind(kind, u64::try_from(idx).unwrap_or(0)),
+                ));
+            }
+
+            let low_budget = usize::from(budget_a.min(budget_b));
+            let high_budget = usize::from(budget_a.max(budget_b));
+            let low = compile_observations(&events, low_budget);
+            let high = compile_observations(&events, high_budget);
+
+            prop_assert!(
+                low.events_processed <= high.events_processed,
+                "OSC events_processed must be monotonic in token budget (low={} high={})",
+                low.events_processed,
+                high.events_processed
+            );
+
+            prop_assert!(
+                summary_lines(&high).len() >= summary_lines(&low).len(),
+                "OSC rendered line count should not decrease when budget increases"
+            );
+
+            prop_assert!(
+                high.events_processed <= events.len(),
+                "OSC cannot process more events than provided input"
+            );
+        }
     }
 }

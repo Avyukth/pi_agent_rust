@@ -2095,6 +2095,7 @@ impl Tool for UploadImageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn make_registry() -> Arc<StdMutex<ObserverRegistry>> {
         Arc::new(StdMutex::new(ObserverRegistry::new()))
@@ -3768,12 +3769,11 @@ mod tests {
     // Tool count verification
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn all_browser_tool_names_unique() {
+    fn all_browser_tools_for_test() -> Vec<Box<dyn Tool>> {
         let bridge = make_bridge();
         let registry = make_registry();
 
-        let tools: Vec<Box<dyn Tool>> = vec![
+        vec![
             // Observation (3)
             Box::new(ObserveTool::new(registry.clone())),
             Box::new(UnobserveTool::new(registry.clone())),
@@ -3801,7 +3801,12 @@ mod tests {
             Box::new(ShortcutsExecuteTool::new(bridge.clone())),
             Box::new(ShortcutsListTool::new(bridge.clone())),
             Box::new(UploadImageTool::new(bridge)),
-        ];
+        ]
+    }
+
+    #[test]
+    fn all_browser_tool_names_unique() {
+        let tools = all_browser_tools_for_test();
 
         assert_eq!(tools.len(), 21, "should have 21 browser tools total");
 
@@ -3810,5 +3815,81 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), original_count, "all tool names must be unique");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+        #[test]
+        fn test_tool_schema_proptest_parameter_schemas_are_valid_and_self_consistent(
+            tool_indices in prop::collection::vec(0_usize..21_usize, 1..64)
+        ) {
+            let tools = all_browser_tools_for_test();
+
+            for index in tool_indices {
+                let tool = &tools[index];
+                let schema = tool.parameters();
+                let schema_again = tool.parameters();
+
+                prop_assert_eq!(
+                    &schema,
+                    &schema_again,
+                    "tool parameter schema should be deterministic for {}",
+                    tool.name()
+                );
+
+                let Some(schema_obj) = schema.as_object() else {
+                    prop_assert!(
+                        false,
+                        "tool parameter schema must be a JSON object for {}",
+                        tool.name()
+                    );
+                    continue;
+                };
+
+                prop_assert_eq!(
+                    schema_obj.get("type").and_then(serde_json::Value::as_str),
+                    Some("object"),
+                    "tool parameter schema must declare top-level object type for {}",
+                    tool.name()
+                );
+
+                if let Some(required) = schema_obj.get("required").and_then(serde_json::Value::as_array) {
+                    let properties = schema_obj
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object);
+
+                    for required_key in required {
+                        let Some(required_key_str) = required_key.as_str() else {
+                            prop_assert!(
+                                false,
+                                "`required` entries must be strings in schema for {}",
+                                tool.name()
+                            );
+                            continue;
+                        };
+
+                        if let Some(properties) = properties {
+                            prop_assert!(
+                                properties.contains_key(required_key_str),
+                                "`required` key '{}' missing from properties in schema for {}",
+                                required_key_str,
+                                tool.name()
+                            );
+                        }
+                    }
+                }
+
+                let validator_result = jsonschema::draft202012::options()
+                    .should_validate_formats(true)
+                    .build(&schema);
+                prop_assert!(
+                    validator_result.is_ok(),
+                    "tool parameter schema failed Draft 2020-12 compilation for {}: {:?}",
+                    tool.name(),
+                    validator_result.err()
+                );
+            }
+        }
     }
 }

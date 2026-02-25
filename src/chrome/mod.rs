@@ -638,6 +638,15 @@ impl ChromeBridge {
         std::mem::take(&mut *guard)
     }
 
+    /// Push a pre-built observation event into the buffer (test-only).
+    #[cfg(test)]
+    pub fn push_observation(&self, event: protocol::ObservationEvent) {
+        self.observations
+            .lock()
+            .expect("observations mutex poisoned")
+            .push(event);
+    }
+
     async fn authenticate_stream(
         &self,
         stream: &mut UnixStream,
