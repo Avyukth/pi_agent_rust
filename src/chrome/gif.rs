@@ -47,6 +47,9 @@ pub enum GifError {
     #[error("failed to encode GIF: {0}")]
     EncodeGif(String),
 
+    #[error("invalid max_dimension {0}; expected 1..={MAX_DIMENSION}")]
+    InvalidMaxDimension(u32),
+
     #[error("I/O error writing GIF: {0}")]
     Io(#[from] io::Error),
 }
@@ -98,6 +101,9 @@ pub fn encode_gif(
     }
     if png_frames.len() > MAX_FRAMES {
         return Err(GifError::TooManyFrames(png_frames.len()));
+    }
+    if config.max_dimension == 0 || config.max_dimension > MAX_DIMENSION {
+        return Err(GifError::InvalidMaxDimension(config.max_dimension));
     }
 
     let start = Instant::now();

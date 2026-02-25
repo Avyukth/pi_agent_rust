@@ -200,6 +200,7 @@ jobs:
           echo "### Rust tests: PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Conformance smoke test
+        id: conformance
         if: steps.check_bump.outputs.skip != 'true'
         working-directory: pi_agent_rust
         env:
@@ -208,12 +209,12 @@ jobs:
         run: |
           set -euxo pipefail
           cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture 2>&1 \
-            | tee /tmp/conformance-output.log || true
-          echo "### Conformance smoke: completed" >> "$GITHUB_STEP_SUMMARY"
+            | tee /tmp/conformance-output.log
+          echo "### Conformance smoke: PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validation gate
         id: gate
-        if: steps.check_bump.outputs.skip != 'true'
+        if: steps.check_bump.outputs.skip != 'true' && steps.conformance.outcome == 'success'
         run: |
           echo "passed=true" >> "$GITHUB_OUTPUT"
           echo "### Validation Gate: PASS" >> "$GITHUB_STEP_SUMMARY"

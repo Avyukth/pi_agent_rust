@@ -30,11 +30,11 @@ const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
 // O16: Connection pool — reuse TCP+TLS connections across requests to the
-// same (host, port) to avoid the 40-150ms per-connection overhead.
+// same (host, port, scheme) to avoid the 40-150ms per-connection overhead.
 const MAX_IDLE_PER_HOST: usize = 1;
 
-/// Key for connection pool: (host, port).
-type PoolKey = (String, u16);
+/// Key for connection pool: (host, port, is_https).
+type PoolKey = (String, u16, bool);
 
 /// Process-wide pool of idle HTTP/1.1 transports.
 struct ConnectionPool {
@@ -48,7 +48,7 @@ impl ConnectionPool {
         }
     }
 
-    /// Take an idle transport for the given (host, port), if one exists.
+    /// Take an idle transport for the given (host, port, is_https), if one exists.
     fn take(&mut self, key: &PoolKey) -> Option<Transport> {
         self.idle.remove(key)
     }
@@ -286,22 +286,28 @@ async fn send_parts(
         body_bytes = body.len(),
         "HTTP request starting"
     );
-    let pool_key: PoolKey = (parsed.host.clone(), parsed.port);
+    let pool_key: PoolKey = (
+        parsed.host.clone(),
+        parsed.port,
+        matches!(parsed.scheme, Scheme::Https),
+    );
 
     // O16: try pooled transport first, fall back to fresh connection.
-    let mut transport = {
+    let (mut transport, used_pooled) = {
         let pooled = global_pool()
             .lock()
             .ok()
             .and_then(|mut pool| pool.take(&pool_key));
         match pooled {
-            Some(t) => t,
-            None => connect_transport(&parsed, client).await?,
+            Some(t) => (t, true),
+            None => (connect_transport(&parsed, client).await?, false),
         }
     };
 
     let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
     // If writing to a pooled connection fails (stale), retry with a fresh one.
+    // Only retry on pooled connections with idempotent methods to avoid
+    // duplicating side effects for POST requests.
     let write_result = async {
         transport.write_all(&request_bytes).await?;
         if !body.is_empty() {
@@ -310,7 +316,10 @@ async fn send_parts(
         transport.flush().await
     }
     .await;
-    if write_result.is_err() {
+    if let Err(write_err) = write_result {
+        if !used_pooled || matches!(method, Method::Post) {
+            return Err(Error::from(write_err));
+        }
         // The pooled transport was stale — create a fresh connection.
         transport = connect_transport(&parsed, client).await?;
         transport.write_all(&request_bytes).await?;
@@ -1652,7 +1661,7 @@ mod tests {
     #[test]
     fn connection_pool_take_returns_none_when_empty() {
         let mut pool = ConnectionPool::new();
-        let key = ("example.com".to_string(), 443);
+        let key = ("example.com".to_string(), 443, true);
         assert!(pool.take(&key).is_none());
     }
 
@@ -1667,7 +1676,7 @@ mod tests {
             // Create a real TCP listener + connection for a valid Transport.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let key = (addr.ip().to_string(), addr.port());
+            let key = (addr.ip().to_string(), addr.port(), false);
 
             let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
                 .await
@@ -1691,7 +1700,7 @@ mod tests {
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let key = (addr.ip().to_string(), addr.port());
+            let key = (addr.ip().to_string(), addr.port(), false);
 
             let tcp1 = TcpStream::connect((addr.ip().to_string(), addr.port()))
                 .await
@@ -1750,7 +1759,7 @@ mod tests {
                 let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
                     .await
                     .unwrap();
-                pool.return_conn((format!("host{i}.example.com"), 443), Transport::Tcp(tcp));
+                pool.return_conn((format!("host{i}.example.com"), 443, true), Transport::Tcp(tcp));
             }
             assert_eq!(pool.idle.len(), 8);
 
@@ -1758,7 +1767,7 @@ mod tests {
             let tcp = TcpStream::connect((addr.ip().to_string(), addr.port()))
                 .await
                 .unwrap();
-            pool.return_conn(("host9.example.com".to_string(), 443), Transport::Tcp(tcp));
+            pool.return_conn(("host9.example.com".to_string(), 443, true), Transport::Tcp(tcp));
             assert_eq!(
                 pool.idle.len(),
                 8,
@@ -1777,8 +1786,8 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
 
-            let key_a = ("a.example.com".to_string(), 443);
-            let key_b = ("b.example.com".to_string(), 443);
+            let key_a = ("a.example.com".to_string(), 443, true);
+            let key_b = ("b.example.com".to_string(), 443, true);
 
             let tcp_a = TcpStream::connect((addr.ip().to_string(), addr.port()))
                 .await
@@ -1833,7 +1842,7 @@ mod tests {
                 Transport::Tcp(tcp),
                 BodyKind::ContentLength(0),
                 vec![],
-                Some(("closed.example.com".to_string(), 443)),
+                Some(("closed.example.com".to_string(), 443, true)),
                 true,
             );
             // Simulate transport already closed.
@@ -1864,7 +1873,7 @@ mod tests {
                 Transport::Tcp(tcp),
                 BodyKind::ContentLength(0),
                 vec![],
-                Some(("nopool.example.com".to_string(), 443)),
+                Some(("nopool.example.com".to_string(), 443, true)),
                 false, // not reusable
             );
             state.try_return_to_pool();

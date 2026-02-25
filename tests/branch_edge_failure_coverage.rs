@@ -998,9 +998,19 @@ fn format_error_summary_skipped_when_contained_in_message() {
     let formatted = format_error_with_hints(&err);
     // "Configuration error" is the summary for generic config errors
     // If the error message contains "Configuration error", the summary line should be skipped
-    let count = formatted.matches("Configuration error").count();
-    // Should appear exactly once (not duplicated)
-    assert!(count >= 1);
+    // The Error::Config display format includes "Configuration error:" prefix,
+    // and the message itself contains "Configuration error", so the phrase
+    // appears twice in the Error line. The key check is that the summary is NOT
+    // appended as a separate line (it's skipped because the message contains it).
+    let lines: Vec<&str> = formatted.lines().collect();
+    let summary_lines = lines
+        .iter()
+        .filter(|l| l.trim() == "Configuration error")
+        .count();
+    assert_eq!(
+        summary_lines, 0,
+        "Summary should be skipped when contained in error message"
+    );
 }
 
 #[test]
