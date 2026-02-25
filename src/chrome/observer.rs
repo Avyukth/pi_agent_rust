@@ -64,7 +64,7 @@ impl std::fmt::Display for ObservableEventKind {
 }
 
 /// A single observation event pushed from the extension.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationEvent {
     /// The observer that generated this event.
     pub observer_id: String,
@@ -88,10 +88,10 @@ impl ObservationEvent {
         kind: ObservableEventKind,
         payload: serde_json::Value,
     ) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis() as u64);
 
         Self {
             observer_id,
@@ -104,7 +104,7 @@ impl ObservationEvent {
 
     /// Create an event with a specific timestamp (for testing).
     #[must_use]
-    pub fn with_timestamp(
+    pub const fn with_timestamp(
         observer_id: String,
         tab_id: u32,
         kind: ObservableEventKind,
@@ -190,19 +190,19 @@ impl ObservationRingBuffer {
 
     /// Get the current number of events in the buffer.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Check if the buffer is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Check if the buffer is at capacity.
     #[must_use]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         self.len >= RING_BUFFER_CAPACITY
     }
 }
@@ -351,7 +351,7 @@ impl ObserverRegistry {
     /// Push an event to all observers that subscribe to its kind.
     ///
     /// Observers are matched by tab_id and event subscription.
-    pub fn push_event(&mut self, event: ObservationEvent) {
+    pub fn push_event(&mut self, event: &ObservationEvent) {
         for observer in self.observers.values_mut() {
             if observer.tab_id == event.tab_id && observer.subscribes_to(event.kind) {
                 observer.push_event(event.clone());
@@ -439,7 +439,7 @@ pub struct CompiledObservations {
 impl CompiledObservations {
     /// Create an empty compiled observation.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             summary: String::new(),
             token_estimate: 0,
@@ -465,7 +465,7 @@ impl CompiledObservations {
 /// A compiled summary suitable for LLM context injection
 #[must_use]
 pub fn compile_observations(
-    events: Vec<ObservationEvent>,
+    events: &[ObservationEvent],
     token_budget: usize,
 ) -> CompiledObservations {
     if events.is_empty() {
@@ -477,14 +477,12 @@ pub fn compile_observations(
     let mut kind_examples: HashMap<ObservableEventKind, &ObservationEvent> = HashMap::new();
     let mut events_by_kind: HashMap<ObservableEventKind, Vec<&ObservationEvent>> = HashMap::new();
 
-    for event in &events {
+    for event in events {
         *kind_counts.entry(event.kind).or_insert(0) += 1;
         events_by_kind.entry(event.kind).or_default().push(event);
 
         // Keep first example of each kind
-        if !kind_examples.contains_key(&event.kind) {
-            kind_examples.insert(event.kind, event);
-        }
+        kind_examples.entry(event.kind).or_insert(event);
     }
 
     // Step 3: Sort by severity (errors > warnings > others)
@@ -535,7 +533,7 @@ pub fn compile_observations(
                         if s.len() > 60 {
                             format!(": {}...", &s[..57])
                         } else {
-                            format!(": {}", s)
+                            format!(": {s}")
                         }
                     })
                     .unwrap_or_default()
@@ -544,7 +542,7 @@ pub fn compile_observations(
                     .payload
                     .get("url")
                     .and_then(|u| u.as_str())
-                    .map(|u| format!(": {}", u))
+                    .map(|u| format!(": {u}"))
                     .unwrap_or_default()
             } else if matches!(
                 kind,
@@ -554,13 +552,13 @@ pub fn compile_observations(
                     .payload
                     .get("url")
                     .and_then(|u| u.as_str())
-                    .map(|u| format!(": {}", u))
+                    .map(|u| format!(": {u}"))
                     .unwrap_or_default()
             } else {
                 String::new()
             };
 
-            format!("- {} x{}{}", kind, count, payload_hint)
+            format!("- {kind} x{count}{payload_hint}")
         };
 
         // Check token budget
@@ -740,7 +738,7 @@ mod tests {
             ObservableEventKind::ConsoleError,
             json!({ "msg": "test" }),
         );
-        registry.push_event(event);
+        registry.push_event(&event);
 
         let obs1 = registry.get("obs-1").unwrap();
         let obs2 = registry.get("obs-2").unwrap();
@@ -770,7 +768,7 @@ mod tests {
                 ObservableEventKind::ConsoleError,
                 json!({ "seq": i }),
             );
-            registry.push_event(event);
+            registry.push_event(&event);
         }
 
         let events = registry.drain_all();
@@ -801,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_compile_observations_empty() {
-        let compiled = compile_observations(vec![], 1000);
+        let compiled = compile_observations(&[], 1000);
         assert!(compiled.summary.is_empty());
         assert_eq!(compiled.events_processed, 0);
     }
@@ -820,7 +818,7 @@ mod tests {
             })
             .collect();
 
-        let compiled = compile_observations(events, 1000);
+        let compiled = compile_observations(&events, 1000);
 
         // Should show count, not individual events
         assert!(compiled.summary.contains("console_error x5"));
@@ -853,12 +851,12 @@ mod tests {
         }
 
         // Small budget should truncate (6 distinct kinds → 6 lines, small budget can't fit all)
-        let compiled = compile_observations(events.clone(), 20);
+        let compiled = compile_observations(&events, 20);
         assert!(compiled.token_estimate <= 25); // Allow small overhead
         assert!(compiled.events_processed < 100); // Not all processed
 
         // Large budget should include all
-        let compiled = compile_observations(events, 10000);
+        let compiled = compile_observations(&events, 10000);
         assert_eq!(compiled.events_processed, 100);
     }
 
@@ -883,7 +881,7 @@ mod tests {
                 i as u64,
                 json!({ "seq": i }),
             );
-            registry.push_event(event);
+            registry.push_event(&event);
         }
 
         let obs = registry.get("obs-ring").unwrap();
@@ -924,7 +922,7 @@ mod tests {
                     j as u64,
                     json!({ "obs": i, "seq": j }),
                 );
-                registry.push_event(event);
+                registry.push_event(&event);
             }
         }
 
@@ -1020,7 +1018,7 @@ mod tests {
             json!({ "message": "Single error" }),
         )];
 
-        let compiled = compile_observations(events, 1000);
+        let compiled = compile_observations(&events, 1000);
         assert_eq!(compiled.events_processed, 1);
         assert!(!compiled.summary.is_empty());
         assert!(compiled.summary.contains("console_error"));
@@ -1049,7 +1047,7 @@ mod tests {
             ),
         ];
 
-        let compiled = compile_observations(events, 1000);
+        let compiled = compile_observations(&events, 1000);
 
         // console_error should appear before console_warn before load_complete
         let error_pos = compiled.summary.find("console_error").unwrap();
