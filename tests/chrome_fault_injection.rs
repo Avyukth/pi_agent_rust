@@ -384,11 +384,18 @@ fn make_test_record(socket_path: &Path, host_id: &str) -> pi::chrome::DiscoveryR
 
 fn write_test_discovery(dir: &Path, record: &pi::chrome::DiscoveryRecord) {
     let filename = format!("pi-chrome-host-{}.discovery.json", record.host_id);
+    let path = dir.join(filename);
     std::fs::write(
-        dir.join(filename),
+        &path,
         serde_json::to_vec(record).expect("serialize discovery record"),
     )
     .expect("write discovery record");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod discovery record");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

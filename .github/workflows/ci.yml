@@ -1240,6 +1240,48 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  # ─── Extension TypeScript build gate (PLAN §6.7) ─────────────────────────
+  extension-build:
+    name: extension-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pi_chrome_extension
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/pi_chrome_extension
+          path: pi_chrome_extension
+          ref: main
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: "1.3.8"
+
+      - name: Install dependencies
+        working-directory: pi_chrome_extension
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript typecheck
+        working-directory: pi_chrome_extension
+        run: bun run typecheck
+
+      - name: Vite production build
+        working-directory: pi_chrome_extension
+        run: bun run build
+
+      - name: Run extension unit tests
+        working-directory: pi_chrome_extension
+        run: bun run test
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-build-${{ github.sha }}
+          path: pi_chrome_extension/dist/
+          if-no-files-found: warn
+          retention-days: 7
+
   qa_shards_linux:
     name: qa-shard (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
