@@ -736,6 +736,40 @@ fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> 
     Ok(())
 }
 
+fn is_chrome_native_host_mode(cli: &cli::Cli) -> bool {
+    cli.mode.as_deref() == Some("chrome-native-host")
+}
+
+fn validate_chrome_native_host_mode_args(cli: &cli::Cli) -> Result<()> {
+    if cli.print {
+        bail!("--mode chrome-native-host cannot be combined with --print");
+    }
+    if !cli.message_args().is_empty() {
+        bail!("--mode chrome-native-host does not accept positional messages");
+    }
+    if cli.export.is_some() {
+        bail!("--mode chrome-native-host cannot be combined with --export");
+    }
+    if cli.r#continue || cli.resume {
+        bail!("--mode chrome-native-host cannot be combined with --continue/--resume");
+    }
+    Ok(())
+}
+
+async fn run_chrome_native_host_mode_with_config(
+    config: pi::chrome::native_host::NativeHostConfig,
+) -> Result<()> {
+    let mut host = pi::chrome::native_host::NativeHost::new(config)?;
+    let _ = host.run().await?;
+    Ok(())
+}
+
+async fn run_chrome_native_host_mode(cli: &cli::Cli) -> Result<()> {
+    validate_chrome_native_host_mode_args(cli)?;
+    run_chrome_native_host_mode_with_config(pi::chrome::native_host::NativeHostConfig::default())
+        .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run(
     mut cli: cli::Cli,
@@ -747,6 +781,10 @@ async fn run(
     if let Some(command) = cli.command.take() {
         handle_subcommand(command, &cwd).await?;
         return Ok(());
+    }
+
+    if is_chrome_native_host_mode(&cli) {
+        return run_chrome_native_host_mode(&cli).await;
     }
 
     if !cli.no_migrations {
@@ -4245,6 +4283,7 @@ fn default_export_path(input: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use clap::Parser;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -4261,6 +4300,38 @@ mod tests {
     fn exit_code_classifier_defaults_to_general_failure() {
         let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
         assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
+
+    #[test]
+    fn validate_chrome_native_host_mode_args_rejects_conflicting_cli_flags() {
+        let cli = cli::Cli::parse_from(["pi", "--mode", "chrome-native-host", "--print", "hello"]);
+        let err = validate_chrome_native_host_mode_args(&cli).expect_err("must reject --print");
+        let message = err.to_string();
+        assert!(
+            message.contains("chrome-native-host"),
+            "validation error should mention the special mode"
+        );
+    }
+
+    #[test]
+    fn chrome_native_host_mode_smoke_exits_on_short_idle_timeout() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let tempdir = TempDir::new().expect("tempdir");
+        let config = pi::chrome::native_host::NativeHostConfig {
+            discovery_dir: tempdir.path().to_path_buf(),
+            socket_dir: tempdir.path().to_path_buf(),
+            host_id: Some("host-smoke".to_string()),
+            idle_timeout_ms: 10,
+            ..pi::chrome::native_host::NativeHostConfig::default()
+        };
+
+        let result = runtime.block_on(run_chrome_native_host_mode_with_config(config));
+        assert!(
+            result.is_ok(),
+            "native host mode helper should reach the native-host entry point and exit on idle timeout: {result:?}"
+        );
     }
 
     #[test]

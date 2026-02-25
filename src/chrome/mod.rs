@@ -1,20 +1,26 @@
 //! Chrome integration modules (Pi Chrome).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use asupersync::channel::oneshot;
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::unix::{OwnedReadHalf, OwnedWriteHalf, UnixStream};
+use futures::lock::Mutex as AsyncMutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod config;
+pub mod gif;
 pub mod install;
+pub mod native_host;
 pub mod observer;
 pub mod protocol;
 pub mod tools;
@@ -24,8 +30,53 @@ const DISCOVERY_PREFIX: &str = "pi-chrome-host-";
 const DISCOVERY_SUFFIX: &str = ".discovery.json";
 const DEFAULT_MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 1000;
+const MAX_ESL_RETRY_ATTEMPTS: u8 = 3;
+const MAX_ESL_IN_PROGRESS_RETRIES: u8 = 3;
+const ESL_IN_PROGRESS_BACKOFF_MS: u64 = 5;
+pub const MEMORY_SOAK_RSS_TARGET_MB: u64 = 150;
+pub const MEMORY_SOAK_ACCEPTANCE_HANDOFF_BEAD: &str = "bd-11p.3";
 
 type PendingResponses = HashMap<String, oneshot::Sender<protocol::ResponseEnvelope>>;
+type RequestFingerprintRegistry = HashMap<(String, String), protocol::RequestFingerprint>;
+type WriteLane = Arc<AsyncMutex<()>>;
+
+struct WriteLaneRegistry {
+    global: WriteLane,
+    by_tab: HashMap<u32, Weak<AsyncMutex<()>>>,
+}
+
+impl WriteLaneRegistry {
+    fn new() -> Self {
+        Self {
+            global: Arc::new(AsyncMutex::new(())),
+            by_tab: HashMap::new(),
+        }
+    }
+
+    fn lane_for(&mut self, tab_id: Option<u32>) -> WriteLane {
+        match tab_id {
+            None => Arc::clone(&self.global),
+            Some(tab_id) => {
+                if let Some(existing) = self.by_tab.get(&tab_id).and_then(Weak::upgrade) {
+                    return existing;
+                }
+
+                self.by_tab.retain(|_, lane| lane.upgrade().is_some());
+                let lane = Arc::new(AsyncMutex::new(()));
+                self.by_tab.insert(tab_id, Arc::downgrade(&lane));
+                lane
+            }
+        }
+    }
+}
+
+impl fmt::Debug for WriteLaneRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteLaneRegistry")
+            .field("tab_lane_entries", &self.by_tab.len())
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -36,6 +87,13 @@ pub enum ConnectionState {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionClass {
+    ReadOnlyReplayable,
+    ConditionallyIdempotent,
+    NonIdempotent,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeBridgeStatus {
     pub state: ConnectionState,
@@ -43,6 +101,30 @@ pub struct ChromeBridgeStatus {
     pub host_epoch: Option<String>,
     pub consecutive_failures: u8,
     pub browser_tools_disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChromeMemoryBoundCaps {
+    pub socket_frame_max_bytes: usize,
+    pub esl_journal_max_entries: usize,
+    pub esl_journal_max_bytes: usize,
+    pub esl_journal_ttl_ms: i64,
+    pub observer_max_observers: usize,
+    pub observer_ring_buffer_capacity: usize,
+    pub observer_max_events_per_drain: usize,
+    pub observer_max_event_bytes: usize,
+    pub worst_case_observer_buffer_bytes: usize,
+    pub soak_rss_target_mb: u64,
+    pub soak_acceptance_handoff_bead: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChromeMemoryBoundMeasurement {
+    pub phase: String,
+    pub measured_rss_bytes: Option<u64>,
+    pub pending_response_count: usize,
+    pub observation_buffer_len: usize,
+    pub caps: ChromeMemoryBoundCaps,
 }
 
 #[derive(Debug, Clone)]
@@ -78,10 +160,14 @@ impl Default for ChromeBridgeConfig {
 #[derive(Debug)]
 pub struct ChromeBridge {
     config: ChromeBridgeConfig,
-    inner: StdMutex<ChromeBridgeInner>,
-    pending: StdMutex<PendingResponses>,
-    observations: StdMutex<Vec<protocol::ObservationEvent>>,
+    inner: Arc<StdMutex<ChromeBridgeInner>>,
+    writer: Arc<StdMutex<Option<OwnedWriteHalf>>>,
+    pending: Arc<StdMutex<PendingResponses>>,
+    observations: Arc<StdMutex<Vec<protocol::ObservationEvent>>>,
+    request_fingerprints: StdMutex<RequestFingerprintRegistry>,
+    write_lanes: StdMutex<WriteLaneRegistry>,
     request_seq: AtomicU64,
+    connection_seq: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -91,7 +177,7 @@ struct ChromeBridgeInner {
     host_epoch: Option<String>,
     consecutive_failures: u8,
     browser_tools_disabled: bool,
-    stream: Option<UnixStream>,
+    connection_token: u64,
 }
 
 impl ChromeBridge {
@@ -99,17 +185,21 @@ impl ChromeBridge {
     pub fn new(config: ChromeBridgeConfig) -> Self {
         Self {
             config,
-            inner: StdMutex::new(ChromeBridgeInner {
+            inner: Arc::new(StdMutex::new(ChromeBridgeInner {
                 state: ConnectionState::Disconnected,
                 pinned_host_id: None,
                 host_epoch: None,
                 consecutive_failures: 0,
                 browser_tools_disabled: false,
-                stream: None,
-            }),
-            pending: StdMutex::new(HashMap::new()),
-            observations: StdMutex::new(Vec::new()),
+                connection_token: 0,
+            })),
+            writer: Arc::new(StdMutex::new(None)),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            observations: Arc::new(StdMutex::new(Vec::new())),
+            request_fingerprints: StdMutex::new(HashMap::new()),
+            write_lanes: StdMutex::new(WriteLaneRegistry::new()),
             request_seq: AtomicU64::new(1),
+            connection_seq: AtomicU64::new(1),
         }
     }
 
@@ -125,11 +215,59 @@ impl ChromeBridge {
         }
     }
 
+    /// Emit a structured memory-bound snapshot for soak/edge evidence collection.
+    ///
+    /// Final RSS/leak acceptance remains delegated to `bd-11p.3`; this provides the
+    /// stable structured measurement shape and cap metadata used by downstream tests.
+    #[must_use]
+    pub fn record_memory_bound_measurement(
+        &self,
+        phase: impl Into<String>,
+        measured_rss_bytes: Option<u64>,
+    ) -> ChromeMemoryBoundMeasurement {
+        let measurement = ChromeMemoryBoundMeasurement {
+            phase: phase.into(),
+            measured_rss_bytes,
+            pending_response_count: self.pending_response_count(),
+            observation_buffer_len: self.observation_buffer_len(),
+            caps: chrome_memory_bound_caps(),
+        };
+
+        tracing::info!(
+            event = "pi.chrome.memory_bound_measurement",
+            phase = %measurement.phase,
+            measured_rss_bytes = measurement.measured_rss_bytes.unwrap_or(0),
+            has_measured_rss = measurement.measured_rss_bytes.is_some(),
+            pending_response_count = measurement.pending_response_count,
+            observation_buffer_len = measurement.observation_buffer_len,
+            socket_frame_max_bytes = measurement.caps.socket_frame_max_bytes,
+            esl_journal_max_entries = measurement.caps.esl_journal_max_entries,
+            esl_journal_max_bytes = measurement.caps.esl_journal_max_bytes,
+            esl_journal_ttl_ms = measurement.caps.esl_journal_ttl_ms,
+            observer_max_observers = measurement.caps.observer_max_observers,
+            observer_ring_buffer_capacity = measurement.caps.observer_ring_buffer_capacity,
+            observer_max_events_per_drain = measurement.caps.observer_max_events_per_drain,
+            observer_max_event_bytes = measurement.caps.observer_max_event_bytes,
+            worst_case_observer_buffer_bytes = measurement.caps.worst_case_observer_buffer_bytes,
+            soak_rss_target_mb = measurement.caps.soak_rss_target_mb,
+            soak_acceptance_handoff_bead = measurement.caps.soak_acceptance_handoff_bead,
+            "chrome memory-bound measurement"
+        );
+
+        measurement
+    }
+
     pub fn disconnect(&self) -> Result<(), ChromeBridgeError> {
+        self.writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
+        self.pending
+            .lock()
+            .expect("pending responses mutex poisoned")
+            .clear();
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
-        if let Some(stream) = guard.stream.take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        guard.connection_token = 0;
         guard.state = if guard.browser_tools_disabled {
             ConnectionState::Disabled
         } else {
@@ -165,7 +303,16 @@ impl ChromeBridge {
             if records.is_empty() {
                 last_error = Some(ChromeBridgeError::NoHostsFound);
             } else {
-                for record in records {
+                let (candidate_records, all_busy) = self.select_connect_candidates(records);
+                if candidate_records.is_empty() {
+                    last_error = Some(if all_busy {
+                        ChromeBridgeError::AllHostsBusy
+                    } else {
+                        ChromeBridgeError::NoHostsFound
+                    });
+                }
+
+                for record in candidate_records {
                     match self.connect_to_record(&record).await {
                         Ok(()) => {
                             self.reset_failure_streak();
@@ -193,8 +340,17 @@ impl ChromeBridge {
             }
         }
 
+        let err = last_error.unwrap_or(ChromeBridgeError::NoHostsFound);
+        if matches!(
+            &err,
+            ChromeBridgeError::AllHostsBusy | ChromeBridgeError::AuthBusy { .. }
+        ) {
+            self.set_state(ConnectionState::Disconnected);
+            return Err(err);
+        }
+
         self.record_failure();
-        Err(last_error.unwrap_or(ChromeBridgeError::NoHostsFound))
+        Err(err)
     }
 
     pub async fn connect_to_record(
@@ -205,6 +361,7 @@ impl ChromeBridge {
             return Err(ChromeBridgeError::BrowserToolsDisabled);
         }
 
+        let _ = self.disconnect();
         self.set_state(ConnectionState::Connecting);
         let mut stream = UnixStream::connect(&record.socket_path)
             .await
@@ -219,31 +376,373 @@ impl ChromeBridge {
             }
         };
 
-        let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
-        guard.pinned_host_id = Some(auth_ok.host_id.clone());
-        guard.host_epoch = Some(auth_ok.host_epoch);
-        guard.consecutive_failures = 0;
-        guard.browser_tools_disabled = false;
-        guard.stream = Some(stream);
-        guard.state = ConnectionState::Connected;
-        drop(guard);
+        let (read_half, write_half) = stream.into_split();
+        let host_id = auth_ok.host_id;
+        let host_epoch = auth_ok.host_epoch;
+        {
+            let mut writer_guard = self
+                .writer
+                .lock()
+                .expect("chrome bridge writer mutex poisoned");
+            *writer_guard = Some(write_half);
+        }
+        let connection_token = self.connection_seq.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
+            guard.pinned_host_id = Some(host_id);
+            guard.host_epoch = Some(host_epoch);
+            guard.consecutive_failures = 0;
+            guard.browser_tools_disabled = false;
+            guard.connection_token = connection_token;
+            guard.state = ConnectionState::Connected;
+        }
+        self.spawn_reader_thread(read_half, connection_token);
         Ok(())
     }
 
     pub fn discover_hosts(&self) -> Result<Vec<DiscoveryRecord>, ChromeBridgeError> {
         let now_ms = unix_time_ms();
         let pinned_host_id = self.status().pinned_host_id;
-        discover_hosts_in_dir(
+        let discovered = discover_hosts_in_dir(
             &self.config.discovery_dir,
             now_ms,
             pinned_host_id.as_deref(),
-        )
+        )?;
+        Ok(discovered
+            .into_iter()
+            .filter(|record| self.discovery_record_is_compatible(record))
+            .collect())
     }
 
     #[must_use]
     pub fn next_request_id(&self) -> String {
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
         format!("chrome-{seq}")
+    }
+
+    #[allow(clippy::future_not_send)]
+    pub async fn send_request(
+        &self,
+        op: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        let op = op.into();
+        self.send_request_with_id(self.next_request_id(), op, payload)
+            .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    pub async fn execute_request_with_esl(
+        &self,
+        op: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        let op = op.into();
+        let request_id = self.next_request_id();
+        self.execute_request_with_esl_id(request_id, op, payload)
+            .await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn execute_request_with_esl_id(
+        &self,
+        request_id: String,
+        op: String,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        let execution_class = classify_execution_class(&op);
+        let mut baseline_host_epoch: Option<String> = None;
+        let mut retry_attempts = 0_u8;
+        let mut in_progress_retries = 0_u8;
+
+        loop {
+            if self.status().state != ConnectionState::Connected {
+                self.connect().await?;
+            }
+
+            let current_epoch = self.current_host_epoch()?;
+            if baseline_host_epoch.is_none() {
+                baseline_host_epoch = Some(current_epoch.clone());
+            }
+
+            let response = self
+                .send_request_with_id(request_id.clone(), op.clone(), payload.clone())
+                .await;
+
+            match response {
+                Ok(protocol::ResponseEnvelope::Error(err)) if is_esl_in_progress_error(&err) => {
+                    in_progress_retries = in_progress_retries.saturating_add(1);
+                    if in_progress_retries > MAX_ESL_IN_PROGRESS_RETRIES {
+                        return Ok(protocol::ResponseEnvelope::Error(err));
+                    }
+
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(ESL_IN_PROGRESS_BACKOFF_MS),
+                    )
+                    .await;
+                }
+                Ok(protocol::ResponseEnvelope::Error(err))
+                    if is_timeout_or_disconnect_error_code(err.error.code) =>
+                {
+                    let baseline = baseline_host_epoch.as_deref().unwrap_or_default();
+                    let message = err.error.message.clone();
+                    let retry_decision = self
+                        .handle_esl_retry_after_ambiguous_result(
+                            execution_class,
+                            baseline,
+                            &request_id,
+                            &mut retry_attempts,
+                            message,
+                        )
+                        .await;
+                    let should_retry = match retry_decision {
+                        Ok(v) => v,
+                        Err(ChromeBridgeError::EslIndeterminate { message, .. }) => {
+                            return Ok(execution_indeterminate_envelope(&request_id, message));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if !should_retry {
+                        return Ok(protocol::ResponseEnvelope::Error(err));
+                    }
+                }
+                Ok(envelope) => return Ok(envelope),
+                Err(err) if is_ambiguous_transport_error(&err) => {
+                    let baseline = baseline_host_epoch.as_deref().unwrap_or_default();
+                    let retry_decision = self
+                        .handle_esl_retry_after_ambiguous_result(
+                            execution_class,
+                            baseline,
+                            &request_id,
+                            &mut retry_attempts,
+                            err.to_string(),
+                        )
+                        .await;
+                    let should_retry = match retry_decision {
+                        Ok(v) => v,
+                        Err(ChromeBridgeError::EslIndeterminate { message, .. }) => {
+                            return Ok(execution_indeterminate_envelope(&request_id, message));
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    if !should_retry {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    async fn handle_esl_retry_after_ambiguous_result(
+        &self,
+        execution_class: ExecutionClass,
+        baseline_host_epoch: &str,
+        request_id: &str,
+        retry_attempts: &mut u8,
+        detail: String,
+    ) -> Result<bool, ChromeBridgeError> {
+        *retry_attempts = retry_attempts.saturating_add(1);
+        if *retry_attempts > MAX_ESL_RETRY_ATTEMPTS {
+            return if execution_class == ExecutionClass::NonIdempotent {
+                Err(ChromeBridgeError::EslIndeterminate {
+                    request_id: request_id.to_string(),
+                    message: format!("retry budget exhausted after ambiguous result: {detail}"),
+                })
+            } else {
+                Ok(false)
+            };
+        }
+
+        if self.status().state != ConnectionState::Connected {
+            match self.connect().await {
+                Ok(()) => {}
+                Err(err) => {
+                    return if execution_class == ExecutionClass::NonIdempotent {
+                        Err(ChromeBridgeError::EslIndeterminate {
+                            request_id: request_id.to_string(),
+                            message: format!("reconnect failed after ambiguous result: {err}"),
+                        })
+                    } else {
+                        Err(err)
+                    };
+                }
+            }
+        }
+
+        if execution_class == ExecutionClass::NonIdempotent {
+            let current_epoch = self.current_host_epoch()?;
+            if current_epoch != baseline_host_epoch {
+                return Err(ChromeBridgeError::EslIndeterminate {
+                    request_id: request_id.to_string(),
+                    message: format!(
+                        "host_epoch changed from {baseline_host_epoch} to {current_epoch}"
+                    ),
+                });
+            }
+        }
+
+        Ok(true)
+    }
+
+    #[allow(
+        clippy::await_holding_lock,
+        clippy::future_not_send,
+        clippy::significant_drop_tightening
+    )]
+    async fn send_request_with_id(
+        &self,
+        request_id: String,
+        op: String,
+        payload: serde_json::Value,
+    ) -> Result<protocol::ResponseEnvelope, ChromeBridgeError> {
+        if self.status().state != ConnectionState::Connected {
+            return Err(ChromeBridgeError::NotConnected);
+        }
+        let host_epoch = self.current_host_epoch()?;
+        self.ensure_request_id_fingerprint(&host_epoch, &request_id, &op, &payload)?;
+        let write_lane = self.write_lane_for_request(&op, &payload);
+        let _write_lane_guard = match write_lane.as_ref() {
+            Some(lane) => Some(lane.lock().await),
+            None => None,
+        };
+
+        let request = protocol::Request {
+            version: protocol::PROTOCOL_VERSION_V1,
+            id: request_id.clone(),
+            op,
+            payload,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .expect("pending responses mutex poisoned")
+            .insert(request_id.clone(), tx);
+
+        let write_result = async {
+            let mut writer_guard = self
+                .writer
+                .lock()
+                .expect("chrome bridge writer mutex poisoned");
+            let writer = writer_guard
+                .as_mut()
+                .ok_or(ChromeBridgeError::NotConnected)?;
+            write_request_frame(writer, &protocol::MessageType::Request(request)).await
+        }
+        .await;
+
+        if let Err(err) = write_result {
+            self.pending
+                .lock()
+                .expect("pending responses mutex poisoned")
+                .remove(&request_id);
+            self.mark_disconnected();
+            return Err(err);
+        }
+
+        let cx = asupersync::Cx::for_request();
+        rx.recv(&cx)
+            .await
+            .map_err(|_| ChromeBridgeError::ResponseChannelClosed { request_id })
+    }
+
+    fn current_host_epoch(&self) -> Result<String, ChromeBridgeError> {
+        let guard = self.inner.lock().expect("chrome bridge mutex poisoned");
+        if guard.state != ConnectionState::Connected {
+            return Err(ChromeBridgeError::NotConnected);
+        }
+        guard
+            .host_epoch
+            .clone()
+            .ok_or(ChromeBridgeError::NotConnected)
+    }
+
+    fn discovery_record_is_compatible(&self, record: &DiscoveryRecord) -> bool {
+        protocol_ranges_overlap(
+            record.protocol_min,
+            record.protocol_max,
+            protocol::PROTOCOL_MIN_SUPPORTED,
+            protocol::PROTOCOL_MAX_SUPPORTED,
+        ) && self
+            .config
+            .want_capabilities
+            .iter()
+            .all(|cap| record.capabilities.iter().any(|have| have == cap))
+    }
+
+    fn select_connect_candidates(
+        &self,
+        records: Vec<DiscoveryRecord>,
+    ) -> (Vec<DiscoveryRecord>, bool) {
+        let mut candidates = Vec::new();
+        let mut saw_busy = false;
+
+        for record in records {
+            if let Some(claimed_by) = &record.claimed_by {
+                let claimed_by_other = claimed_by.pi_session_id != self.config.pi_session_id
+                    || claimed_by.client_instance_id != self.config.client_instance_id;
+                if claimed_by_other {
+                    saw_busy = true;
+                    continue;
+                }
+            }
+            candidates.push(record);
+        }
+
+        (candidates, saw_busy)
+    }
+
+    fn ensure_request_id_fingerprint(
+        &self,
+        host_epoch: &str,
+        request_id: &str,
+        op: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), ChromeBridgeError> {
+        let fingerprint = protocol::RequestFingerprint::new(op, payload)
+            .map_err(ChromeBridgeError::Fingerprint)?;
+        let key = (host_epoch.to_string(), request_id.to_string());
+        let mut guard = self
+            .request_fingerprints
+            .lock()
+            .expect("request fingerprints mutex poisoned");
+
+        match guard.get(&key) {
+            Some(existing) if existing != &fingerprint => {
+                let err = ChromeBridgeError::RequestIdPayloadMismatch {
+                    host_epoch: host_epoch.to_string(),
+                    request_id: request_id.to_string(),
+                    expected_fingerprint: existing.as_str().to_string(),
+                    actual_fingerprint: fingerprint.as_str().to_string(),
+                };
+                drop(guard);
+                Err(err)
+            }
+            Some(_) => {
+                drop(guard);
+                Ok(())
+            }
+            None => {
+                guard.insert(key, fingerprint);
+                drop(guard);
+                Ok(())
+            }
+        }
+    }
+
+    fn write_lane_for_request(&self, op: &str, payload: &serde_json::Value) -> Option<WriteLane> {
+        if classify_execution_class(op) == ExecutionClass::ReadOnlyReplayable {
+            return None;
+        }
+
+        let tab_id = extract_tab_id_from_payload(payload);
+        Some(
+            self.write_lanes
+                .lock()
+                .expect("write lanes mutex poisoned")
+                .lane_for(tab_id),
+        )
     }
 
     #[must_use]
@@ -318,6 +817,11 @@ impl ChromeBridge {
             {
                 Err(ChromeBridgeError::ProtocolMismatch(err.error.message))
             }
+            protocol::MessageType::Response(protocol::ResponseEnvelope::Error(err))
+                if err.error.code == protocol::ProtocolErrorCode::ChromeBridgeAuthFailed =>
+            {
+                Err(ChromeBridgeError::AuthRejected(err.error.message))
+            }
             other => Err(ChromeBridgeError::UnexpectedHandshakeMessage(format!(
                 "{other:?}"
             ))),
@@ -327,6 +831,46 @@ impl ChromeBridge {
     fn set_state(&self, state: ConnectionState) {
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
         guard.state = state;
+    }
+
+    fn spawn_reader_thread(&self, read_half: OwnedReadHalf, connection_token: u64) {
+        let pending = Arc::clone(&self.pending);
+        let observations = Arc::clone(&self.observations);
+        let inner = Arc::clone(&self.inner);
+        let writer = Arc::clone(&self.writer);
+
+        let _reader = std::thread::spawn(move || {
+            let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::debug!("chrome reader runtime init failed: {err}");
+                    finalize_reader_shutdown(connection_token, &inner, &writer, &pending);
+                    return;
+                }
+            };
+
+            let result = runtime.block_on(reader_loop(
+                read_half,
+                Arc::clone(&pending),
+                Arc::clone(&observations),
+            ));
+            if let Err(err) = result {
+                tracing::debug!("chrome reader loop exited with error: {err}");
+            }
+            finalize_reader_shutdown(connection_token, &inner, &writer, &pending);
+        });
+    }
+
+    fn mark_disconnected(&self) {
+        self.writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
+        let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
+        guard.connection_token = 0;
+        if guard.state != ConnectionState::Disabled {
+            guard.state = ConnectionState::Disconnected;
+        }
     }
 
     fn reset_failure_streak(&self) {
@@ -339,12 +883,16 @@ impl ChromeBridge {
     }
 
     fn record_failure(&self) {
+        self.writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
+        guard.connection_token = 0;
         if guard.consecutive_failures >= self.config.max_reconnect_attempts.max(1) {
             guard.browser_tools_disabled = true;
             guard.state = ConnectionState::Disabled;
-            guard.stream = None;
         } else {
             guard.state = ConnectionState::Disconnected;
         }
@@ -383,7 +931,21 @@ pub struct DiscoveryRecord {
 impl DiscoveryRecord {
     #[must_use]
     pub fn is_expired(&self, now_ms: i64) -> bool {
-        self.expires_at_ms.is_some_and(|ts| ts <= now_ms)
+        self.lease_expires_at_ms.is_some_and(|ts| ts <= now_ms)
+            || self.expires_at_ms.is_some_and(|ts| ts <= now_ms)
+    }
+
+    #[must_use]
+    pub fn has_valid_security_fields(&self) -> bool {
+        let ids_valid = !self.host_id.trim().is_empty() && !self.host_epoch.trim().is_empty();
+        let token_valid = !self.token.trim().is_empty();
+        let socket_valid = self.socket_path.is_absolute();
+        let claim_valid = self.claimed_by.as_ref().is_none_or(|claim| {
+            !claim.pi_session_id.trim().is_empty() && !claim.client_instance_id.trim().is_empty()
+        });
+        let protocol_range_valid = self.protocol_min <= self.protocol_max;
+
+        ids_valid && token_valid && socket_valid && claim_valid && protocol_range_valid
     }
 }
 
@@ -401,6 +963,8 @@ pub enum ChromeBridgeError {
     BrowserToolsDisabled,
     #[error("no valid chrome host discovery records found")]
     NoHostsFound,
+    #[error("all discovered chrome hosts are claimed by other sessions")]
+    AllHostsBusy,
     #[error("failed to read discovery directory {path}: {source}")]
     DiscoveryDirRead {
         path: PathBuf,
@@ -420,13 +984,32 @@ pub enum ChromeBridgeError {
     Io(std::io::Error),
     #[error("chrome bridge frame codec error: {0}")]
     Frame(#[from] protocol::FrameCodecError),
+    #[error("failed to fingerprint request payload: {0}")]
+    Fingerprint(serde_json::Error),
+    #[error("chrome bridge is not connected")]
+    NotConnected,
+    #[error("response channel closed before request {request_id} completed")]
+    ResponseChannelClosed { request_id: String },
+    #[error(
+        "logical request id {request_id} reused with different payload in host_epoch {host_epoch}"
+    )]
+    RequestIdPayloadMismatch {
+        host_epoch: String,
+        request_id: String,
+        expected_fingerprint: String,
+        actual_fingerprint: String,
+    },
     #[error("host {host_id} is busy (claimed_by={claimed_by:?})")]
     AuthBusy {
         host_id: String,
         claimed_by: Option<protocol::ClaimedBy>,
     },
+    #[error("chrome bridge auth rejected: {0}")]
+    AuthRejected(String),
     #[error("chrome bridge protocol mismatch: {0}")]
     ProtocolMismatch(String),
+    #[error("ESL ambiguity for request {request_id}: {message}")]
+    EslIndeterminate { request_id: String, message: String },
     #[error("unexpected handshake message: {0}")]
     UnexpectedHandshakeMessage(String),
 }
@@ -459,6 +1042,9 @@ fn discover_hosts_in_dir(
         if !name.starts_with(DISCOVERY_PREFIX) || !name.ends_with(DISCOVERY_SUFFIX) {
             continue;
         }
+        if !discovery_file_permissions_are_secure(&path) {
+            continue;
+        }
 
         let raw = fs::read(&path).map_err(|source| ChromeBridgeError::DiscoveryFileRead {
             path: path.clone(),
@@ -470,6 +1056,10 @@ fn discover_hosts_in_dir(
                 source,
             }
         })?;
+        if !record.has_valid_security_fields() {
+            tracing::debug!("Skipping invalid discovery record in {:?}", path);
+            continue;
+        }
 
         if record.is_expired(now_ms) {
             continue;
@@ -485,6 +1075,54 @@ fn discover_hosts_in_dir(
         discovered.sort_by_key(|record| u8::from(record.host_id != pinned));
     }
     Ok(discovered)
+}
+
+const fn protocol_ranges_overlap(a_min: u16, a_max: u16, b_min: u16, b_max: u16) -> bool {
+    if a_min > a_max || b_min > b_max {
+        return false;
+    }
+    a_min <= b_max && b_min <= a_max
+}
+
+fn discovery_file_permissions_are_secure(path: &Path) -> bool {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            tracing::debug!(
+                "Skipping discovery file with unreadable metadata {:?}: {err}",
+                path
+            );
+            return false;
+        }
+    };
+
+    if !metadata.file_type().is_file() {
+        tracing::debug!("Skipping non-regular discovery file {:?}", path);
+        return false;
+    }
+
+    discovery_metadata_permissions_are_secure(path, &metadata)
+}
+
+#[cfg(unix)]
+fn discovery_metadata_permissions_are_secure(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        tracing::debug!(
+            "Skipping discovery file with insecure permissions {:?} mode {:o} (expected 600)",
+            path,
+            mode
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(not(unix))]
+fn discovery_metadata_permissions_are_secure(_: &Path, _: &std::fs::Metadata) -> bool {
+    true
 }
 
 async fn write_message(
@@ -514,11 +1152,41 @@ async fn read_message(stream: &mut UnixStream) -> Result<protocol::MessageType, 
     }
 }
 
-#[allow(dead_code)]
+fn finalize_reader_shutdown(
+    connection_token: u64,
+    inner: &Arc<StdMutex<ChromeBridgeInner>>,
+    writer: &Arc<StdMutex<Option<OwnedWriteHalf>>>,
+    pending: &Arc<StdMutex<PendingResponses>>,
+) {
+    let should_finalize = {
+        let mut guard = inner.lock().expect("chrome bridge mutex poisoned");
+        if guard.connection_token == connection_token {
+            guard.connection_token = 0;
+            if guard.state != ConnectionState::Disabled {
+                guard.state = ConnectionState::Disconnected;
+            }
+            true
+        } else {
+            false
+        }
+    };
+
+    if should_finalize {
+        pending
+            .lock()
+            .expect("pending responses mutex poisoned")
+            .clear();
+        writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
+    }
+}
+
 async fn reader_loop(
     mut read_half: OwnedReadHalf,
-    pending: &StdMutex<PendingResponses>,
-    observations: &StdMutex<Vec<protocol::ObservationEvent>>,
+    pending: Arc<StdMutex<PendingResponses>>,
+    observations: Arc<StdMutex<Vec<protocol::ObservationEvent>>>,
 ) -> Result<(), ChromeBridgeError> {
     let cx = asupersync::Cx::for_request();
     let mut buf = Vec::with_capacity(1024);
@@ -561,7 +1229,6 @@ async fn reader_loop(
     }
 }
 
-#[allow(dead_code)]
 async fn write_request_frame(
     write_half: &mut OwnedWriteHalf,
     message: &protocol::MessageType,
@@ -582,11 +1249,101 @@ fn unix_time_ms() -> i64 {
     i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
 }
 
+#[must_use]
+pub fn chrome_memory_bound_caps() -> ChromeMemoryBoundCaps {
+    ChromeMemoryBoundCaps {
+        socket_frame_max_bytes: protocol::MAX_SOCKET_FRAME_BYTES,
+        esl_journal_max_entries: native_host::MAX_JOURNAL_ENTRIES,
+        esl_journal_max_bytes: native_host::MAX_JOURNAL_BYTES,
+        esl_journal_ttl_ms: native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+        observer_max_observers: observer::MAX_OBSERVERS,
+        observer_ring_buffer_capacity: observer::RING_BUFFER_CAPACITY,
+        observer_max_events_per_drain: observer::MAX_EVENTS_PER_DRAIN,
+        observer_max_event_bytes: observer::MAX_EVENT_BYTES,
+        worst_case_observer_buffer_bytes: observer::MAX_OBSERVERS
+            .saturating_mul(observer::RING_BUFFER_CAPACITY)
+            .saturating_mul(observer::MAX_EVENT_BYTES),
+        soak_rss_target_mb: MEMORY_SOAK_RSS_TARGET_MB,
+        soak_acceptance_handoff_bead: MEMORY_SOAK_ACCEPTANCE_HANDOFF_BEAD,
+    }
+}
+
+fn extract_tab_id_from_payload(payload: &serde_json::Value) -> Option<u32> {
+    let object = payload.as_object()?;
+    let tab_value = object.get("tab_id").or_else(|| object.get("tabId"))?;
+    match tab_value {
+        serde_json::Value::Number(number) => {
+            let raw = number.as_u64()?;
+            u32::try_from(raw).ok()
+        }
+        _ => None,
+    }
+}
+
+fn classify_execution_class(op: &str) -> ExecutionClass {
+    match op {
+        "read_page" | "get_page_text" | "tabs_context" | "read_console" | "read_network" => {
+            ExecutionClass::ReadOnlyReplayable
+        }
+        _ => ExecutionClass::NonIdempotent,
+    }
+}
+
+const fn is_timeout_or_disconnect_error_code(code: protocol::ProtocolErrorCode) -> bool {
+    matches!(
+        code,
+        protocol::ProtocolErrorCode::ChromeBridgeTimeout
+            | protocol::ProtocolErrorCode::ChromeBridgeDisconnected
+    )
+}
+
+fn is_esl_in_progress_error(err: &protocol::ErrorResponse) -> bool {
+    err.error.retryable
+        && err.error.code == protocol::ProtocolErrorCode::ChromeBridgeBusy
+        && err
+            .error
+            .message
+            .to_ascii_lowercase()
+            .contains("in_progress")
+}
+
+const fn is_ambiguous_transport_error(err: &ChromeBridgeError) -> bool {
+    matches!(
+        err,
+        ChromeBridgeError::ResponseChannelClosed { .. }
+            | ChromeBridgeError::Io(_)
+            | ChromeBridgeError::NotConnected
+    )
+}
+
+fn execution_indeterminate_envelope(
+    request_id: &str,
+    message: impl Into<String>,
+) -> protocol::ResponseEnvelope {
+    protocol::ResponseEnvelope::Error(protocol::ErrorResponse {
+        version: protocol::PROTOCOL_VERSION_V1,
+        id: request_id.to_string(),
+        ok: false,
+        error: protocol::ProtocolErrorDetail {
+            code: protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+            message: message.into(),
+            retryable: false,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::bool_assert_comparison,
+        clippy::match_wildcard_for_single_variants,
+        clippy::needless_pass_by_value
+    )]
+
     use super::*;
 
     use asupersync::runtime::RuntimeBuilder;
+    use futures::future;
     use serde_json::json;
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener as StdUnixListener;
@@ -604,6 +1361,16 @@ mod tests {
             serde_json::to_vec(record).expect("serialize discovery record"),
         )
         .expect("write discovery record");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut perms = std::fs::metadata(path)
+                .expect("stat discovery record")
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms).expect("chmod discovery record 0600");
+        }
     }
 
     fn make_record(socket_path: &Path, host_id: &str) -> DiscoveryRecord {
@@ -634,37 +1401,603 @@ mod tests {
                     .try_clone()
                     .expect("clone accepted unix stream for buffered read"),
             );
-            let mut line = Vec::new();
-            let bytes_read = reader
-                .read_until(b'\n', &mut line)
-                .expect("read auth_claim frame");
-            assert!(bytes_read > 0, "mock host must receive an auth_claim frame");
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(&mut stream, &response);
+        })
+    }
 
-            let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
-                .expect("decode auth_claim frame")
-                .expect("complete auth_claim frame");
-            assert_eq!(
-                consumed,
-                line.len(),
-                "mock host must consume exactly one frame"
+    fn spawn_mock_host_keepalive_after_auth_ok(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-1".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
             );
 
-            match message {
-                protocol::MessageType::AuthClaim(auth) => {
-                    assert_eq!(auth.version, protocol::PROTOCOL_VERSION_V1, "auth version");
-                    assert_eq!(
-                        auth.token, "secret-token",
-                        "auth token forwarded from discovery"
-                    );
+            // Stay alive until the client disconnects so connect_success remains deterministic.
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let bytes = reader.read_until(b'\n', &mut buf).expect("keepalive read");
+                if bytes == 0 {
+                    break;
                 }
-                other => panic!("expected auth_claim, got {other:?}"),
+            }
+        })
+    }
+
+    fn spawn_mock_host_request_echo(
+        socket_path: PathBuf,
+        expected_requests: usize,
+        emit_observation_before_responses: bool,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-echo".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-echo".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let mut requests = Vec::with_capacity(expected_requests);
+            for _ in 0..expected_requests {
+                let mut line = Vec::new();
+                let bytes_read = reader
+                    .read_until(b'\n', &mut line)
+                    .expect("read request frame");
+                assert!(bytes_read > 0, "mock host must receive request frames");
+                let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+                    .expect("decode request frame")
+                    .expect("complete request frame");
+                assert_eq!(
+                    consumed,
+                    line.len(),
+                    "mock host must consume one request frame"
+                );
+                match message {
+                    protocol::MessageType::Request(request) => requests.push(request),
+                    other => panic!("expected request frame, got {other:?}"),
+                }
             }
 
-            let frame = protocol::encode_frame(&response).expect("encode mock response");
-            stream
-                .write_all(&frame)
-                .expect("write handshake response from mock host");
+            if emit_observation_before_responses {
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::Observation(protocol::ObservationEvent {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        observer_id: "observer-1".to_string(),
+                        events: vec![protocol::ObservationEntry {
+                            kind: "console".to_string(),
+                            message: Some("navigated".to_string()),
+                            source: Some("page".to_string()),
+                            url: Some("https://example.test".to_string()),
+                            ts: unix_time_ms(),
+                        }],
+                    }),
+                );
+            }
+
+            for request in requests.into_iter().rev() {
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                        protocol::Response {
+                            version: protocol::PROTOCOL_VERSION_V1,
+                            id: request.id,
+                            ok: true,
+                            result: json!({
+                                "echo": request.payload,
+                                "op": request.op,
+                            }),
+                        },
+                    )),
+                );
+            }
         })
+    }
+
+    fn spawn_mock_host_requires_two_requests_before_any_response(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-two-before-response".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set short read timeout");
+            let first = read_request_frame(&mut reader);
+            let second = read_request_frame(&mut reader);
+
+            for request in [first, second] {
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                        protocol::Response {
+                            version: protocol::PROTOCOL_VERSION_V1,
+                            id: request.id,
+                            ok: true,
+                            result: json!({
+                                "echo": request.payload,
+                                "op": request.op,
+                            }),
+                        },
+                    )),
+                );
+            }
+        })
+    }
+
+    fn spawn_mock_host_blocks_second_request_until_first_response(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-serialized".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+
+            stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("set short read timeout");
+            let mut blocked_probe = Vec::new();
+            match reader.read_until(b'\n', &mut blocked_probe) {
+                Ok(0) => panic!("client disconnected before first response"),
+                Ok(bytes) => panic!(
+                    "same-tab write requests must serialize; unexpectedly read {bytes} bytes before first response"
+                ),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => panic!("unexpected blocked-read probe error: {err}"),
+            }
+            stream.set_read_timeout(None).expect("clear read timeout");
+
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id,
+                        ok: true,
+                        result: json!({
+                            "echo": first.payload,
+                            "op": first.op,
+                            "phase": "first",
+                        }),
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({
+                            "echo": second.payload,
+                            "op": second.op,
+                            "phase": "second",
+                        }),
+                    },
+                )),
+            );
+        })
+    }
+
+    fn spawn_mock_host_reconnect_two_sessions(socket_path: PathBuf) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            for (epoch, expected_n) in [("epoch-1", 1_i64), ("epoch-2", 2_i64)] {
+                let (mut stream, _) = listener.accept().expect("accept mock client");
+                let mut reader = std::io::BufReader::new(
+                    stream
+                        .try_clone()
+                        .expect("clone accepted unix stream for buffered read"),
+                );
+                read_and_assert_auth_claim(&mut reader);
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthOk(protocol::AuthOk {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        host_id: "host-reconnect".to_string(),
+                        claimed_by: protocol::ClaimedBy {
+                            pi_session_id: "session-1".to_string(),
+                            client_instance_id: "client-1".to_string(),
+                        },
+                        host_epoch: epoch.to_string(),
+                        protocol: protocol::PROTOCOL_VERSION_V1,
+                        capabilities: vec!["browser_tools".to_string()],
+                        lease_ttl_ms: 30_000,
+                    }),
+                );
+
+                let mut line = Vec::new();
+                let bytes_read = reader
+                    .read_until(b'\n', &mut line)
+                    .expect("read request frame");
+                assert!(bytes_read > 0, "mock host must receive request frame");
+                let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+                    .expect("decode request frame")
+                    .expect("complete request frame");
+                assert_eq!(
+                    consumed,
+                    line.len(),
+                    "mock host must consume one request frame"
+                );
+
+                let request = match message {
+                    protocol::MessageType::Request(request) => request,
+                    other => panic!("expected request frame, got {other:?}"),
+                };
+                assert_eq!(
+                    request.payload["n"],
+                    json!(expected_n),
+                    "reconnect session request payload must match expected sequence"
+                );
+
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                        protocol::Response {
+                            version: protocol::PROTOCOL_VERSION_V1,
+                            id: request.id,
+                            ok: true,
+                            result: json!({ "epoch": epoch, "n": expected_n }),
+                        },
+                    )),
+                );
+                // Drop this connection to force connection-loss path before the next accept.
+            }
+        })
+    }
+
+    fn spawn_mock_host_esl_timeout_then_replay(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Error(
+                    protocol::ErrorResponse {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id.clone(),
+                        ok: false,
+                        error: protocol::ProtocolErrorDetail {
+                            code: protocol::ProtocolErrorCode::ChromeBridgeTimeout,
+                            message: "request timed out waiting for chrome".to_string(),
+                            retryable: true,
+                        },
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            assert_eq!(
+                second.id, first.id,
+                "ESL retry must reuse stable request id for timeout replay"
+            );
+            assert_eq!(
+                second.payload, first.payload,
+                "ESL retry must preserve payload for duplicate request id"
+            );
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({"replayed": true, "epoch": "epoch-1"}),
+                    },
+                )),
+            );
+        })
+    }
+
+    fn spawn_mock_host_esl_in_progress_then_complete(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock client");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-1".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            let first = read_request_frame(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Error(
+                    protocol::ErrorResponse {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: first.id.clone(),
+                        ok: false,
+                        error: protocol::ProtocolErrorDetail {
+                            code: protocol::ProtocolErrorCode::ChromeBridgeBusy,
+                            message: "in_progress: request still executing".to_string(),
+                            retryable: true,
+                        },
+                    },
+                )),
+            );
+
+            let second = read_request_frame(&mut reader);
+            assert_eq!(
+                second.id, first.id,
+                "in-progress retry must reuse stable request id"
+            );
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::Response(protocol::ResponseEnvelope::Ok(
+                    protocol::Response {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        id: second.id,
+                        ok: true,
+                        result: json!({"status": "completed_after_wait"}),
+                    },
+                )),
+            );
+        })
+    }
+
+    fn spawn_mock_host_esl_host_restart_indeterminate(
+        socket_path: PathBuf,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = StdUnixListener::bind(&socket_path).expect("bind mock unix listener");
+        std::thread::spawn(move || {
+            // First host epoch: read one request then drop connection before responding.
+            {
+                let (mut stream, _) = listener.accept().expect("accept conn1");
+                let mut reader = std::io::BufReader::new(
+                    stream
+                        .try_clone()
+                        .expect("clone accepted unix stream for buffered read"),
+                );
+                read_and_assert_auth_claim(&mut reader);
+                send_frame(
+                    &mut stream,
+                    &protocol::MessageType::AuthOk(protocol::AuthOk {
+                        version: protocol::PROTOCOL_VERSION_V1,
+                        host_id: "host-esl".to_string(),
+                        claimed_by: protocol::ClaimedBy {
+                            pi_session_id: "session-1".to_string(),
+                            client_instance_id: "client-1".to_string(),
+                        },
+                        host_epoch: "epoch-1".to_string(),
+                        protocol: protocol::PROTOCOL_VERSION_V1,
+                        capabilities: vec!["browser_tools".to_string()],
+                        lease_ttl_ms: 30_000,
+                    }),
+                );
+                let _request = read_request_frame(&mut reader);
+            }
+
+            // Second host epoch: handshake only; agent should return indeterminate without resending.
+            let (mut stream, _) = listener.accept().expect("accept conn2");
+            let mut reader = std::io::BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("clone accepted unix stream for buffered read"),
+            );
+            read_and_assert_auth_claim(&mut reader);
+            send_frame(
+                &mut stream,
+                &protocol::MessageType::AuthOk(protocol::AuthOk {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    host_id: "host-esl".to_string(),
+                    claimed_by: protocol::ClaimedBy {
+                        pi_session_id: "session-1".to_string(),
+                        client_instance_id: "client-1".to_string(),
+                    },
+                    host_epoch: "epoch-2".to_string(),
+                    protocol: protocol::PROTOCOL_VERSION_V1,
+                    capabilities: vec!["browser_tools".to_string()],
+                    lease_ttl_ms: 30_000,
+                }),
+            );
+
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+                .expect("set read timeout");
+            let mut maybe_line = Vec::new();
+            match reader.read_until(b'\n', &mut maybe_line) {
+                Ok(0) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Ok(n) => {
+                    panic!("agent should not resend request after epoch change, read {n} bytes")
+                }
+                Err(err) => panic!("unexpected conn2 read error: {err}"),
+            }
+        })
+    }
+
+    fn read_request_frame(
+        reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>,
+    ) -> protocol::Request {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .expect("read request frame");
+        assert!(bytes_read > 0, "mock host must receive request frame");
+        let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+            .expect("decode request frame")
+            .expect("complete request frame");
+        assert_eq!(
+            consumed,
+            line.len(),
+            "mock host must consume one request frame"
+        );
+        match message {
+            protocol::MessageType::Request(request) => request,
+            other => panic!("expected request frame, got {other:?}"),
+        }
+    }
+
+    fn read_and_assert_auth_claim(reader: &mut std::io::BufReader<std::os::unix::net::UnixStream>) {
+        let mut line = Vec::new();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .expect("read auth_claim frame");
+        assert!(bytes_read > 0, "mock host must receive an auth_claim frame");
+
+        let (message, consumed) = protocol::decode_frame::<protocol::MessageType>(&line)
+            .expect("decode auth_claim frame")
+            .expect("complete auth_claim frame");
+        assert_eq!(
+            consumed,
+            line.len(),
+            "mock host must consume exactly one frame"
+        );
+
+        match message {
+            protocol::MessageType::AuthClaim(auth) => {
+                assert_eq!(auth.version, protocol::PROTOCOL_VERSION_V1, "auth version");
+                assert_eq!(
+                    auth.token, "secret-token",
+                    "auth token forwarded from discovery"
+                );
+            }
+            other => panic!("expected auth_claim, got {other:?}"),
+        }
+    }
+
+    fn send_frame(stream: &mut std::os::unix::net::UnixStream, message: &protocol::MessageType) {
+        let frame = protocol::encode_frame(message).expect("encode mock frame");
+        stream
+            .write_all(&frame)
+            .expect("write mock frame to unix stream");
     }
 
     #[test]
@@ -708,25 +2041,146 @@ mod tests {
     }
 
     #[test]
+    fn test_discover_hosts_filters_expired_lease_dead_socket_and_invalid_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let valid_socket = dir.path().join("valid.sock");
+        let lease_socket = dir.path().join("lease.sock");
+        let invalid_claim_socket = dir.path().join("invalid-claim.sock");
+        std::fs::write(&valid_socket, []).expect("create valid socket placeholder");
+        std::fs::write(&lease_socket, []).expect("create lease socket placeholder");
+        std::fs::write(&invalid_claim_socket, []).expect("create invalid-claim socket placeholder");
+
+        let valid = make_record(&valid_socket, "host-valid");
+        let mut lease_expired = make_record(&lease_socket, "host-lease-expired");
+        lease_expired.lease_expires_at_ms = Some(unix_time_ms() - 1);
+
+        let dead_socket_record = make_record(&dir.path().join("missing.sock"), "host-dead-socket");
+
+        let mut invalid_claim = make_record(&invalid_claim_socket, "host-invalid-claim");
+        invalid_claim.claimed_by = Some(protocol::ClaimedBy {
+            pi_session_id: String::new(),
+            client_instance_id: "client-2".to_string(),
+        });
+
+        write_discovery_record(
+            &dir.path().join("pi-chrome-host-host-valid.discovery.json"),
+            &valid,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-lease-expired.discovery.json"),
+            &lease_expired,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-dead-socket.discovery.json"),
+            &dead_socket_record,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-invalid-claim.discovery.json"),
+            &invalid_claim,
+        );
+
+        let discovered = discover_hosts_in_dir(dir.path(), unix_time_ms(), None)
+            .expect("discover hosts should succeed");
+        let discovered_ids: Vec<_> = discovered.into_iter().map(|r| r.host_id).collect();
+
+        assert_eq!(
+            discovered_ids,
+            vec!["host-valid".to_string()],
+            "discovery must reject expired lease, dead socket, and invalid claim metadata"
+        );
+    }
+
+    #[test]
+    fn test_discover_hosts_applies_protocol_and_capability_compatibility_filters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ok_socket = dir.path().join("ok.sock");
+        let proto_socket = dir.path().join("proto.sock");
+        let caps_socket = dir.path().join("caps.sock");
+        std::fs::write(&ok_socket, []).expect("create ok socket placeholder");
+        std::fs::write(&proto_socket, []).expect("create proto socket placeholder");
+        std::fs::write(&caps_socket, []).expect("create caps socket placeholder");
+
+        let ok_record = make_record(&ok_socket, "host-ok");
+        let mut proto_mismatch = make_record(&proto_socket, "host-proto-mismatch");
+        proto_mismatch.protocol_min = protocol::PROTOCOL_MAX_SUPPORTED.saturating_add(1);
+        proto_mismatch.protocol_max = proto_mismatch.protocol_min;
+
+        let mut missing_caps = make_record(&caps_socket, "host-missing-caps");
+        missing_caps.capabilities = vec!["browser_tools".to_string()];
+
+        write_discovery_record(
+            &dir.path().join("pi-chrome-host-host-ok.discovery.json"),
+            &ok_record,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-proto-mismatch.discovery.json"),
+            &proto_mismatch,
+        );
+        write_discovery_record(
+            &dir.path()
+                .join("pi-chrome-host-host-missing-caps.discovery.json"),
+            &missing_caps,
+        );
+
+        let bridge = ChromeBridge::new(ChromeBridgeConfig {
+            pi_session_id: "session-1".to_string(),
+            client_instance_id: "client-1".to_string(),
+            discovery_dir: dir.path().to_path_buf(),
+            want_capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+            max_reconnect_attempts: 1,
+            reconnect_backoff_ms: 1,
+        });
+
+        let discovered = bridge
+            .discover_hosts()
+            .expect("discover_hosts should apply compatibility filtering");
+        let discovered_ids: Vec<_> = discovered.into_iter().map(|r| r.host_id).collect();
+
+        assert_eq!(
+            discovered_ids,
+            vec!["host-ok".to_string()],
+            "protocol/capability incompatible records must be filtered before connect"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_hosts_skips_insecure_permission_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("host.sock");
+        std::fs::write(&socket_path, []).expect("create socket placeholder");
+        let record = make_record(&socket_path, "host-1");
+        let record_path = dir.path().join("pi-chrome-host-host-1.discovery.json");
+        write_discovery_record(&record_path, &record);
+
+        let mut perms = std::fs::metadata(&record_path)
+            .expect("stat discovery file")
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&record_path, perms).expect("chmod insecure");
+
+        let discovered = discover_hosts_in_dir(dir.path(), unix_time_ms(), None)
+            .expect("discovery scan should continue when a file is insecure");
+        assert!(
+            discovered.is_empty(),
+            "discovery must skip files with non-0600 permissions because token is embedded"
+        );
+    }
+
+    #[test]
     fn test_chrome_bridge_connect_success_and_disconnect() {
         run_async(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
             let socket_path = tempdir.path().join("host.sock");
             let record = make_record(&socket_path, "host-1");
 
-            let response = protocol::MessageType::AuthOk(protocol::AuthOk {
-                version: protocol::PROTOCOL_VERSION_V1,
-                host_id: "host-1".to_string(),
-                claimed_by: protocol::ClaimedBy {
-                    pi_session_id: "session-1".to_string(),
-                    client_instance_id: "client-1".to_string(),
-                },
-                host_epoch: "epoch-1".to_string(),
-                protocol: protocol::PROTOCOL_VERSION_V1,
-                capabilities: vec!["browser_tools".to_string()],
-                lease_ttl_ms: 30_000,
-            });
-            let server = spawn_mock_host(socket_path.clone(), response);
+            let server = spawn_mock_host_keepalive_after_auth_ok(socket_path.clone());
 
             let bridge = ChromeBridge::new(ChromeBridgeConfig {
                 pi_session_id: "session-1".to_string(),
@@ -773,6 +2227,581 @@ mod tests {
 
             server.join().expect("mock host thread join");
         });
+    }
+
+    #[test]
+    fn test_chrome_bridge_send_request_roundtrip_and_observation_dispatch() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("echo.sock");
+            let record = make_record(&socket_path, "host-echo");
+            let server = spawn_mock_host_request_echo(socket_path.clone(), 1, true);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let envelope = bridge
+                .send_request("browser.navigate", json!({ "url": "https://example.test" }))
+                .await
+                .expect("request/response roundtrip must succeed");
+            match envelope {
+                protocol::ResponseEnvelope::Ok(response) => {
+                    assert_eq!(response.ok, true, "host response must be ok");
+                    assert_eq!(
+                        response.result["op"],
+                        json!("browser.navigate"),
+                        "response must echo op"
+                    );
+                    assert_eq!(
+                        response.result["echo"]["url"],
+                        json!("https://example.test"),
+                        "response must echo payload"
+                    );
+                }
+                other => panic!("expected successful response, got {other:?}"),
+            }
+
+            let observations = bridge.take_observations();
+            assert_eq!(
+                observations.len(),
+                1,
+                "reader loop must buffer pushed observations"
+            );
+            assert_eq!(
+                observations[0].events[0].kind, "console",
+                "observation event kind must roundtrip"
+            );
+            assert_eq!(
+                bridge.pending_response_count(),
+                0,
+                "pending map must be empty after request completes"
+            );
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_concurrent_requests_are_dispatched_by_id() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("echo-concurrent.sock");
+            let record = make_record(&socket_path, "host-echo");
+            let server = spawn_mock_host_request_echo(socket_path.clone(), 8, false);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let responses = future::join_all(
+                (0..8).map(|n| bridge.send_request("read_page", json!({ "n": n }))),
+            )
+            .await;
+
+            for (n, response) in (0..8).zip(responses) {
+                let envelope = response.expect("request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        assert_eq!(ok.result["echo"]["n"], json!(n), "response id routing");
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                bridge.pending_response_count(),
+                0,
+                "pending map must drain after concurrent request completion"
+            );
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_serializes_same_tab_mutating_requests() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("same-tab-serialized.sock");
+            let record = make_record(&socket_path, "host-serialized");
+            let server = spawn_mock_host_blocks_second_request_until_first_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (first, second) = future::join(
+                bridge.send_request("browser.click", json!({ "tab_id": 7, "seq": 1 })),
+                bridge.send_request("browser.type", json!({ "tab_id": 7, "seq": 2 })),
+            )
+            .await;
+
+            for response in [first, second] {
+                let envelope = response.expect("same-tab write request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        assert_eq!(
+                            ok.result["echo"]["tab_id"],
+                            json!(7),
+                            "same-tab write requests must retain tab_id"
+                        );
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_allows_cross_tab_mutating_requests_to_overlap() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("cross-tab-overlap.sock");
+            let record = make_record(&socket_path, "host-two-before-response");
+            let server = spawn_mock_host_requires_two_requests_before_any_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (r1, r2) = future::join(
+                bridge.send_request("browser.click", json!({ "tab_id": 11, "seq": 1 })),
+                bridge.send_request("browser.click", json!({ "tab_id": 22, "seq": 2 })),
+            )
+            .await;
+
+            let mut seen_tab_ids = vec![];
+            for response in [r1, r2] {
+                let envelope = response.expect("cross-tab write request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        let tab_id = ok.result["echo"]["tab_id"]
+                            .as_u64()
+                            .expect("echoed tab_id must be numeric");
+                        seen_tab_ids.push(tab_id);
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+            seen_tab_ids.sort_unstable();
+            assert_eq!(
+                seen_tab_ids,
+                vec![11, 22],
+                "cross-tab writes must both dispatch before any response"
+            );
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_read_only_requests_are_not_serialized_by_tab() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("same-tab-read-overlap.sock");
+            let record = make_record(&socket_path, "host-two-before-response");
+            let server = spawn_mock_host_requires_two_requests_before_any_response(socket_path);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let (r1, r2) = future::join(
+                bridge.send_request("read_page", json!({ "tab_id": 42, "seq": 1 })),
+                bridge.send_request("read_page", json!({ "tab_id": 42, "seq": 2 })),
+            )
+            .await;
+
+            for response in [r1, r2] {
+                let envelope = response.expect("read-only request must complete");
+                match envelope {
+                    protocol::ResponseEnvelope::Ok(ok) => {
+                        assert_eq!(
+                            ok.result["op"],
+                            json!("read_page"),
+                            "read-only requests must roundtrip unchanged"
+                        );
+                        assert_eq!(
+                            ok.result["echo"]["tab_id"],
+                            json!(42),
+                            "same-tab read-only requests should not require serialization"
+                        );
+                    }
+                    other => panic!("expected ok response, got {other:?}"),
+                }
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_memory_bound_caps_match_component_limits_and_handoff() {
+        let caps = chrome_memory_bound_caps();
+
+        assert_eq!(
+            caps.socket_frame_max_bytes,
+            protocol::MAX_SOCKET_FRAME_BYTES,
+            "caps snapshot must reflect protocol socket frame cap"
+        );
+        assert_eq!(
+            caps.socket_frame_max_bytes,
+            1024 * 1024,
+            "socket frame cap must remain interview-locked at 1 MiB"
+        );
+        assert_eq!(
+            caps.esl_journal_max_entries,
+            native_host::MAX_JOURNAL_ENTRIES,
+            "caps snapshot must reflect ESL journal entry cap"
+        );
+        assert_eq!(
+            caps.esl_journal_max_entries, 256,
+            "ESL journal entry cap must remain bounded"
+        );
+        assert_eq!(
+            caps.esl_journal_max_bytes,
+            native_host::MAX_JOURNAL_BYTES,
+            "caps snapshot must reflect ESL journal byte cap"
+        );
+        assert_eq!(
+            caps.esl_journal_max_bytes,
+            16 * 1024 * 1024,
+            "ESL journal byte cap must remain 16 MiB"
+        );
+        assert_eq!(
+            caps.esl_journal_ttl_ms,
+            native_host::DEFAULT_REQUEST_JOURNAL_TTL_MS,
+            "caps snapshot must expose ESL journal TTL"
+        );
+        assert_eq!(
+            caps.observer_max_observers,
+            observer::MAX_OBSERVERS,
+            "caps snapshot must reflect observer count cap"
+        );
+        assert_eq!(
+            caps.observer_ring_buffer_capacity,
+            observer::RING_BUFFER_CAPACITY,
+            "caps snapshot must reflect ring buffer cap"
+        );
+        assert_eq!(
+            caps.observer_max_events_per_drain,
+            observer::MAX_EVENTS_PER_DRAIN,
+            "caps snapshot must reflect drain cap"
+        );
+        assert_eq!(
+            caps.observer_max_event_bytes,
+            observer::MAX_EVENT_BYTES,
+            "caps snapshot must reflect per-event byte cap"
+        );
+        assert_eq!(
+            caps.worst_case_observer_buffer_bytes,
+            observer::MAX_OBSERVERS * observer::RING_BUFFER_CAPACITY * observer::MAX_EVENT_BYTES,
+            "derived observer buffer bound must match component caps"
+        );
+        assert_eq!(
+            caps.soak_rss_target_mb, MEMORY_SOAK_RSS_TARGET_MB,
+            "caps snapshot must surface soak RSS target"
+        );
+        assert_eq!(
+            caps.soak_acceptance_handoff_bead, "bd-11p.3",
+            "bd-18m.8 must explicitly record the soak handoff bead"
+        );
+    }
+
+    #[test]
+    fn test_chrome_memory_bound_measurement_is_structured_for_soak_evidence() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+        bridge.push_observation(protocol::ObservationEvent {
+            version: protocol::PROTOCOL_VERSION_V1,
+            observer_id: "obs-1".to_string(),
+            events: vec![protocol::ObservationEntry {
+                kind: "console".to_string(),
+                message: Some("test".to_string()),
+                source: None,
+                url: None,
+                ts: unix_time_ms(),
+            }],
+        });
+
+        let measurement = bridge.record_memory_bound_measurement("unit-test", Some(12_345_678));
+        assert_eq!(
+            measurement.phase, "unit-test",
+            "measurement must keep caller-provided phase label"
+        );
+        assert_eq!(
+            measurement.measured_rss_bytes,
+            Some(12_345_678),
+            "measurement must preserve supplied RSS reading"
+        );
+        assert_eq!(
+            measurement.observation_buffer_len, 1,
+            "measurement must expose current buffered observations"
+        );
+        assert_eq!(
+            measurement.pending_response_count, 0,
+            "new bridge must start with zero pending responses"
+        );
+        assert_eq!(
+            measurement.caps.soak_acceptance_handoff_bead, "bd-11p.3",
+            "measurement metadata must carry explicit soak handoff"
+        );
+
+        let json = serde_json::to_value(&measurement).expect("serialize memory measurement");
+        assert_eq!(
+            json["phase"],
+            serde_json::Value::String("unit-test".to_string()),
+            "measurement JSON must expose a stable phase field"
+        );
+        assert!(
+            json.get("caps")
+                .and_then(|caps_json| caps_json.get("socket_frame_max_bytes"))
+                .is_some(),
+            "measurement JSON must include nested cap metadata for downstream soak artifacts"
+        );
+    }
+
+    #[test]
+    fn test_timeout_then_retry_replays_cached_result() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-timeout.sock");
+            let record = make_record(&socket_path, "host-esl");
+            let server = spawn_mock_host_esl_timeout_then_replay(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let response = bridge
+                .execute_request_with_esl(
+                    "browser.navigate",
+                    json!({ "url": "https://example.test" }),
+                )
+                .await
+                .expect("ESL timeout replay path should succeed");
+
+            match response {
+                protocol::ResponseEnvelope::Ok(ok) => {
+                    assert_eq!(ok.result["replayed"], json!(true), "host replay result");
+                    assert_eq!(ok.result["epoch"], json!("epoch-1"), "same epoch replay");
+                }
+                other => panic!("expected replayed ok response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_esl_in_progress_waits_and_retries_same_request_id() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-in-progress.sock");
+            let record = make_record(&socket_path, "host-esl");
+            let server = spawn_mock_host_esl_in_progress_then_complete(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect_to_record(&record)
+                .await
+                .expect("connect/auth handshake should succeed");
+
+            let response = bridge
+                .execute_request_with_esl("browser.navigate", json!({ "step": 1 }))
+                .await
+                .expect("in_progress retry path should eventually succeed");
+
+            match response {
+                protocol::ResponseEnvelope::Ok(ok) => {
+                    assert_eq!(
+                        ok.result["status"],
+                        json!("completed_after_wait"),
+                        "in-progress retry should return terminal result"
+                    );
+                }
+                other => panic!("expected terminal ok response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_non_idempotent_retry_after_host_restart_returns_indeterminate() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("esl-host-restart.sock");
+            let record = DiscoveryRecord {
+                host_id: "host-esl".to_string(),
+                host_epoch: "ignored".to_string(),
+                socket_path: socket_path.clone(),
+                token: "secret-token".to_string(),
+                protocol_min: protocol::PROTOCOL_MIN_SUPPORTED,
+                protocol_max: protocol::PROTOCOL_MAX_SUPPORTED,
+                capabilities: vec!["browser_tools".to_string()],
+                claimed_by: None,
+                lease_expires_at_ms: None,
+                expires_at_ms: Some(unix_time_ms() + 60_000),
+            };
+            write_discovery_record(
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-esl.discovery.json"),
+                &record,
+            );
+            let server = spawn_mock_host_esl_host_restart_indeterminate(socket_path.clone());
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+            bridge
+                .connect()
+                .await
+                .expect("initial connect should succeed");
+
+            let response = bridge
+                .execute_request_with_esl(
+                    "browser.navigate",
+                    json!({ "url": "https://restart.test" }),
+                )
+                .await
+                .expect("indeterminate should be returned as protocol error envelope");
+
+            match response {
+                protocol::ResponseEnvelope::Error(err) => {
+                    assert_eq!(
+                        err.error.code,
+                        protocol::ProtocolErrorCode::ChromeBridgeExecutionIndeterminate,
+                        "epoch change after ambiguous non-idempotent request must fail closed"
+                    );
+                    assert!(
+                        !err.error.retryable,
+                        "indeterminate safety error must not be auto-retryable"
+                    );
+                }
+                other => panic!("expected indeterminate error response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_retry_policy_classifies_non_idempotent_fail_closed() {
+        assert_eq!(
+            classify_execution_class("read_page"),
+            ExecutionClass::ReadOnlyReplayable,
+            "read_page should be classified as read_only_replayable"
+        );
+        assert_eq!(
+            classify_execution_class("browser.navigate"),
+            ExecutionClass::NonIdempotent,
+            "navigate defaults to non-idempotent in v1"
+        );
+        assert_eq!(
+            classify_execution_class("javascript_tool"),
+            ExecutionClass::NonIdempotent,
+            "javascript_tool defaults to non-idempotent in v1"
+        );
+        assert_eq!(
+            classify_execution_class("unknown_future_browser_op"),
+            ExecutionClass::NonIdempotent,
+            "unknown ops must fail closed to non-idempotent"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_request_id_payload_mismatch_rejected_before_dispatch() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+        bridge
+            .ensure_request_id_fingerprint("epoch-1", "call-1", "read_page", &json!({"a": 1}))
+            .expect("first fingerprint registration should succeed");
+
+        let err = bridge
+            .ensure_request_id_fingerprint("epoch-1", "call-1", "read_page", &json!({"a": 2}))
+            .expect_err("same request id with different payload must be rejected");
+
+        match err {
+            ChromeBridgeError::RequestIdPayloadMismatch {
+                request_id,
+                host_epoch,
+                ..
+            } => {
+                assert_eq!(request_id, "call-1");
+                assert_eq!(host_epoch, "epoch-1");
+            }
+            other => panic!("expected RequestIdPayloadMismatch, got {other:?}"),
+        }
     }
 
     #[test]
@@ -825,6 +2854,55 @@ mod tests {
     }
 
     #[test]
+    fn test_chrome_bridge_connect_returns_all_hosts_busy_when_claimed_by_others() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("busy-only.sock");
+            std::fs::write(&socket_path, []).expect("create placeholder socket");
+            let mut record = make_record(&socket_path, "host-busy-only");
+            record.claimed_by = Some(protocol::ClaimedBy {
+                pi_session_id: "other-session".to_string(),
+                client_instance_id: "other-client".to_string(),
+            });
+            write_discovery_record(
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-busy-only.discovery.json"),
+                &record,
+            );
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 1,
+                reconnect_backoff_ms: 1,
+            });
+
+            let err = bridge
+                .connect()
+                .await
+                .expect_err("all foreign-claimed hosts should return busy without binding");
+            assert!(
+                matches!(err, ChromeBridgeError::AllHostsBusy),
+                "expected AllHostsBusy when no unclaimed compatible hosts are available, got {err:?}"
+            );
+
+            let status = bridge.status();
+            assert_eq!(
+                status.state,
+                ConnectionState::Disconnected,
+                "busy contention should not leave bridge in connecting state"
+            );
+            assert_eq!(
+                status.consecutive_failures, 0,
+                "busy contention should not count as a transport failure"
+            );
+        });
+    }
+
+    #[test]
     fn test_chrome_bridge_protocol_mismatch_error_response() {
         run_async(async {
             let tempdir = tempfile::tempdir().expect("tempdir");
@@ -862,6 +2940,49 @@ mod tests {
             assert!(
                 matches!(err, ChromeBridgeError::ProtocolMismatch(_)),
                 "expected protocol mismatch, got {err:?}"
+            );
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
+    fn test_chrome_bridge_auth_reject_error_response() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("auth-reject.sock");
+            let record = make_record(&socket_path, "host-auth-reject");
+
+            let response = protocol::MessageType::Response(protocol::ResponseEnvelope::Error(
+                protocol::ErrorResponse {
+                    version: protocol::PROTOCOL_VERSION_V1,
+                    id: "handshake".to_string(),
+                    ok: false,
+                    error: protocol::ProtocolErrorDetail {
+                        code: protocol::ProtocolErrorCode::ChromeBridgeAuthFailed,
+                        message: "token mismatch".to_string(),
+                        retryable: false,
+                    },
+                },
+            ));
+            let server = spawn_mock_host(socket_path.clone(), response);
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+
+            let err = bridge
+                .connect_to_record(&record)
+                .await
+                .expect_err("auth reject error response must fail handshake");
+            assert!(
+                matches!(err, ChromeBridgeError::AuthRejected(_)),
+                "expected auth rejected, got {err:?}"
             );
 
             server.join().expect("mock host thread join");
@@ -923,6 +3044,97 @@ mod tests {
     }
 
     #[test]
+    fn test_chrome_bridge_connection_loss_recovery_updates_host_epoch() {
+        run_async(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let socket_path = tempdir.path().join("reconnect.sock");
+            let record = DiscoveryRecord {
+                host_id: "host-reconnect".to_string(),
+                host_epoch: "ignored-by-host".to_string(),
+                socket_path: socket_path.clone(),
+                token: "secret-token".to_string(),
+                protocol_min: protocol::PROTOCOL_MIN_SUPPORTED,
+                protocol_max: protocol::PROTOCOL_MAX_SUPPORTED,
+                capabilities: vec!["browser_tools".to_string()],
+                claimed_by: None,
+                lease_expires_at_ms: None,
+                expires_at_ms: Some(unix_time_ms() + 60_000),
+            };
+            let server = spawn_mock_host_reconnect_two_sessions(socket_path.clone());
+            write_discovery_record(
+                &tempdir
+                    .path()
+                    .join("pi-chrome-host-host-reconnect.discovery.json"),
+                &record,
+            );
+
+            let bridge = ChromeBridge::new(ChromeBridgeConfig {
+                pi_session_id: "session-1".to_string(),
+                client_instance_id: "client-1".to_string(),
+                discovery_dir: tempdir.path().to_path_buf(),
+                want_capabilities: vec!["browser_tools".to_string()],
+                max_reconnect_attempts: 3,
+                reconnect_backoff_ms: 1,
+            });
+
+            bridge
+                .connect()
+                .await
+                .expect("initial connect should succeed");
+            assert_eq!(
+                bridge.status().host_epoch.as_deref(),
+                Some("epoch-1"),
+                "first handshake should cache initial host epoch"
+            );
+
+            let first = bridge
+                .send_request("echo", json!({ "n": 1 }))
+                .await
+                .expect("first request must succeed");
+            match first {
+                protocol::ResponseEnvelope::Ok(resp) => {
+                    assert_eq!(resp.result["epoch"], json!("epoch-1"), "first epoch echoed");
+                }
+                other => panic!("expected ok response, got {other:?}"),
+            }
+
+            // Server closes conn1 after response; reconnect should re-pin same host and update epoch.
+            bridge
+                .connect()
+                .await
+                .expect("reconnect after connection loss should succeed");
+            let status = bridge.status();
+            assert_eq!(
+                status.pinned_host_id.as_deref(),
+                Some("host-reconnect"),
+                "reconnect must retain pinned host id"
+            );
+            assert_eq!(
+                status.host_epoch.as_deref(),
+                Some("epoch-2"),
+                "reconnect handshake must refresh host epoch"
+            );
+
+            let second = bridge
+                .send_request("echo", json!({ "n": 2 }))
+                .await
+                .expect("second request after reconnect must succeed");
+            match second {
+                protocol::ResponseEnvelope::Ok(resp) => {
+                    assert_eq!(
+                        resp.result["epoch"],
+                        json!("epoch-2"),
+                        "second epoch echoed"
+                    );
+                }
+                other => panic!("expected ok response, got {other:?}"),
+            }
+
+            server.join().expect("mock host thread join");
+        });
+    }
+
+    #[test]
     fn test_next_request_id_monotonic() {
         let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
         let a = bridge.next_request_id();
@@ -941,222 +3153,5 @@ mod tests {
             true,
             "serde_json smoke for test module"
         );
-    }
-
-    #[test]
-    fn test_bridge_config_default_values() {
-        let cfg = ChromeBridgeConfig::default();
-        assert_eq!(cfg.pi_session_id, "pi-session");
-        assert_eq!(cfg.client_instance_id, "pi-client");
-        assert_eq!(cfg.discovery_dir, PathBuf::from(DEFAULT_DISCOVERY_DIR));
-        assert_eq!(cfg.max_reconnect_attempts, DEFAULT_MAX_RECONNECT_ATTEMPTS);
-        assert_eq!(cfg.reconnect_backoff_ms, DEFAULT_RECONNECT_BACKOFF_MS);
-        assert!(
-            !cfg.want_capabilities.is_empty(),
-            "default config must request some capabilities"
-        );
-    }
-
-    #[test]
-    fn test_bridge_config_new_custom() {
-        let cfg = ChromeBridgeConfig::new("my-session", "my-client");
-        assert_eq!(cfg.pi_session_id, "my-session");
-        assert_eq!(cfg.client_instance_id, "my-client");
-        assert!(
-            cfg.want_capabilities.contains(&"browser_tools".to_string()),
-            "must request browser_tools by default"
-        );
-        assert!(
-            cfg.want_capabilities.contains(&"observations".to_string()),
-            "must request observations by default"
-        );
-    }
-
-    #[test]
-    fn test_bridge_initial_status() {
-        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
-        let status = bridge.status();
-        assert_eq!(status.state, ConnectionState::Disconnected);
-        assert!(status.pinned_host_id.is_none());
-        assert!(status.host_epoch.is_none());
-        assert_eq!(status.consecutive_failures, 0);
-        assert!(!status.browser_tools_disabled);
-    }
-
-    #[test]
-    fn test_discovery_record_is_expired() {
-        let record = DiscoveryRecord {
-            host_id: "h1".to_string(),
-            host_epoch: "e1".to_string(),
-            socket_path: PathBuf::from("/tmp/sock"),
-            token: "tok".to_string(),
-            protocol_min: 1,
-            protocol_max: 1,
-            capabilities: vec![],
-            claimed_by: None,
-            lease_expires_at_ms: None,
-            expires_at_ms: Some(1000),
-        };
-        assert!(
-            record.is_expired(1000),
-            "record at exact expiry must be expired"
-        );
-        assert!(
-            record.is_expired(2000),
-            "record past expiry must be expired"
-        );
-        assert!(
-            !record.is_expired(999),
-            "record before expiry must not be expired"
-        );
-    }
-
-    #[test]
-    fn test_discovery_record_no_expiry_never_expires() {
-        let record = DiscoveryRecord {
-            host_id: "h1".to_string(),
-            host_epoch: "e1".to_string(),
-            socket_path: PathBuf::from("/tmp/sock"),
-            token: "tok".to_string(),
-            protocol_min: 1,
-            protocol_max: 1,
-            capabilities: vec![],
-            claimed_by: None,
-            lease_expires_at_ms: None,
-            expires_at_ms: None,
-        };
-        assert!(
-            !record.is_expired(i64::MAX),
-            "record without expires_at must never expire"
-        );
-    }
-
-    #[test]
-    fn test_discovery_record_serde_roundtrip() {
-        let record = DiscoveryRecord {
-            host_id: "host-rt".to_string(),
-            host_epoch: "epoch-rt".to_string(),
-            socket_path: PathBuf::from("/tmp/rt.sock"),
-            token: "secret".to_string(),
-            protocol_min: 1,
-            protocol_max: 1,
-            capabilities: vec!["browser_tools".to_string()],
-            claimed_by: None,
-            lease_expires_at_ms: Some(5000),
-            expires_at_ms: Some(60000),
-        };
-        let json = serde_json::to_vec(&record).expect("serialize");
-        let parsed: DiscoveryRecord = serde_json::from_slice(&json).expect("deserialize");
-        assert_eq!(record, parsed, "roundtrip must preserve all fields");
-    }
-
-    #[test]
-    fn test_discovery_record_serde_aliases() {
-        // "socket" alias for socket_path
-        let json = json!({
-            "host_id": "h1",
-            "host_epoch": "e1",
-            "socket": "/tmp/alias.sock",
-            "token": "tok",
-            "protocolMin": 1,
-            "protocolMax": 1,
-        });
-        let record: DiscoveryRecord = serde_json::from_value(json).expect("parse with aliases");
-        assert_eq!(record.socket_path, PathBuf::from("/tmp/alias.sock"));
-        assert_eq!(record.protocol_min, 1);
-        assert_eq!(record.protocol_max, 1);
-    }
-
-    #[test]
-    fn test_discover_hosts_empty_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let records = discover_hosts_in_dir(dir.path(), unix_time_ms(), None).expect("discover");
-        assert!(records.is_empty(), "empty dir must yield no hosts");
-    }
-
-    #[test]
-    fn test_discover_hosts_ignores_non_matching_filenames() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // Write a valid JSON file but with wrong naming
-        let bad_name = dir.path().join("not-a-discovery.json");
-        let record = make_record(&dir.path().join("placeholder"), "host-x");
-        write_discovery_record(&bad_name, &record);
-
-        let discovered = discover_hosts_in_dir(dir.path(), unix_time_ms(), None).expect("discover");
-        assert!(
-            discovered.is_empty(),
-            "files not matching naming convention must be ignored"
-        );
-    }
-
-    #[test]
-    fn test_observation_buffer_push_take_len() {
-        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
-        assert_eq!(bridge.observation_buffer_len(), 0);
-
-        let event = protocol::ObservationEvent {
-            version: 1,
-            observer_id: "obs-1".to_string(),
-            events: vec![protocol::ObservationEntry {
-                kind: "console".to_string(),
-                message: Some("hello".to_string()),
-                source: None,
-                url: None,
-                ts: 1000,
-            }],
-        };
-        bridge.push_observation(event);
-        assert_eq!(bridge.observation_buffer_len(), 1);
-
-        let taken = bridge.take_observations();
-        assert_eq!(taken.len(), 1);
-        assert_eq!(bridge.observation_buffer_len(), 0, "take must clear buffer");
-    }
-
-    #[test]
-    fn test_disconnect_when_already_disconnected() {
-        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
-        assert_eq!(bridge.status().state, ConnectionState::Disconnected);
-        bridge
-            .disconnect()
-            .expect("disconnect on already-disconnected bridge must succeed");
-        assert_eq!(bridge.status().state, ConnectionState::Disconnected);
-    }
-
-    #[test]
-    fn test_bridge_error_display_messages() {
-        let err = ChromeBridgeError::BrowserToolsDisabled;
-        assert!(
-            format!("{err}").contains("disabled"),
-            "BrowserToolsDisabled: {err}"
-        );
-
-        let err = ChromeBridgeError::NoHostsFound;
-        assert!(format!("{err}").contains("no valid"), "NoHostsFound: {err}");
-
-        let err = ChromeBridgeError::ProtocolMismatch("v99".to_string());
-        assert!(format!("{err}").contains("v99"), "ProtocolMismatch: {err}");
-
-        let err = ChromeBridgeError::AuthBusy {
-            host_id: "h1".to_string(),
-            claimed_by: None,
-        };
-        assert!(format!("{err}").contains("h1"), "AuthBusy: {err}");
-    }
-
-    #[test]
-    fn test_connection_state_equality() {
-        assert_eq!(ConnectionState::Disconnected, ConnectionState::Disconnected);
-        assert_ne!(ConnectionState::Disconnected, ConnectionState::Connected);
-        assert_ne!(ConnectionState::Connecting, ConnectionState::Authenticating);
-        assert_ne!(ConnectionState::Connected, ConnectionState::Disabled);
-    }
-
-    #[test]
-    fn test_bridge_status_clone() {
-        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
-        let s1 = bridge.status();
-        let s2 = s1.clone();
-        assert_eq!(s1, s2, "cloned status must equal original");
     }
 }

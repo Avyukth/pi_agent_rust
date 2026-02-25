@@ -13598,6 +13598,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let env = self.config.env.clone();
         let deny_env = self.config.deny_env;
         let repair_mode = self.config.repair_mode;
+        #[cfg(target_os = "linux")]
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
@@ -14227,6 +14228,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let configured_repair_mode = repair_mode;
+                        #[cfg(target_os = "linux")]
                         let repair_events = Arc::clone(&repair_events);
                         move |path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
@@ -14430,6 +14432,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             #[cfg(not(target_os = "linux"))]
                             {
+                                use std::io::Read;
+
                                 let checked_path = std::fs::canonicalize(&requested_abs)
                                     .map(crate::extensions::strip_unc_prefix)
                                     .or_else(|err| {
@@ -14488,7 +14492,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                use std::io::Read;
                                 let file = std::fs::File::open(&checked_path).map_err(|err| {
                                     // Handle missing asset logic for non-Linux if needed, but for now
                                     // standard error mapping is fine as the Linux block above handles
@@ -14523,7 +14526,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
-                                        format!("host read failed: file exceeds {} bytes", MAX_SYNC_READ_SIZE),
+                                        format!(
+                                            "host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"
+                                        ),
                                     ));
                                 }
 

@@ -336,8 +336,8 @@ pub struct Cli {
     pub no_migrations: bool,
 
     // === Mode & Output ===
-    /// Output mode for print mode (text, json, rpc)
-    #[arg(long, value_parser = ["text", "json", "rpc"])]
+    /// Output mode for print mode (text, json, rpc) or internal host mode (chrome-native-host)
+    #[arg(long, value_parser = ["text", "json", "rpc", "chrome-native-host"])]
     pub mode: Option<String>,
 
     /// Non-interactive mode (process & exit)
@@ -896,6 +896,12 @@ mod tests {
     fn invalid_mode_rejected() {
         let result = Cli::try_parse_from(["pi", "--mode", "xml"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn chrome_native_host_mode_parses() {
+        let cli = Cli::parse_from(["pi", "--mode", "chrome-native-host"]);
+        assert_eq!(cli.mode.as_deref(), Some("chrome-native-host"));
     }
 
     #[test]
