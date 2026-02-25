@@ -59,7 +59,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
     // Execute the tool
     let result = tool.execute("test-id", case.input.clone(), None).await;
 
-    // Handle expected errors
+    // Handle expected errors — both Err(...) and Ok(ToolOutput { is_error: true }).
     if case.expect_error {
         match result {
             Err(e) => {
@@ -75,6 +75,25 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                         &case.name,
                         format!(
                             "Error message '{error_msg}' does not contain expected '{expected_substr}'"
+                        ),
+                    );
+                }
+                return TestResult::pass(&case.name);
+            }
+            Ok(ref o) if o.is_error => {
+                // Tool returned success with is_error flag (e.g. bash non-zero exit).
+                let content = extract_text_content(&o.content);
+                if let Some(expected_substr) = &case.error_contains {
+                    if content
+                        .to_lowercase()
+                        .contains(&expected_substr.to_lowercase())
+                    {
+                        return TestResult::pass(&case.name);
+                    }
+                    return TestResult::fail(
+                        &case.name,
+                        format!(
+                            "is_error output '{content}' does not contain expected '{expected_substr}'"
                         ),
                     );
                 }

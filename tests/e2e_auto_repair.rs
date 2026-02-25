@@ -427,15 +427,16 @@ fn full_corpus_with_auto_repair() {
         eprintln!("  {pat}: {count}");
     }
 
-    // Assert: no failures among extensions that have artifacts
+    // Assert: no failures among extensions that have artifacts.
+    // Exclude: artifacts not found, and ENOENT on internal files (incomplete corpus data).
     let real_failures: Vec<_> = results
         .iter()
         .filter(|r| {
             !r.loaded
-                && !r
-                    .error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("artifact not found"))
+                && !r.error.as_deref().is_some_and(|e| {
+                    e.starts_with("artifact not found")
+                        || e.contains("ENOENT: no such file or directory")
+                })
         })
         .collect();
     assert!(

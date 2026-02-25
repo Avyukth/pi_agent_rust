@@ -64,26 +64,29 @@ fn capability_display_matches_as_str() {
 
 #[test]
 fn capability_dangerous_classification() {
-    // Only exec and env are dangerous.
     let dangerous: Vec<Capability> = ALL_CAPABILITIES
         .iter()
         .copied()
         .filter(|c| c.is_dangerous())
         .collect();
-    assert_eq!(dangerous, vec![Capability::Exec, Capability::Env]);
+    assert_eq!(
+        dangerous,
+        vec![Capability::Exec, Capability::Env, Capability::Browser]
+    );
 }
 
 #[test]
 fn capability_safe_classification() {
+    let dangerous_count = Capability::dangerous_list().len();
     let safe: Vec<Capability> = ALL_CAPABILITIES
         .iter()
         .copied()
         .filter(|c| !c.is_dangerous())
         .collect();
-    assert_eq!(safe.len(), ALL_CAPABILITIES.len() - 2);
+    assert_eq!(safe.len(), ALL_CAPABILITIES.len() - dangerous_count);
     for cap in &safe {
         assert!(
-            !matches!(cap, Capability::Exec | Capability::Env),
+            !cap.is_dangerous(),
             "{cap} should be safe"
         );
     }

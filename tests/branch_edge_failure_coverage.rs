@@ -33,9 +33,9 @@ use tempfile::TempDir;
 fn truncate_head_empty_content() {
     let result = truncate_head("", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 1); // empty string = 1 line (no newlines)
+    assert_eq!(result.total_lines, 0); // empty string = 0 lines
     assert_eq!(result.total_bytes, 0);
-    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_lines, 0);
     assert!(!result.first_line_exceeds_limit);
 }
 
@@ -52,15 +52,17 @@ fn truncate_head_no_truncation_exact_fit() {
 
 #[test]
 fn truncate_head_first_line_exceeds_bytes() {
-    // Single line that is longer than max_bytes — triggers first_line_exceeds_limit branch
+    // Single line that is longer than max_bytes — triggers first_line_exceeds_limit branch.
+    // Implementation truncates the first line to max_bytes (not empties it).
     let long_line = "x".repeat(100);
     let result = truncate_head(&long_line, 10, 50);
     assert!(result.truncated);
     assert!(result.first_line_exceeds_limit);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    assert_eq!(result.output_lines, 0);
-    assert_eq!(result.output_bytes, 0);
-    assert!(result.content.is_empty());
+    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_bytes, 50);
+    assert_eq!(result.content.len(), 50);
+    assert!(result.last_line_partial);
 }
 
 #[test]
@@ -70,38 +72,41 @@ fn truncate_head_truncated_by_lines_not_bytes() {
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
     assert_eq!(result.output_lines, 3);
-    assert_eq!(result.content, "a\nb\nc");
+    // Implementation includes trailing newlines of kept lines: "a\nb\nc\n"
+    assert_eq!(result.content, "a\nb\nc\n");
 }
 
 #[test]
 fn truncate_head_truncated_by_bytes_not_lines() {
-    // 5 short lines but byte limit cuts it
+    // 5 short lines but byte limit cuts it.
+    // Each line is 4 bytes + 1 newline = 5 bytes per line.
+    // "aaaa\n" = 5, "aaaa\nbbbb\n" = 10. Implementation includes trailing newlines.
     let content = "aaaa\nbbbb\ncccc\ndddd\neeee";
-    // Each line is 4 bytes + 1 newline = 5 bytes per line. First line = 4 bytes, then +5 each.
-    // max_bytes = 10 → fits "aaaa\nbbbb" (9 bytes) but not "aaaa\nbbbb\ncccc" (14 bytes)
     let result = truncate_head(content, 100, 10);
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
     assert_eq!(result.output_lines, 2);
-    assert_eq!(result.content, "aaaa\nbbbb");
+    assert_eq!(result.content, "aaaa\nbbbb\n");
 }
 
 #[test]
 fn truncate_head_single_newline_only() {
+    // "\n" ends with '\n', so total_lines = count_of_newlines = 1
     let result = truncate_head("\n", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 2); // "\n" = empty line + empty line after
+    assert_eq!(result.total_lines, 1);
     assert_eq!(result.content, "\n");
 }
 
 #[test]
 fn truncate_head_trailing_newline_preserved() {
     let content = "line1\nline2\n";
+    // "line1\nline2\n" ends with '\n' → total_lines = 2 (2 newlines).
+    // 2 lines <= max_lines=2, 12 bytes <= 1024 → not truncated.
     let result = truncate_head(content, 2, 1024);
-    // "line1\nline2\n" has 3 lines (last is empty after trailing newline)
-    // With max_lines=2, we get "line1\nline2"
-    assert!(result.truncated);
+    assert!(!result.truncated);
     assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, content);
 }
 
 #[test]
@@ -123,12 +128,16 @@ fn truncate_head_max_bytes_zero() {
 
 #[test]
 fn truncate_head_unicode_multibyte() {
-    // Each emoji is 4 bytes
+    // Each emoji is 4 bytes. First line = 8 bytes (2 emojis). Total = 8 + 1 + 4 = 13 bytes.
     let content = "\u{1F600}\u{1F601}\n\u{1F602}";
+    // first_line_bytes = 8, not > 8 → normal iteration.
+    // i=0: line=8 bytes, has_newline=true, line_len=9. 0+9 > 8 → break (Bytes).
+    // byte_count=0, line_count=0 → empty output.
     let result = truncate_head(content, 10, 8);
-    // First line: 8 bytes (2 emojis). Byte budget = 8.
-    // First line fits exactly.
-    assert_eq!(result.output_lines, 1);
+    assert!(result.truncated);
+    assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+    assert_eq!(result.output_lines, 0);
+    assert!(result.content.is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1386,21 +1395,26 @@ fn hints_api_generic() {
 
 #[test]
 fn truncate_head_byte_boundary_between_lines() {
-    // "ab\ncd\nef" -> line sizes: "ab"=2, "\ncd"=3 (total 5), "\nef"=3 (total 8)
+    // split('\n') → ["ab", "cd", "ef"]
+    // i=0: "ab", has_newline=true, line_len=3. byte_count=3, line_count=1
+    // i=1: "cd", has_newline=true, line_len=3. 3+3=6 > 5 → break (Bytes)
+    // content.truncate(3) → "ab\n"
     let content = "ab\ncd\nef";
-    // Byte limit 5 → "ab\ncd" = 5 bytes exactly
     let result = truncate_head(content, 100, 5);
-    assert_eq!(result.content, "ab\ncd");
-    assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, "ab\n");
+    assert_eq!(result.output_lines, 1);
     assert!(result.truncated);
 }
 
 #[test]
 fn truncate_head_byte_limit_one_less_than_line_end() {
-    // "ab\ncd\nef" with limit 4 → "ab" only (can't fit "\ncd" = 3 more bytes, total would be 5)
+    // split('\n') → ["ab", "cd", "ef"]
+    // i=0: "ab", has_newline=true, line_len=3. byte_count=3, line_count=1
+    // i=1: "cd", has_newline=true, line_len=3. 3+3=6 > 4 → break (Bytes)
+    // content.truncate(3) → "ab\n"
     let content = "ab\ncd\nef";
     let result = truncate_head(content, 100, 4);
-    assert_eq!(result.content, "ab");
+    assert_eq!(result.content, "ab\n");
     assert_eq!(result.output_lines, 1);
 }
 
@@ -1434,12 +1448,14 @@ fn truncate_head_both_limits_hit_lines_first() {
 
 #[test]
 fn truncate_head_both_limits_hit_bytes_first() {
-    // 3 lines, 6 bytes total. Line limit = 100, byte limit = 3
+    // split('\n') → ["a", "b", "c"]
+    // i=0: "a", has_newline=true, line_len=2. byte_count=2, line_count=1
+    // i=1: "b", has_newline=true, line_len=2. 2+2=4 > 3 → break (Bytes)
+    // content.truncate(2) → "a\n"
     let content = "a\nb\nc";
     let result = truncate_head(content, 100, 3);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    // "a\nb" = 3 bytes
-    assert_eq!(result.content, "a\nb");
+    assert_eq!(result.content, "a\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

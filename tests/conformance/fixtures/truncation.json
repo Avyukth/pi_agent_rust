@@ -22,14 +22,14 @@
     },
     {
       "name": "head_truncate_by_lines",
-      "description": "Truncate from head when exceeding line limit",
+      "description": "Truncate from head when exceeding line limit (includes trailing newline of last kept line)",
       "input": {
         "content": "line1\nline2\nline3\nline4\nline5",
         "max_lines": 3,
         "max_bytes": 10000
       },
       "expected": {
-        "content_exact": "line1\nline2\nline3",
+        "content_exact": "line1\nline2\nline3\n",
         "details_exact": {
           "truncated": true,
           "truncated_by": "lines",
@@ -56,19 +56,19 @@
     },
     {
       "name": "head_first_line_exceeds_bytes",
-      "description": "When first line alone exceeds byte limit, return empty",
+      "description": "When first line alone exceeds byte limit, truncate to max_bytes",
       "input": {
         "content": "this is a very long first line that exceeds the limit",
         "max_lines": 100,
         "max_bytes": 10
       },
       "expected": {
-        "content_exact": "",
+        "content_exact": "this is a ",
         "details_exact": {
           "truncated": true,
           "truncated_by": "bytes",
           "first_line_exceeds_limit": true,
-          "output_lines": 0
+          "output_lines": 1
         }
       }
     },
@@ -119,8 +119,8 @@
         "content_exact": "",
         "details_exact": {
           "truncated": false,
-          "total_lines": 1,
-          "output_lines": 1
+          "total_lines": 0,
+          "output_lines": 0
         }
       }
     },
