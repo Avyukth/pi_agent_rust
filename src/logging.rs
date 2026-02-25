@@ -86,8 +86,9 @@ const REDACTED_FIELD_NAMES: &[&str] = &[
 /// 2. **file** — JSON-formatted, filtered at `debug` level, written to
 ///    `~/.pi/logs/pi-chrome.YYYY-MM-DD.log` with daily rotation.
 ///
-/// Both layers apply field-level redaction for sensitive values at INFO
-/// and below (DEBUG/TRACE bypass redaction for local debugging).
+/// **Note on redaction:** `is_sensitive_field` and `redact_if_sensitive` are
+/// defined in this module but are NOT yet wired into these production layers.
+/// See the `Redaction` section below for details and the TODO.
 pub fn init_logging() {
     let stderr_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -187,8 +188,30 @@ pub fn prune_old_logs() {
 }
 
 // ─── Redaction ──────────────────────────────────────────────────────────────
+//
+// **STATUS: NOT CURRENTLY ACTIVE in production tracing layers.**
+//
+// The functions below (`is_sensitive_field`, `redact_if_sensitive`) define the
+// redaction policy but are NOT wired into the stderr or file appender tracing
+// subscriber layers. The file appender logs at `debug` level with full field
+// values, which means tokens and keys CAN appear in log files.
+//
+// These functions ARE used by the test `CaptureLayer` (see `StringVisitor`
+// below) to verify that the redaction logic itself is correct.
+//
+// TODO(security): Wire redaction into production layers by implementing a
+// custom `FormatFields` / `MakeVisitor` for the file appender layer that
+// calls `redact_if_sensitive` for each recorded field. This requires either:
+//   1. A custom `tracing_subscriber::fmt::FormatFields` implementation, or
+//   2. A dedicated `Layer` that rewrites events before they reach the
+//      formatter (complex, requires `tracing-subscriber` internals).
+// Until then, ensure sensitive fields are not logged at call sites.
 
 /// Returns true if the field name looks sensitive and should be redacted.
+///
+/// **Note:** This function is not currently called by the production tracing
+/// subscriber layers. It is used by the test capture layer and exists for
+/// future integration into a custom `FormatFields` visitor.
 pub fn is_sensitive_field(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     REDACTED_FIELD_NAMES.iter().any(|&pat| lower.contains(pat))
@@ -197,6 +220,10 @@ pub fn is_sensitive_field(name: &str) -> bool {
 /// Redact a value if the field name is sensitive.
 ///
 /// Returns `"[REDACTED]"` for sensitive fields, the original value otherwise.
+///
+/// **Note:** This function is not currently called by the production tracing
+/// subscriber layers. It is used by the test capture layer and exists for
+/// future integration into a custom `FormatFields` visitor.
 pub fn redact_if_sensitive<'a>(field_name: &str, value: &'a str) -> std::borrow::Cow<'a, str> {
     if is_sensitive_field(field_name) {
         std::borrow::Cow::Borrowed("[REDACTED]")
