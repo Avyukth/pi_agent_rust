@@ -213,6 +213,8 @@ pub struct ChromeBridge {
     write_lanes: StdMutex<WriteLaneRegistry>,
     request_seq: AtomicU64,
     connection_seq: AtomicU64,
+    /// Handle to the background reader thread, joined on disconnect/drop (M6 fix).
+    reader_handle: StdMutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
@@ -245,6 +247,7 @@ impl ChromeBridge {
             write_lanes: StdMutex::new(WriteLaneRegistry::new()),
             request_seq: AtomicU64::new(1),
             connection_seq: AtomicU64::new(1),
+            reader_handle: StdMutex::new(None),
         }
     }
 
@@ -912,12 +915,15 @@ impl ChromeBridge {
     }
 
     fn spawn_reader_thread(&self, read_half: OwnedReadHalf, connection_token: u64) {
+        // Join any lingering previous reader thread before spawning a new one.
+        self.join_reader_thread();
+
         let pending = Arc::clone(&self.pending);
         let observations = Arc::clone(&self.observations);
         let inner = Arc::clone(&self.inner);
         let writer = Arc::clone(&self.writer);
 
-        let _reader = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let runtime = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
                 Ok(runtime) => runtime,
                 Err(err) => {
@@ -937,13 +943,34 @@ impl ChromeBridge {
             }
             finalize_reader_shutdown(connection_token, &inner, &writer, &pending);
         });
+
+        *self
+            .reader_handle
+            .lock()
+            .expect("reader_handle mutex poisoned") = Some(handle);
+    }
+
+    /// Join the background reader thread if one is running.
+    /// Dropping the writer (closing the socket) should unblock the reader.
+    fn join_reader_thread(&self) {
+        if let Some(handle) = self
+            .reader_handle
+            .lock()
+            .expect("reader_handle mutex poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
     }
 
     fn mark_disconnected(&self) {
+        // Drop the writer first — closing the socket unblocks the reader thread.
         self.writer
             .lock()
             .expect("chrome bridge writer mutex poisoned")
             .take();
+        // Join the reader thread now that the socket is closed (M6 fix).
+        self.join_reader_thread();
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
         guard.connection_token = 0;
         if guard.state != ConnectionState::Disabled {
@@ -965,6 +992,7 @@ impl ChromeBridge {
             .lock()
             .expect("chrome bridge writer mutex poisoned")
             .take();
+        self.join_reader_thread();
         let mut guard = self.inner.lock().expect("chrome bridge mutex poisoned");
         guard.consecutive_failures = guard.consecutive_failures.saturating_add(1);
         guard.connection_token = 0;
@@ -974,6 +1002,17 @@ impl ChromeBridge {
         } else {
             guard.state = ConnectionState::Disconnected;
         }
+    }
+}
+
+impl Drop for ChromeBridge {
+    fn drop(&mut self) {
+        // Close the socket to unblock the reader, then join.
+        self.writer
+            .lock()
+            .expect("chrome bridge writer mutex poisoned")
+            .take();
+        self.join_reader_thread();
     }
 }
 
@@ -3359,6 +3398,54 @@ mod tests {
         assert!(
             reg.by_tab.contains_key(&42),
             "live lane for tab 42 must survive cleanup"
+        );
+    }
+
+    // ===================================================================
+    // Reader thread join tests (M6 fix)
+    // ===================================================================
+
+    /// M6: ChromeBridge must join its reader thread on drop instead of
+    /// leaving it lingering.
+    #[test]
+    fn reader_handle_is_joined_on_drop() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+
+        // Simulate a reader handle by inserting a trivial thread.
+        let handle = std::thread::spawn(|| {
+            // Completes immediately.
+        });
+        *bridge
+            .reader_handle
+            .lock()
+            .expect("reader_handle mutex poisoned") = Some(handle);
+
+        // Drop should join without hanging.
+        drop(bridge);
+        // If we get here, the join succeeded and didn't block.
+    }
+
+    /// M6: mark_disconnected must join the reader thread after closing the socket.
+    #[test]
+    fn mark_disconnected_joins_reader_thread() {
+        let bridge = ChromeBridge::new(ChromeBridgeConfig::default());
+
+        let handle = std::thread::spawn(|| {});
+        *bridge
+            .reader_handle
+            .lock()
+            .expect("reader_handle mutex poisoned") = Some(handle);
+
+        bridge.mark_disconnected();
+
+        // After mark_disconnected, reader_handle should be None (joined).
+        assert!(
+            bridge
+                .reader_handle
+                .lock()
+                .expect("reader_handle mutex poisoned")
+                .is_none(),
+            "reader handle must be joined after mark_disconnected"
         );
     }
 }
