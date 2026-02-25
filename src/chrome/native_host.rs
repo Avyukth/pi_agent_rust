@@ -1945,6 +1945,91 @@ mod tests {
         }
 
         #[test]
+        fn test_esl_proptest_request_id_scope_isolates_terminal_replay(
+            payload_a in esl_json_value_strategy(),
+            payload_b in esl_json_value_strategy(),
+            request_suffix in 1_u16..2000,
+        ) {
+            let mut journal = EslJournal::with_limits_for_test(60_000, 64, 1 << 20);
+            let request_a = sample_request_struct("req-esl-request-scope-a", payload_a);
+            let request_b = protocol::Request {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: format!("req-esl-request-scope-b-{request_suffix}"),
+                op: request_a.op.clone(),
+                payload: payload_b,
+            };
+            let response_a = protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: request_a.id.clone(),
+                ok: true,
+                result: serde_json::json!({"request_scope": "a", "ok": true}),
+            });
+            let response_b = protocol::ResponseEnvelope::Ok(protocol::Response {
+                version: protocol::PROTOCOL_VERSION_V1,
+                id: request_b.id.clone(),
+                ok: true,
+                result: serde_json::json!({"request_scope": "b", "ok": true}),
+            });
+            let session = "session-prop";
+            let epoch = "epoch-prop";
+            let now_ms = unix_time_ms();
+
+            let first_a = journal.begin_request(session, epoch, &request_a, now_ms)?;
+            prop_assert_eq!(
+                first_a,
+                EslBeginOutcome::Dispatch,
+                "first request_id must dispatch"
+            );
+            journal.record_terminal_response(
+                session,
+                epoch,
+                &request_a,
+                &response_a,
+                now_ms + 1,
+            )?;
+
+            let first_b = journal.begin_request(session, epoch, &request_b, now_ms + 2)?;
+            prop_assert_eq!(
+                first_b,
+                EslBeginOutcome::Dispatch,
+                "different request_id in same session/epoch must dispatch independently"
+            );
+            journal.record_terminal_response(
+                session,
+                epoch,
+                &request_b,
+                &response_b,
+                now_ms + 3,
+            )?;
+
+            let replay_a = journal.begin_request(session, epoch, &request_a, now_ms + 4)?;
+            match replay_a {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response_a,
+                    "request_id A duplicate must replay request_id A terminal response only"
+                ),
+                other => prop_assert!(
+                    false,
+                    "request_id A duplicate must replay after terminal record, got {other:?}"
+                ),
+            }
+
+            let replay_b = journal.begin_request(session, epoch, &request_b, now_ms + 5)?;
+            match replay_b {
+                EslBeginOutcome::Replay(replayed) => prop_assert_eq!(
+                    replayed,
+                    response_b,
+                    "request_id B duplicate must replay request_id B terminal response only"
+                ),
+                other => prop_assert!(
+                    false,
+                    "request_id B duplicate must replay after terminal record, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
         fn test_esl_proptest_trace_duplicate_requests_are_terminally_idempotent(
             trace in prop::collection::vec((0_u8..6_u8, 0_u8..8_u8, 0_u8..8_u8), 0..48)
         ) {
