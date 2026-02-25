@@ -3309,6 +3309,13 @@ fn list_packages_in_settings(path: &Path) -> Result<Vec<PackageEntry>> {
 }
 
 fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Result<()> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(Error::Config(
+            "settings package source cannot be empty".to_string(),
+        ));
+    }
+
     let mut root = read_settings_json(path)?;
     if !root.is_object() {
         root = serde_json::json!({});
@@ -4522,6 +4529,26 @@ mod tests {
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages, &vec![json!("npm:foo")]);
+    }
+
+    #[test]
+    fn update_package_sources_rejects_empty_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        let err = update_package_sources(&path, "   ", UpdateAction::Add).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("settings package source cannot be empty"),
+            "unexpected error: {err}"
+        );
+
+        let settings = read_settings_json(&path).expect("read");
+        assert!(
+            settings.get("packages").is_none(),
+            "failed update must not mutate packages"
+        );
     }
 
     // ======================================================================
