@@ -84,6 +84,7 @@ pub mod http;
 pub mod http_shim;
 pub mod interactive;
 pub mod keybindings;
+pub mod logging;
 pub mod migrations;
 pub mod model;
 pub mod model_selector;
