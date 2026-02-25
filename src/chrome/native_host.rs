@@ -2152,6 +2152,87 @@ mod tests {
                 ),
             }
         }
+
+        #[test]
+        fn test_esl_proptest_accounting_and_capacity_invariants_hold_across_trace(
+            trace in prop::collection::vec((0_u8..8_u8, 0_u8..8_u8, 0_u8..8_u8, 0_u16..512_u16), 0..96)
+        ) {
+            let ttl_ms = 64_i64;
+            let mut journal = EslJournal::with_limits_for_test(ttl_ms, 8, 16 << 10);
+            let session = "session-accounting";
+            let mut epoch = "epoch-accounting-a".to_string();
+            let mut now_ms = unix_time_ms();
+
+            for (kind, slot_raw, variant_raw, advance_raw) in trace {
+                now_ms = now_ms.saturating_add(i64::from(advance_raw % 9));
+
+                match kind % 8 {
+                    0..=2 => {
+                        let request = trace_request_for_slot(slot_raw, variant_raw);
+                        let _ = journal.begin_request(session, &epoch, &request, now_ms)?;
+                    }
+                    3 => {
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, true);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                    }
+                    4 => {
+                        let request = trace_request_for_slot(slot_raw, 0);
+                        let response = trace_terminal_response_for(&request, false);
+                        journal.record_terminal_response(session, &epoch, &request, &response, now_ms)?;
+                    }
+                    5 => {
+                        // Explicit prune step to exercise accounting cleanup independent of begin_request().
+                        journal.prune_expired_terminal_entries(
+                            now_ms.saturating_add(i64::from(advance_raw % 200)),
+                        );
+                    }
+                    6 => {
+                        epoch = if epoch == "epoch-accounting-a" {
+                            format!("epoch-accounting-b-{}", variant_raw % 4)
+                        } else {
+                            "epoch-accounting-a".to_string()
+                        };
+                    }
+                    7 => {
+                        // Touching capacity checks with zero additional bytes should be a no-op success.
+                        let _ = journal.ensure_capacity_for_new_entry(0, now_ms);
+                    }
+                    _ => unreachable!("kind % 8 constrains action space"),
+                }
+
+                let accounted_bytes: usize =
+                    journal.entries.values().map(|entry| entry.approx_bytes).sum();
+                prop_assert_eq!(
+                    journal.current_bytes,
+                    accounted_bytes,
+                    "ESL byte accounting drifted from entry sum"
+                );
+                prop_assert!(
+                    journal.entries.len() <= journal.max_entries,
+                    "ESL entry count exceeded max_entries: {} > {}",
+                    journal.entries.len(),
+                    journal.max_entries
+                );
+                prop_assert!(
+                    journal.current_bytes <= journal.max_bytes,
+                    "ESL byte usage exceeded max_bytes: {} > {}",
+                    journal.current_bytes,
+                    journal.max_bytes
+                );
+
+                for entry in journal.entries.values() {
+                    prop_assert!(
+                        entry.last_access_ms >= entry.created_at_ms,
+                        "ESL entry last_access_ms must not move before created_at_ms"
+                    );
+                    prop_assert!(
+                        entry.approx_bytes > 0,
+                        "ESL entry approx_bytes must remain positive for accounting safety"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
