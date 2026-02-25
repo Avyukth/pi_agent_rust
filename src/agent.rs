@@ -2402,8 +2402,8 @@ mod hidden_custom_counter_tests {
 #[cfg(test)]
 mod drain_observations_tests {
     use super::*;
-    use crate::chrome::ChromeBridge;
     use crate::chrome::protocol::{ObservationEntry, ObservationEvent};
+    use crate::chrome::{ChromeBridge, ChromeBridgeConfig};
     use crate::tools::ToolRegistry;
     use std::path::Path;
     use std::sync::Arc;
@@ -2452,7 +2452,7 @@ mod drain_observations_tests {
             observer_id: "obs-1".to_string(),
             events: vec![ObservationEntry {
                 kind: kind.to_string(),
-                message: message.map(|s| s.to_string()),
+                message: message.map(std::string::ToString::to_string),
                 source: None,
                 url: None,
                 ts: 1000,
@@ -2469,7 +2469,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_returns_none_with_empty_buffer() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         agent.set_chrome_bridge(bridge);
         assert!(agent.drain_observations().is_none());
     }
@@ -2477,7 +2477,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_returns_custom_message_with_events() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(sample_observation(
             "console_error",
             Some("TypeError: cannot read property 'x' of null"),
@@ -2500,12 +2500,12 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_clears_buffer_after_take() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(sample_observation(
             "navigation",
             Some("https://example.com"),
         ));
-        agent.set_chrome_bridge(bridge.clone());
+        agent.set_chrome_bridge(bridge);
 
         // First drain should produce a message
         assert!(agent.drain_observations().is_some());
@@ -2516,7 +2516,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_caps_at_20_lines() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         // Push 25 events in a single batch
         let entries: Vec<ObservationEntry> = (0..25)
             .map(|i| ObservationEntry {
@@ -2551,7 +2551,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_truncates_long_details() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         let long_message = "a".repeat(200);
         bridge.push_observation(sample_observation("console_error", Some(&long_message)));
         agent.set_chrome_bridge(bridge);
@@ -2576,7 +2576,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_includes_metadata_in_details() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(sample_observation("load_complete", None));
         bridge.push_observation(sample_observation("console_error", Some("err")));
         agent.set_chrome_bridge(bridge);
@@ -2595,7 +2595,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_message_added_to_history() {
         let mut agent = make_agent();
-        let bridge = Arc::new(ChromeBridge::new(Default::default()));
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(sample_observation("dom_mutation", Some("element added")));
         agent.set_chrome_bridge(bridge);
 

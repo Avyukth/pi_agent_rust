@@ -5168,7 +5168,7 @@ mod rpc_model_index_tests {
         let models = vec![make_entry("anthropic", "claude-3-opus")];
         let index = build_models_index(&models);
         let key = rpc_model_key("openai", "gpt-4");
-        assert!(index.get(&key).is_none());
+        assert!(!index.contains_key(&key));
     }
 
     #[test]
@@ -5264,10 +5264,7 @@ mod event_drain_tests {
     #[test]
     fn event_drain_buffer_capacity_is_sufficient() {
         // Guardrail: buffer must be large enough for 8 tools × 500 updates.
-        assert!(
-            EVENT_DRAIN_BUFFER >= 4096,
-            "EVENT_DRAIN_BUFFER ({EVENT_DRAIN_BUFFER}) must be >= 4096"
-        );
+        const { assert!(EVENT_DRAIN_BUFFER >= 4096) };
     }
 
     #[test]

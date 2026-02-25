@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn percentile_stats_known_distribution() {
         // 100 values: 1.0, 2.0, ..., 100.0
-        let mut samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let mut samples: Vec<f64> = (1..=100).map(f64::from).collect();
         let stats = PercentileStats::from_samples(&mut samples, "ms").unwrap();
 
         assert_eq!(stats.sample_count, 100);
@@ -1408,7 +1408,7 @@ mod tests {
         let report = EvidenceReport::generate(vec![record], &store);
         let jsonl = report.to_jsonl();
 
-        let lines: Vec<&str> = jsonl.trim().split('\n').collect();
+        let lines: Vec<&str> = jsonl.trim().lines().collect();
         assert_eq!(lines.len(), 3, "envelope + 1 record + 1 comparison");
 
         // Each line should be valid JSON

@@ -1712,7 +1712,7 @@ mod tests {
     #[test]
     fn body_stream_state_reusable_flag_from_connection_close() {
         // `Connection: close` should prevent pooling.
-        let headers = vec![("Connection".to_string(), "close".to_string())];
+        let headers = [("Connection".to_string(), "close".to_string())];
         let has_close = headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close")
         });

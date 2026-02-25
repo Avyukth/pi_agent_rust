@@ -9215,7 +9215,7 @@ mod tests {
         // Reset counter after any initial rebuilds from creation.
         session.rebuild_cache_count = 0;
 
-        run_async(session.save_inner());
+        run_async(session.save_inner()).expect("save_inner");
 
         assert_eq!(
             session.rebuild_cache_count, 0,
@@ -9234,7 +9234,7 @@ mod tests {
         session.entry_ids.clear();
         session.rebuild_cache_count = 0;
 
-        run_async(session.save_inner());
+        run_async(session.save_inner()).expect("save_inner");
 
         assert_eq!(
             session.rebuild_cache_count, 1,
