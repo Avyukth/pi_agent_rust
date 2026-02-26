@@ -1292,6 +1292,19 @@ impl ToolRegistry {
         self.push(Box::new(ShortcutsListTool::new(bridge.clone())));
         self.push(Box::new(UploadImageTool::new(bridge)));
     }
+
+    /// Register voice tools. Only called when `--chrome-voice` is enabled (VS1).
+    /// No-op cost when voice is disabled — this method simply isn't called.
+    pub fn register_voice_tools(
+        &mut self,
+        bridge: std::sync::Arc<crate::chrome::ChromeBridge>,
+    ) {
+        use crate::chrome::tools::*;
+
+        self.push(Box::new(VoiceTtsSpeakTool::new(bridge.clone())));
+        self.push(Box::new(VoiceTtsStopTool::new(bridge.clone())));
+        self.push(Box::new(VoiceStatusTool::new(bridge)));
+    }
 }
 
 // ============================================================================
@@ -6972,5 +6985,49 @@ mod tests {
         assert!(registry.get("edit").is_some());
         assert!(registry.get("nonexistent").is_none());
         assert_eq!(registry.tools().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice tool registration gating (bd-19o.1.5.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_tools_registered_when_enabled() {
+        let mut registry = ToolRegistry::from_tools(vec![]);
+        let bridge = std::sync::Arc::new(crate::chrome::ChromeBridge::new(Default::default()));
+        let observer_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chrome::observer::ObserverRegistry::new(),
+        ));
+
+        registry.register_chrome_tools(bridge.clone(), observer_registry);
+        let count_before = registry.tools().len();
+
+        // Simulate chrome_voice=true
+        registry.register_voice_tools(bridge);
+        let count_after = registry.tools().len();
+
+        assert_eq!(count_after - count_before, 3, "exactly 3 voice tools added");
+        assert!(registry.get("voice_tts_speak").is_some());
+        assert!(registry.get("voice_tts_stop").is_some());
+        assert!(registry.get("voice_status").is_some());
+    }
+
+    #[test]
+    fn voice_tools_absent_when_disabled() {
+        let mut registry = ToolRegistry::from_tools(vec![]);
+        let bridge = std::sync::Arc::new(crate::chrome::ChromeBridge::new(Default::default()));
+        let observer_registry = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chrome::observer::ObserverRegistry::new(),
+        ));
+
+        // Simulate chrome_voice=false: only register_chrome_tools, NOT register_voice_tools
+        registry.register_chrome_tools(bridge, observer_registry);
+
+        assert!(
+            registry.get("voice_tts_speak").is_none(),
+            "voice tools should not be registered without --chrome-voice"
+        );
+        assert!(registry.get("voice_tts_stop").is_none());
+        assert!(registry.get("voice_status").is_none());
     }
 }

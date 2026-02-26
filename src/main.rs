@@ -1162,6 +1162,12 @@ async fn run(
         ));
         tools.register_chrome_tools(bridge.clone(), observer_registry);
 
+        // Voice tools: only registered when --chrome-voice is also set (VS1).
+        if cli.chrome_voice {
+            tools.register_voice_tools(bridge.clone());
+            tracing::info!("Voice tools registered (--chrome-voice)");
+        }
+
         // Discover and connect to the Chrome native host (non-fatal on failure —
         // bridge tools will return "not connected" errors until a host appears).
         match bridge.connect().await {
