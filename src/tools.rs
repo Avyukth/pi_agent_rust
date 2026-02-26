@@ -1454,11 +1454,18 @@ impl Tool for ReadTool {
                     resized.width,
                     resized.height,
                 ) {
-                    let scale = f64::from(ow) / f64::from(w);
-                    let _ = write!(
-                        note,
-                        "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
-                    );
+                    if w > 0 {
+                        let scale = f64::from(ow) / f64::from(w);
+                        let _ = write!(
+                            note,
+                            "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
+                        );
+                    } else {
+                        let _ = write!(
+                            note,
+                            "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]"
+                        );
+                    }
                 }
             }
 
@@ -1692,10 +1699,7 @@ impl Tool for ReadTool {
             details = Some(serde_json::json!({ "truncation": truncation }));
         } else {
             // Calculate how many lines we actually displayed
-            let displayed_lines = text_content
-                .split('\n')
-                .count()
-                .saturating_sub(usize::from(text_content.ends_with('\n')));
+            let displayed_lines = truncation.output_lines;
             let end_line_display = start_line_display
                 .saturating_add(displayed_lines)
                 .saturating_sub(1);
