@@ -285,7 +285,7 @@ fn main_impl() -> Result<()> {
     // Run the application
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 8)
+        .blocking_threads(1, 2)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
