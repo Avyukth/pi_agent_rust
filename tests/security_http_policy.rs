@@ -134,7 +134,7 @@ fn tls_not_required_allows_http() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -156,6 +156,7 @@ fn tls_not_required_allows_http() {
         result.output.get("status").and_then(Value::as_u64),
         Some(200)
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -216,7 +217,7 @@ fn allowlist_wildcard_allows_subdomain() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -234,6 +235,7 @@ fn allowlist_wildcard_allows_subdomain() {
     let result = run_async(async move { connector.dispatch(&call).await.unwrap() });
 
     assert!(!result.is_error, "127.0.0.1 in allowlist should succeed");
+    server.join().unwrap();
 }
 
 #[test]
@@ -242,7 +244,7 @@ fn empty_allowlist_allows_all_hosts() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -261,6 +263,7 @@ fn empty_allowlist_allows_all_hosts() {
         "empty allowlist should allow all: {:?}",
         result.error
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -389,7 +392,7 @@ fn request_body_within_limit_accepted() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         // Read request then respond
         let mut buf = [0u8; 4096];
@@ -412,6 +415,7 @@ fn request_body_within_limit_accepted() {
         "body within limit should succeed: {:?}",
         result.error
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

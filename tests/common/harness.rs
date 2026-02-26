@@ -700,7 +700,9 @@ impl Drop for MockHttpServer {
         self.shutdown.store(true, Ordering::SeqCst);
 
         // Best-effort: poke the listener to unblock accept loops on some platforms.
-        let _ = TcpStream::connect(self.addr);
+        if let Ok(stream) = TcpStream::connect(self.addr) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
 
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -1835,6 +1837,7 @@ mod tests {
 
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("read response");
+        let _ = stream.shutdown(std::net::Shutdown::Both);
 
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("world"));
