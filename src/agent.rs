@@ -416,6 +416,9 @@ pub struct Agent {
 
     /// Optional ChromeBridge for browser automation observation draining.
     chrome_bridge: Option<Arc<ChromeBridge>>,
+
+    /// Whether voice observations should be processed (VS1 gating).
+    voice_enabled: bool,
 }
 
 impl Agent {
@@ -433,6 +436,7 @@ impl Agent {
             cached_tool_defs: None,
             hidden_custom_count: 0,
             chrome_bridge: None,
+            voice_enabled: false,
         }
     }
 
@@ -501,6 +505,12 @@ impl Agent {
         self.chrome_bridge = Some(bridge);
     }
 
+    /// Enable voice observation processing (VS1 opt-in).
+    /// When false (default), voice observations are silently discarded.
+    pub fn set_voice_enabled(&mut self, enabled: bool) {
+        self.voice_enabled = enabled;
+    }
+
     /// Drain browser observations from the ChromeBridge, format as a summary,
     /// and return as a hidden custom message for LLM context injection.
     ///
@@ -525,6 +535,13 @@ impl Agent {
         let mut total_entries = 0;
         for batch in &events {
             for entry in &batch.events {
+                // VS1: silently discard voice observations when voice is disabled.
+                // They shouldn't arrive, but may during reconnect — no error log.
+                if !self.voice_enabled
+                    && entry.source.as_deref() == Some(crate::chrome::protocol::VOICE_OBSERVATION_SOURCE)
+                {
+                    continue;
+                }
                 let msg = entry.message.as_deref().unwrap_or("");
                 let url = entry.url.as_deref().unwrap_or("");
                 let detail = if !msg.is_empty() {
@@ -2766,6 +2783,103 @@ mod drain_observations_tests {
             30,
             "total events across both drains must equal 30 (no data loss)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice observation gating (bd-19o.1.6.3)
+    // -----------------------------------------------------------------------
+
+    fn voice_observation(kind: &str) -> ObservationEvent {
+        ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: kind.to_string(),
+                message: Some(r#"{"transcript":"hello"}"#.to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        }
+    }
+
+    #[test]
+    fn drain_observations_drops_voice_when_disabled() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_turn_committed"));
+        agent.set_chrome_bridge(bridge);
+        // voice_enabled defaults to false
+        assert!(
+            agent.drain_observations().is_none(),
+            "voice observations should be silently discarded when voice is disabled"
+        );
+    }
+
+    #[test]
+    fn drain_observations_processes_voice_when_enabled() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_turn_committed"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msg = agent
+            .drain_observations()
+            .expect("voice observations should be processed when enabled");
+        match msg {
+            Message::Custom(cm) => {
+                assert!(cm.content.contains("voice_turn_committed"));
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_observations_mixed_browser_and_voice_filters_voice_when_disabled() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+
+        // Push a batch with both browser and voice entries
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "mixed".to_string(),
+            events: vec![
+                ObservationEntry {
+                    kind: "console_error".to_string(),
+                    message: Some("ReferenceError".to_string()),
+                    source: None,
+                    url: None,
+                    ts: 1000,
+                },
+                ObservationEntry {
+                    kind: "voice_stt_final".to_string(),
+                    message: Some(r#"{"text":"hi"}"#.to_string()),
+                    source: Some("voice".to_string()),
+                    url: None,
+                    ts: 1001,
+                },
+            ],
+        });
+        agent.set_chrome_bridge(bridge);
+        // voice disabled — only browser events should pass
+
+        let msg = agent
+            .drain_observations()
+            .expect("browser events should still be processed");
+        match msg {
+            Message::Custom(cm) => {
+                assert!(
+                    cm.content.contains("console_error"),
+                    "browser events should be present"
+                );
+                assert!(
+                    !cm.content.contains("voice_stt_final"),
+                    "voice events should be filtered out"
+                );
+            }
+            other => panic!("expected Custom message, got {other:?}"),
+        }
     }
 }
 

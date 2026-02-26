@@ -1207,6 +1207,11 @@ async fn run(
         agent.set_chrome_bridge(bridge.clone());
     }
 
+    // VS1: enable voice observation processing only when --chrome-voice is set.
+    if cli.chrome_voice {
+        agent.set_voice_enabled(true);
+    }
+
     let mut agent_session = AgentSession::new(
         agent,
         session_arc,
