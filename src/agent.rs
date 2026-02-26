@@ -3195,6 +3195,56 @@ mod drain_observations_tests {
         assert!(msgs.is_empty(), "no message field → no messages");
     }
 
+    // -----------------------------------------------------------------------
+    // Malformed event rejection (bd-19o.1.10.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_turn_committed_missing_proof_fields_skips_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // JSON has transcript but proof is missing required fields
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(r#"{"transcript":"hello","proof":{"turn_id":"abc"}}"#.to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert!(msgs.is_empty(), "missing proof fields → no messages");
+    }
+
+    #[test]
+    fn voice_turn_committed_wrong_field_types_skips_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // confidence is a string instead of number
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(r#"{"transcript":"hello","proof":{"turn_id":"abc","confidence":"high","backend":"test","model_id":"v1","timestamp_ms":"now","audio_duration_ms":100,"processing_ms":50}}"#.to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert!(msgs.is_empty(), "wrong field types → no messages");
+    }
+
     #[test]
     fn voice_turn_committed_mixed_with_other_voice_events() {
         let mut agent = make_agent();
