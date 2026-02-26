@@ -600,7 +600,7 @@ impl AuthStorage {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to refresh OAuth token for {provider}: {e}");
-                    failed_providers.push(provider);
+                    failed_providers.push(format!("{provider} ({e})"));
                 }
             }
         }
@@ -693,7 +693,7 @@ impl AuthStorage {
                         elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "Failed to refresh extension OAuth token; continuing with remaining providers"
                     );
-                    failed_providers.push(provider);
+                    failed_providers.push(format!("{provider} ({e})"));
                 }
             }
         }
