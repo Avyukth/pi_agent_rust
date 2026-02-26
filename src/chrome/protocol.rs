@@ -279,6 +279,45 @@ pub enum ProtocolErrorCode {
 }
 
 #[cfg(test)]
+impl CommitProof {
+    /// Returns a valid `CommitProof` with sensible test defaults.
+    pub fn test_default() -> Self {
+        Self {
+            turn_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            confidence: 0.95,
+            backend: "simulated".to_string(),
+            model_id: "tiny-int8-v1.0.0".to_string(),
+            timestamp_ms: 1708700000000,
+            audio_duration_ms: 3200,
+            processing_ms: 450,
+        }
+    }
+}
+
+#[cfg(test)]
+impl VoiceTurnCommitted {
+    /// Returns a valid `VoiceTurnCommitted` with sensible test defaults.
+    pub fn test_default() -> Self {
+        Self {
+            transcript: "list my open tabs".to_string(),
+            proof: CommitProof::test_default(),
+        }
+    }
+}
+
+/// Construct a voice-tagged `ObservationEntry` for tests.
+#[cfg(test)]
+pub fn voice_observation_entry(kind: &str, message_json: Option<String>) -> ObservationEntry {
+    ObservationEntry {
+        kind: kind.to_string(),
+        message: message_json,
+        source: Some(VOICE_OBSERVATION_SOURCE.to_string()),
+        url: None,
+        ts: 1708700000000,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -930,16 +969,59 @@ mod tests {
 
     #[test]
     fn test_voice_observation_entry_with_voice_source() {
-        let entry = ObservationEntry {
-            kind: voice_event_kind::TURN_COMMITTED.to_string(),
-            message: Some(r#"{"transcript":"hello","proof":{}}"#.to_string()),
-            source: Some(VOICE_OBSERVATION_SOURCE.to_string()),
-            url: None,
-            ts: 1000,
-        };
+        let entry = voice_observation_entry(
+            voice_event_kind::TURN_COMMITTED,
+            Some(r#"{"transcript":"hello","proof":{}}"#.to_string()),
+        );
 
         let serialized = serde_json::to_value(&entry).expect("serialize voice observation entry");
         assert_eq!(serialized["kind"], "turn_committed");
         assert_eq!(serialized["source"], "voice");
+    }
+
+    // -----------------------------------------------------------------------
+    // Test helper roundtrips (bd-19o.1.2.4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commit_proof_test_default_roundtrip() {
+        let proof = CommitProof::test_default();
+        assert_eq!(proof.turn_id, "00000000-0000-4000-8000-000000000001");
+        assert!((proof.confidence - 0.95).abs() < f64::EPSILON);
+        assert_eq!(proof.backend, "simulated");
+
+        let json = serde_json::to_string(&proof).expect("serialize");
+        let back: CommitProof = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(proof, back);
+    }
+
+    #[test]
+    fn test_voice_turn_committed_test_default_roundtrip() {
+        let vtc = VoiceTurnCommitted::test_default();
+        assert_eq!(vtc.transcript, "list my open tabs");
+        assert_eq!(vtc.proof.backend, "simulated");
+
+        let json = serde_json::to_string(&vtc).expect("serialize");
+        let back: VoiceTurnCommitted = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(vtc, back);
+    }
+
+    #[test]
+    fn test_voice_observation_entry_helper_tags_source() {
+        let entry = voice_observation_entry(
+            voice_event_kind::STT_FINAL,
+            Some(r#"{"text":"hello","confidence":0.9,"processing_ms":100}"#.to_string()),
+        );
+        assert_eq!(entry.source.as_deref(), Some("voice"));
+        assert_eq!(entry.kind, "stt_final");
+        assert!(entry.message.is_some());
+    }
+
+    #[test]
+    fn test_voice_observation_entry_helper_no_message() {
+        let entry = voice_observation_entry(voice_event_kind::TTS_DONE, None);
+        assert_eq!(entry.source.as_deref(), Some("voice"));
+        assert_eq!(entry.kind, "tts_done");
+        assert!(entry.message.is_none());
     }
 }
