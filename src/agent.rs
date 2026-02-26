@@ -4390,7 +4390,7 @@ mod turn_event_tests {
                 assert_eq!(tr.tool_name, "echo_tool");
                 assert!(!tr.is_error);
             } else {
-                panic!("expected Message::ToolResult, got {:?}", first_result);
+                unreachable!("expected Message::ToolResult, got {:?}", first_result);
             }
             drop(events);
         });

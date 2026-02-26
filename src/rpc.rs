@@ -3997,7 +3997,7 @@ mod tests {
         let mut entry = dummy_entry("gpt-4o-mini", true);
         entry.model.provider = "openai".to_string();
         entry.auth_header = true;
-        entry.api_key = Some("inline-model-key".to_string());
+        entry.api_key = Some("dummy-test-key-12345".to_string());
 
         let auth_path = tempfile::tempdir()
             .expect("tempdir")
@@ -4022,7 +4022,7 @@ mod tests {
         let mut entry = dummy_entry("gpt-4o-mini", true);
         entry.model.provider = "openai".to_string();
         entry.auth_header = true;
-        entry.api_key = Some("   ".to_string());
+        entry.api_key = Some("   ".to_string()); // intentional blank space
 
         let auth_path = tempfile::tempdir()
             .expect("tempdir")
@@ -4169,7 +4169,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, "hello"),
-            other => panic!(),
+            other => unreachable!("expected different match, got: {other:?}"),
         }
     }
 
@@ -4189,7 +4189,7 @@ mod tests {
                 assert!(matches!(&blocks[0], ContentBlock::Text(_)));
                 assert!(matches!(&blocks[1], ContentBlock::Image(_)));
             }
-            other => panic!(),
+            other => unreachable!("expected different match, got: {other:?}"),
         }
     }
 
