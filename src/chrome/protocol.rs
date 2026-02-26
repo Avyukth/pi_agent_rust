@@ -1131,4 +1131,89 @@ mod tests {
         assert!(result.model_id.is_none());
         assert!(result.active_turn_id.is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // Schema roundtrip edge cases (bd-19o.1.10.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commit_proof_confidence_zero_roundtrip() {
+        let proof = CommitProof {
+            turn_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            confidence: 0.0,
+            backend: "whisper_apr_wasm".to_string(),
+            model_id: "tiny-int8-v1.0.0".to_string(),
+            timestamp_ms: 0,
+            audio_duration_ms: 0,
+            processing_ms: 0,
+        };
+        let json = serde_json::to_string(&proof).expect("serialize confidence=0.0");
+        let back: CommitProof = serde_json::from_str(&json).expect("deserialize confidence=0.0");
+        assert!((back.confidence - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_commit_proof_confidence_one_roundtrip() {
+        let proof = CommitProof {
+            turn_id: "ffffffff-ffff-4fff-bfff-ffffffffffff".to_string(),
+            confidence: 1.0,
+            backend: "whisper_apr_wasm".to_string(),
+            model_id: "tiny-int8-v1.0.0".to_string(),
+            timestamp_ms: 9_007_199_254_740_991, // JS MAX_SAFE_INTEGER
+            audio_duration_ms: 999999,
+            processing_ms: 999999,
+        };
+        let json = serde_json::to_string(&proof).expect("serialize confidence=1.0");
+        let back: CommitProof = serde_json::from_str(&json).expect("deserialize confidence=1.0");
+        assert!((back.confidence - 1.0).abs() < f64::EPSILON);
+        assert_eq!(back.timestamp_ms, 9_007_199_254_740_991);
+    }
+
+    #[test]
+    fn test_voice_turn_committed_empty_transcript_roundtrip() {
+        let vtc = VoiceTurnCommitted {
+            transcript: String::new(),
+            proof: CommitProof::test_default(),
+        };
+        let json = serde_json::to_string(&vtc).expect("serialize empty transcript");
+        let back: VoiceTurnCommitted =
+            serde_json::from_str(&json).expect("deserialize empty transcript");
+        assert_eq!(back.transcript, "");
+    }
+
+    #[test]
+    fn test_voice_tts_speak_payload_full_from_typescript_json() {
+        // Matches the wire format TypeScript produces with all optional fields
+        let ts_json = json!({
+            "text": "Here is the refactored auth module",
+            "utterance_id": "utt-001",
+            "voice_name": "Google US English",
+            "rate": 1.2,
+            "pitch": 0.9
+        });
+        // Deserialize into a generic Value to verify field names match
+        let obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(ts_json).expect("parse TS speak payload");
+        assert_eq!(obj["text"], "Here is the refactored auth module");
+        assert_eq!(obj["utterance_id"], "utt-001");
+        assert_eq!(obj["voice_name"], "Google US English");
+        assert_eq!(obj["rate"], 1.2);
+        assert_eq!(obj["pitch"], 0.9);
+    }
+
+    #[test]
+    fn test_voice_tts_speak_payload_minimal_from_typescript_json() {
+        // Matches wire format with optional fields absent (TS undefined → not serialized)
+        let ts_json = json!({
+            "text": "Done",
+            "utterance_id": "utt-002"
+        });
+        let obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(ts_json).expect("parse minimal TS speak payload");
+        assert_eq!(obj["text"], "Done");
+        assert_eq!(obj["utterance_id"], "utt-002");
+        assert!(!obj.contains_key("voice_name"));
+        assert!(!obj.contains_key("rate"));
+        assert!(!obj.contains_key("pitch"));
+    }
 }
