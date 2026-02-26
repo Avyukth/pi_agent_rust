@@ -538,12 +538,35 @@ impl ModelRegistry {
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
     /// where the provider name may be custom.
+    ///
+    /// When multiple providers carry the same model ID, the canonical/primary
+    /// provider is preferred (e.g. `anthropic` for Claude models, `openai` for
+    /// GPT models). If no canonical match exists, the first alphabetical
+    /// provider wins, ensuring deterministic results regardless of insertion
+    /// order.
     pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
         let id = id.trim();
-        self.models
-            .iter()
-            .find(|m| m.model.id.eq_ignore_ascii_case(id))
-            .cloned()
+        let mut best: Option<&ModelEntry> = None;
+        for entry in &self.models {
+            if !entry.model.id.eq_ignore_ascii_case(id) {
+                continue;
+            }
+            let Some(current_best) = best else {
+                best = Some(entry);
+                continue;
+            };
+            let entry_canonical = is_canonical_provider_for_model(id, &entry.model.provider);
+            let best_canonical = is_canonical_provider_for_model(id, &current_best.model.provider);
+            if entry_canonical && !best_canonical {
+                best = Some(entry);
+            } else if entry_canonical == best_canonical
+                && entry.model.provider < current_best.model.provider
+            {
+                // Tie-break alphabetically for determinism.
+                best = Some(entry);
+            }
+        }
+        best.cloned()
     }
 
     /// Merge extension-provided model entries into the registry.
@@ -560,6 +583,84 @@ impl ModelRegistry {
             }
         }
     }
+}
+
+/// Returns `true` when `provider` is the canonical/primary source for a model
+/// identified by `model_id`. Used by `find_by_id` to prefer the authoritative
+/// provider when the same model ID appears under multiple resellers.
+fn is_canonical_provider_for_model(model_id: &str, provider: &str) -> bool {
+    let id_lower = model_id.to_ascii_lowercase();
+    let prov_lower = provider.to_ascii_lowercase();
+    if id_lower.starts_with("claude") {
+        prov_lower == "anthropic"
+    } else if id_lower.starts_with("gpt-")
+        || id_lower.starts_with("o1")
+        || id_lower.starts_with("o3")
+        || id_lower.starts_with("o4")
+    {
+        prov_lower == "openai"
+    } else if id_lower.starts_with("gemini") {
+        prov_lower == "google"
+    } else if id_lower.starts_with("command") {
+        prov_lower == "cohere"
+    } else if id_lower.starts_with("mistral") || id_lower.starts_with("codestral") {
+        prov_lower == "mistral"
+    } else if id_lower.starts_with("deepseek") {
+        prov_lower == "deepseek"
+    } else {
+        false
+    }
+}
+
+/// Determine per-model reasoning capability. Returns `Some(true/false)` for
+/// known model ID patterns, `None` for unknown models (caller should fall back
+/// to the provider-level default).
+///
+/// This prevents non-reasoning models like `gpt-4o` from inheriting a
+/// provider-level `reasoning: true` flag from their provider (Issue #19).
+fn model_is_reasoning(model_id: &str) -> Option<bool> {
+    let id = model_id.to_ascii_lowercase();
+
+    // OpenAI: o1/o3/o4 series are reasoning; gpt-4o/gpt-4-turbo/gpt-3.5 are not.
+    if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+        return Some(true);
+    }
+    if id.starts_with("gpt-4o") || id.starts_with("gpt-4-turbo") || id.starts_with("gpt-3.5") {
+        return Some(false);
+    }
+    // gpt-5.x series: reasoning models.
+    if id.starts_with("gpt-5") {
+        return Some(true);
+    }
+
+    // Anthropic: all Claude models support extended thinking (reasoning).
+    if id.starts_with("claude") {
+        return Some(true);
+    }
+
+    // Google: gemini-2.5+ models are reasoning-capable; earlier are not.
+    if id.starts_with("gemini-2.0-flash-lite") || id.starts_with("gemini-1") {
+        return Some(false);
+    }
+    if id.starts_with("gemini-2.5") || id.starts_with("gemini-3") {
+        return Some(true);
+    }
+
+    // Cohere: command-a is reasoning; command-r is not.
+    if id.starts_with("command-a") {
+        return Some(true);
+    }
+    if id.starts_with("command-r") {
+        return Some(false);
+    }
+
+    None
+}
+
+/// Resolve the effective reasoning flag for a model, preferring per-model
+/// detection over the provider-level default.
+fn effective_reasoning(model_id: &str, provider_default: bool) -> bool {
+    model_is_reasoning(model_id).unwrap_or(provider_default)
 }
 
 fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
@@ -668,6 +769,8 @@ fn append_upstream_nonlegacy_models(
                 continue;
             }
 
+            let reasoning =
+                effective_reasoning(&normalized_model_id, defaults.reasoning);
             models.push(ModelEntry {
                 model: Model {
                     id: normalized_model_id.clone(),
@@ -675,7 +778,7 @@ fn append_upstream_nonlegacy_models(
                     api: defaults.api.to_string(),
                     provider: canonical_provider.to_string(),
                     base_url: defaults.base_url.to_string(),
-                    reasoning: defaults.reasoning,
+                    reasoning,
                     input: defaults.input.to_vec(),
                     cost: ModelCost {
                         input: 0.0,
@@ -803,7 +906,7 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
                 api: api_string,
                 provider: provider.to_string(),
                 base_url,
-                reasoning: legacy.reasoning,
+                reasoning: effective_reasoning(&normalized_model_id, legacy.reasoning),
                 input,
                 cost: if mode == ModelRegistryLoadMode::Full {
                     legacy.cost.clone().unwrap_or_else(|| default_cost.clone())
@@ -1134,7 +1237,9 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 api: model_api_parsed.to_string(),
                 provider: provider_id.clone(),
                 base_url: provider_base.clone(),
-                reasoning: model_cfg.reasoning.unwrap_or(default_reasoning),
+                reasoning: model_cfg
+                    .reasoning
+                    .unwrap_or_else(|| effective_reasoning(&normalized_model_id, default_reasoning)),
                 input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
                     input: 0.0,
@@ -1389,6 +1494,7 @@ where
     if normalized_model_id.is_empty() {
         return None;
     }
+    let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
     Some(ModelEntry {
         model: Model {
             id: normalized_model_id.clone(),
@@ -1396,7 +1502,7 @@ where
             api: defaults.api.to_string(),
             provider: provider.to_string(),
             base_url: defaults.base_url.to_string(),
-            reasoning: defaults.reasoning,
+            reasoning,
             input: defaults.input.to_vec(),
             cost: ModelCost {
                 input: 0.0,
@@ -2335,7 +2441,8 @@ mod tests {
     #[test]
     fn ad_hoc_alibaba_aliases() {
         for alias in ["alibaba", "dashscope", "qwen"] {
-            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("dashscope"));
         }
     }
@@ -2343,7 +2450,8 @@ mod tests {
     #[test]
     fn ad_hoc_moonshot_aliases() {
         for alias in ["moonshotai", "moonshot", "kimi"] {
-            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("moonshot"));
         }
     }
@@ -2368,7 +2476,8 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
             assert!(defaults.base_url.contains("api.minimax"));
@@ -2388,7 +2497,8 @@ mod tests {
             ("scaleway", "https://api.scaleway.ai/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2411,7 +2521,8 @@ mod tests {
             ),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2463,7 +2574,8 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
