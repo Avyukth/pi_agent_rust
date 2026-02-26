@@ -145,7 +145,7 @@ fn dispatch_event(
         let event_name = event_name.to_string();
         async move {
             runtime
-                .dispatch_event(event_name, payload, ctx, DEFAULT_TIMEOUT_MS)
+                .dispatch_event(event_name, payload, std::sync::Arc::new(ctx), DEFAULT_TIMEOUT_MS)
                 .await
                 .map_err(|e| format!("dispatch_event: {e}"))
         }
