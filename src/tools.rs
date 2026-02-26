@@ -3050,28 +3050,28 @@ fn process_rg_json_match_line(
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     effective_limit: usize,
-) -> Result<()> {
+) {
     if *match_limit_reached {
-        return Ok(());
+        return;
     }
 
     let line = match line_res {
         Ok(l) => l,
         Err(e) => {
             tracing::debug!("Skipping ripgrep output line due to read error: {e}");
-            return Ok(());
+            return;
         }
     };
     if line.trim().is_empty() {
-        return Ok(());
+        return;
     }
 
     let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return Ok(());
+        return;
     };
 
     if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
-        return Ok(());
+        return;
     }
 
     *match_count += 1;
@@ -3092,8 +3092,6 @@ fn process_rg_json_match_line(
     if *match_count >= effective_limit {
         *match_limit_reached = true;
     }
-
-    Ok(())
 }
 
 fn drain_rg_stdout(
@@ -3102,7 +3100,7 @@ fn drain_rg_stdout(
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     effective_limit: usize,
-) -> Result<()> {
+) {
     while let Ok(line_res) = stdout_rx.try_recv() {
         process_rg_json_match_line(
             line_res,
@@ -3110,12 +3108,11 @@ fn drain_rg_stdout(
             match_count,
             match_limit_reached,
             effective_limit,
-        )?;
+        );
         if *match_limit_reached {
             break;
         }
     }
-    Ok(())
 }
 
 fn drain_rg_stderr(
@@ -3318,7 +3315,7 @@ impl Tool for GrepTool {
                 &mut match_count,
                 &mut match_limit_reached,
                 effective_limit,
-            )?;
+            );
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
             if match_limit_reached {
@@ -3344,7 +3341,7 @@ impl Tool for GrepTool {
             &mut match_count,
             &mut match_limit_reached,
             effective_limit,
-        )?;
+        );
 
         let code = if match_limit_reached {
             // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
@@ -3377,7 +3374,7 @@ impl Tool for GrepTool {
                     &mut match_count,
                     &mut match_limit_reached,
                     effective_limit,
-                )?;
+                );
             }
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
             sleep(wall_now(), Duration::from_millis(1)).await;
@@ -3404,7 +3401,7 @@ impl Tool for GrepTool {
                 &mut match_count,
                 &mut match_limit_reached,
                 effective_limit,
-            )?;
+            );
         }
         drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
