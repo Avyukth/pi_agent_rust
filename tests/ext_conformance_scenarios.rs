@@ -1763,8 +1763,10 @@ fn load_extension_with_mocks(
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
         let interceptor_clone = Arc::clone(&interceptor) as Arc<dyn HostcallInterceptor>;
-        let mut policy = ExtensionPolicy::default();
-        policy.mode = ExtensionPolicyMode::Permissive;
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Permissive,
+            ..ExtensionPolicy::default()
+        };
         policy.deny_caps.clear();
         async move {
             JsExtensionRuntimeHandle::start_with_interceptor_and_policy(
