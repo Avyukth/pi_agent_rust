@@ -3604,6 +3604,285 @@ mod drain_observations_tests {
     }
 }
 
+/// Transport trace replay tests (bd-19o.1.10.3):
+/// Replay canonical trace fixtures through drain_observations and verify
+/// the correct Messages are produced.
+#[cfg(test)]
+mod trace_replay_tests {
+    use super::*;
+    use crate::chrome::protocol::{
+        ObservationEntry, ObservationEvent, VOICE_OBSERVATION_SOURCE,
+    };
+    use crate::chrome::{ChromeBridge, ChromeBridgeConfig};
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str { "stub" }
+        fn api(&self) -> &str { "stub" }
+        fn model_id(&self) -> &str { "stub" }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn make_voice_agent() -> Agent {
+        let mut agent = Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        agent.set_voice_enabled(true);
+        agent
+    }
+
+    /// Convert a trace fixture JSON to ObservationEvents for ChromeBridge.
+    fn trace_to_observations(trace_json: &str) -> Vec<ObservationEvent> {
+        let trace: serde_json::Value =
+            serde_json::from_str(trace_json).expect("parse trace JSON");
+        let events = trace["events"].as_array().expect("events array");
+
+        events
+            .iter()
+            .map(|event| {
+                let wire_kind = event["kind"].as_str().expect("kind string");
+
+                ObservationEvent {
+                    version: 1,
+                    observer_id: "observer_voice_replay".to_string(),
+                    events: vec![ObservationEntry {
+                        kind: wire_kind.to_string(),
+                        message: event
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .map(String::from),
+                        source: Some(VOICE_OBSERVATION_SOURCE.to_string()),
+                        url: None,
+                        ts: event["relative_ms"].as_i64().unwrap_or(0),
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    fn replay_and_drain(trace_json: &str) -> Vec<Message> {
+        let mut agent = make_voice_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        for obs in trace_to_observations(trace_json) {
+            bridge.push_observation(obs);
+        }
+        agent.set_chrome_bridge(bridge);
+        agent.drain_observations()
+    }
+
+    // Inline trace fixtures via include_str!
+    const SIMPLE_TURN: &str = include_str!(
+        "../../pi_chrome_extension/test/fixtures/voice/traces/simple-turn.json"
+    );
+    const RAPID_TURNS: &str = include_str!(
+        "../../pi_chrome_extension/test/fixtures/voice/traces/rapid-turns.json"
+    );
+    const STT_TIMEOUT: &str = include_str!(
+        "../../pi_chrome_extension/test/fixtures/voice/traces/stt-timeout.json"
+    );
+    const TTS_ERROR: &str = include_str!(
+        "../../pi_chrome_extension/test/fixtures/voice/traces/tts-error.json"
+    );
+    const RECONNECT: &str = include_str!(
+        "../../pi_chrome_extension/test/fixtures/voice/traces/reconnect-mid-turn.json"
+    );
+
+    // --- simple-turn.json: turn_committed → Message::User ---
+
+    #[test]
+    fn simple_turn_committed_becomes_user_message() {
+        let msgs = replay_and_drain(SIMPLE_TURN);
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 1, "expected exactly 1 User message");
+        match user_msgs[0] {
+            Message::User(um) => match &um.content {
+                UserContent::Text(t) => assert_eq!(t, "hello world"),
+                other => panic!("expected Text, got {other:?}"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn simple_turn_has_commit_proof() {
+        let msgs = replay_and_drain(SIMPLE_TURN);
+        let proof_msgs: Vec<_> = msgs
+            .iter()
+            .filter(|m| {
+                matches!(m, Message::Custom(cm) if cm.custom_type == "voice_commit_proof")
+            })
+            .collect();
+        assert_eq!(proof_msgs.len(), 1, "expected exactly 1 CommitProof message");
+    }
+
+    // --- rapid-turns.json: all 3 commits arrive in order ---
+
+    #[test]
+    fn rapid_turns_all_3_committed() {
+        let msgs = replay_and_drain(RAPID_TURNS);
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 3, "expected 3 User messages");
+    }
+
+    #[test]
+    fn rapid_turns_transcripts_in_order() {
+        let msgs = replay_and_drain(RAPID_TURNS);
+        let transcripts: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(um) => match &um.content {
+                    UserContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            transcripts,
+            vec!["run tests", "fix the bug", "deploy to staging"]
+        );
+    }
+
+    #[test]
+    fn rapid_turns_unique_turn_ids() {
+        let msgs = replay_and_drain(RAPID_TURNS);
+        let proofs: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Message::Custom(cm) if cm.custom_type == "voice_commit_proof" => {
+                    cm.details.as_ref().and_then(|d| {
+                        d.get("proof")
+                            .and_then(|p| p.get("turn_id"))
+                            .and_then(|t| t.as_str())
+                            .map(String::from)
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(proofs.len(), 3);
+        let unique: std::collections::HashSet<_> = proofs.iter().collect();
+        assert_eq!(unique.len(), 3, "all turn_ids should be unique");
+    }
+
+    // --- stt-timeout.json: no User message ---
+
+    #[test]
+    fn stt_timeout_no_user_message() {
+        let msgs = replay_and_drain(STT_TIMEOUT);
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 0, "stt_error should not produce User message");
+    }
+
+    #[test]
+    fn stt_timeout_produces_voice_observation() {
+        let msgs = replay_and_drain(STT_TIMEOUT);
+        let voice_obs: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, Message::Custom(cm) if cm.custom_type == "voice_event"))
+            .collect();
+        assert!(!voice_obs.is_empty(), "should produce voice observation summary");
+    }
+
+    // --- tts-error.json: User message still arrives, tts_error in summary ---
+
+    #[test]
+    fn tts_error_user_message_still_arrives() {
+        let msgs = replay_and_drain(TTS_ERROR);
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 1, "committed turn should produce User message");
+        match user_msgs[0] {
+            Message::User(um) => match &um.content {
+                UserContent::Text(t) => assert_eq!(t, "check status"),
+                other => panic!("expected Text, got {other:?}"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn tts_error_in_voice_observation_summary() {
+        let msgs = replay_and_drain(TTS_ERROR);
+        let voice_obs: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, Message::Custom(cm) if cm.custom_type == "voice_event"))
+            .collect();
+        assert!(!voice_obs.is_empty(), "tts_error should be in voice observation summary");
+        if let Message::Custom(cm) = voice_obs[0] {
+            assert!(
+                cm.content.contains("tts_error"),
+                "voice observation summary should mention tts_error, got: {}",
+                cm.content
+            );
+        }
+    }
+
+    // --- reconnect-mid-turn.json: recovery turn arrives ---
+
+    #[test]
+    fn reconnect_recovery_turn_arrives() {
+        let msgs = replay_and_drain(RECONNECT);
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 1, "recovery turn should produce User message");
+        match user_msgs[0] {
+            Message::User(um) => match &um.content {
+                UserContent::Text(t) => assert_eq!(t, "open the file"),
+                other => panic!("expected Text, got {other:?}"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    // --- Event ordering: User messages before observation summaries ---
+
+    #[test]
+    fn user_messages_before_voice_observations() {
+        for (name, json) in [
+            ("simple-turn", SIMPLE_TURN),
+            ("rapid-turns", RAPID_TURNS),
+            ("tts-error", TTS_ERROR),
+            ("reconnect", RECONNECT),
+        ] {
+            let msgs = replay_and_drain(json);
+            let mut found_voice_obs = false;
+            for msg in &msgs {
+                if let Message::Custom(cm) = msg {
+                    if cm.custom_type == "voice_event" {
+                        found_voice_obs = true;
+                    }
+                }
+                if found_voice_obs {
+                    assert!(
+                        !matches!(msg, Message::User(_)),
+                        "{name}: User message should not appear after voice observation summary"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// VS1 behavior matrix tests (bd-19o.1.6.4):
 /// {voice enabled, voice disabled} × {tool calls, observations, capabilities}
 ///
