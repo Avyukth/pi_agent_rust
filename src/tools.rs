@@ -2650,7 +2650,7 @@ impl Tool for EditTool {
             )));
         }
 
-        let absolute_path = resolve_read_path(&input.path, &self.cwd);
+        let absolute_path = crate::extensions::safe_canonicalize(&resolve_read_path(&input.path, &self.cwd));
 
         // Match legacy behavior: any access failure is reported as "File not found".
         if asupersync::fs::OpenOptions::new()
@@ -2935,7 +2935,7 @@ impl Tool for WriteTool {
             )));
         }
 
-        let path = resolve_path(&input.path, &self.cwd);
+        let path = crate::extensions::safe_canonicalize(&resolve_path(&input.path, &self.cwd));
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
@@ -3441,7 +3441,7 @@ impl Tool for GrepTool {
         }
 
         for file_path in file_order {
-            let mut match_lines = matches_by_file.remove(&file_path).unwrap();
+            let Some(mut match_lines) = matches_by_file.remove(&file_path) else { continue; };
             let relative_path = format_grep_path(&file_path, &self.cwd);
             let lines = get_file_lines_async(&file_path, &mut file_cache).await;
 
