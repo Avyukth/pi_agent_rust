@@ -26,6 +26,8 @@ use std::process::{Command, Output};
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const TESTING_POLICY_PATH: &str = "docs/testing-policy.md";
+const PLAN_TO_COMPLETE_PORT_PATH: &str = "PLAN_TO_COMPLETE_PORT.md";
+const PROGRAM_GOVERNANCE_PATH: &str = "docs/program-governance.md";
 const NON_MOCK_RUBRIC_PATH: &str = "docs/non-mock-rubric.json";
 const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
 const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
@@ -4116,4 +4118,43 @@ fn binary_size_budget_event_threshold_matches_perf_budget_source() {
         (actual_threshold - expected_threshold).abs() < f64::EPSILON,
         "binary-size event threshold drift: event={actual_threshold}, source={expected_threshold}"
     );
+}
+
+#[test]
+fn governance_docs_reject_deprecated_bv_robot_flags() {
+    let monitored_docs = [PLAN_TO_COMPLETE_PORT_PATH, PROGRAM_GOVERNANCE_PATH];
+    for path in monitored_docs {
+        let doc = load_text(path);
+        assert!(
+            !doc.contains("--robot-triage"),
+            "{path} must not reference deprecated bv flag --robot-triage"
+        );
+        assert!(
+            !doc.contains("--robot-next"),
+            "{path} must not reference deprecated bv flag --robot-next"
+        );
+    }
+
+    let plan_doc = load_text(PLAN_TO_COMPLETE_PORT_PATH);
+    assert!(
+        plan_doc.contains("bv --robot-plan"),
+        "{PLAN_TO_COMPLETE_PORT_PATH} must reference bv --robot-plan"
+    );
+    assert!(
+        plan_doc.contains("bv --robot-priority"),
+        "{PLAN_TO_COMPLETE_PORT_PATH} must reference bv --robot-priority"
+    );
+
+    let governance_doc = load_text(PROGRAM_GOVERNANCE_PATH);
+    for needle in [
+        "bv --robot-plan",
+        "bv --robot-priority",
+        "br ready --json",
+        "br show <id>",
+    ] {
+        assert!(
+            governance_doc.contains(needle),
+            "{PROGRAM_GOVERNANCE_PATH} must include '{needle}' for tombstone-safe triage"
+        );
+    }
 }
