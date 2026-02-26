@@ -1152,10 +1152,14 @@ async fn run(
     // Chrome browser automation: when --chrome is set, create the ChromeBridge
     // and register all 21 browser tools (S1 opt-in security invariant).
     let chrome_bridge = if cli.chrome {
-        let bridge_config = pi::chrome::ChromeBridgeConfig::new(
+        let mut bridge_config = pi::chrome::ChromeBridgeConfig::new(
             format!("pi-{}", std::process::id()),
             format!("cli-{}", std::process::id()),
         );
+        // VS1: include "voice" in want_capabilities only when --chrome-voice is set.
+        if cli.chrome_voice {
+            bridge_config.want_capabilities.push("voice".to_string());
+        }
         let bridge = std::sync::Arc::new(pi::chrome::ChromeBridge::new(bridge_config));
         let observer_registry = std::sync::Arc::new(std::sync::Mutex::new(
             pi::chrome::observer::ObserverRegistry::new(),

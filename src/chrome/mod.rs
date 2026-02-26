@@ -3451,4 +3451,41 @@ mod tests {
             "reader handle must be joined after mark_disconnected"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Voice capability negotiation (bd-19o.1.6.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn want_capabilities_default_excludes_voice() {
+        let config = ChromeBridgeConfig::default();
+        assert!(
+            !config.want_capabilities.contains(&"voice".to_string()),
+            "default want_capabilities must NOT include 'voice' (VS1)"
+        );
+        assert!(config.want_capabilities.contains(&"browser_tools".to_string()));
+        assert!(config.want_capabilities.contains(&"observations".to_string()));
+    }
+
+    #[test]
+    fn want_capabilities_includes_voice_when_pushed() {
+        let mut config = ChromeBridgeConfig::default();
+        config.want_capabilities.push("voice".to_string());
+        assert!(config.want_capabilities.contains(&"voice".to_string()));
+        // Existing capabilities still present
+        assert!(config.want_capabilities.contains(&"browser_tools".to_string()));
+        assert!(config.want_capabilities.contains(&"observations".to_string()));
+        assert_eq!(config.want_capabilities.len(), 3);
+    }
+
+    #[test]
+    fn auth_claim_carries_want_capabilities() {
+        let mut config = ChromeBridgeConfig::new("test-session", "test-client");
+        config.want_capabilities.push("voice".to_string());
+        let bridge = ChromeBridge::new(config.clone());
+
+        // Verify the bridge stores the capabilities
+        assert_eq!(bridge.config.want_capabilities, config.want_capabilities);
+        assert!(bridge.config.want_capabilities.contains(&"voice".to_string()));
+    }
 }
