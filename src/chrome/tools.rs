@@ -32,6 +32,11 @@
 //! - `ShortcutsExecuteTool`: dispatch keyboard shortcut
 //! - `ShortcutsListTool`: list available shortcuts (read-only)
 //! - `UploadImageTool`: upload image to file input
+//!
+//! Voice tools (bd-19o.1.5):
+//! - `VoiceTtsSpeakTool`: speak text aloud via chrome.tts
+//! - `VoiceTtsStopTool`: stop current TTS utterance
+//! - `VoiceStatusTool`: query voice subsystem state (read-only)
 
 // All Tool trait impls return `&'static str` from name/label/description but the
 // trait signature uses `&str` tied to `&self`. Clippy flags this as
@@ -2106,6 +2111,219 @@ impl Tool for UploadImageTool {
 }
 
 // ============================================================================
+// Voice Tools (bd-19o.1.5)
+// ============================================================================
+
+/// Input type for voice_tts_speak.
+#[derive(Debug, Deserialize)]
+struct VoiceTtsSpeakInput {
+    /// Text to speak aloud.
+    text: String,
+    /// Caller-generated utterance ID for tracking.
+    utterance_id: String,
+    /// Optional TTS voice name override.
+    voice_name: Option<String>,
+    /// Optional speech rate (0.1–10.0, default 1.0).
+    rate: Option<f64>,
+    /// Optional pitch (0.0–2.0, default 1.0).
+    pitch: Option<f64>,
+}
+
+/// Speak text aloud via chrome.tts.
+///
+/// Sends a TTS request to the Chrome extension with the given text and
+/// optional voice parameters. The extension emits voice_tts_started and
+/// voice_tts_done/voice_tts_error observations on completion.
+pub struct VoiceTtsSpeakTool {
+    bridge: Arc<ChromeBridge>,
+}
+
+impl VoiceTtsSpeakTool {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+#[async_trait]
+impl Tool for VoiceTtsSpeakTool {
+    fn name(&self) -> &str {
+        "voice_tts_speak"
+    }
+
+    fn label(&self) -> &str {
+        "voice_tts_speak"
+    }
+
+    fn description(&self) -> &str {
+        "Speak text aloud using chrome.tts. Requires --chrome-voice flag (VS1). \
+         Emits voice_tts_started and voice_tts_done/voice_tts_error observations."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to speak aloud"
+                },
+                "utterance_id": {
+                    "type": "string",
+                    "description": "Unique identifier for this utterance (for tracking)"
+                },
+                "voice_name": {
+                    "type": "string",
+                    "description": "TTS voice name override (optional, uses default if omitted)"
+                },
+                "rate": {
+                    "type": "number",
+                    "description": "Speech rate, 0.1–10.0 (default 1.0)"
+                },
+                "pitch": {
+                    "type": "number",
+                    "description": "Speech pitch, 0.0–2.0 (default 1.0)"
+                }
+            },
+            "required": ["text", "utterance_id"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let payload = input.clone();
+        let input: VoiceTtsSpeakInput =
+            serde_json::from_value(input).map_err(|e| crate::error::Error::Tool {
+                tool: "voice_tts_speak".to_string(),
+                message: format!("invalid parameters: {e}"),
+            })?;
+
+        if input.text.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "Error: text must not be empty",
+                ))],
+                details: None,
+                is_error: true,
+            });
+        }
+
+        if input.utterance_id.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "Error: utterance_id must not be empty",
+                ))],
+                details: None,
+                is_error: true,
+            });
+        }
+
+        execute_bridge_request(&self.bridge, "voice_tts_speak", payload).await
+    }
+}
+
+/// Stop the current TTS utterance.
+///
+/// Sends a stop command to the Chrome extension to halt any in-progress
+/// TTS playback. No-op if nothing is playing.
+pub struct VoiceTtsStopTool {
+    bridge: Arc<ChromeBridge>,
+}
+
+impl VoiceTtsStopTool {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+#[async_trait]
+impl Tool for VoiceTtsStopTool {
+    fn name(&self) -> &str {
+        "voice_tts_stop"
+    }
+
+    fn label(&self) -> &str {
+        "voice_tts_stop"
+    }
+
+    fn description(&self) -> &str {
+        "Stop the current TTS utterance. No-op if nothing is playing. \
+         Requires --chrome-voice flag (VS1)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        execute_bridge_request(&self.bridge, "voice_tts_stop", input).await
+    }
+}
+
+/// Query the current voice subsystem state.
+///
+/// Returns the VoiceSession FSM state (disabled, idle, listening,
+/// processing, speaking) and any active observer/utterance IDs.
+pub struct VoiceStatusTool {
+    bridge: Arc<ChromeBridge>,
+}
+
+impl VoiceStatusTool {
+    pub const fn new(bridge: Arc<ChromeBridge>) -> Self {
+        Self { bridge }
+    }
+}
+
+#[async_trait]
+impl Tool for VoiceStatusTool {
+    fn name(&self) -> &str {
+        "voice_status"
+    }
+
+    fn label(&self) -> &str {
+        "voice_status"
+    }
+
+    fn description(&self) -> &str {
+        "Query the current voice subsystem state (disabled, idle, listening, \
+         processing, speaking). Requires --chrome-voice flag (VS1)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        execute_bridge_request(&self.bridge, "voice_status", input).await
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -3732,5 +3950,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // VoiceTtsSpeakTool tests (bd-19o.1.5.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_tts_speak_tool_metadata() {
+        let tool = VoiceTtsSpeakTool::new(make_bridge());
+        assert_eq!(tool.name(), "voice_tts_speak");
+        assert_eq!(tool.label(), "voice_tts_speak");
+        assert!(tool.description().contains("Speak text aloud"));
+        assert!(!tool.is_read_only());
+    }
+
+    #[test]
+    fn voice_tts_speak_schema_has_required_fields() {
+        let tool = VoiceTtsSpeakTool::new(make_bridge());
+        let params = tool.parameters();
+        let required = params["required"].as_array().expect("required array");
+        let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_names.contains(&"text"));
+        assert!(required_names.contains(&"utterance_id"));
+    }
+
+    #[test]
+    fn voice_tts_speak_rejects_empty_text() {
+        run_async(async {
+            let tool = VoiceTtsSpeakTool::new(make_bridge());
+            let result = tool
+                .execute(
+                    "call-1",
+                    serde_json::json!({ "text": "", "utterance_id": "u1" }),
+                    None,
+                )
+                .await
+                .expect("should return ToolOutput, not Err");
+            assert!(result.is_error);
+        });
+    }
+
+    #[test]
+    fn voice_tts_speak_rejects_empty_utterance_id() {
+        run_async(async {
+            let tool = VoiceTtsSpeakTool::new(make_bridge());
+            let result = tool
+                .execute(
+                    "call-1",
+                    serde_json::json!({ "text": "hello", "utterance_id": "" }),
+                    None,
+                )
+                .await
+                .expect("should return ToolOutput, not Err");
+            assert!(result.is_error);
+        });
+    }
+
+    #[test]
+    fn voice_tts_speak_reaches_bridge_with_valid_input() {
+        run_async(async {
+            let tool = VoiceTtsSpeakTool::new(make_bridge());
+            assert_reaches_bridge(
+                &tool,
+                serde_json::json!({
+                    "text": "hello world",
+                    "utterance_id": "u-001",
+                    "rate": 1.5,
+                    "pitch": 0.8
+                }),
+            )
+            .await;
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // VoiceTtsStopTool tests (bd-19o.1.5.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_tts_stop_tool_metadata() {
+        let tool = VoiceTtsStopTool::new(make_bridge());
+        assert_eq!(tool.name(), "voice_tts_stop");
+        assert_eq!(tool.label(), "voice_tts_stop");
+        assert!(tool.description().contains("Stop"));
+        assert!(tool.description().contains("utterance"));
+        assert!(!tool.is_read_only());
+    }
+
+    #[test]
+    fn voice_tts_stop_reaches_bridge_with_empty_params() {
+        run_async(async {
+            let tool = VoiceTtsStopTool::new(make_bridge());
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // VoiceStatusTool tests (bd-19o.1.5.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_status_tool_metadata() {
+        let tool = VoiceStatusTool::new(make_bridge());
+        assert_eq!(tool.name(), "voice_status");
+        assert_eq!(tool.label(), "voice_status");
+        assert!(tool.description().contains("Query"));
+        assert!(tool.description().contains("state"));
+        assert!(tool.is_read_only());
+    }
+
+    #[test]
+    fn voice_status_reaches_bridge_with_empty_params() {
+        run_async(async {
+            let tool = VoiceStatusTool::new(make_bridge());
+            assert_reaches_bridge(&tool, serde_json::json!({})).await;
+        });
     }
 }
