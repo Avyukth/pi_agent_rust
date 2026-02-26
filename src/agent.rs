@@ -538,6 +538,7 @@ impl Agent {
         let mut browser_lines = Vec::new();
         let mut browser_entries = 0;
         let mut voice_lines = Vec::new();
+        let mut voice_kinds = Vec::new();
         let mut voice_entries = 0;
         let mut voice_user_messages: Vec<Message> = Vec::new();
 
@@ -597,6 +598,7 @@ impl Agent {
                 let line = Self::format_observation_line(entry);
                 if is_voice {
                     voice_lines.push(line);
+                    voice_kinds.push(Value::String(entry.kind.clone()));
                     voice_entries += 1;
                 } else {
                     browser_lines.push(line);
@@ -628,11 +630,12 @@ impl Agent {
             let summary = format!("[Voice Observation]\n{}", voice_lines.join("\n"));
             messages.push(Message::Custom(CustomMessage {
                 content: summary,
-                custom_type: "voice_observations".to_string(),
+                custom_type: "voice_event".to_string(),
                 display: false,
                 details: Some(json!({
                     "events_processed": voice_entries,
                     "batches": events.len(),
+                    "kinds": voice_kinds,
                 })),
                 timestamp: Utc::now().timestamp_millis(),
             }));
@@ -3013,7 +3016,7 @@ mod drain_observations_tests {
             _ => false,
         });
         let voice_msg = msgs.iter().find(|m| match m {
-            Message::Custom(cm) => cm.custom_type == "voice_observations",
+            Message::Custom(cm) => cm.custom_type == "voice_event",
             _ => false,
         });
 
@@ -3198,7 +3201,7 @@ mod drain_observations_tests {
         }
         match &msgs[2] {
             Message::Custom(cm) => {
-                assert_eq!(cm.custom_type, "voice_observations");
+                assert_eq!(cm.custom_type, "voice_event");
                 assert!(cm.content.contains("voice_stt_partial"));
             }
             other => panic!("expected voice_observations at [2], got {other:?}"),
@@ -3216,13 +3219,134 @@ mod drain_observations_tests {
         agent.set_voice_enabled(true);
 
         let msgs = agent.drain_observations();
-        // Should only produce voice_observations Custom, no User messages
+        // Should only produce voice_event Custom, no User messages
         assert_eq!(msgs.len(), 1);
         for msg in &msgs {
             match msg {
                 Message::User(_) => panic!("non-committed voice events must NOT create User messages"),
                 _ => {}
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-committed voice events → hidden Custom messages (bd-19o.1.7.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_tts_started_becomes_hidden_custom() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_tts_started"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_event");
+                assert!(!cm.display, "voice events must be hidden (display=false)");
+                assert!(cm.content.contains("voice_tts_started"));
+                let details = cm.details.as_ref().expect("details present");
+                let kinds = details["kinds"].as_array().expect("kinds is array");
+                assert!(kinds.iter().any(|k| k.as_str() == Some("voice_tts_started")));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_tts_done_becomes_hidden_custom() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_tts_done"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_event");
+                assert!(!cm.display);
+                let details = cm.details.as_ref().unwrap();
+                let kinds = details["kinds"].as_array().unwrap();
+                assert!(kinds.iter().any(|k| k.as_str() == Some("voice_tts_done")));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_stt_error_becomes_hidden_custom() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_stt_error"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_event");
+                assert!(!cm.display);
+                let details = cm.details.as_ref().unwrap();
+                let kinds = details["kinds"].as_array().unwrap();
+                assert!(kinds.iter().any(|k| k.as_str() == Some("voice_stt_error")));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_tts_error_becomes_hidden_custom() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_tts_error"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_event");
+                assert!(!cm.display);
+                let details = cm.details.as_ref().unwrap();
+                let kinds = details["kinds"].as_array().unwrap();
+                assert!(kinds.iter().any(|k| k.as_str() == Some("voice_tts_error")));
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_multiple_non_committed_kinds_batched_with_all_kinds_in_details() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_observation("voice_tts_started"));
+        bridge.push_observation(voice_observation("voice_tts_done"));
+        bridge.push_observation(voice_observation("voice_stt_error"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1, "batched into single Custom");
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_event");
+                assert!(!cm.display);
+                let details = cm.details.as_ref().unwrap();
+                let kinds = details["kinds"].as_array().unwrap();
+                let kind_strs: Vec<&str> = kinds.iter().filter_map(|k| k.as_str()).collect();
+                assert!(kind_strs.contains(&"voice_tts_started"));
+                assert!(kind_strs.contains(&"voice_tts_done"));
+                assert!(kind_strs.contains(&"voice_stt_error"));
+                assert_eq!(details["events_processed"], 3);
+            }
+            other => panic!("expected Custom, got {other:?}"),
         }
     }
 }
