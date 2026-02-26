@@ -189,6 +189,64 @@ pub enum ResponseEnvelope {
     Error(ErrorResponse),
 }
 
+// ============================================================================
+// Voice Types (mirrors pi_chrome_extension/src/shared/voice-types.ts)
+// ============================================================================
+
+/// Verified Transcript Commit (VTC) evidence.
+/// Every committed voice transcript carries this provenance chain.
+/// Must stay byte-for-byte JSON-compatible with the TypeScript CommitProof.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitProof {
+    /// UUID v4, unique per committed turn.
+    pub turn_id: String,
+    /// STT confidence score, 0.0–1.0.
+    pub confidence: f64,
+    /// STT backend identifier (e.g. "whisper_apr_wasm", "web_speech", "simulated").
+    pub backend: String,
+    /// Model version identifier (e.g. "tiny-int8-v1.0.0").
+    pub model_id: String,
+    /// Date.now() at commit time (milliseconds since epoch).
+    pub timestamp_ms: u64,
+    /// Total captured audio duration in milliseconds.
+    pub audio_duration_ms: u64,
+    /// STT wall-clock processing time in milliseconds.
+    pub processing_ms: u64,
+}
+
+/// The voice event that becomes agent text input (VS4).
+/// Only voice_turn_committed observations produce Message::User in the agent.
+/// Must stay byte-for-byte JSON-compatible with the TypeScript VoiceTurnCommitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VoiceTurnCommitted {
+    /// Raw transcript text from STT.
+    pub transcript: String,
+    /// VTC provenance proof.
+    pub proof: CommitProof,
+}
+
+/// Voice event kind string constants matching TypeScript `VoiceEventKind` values.
+///
+/// These are the bare (unprefixed) kind names used inside the TypeScript
+/// extension. On the wire (`ObservationEntry.kind`), the extension prepends
+/// `"voice_"` — e.g., `"turn_committed"` becomes `"voice_turn_committed"`.
+/// The Rust `ObservableEventKind` enum in observer.rs uses the prefixed
+/// wire format for serde serialization.
+pub mod voice_event_kind {
+    pub const TURN_COMMITTED: &str = "turn_committed";
+    pub const STT_PARTIAL: &str = "stt_partial";
+    pub const STT_FINAL: &str = "stt_final";
+    pub const STT_ERROR: &str = "stt_error";
+    pub const VAD_STARTED: &str = "vad_started";
+    pub const VAD_STOPPED: &str = "vad_stopped";
+    pub const TTS_STARTED: &str = "tts_started";
+    pub const TTS_DONE: &str = "tts_done";
+    pub const TTS_ERROR: &str = "tts_error";
+}
+
+/// Source field value for voice observations.
+pub const VOICE_OBSERVATION_SOURCE: &str = "voice";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageType {
@@ -748,5 +806,140 @@ mod tests {
                 "decoder must report full consumed length for arbitrary frames"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice type roundtrips
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_commit_proof_json_roundtrip() {
+        let proof = CommitProof {
+            turn_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            confidence: 0.95,
+            backend: "whisper_apr_wasm".to_string(),
+            model_id: "tiny-int8-v1.0.0".to_string(),
+            timestamp_ms: 1708700000000,
+            audio_duration_ms: 3200,
+            processing_ms: 450,
+        };
+
+        let serialized = serde_json::to_string(&proof).expect("serialize CommitProof");
+        let deserialized: CommitProof =
+            serde_json::from_str(&serialized).expect("deserialize CommitProof");
+
+        assert_eq!(deserialized.turn_id, proof.turn_id);
+        assert!((deserialized.confidence - proof.confidence).abs() < f64::EPSILON);
+        assert_eq!(deserialized.backend, proof.backend);
+        assert_eq!(deserialized.model_id, proof.model_id);
+        assert_eq!(deserialized.timestamp_ms, proof.timestamp_ms);
+        assert_eq!(deserialized.audio_duration_ms, proof.audio_duration_ms);
+        assert_eq!(deserialized.processing_ms, proof.processing_ms);
+    }
+
+    #[test]
+    fn test_voice_turn_committed_json_roundtrip() {
+        let committed = VoiceTurnCommitted {
+            transcript: "list my open tabs".to_string(),
+            proof: CommitProof {
+                turn_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                confidence: 0.92,
+                backend: "simulated".to_string(),
+                model_id: "tiny-int8-v1.0.0".to_string(),
+                timestamp_ms: 1708700001000,
+                audio_duration_ms: 1500,
+                processing_ms: 200,
+            },
+        };
+
+        let serialized = serde_json::to_string(&committed).expect("serialize VoiceTurnCommitted");
+        let deserialized: VoiceTurnCommitted =
+            serde_json::from_str(&serialized).expect("deserialize VoiceTurnCommitted");
+
+        assert_eq!(deserialized.transcript, committed.transcript);
+        assert_eq!(deserialized.proof.turn_id, committed.proof.turn_id);
+        assert!((deserialized.proof.confidence - committed.proof.confidence).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_commit_proof_has_all_7_fields() {
+        let proof_json = json!({
+            "turn_id": "abc-123",
+            "confidence": 0.85,
+            "backend": "whisper_apr_wasm",
+            "model_id": "tiny-int8-v1.0.0",
+            "timestamp_ms": 1000,
+            "audio_duration_ms": 2000,
+            "processing_ms": 300
+        });
+
+        let proof: CommitProof =
+            serde_json::from_value(proof_json).expect("all 7 fields must deserialize");
+        assert_eq!(proof.turn_id, "abc-123");
+        assert!((proof.confidence - 0.85).abs() < f64::EPSILON);
+    }
+
+    /// JS Number.MAX_SAFE_INTEGER = 2^53 - 1.  All u64 timestamp/duration
+    /// fields that cross the wire to TypeScript must stay within this bound.
+    #[test]
+    fn test_timestamp_ms_fits_js_safe_integer() {
+        const JS_MAX_SAFE_INTEGER: u64 = (1u64 << 53) - 1;
+        // A realistic timestamp_ms: 2024-02-23T14:00:00Z ≈ 1.7 × 10^12
+        let proof = CommitProof {
+            turn_id: "test".into(),
+            confidence: 0.9,
+            backend: "test".into(),
+            model_id: "test".into(),
+            timestamp_ms: 1708700000000,
+            audio_duration_ms: 3200,
+            processing_ms: 450,
+        };
+        assert!(
+            proof.timestamp_ms < JS_MAX_SAFE_INTEGER,
+            "timestamp_ms must fit in JS safe integer range"
+        );
+        assert!(
+            proof.audio_duration_ms < JS_MAX_SAFE_INTEGER,
+            "audio_duration_ms must fit in JS safe integer range"
+        );
+        assert!(
+            proof.processing_ms < JS_MAX_SAFE_INTEGER,
+            "processing_ms must fit in JS safe integer range"
+        );
+        // Verify the boundary: max safe integer itself
+        assert_eq!(JS_MAX_SAFE_INTEGER, 9_007_199_254_740_991);
+    }
+
+    #[test]
+    fn test_voice_event_kind_constants_match_typescript() {
+        assert_eq!(voice_event_kind::TURN_COMMITTED, "turn_committed");
+        assert_eq!(voice_event_kind::STT_PARTIAL, "stt_partial");
+        assert_eq!(voice_event_kind::STT_FINAL, "stt_final");
+        assert_eq!(voice_event_kind::STT_ERROR, "stt_error");
+        assert_eq!(voice_event_kind::VAD_STARTED, "vad_started");
+        assert_eq!(voice_event_kind::VAD_STOPPED, "vad_stopped");
+        assert_eq!(voice_event_kind::TTS_STARTED, "tts_started");
+        assert_eq!(voice_event_kind::TTS_DONE, "tts_done");
+        assert_eq!(voice_event_kind::TTS_ERROR, "tts_error");
+    }
+
+    #[test]
+    fn test_voice_observation_source_constant() {
+        assert_eq!(VOICE_OBSERVATION_SOURCE, "voice");
+    }
+
+    #[test]
+    fn test_voice_observation_entry_with_voice_source() {
+        let entry = ObservationEntry {
+            kind: voice_event_kind::TURN_COMMITTED.to_string(),
+            message: Some(r#"{"transcript":"hello","proof":{}}"#.to_string()),
+            source: Some(VOICE_OBSERVATION_SOURCE.to_string()),
+            url: None,
+            ts: 1000,
+        };
+
+        let serialized = serde_json::to_value(&entry).expect("serialize voice observation entry");
+        assert_eq!(serialized["kind"], "turn_committed");
+        assert_eq!(serialized["source"], "voice");
     }
 }

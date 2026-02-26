@@ -40,6 +40,58 @@ pub const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 const COUPLING_SAFETY_MARGIN_MS: u64 = 10_000;
 
 // ============================================================================
+// Voice defaults (from VOICE-BUILD-SPEC §6.9 + README §Configuration)
+// ============================================================================
+
+/// Default STT timeout after PTT release (seconds).
+pub const DEFAULT_STT_TIMEOUT_S: u64 = 5;
+
+/// Default TTS speech rate multiplier (1.0 = normal).
+pub const DEFAULT_TTS_RATE: f64 = 1.0;
+
+/// Default TTS pitch multiplier (1.0 = normal).
+pub const DEFAULT_TTS_PITCH: f64 = 1.0;
+
+// ============================================================================
+// VoiceConfig
+// ============================================================================
+
+/// Voice configuration, nested under `ChromeConfig.voice`.
+///
+/// When absent (or `enabled: false`), voice tools are not registered and
+/// all voice functionality is disabled (VS1 safety invariant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Master enable/disable for voice tools.
+    pub enabled: bool,
+
+    /// Max seconds to wait for STT result after PTT release.
+    pub stt_timeout_s: u64,
+
+    /// TTS speech rate multiplier (1.0 = normal).
+    pub tts_rate: f64,
+
+    /// TTS pitch multiplier (1.0 = normal).
+    pub tts_pitch: f64,
+
+    /// Preferred OS voice name (None = system default).
+    pub tts_voice_name: Option<String>,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_timeout_s: DEFAULT_STT_TIMEOUT_S,
+            tts_rate: DEFAULT_TTS_RATE,
+            tts_pitch: DEFAULT_TTS_PITCH,
+            tts_voice_name: None,
+        }
+    }
+}
+
+// ============================================================================
 // ChromeConfig
 // ============================================================================
 
@@ -53,6 +105,10 @@ const COUPLING_SAFETY_MARGIN_MS: u64 = 10_000;
 pub struct ChromeConfig {
     /// Master enable/disable for browser tools.
     pub enabled: bool,
+
+    /// Voice configuration. When absent or `enabled: false`, voice tools
+    /// are not registered (VS1 safety invariant: `--chrome-voice` opt-in).
+    pub voice: VoiceConfig,
 
     /// Socket timeout for native host connections (milliseconds).
     pub socket_timeout_ms: u64,
@@ -74,6 +130,7 @@ impl Default for ChromeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            voice: VoiceConfig::default(),
             socket_timeout_ms: DEFAULT_SOCKET_TIMEOUT_MS,
             max_reconnect_attempts: DEFAULT_MAX_RECONNECT_ATTEMPTS,
             native_host_idle_timeout_s: DEFAULT_NATIVE_HOST_IDLE_TIMEOUT_S,
@@ -562,5 +619,88 @@ mod tests {
             config.max_reconnect_attempts,
             deserialized.max_reconnect_attempts
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // VoiceConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_config_defaults_disabled() {
+        // VS1: voice defaults to disabled
+        let voice = VoiceConfig::default();
+        assert!(!voice.enabled, "VS1: voice must default to disabled");
+        assert_eq!(voice.stt_timeout_s, 5);
+        assert!((voice.tts_rate - 1.0).abs() < f64::EPSILON);
+        assert!((voice.tts_pitch - 1.0).abs() < f64::EPSILON);
+        assert!(voice.tts_voice_name.is_none());
+    }
+
+    #[test]
+    fn chrome_config_contains_voice_section() {
+        let config = ChromeConfig::default();
+        assert!(
+            !config.voice.enabled,
+            "voice must be disabled by default in ChromeConfig"
+        );
+    }
+
+    #[test]
+    fn voice_config_serialization_roundtrip() {
+        let voice = VoiceConfig {
+            enabled: true,
+            stt_timeout_s: 10,
+            tts_rate: 1.5,
+            tts_pitch: 0.8,
+            tts_voice_name: Some("Samantha".to_string()),
+        };
+        let json = serde_json::to_value(&voice).expect("serialize");
+        let deserialized: VoiceConfig = serde_json::from_value(json).expect("deserialize");
+        assert!(deserialized.enabled);
+        assert_eq!(deserialized.stt_timeout_s, 10);
+        assert!((deserialized.tts_rate - 1.5).abs() < f64::EPSILON);
+        assert!((deserialized.tts_pitch - 0.8).abs() < f64::EPSILON);
+        assert_eq!(deserialized.tts_voice_name.as_deref(), Some("Samantha"));
+    }
+
+    #[test]
+    fn voice_config_absent_key_uses_defaults() {
+        // Absent "voice" key in chrome config JSON should yield defaults
+        let json = serde_json::json!({
+            "enabled": true,
+            "socket_timeout_ms": 5000
+        });
+        let config: ChromeConfig = serde_json::from_value(json).expect("parse");
+        assert!(!config.voice.enabled, "absent voice key should default to disabled");
+        assert_eq!(config.voice.stt_timeout_s, DEFAULT_STT_TIMEOUT_S);
+    }
+
+    #[test]
+    fn voice_config_partial_json_fills_defaults() {
+        let json = serde_json::json!({
+            "enabled": true
+        });
+        let voice: VoiceConfig = serde_json::from_value(json).expect("parse");
+        assert!(voice.enabled);
+        assert_eq!(voice.stt_timeout_s, DEFAULT_STT_TIMEOUT_S);
+        assert!((voice.tts_rate - DEFAULT_TTS_RATE).abs() < f64::EPSILON);
+        assert!(voice.tts_voice_name.is_none());
+    }
+
+    #[test]
+    fn chrome_config_with_voice_section_parses() {
+        let json = serde_json::json!({
+            "enabled": true,
+            "voice": {
+                "enabled": true,
+                "stt_timeout_s": 8,
+                "tts_voice_name": "Alex"
+            }
+        });
+        let config: ChromeConfig = serde_json::from_value(json).expect("parse");
+        assert!(config.enabled);
+        assert!(config.voice.enabled);
+        assert_eq!(config.voice.stt_timeout_s, 8);
+        assert_eq!(config.voice.tts_voice_name.as_deref(), Some("Alex"));
     }
 }

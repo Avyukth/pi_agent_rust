@@ -456,6 +456,13 @@ fn parse_event_kind(s: &str) -> Option<ObservableEventKind> {
         "dom_mutation" => Some(ObservableEventKind::DomMutation),
         "navigation" => Some(ObservableEventKind::Navigation),
         "load_complete" => Some(ObservableEventKind::LoadComplete),
+        "voice_turn_committed" => Some(ObservableEventKind::VoiceTurnCommitted),
+        "voice_stt_partial" => Some(ObservableEventKind::VoiceSttPartial),
+        "voice_stt_final" => Some(ObservableEventKind::VoiceSttFinal),
+        "voice_stt_error" => Some(ObservableEventKind::VoiceSttError),
+        "voice_tts_started" => Some(ObservableEventKind::VoiceTtsStarted),
+        "voice_tts_done" => Some(ObservableEventKind::VoiceTtsDone),
+        "voice_tts_error" => Some(ObservableEventKind::VoiceTtsError),
         _ => None,
     }
 }
@@ -469,6 +476,13 @@ const fn event_kind_str(kind: ObservableEventKind) -> &'static str {
         ObservableEventKind::DomMutation => "dom_mutation",
         ObservableEventKind::Navigation => "navigation",
         ObservableEventKind::LoadComplete => "load_complete",
+        ObservableEventKind::VoiceTurnCommitted => "voice_turn_committed",
+        ObservableEventKind::VoiceSttPartial => "voice_stt_partial",
+        ObservableEventKind::VoiceSttFinal => "voice_stt_final",
+        ObservableEventKind::VoiceSttError => "voice_stt_error",
+        ObservableEventKind::VoiceTtsStarted => "voice_tts_started",
+        ObservableEventKind::VoiceTtsDone => "voice_tts_done",
+        ObservableEventKind::VoiceTtsError => "voice_tts_error",
     }
 }
 
@@ -2625,12 +2639,51 @@ mod tests {
             ObservableEventKind::DomMutation,
             ObservableEventKind::Navigation,
             ObservableEventKind::LoadComplete,
+            ObservableEventKind::VoiceTurnCommitted,
+            ObservableEventKind::VoiceSttPartial,
+            ObservableEventKind::VoiceSttFinal,
+            ObservableEventKind::VoiceSttError,
+            ObservableEventKind::VoiceTtsStarted,
+            ObservableEventKind::VoiceTtsDone,
+            ObservableEventKind::VoiceTtsError,
         ];
         for kind in &kinds {
             let s = event_kind_str(*kind);
             let parsed = parse_event_kind(s).expect("roundtrip should succeed");
             assert_eq!(&parsed, kind);
         }
+    }
+
+    #[test]
+    fn parse_event_kind_voice_valid() {
+        assert_eq!(
+            parse_event_kind("voice_turn_committed"),
+            Some(ObservableEventKind::VoiceTurnCommitted)
+        );
+        assert_eq!(
+            parse_event_kind("voice_stt_partial"),
+            Some(ObservableEventKind::VoiceSttPartial)
+        );
+        assert_eq!(
+            parse_event_kind("voice_stt_final"),
+            Some(ObservableEventKind::VoiceSttFinal)
+        );
+        assert_eq!(
+            parse_event_kind("voice_stt_error"),
+            Some(ObservableEventKind::VoiceSttError)
+        );
+        assert_eq!(
+            parse_event_kind("voice_tts_started"),
+            Some(ObservableEventKind::VoiceTtsStarted)
+        );
+        assert_eq!(
+            parse_event_kind("voice_tts_done"),
+            Some(ObservableEventKind::VoiceTtsDone)
+        );
+        assert_eq!(
+            parse_event_kind("voice_tts_error"),
+            Some(ObservableEventKind::VoiceTtsError)
+        );
     }
 
     // -----------------------------------------------------------------------

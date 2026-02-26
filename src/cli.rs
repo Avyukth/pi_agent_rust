@@ -57,6 +57,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-themes"
         | "list-providers"
         | "chrome"
+        | "chrome-voice"
         | "setup-chrome" => (false, false),
         "provider"
         | "model"
@@ -365,6 +366,10 @@ pub struct Cli {
     /// Install Chrome native host manifest and wrapper script, then exit
     #[arg(long)]
     pub setup_chrome: bool,
+
+    /// Enable voice input/output for Chrome sessions (VS1 opt-in)
+    #[arg(long)]
+    pub chrome_voice: bool,
 
     /// Chrome extension ID for native messaging allowed_origins (used with --setup-chrome)
     #[arg(long)]
@@ -1401,6 +1406,68 @@ mod tests {
         assert!(
             parsed.extension_flags.is_empty(),
             "--setup-chrome should not be treated as an extension flag"
+        );
+    }
+
+    // ── 16. Voice flags (--chrome-voice) ────────────────────────────────
+
+    #[test]
+    fn chrome_voice_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.chrome_voice, "VS1: chrome_voice must default to false");
+    }
+
+    #[test]
+    fn chrome_voice_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--chrome-voice"]);
+        assert!(cli.chrome_voice);
+    }
+
+    #[test]
+    fn chrome_voice_independent_of_chrome_flag() {
+        // --chrome-voice without --chrome should parse (even if semantically odd)
+        let cli = Cli::parse_from(["pi", "--chrome-voice"]);
+        assert!(cli.chrome_voice);
+        assert!(!cli.chrome, "--chrome-voice should not imply --chrome");
+    }
+
+    #[test]
+    fn chrome_and_chrome_voice_can_coexist() {
+        let cli = Cli::parse_from(["pi", "--chrome", "--chrome-voice"]);
+        assert!(cli.chrome);
+        assert!(cli.chrome_voice);
+    }
+
+    #[test]
+    fn vs1_safety_invariant_no_voice_without_chrome_voice_flag() {
+        // VS1: voice must NEVER activate without explicit --chrome-voice opt-in
+        let cli = Cli::parse_from(["pi"]);
+        assert!(
+            !cli.chrome_voice,
+            "VS1 violation: chrome_voice must default to false"
+        );
+        // Even with --chrome, voice should not be enabled
+        let cli = Cli::parse_from(["pi", "--chrome"]);
+        assert!(
+            !cli.chrome_voice,
+            "VS1 violation: --chrome must not imply --chrome-voice"
+        );
+    }
+
+    #[test]
+    fn chrome_voice_flag_recognized_by_extension_flag_parser() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--chrome".to_string(),
+            "--chrome-voice".to_string(),
+        ])
+        .expect("parse with --chrome-voice flag");
+
+        assert!(parsed.cli.chrome);
+        assert!(parsed.cli.chrome_voice);
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--chrome-voice should not be treated as an extension flag"
         );
     }
 

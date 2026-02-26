@@ -39,15 +39,27 @@ pub const THROTTLE_FLOOR_MS: u64 = 500;
 // ============================================================================
 
 /// Observable event kinds that can be subscribed to.
+/// Browser kinds are the original 6; voice kinds (7 variants) were added
+/// for the voice integration (VOICE-BUILD-SPEC.md §4.2).
+/// Voice events use source="voice" on the wire to distinguish from browser events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservableEventKind {
+    // Browser observation kinds (original)
     ConsoleError,
     ConsoleWarn,
     NetworkError,
     DomMutation,
     Navigation,
     LoadComplete,
+    // Voice observation kinds (VOICE-BUILD-SPEC.md §4.2)
+    VoiceTurnCommitted,
+    VoiceSttPartial,
+    VoiceSttFinal,
+    VoiceSttError,
+    VoiceTtsStarted,
+    VoiceTtsDone,
+    VoiceTtsError,
 }
 
 impl std::fmt::Display for ObservableEventKind {
@@ -59,6 +71,13 @@ impl std::fmt::Display for ObservableEventKind {
             Self::DomMutation => write!(f, "dom_mutation"),
             Self::Navigation => write!(f, "navigation"),
             Self::LoadComplete => write!(f, "load_complete"),
+            Self::VoiceTurnCommitted => write!(f, "voice_turn_committed"),
+            Self::VoiceSttPartial => write!(f, "voice_stt_partial"),
+            Self::VoiceSttFinal => write!(f, "voice_stt_final"),
+            Self::VoiceSttError => write!(f, "voice_stt_error"),
+            Self::VoiceTtsStarted => write!(f, "voice_tts_started"),
+            Self::VoiceTtsDone => write!(f, "voice_tts_done"),
+            Self::VoiceTtsError => write!(f, "voice_tts_error"),
         }
     }
 }
@@ -537,6 +556,11 @@ pub fn compile_observations(
             ObservableEventKind::LoadComplete => 3,
             ObservableEventKind::Navigation => 4,
             ObservableEventKind::DomMutation => 5,
+            // Voice events sorted after browser events
+            ObservableEventKind::VoiceSttError | ObservableEventKind::VoiceTtsError => 6,
+            ObservableEventKind::VoiceTurnCommitted => 7,
+            ObservableEventKind::VoiceTtsStarted | ObservableEventKind::VoiceTtsDone => 8,
+            ObservableEventKind::VoiceSttPartial | ObservableEventKind::VoiceSttFinal => 9,
         }
     };
 
@@ -638,7 +662,7 @@ mod tests {
     use proptest::prelude::*;
     use serde_json::json;
 
-    fn all_observable_kinds() -> [ObservableEventKind; 6] {
+    fn all_browser_observable_kinds() -> [ObservableEventKind; 6] {
         [
             ObservableEventKind::ConsoleError,
             ObservableEventKind::NetworkError,
@@ -647,6 +671,20 @@ mod tests {
             ObservableEventKind::Navigation,
             ObservableEventKind::DomMutation,
         ]
+    }
+
+    fn all_observable_kinds() -> Vec<ObservableEventKind> {
+        let mut kinds = all_browser_observable_kinds().to_vec();
+        kinds.extend_from_slice(&[
+            ObservableEventKind::VoiceTurnCommitted,
+            ObservableEventKind::VoiceSttPartial,
+            ObservableEventKind::VoiceSttFinal,
+            ObservableEventKind::VoiceSttError,
+            ObservableEventKind::VoiceTtsStarted,
+            ObservableEventKind::VoiceTtsDone,
+            ObservableEventKind::VoiceTtsError,
+        ]);
+        kinds
     }
 
     fn payload_for_kind(kind: ObservableEventKind, seq: u64) -> serde_json::Value {
@@ -660,6 +698,11 @@ mod tests {
                 json!({ "url": format!("https://example.test/{kind}/{seq}") })
             }
             ObservableEventKind::DomMutation => json!({ "mutation": seq }),
+            // Voice events use their own payload shape
+            ObservableEventKind::VoiceTurnCommitted => {
+                json!({ "transcript": format!("voice-{seq}"), "proof": {} })
+            }
+            _ => json!({ "event": format!("{kind}-{seq}") }),
         }
     }
 
@@ -1071,20 +1114,45 @@ mod tests {
 
     #[test]
     fn test_observable_event_kind_serde_roundtrip() {
-        let kinds = [
-            ObservableEventKind::ConsoleError,
-            ObservableEventKind::ConsoleWarn,
-            ObservableEventKind::NetworkError,
-            ObservableEventKind::DomMutation,
-            ObservableEventKind::Navigation,
-            ObservableEventKind::LoadComplete,
-        ];
+        let kinds = all_observable_kinds();
         for kind in &kinds {
             let serialized = serde_json::to_string(kind).expect("serialize");
             let deserialized: ObservableEventKind =
                 serde_json::from_str(&serialized).expect("deserialize");
             assert_eq!(&deserialized, kind, "kind roundtrip must preserve variant");
         }
+    }
+
+    #[test]
+    fn test_voice_event_kind_serde_values() {
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceTurnCommitted).unwrap(),
+            "\"voice_turn_committed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceSttPartial).unwrap(),
+            "\"voice_stt_partial\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceSttFinal).unwrap(),
+            "\"voice_stt_final\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceSttError).unwrap(),
+            "\"voice_stt_error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceTtsStarted).unwrap(),
+            "\"voice_tts_started\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceTtsDone).unwrap(),
+            "\"voice_tts_done\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ObservableEventKind::VoiceTtsError).unwrap(),
+            "\"voice_tts_error\""
+        );
     }
 
     #[test]
@@ -1145,7 +1213,7 @@ mod tests {
         ) {
             prop_assume!(counts.iter().any(|count| *count > 0));
 
-            let kinds = all_observable_kinds();
+            let kinds = all_browser_observable_kinds();
             let mut events = Vec::new();
 
             for (idx, kind) in kinds.iter().copied().enumerate() {
@@ -1190,9 +1258,10 @@ mod tests {
             budget_a in 0_u16..512_u16,
             budget_b in 0_u16..512_u16,
         ) {
+            let browser_kinds = all_browser_observable_kinds();
             let mut events = Vec::with_capacity(kinds_raw.len());
             for (idx, kind_raw) in kinds_raw.iter().copied().enumerate() {
-                let kind = all_observable_kinds()[usize::from(kind_raw % 6)];
+                let kind = browser_kinds[usize::from(kind_raw % 6)];
                 events.push(ObservationEvent::with_timestamp(
                     "obs-prop".to_string(),
                     1,
@@ -1230,7 +1299,7 @@ mod tests {
             counts in prop::array::uniform6(2_u8..9_u8),
             kind_to_perturb in 0_u8..6_u8,
         ) {
-            let kinds = all_observable_kinds();
+            let kinds = all_browser_observable_kinds();
             let mut base_events = Vec::new();
 
             for (idx, kind) in kinds.iter().copied().enumerate() {
