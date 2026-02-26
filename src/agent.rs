@@ -1127,7 +1127,31 @@ impl Agent {
             let Some(event_result) = event_result else {
                 break;
             };
-            let event = event_result?;
+            let event = match event_result {
+                Ok(e) => e,
+                Err(err) => {
+                    let mut msg = if added_partial {
+                        match self
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| matches!(m, Message::Assistant(_)))
+                        {
+                            Some(Message::Assistant(a)) => (**a).clone(),
+                            _ => AssistantMessage::default(),
+                        }
+                    } else {
+                        AssistantMessage::default()
+                    };
+                    msg.stop_reason = StopReason::Error;
+                    msg.error_message = Some(err.to_string());
+
+                    // If we never sent a Start event, finalize_assistant_message handles it.
+                    // But if sent_start is true and added_partial is somehow false,
+                    // finalize_assistant_message will emit a second Start. That shouldn't happen.
+                    return Ok(self.finalize_assistant_message(msg, &on_event, added_partial));
+                }
+            };
 
             match event {
                 StreamEvent::Start { partial } => {
