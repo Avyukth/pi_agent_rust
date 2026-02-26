@@ -599,6 +599,9 @@ cargo build --release
 
 # Binary is at target/release/pi
 ./target/release/pi --version
+
+# To install system-wide (--locked ensures reproducible dependency resolution)
+cargo install --path . --locked
 ```
 
 ### Dependencies
