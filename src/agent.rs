@@ -4358,16 +4358,14 @@ mod turn_event_tests {
                 _ => None,
             });
 
-            let Some(first_turn_tool_results) = first_turn_tool_results else {
-                panic!("expected tool results for first turn");
-            };
+            let first_turn_tool_results = first_turn_tool_results.expect("expected tool results for first turn");
             assert_eq!(first_turn_tool_results.len(), 1);
             let first_result = first_turn_tool_results.first().unwrap();
             if let Message::ToolResult(tr) = first_result {
                 assert_eq!(tr.tool_name, "echo_tool");
                 assert!(!tr.is_error);
             } else {
-                panic!("expected Message::ToolResult");
+                panic!("expected Message::ToolResult, got {:?}", first_result);
             }
             drop(events);
         });
