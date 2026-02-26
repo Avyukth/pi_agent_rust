@@ -5274,7 +5274,10 @@ mod tests {
                 assert_eq!(command, "echo hello");
                 assert_eq!(*exit_code, 0);
             } else {
-                panic!("Expected SessionMessage::BashExecution, got {:?}", msg.message);
+                panic!(
+                    "Expected SessionMessage::BashExecution, got {:?}",
+                    msg.message
+                );
             }
         } else {
             panic!("Expected SessionEntry::Message");
@@ -5331,7 +5334,9 @@ mod tests {
         };
         let custom_id = session.append_message(custom_msg);
 
-        let entry = session.get_entry(&custom_id).expect("should find custom entry");
+        let entry = session
+            .get_entry(&custom_id)
+            .expect("should find custom entry");
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::Custom {
                 custom_type,
@@ -5357,7 +5362,9 @@ mod tests {
         let custom_id =
             session.append_custom_entry("my_type".to_string(), Some(serde_json::json!(42)));
 
-        let entry = session.get_entry(&custom_id).expect("should find custom entry");
+        let entry = session
+            .get_entry(&custom_id)
+            .expect("should find custom entry");
         if let SessionEntry::Custom(custom) = entry {
             assert_eq!(custom.custom_type, "my_type");
             assert_eq!(custom.data, Some(serde_json::json!(42)));
@@ -5401,7 +5408,9 @@ mod tests {
 
         assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
 
-        let entry = session.get_entry(&change_id).expect("should find change entry");
+        let entry = session
+            .get_entry(&change_id)
+            .expect("should find change entry");
         assert_eq!(entry.base().parent_id.as_deref(), Some(msg_id.as_str()));
 
         if let SessionEntry::ModelChange(mc) = entry {
@@ -5420,11 +5429,16 @@ mod tests {
         let change_id = session.append_thinking_level_change("high".to_string());
         assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
 
-        let entry = session.get_entry(&change_id).expect("should find change entry");
+        let entry = session
+            .get_entry(&change_id)
+            .expect("should find change entry");
         if let SessionEntry::ThinkingLevelChange(tlc) = entry {
             assert_eq!(tlc.thinking_level, "high");
         } else {
-            panic!("Expected SessionEntry::ThinkingLevelChange, got {:?}", entry);
+            panic!(
+                "Expected SessionEntry::ThinkingLevelChange, got {:?}",
+                entry
+            );
         }
     }
 
@@ -5466,7 +5480,9 @@ mod tests {
         let label_id = session.add_label(&msg_id, Some("important".to_string()));
         assert!(label_id.is_some());
 
-        let entry = session.get_entry(&label_id.unwrap()).expect("should find label entry");
+        let entry = session
+            .get_entry(&label_id.unwrap())
+            .expect("should find label entry");
         if let SessionEntry::Label(label) = entry {
             assert_eq!(label.target_id, msg_id);
             assert_eq!(label.label.as_deref(), Some("important"));

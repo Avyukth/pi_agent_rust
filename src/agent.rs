@@ -4358,7 +4358,8 @@ mod turn_event_tests {
                 _ => None,
             });
 
-            let first_turn_tool_results = first_turn_tool_results.expect("expected tool results for first turn");
+            let first_turn_tool_results =
+                first_turn_tool_results.expect("expected tool results for first turn");
             assert_eq!(first_turn_tool_results.len(), 1);
             let first_result = first_turn_tool_results.first().unwrap();
             if let Message::ToolResult(tr) = first_result {
