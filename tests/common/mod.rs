@@ -27,6 +27,8 @@ pub mod scenario_runner;
 pub mod tmux;
 #[allow(dead_code)]
 pub mod transcript_diff;
+#[allow(dead_code)]
+pub mod voice_helpers;
 
 #[allow(unused_imports)]
 pub use artifact_bundle::{
