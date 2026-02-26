@@ -419,6 +419,9 @@ pub struct Agent {
 
     /// Whether voice observations should be processed (VS1 gating).
     voice_enabled: bool,
+
+    /// Recently seen voice turn_ids for dedup (bounded ring buffer, max 100).
+    seen_turn_ids: VecDeque<String>,
 }
 
 impl Agent {
@@ -437,6 +440,7 @@ impl Agent {
             hidden_custom_count: 0,
             chrome_bridge: None,
             voice_enabled: false,
+            seen_turn_ids: VecDeque::new(),
         }
     }
 
@@ -520,7 +524,10 @@ impl Agent {
     /// Maximum observation entries rendered per drain cycle.
     const OBSERVATION_RENDER_BUDGET: usize = 20;
 
-    fn drain_observations(&self) -> Vec<Message> {
+    /// Max number of voice turn_ids to track for dedup.
+    const SEEN_TURN_ID_CAPACITY: usize = 100;
+
+    fn drain_observations(&mut self) -> Vec<Message> {
         let bridge = match self.chrome_bridge.as_ref() {
             Some(b) => b,
             None => return Vec::new(),
@@ -559,6 +566,21 @@ impl Agent {
                         Some(msg_json) => {
                             match serde_json::from_str::<crate::chrome::protocol::VoiceTurnCommitted>(msg_json) {
                                 Ok(vtc) => {
+                                    // Dedup: reject duplicate turn_ids.
+                                    let turn_id = &vtc.proof.turn_id;
+                                    if self.seen_turn_ids.iter().any(|id| id == turn_id) {
+                                        tracing::warn!(
+                                            turn_id = %turn_id,
+                                            "duplicate voice turn_id, skipping"
+                                        );
+                                        continue;
+                                    }
+                                    // Track this turn_id (bounded ring buffer).
+                                    if self.seen_turn_ids.len() >= Self::SEEN_TURN_ID_CAPACITY {
+                                        self.seen_turn_ids.pop_front();
+                                    }
+                                    self.seen_turn_ids.push_back(turn_id.clone());
+
                                     let ts = Utc::now().timestamp_millis();
                                     // User message with the spoken transcript.
                                     voice_user_messages.push(Message::User(UserMessage {
@@ -2643,7 +2665,7 @@ mod drain_observations_tests {
 
     #[test]
     fn drain_observations_returns_none_without_bridge() {
-        let agent = make_agent();
+        let mut agent = make_agent();
         assert!(agent.drain_observations().is_empty());
     }
 
@@ -3348,6 +3370,187 @@ mod drain_observations_tests {
             }
             other => panic!("expected Custom, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dedup / ordering / error guards (bd-19o.1.7.4)
+    // -----------------------------------------------------------------------
+
+    /// Build a voice_turn_committed observation with a specific turn_id.
+    fn voice_turn_committed_with_id(transcript: &str, turn_id: &str) -> ObservationEvent {
+        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted};
+        let mut proof = CommitProof::test_default();
+        proof.turn_id = turn_id.to_string();
+        let vtc = VoiceTurnCommitted {
+            transcript: transcript.to_string(),
+            proof,
+        };
+        ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(serde_json::to_string(&vtc).unwrap()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        }
+    }
+
+    #[test]
+    fn dedup_same_turn_id_in_same_batch_skips_second() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_with_id("first", "turn-aaa"));
+        bridge.push_observation(voice_turn_committed_with_id("duplicate", "turn-aaa"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        // Only one User + CommitProof pair (the first), second is deduped.
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 1, "duplicate turn_id should be skipped");
+        match &user_msgs[0] {
+            Message::User(um) => match &um.content {
+                UserContent::Text(t) => assert_eq!(t, "first"),
+                other => panic!("expected Text, got {other:?}"),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn dedup_different_turn_ids_both_accepted() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_with_id("first", "turn-aaa"));
+        bridge.push_observation(voice_turn_committed_with_id("second", "turn-bbb"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(user_msgs.len(), 2, "distinct turn_ids should both be accepted");
+    }
+
+    #[test]
+    fn dedup_across_drain_calls_rejects_replay() {
+        let mut agent = make_agent();
+        agent.set_voice_enabled(true);
+
+        // First drain: accept turn-aaa
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_with_id("first", "turn-aaa"));
+        agent.set_chrome_bridge(bridge.clone());
+        let msgs1 = agent.drain_observations();
+        assert_eq!(
+            msgs1.iter().filter(|m| matches!(m, Message::User(_))).count(),
+            1,
+            "first drain accepts"
+        );
+
+        // Second drain: replay same turn_id → rejected
+        bridge.push_observation(voice_turn_committed_with_id("replay", "turn-aaa"));
+        let msgs2 = agent.drain_observations();
+        assert_eq!(
+            msgs2.iter().filter(|m| matches!(m, Message::User(_))).count(),
+            0,
+            "replayed turn_id rejected across drains"
+        );
+    }
+
+    #[test]
+    fn dedup_ring_buffer_bounded_at_capacity() {
+        let mut agent = make_agent();
+        agent.set_voice_enabled(true);
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        agent.set_chrome_bridge(bridge.clone());
+
+        // Fill the ring buffer to capacity (100 unique turn_ids).
+        // Must drain in batches since take_observations_limited caps at RENDER_BUDGET.
+        let budget = Agent::OBSERVATION_RENDER_BUDGET;
+        let cap = Agent::SEEN_TURN_ID_CAPACITY;
+        let batches = (cap + budget - 1) / budget; // ceil division
+        for batch in 0..batches {
+            let start = batch * budget;
+            let end = std::cmp::min(start + budget, cap);
+            for i in start..end {
+                bridge.push_observation(voice_turn_committed_with_id(
+                    &format!("msg-{i}"),
+                    &format!("turn-{i:04}"),
+                ));
+            }
+            let _ = agent.drain_observations();
+        }
+        assert_eq!(agent.seen_turn_ids.len(), cap);
+
+        // Push one more → oldest (turn-0000) should be evicted.
+        bridge.push_observation(voice_turn_committed_with_id("overflow", "turn-overflow"));
+        let _ = agent.drain_observations();
+        assert_eq!(
+            agent.seen_turn_ids.len(),
+            cap,
+            "ring buffer should not grow beyond capacity"
+        );
+        assert!(
+            !agent.seen_turn_ids.iter().any(|id| id == "turn-0000"),
+            "oldest turn_id should be evicted"
+        );
+
+        // Replaying the evicted turn_id should now be accepted.
+        bridge.push_observation(voice_turn_committed_with_id("re-accepted", "turn-0000"));
+        let msgs = agent.drain_observations();
+        assert_eq!(
+            msgs.iter().filter(|m| matches!(m, Message::User(_))).count(),
+            1,
+            "evicted turn_id can be re-accepted"
+        );
+    }
+
+    #[test]
+    fn events_maintain_insertion_order_within_batch() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_with_id("alpha", "turn-001"));
+        bridge.push_observation(voice_turn_committed_with_id("beta", "turn-002"));
+        bridge.push_observation(voice_turn_committed_with_id("gamma", "turn-003"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        let transcripts: Vec<String> = msgs.iter().filter_map(|m| match m {
+            Message::User(um) => match &um.content {
+                UserContent::Text(t) => Some(t.clone()),
+                _ => None,
+            },
+            _ => None,
+        }).collect();
+        assert_eq!(transcripts, vec!["alpha", "beta", "gamma"], "insertion order preserved");
+    }
+
+    #[test]
+    fn render_budget_caps_voice_events_too() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // Push more than OBSERVATION_RENDER_BUDGET events
+        for i in 0..(Agent::OBSERVATION_RENDER_BUDGET + 5) {
+            bridge.push_observation(voice_turn_committed_with_id(
+                &format!("msg-{i}"),
+                &format!("turn-budget-{i:04}"),
+            ));
+        }
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        let user_count = msgs.iter().filter(|m| matches!(m, Message::User(_))).count();
+        // The budget caps entries from take_observations_limited, so we get at most BUDGET entries.
+        assert!(
+            user_count <= Agent::OBSERVATION_RENDER_BUDGET,
+            "voice events capped at render budget: got {user_count}, max {}",
+            Agent::OBSERVATION_RENDER_BUDGET
+        );
     }
 }
 
