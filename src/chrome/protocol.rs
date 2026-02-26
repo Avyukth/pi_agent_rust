@@ -247,6 +247,38 @@ pub mod voice_event_kind {
 /// Source field value for voice observations.
 pub const VOICE_OBSERVATION_SOURCE: &str = "voice";
 
+/// VoiceSession FSM states matching TypeScript `VoiceSessionState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceSessionState {
+    Disabled,
+    Idle,
+    Listening,
+    Processing,
+    Speaking,
+    Error,
+}
+
+/// Response from the `voice_status` tool.
+/// Must stay JSON-compatible with TypeScript `VoiceStatusResult`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VoiceStatusResult {
+    /// Current FSM state.
+    pub state: VoiceSessionState,
+    /// STT backend name, None if STT unavailable.
+    pub stt_backend: Option<String>,
+    /// TTS backend identifier.
+    pub tts_backend: String,
+    /// Whether the WASM STT model is loaded and ready.
+    pub model_loaded: bool,
+    /// Model version identifier, None if not loaded.
+    pub model_id: Option<String>,
+    /// Whether the earcon AudioBuffer is decoded and ready.
+    pub earcon_ready: bool,
+    /// Non-null during listening/processing states.
+    pub active_turn_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessageType {
@@ -1023,5 +1055,80 @@ mod tests {
         assert_eq!(entry.source.as_deref(), Some("voice"));
         assert_eq!(entry.kind, "tts_done");
         assert!(entry.message.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // VoiceSessionState + VoiceStatusResult (bd-19o.1.5.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_voice_session_state_serde_roundtrip() {
+        let states = [
+            (VoiceSessionState::Disabled, "\"disabled\""),
+            (VoiceSessionState::Idle, "\"idle\""),
+            (VoiceSessionState::Listening, "\"listening\""),
+            (VoiceSessionState::Processing, "\"processing\""),
+            (VoiceSessionState::Speaking, "\"speaking\""),
+            (VoiceSessionState::Error, "\"error\""),
+        ];
+        for (state, expected_json) in &states {
+            let json = serde_json::to_string(state).expect("serialize state");
+            assert_eq!(&json, expected_json);
+            let back: VoiceSessionState = serde_json::from_str(&json).expect("deserialize state");
+            assert_eq!(&back, state);
+        }
+    }
+
+    #[test]
+    fn test_voice_status_result_json_roundtrip() {
+        let result = VoiceStatusResult {
+            state: VoiceSessionState::Idle,
+            stt_backend: Some("whisper_apr_wasm".to_string()),
+            tts_backend: "chrome_tts".to_string(),
+            model_loaded: true,
+            model_id: Some("tiny-int8-v1.0.0".to_string()),
+            earcon_ready: true,
+            active_turn_id: None,
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        let back: VoiceStatusResult = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(result, back);
+    }
+
+    #[test]
+    fn test_voice_status_result_from_typescript_json() {
+        let ts_json = json!({
+            "state": "listening",
+            "stt_backend": "whisper_apr_wasm",
+            "tts_backend": "chrome_tts",
+            "model_loaded": true,
+            "model_id": "tiny-int8-v1.0.0",
+            "earcon_ready": false,
+            "active_turn_id": "abc-123"
+        });
+        let result: VoiceStatusResult =
+            serde_json::from_value(ts_json).expect("deserialize from TS shape");
+        assert_eq!(result.state, VoiceSessionState::Listening);
+        assert_eq!(result.active_turn_id.as_deref(), Some("abc-123"));
+        assert!(!result.earcon_ready);
+    }
+
+    #[test]
+    fn test_voice_status_result_null_optional_fields() {
+        let ts_json = json!({
+            "state": "disabled",
+            "stt_backend": null,
+            "tts_backend": "chrome_tts",
+            "model_loaded": false,
+            "model_id": null,
+            "earcon_ready": false,
+            "active_turn_id": null
+        });
+        let result: VoiceStatusResult =
+            serde_json::from_value(ts_json).expect("deserialize with nulls");
+        assert_eq!(result.state, VoiceSessionState::Disabled);
+        assert!(result.stt_backend.is_none());
+        assert!(result.model_id.is_none());
+        assert!(result.active_turn_id.is_none());
     }
 }
