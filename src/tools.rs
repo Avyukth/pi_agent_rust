@@ -2679,10 +2679,27 @@ impl Tool for EditTool {
             }
         }
 
-        // Read bytes and decode strictly as UTF-8 to avoid corrupting binary files.
-        let raw = asupersync::fs::read(&absolute_path)
+        // Read bytes strictly up to the limit to prevent OOM if metadata failed or file grows.
+        let file = asupersync::fs::File::open(&absolute_path)
+            .await
+            .map_err(|e| Error::tool("edit", format!("Failed to open file: {e}")))?;
+        let mut raw = Vec::new();
+        let mut limiter = file.take((READ_TOOL_MAX_BYTES as u64).saturating_add(1));
+        limiter
+            .read_to_end(&mut raw)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
+
+        if raw.len() > READ_TOOL_MAX_BYTES as usize {
+            return Err(Error::tool(
+                "edit",
+                format!(
+                    "File is too large (> {} bytes).",
+                    READ_TOOL_MAX_BYTES
+                ),
+            ));
+        }
+
         let raw_content = String::from_utf8(raw).map_err(|_| {
             Error::tool(
                 "edit",
