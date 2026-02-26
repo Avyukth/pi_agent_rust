@@ -520,69 +520,102 @@ impl Agent {
     /// Maximum observation entries rendered per drain cycle.
     const OBSERVATION_RENDER_BUDGET: usize = 20;
 
-    fn drain_observations(&self) -> Option<Message> {
-        let bridge = self.chrome_bridge.as_ref()?;
+    fn drain_observations(&self) -> Vec<Message> {
+        let bridge = match self.chrome_bridge.as_ref() {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
         // Only take as many batches as we can render so overflow events
         // stay in the bridge buffer for the next drain cycle (M2 fix).
+        // Budget applies to the TOTAL across both partitions.
         let events = bridge.take_observations_limited(Self::OBSERVATION_RENDER_BUDGET);
         if events.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        // Format protocol-level observation batches into a text summary.
-        // Each protocol ObservationEvent contains a batch of ObservationEntries.
-        let mut lines = Vec::new();
-        let mut total_entries = 0;
+        // Partition entries into browser and voice using source field.
+        let mut browser_lines = Vec::new();
+        let mut browser_entries = 0;
+        let mut voice_lines = Vec::new();
+        let mut voice_entries = 0;
+
         for batch in &events {
             for entry in &batch.events {
+                let is_voice = entry.source.as_deref()
+                    == Some(crate::chrome::protocol::VOICE_OBSERVATION_SOURCE);
+
                 // VS1: silently discard voice observations when voice is disabled.
-                // They shouldn't arrive, but may during reconnect — no error log.
-                if !self.voice_enabled
-                    && entry.source.as_deref() == Some(crate::chrome::protocol::VOICE_OBSERVATION_SOURCE)
-                {
+                if is_voice && !self.voice_enabled {
                     continue;
                 }
-                let msg = entry.message.as_deref().unwrap_or("");
-                let url = entry.url.as_deref().unwrap_or("");
-                let detail = if !msg.is_empty() {
-                    msg
-                } else if !url.is_empty() {
-                    url
+
+                let line = Self::format_observation_line(entry);
+                if is_voice {
+                    voice_lines.push(line);
+                    voice_entries += 1;
                 } else {
-                    ""
-                };
-                let suffix = if detail.is_empty() {
-                    String::new()
-                } else {
-                    let mut chars = detail.chars();
-                    let preview: String = chars.by_ref().take(77).collect();
-                    if chars.next().is_some() {
-                        format!(": {preview}...")
-                    } else {
-                        format!(": {detail}")
-                    }
-                };
-                lines.push(format!("- {}{suffix}", entry.kind));
-                total_entries += 1;
+                    browser_lines.push(line);
+                    browser_entries += 1;
+                }
             }
         }
 
-        if lines.is_empty() {
-            return None;
+        let mut messages = Vec::new();
+
+        if !browser_lines.is_empty() {
+            let summary = format!("[Browser Observation]\n{}", browser_lines.join("\n"));
+            messages.push(Message::Custom(CustomMessage {
+                content: summary,
+                custom_type: "browser_observations".to_string(),
+                display: false,
+                details: Some(json!({
+                    "events_processed": browser_entries,
+                    "batches": events.len(),
+                })),
+                timestamp: Utc::now().timestamp_millis(),
+            }));
         }
 
-        let summary = format!("[Browser Observation]\n{}", lines.join("\n"));
+        if !voice_lines.is_empty() {
+            let summary = format!("[Voice Observation]\n{}", voice_lines.join("\n"));
+            messages.push(Message::Custom(CustomMessage {
+                content: summary,
+                custom_type: "voice_observations".to_string(),
+                display: false,
+                details: Some(json!({
+                    "events_processed": voice_entries,
+                    "batches": events.len(),
+                })),
+                timestamp: Utc::now().timestamp_millis(),
+            }));
+        }
 
-        Some(Message::Custom(CustomMessage {
-            content: summary,
-            custom_type: "browser_observations".to_string(),
-            display: false,
-            details: Some(json!({
-                "events_processed": total_entries,
-                "batches": events.len(),
-            })),
-            timestamp: Utc::now().timestamp_millis(),
-        }))
+        messages
+    }
+
+    /// Format a single observation entry into a summary line.
+    fn format_observation_line(entry: &crate::chrome::protocol::ObservationEntry) -> String {
+        let msg = entry.message.as_deref().unwrap_or("");
+        let url = entry.url.as_deref().unwrap_or("");
+        let detail = if !msg.is_empty() {
+            msg
+        } else if !url.is_empty() {
+            url
+        } else {
+            ""
+        };
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            let mut chars = detail.chars();
+            let preview: String = chars.by_ref().take(77).collect();
+            if chars.next().is_some() {
+                format!(": {preview}...")
+            } else {
+                format!(": {detail}")
+            }
+        };
+        format!("- {}{suffix}", entry.kind)
     }
 
     /// Queue a steering message (delivered after tool completion).
@@ -1015,7 +1048,7 @@ impl Agent {
                 // Drain browser observations and inject as hidden context note.
                 // This enables the verify loop: the LLM sees observation summaries
                 // (console errors, load events, etc.) in its next turn context.
-                if let Some(obs_message) = self.drain_observations() {
+                for obs_message in self.drain_observations() {
                     self.add_message(obs_message.clone());
                     new_messages.push(obs_message);
                 }
@@ -2560,7 +2593,7 @@ mod drain_observations_tests {
     #[test]
     fn drain_observations_returns_none_without_bridge() {
         let agent = make_agent();
-        assert!(agent.drain_observations().is_none());
+        assert!(agent.drain_observations().is_empty());
     }
 
     #[test]
@@ -2568,7 +2601,7 @@ mod drain_observations_tests {
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         agent.set_chrome_bridge(bridge);
-        assert!(agent.drain_observations().is_none());
+        assert!(agent.drain_observations().is_empty());
     }
 
     #[test]
@@ -2581,7 +2614,9 @@ mod drain_observations_tests {
         ));
         agent.set_chrome_bridge(bridge);
 
-        let msg = agent.drain_observations().expect("should produce message");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "should produce message");
+        let msg = msgs.into_iter().next().unwrap();
         match &msg {
             Message::Custom(cm) => {
                 assert_eq!(cm.custom_type, "browser_observations");
@@ -2605,9 +2640,9 @@ mod drain_observations_tests {
         agent.set_chrome_bridge(bridge);
 
         // First drain should produce a message
-        assert!(agent.drain_observations().is_some());
+        assert!(!agent.drain_observations().is_empty());
         // Second drain should be empty (buffer was cleared)
-        assert!(agent.drain_observations().is_none());
+        assert!(agent.drain_observations().is_empty());
     }
 
     #[test]
@@ -2631,7 +2666,9 @@ mod drain_observations_tests {
         }
         agent.set_chrome_bridge(bridge.clone());
 
-        let msg = agent.drain_observations().expect("should produce message");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "should produce message");
+        let msg = msgs.into_iter().next().unwrap();
         match &msg {
             Message::Custom(cm) => {
                 let line_count = cm.content.lines().count();
@@ -2645,9 +2682,9 @@ mod drain_observations_tests {
         }
 
         // Remaining 5 events should survive for the next drain (no data loss).
-        let msg2 = agent
-            .drain_observations()
-            .expect("overflow should produce second message");
+        let msgs2 = agent.drain_observations();
+        assert!(!msgs2.is_empty(), "overflow should produce second message");
+        let msg2 = msgs2.into_iter().next().unwrap();
         match &msg2 {
             Message::Custom(cm) => {
                 let line_count = cm.content.lines().count() - 1;
@@ -2665,7 +2702,9 @@ mod drain_observations_tests {
         bridge.push_observation(sample_observation("console_error", Some(&long_message)));
         agent.set_chrome_bridge(bridge);
 
-        let msg = agent.drain_observations().expect("should produce message");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "should produce message");
+        let msg = msgs.into_iter().next().unwrap();
         match &msg {
             Message::Custom(cm) => {
                 // Detail should be truncated to ~80 chars + "..."
@@ -2690,7 +2729,9 @@ mod drain_observations_tests {
         bridge.push_observation(sample_observation("console_error", Some("err")));
         agent.set_chrome_bridge(bridge);
 
-        let msg = agent.drain_observations().expect("should produce message");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "should produce message");
+        let msg = msgs.into_iter().next().unwrap();
         match &msg {
             Message::Custom(cm) => {
                 let details = cm.details.as_ref().expect("should have details");
@@ -2708,7 +2749,9 @@ mod drain_observations_tests {
         bridge.push_observation(sample_observation("dom_mutation", Some("element added")));
         agent.set_chrome_bridge(bridge);
 
-        let msg = agent.drain_observations().expect("should produce message");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "should produce message");
+        let msg = msgs.into_iter().next().unwrap();
         agent.add_message(msg);
 
         // Verify it's in the message history
@@ -2753,9 +2796,9 @@ mod drain_observations_tests {
         agent.set_chrome_bridge(bridge.clone());
 
         // First drain: should take at most 20 entries.
-        let msg1 = agent
-            .drain_observations()
-            .expect("first drain should produce message");
+        let msgs1 = agent.drain_observations();
+        assert!(!msgs1.is_empty(), "first drain should produce message");
+        let msg1 = msgs1.into_iter().next().unwrap();
         let line_count_1 = match &msg1 {
             Message::Custom(cm) => {
                 // header + event lines
@@ -2770,9 +2813,9 @@ mod drain_observations_tests {
         };
 
         // Second drain: the remaining events must still be available.
-        let msg2 = agent
-            .drain_observations()
-            .expect("second drain must produce overflow events");
+        let msgs2 = agent.drain_observations();
+        assert!(!msgs2.is_empty(), "second drain must produce overflow events");
+        let msg2 = msgs2.into_iter().next().unwrap();
         let line_count_2 = match &msg2 {
             Message::Custom(cm) => cm.content.lines().count() - 1,
             other => panic!("expected Custom message, got {other:?}"),
@@ -2811,7 +2854,7 @@ mod drain_observations_tests {
         agent.set_chrome_bridge(bridge);
         // voice_enabled defaults to false
         assert!(
-            agent.drain_observations().is_none(),
+            agent.drain_observations().is_empty(),
             "voice observations should be silently discarded when voice is disabled"
         );
     }
@@ -2824,9 +2867,9 @@ mod drain_observations_tests {
         agent.set_chrome_bridge(bridge);
         agent.set_voice_enabled(true);
 
-        let msg = agent
-            .drain_observations()
-            .expect("voice observations should be processed when enabled");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "voice observations should be processed when enabled");
+        let msg = msgs.into_iter().next().unwrap();
         match msg {
             Message::Custom(cm) => {
                 assert!(cm.content.contains("voice_turn_committed"));
@@ -2864,9 +2907,9 @@ mod drain_observations_tests {
         agent.set_chrome_bridge(bridge);
         // voice disabled — only browser events should pass
 
-        let msg = agent
-            .drain_observations()
-            .expect("browser events should still be processed");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "browser events should still be processed");
+        let msg = msgs.into_iter().next().unwrap();
         match msg {
             Message::Custom(cm) => {
                 assert!(
@@ -2879,6 +2922,82 @@ mod drain_observations_tests {
                 );
             }
             other => panic!("expected Custom message, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Partition tests (bd-19o.1.7.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drain_observations_partitions_browser_and_voice_when_enabled() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "mixed".to_string(),
+            events: vec![
+                ObservationEntry {
+                    kind: "console_error".to_string(),
+                    message: Some("TypeError".to_string()),
+                    source: None,
+                    url: None,
+                    ts: 1000,
+                },
+                ObservationEntry {
+                    kind: "voice_turn_committed".to_string(),
+                    message: Some(r#"{"transcript":"hello"}"#.to_string()),
+                    source: Some("voice".to_string()),
+                    url: None,
+                    ts: 1001,
+                },
+            ],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 2, "mixed batch should produce 2 messages (browser + voice)");
+
+        let browser_msg = msgs.iter().find(|m| match m {
+            Message::Custom(cm) => cm.custom_type == "browser_observations",
+            _ => false,
+        });
+        let voice_msg = msgs.iter().find(|m| match m {
+            Message::Custom(cm) => cm.custom_type == "voice_observations",
+            _ => false,
+        });
+
+        assert!(browser_msg.is_some(), "browser partition should be populated");
+        assert!(voice_msg.is_some(), "voice partition should be populated");
+
+        if let Some(Message::Custom(cm)) = browser_msg {
+            assert!(cm.content.contains("console_error"));
+            assert!(!cm.content.contains("voice_turn_committed"));
+        }
+        if let Some(Message::Custom(cm)) = voice_msg {
+            assert!(cm.content.contains("voice_turn_committed"));
+            assert!(!cm.content.contains("console_error"));
+        }
+    }
+
+    #[test]
+    fn drain_observations_empty_voice_partition_no_voice_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // Only browser events
+        bridge.push_observation(sample_observation("console_warn", Some("test")));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 1, "only browser events → 1 message");
+        match &msgs[0] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "browser_observations");
+            }
+            other => panic!("expected Custom, got {other:?}"),
         }
     }
 }
@@ -2964,8 +3083,8 @@ mod vs1_behavior_matrix_tests {
         agent.set_chrome_bridge(bridge);
         agent.set_voice_enabled(true);
 
-        let msg = agent.drain_observations();
-        assert!(msg.is_some(), "VS1 enabled: voice observations should be processed");
+        let msgs = agent.drain_observations();
+        assert!(!msgs.is_empty(), "VS1 enabled: voice observations should be processed");
     }
 
     #[test]
@@ -3011,8 +3130,8 @@ mod vs1_behavior_matrix_tests {
         agent.set_chrome_bridge(bridge);
         // voice_enabled defaults to false
 
-        let msg = agent.drain_observations();
-        assert!(msg.is_none(), "VS1 disabled: voice observations must be silently dropped");
+        let msgs = agent.drain_observations();
+        assert!(msgs.is_empty(), "VS1 disabled: voice observations must be silently dropped");
     }
 
     #[test]
