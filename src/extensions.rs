@@ -30833,7 +30833,7 @@ mod tests {
                 .get("event")
                 .is_some_and(|value| value.contains("host_call.start"))
         });
-        let start = start.unwrap_or_else(|| panic!());
+        let start = start.expect("expected host_call.start event in trace");
         assert_eq!(
             start.fields.get("runtime").map(std::string::String::as_str),
             Some("protocol")
