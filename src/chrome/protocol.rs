@@ -227,11 +227,13 @@ pub struct VoiceTurnCommitted {
 
 /// Voice event kind string constants matching TypeScript `VoiceEventKind` values.
 ///
-/// These are the bare (unprefixed) kind names used inside the TypeScript
-/// extension. On the wire (`ObservationEntry.kind`), the extension prepends
-/// `"voice_"` — e.g., `"turn_committed"` becomes `"voice_turn_committed"`.
-/// The Rust `ObservableEventKind` enum in observer.rs uses the prefixed
-/// wire format for serde serialization.
+/// These are the unprefixed kind names used on the wire in `ObservationEntry.kind`
+/// when `source="voice"`. The TypeScript extension's `VoiceEventKind` enum sends
+/// these exact values (e.g., `"turn_committed"`, not `"voice_turn_committed"`).
+///
+/// Note: The Rust `ObservableEventKind` enum in observer.rs uses a `voice_` prefixed
+/// form for its own serde serialization (e.g., `VoiceTurnCommitted` → `"voice_turn_committed"`),
+/// but that is a separate subsystem from the observation wire protocol.
 pub mod voice_event_kind {
     pub const TURN_COMMITTED: &str = "turn_committed";
     pub const STT_PARTIAL: &str = "stt_partial";
