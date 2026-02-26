@@ -5239,13 +5239,15 @@ mod tests {
         };
         let tool_id = session.append_message(tool_msg);
 
-        let entry = session.get_entry(&tool_id).unwrap();
+        let entry = session.get_entry(&tool_id).expect("should find tool entry");
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::ToolResult { is_error, .. } = &msg.message {
                 assert!(is_error);
             } else {
-                panic!();
+                panic!("Expected SessionMessage::ToolResult, got {:?}", msg.message);
             }
+        } else {
+            panic!("Expected SessionEntry::Message");
         }
     }
 
@@ -5263,7 +5265,7 @@ mod tests {
             None,
         );
 
-        let entry = session.get_entry(&bash_id).unwrap();
+        let entry = session.get_entry(&bash_id).expect("should find bash entry");
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::BashExecution {
                 command, exit_code, ..
@@ -5272,8 +5274,10 @@ mod tests {
                 assert_eq!(command, "echo hello");
                 assert_eq!(*exit_code, 0);
             } else {
-                panic!();
+                panic!("Expected SessionMessage::BashExecution, got {:?}", msg.message);
             }
+        } else {
+            panic!("Expected SessionEntry::Message");
         }
 
         // BashExecution converts to User message for model context
@@ -5327,7 +5331,7 @@ mod tests {
         };
         let custom_id = session.append_message(custom_msg);
 
-        let entry = session.get_entry(&custom_id).unwrap();
+        let entry = session.get_entry(&custom_id).expect("should find custom entry");
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::Custom {
                 custom_type,
@@ -5338,8 +5342,10 @@ mod tests {
                 assert_eq!(custom_type, "extension_state");
                 assert!(!display);
             } else {
-                panic!();
+                panic!("Expected SessionMessage::Custom, got {:?}", msg.message);
             }
+        } else {
+            panic!("Expected SessionEntry::Message");
         }
     }
 
@@ -5351,13 +5357,13 @@ mod tests {
         let custom_id =
             session.append_custom_entry("my_type".to_string(), Some(serde_json::json!(42)));
 
-        let entry = session.get_entry(&custom_id).unwrap();
+        let entry = session.get_entry(&custom_id).expect("should find custom entry");
         if let SessionEntry::Custom(custom) = entry {
             assert_eq!(custom.custom_type, "my_type");
             assert_eq!(custom.data, Some(serde_json::json!(42)));
             assert_eq!(custom.base.parent_id.as_deref(), Some(root_id.as_str()));
         } else {
-            panic!();
+            panic!("Expected SessionEntry::Custom, got {:?}", entry);
         }
     }
 
@@ -5395,14 +5401,14 @@ mod tests {
 
         assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
 
-        let entry = session.get_entry(&change_id).unwrap();
+        let entry = session.get_entry(&change_id).expect("should find change entry");
         assert_eq!(entry.base().parent_id.as_deref(), Some(msg_id.as_str()));
 
         if let SessionEntry::ModelChange(mc) = entry {
             assert_eq!(mc.provider, "openai");
             assert_eq!(mc.model_id, "gpt-4");
         } else {
-            panic!();
+            panic!("Expected SessionEntry::ModelChange, got {:?}", entry);
         }
     }
 
@@ -5414,11 +5420,11 @@ mod tests {
         let change_id = session.append_thinking_level_change("high".to_string());
         assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
 
-        let entry = session.get_entry(&change_id).unwrap();
+        let entry = session.get_entry(&change_id).expect("should find change entry");
         if let SessionEntry::ThinkingLevelChange(tlc) = entry {
             assert_eq!(tlc.thinking_level, "high");
         } else {
-            panic!();
+            panic!("Expected SessionEntry::ThinkingLevelChange, got {:?}", entry);
         }
     }
 
@@ -5460,12 +5466,12 @@ mod tests {
         let label_id = session.add_label(&msg_id, Some("important".to_string()));
         assert!(label_id.is_some());
 
-        let entry = session.get_entry(&label_id.unwrap()).unwrap();
+        let entry = session.get_entry(&label_id.unwrap()).expect("should find label entry");
         if let SessionEntry::Label(label) = entry {
             assert_eq!(label.target_id, msg_id);
             assert_eq!(label.label.as_deref(), Some("important"));
         } else {
-            panic!();
+            panic!("Expected SessionEntry::Label, got {:?}", entry);
         }
     }
 
@@ -6239,10 +6245,10 @@ mod tests {
             if let SessionMessage::User { content, .. } = &msg.message {
                 match content {
                     UserContent::Text(t) => assert_eq!(t, "Modified"),
-                    UserContent::Blocks(_) => panic!(),
+                    UserContent::Blocks(_) => panic!("Expected UserContent::Text, got Blocks"),
                 }
             } else {
-                panic!();
+                panic!("Expected SessionMessage::User, got {:?}", msg.message);
             }
         }
     }
@@ -6464,7 +6470,7 @@ mod tests {
                 if let SessionMessage::User { content, .. } = &msg.message {
                     match content {
                         UserContent::Text(t) => assert_eq!(t, unicode_texts[i]),
-                        UserContent::Blocks(_) => panic!(),
+                        UserContent::Blocks(_) => panic!("Expected UserContent::Text, got Blocks"),
                     }
                 }
             }
