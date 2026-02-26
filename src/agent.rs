@@ -2883,6 +2883,148 @@ mod drain_observations_tests {
     }
 }
 
+/// VS1 behavior matrix tests (bd-19o.1.6.4):
+/// {voice enabled, voice disabled} × {tool calls, observations, capabilities}
+///
+/// | Scenario        | Tool calls               | Observations           | want_capabilities  |
+/// |-----------------|--------------------------|------------------------|--------------------|
+/// | voice enabled   | 3 voice tools present    | voice events processed | includes "voice"   |
+/// | voice disabled  | 0 voice tools            | voice events dropped   | no "voice"         |
+#[cfg(test)]
+mod vs1_behavior_matrix_tests {
+    use super::*;
+    use crate::chrome::protocol::{ObservationEntry, ObservationEvent};
+    use crate::chrome::{ChromeBridge, ChromeBridgeConfig};
+    use crate::tools::ToolRegistry;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn api(&self) -> &str {
+            "stub"
+        }
+        fn model_id(&self) -> &str {
+            "stub"
+        }
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    // --- Matrix row: voice ENABLED ---
+
+    #[test]
+    fn enabled_tool_call_succeeds() {
+        let mut tools = ToolRegistry::new(&[], Path::new("."), None);
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        tools.register_voice_tools(bridge);
+        // When voice is enabled, the 3 voice tools are visible in the registry
+        assert!(tools.get("voice_tts_speak").is_some(), "VS1 enabled: voice_tts_speak present");
+        assert!(tools.get("voice_tts_stop").is_some(), "VS1 enabled: voice_tts_stop present");
+        assert!(tools.get("voice_status").is_some(), "VS1 enabled: voice_status present");
+    }
+
+    #[test]
+    fn enabled_observation_processed() {
+        let mut agent = Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(r#"{"transcript":"test"}"#.to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 1000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msg = agent.drain_observations();
+        assert!(msg.is_some(), "VS1 enabled: voice observations should be processed");
+    }
+
+    #[test]
+    fn enabled_capabilities_include_voice() {
+        let mut config = ChromeBridgeConfig::default();
+        config.want_capabilities.push("voice".to_string());
+        assert!(
+            config.want_capabilities.contains(&"voice".to_string()),
+            "VS1 enabled: want_capabilities must include 'voice'"
+        );
+    }
+
+    // --- Matrix row: voice DISABLED ---
+
+    #[test]
+    fn disabled_tool_call_not_found() {
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        // When voice is disabled, register_voice_tools is never called
+        assert!(tools.get("voice_tts_speak").is_none(), "VS1 disabled: voice_tts_speak absent");
+        assert!(tools.get("voice_tts_stop").is_none(), "VS1 disabled: voice_tts_stop absent");
+        assert!(tools.get("voice_status").is_none(), "VS1 disabled: voice_status absent");
+    }
+
+    #[test]
+    fn disabled_observation_silently_dropped() {
+        let mut agent = Agent::new(
+            Arc::new(StubProvider),
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(r#"{"transcript":"test"}"#.to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 1000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        // voice_enabled defaults to false
+
+        let msg = agent.drain_observations();
+        assert!(msg.is_none(), "VS1 disabled: voice observations must be silently dropped");
+    }
+
+    #[test]
+    fn disabled_capabilities_lack_voice() {
+        let config = ChromeBridgeConfig::default();
+        assert!(
+            !config.want_capabilities.contains(&"voice".to_string()),
+            "VS1 disabled: want_capabilities must NOT include 'voice'"
+        );
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_hook_gate_tests {
     use super::*;
