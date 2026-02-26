@@ -534,10 +534,12 @@ impl Agent {
         }
 
         // Partition entries into browser and voice using source field.
+        // Voice turn_committed entries become Message::User (VS4).
         let mut browser_lines = Vec::new();
         let mut browser_entries = 0;
         let mut voice_lines = Vec::new();
         let mut voice_entries = 0;
+        let mut voice_user_messages: Vec<Message> = Vec::new();
 
         for batch in &events {
             for entry in &batch.events {
@@ -546,6 +548,49 @@ impl Agent {
 
                 // VS1: silently discard voice observations when voice is disabled.
                 if is_voice && !self.voice_enabled {
+                    continue;
+                }
+
+                if is_voice && entry.kind == "voice_turn_committed" {
+                    // VS4: voice_turn_committed → Message::User with transcript.
+                    voice_entries += 1;
+                    match entry.message.as_deref() {
+                        Some(msg_json) => {
+                            match serde_json::from_str::<crate::chrome::protocol::VoiceTurnCommitted>(msg_json) {
+                                Ok(vtc) => {
+                                    let ts = Utc::now().timestamp_millis();
+                                    // User message with the spoken transcript.
+                                    voice_user_messages.push(Message::User(UserMessage {
+                                        content: UserContent::Text(vtc.transcript),
+                                        timestamp: ts,
+                                    }));
+                                    // Companion metadata with CommitProof provenance.
+                                    voice_user_messages.push(Message::Custom(CustomMessage {
+                                        content: "[Voice CommitProof]".to_string(),
+                                        custom_type: "voice_commit_proof".to_string(),
+                                        display: false,
+                                        details: Some(json!({
+                                            "proof": vtc.proof,
+                                        })),
+                                        timestamp: ts,
+                                    }));
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        kind = "voice_turn_committed",
+                                        error = %e,
+                                        "malformed voice_turn_committed message JSON, skipping User message"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::error!(
+                                kind = "voice_turn_committed",
+                                "voice_turn_committed entry has no message field, skipping User message"
+                            );
+                        }
+                    }
                     continue;
                 }
 
@@ -575,6 +620,9 @@ impl Agent {
                 timestamp: Utc::now().timestamp_millis(),
             }));
         }
+
+        // Voice turn_committed → User messages come before the observation summary.
+        messages.extend(voice_user_messages);
 
         if !voice_lines.is_empty() {
             let summary = format!("[Voice Observation]\n{}", voice_lines.join("\n"));
@@ -2863,7 +2911,7 @@ mod drain_observations_tests {
     fn drain_observations_processes_voice_when_enabled() {
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
-        bridge.push_observation(voice_observation("voice_turn_committed"));
+        bridge.push_observation(voice_observation("voice_stt_partial"));
         agent.set_chrome_bridge(bridge);
         agent.set_voice_enabled(true);
 
@@ -2872,7 +2920,7 @@ mod drain_observations_tests {
         let msg = msgs.into_iter().next().unwrap();
         match msg {
             Message::Custom(cm) => {
-                assert!(cm.content.contains("voice_turn_committed"));
+                assert!(cm.content.contains("voice_stt_partial"));
             }
             other => panic!("expected Custom message, got {other:?}"),
         }
@@ -2946,8 +2994,8 @@ mod drain_observations_tests {
                     ts: 1000,
                 },
                 ObservationEntry {
-                    kind: "voice_turn_committed".to_string(),
-                    message: Some(r#"{"transcript":"hello"}"#.to_string()),
+                    kind: "voice_stt_final".to_string(),
+                    message: Some(r#"{"text":"hello"}"#.to_string()),
                     source: Some("voice".to_string()),
                     url: None,
                     ts: 1001,
@@ -2974,10 +3022,10 @@ mod drain_observations_tests {
 
         if let Some(Message::Custom(cm)) = browser_msg {
             assert!(cm.content.contains("console_error"));
-            assert!(!cm.content.contains("voice_turn_committed"));
+            assert!(!cm.content.contains("voice_stt_final"));
         }
         if let Some(Message::Custom(cm)) = voice_msg {
-            assert!(cm.content.contains("voice_turn_committed"));
+            assert!(cm.content.contains("voice_stt_final"));
             assert!(!cm.content.contains("console_error"));
         }
     }
@@ -2998,6 +3046,183 @@ mod drain_observations_tests {
                 assert_eq!(cm.custom_type, "browser_observations");
             }
             other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Voice turn_committed → Message::User conversion (bd-19o.1.7.2)
+    // -----------------------------------------------------------------------
+
+    /// Build a voice_turn_committed observation with valid VoiceTurnCommitted JSON.
+    fn voice_turn_committed_observation(transcript: &str) -> ObservationEvent {
+        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted};
+        let vtc = VoiceTurnCommitted {
+            transcript: transcript.to_string(),
+            proof: CommitProof::test_default(),
+        };
+        ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some(serde_json::to_string(&vtc).unwrap()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        }
+    }
+
+    #[test]
+    fn voice_turn_committed_creates_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_observation("open the settings page"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        // Expect: User message + CommitProof companion
+        assert_eq!(msgs.len(), 2, "turn_committed → User + CommitProof");
+        match &msgs[0] {
+            Message::User(um) => {
+                match &um.content {
+                    UserContent::Text(t) => assert_eq!(t, "open the settings page"),
+                    other => panic!("expected Text content, got {other:?}"),
+                }
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
+        match &msgs[1] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_commit_proof");
+                assert!(!cm.display);
+                let details = cm.details.as_ref().expect("details present");
+                assert!(details.get("proof").is_some(), "proof field in details");
+            }
+            other => panic!("expected Custom commit_proof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_turn_committed_empty_transcript_still_creates_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_observation(""));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert_eq!(msgs.len(), 2, "empty transcript → still User + proof");
+        match &msgs[0] {
+            Message::User(um) => {
+                match &um.content {
+                    UserContent::Text(t) => assert_eq!(t, ""),
+                    other => panic!("expected Text content, got {other:?}"),
+                }
+            }
+            other => panic!("expected User message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_turn_committed_malformed_json_skips_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // Push malformed JSON as voice_turn_committed
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: Some("{not valid json!!!}".to_string()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert!(msgs.is_empty(), "malformed JSON → no messages");
+    }
+
+    #[test]
+    fn voice_turn_committed_no_message_field_skips_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: "voice_turn_committed".to_string(),
+                message: None,
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert!(msgs.is_empty(), "no message field → no messages");
+    }
+
+    #[test]
+    fn voice_turn_committed_mixed_with_other_voice_events() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // Push a batch with both turn_committed and stt_partial
+        bridge.push_observation(voice_turn_committed_observation("hello world"));
+        bridge.push_observation(voice_observation("voice_stt_partial"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        // Expect: User + CommitProof + Voice Observation summary for stt_partial
+        assert_eq!(msgs.len(), 3, "turn_committed + stt_partial → 3 msgs");
+        match &msgs[0] {
+            Message::User(um) => {
+                match &um.content {
+                    UserContent::Text(t) => assert_eq!(t, "hello world"),
+                    other => panic!("expected Text, got {other:?}"),
+                }
+            }
+            other => panic!("expected User msg at [0], got {other:?}"),
+        }
+        match &msgs[1] {
+            Message::Custom(cm) => assert_eq!(cm.custom_type, "voice_commit_proof"),
+            other => panic!("expected commit_proof at [1], got {other:?}"),
+        }
+        match &msgs[2] {
+            Message::Custom(cm) => {
+                assert_eq!(cm.custom_type, "voice_observations");
+                assert!(cm.content.contains("voice_stt_partial"));
+            }
+            other => panic!("expected voice_observations at [2], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_turn_committed_only_committed_creates_user_not_other_kinds() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        // Push only non-committed voice events
+        bridge.push_observation(voice_observation("voice_tts_started"));
+        bridge.push_observation(voice_observation("voice_stt_final"));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        // Should only produce voice_observations Custom, no User messages
+        assert_eq!(msgs.len(), 1);
+        for msg in &msgs {
+            match msg {
+                Message::User(_) => panic!("non-committed voice events must NOT create User messages"),
+                _ => {}
+            }
         }
     }
 }
@@ -3073,8 +3298,8 @@ mod vs1_behavior_matrix_tests {
             version: 1,
             observer_id: "voice".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
-                message: Some(r#"{"transcript":"test"}"#.to_string()),
+                kind: "voice_stt_partial".to_string(),
+                message: Some(r#"{"text":"test"}"#.to_string()),
                 source: Some("voice".to_string()),
                 url: None,
                 ts: 1000,
