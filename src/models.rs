@@ -675,6 +675,11 @@ fn model_is_reasoning(model_id: &str) -> Option<bool> {
         return Some(false);
     }
 
+    // Qwen: qwq- series are reasoning.
+    if id.starts_with("qwq-") {
+        return Some(true);
+    }
+
     // Mistral/Codestral: no reasoning support currently.
     if id.starts_with("mistral") || id.starts_with("codestral") || id.starts_with("pixtral") {
         return Some(false);
@@ -687,7 +692,6 @@ fn model_is_reasoning(model_id: &str) -> Option<bool> {
 
     // Groq-hosted models: groq model IDs typically include the upstream model name
     // (e.g., "llama-3.3-70b-versatile"), so the upstream checks above should catch them.
-
     None
 }
 
