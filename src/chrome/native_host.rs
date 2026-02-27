@@ -45,7 +45,7 @@ impl NativeHostConfig {
             token: None,
             lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
             idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
-            capabilities: vec!["browser_tools".to_string(), "observations".to_string()],
+            capabilities: vec!["browser_tools".to_string(), "observations".to_string(), "voice".to_string()],
         }
     }
 }
