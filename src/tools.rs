@@ -2382,7 +2382,7 @@ fn diff_parts(old_content: &str, new_content: &str) -> Vec<DiffPart> {
 
     let mut parts: Vec<DiffPart> = Vec::new();
     let mut current_tag: Option<DiffTag> = None;
-    let mut current_value = String::new();
+    let mut current_lines: Vec<&str> = Vec::new();
 
     for change in diff.iter_all_changes() {
         let tag = match change.tag() {
@@ -2397,26 +2397,23 @@ fn diff_parts(old_content: &str, new_content: &str) -> Vec<DiffPart> {
         }
 
         if current_tag == Some(tag) {
-            if !current_value.is_empty() {
-                current_value.push('\n');
-            }
-            current_value.push_str(line);
+            current_lines.push(line);
         } else {
             if let Some(prev_tag) = current_tag {
                 parts.push(DiffPart {
                     tag: prev_tag,
-                    value: current_value,
+                    value: current_lines.join("\n"),
                 });
             }
             current_tag = Some(tag);
-            current_value = line.to_string();
+            current_lines = vec![line];
         }
     }
 
     if let Some(tag) = current_tag {
         parts.push(DiffPart {
             tag,
-            value: current_value,
+            value: current_lines.join("\n"),
         });
     }
 
@@ -2432,11 +2429,12 @@ fn diff_line_num_width(old_content: &str, new_content: &str) -> usize {
 }
 
 fn split_diff_lines(value: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = value.split('\n').collect();
-    if lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-    }
-    lines
+    // value is joined by `\n` from a Vec<&str> in diff_parts, so there is no
+    // spurious trailing newline. We can split exactly.
+    // We only need to handle the case where value is empty but it originated from
+    // 0 elements, but `diff_parts` only emits when there is at least 1 line.
+    // If value is "", `split('\n')` returns `[""]`, which correctly represents 1 empty line.
+    value.split('\n').collect()
 }
 
 #[inline]
@@ -3045,6 +3043,8 @@ struct GrepInput {
     literal: Option<bool>,
     context: Option<usize>,
     limit: Option<usize>,
+    #[serde(default)]
+    hashline: bool,
 }
 
 pub struct GrepTool {
@@ -3178,7 +3178,7 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &str {
-        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars."
+        "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars. Use hashline=true to get N#AB content-hash tags for use with hashline_edit."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -3212,6 +3212,10 @@ impl Tool for GrepTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of matches to return (default: 100)"
+                },
+                "hashline": {
+                    "type": "boolean",
+                    "description": "When true, output each line as N#AB:content where N is the line number and AB is a content hash. Use with hashline_edit tool for precise edits."
                 }
             },
             "required": ["pattern"]
@@ -3534,7 +3538,15 @@ impl Tool for GrepTool {
                         lines_truncated = true;
                     }
 
-                    if match_lines.binary_search(&current).is_ok() {
+                    if input.hashline {
+                        let line_idx = current - 1; // 0-indexed for hashline
+                        let tag = format_hashline_tag(line_idx, &sanitized);
+                        if match_lines.binary_search(&current).is_ok() {
+                            output_lines.push(format!("{relative_path}:{tag}: {}", truncated.text));
+                        } else {
+                            output_lines.push(format!("{relative_path}-{tag}- {}", truncated.text));
+                        }
+                    } else if match_lines.binary_search(&current).is_ok() {
                         output_lines.push(format!("{relative_path}:{current}: {}", truncated.text));
                     } else {
                         output_lines.push(format!("{relative_path}-{current}- {}", truncated.text));
@@ -4609,12 +4621,7 @@ fn compute_line_hash(line_idx: usize, line: &str) -> [u8; 2] {
 /// Format a hashline tag as `"N#AB"` where N is the 1-indexed line number.
 fn format_hashline_tag(line_idx: usize, line: &str) -> String {
     let h = compute_line_hash(line_idx, line);
-    format!(
-        "{}#{}{}",
-        line_idx + 1,
-        h[0] as char,
-        h[1] as char
-    )
+    format!("{}#{}{}", line_idx + 1, h[0] as char, h[1] as char)
 }
 
 /// Regex for parsing hashline references like `5#KJ` or ` > +  5 # KJ `.
@@ -4648,9 +4655,8 @@ fn parse_hashline_tag(ref_str: &str) -> std::result::Result<(usize, [u8; 2]), St
 static HASHLINE_PREFIX_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn strip_hashline_prefix(line: &str) -> &str {
-    let re = HASHLINE_PREFIX_RE.get_or_init(|| {
-        regex::Regex::new(r"^\d+#[ZPMQVRWSNKTXJBYH]{2}:").unwrap()
-    });
+    let re = HASHLINE_PREFIX_RE
+        .get_or_init(|| regex::Regex::new(r"^\d+#[ZPMQVRWSNKTXJBYH]{2}:").unwrap());
     re.find(line).map_or(line, |m| &line[m.end()..])
 }
 
@@ -4717,10 +4723,7 @@ impl HashlineEditTool {
 
 /// Validate a hashline tag reference against actual file lines.
 /// Returns `Ok(0-indexed line)` or `Err(message)` with context.
-fn validate_line_ref(
-    ref_str: &str,
-    file_lines: &[&str],
-) -> std::result::Result<usize, String> {
+fn validate_line_ref(ref_str: &str, file_lines: &[&str]) -> std::result::Result<usize, String> {
     let (line_num, expected_hash) = parse_hashline_tag(ref_str)?;
     let line_idx = line_num - 1;
     if line_idx >= file_lines.len() {
@@ -4734,9 +4737,7 @@ fn validate_line_ref(
         let tag = format_hashline_tag(line_idx, file_lines[line_idx]);
         return Err(format!(
             "Hash mismatch at line {line_num}: expected {}#{}{}, actual is {tag}",
-            line_num,
-            expected_hash[0] as char,
-            expected_hash[1] as char,
+            line_num, expected_hash[0] as char, expected_hash[1] as char,
         ));
     }
     Ok(line_idx)
@@ -4880,12 +4881,8 @@ impl Tool for HashlineEditTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let input: HashlineEditInput = serde_json::from_value(input).map_err(|e| {
-            Error::tool(
-                "hashline_edit",
-                format!("Invalid input: {e}"),
-            )
-        })?;
+        let input: HashlineEditInput = serde_json::from_value(input)
+            .map_err(|e| Error::tool("hashline_edit", format!("Invalid input: {e}")))?;
 
         if input.edits.is_empty() {
             return Err(Error::tool("hashline_edit", "No edits provided"));
@@ -5072,8 +5069,10 @@ impl Tool for HashlineEditTool {
             match edit.op {
                 "replace" => {
                     // Check if it's a no-op
-                    let existing: Vec<&str> =
-                        lines[edit.start..=edit.end].iter().map(String::as_str).collect();
+                    let existing: Vec<&str> = lines[edit.start..=edit.end]
+                        .iter()
+                        .map(String::as_str)
+                        .collect();
                     if existing == edit.lines.iter().map(String::as_str).collect::<Vec<&str>>() {
                         continue; // no-op
                     }
@@ -5127,8 +5126,9 @@ impl Tool for HashlineEditTool {
             .ok()
             .map(|m| m.permissions());
         let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp_file = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|e| Error::tool("hashline_edit", format!("Failed to create temp file: {e}")))?;
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
+            Error::tool("hashline_edit", format!("Failed to create temp file: {e}"))
+        })?;
         temp_file
             .as_file_mut()
             .write_all(final_content.as_bytes())
@@ -5156,8 +5156,7 @@ impl Tool for HashlineEditTool {
             .map_err(|e| Error::tool("hashline_edit", format!("Failed to persist file: {e}")))?;
 
         // Generate diff
-        let (diff, first_changed_line) =
-            generate_diff_string(&normalized, &new_normalized);
+        let (diff, first_changed_line) = generate_diff_string(&normalized, &new_normalized);
         let mut details = serde_json::Map::new();
         details.insert("diff".to_string(), serde_json::Value::String(diff));
         if let Some(line) = first_changed_line {
@@ -6513,6 +6512,90 @@ mod tests {
         });
     }
 
+    #[test]
+    fn test_grep_hashline_output() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("hash.txt"),
+                "apple\nbanana\napricot\ncherry",
+            )
+            .unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "ap",
+                        "path": tmp.path().join("hash.txt").to_string_lossy(),
+                        "hashline": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            // Hashline output should contain N#AB tags instead of bare line numbers
+            // Line 1 (apple) and line 3 (apricot) should match
+            assert!(text.contains("apple"), "should contain apple");
+            assert!(text.contains("apricot"), "should contain apricot");
+            assert!(
+                !text.contains("banana"),
+                "should not contain banana context"
+            );
+            // Verify hashline tag format: digit(s) followed by # and two uppercase letters
+            let re = regex::Regex::new(r"\d+#[A-Z]{2}").unwrap();
+            assert!(
+                re.is_match(&text),
+                "hashline output should contain N#AB tags, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_grep_hashline_with_context() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("ctx.txt"),
+                "line1\nline2\ntarget\nline4\nline5",
+            )
+            .unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "target",
+                        "path": tmp.path().join("ctx.txt").to_string_lossy(),
+                        "hashline": true,
+                        "context": 1
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            // With context=1, should include line2, target, line4
+            assert!(text.contains("line2"), "should contain context line2");
+            assert!(text.contains("target"), "should contain match");
+            assert!(text.contains("line4"), "should contain context line4");
+            // Match lines use `:` separator, context lines use `-`
+            let re_match = regex::Regex::new(r"\d+#[A-Z]{2}: target").unwrap();
+            assert!(
+                re_match.is_match(&text),
+                "match line should use : separator with hashline tag, got: {text}"
+            );
+            let re_ctx = regex::Regex::new(r"\d+#[A-Z]{2}- line").unwrap();
+            assert!(
+                re_ctx.is_match(&text),
+                "context line should use - separator with hashline tag, got: {text}"
+            );
+        });
+    }
+
     // ========================================================================
     // Find Tool Tests
     // ========================================================================
@@ -7545,10 +7628,7 @@ mod tests {
 
         // Hash is 2 bytes from NIBBLE_STR
         for &b in &h1 {
-            assert!(
-                NIBBLE_STR.contains(&b),
-                "hash byte {b} not in NIBBLE_STR"
-            );
+            assert!(NIBBLE_STR.contains(&b), "hash byte {b} not in NIBBLE_STR");
         }
     }
 
@@ -7558,7 +7638,10 @@ mod tests {
         // different indices should produce different hashes.
         let h1 = compute_line_hash(0, "}");
         let h2 = compute_line_hash(1, "}");
-        assert_ne!(h1, h2, "punctuation-only lines at different indices should differ");
+        assert_ne!(
+            h1, h2,
+            "punctuation-only lines at different indices should differ"
+        );
 
         // Blank lines also use idx as seed
         let h3 = compute_line_hash(0, "");
@@ -7580,7 +7663,10 @@ mod tests {
     fn test_format_hashline_tag() {
         let tag = format_hashline_tag(0, "fn main() {");
         // Should be "1#XX" format (1-indexed)
-        assert!(tag.starts_with("1#"), "tag should start with 1#, got: {tag}");
+        assert!(
+            tag.starts_with("1#"),
+            "tag should start with 1#, got: {tag}"
+        );
         assert_eq!(tag.len(), 4, "tag should be 4 chars: N#AB");
 
         let tag10 = format_hashline_tag(9, "line 10");
