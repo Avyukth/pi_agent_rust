@@ -476,7 +476,7 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
             return Err(rquickjs::Error::new_into_js_message(
                 "json",
                 "stringify",
-                "Array length exceeds maximum allowed limit of 100,000",
+                format!("Array length ({len}) exceeds maximum allowed limit of 100,000"),
             ));
         }
         let mut result = Vec::with_capacity(std::cmp::min(len, 1024));

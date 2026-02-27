@@ -523,7 +523,7 @@ impl Buffer {
     }
 
     fn consume(&mut self, n: usize) {
-        self.pos = self.pos.saturating_add(n);
+        self.pos = self.pos.saturating_add(n).min(self.bytes.len());
         if self.pos == self.bytes.len() {
             self.bytes.clear();
             self.pos = 0;
