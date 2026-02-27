@@ -715,7 +715,7 @@ run_lint_gates() {
     fi
 
     echo "[lint] Running clippy..."
-    if run_cargo clippy --all-targets -- -D warnings > "$lint_dir/clippy.log" 2>&1; then
+    if run_split_clippy_gates "$lint_dir/clippy.log"; then
         echo "[lint] clippy: PASS"
     else
         echo "[lint] clippy: FAIL (see $lint_dir/clippy.log)"
@@ -729,6 +729,42 @@ run_lint_gates() {
         echo "[lint] Some gates failed" >&2
         return 1
     fi
+}
+
+run_split_clippy_gates() {
+    local log_file="$1"
+    : > "$log_file"
+
+    local -a labels=("lib+bins" "tests" "benches" "examples")
+    local -a args=()
+    for label in "${labels[@]}"; do
+        echo "=== clippy slice: $label ===" >> "$log_file"
+        case "$label" in
+            "lib+bins")
+                args=(clippy --lib --bins -- -D warnings)
+                ;;
+            "tests")
+                args=(clippy --tests -- -D warnings)
+                ;;
+            "benches")
+                args=(clippy --benches -- -D warnings)
+                ;;
+            "examples")
+                args=(clippy --examples -- -D warnings)
+                ;;
+        esac
+
+        if run_cargo "${args[@]}" >> "$log_file" 2>&1; then
+            echo "slice $label: PASS" >> "$log_file"
+            echo >> "$log_file"
+        else
+            echo "slice $label: FAIL" >> "$log_file"
+            echo >> "$log_file"
+            return 1
+        fi
+    done
+
+    return 0
 }
 
 # ─── Lib Inline Tests ────────────────────────────────────────────────────────

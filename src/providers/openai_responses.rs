@@ -336,6 +336,8 @@ impl Provider for OpenAIResponsesProvider {
 
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            // A successful chunk resets the consecutive error counter.
+                            state.write_zero_count = 0;
                             if msg.data == "[DONE]" {
                                 // Best-effort fallback: if we didn't see a completed/incomplete
                                 // chunk, emit Done using current state.
@@ -348,6 +350,25 @@ impl Provider for OpenAIResponsesProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames from certain providers like Kimi K2.5).
+                            // Skip them and keep reading the stream, but cap
+                            // consecutive occurrences to avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
@@ -403,6 +424,8 @@ where
     text_blocks: HashMap<TextKey, usize>,
     reasoning_blocks: HashMap<ReasoningKey, usize>,
     tool_calls_by_item_id: HashMap<String, ToolCallState>,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 impl<S> StreamState<S>
@@ -428,6 +451,7 @@ where
             text_blocks: HashMap::new(),
             reasoning_blocks: HashMap::new(),
             tool_calls_by_item_id: HashMap::new(),
+            write_zero_count: 0,
         }
     }
 
@@ -483,8 +507,8 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIResponsesChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: OpenAIResponsesChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         match chunk {
             OpenAIResponsesChunk::OutputTextDelta {

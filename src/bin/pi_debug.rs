@@ -45,7 +45,7 @@ fn main_impl() -> Result<()> {
 
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 8)
+        .blocking_threads(1, 2)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -210,6 +210,7 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         &global_dir,
         &package_dir,
         test_mode,
+        !cli.hide_cwd_in_prompt,
     );
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;

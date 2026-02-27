@@ -1099,7 +1099,7 @@ mod tests {
             ReplayTraceCodecError::Validation(ReplayTraceValidationError::RetryWithoutCancel {
                 ..
             }) => {}
-            other => panic!(),
+            other => unreachable!("expected RetryWithoutCancel, got: {other:?}"),
         }
     }
 
@@ -1140,7 +1140,7 @@ mod tests {
                 assert_eq!(expected, 2);
                 assert_eq!(observed, 3);
             }
-            other => panic!(),
+            other => unreachable!("expected NonContiguousSequence, got: {other:?}"),
         }
     }
 
@@ -1164,7 +1164,7 @@ mod tests {
             ReplayDivergenceReason::EventFieldMismatch { field, .. } => {
                 assert_eq!(field, "kind");
             }
-            other => panic!(),
+            other => unreachable!("expected EventFieldMismatch, got: {other:?}"),
         }
     }
 
@@ -1188,7 +1188,7 @@ mod tests {
                 assert_eq!(expected, 2);
                 assert_eq!(observed, 1);
             }
-            other => panic!(),
+            other => unreachable!("expected EventCountMismatch, got: {other:?}"),
         }
     }
 
@@ -1618,7 +1618,7 @@ mod tests {
             ReplayDivergenceReason::EventFieldMismatch { field, .. } => {
                 assert_eq!(field, "attributes");
             }
-            other => panic!(),
+            other => unreachable!("expected EventFieldMismatch for attributes, got: {other:?}"),
         }
     }
 

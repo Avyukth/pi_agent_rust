@@ -58,7 +58,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "list-providers"
         | "chrome"
         | "chrome-voice"
-        | "setup-chrome" => (false, false),
+        | "setup-chrome"
+        | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
         | "api-key"
@@ -354,8 +355,8 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls)
-    #[arg(long, default_value = "read,bash,edit,write")]
+    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,hashline_edit)
+    #[arg(long, default_value = "read,bash,edit,write,hashline_edit")]
     pub tools: String,
 
     // === Chrome Browser Automation ===
@@ -430,6 +431,11 @@ pub struct Cli {
     /// Disable theme discovery
     #[arg(long)]
     pub no_themes: bool,
+
+    // === System prompt modifiers ===
+    /// Hide the current working directory from the system prompt.
+    #[arg(long, env = "PI_HIDE_CWD_IN_PROMPT")]
+    pub hide_cwd_in_prompt: bool,
 
     // === Export & Listing ===
     /// Export session file to HTML
@@ -872,7 +878,10 @@ mod tests {
     #[test]
     fn default_tools() {
         let cli = Cli::parse_from(["pi"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit", "write"]);
+        assert_eq!(
+            cli.enabled_tools(),
+            vec!["read", "bash", "edit", "write", "hashline_edit"]
+        );
     }
 
     #[test]
@@ -1123,7 +1132,7 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write");
+        assert_eq!(cli.tools, "read,bash,edit,write,hashline_edit");
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────

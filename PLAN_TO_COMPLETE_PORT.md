@@ -4,7 +4,8 @@
 
 > **Important:** This document is a historical overview, not the live backlog.
 > For the authoritative plan, use Beads:
-> - `bv --robot-triage`
+> - `bv --robot-plan`
+> - `bv --robot-priority`
 > - `br ready`
 > - `br show <id>`
 
@@ -607,7 +608,8 @@ FEATURE_PARITY.md        # Update as features complete
 **Current Priorities:**
 
 Use Beads for the live queue:
-- `bv --robot-triage`
+- `bv --robot-plan`
+- `bv --robot-priority`
 - `br ready`
 
 High-level workstreams:

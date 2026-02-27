@@ -158,35 +158,43 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
 
     if settings_path.exists() {
         match fs::read_to_string(&settings_path) {
-            Ok(content) => match serde_json::from_str::<Value>(&content) {
-                Ok(mut settings_value) => {
-                    if let Some(api_keys) = settings_value
-                        .get("apiKeys")
-                        .and_then(Value::as_object)
-                        .cloned()
-                    {
-                        for (provider, key_value) in api_keys {
-                            let Some(key) = key_value.as_str() else {
-                                continue;
-                            };
-                            if migrated.contains_key(&provider) {
-                                continue;
+            Ok(content) => {
+                match serde_json::from_str::<Value>(&content) {
+                    Ok(mut settings_value) => {
+                        if let Some(api_keys) = settings_value
+                            .get("apiKeys")
+                            .and_then(Value::as_object)
+                            .cloned()
+                        {
+                            for (provider, key_value) in api_keys {
+                                let Some(key) = key_value.as_str() else {
+                                    continue;
+                                };
+                                if migrated.contains_key(&provider) {
+                                    continue;
+                                }
+                                migrated.insert(
+                                    provider.clone(),
+                                    serde_json::json!({
+                                        "type": "api_key",
+                                        "key": key,
+                                    }),
+                                );
+                                providers.insert(provider);
                             }
-                            migrated.insert(
-                                provider.clone(),
-                                serde_json::json!({
-                                    "type": "api_key",
-                                    "key": key,
-                                }),
-                            );
-                            providers.insert(provider);
-                        }
-                        if let Value::Object(settings_obj) = &mut settings_value {
-                            settings_obj.remove("apiKeys");
-                        }
-                        match serde_json::to_string_pretty(&settings_value) {
+                            if let Value::Object(settings_obj) = &mut settings_value {
+                                settings_obj.remove("apiKeys");
+                            }
+                            match serde_json::to_string_pretty(&settings_value) {
                             Ok(updated) => {
-                                if let Err(err) = fs::write(&settings_path, updated) {
+                                let tmp = settings_path.with_extension("json.tmp");
+                                let res = fs::File::create(&tmp).and_then(|mut f| {
+                                    use std::io::Write;
+                                    f.write_all(updated.as_bytes())?;
+                                    f.sync_all()
+                                }).and_then(|()| fs::rename(&tmp, &settings_path));
+
+                                if let Err(err) = res {
                                     warnings.push(format!(
                                         "could not persist settings.json after apiKeys migration: {err}"
                                     ));
@@ -196,12 +204,13 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
                                 "could not serialize settings.json after apiKeys migration: {err}"
                             )),
                         }
+                        }
                     }
+                    Err(err) => warnings.push(format!(
+                        "could not parse settings.json for apiKeys migration: {err}"
+                    )),
                 }
-                Err(err) => warnings.push(format!(
-                    "could not parse settings.json for apiKeys migration: {err}"
-                )),
-            },
+            }
             Err(err) => warnings.push(format!(
                 "could not read settings.json for apiKeys migration: {err}"
             )),
@@ -219,7 +228,25 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
 
         match serde_json::to_string_pretty(&Value::Object(migrated)) {
             Ok(contents) => {
-                if let Err(err) = fs::write(&auth_path, contents) {
+                let tmp = auth_path.with_extension("json.tmp");
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+
+                let res = options
+                    .open(&tmp)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(contents.as_bytes())?;
+                        f.sync_all()
+                    })
+                    .and_then(|()| fs::rename(&tmp, &auth_path));
+
+                if let Err(err) = res {
                     warnings.push(format!("could not write auth.json during migration: {err}"));
                 } else if let Err(err) = set_owner_only_permissions(&auth_path) {
                     warnings.push(format!("could not set auth.json permissions to 600: {err}"));
@@ -479,6 +506,37 @@ mod tests {
         .expect("parse settings");
         assert!(settings_value.get("apiKeys").is_none());
         assert!(agent_dir.join("oauth.json.migrated").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_auth_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        write(
+            &agent_dir.join("settings.json"),
+            r#"{"apiKeys":{"openai":"sk-test"}}"#,
+        );
+
+        let _report = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
+
+        let auth_path = agent_dir.join("auth.json");
+        assert!(auth_path.exists(), "auth.json should be created");
+        let mode = fs::metadata(&auth_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "auth.json should have 0o600 permissions, got {mode:#o}"
+        );
     }
 
     #[test]

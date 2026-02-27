@@ -6,7 +6,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gix = GixBuilder::default().sha(true).dirty(true).build()?;
     let rustc = RustcBuilder::default().semver(true).build()?;
 
-    Emitter::default()
+    let mut emitter = Emitter::default();
+    // Offloaded builds can temporarily miss git objects and trigger fallback warnings.
+    // Keep default env fallbacks, but suppress warning noise in build output.
+    emitter
+        .quiet()
         .add_instructions(&build)?
         .add_instructions(&cargo)?
         .add_instructions(&gix)?

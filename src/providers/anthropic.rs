@@ -478,6 +478,7 @@ impl Provider for AnthropicProvider {
                 loop {
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            state.write_zero_count = 0;
                             if msg.event == "ping" {
                                 // Skip ping events
                             } else {
@@ -500,6 +501,25 @@ impl Provider for AnthropicProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames when TLS buffers are full). Skip them and
+                            // keep reading, but cap consecutive occurrences to
+                            // avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
@@ -536,6 +556,8 @@ where
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     done: bool,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 impl<S> StreamState<S>
@@ -569,13 +591,14 @@ where
             current_tool_id: None,
             current_tool_name: None,
             done: false,
+            write_zero_count: 0,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<Option<StreamEvent>> {
-        let event: AnthropicStreamEvent =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let event: AnthropicStreamEvent = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {

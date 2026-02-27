@@ -22025,7 +22025,12 @@ async fn dispatch_hostcall_exec_ref(
         let mut partial = Vec::new();
 
         loop {
-            let read = reader.read(&mut buf).map_err(|err| err.to_string())?;
+            let read = match reader.read(&mut buf) {
+                Ok(0) => 0,
+                Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.to_string()),
+            };
             if read == 0 {
                 // EOF. Flush partial if any (lossy).
                 if !partial.is_empty() {
@@ -30894,7 +30899,7 @@ mod tests {
                 .get("event")
                 .is_some_and(|value| value.contains("host_call.start"))
         });
-        let start = start.unwrap_or_else(|| panic!());
+        let start = start.expect("expected host_call.start event in trace");
         assert_eq!(
             start.fields.get("runtime").map(std::string::String::as_str),
             Some("protocol")

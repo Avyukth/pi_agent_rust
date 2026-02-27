@@ -864,6 +864,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         global_dir,
         package_dir,
         true, // test_mode
+        true, // include_cwd
     );
     assert!(prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("<CWD>"));
@@ -876,8 +877,16 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
     let cwd = Path::new("/tmp/test_cwd");
     let global_dir = Path::new("/tmp/nonexistent_global");
     let package_dir = Path::new("/tmp/nonexistent_package");
-    let prompt =
-        app::build_system_prompt(&cli, cwd, &["read"], None, global_dir, package_dir, false);
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read"],
+        None,
+        global_dir,
+        package_dir,
+        false,
+        true,
+    );
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
 }
@@ -896,9 +905,40 @@ fn build_system_prompt_with_skills_prompt() {
         global_dir,
         package_dir,
         true,
+        true,
     );
     assert!(prompt.contains("Available Skills"));
     assert!(prompt.contains("/commit"));
+}
+
+#[test]
+fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
+    let cli = Cli::parse_from(["pi"]);
+    let cwd = Path::new("/tmp/test_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read", "bash", "edit", "write", "hashline_edit"],
+        None,
+        global_dir,
+        package_dir,
+        true,
+        true,
+    );
+    assert!(
+        prompt.contains("hashline_edit"),
+        "System prompt should list hashline_edit tool"
+    );
+    assert!(
+        prompt.contains("LINE#HASH"),
+        "System prompt should describe hashline tag format"
+    );
+    assert!(
+        prompt.contains("hashline=true"),
+        "System prompt guideline should mention read with hashline=true"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

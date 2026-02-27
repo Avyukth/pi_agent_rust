@@ -396,8 +396,8 @@ where
 
     #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: AzureStreamChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: AzureStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         // Process usage if present
         if let Some(usage) = chunk.usage {
@@ -475,20 +475,20 @@ where
 
                     // Update the tool call state
                     if let Some(id) = tc.id {
-                        tc_state.id.clone_from(&id);
+                        tc_state.id.push_str(&id);
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
                         {
-                            block.id = id;
+                            block.id.clone_from(&tc_state.id);
                         }
                     }
                     if let Some(func) = tc.function {
                         if let Some(name) = func.name {
-                            tc_state.name.clone_from(&name);
+                            tc_state.name.push_str(&name);
                             if let Some(ContentBlock::ToolCall(block)) =
                                 self.partial.content.get_mut(content_index)
                             {
-                                block.name = name;
+                                block.name.clone_from(&tc_state.name);
                             }
                         }
                         if let Some(args) = func.arguments {
@@ -695,6 +695,7 @@ struct AzureUsage {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
     match message {
         Message::User(user) => vec![AzureMessage {
@@ -761,41 +762,53 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             messages
         }
         Message::ToolResult(result) => {
-            let parts: Vec<AzureContentPart> = result
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(AzureContentPart::Text {
-                        text: t.text.clone(),
-                    }),
+            let mut text_parts = Vec::new();
+            let mut image_parts = Vec::new();
+
+            for block in &result.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.text.clone()),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                        Some(AzureContentPart::ImageUrl {
+                        image_parts.push(AzureContentPart::ImageUrl {
                             image_url: AzureImageUrl { url },
-                        })
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    _ => {}
+                }
+            }
 
-            let content = if parts.is_empty() {
-                None
-            } else if parts.len() == 1 && matches!(parts[0], AzureContentPart::Text { .. }) {
-                if let AzureContentPart::Text { text } = &parts[0] {
-                    Some(AzureContent::Text(text.clone()))
+            let text_content = if text_parts.is_empty() {
+                if image_parts.is_empty() {
+                    None
                 } else {
-                    Some(AzureContent::Parts(parts))
+                    Some(AzureContent::Text("(see attached image)".to_string()))
                 }
             } else {
-                Some(AzureContent::Parts(parts))
+                Some(AzureContent::Text(text_parts.join("\n")))
             };
 
-            vec![AzureMessage {
+            let mut messages = vec![AzureMessage {
                 role: "tool".to_string(),
-                content,
+                content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
-            }]
+            }];
+
+            if !image_parts.is_empty() {
+                let mut parts = vec![AzureContentPart::Text {
+                    text: "Attached image(s) from tool result:".to_string(),
+                }];
+                parts.extend(image_parts);
+                messages.push(AzureMessage {
+                    role: "user".to_string(),
+                    content: Some(AzureContent::Parts(parts)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            messages
         }
     }
 }
@@ -842,7 +855,7 @@ fn convert_tool_to_azure(tool: &ToolDef) -> AzureTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TextContent, ToolCall, UserMessage};
+    use crate::model::{ImageContent, TextContent, ToolCall, ToolResultMessage, UserMessage};
     use crate::provider::ToolDef;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
@@ -1240,6 +1253,109 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    fn make_tool_result(content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "test_tool".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn tool_result_text_only_produces_single_tool_message() {
+        let msg = make_tool_result(vec![ContentBlock::Text(TextContent {
+            text: "result text".to_string(),
+            text_signature: None,
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[0].tool_call_id.as_deref(), Some("call_123"));
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert_eq!(json["content"], "result text");
+    }
+
+    #[test]
+    fn tool_result_image_only_produces_tool_plus_user_message() {
+        let msg = make_tool_result(vec![ContentBlock::Image(ImageContent {
+            data: "aW1hZ2U=".to_string(),
+            mime_type: "image/png".to_string(),
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "image-only should produce tool + user messages"
+        );
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[1].role, "user");
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "(see attached image)");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_image_splits_correctly() {
+        let msg = make_tool_result(vec![
+            ContentBlock::Text(TextContent {
+                text: "line one".to_string(),
+                text_signature: None,
+            }),
+            ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            }),
+            ContentBlock::Text(TextContent {
+                text: "line two".to_string(),
+                text_signature: None,
+            }),
+        ]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "mixed content should produce tool + user messages"
+        );
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "line one\nline two");
+        assert_eq!(tool_json["tool_call_id"], "call_123");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn tool_result_empty_content_produces_single_tool_message_with_no_content() {
+        let msg = make_tool_result(vec![]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert!(
+            json["content"].is_null(),
+            "empty tool result should have null content"
+        );
     }
 }
 

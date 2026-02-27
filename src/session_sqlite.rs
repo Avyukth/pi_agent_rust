@@ -134,14 +134,17 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
     let header_json = row_get_str(header_row, "json")?;
     let header: SessionHeader = serde_json::from_str(header_json)?;
 
-    let meta_rows = map_outcome(
-        conn.query(
+    let meta_rows = match conn
+        .query(
             cx.cx(),
             "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')",
             &[],
         )
-        .await,
-    )?;
+        .await
+    {
+        Outcome::Ok(rows) => rows,
+        _ => Vec::new(),
+    };
 
     let mut message_count: Option<u64> = None;
     let mut name: Option<String> = None;
@@ -150,7 +153,11 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         let value = row_get_str(&row, "value")?;
         match key {
             "message_count" => message_count = value.parse::<u64>().ok(),
-            "name" => name = Some(value.to_string()),
+            "name" => {
+                if !value.is_empty() {
+                    name = Some(value.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -396,7 +403,7 @@ mod tests {
             Error::Session(message) => {
                 assert!(message.contains("SQLite session error"));
             }
-            other => panic!(),
+            other => unreachable!("Unexpected error: {:?}", other),
         }
     }
 
@@ -419,7 +426,7 @@ mod tests {
             Error::Session(message) => {
                 assert!(message.contains("panicked"));
             }
-            other => panic!(),
+            other => unreachable!("Unexpected error: {:?}", other),
         }
     }
 
@@ -597,19 +604,18 @@ pub async fn save_session(
         )
         .await,
     )?;
-    if let Some(name) = name {
-        map_outcome(
-            tx.execute(
-                cx.cx(),
-                "INSERT INTO pi_session_meta (key,value) VALUES (?1,?2)",
-                &[
-                    SqliteValue::Text("name".to_string()),
-                    SqliteValue::Text(name),
-                ],
-            )
-            .await,
-        )?;
-    }
+    let name_value = name.unwrap_or_else(String::new);
+    map_outcome(
+        tx.execute(
+            cx.cx(),
+            "INSERT INTO pi_session_meta (key,value) VALUES (?1,?2)",
+            &[
+                SqliteValue::Text("name".to_string()),
+                SqliteValue::Text(name_value),
+            ],
+        )
+        .await,
+    )?;
 
     map_outcome(tx.commit(cx.cx()).await)?;
     Ok(())
@@ -636,11 +642,8 @@ pub async fn append_entries(
     let cx = AgentCx::for_request();
     let conn = map_outcome(SqliteConnection::open(cx.cx(), path).await)?;
 
-    // Ensure WAL mode is active (no-op if already set).
-    map_outcome(
-        conn.execute_batch(cx.cx(), "PRAGMA journal_mode = WAL")
-            .await,
-    )?;
+    // Ensure WAL mode is active and tables exist (especially pi_session_meta for old DBs).
+    map_outcome(conn.execute_batch(cx.cx(), INIT_SQL).await)?;
 
     let tx = map_outcome(conn.begin_immediate(cx.cx()).await)?;
 
@@ -683,19 +686,18 @@ pub async fn append_entries(
         )
         .await,
     )?;
-    if let Some(name) = session_name {
-        map_outcome(
-            tx.execute(
-                cx.cx(),
-                "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
-                &[
-                    SqliteValue::Text("name".to_string()),
-                    SqliteValue::Text(name.to_string()),
-                ],
-            )
-            .await,
-        )?;
-    }
+    let name_value = session_name.unwrap_or("");
+    map_outcome(
+        tx.execute(
+            cx.cx(),
+            "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+            &[
+                SqliteValue::Text("name".to_string()),
+                SqliteValue::Text(name_value.to_string()),
+            ],
+        )
+        .await,
+    )?;
 
     map_outcome(tx.commit(cx.cx()).await)?;
     Ok(())

@@ -412,6 +412,8 @@ impl Provider for OpenAIProvider {
 
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            // A successful chunk resets the consecutive error counter.
+                            state.write_zero_count = 0;
                             // OpenAI sends "[DONE]" as final message
                             if msg.data == "[DONE]" {
                                 state.done = true;
@@ -426,6 +428,25 @@ impl Provider for OpenAIProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames from certain providers like Kimi K2.5).
+                            // Skip them and keep reading the stream, but cap
+                            // consecutive occurrences to avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
@@ -463,6 +484,8 @@ where
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 struct ToolCallState {
@@ -494,6 +517,7 @@ where
             pending_events: VecDeque::new(),
             started: false,
             done: false,
+            write_zero_count: 0,
         }
     }
 
@@ -507,8 +531,8 @@ where
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIStreamChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         // Handle usage in final chunk
         if let Some(usage) = chunk.usage {
@@ -702,7 +726,7 @@ where
                 // Update ID if present
 
                 if let Some(id) = tc_delta.id {
-                    tc.id = id;
+                    tc.id.push_str(&id);
 
                     if let Some(ContentBlock::ToolCall(block)) =
                         self.partial.content.get_mut(content_index)
@@ -715,7 +739,7 @@ where
 
                 if let Some(function) = tc_delta.function {
                     if let Some(name) = function.name {
-                        tc.name = name;
+                        tc.name.push_str(&name);
 
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
@@ -949,6 +973,7 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
@@ -1015,46 +1040,56 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
             messages
         }
         Message::ToolResult(result) => {
-            // OpenAI expects tool results as separate messages with role "tool"
-            let parts: Vec<OpenAIContentPart<'_>> = result
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(OpenAIContentPart::Text {
-                        text: Cow::Borrowed(&t.text),
-                    }),
+            let mut text_parts = Vec::new();
+            let mut image_parts = Vec::new();
+
+            for block in &result.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.text.as_str()),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                        Some(OpenAIContentPart::ImageUrl {
+                        image_parts.push(OpenAIContentPart::ImageUrl {
                             image_url: OpenAIImageUrl {
                                 url,
                                 _phantom: std::marker::PhantomData,
                             },
-                        })
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    _ => {}
+                }
+            }
 
-            let content = if parts.is_empty() {
-                None
-            } else if parts.len() == 1 && matches!(parts[0], OpenAIContentPart::Text { .. }) {
-                // Optimization: use simple text content if possible
-                if let OpenAIContentPart::Text { text } = &parts[0] {
-                    Some(OpenAIContent::Text(text.clone()))
+            let text_content = if text_parts.is_empty() {
+                if image_parts.is_empty() {
+                    None
                 } else {
-                    Some(OpenAIContent::Parts(parts))
+                    Some(OpenAIContent::Text(Cow::Borrowed("(see attached image)")))
                 }
             } else {
-                Some(OpenAIContent::Parts(parts))
+                Some(OpenAIContent::Text(Cow::Owned(text_parts.join("\n"))))
             };
 
-            vec![OpenAIMessage {
+            let mut messages = vec![OpenAIMessage {
                 role: Cow::Borrowed("tool"),
-                content,
+                content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(&result.tool_call_id),
-            }]
+            }];
+
+            if !image_parts.is_empty() {
+                let mut parts = vec![OpenAIContentPart::Text {
+                    text: Cow::Borrowed("Attached image(s) from tool result:"),
+                }];
+                parts.extend(image_parts);
+                messages.push(OpenAIMessage {
+                    role: Cow::Borrowed("user"),
+                    content: Some(OpenAIContent::Parts(parts)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            messages
         }
     }
 }

@@ -528,12 +528,35 @@ impl ModelRegistry {
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
     /// where the provider name may be custom.
+    ///
+    /// When multiple providers carry the same model ID, the canonical/primary
+    /// provider is preferred (e.g. `anthropic` for Claude models, `openai` for
+    /// GPT models). If no canonical match exists, the first alphabetical
+    /// provider wins, ensuring deterministic results regardless of insertion
+    /// order.
     pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
         let id = id.trim();
-        self.models
-            .iter()
-            .find(|m| m.model.id.eq_ignore_ascii_case(id))
-            .cloned()
+        let mut best: Option<&ModelEntry> = None;
+        for entry in &self.models {
+            if !entry.model.id.eq_ignore_ascii_case(id) {
+                continue;
+            }
+            let Some(current_best) = best else {
+                best = Some(entry);
+                continue;
+            };
+            let entry_canonical = is_canonical_provider_for_model(id, &entry.model.provider);
+            let best_canonical = is_canonical_provider_for_model(id, &current_best.model.provider);
+            if entry_canonical && !best_canonical {
+                best = Some(entry);
+            } else if entry_canonical == best_canonical
+                && entry.model.provider < current_best.model.provider
+            {
+                // Tie-break alphabetically for determinism.
+                best = Some(entry);
+            }
+        }
+        best.cloned()
     }
 
     /// Merge extension-provided model entries into the registry.
@@ -549,6 +572,122 @@ impl ModelRegistry {
             self.models.push(entry);
         }
     }
+}
+
+/// Returns `true` when `provider` is the canonical/primary source for a model
+/// identified by `model_id`. Used by `find_by_id` to prefer the authoritative
+/// provider when the same model ID appears under multiple resellers.
+fn is_canonical_provider_for_model(model_id: &str, provider: &str) -> bool {
+    let id_lower = model_id.to_ascii_lowercase();
+    let prov_lower = provider.to_ascii_lowercase();
+    if id_lower.starts_with("claude") {
+        prov_lower == "anthropic"
+    } else if id_lower.starts_with("gpt-")
+        || id_lower.starts_with("o1")
+        || id_lower.starts_with("o3")
+        || id_lower.starts_with("o4")
+    {
+        prov_lower == "openai"
+    } else if id_lower.starts_with("gemini") {
+        prov_lower == "google"
+    } else if id_lower.starts_with("command") {
+        prov_lower == "cohere"
+    } else if id_lower.starts_with("mistral") || id_lower.starts_with("codestral") {
+        prov_lower == "mistral"
+    } else if id_lower.starts_with("deepseek") {
+        prov_lower == "deepseek"
+    } else {
+        false
+    }
+}
+
+/// Determine per-model reasoning capability. Returns `Some(true/false)` for
+/// known model ID patterns, `None` for unknown models (caller should fall back
+/// to the provider-level default).
+///
+/// This prevents non-reasoning models like `gpt-4o` from inheriting a
+/// provider-level `reasoning: true` flag from their provider (Issue #19).
+fn model_is_reasoning(model_id: &str) -> Option<bool> {
+    let id = model_id.to_ascii_lowercase();
+
+    // OpenAI: o1/o3/o4 series and gpt-5.x are reasoning.
+    // All gpt-4 variants (gpt-4o, gpt-4-turbo, gpt-4-0613, etc.) and gpt-3.5 are NOT.
+    if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+        return Some(true);
+    }
+    if id.starts_with("gpt-5") {
+        return Some(true);
+    }
+    if id.starts_with("gpt-4") || id.starts_with("gpt-3.5") {
+        return Some(false);
+    }
+
+    // Anthropic: Claude 3.5 Sonnet and Claude 4+ support extended thinking.
+    // Claude 3 (Haiku/Sonnet/Opus) and Claude 3.5 Haiku do NOT.
+    if id.starts_with("claude-3-5-haiku")
+        || id.starts_with("claude-3-haiku")
+        || id.starts_with("claude-3-sonnet")
+        || id.starts_with("claude-3-opus")
+    {
+        return Some(false);
+    }
+    if id.starts_with("claude") {
+        // Claude 3.5 Sonnet, Claude 4.x, Claude Opus 4+, Claude Sonnet 4+ etc.
+        return Some(true);
+    }
+
+    // Google: gemini-2.5+ and gemini-2.0-flash-thinking are reasoning.
+    // All other gemini models (2.0-flash, 2.0-flash-lite, 1.x, etc.) are NOT.
+    if id.starts_with("gemini-2.5")
+        || id.starts_with("gemini-3")
+        || id.starts_with("gemini-2.0-flash-thinking")
+    {
+        return Some(true);
+    }
+    if id.starts_with("gemini") {
+        return Some(false);
+    }
+
+    // Cohere: command-a is reasoning; command-r is not.
+    if id.starts_with("command-a") {
+        return Some(true);
+    }
+    if id.starts_with("command-r") {
+        return Some(false);
+    }
+
+    // DeepSeek: deepseek-reasoner (R1) is reasoning; deepseek-chat (V3) and others are not.
+    if id.starts_with("deepseek-reasoner") || id.starts_with("deepseek-r") {
+        return Some(true);
+    }
+    if id.starts_with("deepseek") {
+        return Some(false);
+    }
+
+    // Qwen: qwq- series are reasoning.
+    if id.starts_with("qwq-") {
+        return Some(true);
+    }
+
+    // Mistral/Codestral: no reasoning support currently.
+    if id.starts_with("mistral") || id.starts_with("codestral") || id.starts_with("pixtral") {
+        return Some(false);
+    }
+
+    // Meta Llama: no reasoning support.
+    if id.starts_with("llama") {
+        return Some(false);
+    }
+
+    // Groq-hosted models: groq model IDs typically include the upstream model name
+    // (e.g., "llama-3.3-70b-versatile"), so the upstream checks above should catch them.
+    None
+}
+
+/// Resolve the effective reasoning flag for a model, preferring per-model
+/// detection over the provider-level default.
+fn effective_reasoning(model_id: &str, provider_default: bool) -> bool {
+    model_is_reasoning(model_id).unwrap_or(provider_default)
 }
 
 fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
@@ -657,14 +796,15 @@ fn append_upstream_nonlegacy_models(
                 continue;
             }
 
+            let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
             models.push(ModelEntry {
                 model: Model {
                     id: normalized_model_id.clone(),
-                    name: normalized_model_id,
+                    name: normalized_model_id.clone(),
                     api: defaults.api.to_string(),
                     provider: canonical_provider.to_string(),
                     base_url: defaults.base_url.to_string(),
-                    reasoning: defaults.reasoning,
+                    reasoning,
                     input: defaults.input.to_vec(),
                     cost: ModelCost {
                         input: 0.0,
@@ -792,7 +932,7 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
                 api: api_string,
                 provider: provider.to_string(),
                 base_url,
-                reasoning: legacy.reasoning,
+                reasoning: effective_reasoning(&normalized_model_id, legacy.reasoning),
                 input,
                 cost: if mode == ModelRegistryLoadMode::Full {
                     legacy.cost.clone().unwrap_or_else(|| default_cost.clone())
@@ -968,6 +1108,27 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
         });
     }
 
+    // Sort for deterministic find_by_id: canonical providers first, then alphabetical.
+    models.sort_by(|a, b| {
+        let priority = |e: &ModelEntry| -> u8 {
+            let p = e.model.provider.as_str();
+            let id = e.model.id.as_str();
+            // Canonical provider gets priority 0
+            let is_canonical = (id.starts_with("claude") && p == "anthropic")
+                || (id.starts_with("gpt-") && p == "openai")
+                || (id.starts_with("o1") && p == "openai")
+                || (id.starts_with("o3") && p == "openai")
+                || (id.starts_with("o4") && p == "openai")
+                || (id.starts_with("gemini") && p == "google")
+                || (id.starts_with("command") && p == "cohere");
+            u8::from(!is_canonical)
+        };
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| a.model.provider.cmp(&b.model.provider))
+            .then_with(|| a.model.id.cmp(&b.model.id))
+    });
+
     models
 }
 
@@ -1123,7 +1284,9 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 api: model_api_parsed.to_string(),
                 provider: provider_id.clone(),
                 base_url: provider_base.clone(),
-                reasoning: model_cfg.reasoning.unwrap_or(default_reasoning),
+                reasoning: model_cfg.reasoning.unwrap_or_else(|| {
+                    effective_reasoning(&normalized_model_id, default_reasoning)
+                }),
                 input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
                     input: 0.0,
@@ -1378,6 +1541,7 @@ where
     if normalized_model_id.is_empty() {
         return None;
     }
+    let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
     Some(ModelEntry {
         model: Model {
             id: normalized_model_id.clone(),
@@ -1385,7 +1549,7 @@ where
             api: defaults.api.to_string(),
             provider: provider.to_string(),
             base_url: defaults.base_url.to_string(),
-            reasoning: defaults.reasoning,
+            reasoning,
             input: defaults.input.to_vec(),
             cost: ModelCost {
                 input: 0.0,
@@ -1767,7 +1931,10 @@ mod tests {
             .expect("cohere model should be added");
         assert_eq!(cohere.model.api, "cohere-chat");
         assert_eq!(cohere.model.base_url, "https://api.cohere.com/v2");
-        assert!(cohere.model.reasoning);
+        assert!(
+            !cohere.model.reasoning,
+            "command-r-plus is non-reasoning; command-a is the reasoning line"
+        );
         assert_eq!(cohere.model.input, vec![InputType::Text]);
         assert_eq!(cohere.model.context_window, 128_000);
         assert_eq!(cohere.model.max_tokens, 8192);
@@ -2323,7 +2490,8 @@ mod tests {
     #[test]
     fn ad_hoc_alibaba_aliases() {
         for alias in ["alibaba", "dashscope", "qwen"] {
-            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("dashscope"));
         }
     }
@@ -2331,7 +2499,8 @@ mod tests {
     #[test]
     fn ad_hoc_moonshot_aliases() {
         for alias in ["moonshotai", "moonshot", "kimi"] {
-            let defaults = ad_hoc_provider_defaults(alias).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(alias)
+                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("moonshot"));
         }
     }
@@ -2356,7 +2525,8 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
             assert!(defaults.base_url.contains("api.minimax"));
@@ -2376,7 +2546,8 @@ mod tests {
             ("scaleway", "https://api.scaleway.ai/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2399,7 +2570,8 @@ mod tests {
             ),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2451,7 +2623,8 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults = ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!());
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| panic!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -3135,6 +3308,67 @@ mod tests {
         {
             assert!(m.model.reasoning, "{} should be reasoning", m.model.id);
         }
+    }
+
+    #[test]
+    fn model_is_reasoning_known_families() {
+        // OpenAI
+        assert_eq!(model_is_reasoning("o1-preview"), Some(true));
+        assert_eq!(model_is_reasoning("o3-mini"), Some(true));
+        assert_eq!(model_is_reasoning("o4-mini"), Some(true));
+        assert_eq!(model_is_reasoning("gpt-5"), Some(true));
+        assert_eq!(model_is_reasoning("gpt-4o"), Some(false));
+        assert_eq!(model_is_reasoning("gpt-4-turbo"), Some(false));
+        assert_eq!(model_is_reasoning("gpt-3.5-turbo"), Some(false));
+
+        // Anthropic
+        assert_eq!(model_is_reasoning("claude-sonnet-4-20250514"), Some(true));
+        assert_eq!(model_is_reasoning("claude-opus-4-20250514"), Some(true));
+        assert_eq!(model_is_reasoning("claude-3-5-sonnet-20241022"), Some(true));
+        assert_eq!(model_is_reasoning("claude-3-5-haiku-20241022"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-haiku-20240307"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-opus-20240229"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-sonnet-20240229"), Some(false));
+
+        // Google
+        assert_eq!(model_is_reasoning("gemini-2.5-pro"), Some(true));
+        assert_eq!(model_is_reasoning("gemini-2.5-flash"), Some(true));
+        assert_eq!(
+            model_is_reasoning("gemini-2.0-flash-thinking-exp"),
+            Some(true)
+        );
+        assert_eq!(model_is_reasoning("gemini-2.0-flash"), Some(false));
+        assert_eq!(model_is_reasoning("gemini-2.0-flash-lite"), Some(false));
+        assert_eq!(model_is_reasoning("gemini-1.5-pro"), Some(false));
+
+        // Cohere
+        assert_eq!(model_is_reasoning("command-a-03-2025"), Some(true));
+        assert_eq!(model_is_reasoning("command-r-plus"), Some(false));
+        assert_eq!(model_is_reasoning("command-r"), Some(false));
+
+        // DeepSeek
+        assert_eq!(model_is_reasoning("deepseek-reasoner"), Some(true));
+        assert_eq!(model_is_reasoning("deepseek-r1"), Some(true));
+        assert_eq!(model_is_reasoning("deepseek-chat"), Some(false));
+        assert_eq!(model_is_reasoning("deepseek-coder"), Some(false));
+
+        // Qwen
+        assert_eq!(model_is_reasoning("qwq-32b"), Some(true));
+        assert_eq!(model_is_reasoning("qwq-1b"), Some(true));
+
+        // Mistral
+        assert_eq!(model_is_reasoning("mistral-large-latest"), Some(false));
+        assert_eq!(model_is_reasoning("mistral-small-latest"), Some(false));
+        assert_eq!(model_is_reasoning("codestral-latest"), Some(false));
+        assert_eq!(model_is_reasoning("pixtral-large-latest"), Some(false));
+
+        // Meta Llama
+        assert_eq!(model_is_reasoning("llama-3.3-70b-versatile"), Some(false));
+        assert_eq!(model_is_reasoning("llama-4-scout"), Some(false));
+
+        // Unknown models return None (fall back to provider default)
+        assert_eq!(model_is_reasoning("some-custom-model"), None);
+        assert_eq!(model_is_reasoning("my-fine-tune"), None);
     }
 
     mod proptest_models {

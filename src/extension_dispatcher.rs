@@ -2510,7 +2510,12 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             let mut partial = Vec::new();
 
             loop {
-                let read = reader.read(&mut buf).map_err(|err| err.to_string())?;
+                let read = match reader.read(&mut buf) {
+                    Ok(0) => 0,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err.to_string()),
+                };
                 if read == 0 {
                     // EOF. Flush partial if any (lossy).
                     if !partial.is_empty() {
@@ -2882,8 +2887,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 let mut buf = [0u8; 8192];
                 loop {
                     let read = match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
+                        Ok(0) => break,
                         Ok(read) => read,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
                     };
                     let chunk = StreamChunk {
                         kind,

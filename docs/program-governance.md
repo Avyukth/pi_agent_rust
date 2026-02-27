@@ -125,7 +125,7 @@ See [releasing.md](releasing.md) for the full release process.
 |------|-------|-------------|
 | Dependency audit (`cargo audit`) | Automated | CI gate |
 | Conformance regression review | Agent triage | Nightly CI reports |
-| Bead backlog grooming | Primary maintainer | `bv --robot-triage` |
+| Bead backlog grooming | Primary maintainer | `bv --robot-plan` + `br ready --json` |
 
 ### Weekly QA Burndown (bd-1f42, as of 2026-02-10)
 
@@ -185,7 +185,7 @@ Criteria: `bd-3uqg.10.2` runs mandatory quality gates, then `bd-3uqg.10.3` perfo
 Anti-stall checkpoints:
 - Every active `bd-3uqg*` assignee posts a concise progress update in Agent Mail thread `br-3uqg` at least once per 24 hours while `in_progress`.
 - Any bead blocked for more than 12 hours must post a blocker note with exact blocking bead IDs, affected files, and required unblock action.
-- Rollup owner re-runs `bv --robot-triage` and `bv --robot-next` at each checkpoint and records priority deltas before reassigning effort.
+- Rollup owner re-runs `bv --robot-plan` and `bv --robot-priority` at each checkpoint, then validates proposed bead IDs with `br ready --json` / `br show <id>` to skip tombstones before reassigning effort.
 - No new provider-family onboarding starts until Gate A evidence exists, to prevent parallel drift and report mismatch.
 
 Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` completion and Gate A evidence audit.
@@ -206,7 +206,7 @@ Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` 
 | Full conformance campaign (223 extensions) | Automated | `conformance.yml` nightly |
 | Security review of capability policies | Primary maintainer | Threat model doc |
 | Dependency major version updates | Primary maintainer | `cargo update` + full test |
-| Roadmap review and bead reprioritization | Primary maintainer | `bv --robot-triage` |
+| Roadmap review and bead reprioritization | Primary maintainer | `bv --robot-plan` + `bv --robot-priority` |
 
 ---
 
@@ -261,7 +261,7 @@ Next provider rollup checkpoint: `2026-02-13` (UTC), focused on `bd-3uqg.3.8.4` 
 
 ### Conformance Regression on Main
 
-1. Triage within 24 hours via `bv --robot-triage`.
+1. Triage within 24 hours via `bv --robot-plan` + `br ready --json`, and confirm candidate IDs with `br show <id>` before claiming.
 2. If regression is in runtime: fix and cut patch release.
 3. If regression is in test harness: fix harness, re-run campaign.
 4. If regression is in extension: update exception list with justification.

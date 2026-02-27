@@ -1754,7 +1754,7 @@ mod tests {
         ];
         for (provider, message) in cases {
             let err = Error::provider(*provider, *message);
-            let d = err.auth_diagnostic().unwrap_or_else(|| panic!());
+            let d = err.auth_diagnostic().expect("expected auth diagnostic");
             assert_eq!(
                 d.code,
                 AuthDiagnosticCode::MissingApiKey,
@@ -1784,7 +1784,7 @@ mod tests {
         ];
         for (provider, message) in cases {
             let err = Error::provider(*provider, *message);
-            let d = err.auth_diagnostic().unwrap_or_else(|| panic!());
+            let d = err.auth_diagnostic().expect("expected auth diagnostic");
             assert_eq!(
                 d.code,
                 AuthDiagnosticCode::InvalidApiKey,
@@ -2011,7 +2011,7 @@ mod tests {
         ];
         for (message, expected_code) in cases {
             let err = Error::auth(*message);
-            let d = err.auth_diagnostic().unwrap_or_else(|| panic!());
+            let d = err.auth_diagnostic().expect("expected auth diagnostic");
             assert_eq!(
                 d.code, *expected_code,
                 "wrong code for Auth({message}): {:?}",
@@ -2026,7 +2026,7 @@ mod tests {
         let variants = ["MISSING API KEY", "Missing Api Key", "missing api key"];
         for msg in &variants {
             let err = Error::provider("openai", *msg);
-            let d = err.auth_diagnostic().unwrap_or_else(|| panic!());
+            let d = err.auth_diagnostic().expect("expected auth diagnostic");
             assert_eq!(
                 d.code,
                 AuthDiagnosticCode::MissingApiKey,
@@ -2068,7 +2068,7 @@ mod tests {
         ];
         for msg in &messages {
             let err = Error::provider("openai", *msg);
-            let d = err.auth_diagnostic().unwrap_or_else(|| panic!());
+            let d = err.auth_diagnostic().expect("expected auth diagnostic");
             assert_eq!(
                 d.code,
                 AuthDiagnosticCode::QuotaExceeded,

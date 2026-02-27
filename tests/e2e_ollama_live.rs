@@ -25,7 +25,10 @@ fn ollama_available() -> bool {
         &"127.0.0.1:11434".parse().unwrap(),
         std::time::Duration::from_secs(2),
     )
-    .is_ok()
+    .is_ok_and(|stream| {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        true
+    })
 }
 
 fn ollama_entry() -> ModelEntry {

@@ -18,6 +18,16 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+fn secure_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
+
 pub const SEGMENT_FRAME_SCHEMA: &str = "pi.session_store_v2.segment_frame.v1";
 pub const OFFSET_INDEX_SCHEMA: &str = "pi.session_store_v2.offset_index.v1";
 pub const CHECKPOINT_SCHEMA: &str = "pi.session_store_v2.checkpoint.v1";
@@ -402,7 +412,7 @@ impl SessionStoreV2 {
         let mut write_buf = encoded;
         write_buf.push(b'\n');
 
-        let mut segment = OpenOptions::new()
+        let mut segment = secure_open_options()
             .create(true)
             .write(true)
             .truncate(false)
@@ -585,7 +595,15 @@ impl SessionStoreV2 {
             .root
             .join("tmp")
             .join(format!("{checkpoint_seq:016}.json.tmp"));
-        fs::write(&tmp_path, serde_json::to_vec_pretty(&checkpoint)?)?;
+        {
+            let mut file = secure_open_options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            file.write_all(&serde_json::to_vec_pretty(&checkpoint)?)?;
+            file.sync_all()?;
+        }
         fs::rename(&tmp_path, self.checkpoint_path(checkpoint_seq))?;
         Ok(checkpoint)
     }
@@ -896,7 +914,15 @@ impl SessionStoreV2 {
         manifest.integrity.manifest_hash = manifest_hash_hex(&manifest)?;
 
         let tmp = self.root.join("tmp").join("manifest.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)?;
+        {
+            let mut file = secure_open_options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+            file.sync_all()?;
+        }
         fs::rename(&tmp, self.manifest_path())?;
         Ok(manifest)
     }
@@ -952,7 +978,7 @@ impl SessionStoreV2 {
         }
 
         let mut index_writer = std::io::BufWriter::new(
-            OpenOptions::new()
+            secure_open_options()
                 .create(true)
                 .write(true)
                 .truncate(true)
@@ -1117,7 +1143,11 @@ impl SessionStoreV2 {
         }
 
         index_writer.flush()?;
-        drop(index_writer); // Close the file handle before renaming (fixes Windows ERROR_SHARING_VIOLATION)
+        let file = index_writer
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        file.sync_all()?;
+        drop(file); // Close the file handle before renaming (fixes Windows ERROR_SHARING_VIOLATION)
 
         // Atomically replace the old index with the rebuilt one
         fs::rename(&index_tmp_path, &index_path)?;
@@ -1435,7 +1465,7 @@ pub fn has_v2_sidecar(jsonl_path: &Path) -> bool {
 }
 
 fn append_jsonl_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = secure_open_options().create(true).append(true).open(path)?;
     // Serialize directly to file — avoids intermediate Vec<u8> allocation.
     serde_json::to_writer(&mut file, value)?;
     file.write_all(b"\n")?;
@@ -1443,13 +1473,16 @@ fn append_jsonl_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn truncate_file_to(path: &Path, len: u64) -> Result<()> {
-    let file = OpenOptions::new().write(true).truncate(false).open(path)?;
+    let file = secure_open_options()
+        .write(true)
+        .truncate(false)
+        .open(path)?;
     file.set_len(len)?;
     Ok(())
 }
 
 fn write_jsonl_lines<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
-    let file = OpenOptions::new()
+    let file = secure_open_options()
         .create(true)
         .write(true)
         .truncate(true)
@@ -1460,6 +1493,10 @@ fn write_jsonl_lines<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
+    file.sync_all()?;
     Ok(())
 }
 

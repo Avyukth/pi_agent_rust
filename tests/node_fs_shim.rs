@@ -95,8 +95,8 @@ fn eval_fs(js_expr: &str) -> String {
 fn write_read_roundtrip_utf8() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/test.txt", "hello world");
-        return fs.readFileSync("/tmp/test.txt", "utf8");
+        fs.writeFileSync("tmp/test.txt", "hello world");
+        return fs.readFileSync("tmp/test.txt", "utf8");
     })()"#,
     );
     assert_eq!(result, "hello world");
@@ -106,8 +106,8 @@ fn write_read_roundtrip_utf8() {
 fn write_read_roundtrip_buffer() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/buf.bin", "binary data");
-        const buf = fs.readFileSync("/tmp/buf.bin");
+        fs.writeFileSync("tmp/buf.bin", "binary data");
+        const buf = fs.readFileSync("tmp/buf.bin");
         return typeof buf === "object" && buf.length > 0;
     })()"#,
     );
@@ -126,8 +126,8 @@ fn exists_sync_false_for_missing() {
 fn exists_sync_true_after_write() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/exists.txt", "data");
-        return fs.existsSync("/tmp/exists.txt");
+        fs.writeFileSync("tmp/exists.txt", "data");
+        return fs.existsSync("tmp/exists.txt");
     })()"#,
     );
     assert_eq!(result, "true");
@@ -137,8 +137,8 @@ fn exists_sync_true_after_write() {
 fn exists_sync_true_for_directory() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/mydir");
-        return fs.existsSync("/tmp/mydir");
+        fs.mkdirSync("tmp/mydir");
+        return fs.existsSync("tmp/mydir");
     })()"#,
     );
     assert_eq!(result, "true");
@@ -150,8 +150,8 @@ fn exists_sync_true_for_directory() {
 fn stat_sync_file() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/stat.txt", "hello");
-        const s = fs.statSync("/tmp/stat.txt");
+        fs.writeFileSync("tmp/stat.txt", "hello");
+        const s = fs.statSync("tmp/stat.txt");
         return s.isFile() + ":" + s.isDirectory() + ":" + s.size;
     })()"#,
     );
@@ -162,8 +162,8 @@ fn stat_sync_file() {
 fn stat_sync_directory() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/statdir");
-        const s = fs.statSync("/tmp/statdir");
+        fs.mkdirSync("tmp/statdir");
+        const s = fs.statSync("tmp/statdir");
         return s.isFile() + ":" + s.isDirectory();
     })()"#,
     );
@@ -186,8 +186,8 @@ fn stat_sync_throws_on_missing() {
 fn mkdir_sync_creates_directory() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/newdir");
-        return fs.statSync("/tmp/newdir").isDirectory();
+        fs.mkdirSync("tmp/newdir");
+        return fs.statSync("tmp/newdir").isDirectory();
     })()"#,
     );
     assert_eq!(result, "true");
@@ -197,8 +197,8 @@ fn mkdir_sync_creates_directory() {
 fn mkdir_sync_recursive() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/a/b/c", { recursive: true });
-        return fs.existsSync("/tmp/a/b/c");
+        fs.mkdirSync("tmp/a/b/c", { recursive: true });
+        return fs.existsSync("tmp/a/b/c");
     })()"#,
     );
     assert_eq!(result, "true");
@@ -210,10 +210,10 @@ fn mkdir_sync_recursive() {
 fn readdir_sync_lists_files() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/listdir");
-        fs.writeFileSync("/tmp/listdir/a.txt", "a");
-        fs.writeFileSync("/tmp/listdir/b.txt", "b");
-        return JSON.stringify(fs.readdirSync("/tmp/listdir").sort());
+        fs.mkdirSync("tmp/listdir");
+        fs.writeFileSync("tmp/listdir/a.txt", "a");
+        fs.writeFileSync("tmp/listdir/b.txt", "b");
+        return JSON.stringify(fs.readdirSync("tmp/listdir").sort());
     })()"#,
     );
     assert_eq!(result, r#"["a.txt","b.txt"]"#);
@@ -223,10 +223,10 @@ fn readdir_sync_lists_files() {
 fn readdir_sync_with_file_types() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/typedir");
-        fs.writeFileSync("/tmp/typedir/file.txt", "data");
-        fs.mkdirSync("/tmp/typedir/subdir");
-        const entries = fs.readdirSync("/tmp/typedir", { withFileTypes: true });
+        fs.mkdirSync("tmp/typedir");
+        fs.writeFileSync("tmp/typedir/file.txt", "data");
+        fs.mkdirSync("tmp/typedir/subdir");
+        const entries = fs.readdirSync("tmp/typedir", { withFileTypes: true });
         const file = entries.find(e => e.name === "file.txt");
         const dir = entries.find(e => e.name === "subdir");
         return file.isFile() + ":" + dir.isDirectory();
@@ -247,9 +247,9 @@ fn readdir_sync_throws_on_missing() {
 fn unlink_sync_removes_file() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/del.txt", "data");
-        fs.unlinkSync("/tmp/del.txt");
-        return fs.existsSync("/tmp/del.txt");
+        fs.writeFileSync("tmp/del.txt", "data");
+        fs.unlinkSync("tmp/del.txt");
+        return fs.existsSync("tmp/del.txt");
     })()"#,
     );
     assert_eq!(result, "false");
@@ -257,7 +257,7 @@ fn unlink_sync_removes_file() {
 
 #[test]
 fn unlink_sync_throws_on_missing() {
-    let result = eval_fs(r#"fs.unlinkSync("/no/such/file")"#);
+    let result = eval_fs(r#"fs.unlinkSync("tmp/no/such/file")"#);
     assert!(result.contains("ENOENT"), "expected ENOENT, got: {result}");
 }
 
@@ -267,12 +267,12 @@ fn unlink_sync_throws_on_missing() {
 fn rm_sync_recursive() {
     let result = eval_fs(
         r#"(() => {
-        fs.mkdirSync("/tmp/rmdir");
-        fs.writeFileSync("/tmp/rmdir/a.txt", "a");
-        fs.mkdirSync("/tmp/rmdir/sub");
-        fs.writeFileSync("/tmp/rmdir/sub/b.txt", "b");
-        fs.rmSync("/tmp/rmdir", { recursive: true });
-        return fs.existsSync("/tmp/rmdir");
+        fs.mkdirSync("tmp/rmdir");
+        fs.writeFileSync("tmp/rmdir/a.txt", "a");
+        fs.mkdirSync("tmp/rmdir/sub");
+        fs.writeFileSync("tmp/rmdir/sub/b.txt", "b");
+        fs.rmSync("tmp/rmdir", { recursive: true });
+        return fs.existsSync("tmp/rmdir");
     })()"#,
     );
     assert_eq!(result, "false");
@@ -284,9 +284,9 @@ fn rm_sync_recursive() {
 fn copy_file_sync() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/orig.txt", "content");
-        fs.copyFileSync("/tmp/orig.txt", "/tmp/copy.txt");
-        return fs.readFileSync("/tmp/copy.txt", "utf8");
+        fs.writeFileSync("tmp/orig.txt", "content");
+        fs.copyFileSync("tmp/orig.txt", "tmp/copy.txt");
+        return fs.readFileSync("tmp/copy.txt", "utf8");
     })()"#,
     );
     assert_eq!(result, "content");
@@ -298,9 +298,9 @@ fn copy_file_sync() {
 fn rename_sync() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/old.txt", "moved");
-        fs.renameSync("/tmp/old.txt", "/tmp/new.txt");
-        return fs.readFileSync("/tmp/new.txt", "utf8") + ":" + fs.existsSync("/tmp/old.txt");
+        fs.writeFileSync("tmp/old.txt", "moved");
+        fs.renameSync("tmp/old.txt", "tmp/new.txt");
+        return fs.readFileSync("tmp/new.txt", "utf8") + ":" + fs.existsSync("tmp/old.txt");
     })()"#,
     );
     assert_eq!(result, "moved:false");
@@ -312,9 +312,9 @@ fn rename_sync() {
 fn append_file_sync() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/append.txt", "hello");
-        fs.appendFileSync("/tmp/append.txt", " world");
-        return fs.readFileSync("/tmp/append.txt", "utf8");
+        fs.writeFileSync("tmp/append.txt", "hello");
+        fs.appendFileSync("tmp/append.txt", " world");
+        return fs.readFileSync("tmp/append.txt", "utf8");
     })()"#,
     );
     assert_eq!(result, "hello world");
@@ -326,8 +326,8 @@ fn append_file_sync() {
 fn access_sync_existing() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/access.txt", "ok");
-        try { fs.accessSync("/tmp/access.txt"); return "ok"; }
+        fs.writeFileSync("tmp/access.txt", "ok");
+        try { fs.accessSync("tmp/access.txt"); return "ok"; }
         catch (_) { return "fail"; }
     })()"#,
     );
@@ -359,11 +359,20 @@ fn read_file_sync_throws_enoent() {
 fn mkdtemp_sync_creates_temp_dir() {
     let result = eval_fs(
         r#"(() => {
-        const dir = fs.mkdtempSync("/tmp/prefix-");
-        return dir.startsWith("/tmp/prefix-") && fs.statSync(dir).isDirectory();
+        const dir = fs.mkdtempSync("tmp/prefix-");
+        return dir.startsWith("tmp/prefix-") && fs.statSync(dir).isDirectory();
     })()"#,
     );
     assert_eq!(result, "true");
+}
+
+#[test]
+fn mkdtemp_sync_denies_outside_workspace() {
+    let result = eval_fs(r#"fs.mkdtempSync("/tmp/prefix-")"#);
+    assert!(
+        result.contains("host write denied"),
+        "expected host write denied, got: {result}"
+    );
 }
 
 // ─── Callback-based async readFile ──────────────────────────────────────────
@@ -372,9 +381,9 @@ fn mkdtemp_sync_creates_temp_dir() {
 fn read_file_callback() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/cb.txt", "callback data");
+        fs.writeFileSync("tmp/cb.txt", "callback data");
         let got = null;
-        fs.readFile("/tmp/cb.txt", "utf8", (err, data) => { got = data; });
+        fs.readFile("tmp/cb.txt", "utf8", (err, data) => { got = data; });
         return got;
     })()"#,
     );
@@ -388,8 +397,8 @@ fn write_file_callback() {
     let result = eval_fs(
         r#"(() => {
         let err = "pending";
-        fs.writeFile("/tmp/wcb.txt", "written", (e) => { err = e; });
-        return (err === null) + ":" + fs.readFileSync("/tmp/wcb.txt", "utf8");
+        fs.writeFile("tmp/wcb.txt", "written", (e) => { err = e; });
+        return (err === null) + ":" + fs.readFileSync("tmp/wcb.txt", "utf8");
     })()"#,
     );
     assert_eq!(result, "true:written");
@@ -405,8 +414,8 @@ import fs from "node:fs";
 
 export default function activate(pi) {
   pi.on("agent_start", async (event, ctx) => {
-    fs.writeFileSync("/tmp/promise.txt", "async content");
-    const data = await fs.promises.readFile("/tmp/promise.txt", "utf8");
+    fs.writeFileSync("tmp/promise.txt", "async content");
+    const data = await fs.promises.readFile("tmp/promise.txt", "utf8");
     return { result: data };
   });
 }
@@ -433,8 +442,8 @@ import fs from "node:fs";
 
 export default function activate(pi) {
   pi.on("agent_start", async (event, ctx) => {
-    await fs.promises.writeFile("/tmp/pw.txt", "promise written");
-    return { result: fs.readFileSync("/tmp/pw.txt", "utf8") };
+    await fs.promises.writeFile("tmp/pw.txt", "promise written");
+    return { result: fs.readFileSync("tmp/pw.txt", "utf8") };
   });
 }
 "#;
@@ -460,8 +469,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 
 export default function activate(pi) {
   pi.on("agent_start", (event, ctx) => {
-    writeFileSync("/tmp/named.txt", "named import");
-    return { result: readFileSync("/tmp/named.txt", "utf8") };
+    writeFileSync("tmp/named.txt", "named import");
+    return { result: readFileSync("tmp/named.txt", "utf8") };
   });
 }
 "#;
@@ -485,8 +494,8 @@ import fs from "fs";
 
 export default function activate(pi) {
   pi.on("agent_start", (event, ctx) => {
-    fs.writeFileSync("/tmp/bare.txt", "bare import");
-    return { result: fs.readFileSync("/tmp/bare.txt", "utf8") };
+    fs.writeFileSync("tmp/bare.txt", "bare import");
+    return { result: fs.readFileSync("tmp/bare.txt", "utf8") };
   });
 }
 "#;
@@ -513,8 +522,8 @@ import fs from "node:fs";
 
 export default function activate(pi) {
   pi.on("agent_start", async (event, ctx) => {
-    fs.writeFileSync("/tmp/fsp.txt", "promises module");
-    const data = await fsp.readFile("/tmp/fsp.txt", "utf8");
+    fs.writeFileSync("tmp/fsp.txt", "promises module");
+    const data = await fsp.readFile("tmp/fsp.txt", "utf8");
     return { result: data };
   });
 }
@@ -549,8 +558,8 @@ fn constants_exported() {
 fn lstat_sync_works() {
     let result = eval_fs(
         r#"(() => {
-        fs.writeFileSync("/tmp/lstat.txt", "data");
-        const s = fs.lstatSync("/tmp/lstat.txt");
+        fs.writeFileSync("tmp/lstat.txt", "data");
+        const s = fs.lstatSync("tmp/lstat.txt");
         return s.isFile();
     })()"#,
     );
@@ -568,28 +577,31 @@ import fsp from "node:fs/promises";
 
 export default function activate(pi) {
   pi.on("agent_start", async () => {
-    fs.mkdirSync("/tmp/links", { recursive: true });
-    fs.writeFileSync("/tmp/links/target.txt", "payload");
-    fs.symlinkSync("/tmp/links/target.txt", "/tmp/links/alias.txt");
+    const cwd = process.cwd().replace(/\\/g, "/");
+    const target = `${cwd}/tmp/links/target.txt`;
+    const missing = `${cwd}/tmp/links/missing.txt`;
+    fs.mkdirSync("tmp/links", { recursive: true });
+    fs.writeFileSync("tmp/links/target.txt", "payload");
+    fs.symlinkSync(target, "tmp/links/alias.txt");
 
-    const syncReadlink = fs.readlinkSync("/tmp/links/alias.txt");
-    const statIsFile = fs.statSync("/tmp/links/alias.txt").isFile();
-    const lstatIsSymlink = fs.lstatSync("/tmp/links/alias.txt").isSymbolicLink();
+    const syncReadlink = fs.readlinkSync("tmp/links/alias.txt");
+    const statIsFile = fs.statSync("tmp/links/alias.txt").isFile();
+    const lstatIsSymlink = fs.lstatSync("tmp/links/alias.txt").isSymbolicLink();
 
-    await fsp.symlink("/tmp/links/target.txt", "/tmp/links/alias2.txt");
-    const promiseReadlink = await fsp.readlink("/tmp/links/alias2.txt");
-    await fsp.appendFile("/tmp/links/alias2.txt", "-more");
-    const appended = await fsp.readFile("/tmp/links/target.txt", "utf8");
+    await fsp.symlink(target, "tmp/links/alias2.txt");
+    const promiseReadlink = await fsp.readlink("tmp/links/alias2.txt");
+    await fsp.appendFile("tmp/links/alias2.txt", "-more");
+    const appended = await fsp.readFile("tmp/links/target.txt", "utf8");
 
-    fs.symlinkSync("/tmp/links/missing.txt", "/tmp/links/broken.txt");
-    const brokenExists = fs.existsSync("/tmp/links/broken.txt");
-    const brokenLstat = fs.lstatSync("/tmp/links/broken.txt").isSymbolicLink();
+    fs.symlinkSync(missing, "tmp/links/broken.txt");
+    const brokenExists = fs.existsSync("tmp/links/broken.txt");
+    const brokenLstat = fs.lstatSync("tmp/links/broken.txt").isSymbolicLink();
 
     const result = [
-      syncReadlink,
+      String(syncReadlink === target),
       String(statIsFile),
       String(lstatIsSymlink),
-      promiseReadlink,
+      String(promiseReadlink === target),
       appended,
       String(brokenExists),
       String(brokenLstat),
@@ -608,8 +620,5 @@ export default function activate(pi) {
     let result = response
         .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
         .unwrap_or_default();
-    assert_eq!(
-        result,
-        "/tmp/links/target.txt|true|true|/tmp/links/target.txt|payload-more|false|true"
-    );
+    assert_eq!(result, "true|true|true|true|payload-more|false|true");
 }

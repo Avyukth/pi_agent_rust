@@ -209,6 +209,7 @@ fn build_vcr_system_prompt_for_args(
         &global_dir,
         &package_dir,
         true,
+        true,
     )
 }
 

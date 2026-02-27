@@ -472,11 +472,11 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     if let Some(arr) = value.as_array() {
         let len = arr.len();
-        if len > 10_000_000 {
+        if len > 100_000 {
             return Err(rquickjs::Error::new_into_js_message(
                 "json",
                 "stringify",
-                "Array length exceeds maximum allowed limit",
+                format!("Array length ({len}) exceeds maximum allowed limit of 100,000"),
             ));
         }
         let mut result = Vec::with_capacity(std::cmp::min(len, 1024));
@@ -9384,6 +9384,7 @@ export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
 export function mkdtempSync(prefix, _opts) {
   const p = String(prefix ?? "/tmp/tmp-");
   const out = `${p}${Date.now().toString(36)}`;
+  __pi_vfs.checkWriteAccess(__pi_vfs.normalizePath(out));
   __pi_vfs.ensureDir(out);
   return out;
 }
@@ -14278,7 +14279,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                             let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                roots.iter().any(|root| checked_path.starts_with(root))
+                                roots.iter().any(|root| {
+                                    let canonical_root = crate::extensions::safe_canonicalize(root);
+                                    checked_path.starts_with(&canonical_root)
+                                })
                             });
                             let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
 
@@ -14367,8 +14371,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                                                 allowed_read_roots.lock()
                                                             {
                                                                 for root in roots.iter() {
+                                                                    let canonical_root = crate::extensions::safe_canonicalize(root);
                                                                     if canonical_ancestor
-                                                                        .starts_with(root)
+                                                                        .starts_with(&canonical_root)
                                                                     {
                                                                         return Ok(
                                                                             requested_abs.clone()
@@ -14391,7 +14396,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                                         let in_ext_root =
                                             allowed_read_roots.lock().is_ok_and(|roots| {
-                                                roots.iter().any(|root| checked_path.starts_with(root))
+                                                roots.iter().any(|root| {
+                                                    let canonical_root = crate::extensions::safe_canonicalize(root);
+                                                    checked_path.starts_with(&canonical_root)
+                                                })
                                             });
 
                                         if in_ext_root {
@@ -14469,7 +14477,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
                                 let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| secure_path.starts_with(root))
+                                    roots.iter().any(|root| {
+                                        let canonical_root = crate::extensions::safe_canonicalize(root);
+                                        secure_path.starts_with(&canonical_root)
+                                    })
                                 });
                                 let allowed =
                                     secure_path.starts_with(&workspace_root) || in_ext_root;
@@ -14536,7 +14547,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                                     }
                                                     if let Ok(roots) = allowed_read_roots.lock() {
                                                         for root in roots.iter() {
-                                                            if canonical_ancestor.starts_with(root)
+                                                            let canonical_root = crate::extensions::safe_canonicalize(root);
+                                                            if canonical_ancestor.starts_with(&canonical_root)
                                                             {
                                                                 return Ok(requested_abs.clone());
                                                             }
@@ -14558,7 +14570,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 // Allow reads from workspace root or any registered
                                 // extension root directory.
                                 let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| checked_path.starts_with(root))
+                                    roots.iter().any(|root| {
+                                        let canonical_root = crate::extensions::safe_canonicalize(root);
+                                        checked_path.starts_with(&canonical_root)
+                                    })
                                 });
                                 let allowed =
                                     checked_path.starts_with(&workspace_root) || in_ext_root;
@@ -14761,6 +14776,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         loop {
                                             let n = match stdout_pipe.read(&mut chunk) {
                                                 Ok(n) => n,
+                                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                                 Err(e) => return (buf, Some(e.to_string())),
                                             };
                                             if n == 0 { break; }
@@ -14780,6 +14796,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         loop {
                                             let n = match stderr_pipe.read(&mut chunk) {
                                                 Ok(n) => n,
+                                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                                 Err(e) => return (buf, Some(e.to_string())),
                                             };
                                             if n == 0 { break; }

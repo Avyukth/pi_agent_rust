@@ -431,6 +431,7 @@ fn build_system_prompt_includes_custom_append_context_and_skills() {
         &global_dir,
         &package_dir,
         false,
+        true,
     );
 
     harness.log().info_ctx("prompt", "Prompt fragments", |ctx| {

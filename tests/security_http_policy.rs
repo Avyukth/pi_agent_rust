@@ -134,7 +134,7 @@ fn tls_not_required_allows_http() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -156,6 +156,7 @@ fn tls_not_required_allows_http() {
         result.output.get("status").and_then(Value::as_u64),
         Some(200)
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -216,7 +217,7 @@ fn allowlist_wildcard_allows_subdomain() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -234,6 +235,7 @@ fn allowlist_wildcard_allows_subdomain() {
     let result = run_async(async move { connector.dispatch(&call).await.unwrap() });
 
     assert!(!result.is_error, "127.0.0.1 in allowlist should succeed");
+    server.join().unwrap();
 }
 
 #[test]
@@ -242,7 +244,7 @@ fn empty_allowlist_allows_all_hosts() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -261,6 +263,7 @@ fn empty_allowlist_allows_all_hosts() {
         "empty allowlist should allow all: {:?}",
         result.error
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -389,7 +392,7 @@ fn request_body_within_limit_accepted() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         // Read request then respond
         let mut buf = [0u8; 4096];
@@ -412,6 +415,7 @@ fn request_body_within_limit_accepted() {
         "body within limit should succeed: {:?}",
         result.error
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -424,7 +428,7 @@ fn response_body_exceeding_limit_returns_error() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let mut buf = [0u8; 1024];
         let _ = std::io::Read::read(&mut stream, &mut buf);
@@ -456,6 +460,7 @@ fn response_body_exceeding_limit_returns_error() {
         "should mention size limit: {}",
         error.message
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -469,7 +474,7 @@ fn request_timeout_returns_timeout_error_code() {
     let addr = listener.local_addr().expect("addr");
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (_stream, _) = listener.accept().expect("accept");
         // Hold connection open without responding
         let _ = shutdown_rx.recv_timeout(std::time::Duration::from_secs(2));
@@ -489,6 +494,7 @@ fn request_timeout_returns_timeout_error_code() {
     assert_eq!(error.retryable, Some(true), "timeouts should be retryable");
 
     let _ = shutdown_tx.send(());
+    server.join().unwrap();
 }
 
 #[test]
@@ -498,7 +504,7 @@ fn call_level_timeout_used_when_request_omits_it() {
     let addr = listener.local_addr().expect("addr");
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (_stream, _) = listener.accept().expect("accept");
         let _ = shutdown_rx.recv_timeout(std::time::Duration::from_secs(2));
     });
@@ -527,6 +533,7 @@ fn call_level_timeout_used_when_request_omits_it() {
     );
 
     let _ = shutdown_tx.send(());
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -727,7 +734,7 @@ fn denied_host_never_opens_connection() {
     let connected = Arc::new(AtomicBool::new(false));
     let connected2 = Arc::clone(&connected);
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).expect("set nonblocking");
         // Try to accept for 500ms
         let start = std::time::Instant::now();
@@ -762,6 +769,7 @@ fn denied_host_never_opens_connection() {
         !connected.load(Ordering::SeqCst),
         "denied request should NEVER open a TCP connection"
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -834,7 +842,7 @@ fn zero_timeout_treated_as_no_timeout() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
 
-    let _server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         stream.write_all(resp.as_bytes()).expect("write");
@@ -854,6 +862,7 @@ fn zero_timeout_treated_as_no_timeout() {
         "timeout_ms=0 should use default, not timeout immediately: {:?}",
         result.error
     );
+    server.join().unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -999,6 +999,35 @@ impl Agent {
                 {
                     Ok(arc) => arc,
                     Err(err) => {
+                        let error_msg = AssistantMessage {
+                            stop_reason: StopReason::Error,
+                            error_message: Some(err.to_string()),
+                            ..AssistantMessage::default()
+                        };
+                        let error_message = Message::Assistant(Arc::new(error_msg));
+
+                        let steering_to_add = self.drain_steering_messages().await;
+                        for message in steering_to_add {
+                            self.messages.push(message.clone());
+                            on_event(AgentEvent::MessageStart {
+                                message: message.clone(),
+                            });
+                            on_event(AgentEvent::MessageEnd {
+                                message: message.clone(),
+                            });
+                            new_messages.push(message);
+                        }
+
+                        let turn_end_event = AgentEvent::TurnEnd {
+                            session_id: session_id.clone(),
+                            turn_index: current_turn_index,
+                            message: error_message,
+                            tool_results: Vec::new(),
+                        };
+                        self.dispatch_extension_lifecycle_event(&turn_end_event)
+                            .await;
+                        on_event(turn_end_event);
+
                         let agent_end_event = AgentEvent::AgentEnd {
                             session_id: session_id.clone(),
                             messages: std::mem::take(&mut new_messages),
@@ -1019,6 +1048,18 @@ impl Agent {
                     assistant_arc.stop_reason,
                     StopReason::Error | StopReason::Aborted
                 ) {
+                    let steering_to_add = self.drain_steering_messages().await;
+                    for message in steering_to_add {
+                        self.messages.push(message.clone());
+                        on_event(AgentEvent::MessageStart {
+                            message: message.clone(),
+                        });
+                        on_event(AgentEvent::MessageEnd {
+                            message: message.clone(),
+                        });
+                        new_messages.push(message);
+                    }
+
                     let turn_end_event = AgentEvent::TurnEnd {
                         session_id: session_id.clone(),
                         turn_index: current_turn_index,
@@ -1109,6 +1150,16 @@ impl Agent {
                     {
                         Ok(outcome) => outcome,
                         Err(err) => {
+                            let turn_end_event = AgentEvent::TurnEnd {
+                                session_id: session_id.clone(),
+                                turn_index: current_turn_index,
+                                message: assistant_event_message.clone(),
+                                tool_results: Vec::new(),
+                            };
+                            self.dispatch_extension_lifecycle_event(&turn_end_event)
+                                .await;
+                            on_event(turn_end_event);
+
                             let agent_end_event = AgentEvent::AgentEnd {
                                 session_id: session_id.clone(),
                                 messages: std::mem::take(&mut new_messages),
@@ -1316,7 +1367,31 @@ impl Agent {
             let Some(event_result) = event_result else {
                 break;
             };
-            let event = event_result?;
+            let event = match event_result {
+                Ok(e) => e,
+                Err(err) => {
+                    let mut msg = if added_partial {
+                        match self
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| matches!(m, Message::Assistant(_)))
+                        {
+                            Some(Message::Assistant(a)) => (**a).clone(),
+                            _ => AssistantMessage::default(),
+                        }
+                    } else {
+                        AssistantMessage::default()
+                    };
+                    msg.stop_reason = StopReason::Error;
+                    msg.error_message = Some(err.to_string());
+
+                    // If we never sent a Start event, finalize_assistant_message handles it.
+                    // But if sent_start is true and added_partial is somehow false,
+                    // finalize_assistant_message will emit a second Start. That shouldn't happen.
+                    return Ok(self.finalize_assistant_message(msg, &on_event, added_partial));
+                }
+            };
 
             match event {
                 StreamEvent::Start { partial } => {
@@ -6309,16 +6384,15 @@ mod turn_event_tests {
                 _ => None,
             });
 
-            let Some(first_turn_tool_results) = first_turn_tool_results else {
-                panic!("expected tool results for first turn");
-            };
+            let first_turn_tool_results =
+                first_turn_tool_results.expect("expected tool results for first turn");
             assert_eq!(first_turn_tool_results.len(), 1);
             let first_result = first_turn_tool_results.first().unwrap();
             if let Message::ToolResult(tr) = first_result {
                 assert_eq!(tr.tool_name, "echo_tool");
                 assert!(!tr.is_error);
             } else {
-                panic!("expected Message::ToolResult");
+                unreachable!("expected Message::ToolResult, got {:?}", first_result);
             }
             drop(events);
         });

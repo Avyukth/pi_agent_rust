@@ -297,13 +297,23 @@ fn main_impl() -> Result<()> {
     pi::logging::init_logging();
     pi::logging::prune_old_logs();
 
-    // Run the application
+    // Run the application.
+    // Native host mode uses a single-threaded runtime: it only processes one
+    // connection at a time (accept → relay → loop) so multi_thread's 12 worker
+    // threads would busy-spin via cthread_yield, wasting ~500% CPU on idle.
     let reactor = create_reactor()?;
-    let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 8)
-        .with_reactor(reactor)
-        .build()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let runtime = if is_chrome_native_host_mode(&cli) {
+        RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 2)
+            .with_reactor(reactor)
+            .build()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
     let handle = runtime.handle();
     let runtime_handle = handle.clone();
     let join = handle.spawn(Box::pin(run(cli, extension_flags, runtime_handle)));
@@ -1157,6 +1167,7 @@ async fn run(
         &global_dir,
         &package_dir,
         test_mode,
+        !cli.hide_cwd_in_prompt,
     );
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;

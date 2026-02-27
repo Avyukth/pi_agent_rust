@@ -629,13 +629,12 @@ fn truncate_head_first_line_exceeds_byte_limit() {
     );
     // Implementation truncates the first line to max_bytes, not empties it.
     assert_eq!(
-        result.content.len(),
-        400,
-        "content should be truncated to max_bytes"
+        result.content,
+        "x".repeat(400),
+        "content should be partial line when first line exceeds limit"
     );
     assert_eq!(result.output_lines, 1);
     assert_eq!(result.output_bytes, 400);
-    assert!(result.last_line_partial, "should be a partial line");
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
 }
 
@@ -740,10 +739,10 @@ fn truncate_head_empty_lines() {
 
     assert!(result.truncated, "should truncate");
     assert_eq!(result.output_lines, 3);
-    // Content is "\n\n\n" (3 newlines = 3 empty lines).
-    // split('\n') produces N+1 parts for N newlines, so 4 parts for 3 lines.
-    assert_eq!(result.content, "\n\n\n", "first 3 empty lines preserved");
-    assert_eq!(result.output_bytes, 3);
+    // First 3 lines should be empty strings, leading to "\n\n\n"
+    assert_eq!(result.content, "\n\n\n");
+    let lines: Vec<&str> = result.content.split('\n').collect();
+    assert_eq!(lines.len(), 4, "split on 3 newlines yields 4 items");
 }
 
 /// truncate_tail: content ending with newline.

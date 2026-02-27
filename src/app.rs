@@ -133,6 +133,7 @@ pub fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
     content
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt(
     cli: &cli::Cli,
     cwd: &Path,
@@ -141,6 +142,7 @@ pub fn build_system_prompt(
     global_dir: &Path,
     package_dir: &Path,
     test_mode: bool,
+    include_cwd: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -175,12 +177,14 @@ pub fn build_system_prompt(
         format_current_datetime()
     };
     let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let cwd_display = if test_mode {
-        "<CWD>".to_string()
-    } else {
-        cwd.display().to_string()
-    };
-    let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+    if include_cwd {
+        let cwd_display = if test_mode {
+            "<CWD>".to_string()
+        } else {
+            cwd.display().to_string()
+        };
+        let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+    }
 
     prompt
 }
@@ -213,10 +217,14 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         ("write", "Create or overwrite files"),
         (
             "grep",
-            "Search file contents for patterns (respects .gitignore)",
+            "Search file contents for patterns (respects .gitignore, supports hashline=true for use with hashline_edit)",
         ),
         ("find", "Find files by glob pattern (respects .gitignore)"),
         ("ls", "List directory contents"),
+        (
+            "hashline_edit",
+            "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
+        ),
     ];
 
     let mut tools = Vec::new();
@@ -240,6 +248,7 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let has_find = has_tool("find");
     let has_ls = has_tool("ls");
     let has_read = has_tool("read");
+    let has_hashline_edit = has_tool("hashline_edit");
 
     let mut guidelines_list = Vec::new();
     if has_bash && !has_grep && !has_find && !has_ls {
@@ -257,6 +266,11 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     }
     if has_edit {
         guidelines_list.push("Use edit for precise changes (old text must match exactly)");
+    }
+    if has_hashline_edit && has_read {
+        guidelines_list.push(
+            "For large files or complex multi-site edits, use read or grep with hashline=true to get LINE#HASH tags, then use hashline_edit for precise line-addressed edits",
+        );
     }
     if has_write {
         guidelines_list.push("Use write only for new files or complete rewrites");

@@ -217,6 +217,42 @@ emit_event "pi.smoke.session_start.v1" \
 echo "──── Runner ────"
 echo "  cargo runner: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
 
+run_split_clippy() {
+    local log_file="$1"
+    : > "$log_file"
+
+    local -a labels=("lib+bins" "tests" "benches" "examples")
+    local -a cmd=()
+    for label in "${labels[@]}"; do
+        echo "=== clippy slice: $label ===" >> "$log_file"
+        case "$label" in
+            "lib+bins")
+                cmd=(clippy --lib --bins -- -D warnings)
+                ;;
+            "tests")
+                cmd=(clippy --tests -- -D warnings)
+                ;;
+            "benches")
+                cmd=(clippy --benches -- -D warnings)
+                ;;
+            "examples")
+                cmd=(clippy --examples -- -D warnings)
+                ;;
+        esac
+
+        if "${CARGO_RUNNER_ARGS[@]}" "${cmd[@]}" >> "$log_file" 2>&1; then
+            echo "slice $label: PASS" >> "$log_file"
+            echo >> "$log_file"
+        else
+            echo "slice $label: FAIL" >> "$log_file"
+            echo >> "$log_file"
+            return 1
+        fi
+    done
+
+    return 0
+}
+
 # ─── Lint phase (optional) ────────────────────────────────────────────────────
 
 LINT_OK=true
@@ -233,7 +269,7 @@ if [[ "$SKIP_LINT" == false ]]; then
         LINT_OK=false
     fi
 
-    if "${CARGO_RUNNER_ARGS[@]}" clippy --all-targets -- -D warnings > "$ARTIFACT_DIR/clippy.log" 2>&1; then
+    if run_split_clippy "$ARTIFACT_DIR/clippy.log"; then
         echo "  clippy: ok"
     else
         echo "  clippy: FAIL (see $ARTIFACT_DIR/clippy.log)"

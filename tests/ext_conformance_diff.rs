@@ -803,7 +803,12 @@ fn run_rust_event_dispatch_bench_result(
                     base
                 };
                 runtime
-                    .dispatch_event(name.to_string(), payload, ctx_payload.clone(), timeout_ms)
+                    .dispatch_event(
+                        name.to_string(),
+                        payload,
+                        std::sync::Arc::new(ctx_payload.clone()),
+                        timeout_ms,
+                    )
                     .await
                     .map_err(|e| format!("dispatch {name} warmup: {e}"))?;
             }
@@ -818,7 +823,12 @@ fn run_rust_event_dispatch_bench_result(
                 };
                 let start = Instant::now();
                 runtime
-                    .dispatch_event(name.to_string(), payload, ctx_payload.clone(), timeout_ms)
+                    .dispatch_event(
+                        name.to_string(),
+                        payload,
+                        std::sync::Arc::new(ctx_payload.clone()),
+                        timeout_ms,
+                    )
                     .await
                     .map_err(|e| format!("dispatch {name}: {e}"))?;
                 let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);

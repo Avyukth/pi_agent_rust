@@ -113,3 +113,17 @@ repro_fuzzy.rs
 PLAN_TO_FIX_READ_TOOL.md
 scripts/skill-smoke.sh
 tests/conformance/test_read_streaming.rs
+
+# UBS scan output and agent debug artifacts
+ubs_*.txt
+ubs_*.json
+ubs_*.sarif
+criticals.txt
+unwraps.txt
+js_unwraps*.txt
+panic_grep*.txt
+rust-bug-scan.txt
+parse_*.py
+tests.log
+test_diff.rs
+test_edit_tool.rs
