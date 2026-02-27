@@ -4681,12 +4681,14 @@ impl HashlineOp {
     fn get_lines(&self) -> Vec<String> {
         match &self.lines {
             None | Some(serde_json::Value::Null) => vec![],
-            Some(serde_json::Value::String(s)) => s.split('\n').map(String::from).collect(),
+            Some(serde_json::Value::String(s)) => {
+                normalize_to_lf(s).split('\n').map(String::from).collect()
+            }
             Some(serde_json::Value::Array(arr)) => arr
                 .iter()
-                .map(|v| v.as_str().unwrap_or("").to_string())
+                .map(|v| normalize_to_lf(v.as_str().unwrap_or("")))
                 .collect(),
-            Some(other) => vec![other.to_string()],
+            Some(other) => vec![normalize_to_lf(&other.to_string())],
         }
     }
 }
@@ -5039,26 +5041,23 @@ impl Tool for HashlineEditTool {
                 .then_with(|| op_precedence(a.op).cmp(&op_precedence(b.op)))
         });
 
-        // Detect overlapping replace ranges (undefined behavior if applied bottom-up)
-        let replace_ranges: Vec<(usize, usize)> = resolved
-            .iter()
-            .filter(|e| e.op == "replace")
-            .map(|e| (e.start, e.end))
-            .collect();
-        for i in 0..replace_ranges.len() {
-            for j in (i + 1)..replace_ranges.len() {
-                let (a_start, a_end) = replace_ranges[i];
-                let (b_start, b_end) = replace_ranges[j];
-                if a_start <= b_end && b_start <= a_end {
+        // Detect overlapping edit ranges (undefined behavior if applied bottom-up)
+        for i in 0..resolved.len() {
+            for j in (i + 1)..resolved.len() {
+                let a = &resolved[i];
+                let b = &resolved[j];
+                if a.start <= b.end && b.start <= a.end {
                     return Err(Error::tool(
                         "hashline_edit",
                         format!(
-                            "Overlapping replace ranges: lines {}-{} and lines {}-{}. \
-                             Split into non-overlapping edits.",
-                            a_start + 1,
-                            a_end + 1,
-                            b_start + 1,
-                            b_end + 1
+                            "Overlapping edits detected: {} at line {}-{} and {} at line {}-{}. \
+                             Please combine overlapping edits into a single operation.",
+                            a.op,
+                            a.start + 1,
+                            a.end + 1,
+                            b.op,
+                            b.start + 1,
+                            b.end + 1
                         ),
                     ));
                 }

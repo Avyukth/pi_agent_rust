@@ -148,14 +148,12 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
     let mut message_count: Option<u64> = None;
     let mut name: Option<String> = None;
-    let mut has_name_key = false;
     for row in meta_rows {
         let key = row_get_str(&row, "key")?;
         let value = row_get_str(&row, "value")?;
         match key {
             "message_count" => message_count = value.parse::<u64>().ok(),
             "name" => {
-                has_name_key = true;
                 if !value.is_empty() {
                     name = Some(value.to_string());
                 }
@@ -164,7 +162,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         }
     }
 
-    let message_count = if let (Some(message_count), true) = (message_count, has_name_key) {
+    let message_count = if let Some(message_count) = message_count {
         message_count
     } else {
         let entry_rows = map_outcome(
@@ -688,19 +686,18 @@ pub async fn append_entries(
         )
         .await,
     )?;
-    if let Some(name) = session_name {
-        map_outcome(
-            tx.execute(
-                cx.cx(),
-                "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
-                &[
-                    SqliteValue::Text("name".to_string()),
-                    SqliteValue::Text(name.to_string()),
-                ],
-            )
-            .await,
-        )?;
-    }
+    let name_value = session_name.unwrap_or("");
+    map_outcome(
+        tx.execute(
+            cx.cx(),
+            "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
+            &[
+                SqliteValue::Text("name".to_string()),
+                SqliteValue::Text(name_value.to_string()),
+            ],
+        )
+        .await,
+    )?;
 
     map_outcome(tx.commit(cx.cx()).await)?;
     Ok(())
