@@ -776,14 +776,27 @@ async fn run_chrome_native_host_mode_with_config(
     // disconnect/reconnect cycles. The host only exits on fatal I/O errors
     // (Chrome closes stdin pipe). Chrome sends SIGTERM shortly after closing
     // stdin if the process doesn't exit on its own.
+    //
+    // idle_timeout_ms is kept short (100ms) because asupersync's runtime
+    // busy-polls non-blocking sockets during the accept window. Between
+    // accept attempts we sleep 5s via std::thread::sleep (kernel-level block)
+    // so that the process idles near 0% CPU. Discovery lease is refreshed
+    // every ~25s (once per 5 accept/sleep cycles).
+    let mut idle_cycles: u32 = 0;
     loop {
         match host.run().await {
             Ok(NativeHostRunOutcome::IdleTimeout) => {
-                // No agent connected within timeout — refresh discovery and retry
-                host.refresh_discovery_lease()?;
+                idle_cycles += 1;
+                // Refresh discovery every ~25s (5 cycles × 5s sleep)
+                if idle_cycles % 5 == 0 {
+                    host.refresh_discovery_lease()?;
+                }
+                // Block the thread in the kernel to avoid busy-poll CPU waste
+                std::thread::sleep(std::time::Duration::from_secs(5));
             }
             Ok(NativeHostRunOutcome::AgentConnected) => {
                 // Agent connected then disconnected — refresh discovery and retry
+                idle_cycles = 0;
                 host.refresh_discovery_lease()?;
             }
             Err(e) => {
@@ -796,8 +809,13 @@ async fn run_chrome_native_host_mode_with_config(
 
 async fn run_chrome_native_host_mode(cli: &cli::Cli) -> Result<()> {
     validate_chrome_native_host_mode_args(cli)?;
-    run_chrome_native_host_mode_with_config(pi::chrome::native_host::NativeHostConfig::default())
-        .await
+    // Use a short async accept timeout (100ms) because asupersync's
+    // current_thread runtime busy-polls non-blocking sockets during
+    // the timeout window. The loop adds a blocking sleep between
+    // iterations to keep CPU near zero while idle.
+    let mut config = pi::chrome::native_host::NativeHostConfig::default();
+    config.idle_timeout_ms = 100;
+    run_chrome_native_host_mode_with_config(config).await
 }
 
 #[allow(clippy::too_many_lines)]
