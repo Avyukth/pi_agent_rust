@@ -973,6 +973,7 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {

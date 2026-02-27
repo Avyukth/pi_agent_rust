@@ -158,33 +158,34 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
 
     if settings_path.exists() {
         match fs::read_to_string(&settings_path) {
-            Ok(content) => match serde_json::from_str::<Value>(&content) {
-                Ok(mut settings_value) => {
-                    if let Some(api_keys) = settings_value
-                        .get("apiKeys")
-                        .and_then(Value::as_object)
-                        .cloned()
-                    {
-                        for (provider, key_value) in api_keys {
-                            let Some(key) = key_value.as_str() else {
-                                continue;
-                            };
-                            if migrated.contains_key(&provider) {
-                                continue;
+            Ok(content) => {
+                match serde_json::from_str::<Value>(&content) {
+                    Ok(mut settings_value) => {
+                        if let Some(api_keys) = settings_value
+                            .get("apiKeys")
+                            .and_then(Value::as_object)
+                            .cloned()
+                        {
+                            for (provider, key_value) in api_keys {
+                                let Some(key) = key_value.as_str() else {
+                                    continue;
+                                };
+                                if migrated.contains_key(&provider) {
+                                    continue;
+                                }
+                                migrated.insert(
+                                    provider.clone(),
+                                    serde_json::json!({
+                                        "type": "api_key",
+                                        "key": key,
+                                    }),
+                                );
+                                providers.insert(provider);
                             }
-                            migrated.insert(
-                                provider.clone(),
-                                serde_json::json!({
-                                    "type": "api_key",
-                                    "key": key,
-                                }),
-                            );
-                            providers.insert(provider);
-                        }
-                        if let Value::Object(settings_obj) = &mut settings_value {
-                            settings_obj.remove("apiKeys");
-                        }
-                        match serde_json::to_string_pretty(&settings_value) {
+                            if let Value::Object(settings_obj) = &mut settings_value {
+                                settings_obj.remove("apiKeys");
+                            }
+                            match serde_json::to_string_pretty(&settings_value) {
                             Ok(updated) => {
                                 let tmp = settings_path.with_extension("json.tmp");
                                 let res = fs::File::create(&tmp).and_then(|mut f| {
@@ -192,7 +193,7 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
                                     f.write_all(updated.as_bytes())?;
                                     f.sync_all()
                                 }).and_then(|()| fs::rename(&tmp, &settings_path));
-                                
+
                                 if let Err(err) = res {
                                     warnings.push(format!(
                                         "could not persist settings.json after apiKeys migration: {err}"
@@ -203,12 +204,13 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
                                 "could not serialize settings.json after apiKeys migration: {err}"
                             )),
                         }
+                        }
                     }
+                    Err(err) => warnings.push(format!(
+                        "could not parse settings.json for apiKeys migration: {err}"
+                    )),
                 }
-                Err(err) => warnings.push(format!(
-                    "could not parse settings.json for apiKeys migration: {err}"
-                )),
-            },
+            }
             Err(err) => warnings.push(format!(
                 "could not read settings.json for apiKeys migration: {err}"
             )),
@@ -227,11 +229,13 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
         match serde_json::to_string_pretty(&Value::Object(migrated)) {
             Ok(contents) => {
                 let tmp = auth_path.with_extension("json.tmp");
-                let res = fs::File::create(&tmp).and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(contents.as_bytes())?;
-                    f.sync_all()
-                }).and_then(|()| fs::rename(&tmp, &auth_path));
+                let res = fs::File::create(&tmp)
+                    .and_then(|mut f| {
+                        use std::io::Write;
+                        f.write_all(contents.as_bytes())?;
+                        f.sync_all()
+                    })
+                    .and_then(|()| fs::rename(&tmp, &auth_path));
 
                 if let Err(err) = res {
                     warnings.push(format!("could not write auth.json during migration: {err}"));
