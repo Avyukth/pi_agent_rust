@@ -758,9 +758,30 @@ fn validate_chrome_native_host_mode_args(cli: &cli::Cli) -> Result<()> {
 async fn run_chrome_native_host_mode_with_config(
     config: pi::chrome::native_host::NativeHostConfig,
 ) -> Result<()> {
+    use pi::chrome::native_host::NativeHostRunOutcome;
+
     let mut host = pi::chrome::native_host::NativeHost::new(config)?;
-    let _ = host.run().await?;
-    Ok(())
+
+    // Loop: keep the native host alive across idle timeouts and agent
+    // disconnect/reconnect cycles. The host only exits on fatal I/O errors
+    // (Chrome closes stdin pipe). Chrome sends SIGTERM shortly after closing
+    // stdin if the process doesn't exit on its own.
+    loop {
+        match host.run().await {
+            Ok(NativeHostRunOutcome::IdleTimeout) => {
+                // No agent connected within timeout — refresh discovery and retry
+                host.refresh_discovery_lease()?;
+            }
+            Ok(NativeHostRunOutcome::AgentConnected) => {
+                // Agent connected then disconnected — refresh discovery and retry
+                host.refresh_discovery_lease()?;
+            }
+            Err(e) => {
+                // Fatal error (Chrome pipe broken, socket error) — exit
+                return Err(e.into());
+            }
+        }
+    }
 }
 
 async fn run_chrome_native_host_mode(cli: &cli::Cli) -> Result<()> {

@@ -262,6 +262,12 @@ impl NativeHost {
         Ok(NativeHostRunOutcome::AgentConnected)
     }
 
+    /// Refresh the discovery record timestamps so agents can still find this host.
+    /// Called between accept cycles when the host loops waiting for connections.
+    pub fn refresh_discovery_lease(&self) -> Result<(), NativeHostError> {
+        self.write_discovery_record()
+    }
+
     pub async fn accept_and_handle_claim_for_test(
         &mut self,
     ) -> Result<protocol::MessageType, NativeHostError> {
