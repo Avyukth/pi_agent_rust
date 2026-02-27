@@ -559,9 +559,10 @@ impl Agent {
                     continue;
                 }
 
-                if is_voice && entry.kind == "voice_turn_committed" {
+                if is_voice && entry.kind == crate::chrome::protocol::voice_event_kind::TURN_COMMITTED {
                     // VS4: voice_turn_committed → Message::User with transcript.
-                    voice_entries += 1;
+                    // Note: voice_entries is incremented only after successful processing
+                    // to avoid counting malformed/rejected events in the summary.
                     match entry.message.as_deref() {
                         Some(msg_json) => {
                             match serde_json::from_str::<crate::chrome::protocol::VoiceTurnCommitted>(msg_json) {
@@ -581,6 +582,15 @@ impl Agent {
                                     }
                                     self.seen_turn_ids.push_back(turn_id.clone());
 
+                                    // C-3: Skip empty or whitespace-only transcripts.
+                                    if vtc.transcript.trim().is_empty() {
+                                        tracing::debug!(
+                                            turn_id = %turn_id,
+                                            "empty voice transcript, skipping User message"
+                                        );
+                                        continue;
+                                    }
+
                                     let ts = Utc::now().timestamp_millis();
                                     // User message with the spoken transcript.
                                     voice_user_messages.push(Message::User(UserMessage {
@@ -597,6 +607,7 @@ impl Agent {
                                         })),
                                         timestamp: ts,
                                     }));
+                                    voice_entries += 1;
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -2923,7 +2934,7 @@ mod drain_observations_tests {
     fn drain_observations_drops_voice_when_disabled() {
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
-        bridge.push_observation(voice_observation("voice_turn_committed"));
+        bridge.push_observation(voice_observation(crate::chrome::protocol::voice_event_kind::TURN_COMMITTED));
         agent.set_chrome_bridge(bridge);
         // voice_enabled defaults to false
         assert!(
@@ -3080,7 +3091,7 @@ mod drain_observations_tests {
 
     /// Build a voice_turn_committed observation with valid VoiceTurnCommitted JSON.
     fn voice_turn_committed_observation(transcript: &str) -> ObservationEvent {
-        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted};
+        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted, voice_event_kind};
         let vtc = VoiceTurnCommitted {
             transcript: transcript.to_string(),
             proof: CommitProof::test_default(),
@@ -3089,7 +3100,7 @@ mod drain_observations_tests {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some(serde_json::to_string(&vtc).unwrap()),
                 source: Some("voice".to_string()),
                 url: None,
@@ -3130,7 +3141,7 @@ mod drain_observations_tests {
     }
 
     #[test]
-    fn voice_turn_committed_empty_transcript_still_creates_user_message() {
+    fn voice_turn_committed_empty_transcript_skips_user_message() {
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(voice_turn_committed_observation(""));
@@ -3138,20 +3149,32 @@ mod drain_observations_tests {
         agent.set_voice_enabled(true);
 
         let msgs = agent.drain_observations();
-        assert_eq!(msgs.len(), 2, "empty transcript → still User + proof");
-        match &msgs[0] {
-            Message::User(um) => {
-                match &um.content {
-                    UserContent::Text(t) => assert_eq!(t, ""),
-                    other => panic!("expected Text content, got {other:?}"),
-                }
-            }
-            other => panic!("expected User message, got {other:?}"),
-        }
+        assert!(
+            msgs.is_empty(),
+            "empty transcript should be skipped, got {} messages",
+            msgs.len()
+        );
+    }
+
+    #[test]
+    fn voice_turn_committed_whitespace_only_transcript_skips_user_message() {
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        bridge.push_observation(voice_turn_committed_observation("   \t\n  "));
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        assert!(
+            msgs.is_empty(),
+            "whitespace-only transcript should be skipped, got {} messages",
+            msgs.len()
+        );
     }
 
     #[test]
     fn voice_turn_committed_malformed_json_skips_user_message() {
+        use crate::chrome::protocol::voice_event_kind;
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         // Push malformed JSON as voice_turn_committed
@@ -3159,7 +3182,7 @@ mod drain_observations_tests {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some("{not valid json!!!}".to_string()),
                 source: Some("voice".to_string()),
                 url: None,
@@ -3175,13 +3198,14 @@ mod drain_observations_tests {
 
     #[test]
     fn voice_turn_committed_no_message_field_skips_user_message() {
+        use crate::chrome::protocol::voice_event_kind;
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         bridge.push_observation(ObservationEvent {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: None,
                 source: Some("voice".to_string()),
                 url: None,
@@ -3201,6 +3225,7 @@ mod drain_observations_tests {
 
     #[test]
     fn voice_turn_committed_missing_proof_fields_skips_user_message() {
+        use crate::chrome::protocol::voice_event_kind;
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         // JSON has transcript but proof is missing required fields
@@ -3208,7 +3233,7 @@ mod drain_observations_tests {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some(r#"{"transcript":"hello","proof":{"turn_id":"abc"}}"#.to_string()),
                 source: Some("voice".to_string()),
                 url: None,
@@ -3224,6 +3249,7 @@ mod drain_observations_tests {
 
     #[test]
     fn voice_turn_committed_wrong_field_types_skips_user_message() {
+        use crate::chrome::protocol::voice_event_kind;
         let mut agent = make_agent();
         let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
         // confidence is a string instead of number
@@ -3231,7 +3257,7 @@ mod drain_observations_tests {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some(r#"{"transcript":"hello","proof":{"turn_id":"abc","confidence":"high","backend":"test","model_id":"v1","timestamp_ms":"now","audio_duration_ms":100,"processing_ms":50}}"#.to_string()),
                 source: Some("voice".to_string()),
                 url: None,
@@ -3428,7 +3454,7 @@ mod drain_observations_tests {
 
     /// Build a voice_turn_committed observation with a specific turn_id.
     fn voice_turn_committed_with_id(transcript: &str, turn_id: &str) -> ObservationEvent {
-        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted};
+        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted, voice_event_kind};
         let mut proof = CommitProof::test_default();
         proof.turn_id = turn_id.to_string();
         let vtc = VoiceTurnCommitted {
@@ -3439,7 +3465,7 @@ mod drain_observations_tests {
             version: 1,
             observer_id: "voice-obs".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some(serde_json::to_string(&vtc).unwrap()),
                 source: Some("voice".to_string()),
                 url: None,
@@ -3600,6 +3626,60 @@ mod drain_observations_tests {
             user_count <= Agent::OBSERVATION_RENDER_BUDGET,
             "voice events capped at render budget: got {user_count}, max {}",
             Agent::OBSERVATION_RENDER_BUDGET
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-boundary naming invariant (C-1 / T-2 fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn voice_turn_committed_kind_matches_wire_constant() {
+        use crate::chrome::protocol::voice_event_kind;
+        // The agent's drain_observations() compares entry.kind against the
+        // wire constant. The TypeScript extension sends the unprefixed form
+        // (e.g. "turn_committed") via VoiceEventKind.TURN_COMMITTED.
+        // This test ensures the agent uses the same constant, preventing
+        // silent runtime mismatches masked by in-process test isolation.
+        assert_eq!(
+            voice_event_kind::TURN_COMMITTED,
+            "turn_committed",
+            "agent.rs drain must match the wire format sent by the TypeScript extension"
+        );
+    }
+
+    /// Verify that an observation with kind matching the wire constant
+    /// (unprefixed "turn_committed") is correctly processed by drain.
+    #[test]
+    fn voice_turn_committed_wire_kind_processed_by_drain() {
+        use crate::chrome::protocol::{CommitProof, VoiceTurnCommitted, voice_event_kind};
+        let mut agent = make_agent();
+        let bridge = Arc::new(ChromeBridge::new(ChromeBridgeConfig::default()));
+        let vtc = VoiceTurnCommitted {
+            transcript: "wire test".to_string(),
+            proof: CommitProof::test_default(),
+        };
+        // Use the wire constant directly — this is what the extension sends.
+        bridge.push_observation(ObservationEvent {
+            version: 1,
+            observer_id: "voice-obs".to_string(),
+            events: vec![ObservationEntry {
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
+                message: Some(serde_json::to_string(&vtc).unwrap()),
+                source: Some("voice".to_string()),
+                url: None,
+                ts: 2000,
+            }],
+        });
+        agent.set_chrome_bridge(bridge);
+        agent.set_voice_enabled(true);
+
+        let msgs = agent.drain_observations();
+        let user_msgs: Vec<_> = msgs.iter().filter(|m| matches!(m, Message::User(_))).collect();
+        assert_eq!(
+            user_msgs.len(),
+            1,
+            "observation with wire constant kind must produce a User message"
         );
     }
 }
@@ -3991,6 +4071,7 @@ mod vs1_behavior_matrix_tests {
 
     #[test]
     fn disabled_observation_silently_dropped() {
+        use crate::chrome::protocol::voice_event_kind;
         let mut agent = Agent::new(
             Arc::new(StubProvider),
             ToolRegistry::new(&[], Path::new("."), None),
@@ -4001,7 +4082,7 @@ mod vs1_behavior_matrix_tests {
             version: 1,
             observer_id: "voice".to_string(),
             events: vec![ObservationEntry {
-                kind: "voice_turn_committed".to_string(),
+                kind: voice_event_kind::TURN_COMMITTED.to_string(),
                 message: Some(r#"{"transcript":"test"}"#.to_string()),
                 source: Some("voice".to_string()),
                 url: None,
