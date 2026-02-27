@@ -531,6 +531,7 @@ struct BedrockToolResult {
 #[serde(untagged)]
 enum BedrockToolResultContent {
     Text { text: String },
+    Image { image: BedrockImageBlock },
 }
 
 #[derive(Debug, Serialize)]
@@ -662,28 +663,49 @@ fn convert_assistant_message(message: &AssistantMessage) -> Option<BedrockMessag
 }
 
 fn convert_tool_result_message(message: &ToolResultMessage) -> BedrockMessage {
-    let text = message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut contents = Vec::new();
 
-    let result_text = if text.trim().is_empty() {
-        "{}".to_string()
-    } else {
-        text
-    };
+    for block in &message.content {
+        match block {
+            ContentBlock::Text(text) => {
+                if !text.text.is_empty() {
+                    contents.push(BedrockToolResultContent::Text {
+                        text: text.text.clone(),
+                    });
+                }
+            }
+            ContentBlock::Image(img) => {
+                let format = img
+                    .mime_type
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("png")
+                    .to_string();
+                contents.push(BedrockToolResultContent::Image {
+                    image: BedrockImageBlock {
+                        format,
+                        source: BedrockImageSource {
+                            bytes: img.data.clone(),
+                        },
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if contents.is_empty() {
+        contents.push(BedrockToolResultContent::Text {
+            text: "{}".to_string(),
+        });
+    }
 
     BedrockMessage {
         role: "user",
         content: vec![BedrockContent::ToolResult {
             tool_result: BedrockToolResult {
                 tool_use_id: message.tool_call_id.clone(),
-                content: vec![BedrockToolResultContent::Text { text: result_text }],
+                content: contents,
                 status: if message.is_error {
                     "error".to_string()
                 } else {

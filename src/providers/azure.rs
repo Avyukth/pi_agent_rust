@@ -695,6 +695,7 @@ struct AzureUsage {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
     match message {
         Message::User(user) => vec![AzureMessage {
@@ -761,41 +762,53 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             messages
         }
         Message::ToolResult(result) => {
-            let parts: Vec<AzureContentPart> = result
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(AzureContentPart::Text {
-                        text: t.text.clone(),
-                    }),
+            let mut text_parts = Vec::new();
+            let mut image_parts = Vec::new();
+
+            for block in &result.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.text.clone()),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                        Some(AzureContentPart::ImageUrl {
+                        image_parts.push(AzureContentPart::ImageUrl {
                             image_url: AzureImageUrl { url },
-                        })
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    _ => {}
+                }
+            }
 
-            let content = if parts.is_empty() {
-                None
-            } else if parts.len() == 1 && matches!(parts[0], AzureContentPart::Text { .. }) {
-                if let AzureContentPart::Text { text } = &parts[0] {
-                    Some(AzureContent::Text(text.clone()))
+            let text_content = if text_parts.is_empty() {
+                if image_parts.is_empty() {
+                    None
                 } else {
-                    Some(AzureContent::Parts(parts))
+                    Some(AzureContent::Text("(see attached image)".to_string()))
                 }
             } else {
-                Some(AzureContent::Parts(parts))
+                Some(AzureContent::Text(text_parts.join("\n")))
             };
 
-            vec![AzureMessage {
+            let mut messages = vec![AzureMessage {
                 role: "tool".to_string(),
-                content,
+                content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
-            }]
+            }];
+
+            if !image_parts.is_empty() {
+                let mut parts = vec![AzureContentPart::Text {
+                    text: "Attached image(s) from tool result:".to_string(),
+                }];
+                parts.extend(image_parts);
+                messages.push(AzureMessage {
+                    role: "user".to_string(),
+                    content: Some(AzureContent::Parts(parts)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            messages
         }
     }
 }
