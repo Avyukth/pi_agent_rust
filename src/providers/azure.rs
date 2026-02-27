@@ -475,20 +475,20 @@ where
 
                     // Update the tool call state
                     if let Some(id) = tc.id {
-                        tc_state.id.clone_from(&id);
+                        tc_state.id.push_str(&id);
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
                         {
-                            block.id = id;
+                            block.id.clone_from(&tc_state.id);
                         }
                     }
                     if let Some(func) = tc.function {
                         if let Some(name) = func.name {
-                            tc_state.name.clone_from(&name);
+                            tc_state.name.push_str(&name);
                             if let Some(ContentBlock::ToolCall(block)) =
                                 self.partial.content.get_mut(content_index)
                             {
-                                block.name = name;
+                                block.name.clone_from(&tc_state.name);
                             }
                         }
                         if let Some(args) = func.arguments {

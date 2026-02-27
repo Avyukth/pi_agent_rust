@@ -726,7 +726,7 @@ where
                 // Update ID if present
 
                 if let Some(id) = tc_delta.id {
-                    tc.id = id;
+                    tc.id.push_str(&id);
 
                     if let Some(ContentBlock::ToolCall(block)) =
                         self.partial.content.get_mut(content_index)
@@ -739,7 +739,7 @@ where
 
                 if let Some(function) = tc_delta.function {
                     if let Some(name) = function.name {
-                        tc.name = name;
+                        tc.name.push_str(&name);
 
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
