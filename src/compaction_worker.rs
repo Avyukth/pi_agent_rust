@@ -219,7 +219,11 @@ mod tests {
             cooldown: Duration::from_millis(0),
             ..CompactionQuota::default()
         });
-        w.last_start = Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now));
+        w.last_start = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+        );
         w.attempt_count = 1;
         assert!(w.can_start());
     }
@@ -272,7 +276,9 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<CompactionOutcome>();
         w.pending = Some(PendingCompaction {
             rx: StdMutex::new(rx),
-            started_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
+            started_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         });
         let outcome = w.try_recv().expect("should return timeout error");
         assert!(outcome.is_err());

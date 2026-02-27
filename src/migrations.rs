@@ -236,8 +236,9 @@ fn migrate_auth_to_auth_json(agent_dir: &Path, warnings: &mut Vec<String>) -> Ve
                     use std::os::unix::fs::OpenOptionsExt;
                     options.mode(0o600);
                 }
-                
-                let res = options.open(&tmp)
+
+                let res = options
+                    .open(&tmp)
                     .and_then(|mut f| {
                         use std::io::Write;
                         f.write_all(contents.as_bytes())?;
@@ -505,6 +506,37 @@ mod tests {
         .expect("parse settings");
         assert!(settings_value.get("apiKeys").is_none());
         assert!(agent_dir.join("oauth.json.migrated").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_auth_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        let cwd = temp.path().join("project");
+        fs::create_dir_all(&agent_dir).expect("create agent dir");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        write(
+            &agent_dir.join("settings.json"),
+            r#"{"apiKeys":{"openai":"sk-test"}}"#,
+        );
+
+        let _report = run_startup_migrations_with_agent_dir(&agent_dir, &cwd);
+
+        let auth_path = agent_dir.join("auth.json");
+        assert!(auth_path.exists(), "auth.json should be created");
+        let mode = fs::metadata(&auth_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "auth.json should have 0o600 permissions, got {mode:#o}"
+        );
     }
 
     #[test]

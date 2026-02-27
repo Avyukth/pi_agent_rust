@@ -1190,4 +1190,119 @@ mod tests {
             .expect("resolve auth context");
         assert!(matches!(auth.auth, BedrockAuth::Bearer { .. }));
     }
+
+    fn make_bedrock_tool_result(content: Vec<ContentBlock>, is_error: bool) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: "tool_42".to_string(),
+            tool_name: "test_tool".to_string(),
+            content,
+            details: None,
+            is_error,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn tool_result_text_only_serializes_correctly() {
+        let msg = make_bedrock_tool_result(
+            vec![ContentBlock::Text(TextContent {
+                text: "found it".to_string(),
+                text_signature: None,
+            })],
+            false,
+        );
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        assert_eq!(value["role"], "user");
+        let tool_result = &value["content"][0]["toolResult"];
+        assert_eq!(tool_result["toolUseId"], "tool_42");
+        assert_eq!(tool_result["status"], "success");
+        assert_eq!(tool_result["content"][0]["text"], "found it");
+        assert_eq!(tool_result["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn tool_result_image_only_uses_native_image_format() {
+        let msg = make_bedrock_tool_result(
+            vec![ContentBlock::Image(crate::model::ImageContent {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/png".to_string(),
+            })],
+            false,
+        );
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        let tool_result = &value["content"][0]["toolResult"];
+        let content = &tool_result["content"][0];
+        assert_eq!(content["image"]["format"], "png");
+        assert_eq!(content["image"]["source"]["bytes"], "aW1hZ2U=");
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_image_preserves_both() {
+        let msg = make_bedrock_tool_result(
+            vec![
+                ContentBlock::Text(TextContent {
+                    text: "description".to_string(),
+                    text_signature: None,
+                }),
+                ContentBlock::Image(crate::model::ImageContent {
+                    data: "anBlZw==".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                }),
+            ],
+            false,
+        );
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        let contents = value["content"][0]["toolResult"]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["text"], "description");
+        assert_eq!(contents[1]["image"]["format"], "jpeg");
+    }
+
+    #[test]
+    fn tool_result_empty_content_falls_back_to_empty_json() {
+        let msg = make_bedrock_tool_result(vec![], false);
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        let contents = value["content"][0]["toolResult"]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["text"], "{}");
+    }
+
+    #[test]
+    fn tool_result_error_sets_error_status() {
+        let msg = make_bedrock_tool_result(
+            vec![ContentBlock::Text(TextContent {
+                text: "not found".to_string(),
+                text_signature: None,
+            })],
+            true,
+        );
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        assert_eq!(value["content"][0]["toolResult"]["status"], "error");
+    }
+
+    #[test]
+    fn tool_result_image_mime_extracts_format() {
+        let msg = make_bedrock_tool_result(
+            vec![ContentBlock::Image(crate::model::ImageContent {
+                data: "data".to_string(),
+                mime_type: "image/webp".to_string(),
+            })],
+            false,
+        );
+        let bedrock_msg = convert_tool_result_message(&msg);
+        let value = serde_json::to_value(&bedrock_msg).expect("serialize");
+        assert_eq!(
+            value["content"][0]["toolResult"]["content"][0]["image"]["format"],
+            "webp"
+        );
+    }
 }

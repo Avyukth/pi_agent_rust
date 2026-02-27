@@ -855,7 +855,7 @@ fn convert_tool_to_azure(tool: &ToolDef) -> AzureTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TextContent, ToolCall, UserMessage};
+    use crate::model::{ImageContent, TextContent, ToolCall, ToolResultMessage, UserMessage};
     use crate::provider::ToolDef;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
@@ -1253,6 +1253,109 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    fn make_tool_result(content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "test_tool".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn tool_result_text_only_produces_single_tool_message() {
+        let msg = make_tool_result(vec![ContentBlock::Text(TextContent {
+            text: "result text".to_string(),
+            text_signature: None,
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[0].tool_call_id.as_deref(), Some("call_123"));
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert_eq!(json["content"], "result text");
+    }
+
+    #[test]
+    fn tool_result_image_only_produces_tool_plus_user_message() {
+        let msg = make_tool_result(vec![ContentBlock::Image(ImageContent {
+            data: "aW1hZ2U=".to_string(),
+            mime_type: "image/png".to_string(),
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "image-only should produce tool + user messages"
+        );
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[1].role, "user");
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "(see attached image)");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_image_splits_correctly() {
+        let msg = make_tool_result(vec![
+            ContentBlock::Text(TextContent {
+                text: "line one".to_string(),
+                text_signature: None,
+            }),
+            ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            }),
+            ContentBlock::Text(TextContent {
+                text: "line two".to_string(),
+                text_signature: None,
+            }),
+        ]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "mixed content should produce tool + user messages"
+        );
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "line one\nline two");
+        assert_eq!(tool_json["tool_call_id"], "call_123");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn tool_result_empty_content_produces_single_tool_message_with_no_content() {
+        let msg = make_tool_result(vec![]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert!(
+            json["content"].is_null(),
+            "empty tool result should have null content"
+        );
     }
 }
 

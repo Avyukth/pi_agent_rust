@@ -81,37 +81,55 @@ impl SessionIndex {
     fn upsert_meta(&self, meta: SessionMeta) -> Result<()> {
         self.with_lock(|conn| {
             init_schema(conn)?;
-            let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
-            let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
-            conn.execute_sync(
-                "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                 ON CONFLICT(path) DO UPDATE SET
-                   id=excluded.id,
-                   cwd=excluded.cwd,
-                   timestamp=excluded.timestamp,
-                   message_count=excluded.message_count,
-                   last_modified_ms=excluded.last_modified_ms,
-                   size_bytes=excluded.size_bytes,
-                   name=excluded.name",
-                &[
-                    Value::Text(meta.path),
-                    Value::Text(meta.id),
-                    Value::Text(meta.cwd),
-                    Value::Text(meta.timestamp),
-                    Value::BigInt(message_count),
-                    Value::BigInt(meta.last_modified_ms),
-                    Value::BigInt(size_bytes),
-                    meta.name.map_or(Value::Null, Value::Text),
-                ],
-            ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
 
-            conn.execute_sync(
-                "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                &[Value::Text(current_epoch_ms())],
-            ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
-            Ok(())
+            conn.execute_raw("BEGIN IMMEDIATE")
+                .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
+
+            let result = (|| -> Result<()> {
+                let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
+                let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
+                conn.execute_sync(
+                    "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(path) DO UPDATE SET
+                       id=excluded.id,
+                       cwd=excluded.cwd,
+                       timestamp=excluded.timestamp,
+                       message_count=excluded.message_count,
+                       last_modified_ms=excluded.last_modified_ms,
+                       size_bytes=excluded.size_bytes,
+                       name=excluded.name",
+                    &[
+                        Value::Text(meta.path),
+                        Value::Text(meta.id),
+                        Value::Text(meta.cwd),
+                        Value::Text(meta.timestamp),
+                        Value::BigInt(message_count),
+                        Value::BigInt(meta.last_modified_ms),
+                        Value::BigInt(size_bytes),
+                        meta.name.map_or(Value::Null, Value::Text),
+                    ],
+                ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
+
+                conn.execute_sync(
+                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    &[Value::Text(current_epoch_ms())],
+                ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {
+                    conn.execute_raw("COMMIT")
+                        .map_err(|e| Error::session(format!("COMMIT failed: {e}")))?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_raw("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -152,9 +170,34 @@ impl SessionIndex {
         let path = path.to_string_lossy().to_string();
         self.with_lock(|conn| {
             init_schema(conn)?;
-            conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::Text(path)])
-                .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
-            Ok(())
+
+            conn.execute_raw("BEGIN IMMEDIATE")
+                .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
+
+            let result = (|| -> Result<()> {
+                conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::Text(path)])
+                    .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+
+                conn.execute_sync(
+                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    &[Value::Text(current_epoch_ms())],
+                )
+                .map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {
+                    conn.execute_raw("COMMIT")
+                        .map_err(|e| Error::session(format!("COMMIT failed: {e}")))?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_raw("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -174,34 +217,53 @@ impl SessionIndex {
 
         self.with_lock(|conn| {
             init_schema(conn)?;
-            conn.execute_sync("DELETE FROM sessions", &[])
-                .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
 
-            for meta in metas {
-                let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
-                let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
+            conn.execute_raw("BEGIN IMMEDIATE")
+                .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
+
+            let result = (|| -> Result<()> {
+                conn.execute_sync("DELETE FROM sessions", &[])
+                    .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+
+                for meta in metas {
+                    let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
+                    let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
+                    conn.execute_sync(
+                        "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                        &[
+                            Value::Text(meta.path),
+                            Value::Text(meta.id),
+                            Value::Text(meta.cwd),
+                            Value::Text(meta.timestamp),
+                            Value::BigInt(message_count),
+                            Value::BigInt(meta.last_modified_ms),
+                            Value::BigInt(size_bytes),
+                            meta.name.map_or(Value::Null, Value::Text),
+                        ],
+                    ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
+                }
+
                 conn.execute_sync(
-                    "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    &[
-                        Value::Text(meta.path),
-                        Value::Text(meta.id),
-                        Value::Text(meta.cwd),
-                        Value::Text(meta.timestamp),
-                        Value::BigInt(message_count),
-                        Value::BigInt(meta.last_modified_ms),
-                        Value::BigInt(size_bytes),
-                        meta.name.map_or(Value::Null, Value::Text),
-                    ],
-                ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
-            }
+                    "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    &[Value::Text(current_epoch_ms())],
+                ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
 
-            conn.execute_sync(
-                "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
-                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                &[Value::Text(current_epoch_ms())],
-            ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
-            Ok(())
+                Ok(())
+            })();
+
+            match result {
+                Ok(()) => {
+                    conn.execute_raw("COMMIT")
+                        .map_err(|e| Error::session(format!("COMMIT failed: {e}")))?;
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = conn.execute_raw("ROLLBACK");
+                    Err(e)
+                }
+            }
         })
     }
 

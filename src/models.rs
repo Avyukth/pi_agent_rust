@@ -3360,6 +3360,10 @@ mod tests {
         assert_eq!(model_is_reasoning("deepseek-chat"), Some(false));
         assert_eq!(model_is_reasoning("deepseek-coder"), Some(false));
 
+        // Qwen
+        assert_eq!(model_is_reasoning("qwq-32b"), Some(true));
+        assert_eq!(model_is_reasoning("qwq-1b"), Some(true));
+
         // Mistral
         assert_eq!(model_is_reasoning("mistral-large-latest"), Some(false));
         assert_eq!(model_is_reasoning("mistral-small-latest"), Some(false));
