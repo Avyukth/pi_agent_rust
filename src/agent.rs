@@ -12218,6 +12218,21 @@ impl AgentSession {
         &self.compaction_settings
     }
 
+    /// Tokens the system prompt + tool schemas add to every request but that
+    /// session entries never account for. Fed into the compaction trigger on
+    /// the heuristic path (first turn / right after a compaction) so it does
+    /// not under-count by the overhead and fire too late. Read-only: uses the
+    /// agent's cached tool definitions (populated by the first request, which
+    /// is before any compaction could matter).
+    fn compaction_overhead_tokens(&self) -> u64 {
+        let tools = self
+            .agent
+            .cached_tool_defs
+            .as_ref()
+            .map_or(&[][..], |(_, defs)| defs.as_slice());
+        compaction::estimate_context_overhead_tokens(self.agent.system_prompt(), tools)
+    }
+
     pub(crate) fn provider_admission_gate(&self) -> ProviderAdmissionGate {
         self.provider_admission.clone()
     }
@@ -12770,6 +12785,12 @@ impl AgentSession {
             return Ok(());
         }
 
+        // Warm the tool-definition cache so `compaction_overhead_tokens` sees
+        // the tool schemas even before this session's first request. Resuming
+        // right after a compaction is exactly the case that matters: there is
+        // no measured usage yet, so the trigger relies on the heuristic path.
+        let _ = self.agent.build_context();
+
         // Phase 1: apply completed background result.
         if let Some((origin, outcome)) = self.compaction_worker.try_recv_bound().await {
             // Preserve legacy lifecycle semantics: isCompacting remains true
@@ -12889,7 +12910,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            );
             let origin = CompactionOrigin {
                 session_id: session.header.id.clone(),
                 provider_id: origin_provider_id,
@@ -13104,7 +13129,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+            compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            )
         };
 
         let Some(prep) = preparation else {
@@ -13331,6 +13360,10 @@ impl AgentSession {
             return Ok(());
         }
 
+        // See `maybe_compact`: warm the tool-definition cache before the
+        // heuristic-path overhead estimate.
+        let _ = self.agent.build_context();
+
         let (entries, preparation) = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
@@ -13344,7 +13377,11 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
+            let prep = compaction::prepare_compaction_with_overhead(
+                &entries,
+                self.compaction_settings.clone(),
+                self.compaction_overhead_tokens(),
+            );
             (entries, prep)
         };
 
