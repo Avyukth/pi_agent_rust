@@ -2535,9 +2535,21 @@ async fn run(
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
+            // Honor `disabledProviders` in the ftui picker too. The classic
+            // stack filters its available_models through provider_is_disabled
+            // (see below), but the ftui model list was built straight off the
+            // registry, so `disabledProviders` had no effect on the default
+            // frontend. Filter here as well so the two stacks agree.
             let ftui_models = model_registry
                 .get_available()
                 .into_iter()
+                .filter(|entry| {
+                    !pi::failover::provider_is_disabled(
+                        &disabled_providers,
+                        scope_override,
+                        &entry.model.provider,
+                    )
+                })
                 .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
                 .collect::<Vec<_>>();
             // /resume picker entries: this cwd's saved sessions, newest first
