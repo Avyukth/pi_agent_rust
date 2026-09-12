@@ -2567,6 +2567,14 @@ async fn run(
                     (label, meta.path)
                 })
                 .collect::<Vec<_>>();
+            // Resolve mouse capture the same way the classic frontend does
+            // (interactive.rs): config `disableMouseCapture`/`noMouseCapture`
+            // (also set by --no-mouse-capture), else the PI_NO_MOUSE_CAPTURE
+            // env var. Without this the ftui stack always grabbed the mouse,
+            // blocking native text selection (notably over SSH).
+            let ftui_disable_mouse = config.disable_mouse_capture.unwrap_or_else(|| {
+                std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
+            });
             pi::interactive_ftui::run(
                 options,
                 &theme,
@@ -2582,6 +2590,7 @@ async fn run(
                         .and_then(|n| usize::try_from(n.clamp(3, 20)).ok())
                         .unwrap_or(5),
                 },
+                ftui_disable_mouse,
             )
             .map_err(Into::into)
         }
