@@ -1191,6 +1191,9 @@ pub struct PiFtuiModel {
     /// (see [`QueuedInputStore`]). `None` when the launch path did not wire
     /// queueing, in which case busy-time submits fall through to a prompt.
     queued_input: Option<Arc<Mutex<QueuedInputStore>>>,
+    /// Large pasted blocks, collapsed in the editor to `[Pasted #N ~L lines]`
+    /// chips (index N-1 here) and expanded back to the full text on submit.
+    pasted_blocks: Vec<String>,
     /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
     /// the pre-stop frames stay byte-identical (the diff engine then emits
     /// nothing into the restored cooked terminal). Cleared by
@@ -1356,6 +1359,7 @@ impl PiFtuiModel {
             alt_screen: false,
             disable_mouse: false,
             queued_input: None,
+            pasted_blocks: Vec::new(),
             suspending: false,
             watchdog: LoopWatchdog::new(),
             transcript_revision: 0,
@@ -2101,6 +2105,64 @@ impl PiFtuiModel {
 
     /// Submit the editor content: echo into the transcript, hand it to the
     /// agent loop (when wired), clear the editor, resume tail follow.
+    /// Paste-collapse threshold, mirroring opencode's paste summary
+    /// (`lineCount >= 3 || length > 150`).
+    const PASTE_COLLAPSE_MIN_LINES: usize = 3;
+    const PASTE_COLLAPSE_MIN_CHARS: usize = 150;
+
+    /// Handle a terminal paste. Small pastes go into the editor verbatim. A
+    /// large block is stored and replaced by an inline chip —
+    /// `[Pasted #N ~L lines]` — so the draft around it stays visible and
+    /// editable (`hello [Pasted #1 ~42 lines] how are you`), the convention
+    /// opencode and Claude Code use. The chip expands back to the full text
+    /// when the message is sent (see `expand_pastes`).
+    fn insert_paste(&mut self, raw: &str) {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let content = normalized.trim();
+        if content.is_empty() {
+            return;
+        }
+        let lines = content.lines().count();
+        if lines >= Self::PASTE_COLLAPSE_MIN_LINES
+            || content.len() > Self::PASTE_COLLAPSE_MIN_CHARS
+        {
+            self.pasted_blocks.push(content.to_string());
+            let n = self.pasted_blocks.len();
+            self.input.insert_text(&format!("[Pasted #{n} ~{lines} lines]"));
+        } else {
+            self.input.insert_text(content);
+        }
+    }
+
+    /// Replace every `[Pasted #N ~L lines]` chip in `text` with stored block
+    /// N. Chips that reference no stored block (typed by hand, or whose
+    /// block was already consumed) are left as-is.
+    fn expand_pastes(&self, text: &str) -> String {
+        const OPEN: &str = "[Pasted #";
+        if self.pasted_blocks.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find(OPEN) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + OPEN.len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            match (digits.parse::<usize>(), after.find(']')) {
+                (Ok(n), Some(end)) if n >= 1 && n <= self.pasted_blocks.len() => {
+                    out.push_str(&self.pasted_blocks[n - 1]);
+                    rest = &after[end + 1..];
+                }
+                _ => {
+                    out.push_str(OPEN);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// Enter: submit, or — while a turn is streaming — queue as a steering
     /// message (mirrors the classic frontend, where Enter steers when busy).
     fn submit_input(&mut self) {
@@ -2120,7 +2182,12 @@ impl PiFtuiModel {
         self.error_banner = None;
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
-        let clean = sanitize(trimmed).into_owned();
+        // `display` keeps any paste chips (what the transcript shows);
+        // `clean` has them expanded to the full pasted text (what is sent).
+        let display = sanitize(trimmed).into_owned();
+        let expanded = self.expand_pastes(trimmed);
+        let clean = sanitize(&expanded).into_owned();
+        self.pasted_blocks.clear();
         self.input.set_text("");
         self.autocomplete.close();
         self.scroll_from_tail = 0;
@@ -2138,12 +2205,12 @@ impl PiFtuiModel {
             }
             self.push_entry(
                 EntryRole::User,
-                format!("[queued · {}] {clean}", busy_kind.label()),
+                format!("[queued · {}] {display}", busy_kind.label()),
             );
             return;
         }
 
-        self.push_entry(EntryRole::User, clean.clone());
+        self.push_entry(EntryRole::User, display);
 
         // Bash routing comes before slash commands, matching submit_message:
         // `!cmd` shows output and submits it to the agent, `!!cmd` shows only.
@@ -2766,9 +2833,16 @@ impl PiFtuiModel {
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
+            Event::Paste(paste) if self.input_active() => {
+                // A large paste collapses to an inline chip (see
+                // `insert_paste`) instead of flooding the editor and burying
+                // the draft around it.
+                self.insert_paste(&paste.text);
+                self.maybe_trigger_autocomplete();
+            }
             _ => {
                 if self.input_active() && self.input.handle_event(event) {
-                    // Paste and other editor-relevant events flow through.
+                    // Other editor-relevant events flow through.
                     self.maybe_trigger_autocomplete();
                 }
             }
@@ -5457,6 +5531,47 @@ mod tests {
         let store = store.lock().expect("store lock");
         assert_eq!(store.steering.len(), 1, "one steering message queued");
         assert_eq!(store.follow_up.len(), 1, "one follow-up message queued");
+    }
+
+    #[test]
+    fn large_paste_collapses_to_chip_and_expands_on_submit() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in "hello ".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        let block = "line one\nline two\nline three\nline four";
+        sim.inject_event(Event::Paste(ftui::core::event::PasteEvent::new(block, true)));
+        // The editor shows a chip, not the block, so the draft stays readable.
+        assert_eq!(sim.model().input.text(), "hello [Pasted #1 ~4 lines]");
+        for ch in " how are you".chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        // What is sent has the chip expanded to the full pasted text …
+        let UiCommand::Prompt(submitted) = submit_rx.try_recv().expect("submitted") else {
+            panic!("expected a prompt");
+        };
+        assert_eq!(submitted, format!("hello {block} how are you"));
+        // … while the transcript keeps the compact chip form.
+        assert_eq!(
+            sim.model().transcript[0].text,
+            "hello [Pasted #1 ~4 lines] how are you"
+        );
+        assert!(sim.model().pasted_blocks.is_empty(), "blocks cleared after submit");
+    }
+
+    #[test]
+    fn small_paste_inserts_verbatim() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let model = PiFtuiModel::new(rx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Paste(ftui::core::event::PasteEvent::new("just a word", true)));
+        assert_eq!(sim.model().input.text(), "just a word");
     }
 
     #[test]
