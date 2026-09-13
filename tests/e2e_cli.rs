@@ -412,18 +412,14 @@ fn canon(p: &Path) -> PathBuf {
 /// tests whose premise is "the process cannot read/write this path" skip
 /// under euid 0 instead of asserting a denial the kernel never produces.
 /// Remote gate workers run as root.
+///
+/// Both callers are themselves `cfg(unix)`, because a POSIX mode is the whole
+/// premise of each. Keep it that way: a non-Unix arm here would be dead code,
+/// and a caller that is not gated is a sign the skip has been copied somewhere
+/// it does not belong.
 #[cfg(unix)]
 fn running_as_root() -> bool {
     rustix::process::geteuid().is_root()
-}
-
-/// There is no euid off Unix, so nothing here can claim the DAC bypass the
-/// skips above are guarding against. Answering `false` lets those tests run
-/// rather than silently skipping everywhere that is not Unix.
-#[cfg(not(unix))]
-#[allow(clippy::missing_const_for_fn)]
-fn running_as_root() -> bool {
-    false
 }
 
 #[cfg(unix)]
@@ -2036,15 +2032,18 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
 
 #[test]
 fn e2e_cli_startup_surfaces_configured_resource_failures() {
-    if running_as_root() {
-        eprintln!("skipping: an unreadable auth fixture is readable by root");
-        return;
-    }
     let mut harness = CliTestHarness::new("e2e_cli_startup_surfaces_configured_resource_failures");
     harness.env.remove("PI_CONFIG_PATH");
     harness
         .env
         .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
+    // `--list-models` alone short-circuits in main.rs long before resources are
+    // loaded, so it never reaches the diagnostic write and this asserted on an
+    // empty stderr. Compat scanning is the documented way to make that flag
+    // boot the normal startup path — which is the path this test is named for.
+    harness
+        .env
+        .insert("PI_EXT_COMPAT_SCAN".to_string(), "1".to_string());
 
     let package_root = harness.harness.create_dir("diagnostic-pkg");
     let skill = package_root.join("skills/oversized-skill/SKILL.md");
