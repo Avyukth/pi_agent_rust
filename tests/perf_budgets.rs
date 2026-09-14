@@ -1379,7 +1379,7 @@ fn benchmark_lineage_is_authoritative(lineage: &BudgetSummaryLineage<'_>) -> boo
 /// named measurement-control failure whenever their result carries no data.
 ///
 /// Must stay in step with `perf_measurement_control_failure_ids` in
-/// tests/release_evidence_gate.rs, which is the validator that reads these.
+/// `tests/release_evidence_gate.rs`, which is the validator that reads these.
 fn blocked_measurement_control_contract_id(budget_name: &str) -> Option<&'static str> {
     match budget_name {
         "binary_size_release" => Some("missing_binary_size_measurement_control"),
