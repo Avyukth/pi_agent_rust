@@ -1227,9 +1227,14 @@ mod tests {
                         true
                     })
                 );
+                // What is asserted is that the receiver observes a disconnect,
+                // not how fast. A closed channel reports it on the first poll,
+                // so this deadline is a hang guard whose budget is only spent
+                // on the way to a failure — and twenty milliseconds of it is
+                // not survivable on a loaded gate worker (bd-0mts7).
                 let closed = asupersync::time::timeout(
                     asupersync::time::wall_now(),
-                    std::time::Duration::from_millis(20),
+                    std::time::Duration::from_secs(5),
                     rx.recv(cx.cx()),
                 )
                 .await

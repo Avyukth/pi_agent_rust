@@ -5250,9 +5250,15 @@ mod stream_delta_batcher_tests {
                 }
             };
             futures::pin_mut!(wait_for_error);
+            // A hang guard, not part of the contract asserted below, so give it
+            // the same five seconds its siblings in this module use. One second
+            // is not enough headroom on a loaded gate worker: the spawned task
+            // has not reached its terminal message yet and the deadline fires
+            // on a healthy run (bd-0mts7). The budget is only ever spent on the
+            // way to a failure.
             let err = asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(5),
                 wait_for_error,
             )
             .await
@@ -5290,9 +5296,11 @@ mod stream_delta_batcher_tests {
                 }
             };
             futures::pin_mut!(wait_for_terminal);
+            // Hang guard only; see the note on the sibling above. Five seconds
+            // to match the rest of this module.
             let outcome = asupersync::time::timeout(
                 asupersync::time::wall_now(),
-                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(5),
                 wait_for_terminal,
             )
             .await
