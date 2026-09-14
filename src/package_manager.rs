@@ -2809,7 +2809,10 @@ fn collect_resource_files(dir: &Path, resource_type: ResourceType) -> Vec<PathBu
         ResourceType::Skills => collect_skill_entries(dir),
         ResourceType::Extensions => collect_auto_extension_entries(dir),
         ResourceType::Prompts => collect_files_recursive(dir, "md"),
-        ResourceType::Themes => collect_files_recursive(dir, "json"),
+        // Must stay in step with `resources::is_theme_file`, which is what
+        // actually loads these; asking for `json` alone silently dropped every
+        // packaged `.ini` and `.theme`.
+        ResourceType::Themes => collect_files_recursive_any(dir, &["json", "ini", "theme"]),
     }
 }
 
@@ -2912,6 +2915,16 @@ fn collect_extension_manifest_entries(entries: &[String], root: &Path) -> Vec<Pa
 }
 
 fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    collect_files_recursive_any(dir, &[ext])
+}
+
+/// Collect files matching any of `exts`, case-insensitively.
+///
+/// Themes need this because the loader in `resources::is_theme_file` accepts
+/// three extensions while collection here used to ask for `json` alone, so a
+/// package shipping a legacy `.ini` or `.theme` file had it dropped before the
+/// loader ever saw it.
+fn collect_files_recursive_any(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
     }
@@ -2932,7 +2945,7 @@ fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
             && path
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                .is_some_and(|found| exts.iter().any(|ext| found.eq_ignore_ascii_case(ext)))
         {
             out.push(path.to_path_buf());
         }
@@ -3049,7 +3062,19 @@ fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
         let Ok(stats) = fs::metadata(&path) else {
             continue;
         };
-        if stats.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+        // Same set, and the same case-insensitivity, as
+        // `resources::is_theme_file`: asking for lowercase `json` alone
+        // silently dropped every auto-discovered `.ini` and `.theme`.
+        if stats.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| {
+                    ["json", "ini", "theme"]
+                        .iter()
+                        .any(|known| ext.eq_ignore_ascii_case(known))
+                })
+        {
             out.push(path);
         }
     }
@@ -6915,6 +6940,53 @@ mod tests {
         let entries = collect_auto_theme_entries(&themes_dir);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|p| p.extension().unwrap() == "json"));
+    }
+
+    /// Collection has to accept everything `resources::is_theme_file` loads.
+    /// It used to ask for lowercase `json` only, so an auto-discovered `.ini`
+    /// or `.theme` was dropped before the loader could see it — and a theme
+    /// that fails to load is supposed to produce a diagnostic, not vanish.
+    #[test]
+    fn collect_auto_theme_entries_accepts_every_loadable_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create dir");
+        for name in ["dark.json", "legacy.ini", "custom.theme", "SHOUTY.JSON"] {
+            fs::write(themes_dir.join(name), "{}").expect("write");
+        }
+        fs::write(themes_dir.join("readme.md"), "text").expect("write");
+
+        let entries = collect_auto_theme_entries(&themes_dir);
+        let names: Vec<String> = entries
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["SHOUTY.JSON", "custom.theme", "dark.json", "legacy.ini"],
+            "every extension resources::is_theme_file loads must be collected, case-insensitively"
+        );
+    }
+
+    /// The package/manifest collection path had the same gap as auto-discovery.
+    #[test]
+    fn collect_resource_files_themes_accepts_every_loadable_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let themes_dir = dir.path().join("themes");
+        fs::create_dir_all(&themes_dir).expect("create dir");
+        for name in ["dark.json", "legacy.ini", "custom.theme"] {
+            fs::write(themes_dir.join(name), "{}").expect("write");
+        }
+        fs::write(themes_dir.join("notes.md"), "text").expect("write");
+
+        let mut names: Vec<String> = collect_resource_files(&themes_dir, ResourceType::Themes)
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["custom.theme", "dark.json", "legacy.ini"]);
     }
 
     // ======================================================================
