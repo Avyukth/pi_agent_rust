@@ -19,6 +19,25 @@ futures = "0.3"
 When developing against a local checkout, replace `version = "0.2.0"` with
 `path = "/path/to/pi_agent_rust"` while retaining `package = "pi_agent_rust"`.
 
+### Raise your crate's `recursion_limit`
+
+Add this at the top of the crate that drives a session:
+
+```rust
+#![recursion_limit = "256"]
+```
+
+Pi's runtime nests its future types deeply enough that proving `Send` for a
+session future can exceed rustc's default limit of 128. `recursion_limit` is
+per-crate and is **not** inherited from a dependency, so pi raising it
+internally does nothing for yours. Without it you get an `overflow evaluating
+the requirement ...: std::marker::Send` error, or a
+`recursion_depth_exceeding_limit` warning that `-D warnings` makes fatal — and
+neither names the real cause.
+
+This is not hypothetical: every one of pi's own binaries, examples and
+integration tests needed the attribute, `examples/basic_sdk.rs` included.
+
 ## SemVer Surface
 
 The supported library surface is the crate root aliases `pi::Error`,

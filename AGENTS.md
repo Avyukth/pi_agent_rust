@@ -171,6 +171,30 @@ compile, test, or quality claim.
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
 
+### Enumerate whole-tree breakage in one pass, not one error at a time
+
+Clippy stops at the first error per run, so a change that breaks many targets
+looks like one problem and then another and then another. Getting the whole
+list at once is worth the extra run:
+
+```bash
+cargo clippy --locked --all-targets --keep-going 2>&1 | grep -E 'overflow|error\[' -A2
+cargo check  --locked --all-targets --keep-going --message-format short
+```
+
+`--keep-going` builds every remaining target instead of stopping. On
+2026-09-13 an `asupersync` minor bump raised the nesting of its future types
+past rustc's default `recursion_limit` of 128, breaking nineteen targets:
+without `--keep-going` that took nine sequential clippy runs to enumerate.
+
+Two things make this class hard to recognise. `recursion_limit` is **per
+crate** and is not inherited, so `src/lib.rs` raising it does nothing for the
+binary, the examples, or any integration test — each is its own crate. And
+`cargo check` reports most of these as `future_incompatible` **warnings**
+while clippy makes them **errors**, so a green `cargo check` proves nothing
+about the gate. SDK embedders hit the same thing in their own crates; see the
+Install section of `docs/sdk.md`.
+
 ---
 
 ## Testing
