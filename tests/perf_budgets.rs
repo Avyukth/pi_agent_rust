@@ -5611,7 +5611,39 @@ fn blocked_sentinel_is_independent_of_artifact_roots_and_contents() {
     let second_summary = budget_summary_value(&lineage, &second_results, &second_failures);
 
     assert_eq!(first_summary, second_summary);
-    assert!(first_failures.is_empty());
+
+    // The property this test is named for is independence from the artifact
+    // roots, and it still holds: the blocked path derives its failures from the
+    // static BUDGETS list, never from anything on disk. It used to assert the
+    // list was empty, which pinned the shape rather than the property — and an
+    // empty list is what made the blocked artifact fail the v2 contract, which
+    // requires a data-less control-governed budget to name its missing control.
+    let failure_ids = |failures: &[DataContractFailure]| {
+        let mut pairs: Vec<(String, Option<String>)> = failures
+            .iter()
+            .map(|failure| (failure.contract_id.clone(), failure.budget_name.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    assert_eq!(
+        failure_ids(&first_failures),
+        failure_ids(&second_failures),
+        "blocked data-contract failures must not depend on the artifact root"
+    );
+    let mut expected: Vec<(String, Option<String>)> = BUDGETS
+        .iter()
+        .filter_map(|budget| {
+            blocked_measurement_control_contract_id(budget.name)
+                .map(|id| (id.to_string(), Some(budget.name.to_string())))
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        failure_ids(&first_failures),
+        expected,
+        "blocked mode must name exactly the absent measurement controls"
+    );
     assert_eq!(first_summary["pass"].as_u64(), Some(0));
     assert_eq!(first_summary["fail"].as_u64(), Some(0));
     assert_eq!(
