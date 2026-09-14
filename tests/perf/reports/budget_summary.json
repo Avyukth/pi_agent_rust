@@ -411,6 +411,7 @@
       "budget_data_missing",
       "ci_budget_data_missing",
       "correlation_id_missing",
+      "data_contract_failure",
       "run_id_missing",
       "strict_mode_disabled"
     ],
@@ -418,15 +419,40 @@
     "status": "blocked"
   },
   "correlation_id": null,
-  "data_contract_failures_count": 0,
+  "data_contract_failures_count": 4,
   "fail": 0,
-  "failing_data_contracts": [],
-  "generated_at": "2026-09-14T19:35:16.581Z",
+  "failing_data_contracts": [
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "contract_id": "missing_cold_load_measurement_control",
+      "detail": "authoritative benchmark lineage is incomplete, so no measurement control was captured for this budget",
+      "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
+    },
+    {
+      "budget_name": "ext_cold_load_complex_p95",
+      "contract_id": "missing_cold_load_measurement_control",
+      "detail": "authoritative benchmark lineage is incomplete, so no measurement control was captured for this budget",
+      "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
+    },
+    {
+      "budget_name": "idle_memory_rss",
+      "contract_id": "missing_idle_rss_measurement_control",
+      "detail": "authoritative benchmark lineage is incomplete, so no measurement control was captured for this budget",
+      "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
+    },
+    {
+      "budget_name": "binary_size_release",
+      "contract_id": "missing_binary_size_measurement_control",
+      "detail": "authoritative benchmark lineage is incomplete, so no measurement control was captured for this budget",
+      "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
+    }
+  ],
+  "generated_at": "2026-09-14T20:24:51.525Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v2",
-  "source_commit": "39d3657e2ce4896fcd07ed6cdfe0c35650325fb9",
+  "source_commit": "784efc3819bf3e78535b0116c19059ca5fd9f39b",
   "strict_mode": false,
   "total_budgets": 19
 }

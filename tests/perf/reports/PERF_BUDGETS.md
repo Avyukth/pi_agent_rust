@@ -1,10 +1,10 @@
 # Performance Budgets
 
-> Generated: 2026-09-14T19:35:16.581Z
+> Generated: 2026-09-14T20:24:51.525Z
 
 > Run ID: not set
 
-> Source commit: 39d3657e2ce4896fcd07ed6cdfe0c35650325fb9
+> Source commit: 784efc3819bf3e78535b0116c19059ca5fd9f39b
 
 > Strict mode: false
 
@@ -23,7 +23,7 @@
 | FAIL | 0 |
 | No data | 19 |
 
-| Failing data contracts | 0 |
+| Failing data contracts | 4 |
 
 ## Claim Readiness
 
@@ -32,6 +32,7 @@ Performance claims are blocked. Blocking reason codes:
 - `budget_data_missing`
 - `ci_budget_data_missing`
 - `correlation_id_missing`
+- `data_contract_failure`
 - `run_id_missing`
 - `strict_mode_disabled`
 
