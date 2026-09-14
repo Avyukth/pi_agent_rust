@@ -1112,6 +1112,20 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+
+        // Nothing spawned into a cancelled region can report: the runtime
+        // cancels the task at its first await, so neither the lock failure nor
+        // an enqueue ahead of it ever runs. Say so here, where a line of output
+        // still reaches somewhere, instead of spawning a task that vanishes.
+        // See the fuller note in `submit_continue` (bd-k01i6).
+        if task_cx.is_cancel_requested() {
+            tracing::warn!(
+                event = "pi.interactive.save_skipped_cancelled_region",
+                "session save skipped: the request was already cancelled"
+            );
+            return;
+        }
+
         runtime_handle.spawn(async move {
             // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9), and
             // `RuntimeHandle::spawn` requires the future to be `Send`.
