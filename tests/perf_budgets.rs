@@ -1375,6 +1375,22 @@ fn benchmark_lineage_is_authoritative(lineage: &BudgetSummaryLineage<'_>) -> boo
         && lineage.run_id == lineage.correlation_id
 }
 
+/// The "missing control" contract id for budgets whose v2 contract demands a
+/// named measurement-control failure whenever their result carries no data.
+///
+/// Must stay in step with `perf_measurement_control_failure_ids` in
+/// tests/release_evidence_gate.rs, which is the validator that reads these.
+fn blocked_measurement_control_contract_id(budget_name: &str) -> Option<&'static str> {
+    match budget_name {
+        "binary_size_release" => Some("missing_binary_size_measurement_control"),
+        "idle_memory_rss" => Some("missing_idle_rss_measurement_control"),
+        "ext_cold_load_simple_p95" | "ext_cold_load_complex_p95" => {
+            Some("missing_cold_load_measurement_control")
+        }
+        _ => None,
+    }
+}
+
 fn blocked_sentinel_result(budget: &Budget) -> BudgetResult {
     BudgetResult {
         budget_name: budget.name.to_string(),
@@ -1397,7 +1413,34 @@ fn evaluate_budget_report(
     if !benchmark_lineage_is_authoritative(lineage) {
         return (
             BUDGETS.iter().map(blocked_sentinel_result).collect(),
-            Vec::new(),
+            // Name the missing measurement controls rather than returning no
+            // failures at all. The v2 contract requires every data-less result
+            // for a control-governed budget to carry one of its named control
+            // failures (release_evidence_gate: "budget result {name} without
+            // data lacks a named measurement-control failure"), so an empty
+            // list made the blocked form unvalidatable — the generator could
+            // not produce an artifact that both gates accepted. Without an
+            // authoritative run these controls are genuinely absent, so saying
+            // so is the accurate answer, and it can only add blocking reasons.
+            BUDGETS
+                .iter()
+                .filter_map(|budget| {
+                    blocked_measurement_control_contract_id(budget.name).map(|contract_id| {
+                        DataContractFailure {
+                            contract_id: contract_id.to_string(),
+                            budget_name: Some(budget.name.to_string()),
+                            detail:
+                                "authoritative benchmark lineage is incomplete, so no measurement \
+                                 control was captured for this budget"
+                                    .to_string(),
+                            remediation:
+                                "re-run the benchmark with a correlation id and strict mode, then \
+                                 regenerate the budget report"
+                                    .to_string(),
+                        }
+                    })
+                })
+                .collect(),
         );
     }
 
