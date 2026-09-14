@@ -3844,6 +3844,14 @@ fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
         || path.starts_with("tests/e2e_results/")
         || path.starts_with("tests/ext_conformance/reports/")
         || path.starts_with("tests/certification/")
+        // Issue-tracker state, not product source and never packaged. The
+        // auto-commit sweeper writes `.beads/` continuously, so without this
+        // the binding is invalidated within minutes of every regeneration and
+        // the perf gate can never stay green — observed directly:
+        // "non-evidence or packaged path changed after source_commit:
+        // .beads/beads.db-wal-cert". scripts/check_clean_release_commit.py
+        // already classifies `.beads/*` this way; the two now agree.
+        || path.starts_with(".beads/")
         || (path.starts_with("docs/evidence/") && !packaged)
 }
 
@@ -8314,6 +8322,10 @@ fn performance_source_descendants_are_evidence_only_and_not_packaged() {
         "tests/ext_conformance/reports/conformance_summary.json",
         "tests/certification/verdict.json",
         "docs/evidence/dropin-certification-verdict.json",
+        // Tracker state the auto-commit sweeper rewrites constantly; allowed
+        // for the same reason scripts/check_clean_release_commit.py allows it.
+        ".beads/issues.jsonl",
+        ".beads/beads.db-wal-cert",
     ] {
         assert!(
             performance_followup_path_allowed(path, false),
