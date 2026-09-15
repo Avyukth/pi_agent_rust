@@ -292,11 +292,14 @@ impl CompactionWorkerState {
     pub async fn try_recv_bound(
         &mut self,
     ) -> Option<(Option<CompactionOrigin>, CompactionOutcome)> {
-        // Check timeout first (read-only borrow, then drop before mutation).
+        // The worker enforces the generation deadline itself. A completed
+        // outcome must survive an idle user or a long foreground turn: time
+        // spent waiting to be collected is not time spent generating a summary.
+        // Keep the defensive timeout only for work that is still unfinished.
         let timed_out = self
             .pending
             .as_ref()
-            .is_some_and(|p| p.started_at.elapsed() > self.quota.timeout);
+            .is_some_and(|p| !p.is_finished() && p.started_at.elapsed() > self.quota.timeout);
 
         if timed_out {
             if let Some(mut pending) = self.pending.take() {
@@ -537,7 +540,6 @@ async fn run_compaction_task(
     // guard lives across the await; thread-local suppression applies on the
     // polling thread.
     let _panic_guard = pi::crash::SuppressPanicHook::new();
-
     match futures::future::select(abort_fut, timed_compaction_fut).await {
         futures::future::Either::Left((abort_result, _)) => abort_result,
         futures::future::Either::Right((result, _)) => result,
@@ -1066,6 +1068,81 @@ mod tests {
             let result = outcome.expect("should be Ok");
             assert_eq!(result.summary, "test summary");
             assert!(w.pending.is_none());
+        });
+    }
+
+    // Wait on a completion barrier rather than guessing how long the runtime
+    // needs. On the current-thread test runtime, the sender's task returns its
+    // outcome in the same poll before the receiver can resume.
+    async fn completed_pending_with_handle(
+        runtime_handle: RuntimeHandle,
+        outcome: CompactionOutcome,
+    ) -> PendingCompaction {
+        let (completed_tx, completed_rx) = oneshot::channel();
+        let join = runtime_handle.spawn(async move {
+            completed_tx.send(()).expect("completion receiver is alive");
+            outcome
+        });
+        completed_rx.await.expect("compaction task completed");
+        assert!(join.is_finished());
+        PendingCompaction {
+            join,
+            abort_tx: None,
+            started_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("test clock supports a past start"),
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn delayed_poll_preserves_completed_summary_and_origin() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                timeout: Duration::ZERO,
+                ..CompactionQuota::default()
+            });
+            let origin = CompactionOrigin {
+                session_id: "session-a".to_string(),
+                provider_id: "provider-a".to_string(),
+                model_id: "model-a".to_string(),
+                snapshot_leaf_id: Some("leaf-a".to_string()),
+            };
+            let mut pending =
+                completed_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            pending.origin = Some(origin.clone());
+            inject_pending(&mut worker, pending);
+
+            let (actual_origin, outcome) = worker.try_recv_bound().await.expect("completed result");
+            assert_eq!(actual_origin, Some(origin));
+            assert_eq!(outcome.expect("completed summary must not expire").summary, "summary");
+            assert_eq!(worker.attempt_count, 1, "not durably applied yet");
+            assert!(worker.try_recv_bound().await.is_none(), "consume exactly once");
+        });
+    }
+
+    #[test]
+    fn delayed_poll_preserves_original_provider_error() {
+        run_async(|runtime_handle| async move {
+            let mut worker = make_worker(CompactionQuota {
+                timeout: Duration::ZERO,
+                ..CompactionQuota::default()
+            });
+            let pending = completed_pending_with_handle(
+                runtime_handle,
+                Err(Error::session("provider returned HTTP 500")),
+            )
+            .await;
+            inject_pending(&mut worker, pending);
+
+            let error = worker
+                .try_recv()
+                .await
+                .expect("completed result")
+                .expect_err("provider failure must be preserved");
+            assert!(error.to_string().contains("HTTP 500"), "got: {error}");
+            assert_eq!(worker.attempt_count, 1);
+            assert!(worker.pending.is_none());
         });
     }
 
