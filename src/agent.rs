@@ -12640,6 +12640,108 @@ impl AgentSession {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Strip the failed request's incomplete output so a retry RESUMES the turn
+    /// instead of replaying it.
+    ///
+    /// A transient drop leaves a partial or error assistant message on the
+    /// path. Reverting only that keeps the user prompt and every completed tool
+    /// cycle, so the retry re-issues one provider request rather than re-running
+    /// tools and re-billing work already done (pi_agent_rust#125).
+    ///
+    /// The whole transition is built on a private `Session` candidate: the live
+    /// transcript and the agent's message list are untouched unless the revert
+    /// and its persistence both succeed. A save that stays indeterminate after
+    /// one idempotent retry is reported as a session-persistence failure, which
+    /// every surface treats as terminal (bd-8188r) — silently continuing there
+    /// could repeat side effects against a record that no longer describes them.
+    ///
+    /// `require_incomplete_tail` is for the caller that has already seen a
+    /// COMPLETED error response: there must be an incomplete tail to revert, and
+    /// its absence means the caller's model of the turn is wrong rather than
+    /// that there is nothing to do.
+    ///
+    /// Print mode and the RPC server each had their own copy of this, down to
+    /// the same error prose (bd-u2qv4). `admission` is what was genuinely
+    /// RPC's: the gate is blocked for the window between persistence and live
+    /// installation, so a crash in between leaves provider re-entry quarantined
+    /// rather than silently resumed. Surfaces without such a gate pass `None`.
+    /// It is taken here rather than wrapped around the call so the lock order —
+    /// inner session first, admission permit second — stays exactly as it was.
+    pub async fn restore_retry_tail(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+    ) -> Result<()> {
+        self.restore_retry_tail_with_admission(cx, require_incomplete_tail, None)
+            .await
+    }
+
+    /// [`Self::restore_retry_tail`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what an embedder driving its own retry loop calls.
+    pub(crate) async fn restore_retry_tail_with_admission(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        require_incomplete_tail: bool,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<()> {
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| {
+                Error::session(format!("retry restoration session lock failed: {err}"))
+            })?;
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if require_incomplete_tail && !reverted {
+            return Err(Error::session(
+                "retry restoration invariant failed: the completed error response had no incomplete assistant tail",
+            ));
+        }
+        if !reverted {
+            return Ok(());
+        }
+
+        let restored_messages = candidate.to_messages_for_current_path();
+        let save_enabled = self.save_enabled();
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "retry restoration persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+
+        // The message list is about to change underneath any background
+        // compaction computed against the old one. RPC has always invalidated
+        // here; print mode did not, so a compaction prepared before the revert
+        // could be applied after it. Discarding prepared work is the safe
+        // direction — the worker recomputes — so the shared path does it.
+        self.invalidate_background_compaction();
+        *inner = candidate;
+        self.agent.replace_messages(restored_messages);
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        Ok(())
+    }
+
     async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {
         let provider = self.agent.provider();
         let cx = crate::agent_cx::AgentCx::for_request();

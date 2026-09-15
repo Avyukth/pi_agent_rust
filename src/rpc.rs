@@ -5256,47 +5256,16 @@ async fn restore_rpc_retry_tail(
         .map_err(|err| Error::session(format!("retry restoration state lock failed: {err}")))?;
     state.bind_provider_admission(guard.provider_admission_gate());
     state.ensure_session_advancement_allowed()?;
-    let session_store = Arc::clone(&guard.session);
-    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+
+    // The revert, its persistence and the live installation are the shared
+    // primitive on AgentSession (bd-u2qv4). RPC's own contribution is the
+    // admission gate it passes in: blocked across the persist-then-install
+    // window so a crash in between quarantines provider re-entry instead of
+    // silently resuming.
+    let admission = state.provider_admission.clone();
+    guard
+        .restore_retry_tail_with_admission(cx, require_incomplete_tail, Some(&admission))
         .await
-        .map_err(|err| Error::session(format!("retry restoration inner lock failed: {err}")))?;
-    let mut candidate = inner.clone();
-    let reverted = candidate.revert_incomplete_response();
-    if require_incomplete_tail && !reverted {
-        return Err(Error::session(
-            "retry restoration invariant failed: the completed error response had no incomplete assistant tail",
-        ));
-    }
-    if !reverted {
-        return Ok(());
-    }
-
-    let restored_messages = candidate.to_messages_for_current_path();
-    let save_enabled = guard.save_enabled();
-    let _provider_transition = state
-        .provider_admission
-        .begin_transition(
-            "retry restoration persistence was interrupted before live installation completed"
-                .to_string(),
-            cx,
-        )
-        .await?;
-    if save_enabled
-        && let Err(first_err) = candidate.save().await
-        && let Err(retry_err) = candidate.save().await
-    {
-        let reason = format!(
-            "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-        );
-        state.provider_admission.block(reason.clone());
-        return Err(Error::session_persistence(reason));
-    }
-
-    guard.invalidate_background_compaction();
-    *inner = candidate;
-    guard.agent.replace_messages(restored_messages);
-    state.provider_admission.clear();
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

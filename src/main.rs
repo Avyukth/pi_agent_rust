@@ -9112,40 +9112,18 @@ fn emit_print_failover_end(
     });
 }
 
+/// Print mode's entry to the shared retry-tail restoration on `AgentSession`
+/// (bd-u2qv4). RPC calls the same primitive inside its provider-admission
+/// transition; print mode has no such gate and needs none.
 async fn restore_print_retry_tail(
     session: &mut AgentSession,
     require_incomplete_tail: bool,
 ) -> Result<()> {
     let cx = pi::agent_cx::AgentCx::for_request();
-    let mut inner = OwnedMutexGuard::lock(Arc::clone(&session.session), &cx)
+    session
+        .restore_retry_tail(&cx, require_incomplete_tail)
         .await
-        .map_err(|err| anyhow::anyhow!("retry restoration session lock failed: {err}"))?;
-    let mut candidate = inner.clone();
-    let reverted = candidate.revert_incomplete_response();
-    if require_incomplete_tail && !reverted {
-        bail!(
-            "retry restoration invariant failed: the completed error response had no incomplete assistant tail"
-        );
-    }
-    if !reverted {
-        return Ok(());
-    }
-
-    let restored_messages = candidate.to_messages_for_current_path();
-    if session.save_enabled()
-        && let Err(first_err) = candidate.save().await
-        && let Err(retry_err) = candidate.save().await
-    {
-        return Err(anyhow::Error::new(pi::error::Error::session_persistence(
-            format!(
-                "retry restoration persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            ),
-        )));
-    }
-
-    *inner = candidate;
-    session.agent.replace_messages(restored_messages);
-    Ok(())
+        .map_err(anyhow::Error::new)
 }
 
 fn emit_print_restore_failure(is_json: bool, retry_count: u32, error: &anyhow::Error) {
