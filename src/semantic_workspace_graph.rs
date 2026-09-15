@@ -3434,6 +3434,12 @@ fn performance_tracked_head_state_failure(
         let Some((mode, oid, stage, path)) = parse_canonical_git_record(record) else {
             return Some(PerformanceSourceBindingFailure::Unavailable);
         };
+        // The tracker database is exempt on both sides of the comparison so a
+        // staged or rewritten `.beads/` export cannot read as source drift, and
+        // so the worktree re-hash below never races the daemon.
+        if tracker_state_path(path) {
+            continue;
+        }
         if stage != b"0"
             || index_entries
                 .insert(path.to_vec(), (mode.to_vec(), oid.to_vec()))
@@ -3458,6 +3464,9 @@ fn performance_tracked_head_state_failure(
         let Some((mode, object_type, oid, path)) = parse_canonical_git_record(record) else {
             return Some(PerformanceSourceBindingFailure::Unavailable);
         };
+        if tracker_state_path(path) {
+            continue;
+        }
         let Some((index_mode, index_oid)) = index_entries.remove(path) else {
             return Some(PerformanceSourceBindingFailure::Invalid(
                 "performance_budget_repository_tracked_state_not_head",
@@ -3488,6 +3497,27 @@ fn performance_tracked_head_state_failure(
     (!index_entries.is_empty()).then_some(PerformanceSourceBindingFailure::Invalid(
         "performance_budget_repository_tracked_state_not_head",
     ))
+}
+
+/// Is this `git status --porcelain=v1 -z --no-renames` record a write to the
+/// issue-tracker database?
+///
+/// Every record is `XY<space>PATH`, so the path begins at byte 3. `.beads/*` is
+/// never product source, never packaged, and cannot affect a measurement, but
+/// the beads daemon exports it on every issue write and the auto-commit sweeper
+/// commits the result. Treating those writes as source drift made the
+/// performance and drop-in source bindings report "repository not clean" almost
+/// continuously — a provenance signal that was really reporting on issue
+/// tracking. The exemption is exactly this prefix; anything else still
+/// invalidates the binding.
+const TRACKER_STATE_PREFIX: &str = ".beads/";
+
+fn tracker_state_path(path: &[u8]) -> bool {
+    path.starts_with(TRACKER_STATE_PREFIX.as_bytes())
+}
+
+fn tracker_state_status_record(record: &[u8]) -> bool {
+    record.get(3..).is_some_and(tracker_state_path)
 }
 
 fn performance_repository_state_failure(
@@ -3526,7 +3556,13 @@ fn performance_repository_state_failure(
     ) else {
         return Some(PerformanceSourceBindingFailure::Unavailable);
     };
-    if !status.is_empty() {
+    let Some(status_records) = canonical_nul_records(&status) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if status_records
+        .iter()
+        .any(|record| !tracker_state_status_record(record))
+    {
         return Some(PerformanceSourceBindingFailure::Invalid(
             "performance_budget_repository_not_clean",
         ));
@@ -3953,6 +3989,11 @@ fn performance_source_binding_failure(
         Vec::new()
     };
     let evidence_only = paths.iter().all(|path| {
+        // Tracker-database churn is not source drift; see
+        // `tracker_state_status_record`.
+        if path.starts_with(TRACKER_STATE_PREFIX) {
+            return true;
+        }
         let packaged_docs_evidence = path.starts_with("docs/evidence/")
             && performance_path_is_packaged(path, &package_patterns) != Some(false);
         performance_artifact_relative_path(path).is_some()
@@ -4986,6 +5027,11 @@ fn dropin_source_binding(
         "tests/certification/",
     ];
     let evidence_only = changed_paths.iter().all(|path| {
+        // Tracker-database churn is not source drift; see
+        // `tracker_state_status_record`.
+        if path.starts_with(TRACKER_STATE_PREFIX) {
+            return true;
+        }
         let packaged_docs_evidence = path.starts_with("docs/evidence/")
             && performance_path_is_packaged(path, &package_patterns) != Some(false);
         !packaged_docs_evidence
