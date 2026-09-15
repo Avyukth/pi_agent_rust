@@ -2306,6 +2306,67 @@ fn performance_budget_freshness_accepts_clean_head_bound_artifact() -> TestResul
     Ok(())
 }
 
+/// The performance source binding is evaluated against the live repository,
+/// where the beads daemon exports `.beads/*` on every issue write and the
+/// auto-commit sweeper commits the result. Treating that as source drift made
+/// the graph report `performance_budget_repository_not_clean` almost
+/// continuously — a provenance signal reporting on issue tracking. Covers every
+/// Git state the daemon and sweeper produce, and pins that the exemption is
+/// exactly the tracker prefix.
+#[test]
+fn performance_budget_source_binding_tolerates_live_tracker_writes() -> TestResult {
+    let temp = fixture_workspace()?;
+    write_fixture(temp.path(), ".beads/issues.jsonl", "{\"id\":\"seed\"}\n")?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+
+    let assert_bound = |root: &Path, context: &str| -> TestResult {
+        let graph = build_fixture_graph(root)?;
+        let perf_budget = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "tests/perf/reports/budget_summary.json",
+        )?;
+        assert_eq!(
+            perf_budget.metadata.get("release_claim_allowed"),
+            Some(&json!(true)),
+            "{context}: {:?}",
+            perf_budget.metadata.get("release_claim_reason")
+        );
+        Ok(())
+    };
+    assert_bound(temp.path(), "clean tree with a committed tracker export")?;
+
+    // Rewritten export plus an untracked journal: the daemon mid-write.
+    write_fixture(
+        temp.path(),
+        ".beads/issues.jsonl",
+        "{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )?;
+    write_fixture(temp.path(), ".beads/beads.db-wal-cert", "cert\n")?;
+    assert_bound(temp.path(), "unstaged and untracked tracker writes")?;
+
+    // Staged: the auto-commit sweeper caught the export mid-run.
+    run_fixture_git(temp.path(), &["add", ".beads"])?;
+    assert_bound(temp.path(), "staged tracker export")?;
+
+    // Committed after source_commit: the sweeper finished.
+    run_fixture_git(temp.path(), &["commit", "-m", "sweep tracker export"])?;
+    assert_bound(temp.path(), "tracker export committed after source_commit")?;
+
+    // The exemption is exactly the tracker prefix: real source drift still
+    // invalidates the binding.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(temp.path().join("src/lib.rs"))?
+        .write_all(b"\n// real source drift\n")?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_not_clean",
+    )?;
+    Ok(())
+}
+
 #[test]
 fn performance_budget_source_binding_rejects_dirty_staged_and_untracked_sources() -> TestResult {
     let dirty = fixture_workspace()?;

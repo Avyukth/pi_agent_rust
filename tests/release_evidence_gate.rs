@@ -8426,6 +8426,23 @@ fn performance_source_descendants_are_evidence_only_and_not_packaged() {
         "docs/evidence/tool-output-context-cache.jsonl",
         true
     ));
+
+    // The tracker exemption is only sound because `.beads/` is never shipped.
+    // If it ever enters `package.include`, exempting it would let a packaged
+    // path change after `source_commit` without invalidating the binding, so
+    // fail here rather than silently widening the hole.
+    let cargo_toml: toml::Value = toml::from_str(&require_text("Cargo.toml"))
+        .expect("parse Cargo.toml package include policy");
+    let include = cargo_toml["package"]["include"]
+        .as_array()
+        .expect("package.include must be an array");
+    for pattern in include {
+        let pattern = pattern.as_str().expect("package.include entries are strings");
+        assert!(
+            !pattern.trim_start_matches('/').starts_with(".beads"),
+            "tracker state must never be packaged while the binding exempts it: {pattern}"
+        );
+    }
 }
 
 // ============================================================================
