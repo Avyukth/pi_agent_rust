@@ -857,20 +857,29 @@ impl Drop for ClearFlagOnDrop {
     }
 }
 
-/// Guarantees the RPC contract that every accepted prompt is answered by
+/// Backstop for the RPC contract that every accepted prompt is answered by
 /// exactly one terminal `agent_end` frame.
 ///
-/// A turn task is dropped at its next `.await` once its ambient region is
-/// cancel-requested, and no code after that point runs — not the retry loop's
-/// own "Retry aborted" break, not the post-loop `auto_retry_end`, not the
-/// terminal `agent_end`. Handing a fresh `AgentCx::for_request()` to the
-/// individual awaits does not rescue this: the region that ends the task is
-/// the task's own, established at spawn, not the one passed to an awaited
-/// call. So a client that cancelled an in-flight turn waited forever for a
-/// frame that could never be sent.
+/// Once the client has been told a prompt was accepted it will block until a
+/// terminal frame arrives, so any way the turn task can end without sending
+/// one strands that client forever. The turn body has many fallible awaits and
+/// can unwind; before this, a panic anywhere inside it dropped the future and
+/// the client simply never heard back. `Drop` is synchronous and so is the
+/// channel send, so this fires on every path that actually drops the future —
+/// panic/unwind and runtime teardown included.
 ///
-/// `Drop` is synchronous and so is the channel send, which makes this the one
-/// emission point that cannot itself be cancelled.
+/// WHAT THIS DOES NOT COVER, measured rather than assumed: when the task's
+/// ambient region becomes cancel-requested, asupersync 0.5 stops polling the
+/// task at its next `.await` WITHOUT dropping it. The future stays alive and
+/// unpolled, so no destructor runs and this guard never fires. Probing
+/// `rpc_prompt_command_inherits_cancelled_context_from_run` showed the retry
+/// delay loop tick exactly once, await, and never be scheduled again — no
+/// further ticks, no drop. Handing a fresh `AgentCx::for_request()` to the
+/// individual awaits does not rescue it either, because the region that stops
+/// the task is the task's own, established at spawn, not the one passed to an
+/// awaited call. Fixing that case needs the turn to stop being spawned inside
+/// the client's cancel region, with cancellation delivered through the
+/// `retry_abort` flag and `AbortHandle` that already exist for it.
 struct TerminalAgentEndOnDrop {
     out_tx: std::sync::mpsc::SyncSender<String>,
     cx: AgentCx,
@@ -878,7 +887,7 @@ struct TerminalAgentEndOnDrop {
 }
 
 impl TerminalAgentEndOnDrop {
-    fn new(out_tx: std::sync::mpsc::SyncSender<String>, cx: AgentCx) -> Self {
+    const fn new(out_tx: std::sync::mpsc::SyncSender<String>, cx: AgentCx) -> Self {
         Self {
             out_tx,
             cx,
@@ -906,7 +915,6 @@ impl Drop for TerminalAgentEndOnDrop {
         } else {
             "Turn ended without a terminal event"
         };
-        eprintln!("PROBE_TERMINAL_GUARD_FIRED error={error}");
         let _ = self.out_tx.send(event(&json!({
             "type": "agent_end",
             "messages": [],
@@ -5690,13 +5698,7 @@ async fn run_prompt_with_retry(
         let delay = Duration::from_millis(delay_ms as u64);
         let start = std::time::Instant::now();
         let mut retry_cancelled = false;
-        eprintln!("PROBE_SERVER_DELAY_ENTER delay_ms={delay_ms}");
         while start.elapsed() < delay {
-            eprintln!(
-                "PROBE_SERVER_DELAY_TICK cancel_requested={} checkpoint_err={}",
-                cx.is_cancel_requested(),
-                cx.checkpoint().is_err()
-            );
             if retry_abort.load(Ordering::SeqCst) {
                 retry_cancelled = true;
                 break;
@@ -9891,11 +9893,9 @@ mod retry_tests {
                                         continue;
                                     };
                                     timeline.push(kind.to_string());
-                                    eprintln!("PROBE_CLIENT_SAW kind={kind}");
                                     if kind == "auto_retry_start" && !cancellation_requested {
                                         cancel_cx.set_cancel_requested(true);
                                         cancellation_requested = true;
-                                        eprintln!("PROBE_CLIENT_CANCELLED");
                                     }
                                     if kind == "agent_end" {
                                         let agent_end_error = value
@@ -9914,13 +9914,11 @@ mod retry_tests {
                                     break (timeline, None);
                                 }
                                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    eprintln!("PROBE_CLIENT_POLL_SLEEP");
                                     asupersync::time::sleep(
                                         asupersync::time::wall_now(),
                                         Duration::from_millis(5),
                                     )
                                     .await;
-                                    eprintln!("PROBE_CLIENT_POLL_WOKE");
                                 }
                             }
                         }
@@ -10105,6 +10103,47 @@ mod retry_tests {
                 "provider.stream must remain unreachable after admission failure"
             );
         });
+    }
+
+    /// A turn that ends without sending its own terminal frame must still
+    /// answer the client. Before the guard, a panic anywhere inside the turn
+    /// body dropped the future silently and the client blocked forever waiting
+    /// for an `agent_end` that no longer had a sender.
+    #[test]
+    fn terminal_agent_end_guard_answers_a_turn_that_never_emitted_one() {
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(8);
+
+        // Dropped while armed, with a live (uncancelled) context: a defect, and
+        // it says so rather than impersonating a cancellation.
+        let guard = TerminalAgentEndOnDrop::new(out_tx.clone(), AgentCx::for_testing());
+        drop(guard);
+        let frame: Value =
+            serde_json::from_str(&out_rx.try_recv().expect("terminal frame")).expect("parse frame");
+        assert_eq!(frame["type"], "agent_end");
+        assert_eq!(frame["error"], "Turn ended without a terminal event");
+
+        // Dropped while armed after cancellation: indistinguishable from the
+        // in-loop checkpoint break, which is the point.
+        let cancelled = AgentCx::for_testing();
+        cancelled.set_cancel_requested(true);
+        drop(TerminalAgentEndOnDrop::new(out_tx.clone(), cancelled));
+        let frame: Value = serde_json::from_str(&out_rx.try_recv().expect("terminal frame"))
+            .expect("parse cancelled frame");
+        assert_eq!(frame["error"], "Retry aborted");
+
+        // Disarmed: the turn sent its own terminal frame, so the guard must
+        // not add a second one — the contract is exactly one.
+        let mut disarmed = TerminalAgentEndOnDrop::new(out_tx.clone(), AgentCx::for_testing());
+        disarmed.disarm();
+        drop(disarmed);
+        // `out_tx` is deliberately still alive here: were it not, the receiver
+        // would report Disconnected and the assertion would pass without
+        // distinguishing "sent nothing" from "channel closed".
+        assert!(
+            matches!(out_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "a disarmed guard must emit nothing"
+        );
+        drop(out_tx);
     }
 
     #[test]
