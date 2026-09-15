@@ -1570,6 +1570,56 @@ impl AbortSignal {
     }
 }
 
+/// Compaction window for a model entry, with a reported zero treated as
+/// "unknown" rather than "no room".
+///
+/// Print mode and the RPC server each had a private copy of this, one of them
+/// silently — the warning is worth having wherever it happens (bd-u2qv4).
+#[must_use]
+pub fn context_window_tokens_for_entry(entry: &crate::models::ModelEntry) -> u32 {
+    if entry.model.context_window == 0 {
+        tracing::warn!(
+            "Model {} reported context_window=0; falling back to default compaction window",
+            entry.model.id
+        );
+        return ResolvedCompactionSettings::default().context_window_tokens;
+    }
+    entry.model.context_window
+}
+
+/// One fallback-chain swap, as [`AgentSession::commit_failover_swap`] needs it.
+///
+/// The caller has already classified the failure, walked the chain, resolved a
+/// credential and constructed the provider; what remains is the persisted
+/// transition, which is identical on every surface.
+pub struct FailoverSwapRequest<'a> {
+    /// The chain entry being installed.
+    pub entry: &'a crate::models::ModelEntry,
+    /// Credential resolved for that entry, `None` only where none is required.
+    pub api_key: Option<String>,
+    /// Provider constructed for the entry.
+    pub provider: Arc<dyn Provider>,
+    /// The identity being left, recorded in the transcript.
+    pub from_provider: &'a str,
+    /// The model being left, recorded in the transcript.
+    pub from_model: &'a str,
+    /// Why the swap is happening, recorded in the transcript.
+    pub class: crate::failover::FailoverClass,
+    /// Chain index recorded with the transcript entry.
+    pub chain_position: usize,
+    /// The level the entry is clamped against.
+    ///
+    /// Print mode passes the LIVE level and RPC the level originally requested
+    /// before any swap. They differ only from the second hop of a chain
+    /// onwards, where print's choice ratchets the level down through whatever
+    /// the previous fallback allowed and never recovers it. Passed in rather
+    /// than chosen here so this extraction changes neither surface; the
+    /// divergence is real and tracked separately.
+    pub thinking_level_to_clamp: crate::model::ThinkingLevel,
+    /// Whether a completed error response must have left a revertible tail.
+    pub require_incomplete_tail: bool,
+}
+
 /// The agent runtime that orchestrates LLM calls and tool execution.
 pub struct Agent {
     /// The LLM provider.
@@ -12740,6 +12790,163 @@ impl AgentSession {
             gate.clear();
         }
         Ok(())
+    }
+
+    /// Everything a fallback-chain swap does to the session and the live agent.
+    ///
+    /// Print mode and the RPC server each carried this whole transition — revert
+    /// the failed tail, record the swap in the transcript, persist, then install
+    /// the new provider and its options — and the two install blocks were
+    /// identical line for line (bd-u2qv4). A duplicated persisted-mutation path
+    /// is the worst kind to let drift: a fallback running with the wrong tool
+    /// dialect, thinking clamp or context window is a silent behaviour change
+    /// nobody would attribute to a failover.
+    ///
+    /// The whole transition is built on a private `Session` candidate, so the
+    /// live transcript, provider and options are untouched unless the revert and
+    /// its persistence both succeed. A save that stays indeterminate after one
+    /// idempotent retry is a session-persistence failure, which every surface
+    /// treats as terminal (bd-8188r).
+    ///
+    /// Returns the thinking level actually installed, which callers record for
+    /// their own restoration bookkeeping.
+    pub async fn commit_failover(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        self.commit_failover_swap(cx, request, None).await
+    }
+
+    /// The private `Session` candidate a swap would install, plus the message
+    /// list and thinking level that go with it.
+    ///
+    /// Nothing here touches live state: build it, and only if the whole
+    /// transition succeeds does the caller install it.
+    fn prepare_failover_candidate(
+        inner: &Session,
+        request: &FailoverSwapRequest<'_>,
+    ) -> Result<(Session, Vec<Message>, crate::model::ThinkingLevel)> {
+        let mut candidate = inner.clone();
+        let reverted = candidate.revert_incomplete_response();
+        if request.require_incomplete_tail && !reverted {
+            return Err(Error::session(
+                "failover restoration invariant failed: the completed error response had no incomplete assistant tail",
+            ));
+        }
+        let restored_messages = candidate.to_messages_for_current_path();
+
+        let entry = request.entry;
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let target_thinking = entry.clamp_thinking_level(request.thinking_level_to_clamp);
+        let target_thinking_text = target_thinking.to_string();
+        let thinking_changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            != Some(target_thinking_text.as_str());
+        candidate.set_model_header(
+            Some(to_provider.clone()),
+            Some(to_model.clone()),
+            Some(target_thinking_text.clone()),
+        );
+        candidate.append_custom_entry(
+            "failover".to_string(),
+            Some(serde_json::json!({
+                "from": format!("{}/{}", request.from_provider, request.from_model),
+                "to": format!("{to_provider}/{to_model}"),
+                "class": format!("{:?}", request.class).to_ascii_lowercase(),
+                "attempt": request.chain_position,
+            })),
+        );
+        candidate.append_model_change_with_role(
+            to_provider,
+            to_model,
+            Some("failover".to_string()),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(target_thinking_text);
+        }
+        Ok((candidate, restored_messages, target_thinking))
+    }
+
+    /// [`Self::commit_failover`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what print mode and any embedder call.
+    pub(crate) async fn commit_failover_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &FailoverSwapRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<crate::model::ThinkingLevel> {
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| Error::session(format!("failover session lock failed: {err}")))?;
+        let (mut candidate, restored_messages, target_thinking) =
+            Self::prepare_failover_candidate(&inner, request)?;
+        let entry = request.entry;
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+
+        let save_enabled = self.save_enabled();
+        self.invalidate_background_compaction();
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "failover Session persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            let reason = format!(
+                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+
+        // No fallible operation remains after installing the candidate.
+        *inner = candidate;
+        self.agent.replace_messages(restored_messages);
+        self.agent.set_provider(Arc::clone(&request.provider));
+        self.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        self.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        self.agent.set_model_accepts_images(
+            entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
+        {
+            let stream_options = self.agent.stream_options_mut();
+            stream_options.api_key.clone_from(&request.api_key);
+            stream_options.headers.clone_from(&entry.headers);
+            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.thinking_level = Some(target_thinking);
+        }
+        self.set_compaction_context_window(context_window_tokens_for_entry(entry));
+        self.refresh_extension_completion_host_state();
+        if let Some(region) = &self.extensions {
+            region
+                .manager()
+                .set_current_model(Some(to_provider), Some(to_model));
+        }
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        Ok(target_thinking)
     }
 
     async fn current_compaction_origin(&self) -> Result<CompactionOrigin> {

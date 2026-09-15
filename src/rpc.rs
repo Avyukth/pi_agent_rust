@@ -238,12 +238,11 @@ fn command_can_queue_while_rpc_agent_streams(command_type: &str) -> bool {
     matches!(command_type, "prompt" | "steer" | "follow_up")
 }
 
+/// RPC's entry to the shared reader. This copy used to fall back silently; the
+/// shared one warns, which is worth having wherever a model reports no window
+/// (bd-u2qv4).
 fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
-    if entry.model.context_window == 0 {
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        entry.model.context_window
-    }
+    crate::agent::context_window_tokens_for_entry(entry)
 }
 
 fn command_resumes_rpc_agent(
@@ -6204,95 +6203,31 @@ async fn try_failover_to_next_chain_entry(
         let to_provider = entry.model.provider.clone();
         let to_model = entry.model.id.clone();
 
-        // Mutate and persist a private Session candidate. The live transcript,
-        // provider/options, shared cooldown, and event stream remain untouched
-        // if restoration, the inner lock, or persistence fails.
-        let session_store = Arc::clone(&guard.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("failover inner session lock failed: {err}")))?;
-        let mut candidate = inner.clone();
-        let reverted = candidate.revert_incomplete_response();
-        if require_incomplete_tail && !reverted {
-            return Err(Error::session(
-                "failover restoration invariant failed: the completed error response had no incomplete assistant tail",
-            ));
-        }
-        let restored_messages = candidate.to_messages_for_current_path();
-        let target_thinking = entry.clamp_thinking_level(primary_model.requested_thinking_level);
-        let target_thinking_text = target_thinking.to_string();
-        let thinking_changed = candidate
-            .effective_thinking_level_for_current_path()
-            .as_deref()
-            != Some(target_thinking_text.as_str());
-        candidate.set_model_header(
-            Some(to_provider.clone()),
-            Some(to_model.clone()),
-            Some(target_thinking_text.clone()),
-        );
-        candidate.append_custom_entry(
-            "failover".to_string(),
-            Some(serde_json::json!({
-                "from": format!("{current_provider}/{current_model}"),
-                "to": format!("{to_provider}/{to_model}"),
-                "class": format!("{class:?}").to_ascii_lowercase(),
-                "attempt": position,
-            })),
-        );
-        candidate.append_model_change_with_role(
-            to_provider.clone(),
-            to_model.clone(),
-            Some("failover".to_string()),
-        );
-        if thinking_changed {
-            candidate.append_thinking_level_change(target_thinking_text);
-        }
-        let save_enabled = guard.save_enabled();
-        guard.invalidate_background_compaction();
-        let _provider_transition = state
-            .provider_admission
-            .begin_transition(
-                "failover Session persistence was interrupted before live installation completed"
-                    .to_string(),
-                cx,
-            )
-            .await?;
-        if save_enabled
-            && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
-
-        // No fallible operation remains in the transition after installation.
-        *inner = candidate;
-        guard.agent.replace_messages(restored_messages);
-        guard.agent.set_provider(provider_impl);
-        guard.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
-        guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        // The whole persisted transition — revert, transcript record, save,
+        // install — is AgentSession::commit_failover_swap, shared with print
+        // mode (bd-u2qv4). The live transcript, provider/options, shared
+        // cooldown and event stream remain untouched if any of it fails; the
+        // admission gate passed in is what keeps provider re-entry quarantined
+        // if the process dies between persistence and installation.
+        let request = crate::agent::FailoverSwapRequest {
+            entry: &entry,
+            api_key: key.clone(),
+            provider: provider_impl,
+            from_provider: &current_provider,
+            from_model: &current_model,
+            class,
+            chain_position: position,
+            // The level originally requested, before any swap: clamping against
+            // the LIVE level instead would ratchet it down through whatever the
+            // previous fallback allowed. Print mode does the latter; see
+            // FailoverSwapRequest::thinking_level_to_clamp.
+            thinking_level_to_clamp: primary_model.requested_thinking_level,
+            require_incomplete_tail,
+        };
+        let admission = state.provider_admission.clone();
         guard
-            .agent
-            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-        {
-            let stream_options = guard.agent.stream_options_mut();
-            stream_options.api_key.clone_from(&key);
-            stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
-            stream_options.thinking_level = Some(target_thinking);
-        }
-        guard.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-        guard.refresh_extension_completion_host_state();
-        if let Some(region) = &guard.extensions {
-            region
-                .manager()
-                .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
-        }
+            .commit_failover_swap(cx, &request, Some(&admission))
+            .await?;
 
         state.failover_primary = Some(primary_model.clone());
         state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
@@ -6313,7 +6248,6 @@ async fn try_failover_to_next_chain_entry(
             attempt: swaps_so_far.saturating_add(1),
             chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
         });
-        drop(inner);
         drop(state);
         drop(guard);
         if let Some(attempt) = retry_attempt_to_end {
