@@ -1006,6 +1006,31 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_is_read_from_config_and_absent_when_retry_is_disabled() {
+        let settings = |enabled: bool| crate::config::Config {
+            retry: Some(crate::config::RetrySettings {
+                enabled: Some(enabled),
+                max_retries: Some(4),
+                base_delay_ms: Some(250),
+                max_delay_ms: Some(9_000),
+                max_failovers_per_turn: Some(2),
+                ..crate::config::RetrySettings::default()
+            }),
+            ..crate::config::Config::default()
+        };
+
+        let policy = RetryPolicy::from_config(&settings(true)).expect("retry enabled");
+        assert_eq!(policy.max_retries, 4);
+        assert_eq!(policy.base_delay_ms, 250);
+        assert_eq!(policy.max_delay_ms, 9_000);
+        assert_eq!(policy.max_failovers_per_turn, 2);
+
+        // "off" must mean off. A surface that substituted a default here would
+        // re-enter the provider on behalf of a user who said not to.
+        assert!(RetryPolicy::from_config(&settings(false)).is_none());
+    }
+
+    #[test]
     fn a_clean_turn_finishes_successfully() {
         let mut message = errored_message(None, 0);
         message.stop_reason = crate::model::StopReason::Stop;

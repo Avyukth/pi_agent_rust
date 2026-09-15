@@ -2536,6 +2536,17 @@ async fn run(
                 // the classic stack uses so `ask`/`write` modes gate here
                 // too, prompting through the ask-card bridge.
                 approval_state: Some(approval_state.clone()),
+                // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
+                // hard error on this stack while the same request in print
+                // mode or over RPC retried and completed, and this is the
+                // stack most people run. `from_config` returns None when the
+                // user has set `retry.enabled = false`, so turning it off
+                // still means nobody re-enters the provider on their behalf.
+                // The retry events it emits already render here as system
+                // notes. A configured fallback CHAIN is still inert: walking
+                // it needs the provider swap, which has not moved out of this
+                // binary yet.
+                retry: pi::failover::RetryPolicy::from_config(&config),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
