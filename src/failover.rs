@@ -308,6 +308,100 @@ pub fn provider_is_disabled(
     in_list(disabled)
 }
 
+/// Cursor over a fallback chain that yields only the specs worth considering.
+///
+/// The live model and any spec already walked earlier in the same chain are
+/// skipped: installing either emits a phantom `FailoverStart`/`FailoverEnd`
+/// pair and spends a unit of `max_failovers_per_turn` on a no-op (bd-oqo03.1).
+/// The walk is bounded by the chain, never by that per-turn cap — bounding the
+/// cursor by the cap let malformed, uncredentialed, unconstructible, current
+/// or duplicate entries consume the budget and hide a later valid entry.
+///
+/// Print mode and the RPC server each had their own copy of exactly this
+/// cursor arithmetic, and both off-by-one bugs in the family (bd-oqo03,
+/// bd-oqo03.1) had to be found and fixed twice. One definition now, so the
+/// interactive surfaces can walk a chain without inheriting a third copy
+/// (bd-u2qv4).
+///
+/// [`Self::position`] is the resume point for the NEXT turn: one past the
+/// entry last yielded. Callers persist it only once a swap actually commits.
+pub struct FailoverWalk<'a> {
+    entries: &'a [String],
+    position: usize,
+    current_provider: &'a str,
+    current_model: &'a str,
+}
+
+impl<'a> FailoverWalk<'a> {
+    /// Start (or resume, via `position`) a walk of `chain` while
+    /// `current_provider`/`current_model` are live.
+    #[must_use]
+    pub const fn new(
+        chain: &'a FailoverChain,
+        position: usize,
+        current_provider: &'a str,
+        current_model: &'a str,
+    ) -> Self {
+        Self {
+            entries: chain.entries.as_slice(),
+            position,
+            current_provider,
+            current_model,
+        }
+    }
+
+    /// The next candidate spec and the chain index it occupies, advancing past
+    /// it. The index is captured BEFORE the advance: reporting the post-advance
+    /// cursor as the chain index is off by one (bd-oqo03).
+    pub fn next_spec(&mut self) -> Option<(usize, &'a str)> {
+        while self.position < self.entries.len() {
+            let index = self.position;
+            let spec = self.entries[index].as_str();
+            self.position += 1;
+            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+                |(provider, model_id)| {
+                    crate::provider_metadata::provider_ids_match(self.current_provider, provider)
+                        && self.current_model.eq_ignore_ascii_case(model_id)
+                },
+            );
+            let is_duplicate = self.entries[..index]
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(spec));
+            if is_current || is_duplicate {
+                continue;
+            }
+            return Some((index, spec));
+        }
+        None
+    }
+
+    /// Where the next turn resumes: one past the entry last yielded.
+    #[must_use]
+    pub const fn position(&self) -> usize {
+        self.position
+    }
+}
+
+/// Resolve one `provider/model` chain spec against the configured model list,
+/// falling back to an ad-hoc entry for a provider/model pair that is well
+/// formed but not configured. `None` means the spec names nothing usable and
+/// the walk should move on.
+#[must_use]
+pub fn resolve_chain_spec(
+    spec: &str,
+    available_models: &[crate::models::ModelEntry],
+) -> Option<crate::models::ModelEntry> {
+    let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
+    available_models
+        .iter()
+        .find(|entry| {
+            crate::provider_metadata::provider_ids_match(&entry.model.provider, provider)
+                && entry.model.id.eq_ignore_ascii_case(model_id)
+        })
+        .cloned()
+        .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+}
+
 // ---------------------------------------------------------------------------
 // Shared retry policy (bd-u2qv4)
 //
@@ -564,6 +658,76 @@ mod tests {
         };
         assert!(provider_is_disabled(&disabled, Some(&scope), "openai"));
         assert!(provider_is_disabled(&disabled, Some(&scope), "anthropic"));
+    }
+
+    // -- shared chain walk (bd-u2qv4) --------------------------------------
+
+    fn chain(specs: &[&str]) -> FailoverChain {
+        FailoverChain {
+            entries: specs.iter().map(|spec| (*spec).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_walk_skips_the_live_model_and_earlier_duplicates() {
+        let chain = chain(&[
+            "anthropic/claude-x", // the live model: a no-op swap
+            "openai/gpt-y",
+            "OpenAI/GPT-Y", // duplicate of the previous, case-insensitively
+            "google/gemini-z",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
+        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
+        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.position(), 4);
+    }
+
+    #[test]
+    fn the_yielded_index_is_the_entry_not_the_resume_point() {
+        // bd-oqo03: reporting the post-advance cursor as the chain index is
+        // off by one, and that index is what reaches the failover event.
+        let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
+        let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
+        let (index, spec) = walk.next_spec().expect("first candidate");
+        assert_eq!((index, spec), (0, "openai/gpt-y"));
+        assert_eq!(
+            walk.position(),
+            1,
+            "the resume point is one past the entry just yielded"
+        );
+    }
+
+    #[test]
+    fn a_resumed_walk_continues_past_the_persisted_position() {
+        // bd-oqo03.1: `position` is durable across turns, so a per-turn cap of
+        // one must still reach entry two on the next turn.
+        let chain = chain(&["openai/gpt-y", "google/gemini-z"]);
+        let mut walk = FailoverWalk::new(&chain, 1, "anthropic", "claude-x");
+        assert_eq!(walk.next_spec(), Some((1, "google/gemini-z")));
+        assert_eq!(walk.next_spec(), None);
+    }
+
+    #[test]
+    fn a_malformed_spec_is_yielded_for_the_caller_to_reject() {
+        // Resolution, credentials and provider construction stay with the
+        // caller; the walk only decides what is worth looking at.
+        let chain = chain(&["not-a-spec", "openai/gpt-y"]);
+        let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
+        assert_eq!(walk.next_spec(), Some((0, "not-a-spec")));
+        assert!(resolve_chain_spec("not-a-spec", &[]).is_none());
+        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+    }
+
+    #[test]
+    fn an_unconfigured_but_well_formed_spec_resolves_ad_hoc() {
+        let resolved = resolve_chain_spec("openai/gpt-y", &[]);
+        let entry = resolved.expect("a well-formed spec resolves even when unconfigured");
+        assert!(crate::provider_metadata::provider_ids_match(
+            &entry.model.provider,
+            "openai"
+        ));
+        assert!(entry.model.id.eq_ignore_ascii_case("gpt-y"));
     }
 
     // -- shared retry policy (bd-u2qv4) ------------------------------------
