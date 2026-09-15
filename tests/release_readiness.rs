@@ -4300,6 +4300,24 @@ fn validate_performance_context_paths(
     Ok(())
 }
 
+/// Issue-tracker database state: never product source, never packaged, and
+/// incapable of affecting a measurement. `collect_performance` runs this
+/// against the live repository, where the beads daemon exports `.beads/*` on
+/// every issue write, so without the exemption the readiness scorer reports
+/// the performance dimension unbindable whenever anyone comments on a bead.
+/// The same predicate governs the follow-up commit check in
+/// `tests/release_evidence_gate.rs`, and
+/// `scripts/check_clean_release_commit.py` classifies these paths the same way.
+fn performance_tracker_state_path(path: &str) -> bool {
+    path.starts_with(".beads/")
+}
+
+/// Extract the path from one `git status --porcelain=v1 -z --no-renames`
+/// record. Every record is `XY<space>PATH`, so the path begins at byte 3.
+fn performance_status_entry_path(entry: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(entry.get(3..).unwrap_or_default())
+}
+
 fn validate_performance_repository_clean(
     context: &PerformanceGitContext,
     injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
@@ -4316,13 +4334,16 @@ fn validate_performance_repository_clean(
         ],
         injected_git_env,
     )?;
-    if !status.is_empty() {
-        let entries = status
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .take(3)
-            .map(|entry| String::from_utf8_lossy(entry).into_owned())
-            .collect::<Vec<_>>();
+    let entries = status
+        .split(|byte| *byte == 0)
+        .filter(|entry| {
+            !entry.is_empty()
+                && !performance_tracker_state_path(&performance_status_entry_path(entry))
+        })
+        .take(3)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect::<Vec<_>>();
+    if !entries.is_empty() {
         return Err(format!(
             "budget summary repository is not clean: {entries:?}"
         ));
@@ -4544,6 +4565,10 @@ fn validate_performance_followup_paths(
             || path.starts_with("tests/e2e_results/")
             || path.starts_with("tests/ext_conformance/reports/")
             || path.starts_with("tests/certification/")
+            // The auto-commit sweeper commits `.beads/` continuously, so
+            // without this the capture is invalidated within minutes of every
+            // regeneration; see performance_tracker_state_path.
+            || performance_tracker_state_path(&path)
             || path.starts_with("docs/evidence/");
         if !evidence_only {
             return Err(format!(
@@ -5546,6 +5571,53 @@ fn performance_source_binding_rejects_unstaged_staged_and_untracked_dirt() {
         .expect("write untracked performance fixture file");
     let (signal, detail) =
         validate_performance_budget_summary(untracked.root.path(), &untracked.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+}
+
+/// `collect_performance` scores the live repository, so the performance
+/// dimension must survive the tracker database being written underneath it.
+/// Before this, any bead comment during a readiness run scored the dimension
+/// Fail with `budget summary repository is not clean: [" M
+/// .beads/issues.jsonl"]` — a provenance guard reporting on issue tracking.
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_tolerates_live_tracker_writes() {
+    let fixture = performance_source_repository_fixture();
+    let root = fixture.root.path();
+    std::fs::create_dir_all(root.join(".beads")).expect("create tracker directory");
+    std::fs::write(root.join(".beads/issues.jsonl"), "{\"id\":\"seed\"}\n")
+        .expect("seed tracker export");
+    run_performance_fixture_git(root, &["add", "--", ".beads"]);
+    commit_performance_fixture(root, "record tracker export");
+    let (signal, detail) = validate_performance_budget_summary(root, &fixture.summary);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+
+    std::fs::write(
+        root.join(".beads/issues.jsonl"),
+        "{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )
+    .expect("rewrite tracker export");
+    std::fs::write(root.join(".beads/beads.db-wal-cert"), "cert\n")
+        .expect("write untracked tracker artifact");
+    let (signal, detail) = validate_performance_budget_summary(root, &fixture.summary);
+    assert_eq!(
+        signal,
+        Signal::Pass,
+        "live tracker writes must not fail the performance dimension: {detail}"
+    );
+
+    run_performance_fixture_git(root, &["add", "--", ".beads"]);
+    let (signal, detail) = validate_performance_budget_summary(root, &fixture.summary);
+    assert_eq!(
+        signal,
+        Signal::Pass,
+        "a staged tracker export must not fail it either: {detail}"
+    );
+
+    // The exemption is exactly the tracker prefix: real dirt still fails.
+    std::fs::write(root.join("source.txt"), "real drift\n").expect("drift the fixture source");
+    let (signal, detail) = validate_performance_budget_summary(root, &fixture.summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
     assert!(detail.contains("repository is not clean"), "{detail}");
 }

@@ -3688,6 +3688,24 @@ fn performance_git_context(root: &Path) -> Result<PerformanceGitContext, String>
     Ok(context)
 }
 
+/// Issue-tracker database state: never product source, never packaged, and
+/// incapable of affecting a measurement. The beads daemon and the auto-commit
+/// sweeper rewrite these paths continuously by design, so a binding that
+/// treats them as release inputs can only be evaluated in a frozen worktree —
+/// which this project never has. Both halves of the binding consult this one
+/// predicate so they can never disagree about whether a tracker write is a
+/// source change; `scripts/check_clean_release_commit.py` classifies `.beads/*`
+/// the same way.
+fn performance_tracker_state_path(path: &str) -> bool {
+    path.starts_with(".beads/")
+}
+
+/// Extract the path from one `git status --porcelain=v1 -z --no-renames`
+/// record. Every record is `XY<space>PATH`, so the path begins at byte 3.
+fn performance_status_entry_path(entry: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(entry.get(3..).unwrap_or_default())
+}
+
 fn validate_performance_checkout_clean(context: &PerformanceGitContext) -> Result<(), String> {
     let status = perf_git_output_at(
         context,
@@ -3700,13 +3718,16 @@ fn validate_performance_checkout_clean(context: &PerformanceGitContext) -> Resul
             "--no-renames",
         ],
     )?;
-    if !status.is_empty() {
-        let entries: Vec<_> = status
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .take(3)
-            .map(|entry| String::from_utf8_lossy(entry).into_owned())
-            .collect();
+    let entries: Vec<_> = status
+        .split(|byte| *byte == 0)
+        .filter(|entry| {
+            !entry.is_empty()
+                && !performance_tracker_state_path(&performance_status_entry_path(entry))
+        })
+        .take(3)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect();
+    if !entries.is_empty() {
         return Err(format!(
             "performance summary repository is not clean: {entries:?}"
         ));
@@ -3844,14 +3865,9 @@ fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
         || path.starts_with("tests/e2e_results/")
         || path.starts_with("tests/ext_conformance/reports/")
         || path.starts_with("tests/certification/")
-        // Issue-tracker state, not product source and never packaged. The
-        // auto-commit sweeper writes `.beads/` continuously, so without this
-        // the binding is invalidated within minutes of every regeneration and
-        // the perf gate can never stay green — observed directly:
-        // "non-evidence or packaged path changed after source_commit:
-        // .beads/beads.db-wal-cert". scripts/check_clean_release_commit.py
-        // already classifies `.beads/*` this way; the two now agree.
-        || path.starts_with(".beads/")
+        // Observed directly: "non-evidence or packaged path changed after
+        // source_commit: .beads/beads.db-wal-cert" on an otherwise clean tree.
+        || performance_tracker_state_path(path)
         || (path.starts_with("docs/evidence/") && !packaged)
 }
 
@@ -7396,6 +7412,75 @@ fn performance_source_binding_rejects_dirty_staged_and_untracked_changes() {
         untracked_error.contains("repository is not clean"),
         "{untracked_error}"
     );
+}
+
+/// The binding must survive the tracker database being written underneath it,
+/// because on this project it always is: the beads daemon exports `.beads/*` on
+/// every issue write and the auto-commit sweeper commits the result. Before
+/// this, the whole-worktree cleanliness check failed on `" M
+/// .beads/issues.jsonl"`, so the gate could only be evaluated in a frozen
+/// worktree and in practice was never evaluated at all.
+#[test]
+fn performance_source_binding_tolerates_live_tracker_writes_in_every_git_state() {
+    let (dirty_root, dirty_source) = retained_performance_binding_fixture(false);
+    std::fs::create_dir_all(dirty_root.join(".beads")).expect("create fixture tracker directory");
+    std::fs::write(
+        dirty_root.join(".beads/issues.jsonl"),
+        b"{\"id\":\"seed\"}\n",
+    )
+    .expect("seed tracked tracker export");
+    commit_performance_binding_fixture(&dirty_root, "record tracker export");
+
+    // Untracked: a fresh journal or WAL certificate the daemon has not exported yet.
+    std::fs::write(dirty_root.join(".beads/beads.db-wal-cert"), b"cert\n")
+        .expect("write untracked tracker artifact");
+    // Modified: an existing export rewritten by an issue comment.
+    std::fs::write(
+        dirty_root.join(".beads/issues.jsonl"),
+        b"{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )
+    .expect("rewrite tracked tracker export");
+    validate_performance_source_binding_at(
+        &dirty_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &dirty_source,
+    )
+    .expect("live tracker writes must not invalidate the binding");
+
+    // Staged: the sweeper caught the export mid-run.
+    fixture_git_output(&dirty_root, &["add", "--", ".beads"]);
+    validate_performance_source_binding_at(
+        &dirty_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &dirty_source,
+    )
+    .expect("a staged tracker export must not invalidate the binding either");
+}
+
+/// The cleanliness exemption is deliberately narrower than the follow-up
+/// commit exemption: an evidence path may legitimately gain new COMMITTED
+/// files after `source_commit`, but an evidence file left DIRTY on disk is the
+/// tampering this check exists to catch. Pins that the two exemptions are not
+/// the same set.
+#[test]
+fn performance_source_binding_still_rejects_a_dirty_evidence_artifact() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    let sibling = "tests/perf/reports/followup.json";
+    std::fs::write(root.join(sibling), b"{\"evidence\":true}\n").expect("write evidence sibling");
+    commit_performance_binding_fixture(&root, "add evidence sibling");
+    validate_performance_source_binding_at(&root, PERFORMANCE_BUDGET_SUMMARY_PATH, &source_commit)
+        .expect("a committed evidence follow-up is admissible");
+
+    std::fs::write(root.join(sibling), b"{\"evidence\":\"tampered\"}\n")
+        .expect("dirty the evidence sibling");
+    let error = validate_performance_source_binding_at(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+    )
+    .expect_err("a dirty evidence artifact must invalidate the binding");
+    assert!(error.contains("repository is not clean"), "{error}");
+    assert!(error.contains(sibling), "{error}");
 }
 
 #[test]

@@ -1252,6 +1252,20 @@ fn git_command_succeeds(root: &Path, args: &[&str]) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Issue-tracker database state is never product source, never packaged, and
+/// cannot affect a measurement — but the beads daemon exports `.beads/*` on
+/// every issue write and the auto-commit sweeper commits the result, so a
+/// whole-worktree cleanliness proxy reports the repository dirty essentially
+/// all the time. That silently cost this project its ability to produce
+/// claimable performance evidence: `generate_budget_report` binds
+/// `source_commit` to whatever `clean_source_commit` returns, so one bead
+/// comment landing mid-generation yields `source_commit: null`, a
+/// non-authoritative lineage, and an artifact that is blocked no matter how
+/// good the numbers are. Excluding the tracker paths is what makes an honest
+/// benchmark run bindable. Matched against Git rather than by string prefix so
+/// path quoting cannot defeat it.
+const TRACKER_STATE_EXCLUDE_PATHSPEC: &str = ":(exclude,top).beads/";
+
 fn clean_source_commit(root: &Path) -> Option<String> {
     let index_flags = Command::new("git")
         .args(["ls-files", "-v", "-z", "--"])
@@ -1263,19 +1277,41 @@ fn clean_source_commit(root: &Path) -> Option<String> {
     }
 
     let status = Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ])
         .current_dir(root)
         .output()
         .ok()?;
     if !status.status.success() || !status.stdout.is_empty() {
         return None;
     }
-    if !git_command_succeeds(root, &["diff", "--quiet", "--no-ext-diff", "HEAD", "--"])
-        || !git_command_succeeds(
-            root,
-            &["diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--"],
-        )
-    {
+    if !git_command_succeeds(
+        root,
+        &[
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ],
+    ) || !git_command_succeeds(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            TRACKER_STATE_EXCLUDE_PATHSPEC,
+        ],
+    ) {
         return None;
     }
     let mut head_commit = String::from("HEAD^");
@@ -5715,6 +5751,77 @@ fn clean_source_commit_rejects_hidden_index_flags_and_untracked_files() {
     std::fs::create_dir_all(nested.parent().expect("nested parent"))
         .expect("create untracked directory");
     std::fs::write(nested, "untracked\n").expect("write untracked file");
+    assert_eq!(clean_source_commit(repo.path()), None);
+}
+
+/// A benchmark run must stay bindable while the tracker database is written
+/// underneath it, which on this project it continuously is. Without this,
+/// `generate_budget_report` records `source_commit: null` whenever a bead is
+/// written mid-run, and the resulting artifact is unclaimable regardless of
+/// what it measured.
+#[test]
+fn clean_source_commit_tolerates_live_tracker_writes_but_not_source_drift() {
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let repo = tempfile::tempdir().expect("temporary git repository");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(repo.path().join(".beads")).expect("create tracker directory");
+    std::fs::write(
+        repo.path().join(".beads/issues.jsonl"),
+        "{\"id\":\"seed\"}\n",
+    )
+    .expect("seed tracker export");
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked file");
+    git(repo.path(), &["add", "--all"]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Pi Test",
+            "-c",
+            "user.email=pi-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    );
+    let bound = clean_source_commit(repo.path()).expect("clean tree binds");
+
+    // Modified export, untracked journal, and a staged export all stand in for
+    // the ways the daemon and the auto-commit sweeper touch `.beads/` mid-run.
+    std::fs::write(
+        repo.path().join(".beads/issues.jsonl"),
+        "{\"id\":\"seed\"}\n{\"id\":\"written-mid-run\"}\n",
+    )
+    .expect("rewrite tracker export");
+    std::fs::write(repo.path().join(".beads/beads.db-wal-cert"), "cert\n")
+        .expect("write untracked tracker artifact");
+    assert_eq!(
+        clean_source_commit(repo.path()).as_deref(),
+        Some(bound.as_str()),
+        "live tracker writes must not un-bind the source commit"
+    );
+    git(repo.path(), &["add", "--", ".beads"]);
+    assert_eq!(
+        clean_source_commit(repo.path()).as_deref(),
+        Some(bound.as_str()),
+        "a staged tracker export must not un-bind the source commit either"
+    );
+
+    // The exemption is exactly the tracker prefix: real drift still un-binds.
+    std::fs::write(repo.path().join("tracked.txt"), "drifted\n").expect("drift the source");
     assert_eq!(clean_source_commit(repo.path()), None);
 }
 
