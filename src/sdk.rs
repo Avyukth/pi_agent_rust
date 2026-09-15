@@ -2687,6 +2687,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    /// Drives `future` to completion on a `current_thread` runtime.
+    ///
+    /// Note that this polls on the CALLING thread, which is the libtest thread,
+    /// so the frames land on whatever stack libtest gave it. These session
+    /// builds need far more than the 2 MiB default in a debug build — see
+    /// `RUST_MIN_STACK` in `.cargo/config.toml`. The builder-level
+    /// `thread_stack_size` that rescued `sdk_unit` and `sdk_integration`
+    /// (bd-79qxb) cannot help here, and neither can moving the work to a
+    /// reserved thread: several of these futures hold an
+    /// `asupersync::sync::MutexGuard` across an await and so are not `Send`.
     fn run_async<F>(future: F) -> F::Output
     where
         F: std::future::Future,
