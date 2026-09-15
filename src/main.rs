@@ -8976,17 +8976,16 @@ enum PromptInput {
     },
 }
 
-/// Compute retry delay with exponential backoff.
-///
-/// Print mode and the RPC server had byte-identical private copies of this
-/// until bd-u2qv4; both now call the one definition in `pi::failover` so the
-/// interactive surfaces can adopt the same policy rather than become a third.
-fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    pi::failover::retry_delay_ms(
-        config.retry_base_delay_ms(),
-        config.retry_max_delay_ms(),
-        attempt,
-    )
+/// Print mode's retry limits, read out of config in exactly one place so the
+/// turn loop and its tests cannot disagree about which keys feed the shared
+/// policy in `pi::failover` (bd-u2qv4).
+fn print_mode_retry_policy(config: &Config, max_retries: u32) -> pi::failover::RetryPolicy {
+    pi::failover::RetryPolicy {
+        max_retries,
+        max_failovers_per_turn: config.max_failovers_per_turn(),
+        base_delay_ms: config.retry_base_delay_ms(),
+        max_delay_ms: config.retry_max_delay_ms(),
+    }
 }
 
 async fn sleep_with_current_timer(duration: Duration) {
@@ -9111,31 +9110,6 @@ fn emit_print_failover_end(
         model: provider.model_id().to_string(),
         restored_primary: false,
     });
-}
-
-/// Terminal marker check (bd-8188r): a session-persistence failure means
-/// provider/tool side effects may already have happened while the durable
-/// record is missing or stale. Re-entering the provider (retry, credential
-/// rotation, model failover) could repeat those effects, so callers must
-/// treat this as final regardless of what the wrapped prose looks like.
-fn message_marks_session_persistence(error_text: &str) -> bool {
-    pi::failover::marks_session_persistence(error_text)
-}
-
-/// Check whether a prompt result is a retryable error.
-///
-/// Session-persistence failures are never retryable, even when their wrapped
-/// message contains transient-looking phrases ("connection reset", "500"):
-/// the flattening loses the typed boundary, so the stable prefix is checked
-/// first.
-///
-/// The `None` context window preserves print mode's behaviour exactly through
-/// the bd-u2qv4 extraction; RPC supplies the real window here, so a context
-/// overflow is still refused there and retried here. That drift is real and is
-/// tracked separately — fixing it means resolving the active model's window on
-/// this path, which is a behaviour change and needs its own test.
-fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
-    pi::failover::error_result_is_retryable(msg, None)
 }
 
 async fn restore_print_retry_tail(
@@ -9635,8 +9609,47 @@ where
     let mut current_result = first_result;
 
     loop {
+        // One policy, shared with RPC and available to the interactive stacks
+        // (bd-u2qv4). It decides; everything below is this surface's I/O for
+        // the decision — JSON events, the backoff sleep, tail restoration and
+        // the chain swap.
+        //
+        // The context window is None here, which is print mode's long-standing
+        // behaviour and is preserved deliberately: RPC supplies the real window
+        // and so refuses a SILENT context overflow that print retries to budget
+        // exhaustion. Resolving the window on this path is a behaviour change
+        // and needs its own test.
+        let decision = {
+            let progress = pi::failover::TurnProgress {
+                retry_count,
+                failovers_this_turn,
+                stream_can_retry: snapshot_print_text_stream_state(text_stream_state)
+                    .can_retry(is_json),
+            };
+            let policy = print_mode_retry_policy(config, max_retries);
+            match &current_result {
+                Ok(msg) => pi::failover::decide(
+                    pi::failover::TurnOutcome::Completed(msg),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+                Err(err) => pi::failover::decide(
+                    pi::failover::TurnOutcome::Failed(err),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+            }
+        };
+
         match current_result {
-            Ok(msg) if matches!(msg.stop_reason, StopReason::Aborted) => {
+            Ok(msg)
+                if decision
+                    == pi::failover::TurnDecision::Terminal(
+                        pi::failover::TerminalReason::Aborted,
+                    ) =>
+            {
                 if retry_count > 0 && is_json {
                     emit_json_event(&AgentEvent::AutoRetryEnd {
                         success: false,
@@ -9647,18 +9660,16 @@ where
                 emit_print_failover_end(is_json, failed_over, session, false);
                 return Ok(msg);
             }
-            Ok(msg)
-                if is_retryable_prompt_result(&msg)
-                    && retry_count < max_retries
-                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json) =>
-            {
+            Ok(msg) if matches!(decision, pi::failover::TurnDecision::Retry { .. }) => {
                 let err_msg = msg
                     .error_message
                     .clone()
                     .unwrap_or_else(|| "Request error".to_string());
 
-                retry_count += 1;
-                let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision else {
+                    unreachable!("guarded by the arm pattern")
+                };
+                retry_count = attempt;
                 if is_json {
                     emit_json_event(&AgentEvent::AutoRetryStart {
                         attempt: retry_count,
@@ -9692,10 +9703,10 @@ where
                 if !success {
                     // Terminal guard (bd-8188r): never walk the failover
                     // chain for a session-persistence failure.
-                    if msg
-                        .error_message
-                        .as_deref()
-                        .is_some_and(message_marks_session_persistence)
+                    if decision
+                        == pi::failover::TurnDecision::Terminal(
+                            pi::failover::TerminalReason::SessionPersistence,
+                        )
                     {
                         if retry_count > 0 && is_json {
                             emit_json_event(&AgentEvent::AutoRetryEnd {
@@ -9709,7 +9720,7 @@ where
                     }
                     // Failover (bd-cv653.3.2): a classified transient failure
                     // on the final retry walks the fallback chain.
-                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                    let failover_result = if decision == pi::failover::TurnDecision::FailOver {
                         try_print_failover(
                             session,
                             config,
@@ -9765,7 +9776,11 @@ where
                 // must never reach quota bookkeeping, retry classification,
                 // or failover — the wrapped prose can look transient while
                 // repeating effects would be unsafe.
-                if err.is_session_persistence() {
+                if decision
+                    == pi::failover::TurnDecision::Terminal(
+                        pi::failover::TerminalReason::SessionPersistence,
+                    )
+                {
                     if retry_count > 0 && is_json {
                         emit_json_event(&AgentEvent::AutoRetryEnd {
                             success: false,
@@ -9785,17 +9800,8 @@ where
                         session.agent.stream_options().api_key.clone(),
                     )
                 });
-                // Classify from the TYPED error first (transient io::ErrorKind
-                // via the source chain), then fall back to message-text matching
-                // for prose-only errors (pi_agent_rust#118). The
-                // session-persistence refusal inside is already satisfied by the
-                // terminal guard above; RPC applies the same predicate.
-                if retry_count < max_retries
-                    && pi::failover::call_error_is_retryable(&err)
-                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json)
-                {
-                    retry_count += 1;
-                    let delay_ms = print_mode_retry_delay_ms(config, retry_count);
+                if let pi::failover::TurnDecision::Retry { attempt, delay_ms } = decision {
+                    retry_count = attempt;
                     if is_json {
                         emit_json_event(&AgentEvent::AutoRetryStart {
                             attempt: retry_count,
@@ -9850,7 +9856,7 @@ where
                     // Failover (bd-cv653.3.2): HTTP/transport errors surface on
                     // the Err path, so the chain walk must live here too —
                     // not only on the Ok-with-error-result path.
-                    let failover_result = if failovers_this_turn < config.max_failovers_per_turn() {
+                    let failover_result = if decision == pi::failover::TurnDecision::FailOver {
                         try_print_failover(
                             session,
                             config,
@@ -10079,6 +10085,25 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::json;
     use tempfile::TempDir;
+
+    // Print mode's retry classification moved into `pi::failover` (bd-u2qv4),
+    // where RPC and the interactive stacks can reach it. These three aliases
+    // name what this surface asks for — in particular the `None` context
+    // window, which is print mode's long-standing choice and the one place it
+    // still differs from RPC — so the tests below keep exercising the real
+    // shared functions and the real config plumbing rather than a copy.
+    fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
+        pi::failover::error_result_is_retryable(msg, None)
+    }
+
+    fn message_marks_session_persistence(error_text: &str) -> bool {
+        pi::failover::marks_session_persistence(error_text)
+    }
+
+    fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
+        let policy = print_mode_retry_policy(config, 0);
+        pi::failover::retry_delay_ms(policy.base_delay_ms, policy.max_delay_ms, attempt)
+    }
 
     fn spawn_auth_response_server(status: u16, body: &str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind auth fixture");
