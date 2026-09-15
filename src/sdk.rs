@@ -330,6 +330,23 @@ pub struct SessionOptions {
     pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
 
+    /// Provider retry for turns driven through this session.
+    ///
+    /// `None` — the default — returns a transient provider failure to the
+    /// caller unchanged. That is what every embedder got before this existed,
+    /// and what both interactive stacks still do: a 500 or a 529 mid-session is
+    /// a hard error there, while the identical request in print mode or over
+    /// RPC retries and completes (bd-u2qv4).
+    ///
+    /// `Some(policy)` applies the shared policy in [`crate::failover`] — the
+    /// same one print mode and the RPC server decide with, so the surfaces
+    /// cannot drift. [`crate::failover::RetryPolicy::from_config`] reads it out
+    /// of configuration, and yields `None` when the user has turned retry off.
+    ///
+    /// Retry only. Walking a configured fallback CHAIN needs the provider swap,
+    /// which still lives per-surface, so a chain remains inert here.
+    pub retry: Option<crate::failover::RetryPolicy>,
+
     /// Opt in to MCP discovery for this SDK session.
     ///
     /// The manager is constructed inside [`create_agent_session`] so the
@@ -477,6 +494,7 @@ impl Default for SessionOptions {
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
+            retry: None,
             mcp: None,
             runtime_handle: None,
             on_event: None,
@@ -548,6 +566,10 @@ pub struct AgentSessionHandle {
     workspace: Option<crate::workspace::WorkspaceHandle>,
     /// MCP manager owned by this exact SDK session, when enabled.
     mcp_manager: Option<Arc<crate::mcp::McpManager>>,
+    /// Provider retry policy for turns driven through this handle, from
+    /// [`SessionOptions::retry`]. `None` is the historical behaviour: a
+    /// transient failure goes straight back to the caller.
+    retry: Option<crate::failover::RetryPolicy>,
     /// Runtime this session built for itself because extensions were loaded and
     /// the embedder supplied no [`SessionOptions::runtime_handle`] (bd-8rvry).
     ///
@@ -2673,6 +2695,7 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         ask_tool: ask_tool_handle,
         workspace: options.workspace.clone(),
         mcp_manager,
+        retry: options.retry,
         event_runtime,
     })
 }

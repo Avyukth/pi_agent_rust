@@ -555,6 +555,29 @@ pub struct RetryPolicy {
     pub max_delay_ms: u32,
 }
 
+impl RetryPolicy {
+    /// Read the policy a surface should apply out of configuration.
+    ///
+    /// `None` means the user turned retry off, and a surface that gets `None`
+    /// must hand a failed turn straight back rather than quietly substituting a
+    /// default — the whole point of `retry.enabled = false` is that nobody
+    /// re-enters the provider on the user's behalf.
+    ///
+    /// One reader for the four config keys, so a surface adopting this policy
+    /// cannot accidentally consult a different set (bd-u2qv4). Print mode
+    /// supplies its own `max_retries` from the CLI and so builds its policy
+    /// directly.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Option<Self> {
+        config.retry_enabled().then(|| Self {
+            max_retries: config.retry_max_retries(),
+            max_failovers_per_turn: config.max_failovers_per_turn(),
+            base_delay_ms: config.retry_base_delay_ms(),
+            max_delay_ms: config.retry_max_delay_ms(),
+        })
+    }
+}
+
 /// Where this turn has got to.
 #[derive(Debug, Clone, Copy)]
 pub struct TurnProgress {
