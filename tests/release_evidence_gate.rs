@@ -8437,7 +8437,9 @@ fn performance_source_descendants_are_evidence_only_and_not_packaged() {
         .as_array()
         .expect("package.include must be an array");
     for pattern in include {
-        let pattern = pattern.as_str().expect("package.include entries are strings");
+        let pattern = pattern
+            .as_str()
+            .expect("package.include entries are strings");
         assert!(
             !pattern.trim_start_matches('/').starts_with(".beads"),
             "tracker state must never be packaged while the binding exempts it: {pattern}"

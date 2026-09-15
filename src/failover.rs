@@ -568,7 +568,10 @@ mod tests {
 
     // -- shared retry policy (bd-u2qv4) ------------------------------------
 
-    fn errored_message(error_message: Option<&str>, input_tokens: u64) -> crate::model::AssistantMessage {
+    fn errored_message(
+        error_message: Option<&str>,
+        input_tokens: u64,
+    ) -> crate::model::AssistantMessage {
         crate::model::AssistantMessage {
             content: Vec::new(),
             api: "test".to_string(),

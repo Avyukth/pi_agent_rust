@@ -857,6 +857,64 @@ impl Drop for ClearFlagOnDrop {
     }
 }
 
+/// Guarantees the RPC contract that every accepted prompt is answered by
+/// exactly one terminal `agent_end` frame.
+///
+/// A turn task is dropped at its next `.await` once its ambient region is
+/// cancel-requested, and no code after that point runs — not the retry loop's
+/// own "Retry aborted" break, not the post-loop `auto_retry_end`, not the
+/// terminal `agent_end`. Handing a fresh `AgentCx::for_request()` to the
+/// individual awaits does not rescue this: the region that ends the task is
+/// the task's own, established at spawn, not the one passed to an awaited
+/// call. So a client that cancelled an in-flight turn waited forever for a
+/// frame that could never be sent.
+///
+/// `Drop` is synchronous and so is the channel send, which makes this the one
+/// emission point that cannot itself be cancelled.
+struct TerminalAgentEndOnDrop {
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    cx: AgentCx,
+    armed: bool,
+}
+
+impl TerminalAgentEndOnDrop {
+    fn new(out_tx: std::sync::mpsc::SyncSender<String>, cx: AgentCx) -> Self {
+        Self {
+            out_tx,
+            cx,
+            armed: true,
+        }
+    }
+
+    /// The turn reached one of its own terminal emissions; stand down.
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalAgentEndOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Same condition and same wording as the in-loop checkpoint break, so
+        // a client cannot tell whether the turn observed its cancellation or
+        // was ended by it — only that it ended. Anything else reaching here is
+        // a real defect and says so rather than masquerading as a cancel.
+        let error = if self.cx.is_cancel_requested() {
+            "Retry aborted"
+        } else {
+            "Turn ended without a terminal event"
+        };
+        eprintln!("PROBE_TERMINAL_GUARD_FIRED error={error}");
+        let _ = self.out_tx.send(event(&json!({
+            "type": "agent_end",
+            "messages": [],
+            "error": error,
+        })));
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RpcTurnPhase {
     Idle,
@@ -5281,6 +5339,12 @@ async fn run_prompt_with_retry(
         return;
     }
 
+    // Armed for the whole turn: from here on the client has been told the
+    // prompt was accepted, so it is entitled to exactly one terminal frame no
+    // matter how this task ends. Both normal exits disarm it before sending
+    // their own.
+    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
     let mut failovers_this_turn: u32 = 0;
@@ -5626,7 +5690,13 @@ async fn run_prompt_with_retry(
         let delay = Duration::from_millis(delay_ms as u64);
         let start = std::time::Instant::now();
         let mut retry_cancelled = false;
+        eprintln!("PROBE_SERVER_DELAY_ENTER delay_ms={delay_ms}");
         while start.elapsed() < delay {
+            eprintln!(
+                "PROBE_SERVER_DELAY_TICK cancel_requested={} checkpoint_err={}",
+                cx.is_cancel_requested(),
+                cx.checkpoint().is_err()
+            );
             if retry_abort.load(Ordering::SeqCst) {
                 retry_cancelled = true;
                 break;
@@ -5799,6 +5869,7 @@ async fn run_prompt_with_retry(
         if let Some(hints) = final_error_hints {
             payload["errorHints"] = hints;
         }
+        terminal_guard.disarm();
         let _ = out_tx.send(event(&payload));
         is_streaming.store(false, Ordering::SeqCst);
         return;
@@ -5813,6 +5884,7 @@ async fn run_prompt_with_retry(
             _ => None,
         })
         .unwrap_or_default();
+    terminal_guard.disarm();
     let _ = out_tx.send(event(&json!({
         "type": "agent_end",
         "messages": terminal_messages,
@@ -9686,195 +9758,227 @@ mod retry_tests {
 
     #[test]
     fn rpc_prompt_command_inherits_cancelled_context_from_run() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-        let runtime_handle = runtime.handle();
+        // Watchdog (bd-yqo76 hang policy). This test hangs forever when the
+        // cancelled context does not reach the retry timeline: its internal
+        // `asupersync::time::timeout` guards cannot save it, because timeouts
+        // do not fire on a bare `RuntimeBuilder::current_thread()` runtime —
+        // the same trap documented on
+        // `auto_compaction_rejects_stale_session_snapshot_with_paired_end_event`.
+        // A hang here stalls the whole lib test binary and every test
+        // scheduled after it, which is how this one silently blocked the DSR
+        // test lane. Running the body on its own thread turns that into a
+        // loud failure after 120 s.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let body = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let runtime_handle = runtime.handle();
 
-        runtime.block_on(async move {
-            let provider = Arc::new(AlwaysErrorProvider);
-            let tools = ToolRegistry::new(&[], Path::new("."), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
-            let agent_session = AgentSession::new(
-                agent,
-                Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
-                false,
-                crate::compaction::ResolvedCompactionSettings::default(),
-            );
+            runtime.block_on(async move {
+                let provider = Arc::new(AlwaysErrorProvider);
+                let tools = ToolRegistry::new(&[], Path::new("."), None);
+                let agent = Agent::new(provider, tools, AgentConfig::default());
+                let agent_session = AgentSession::new(
+                    agent,
+                    Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+                    false,
+                    crate::compaction::ResolvedCompactionSettings::default(),
+                );
 
-            let mut config = Config::default();
-            config.retry = Some(crate::config::RetrySettings {
-                enabled: Some(true),
-                max_retries: Some(10),
-                base_delay_ms: Some(1000),
-                max_delay_ms: Some(1000),
-                ..Default::default()
-            });
+                let mut config = Config::default();
+                config.retry = Some(crate::config::RetrySettings {
+                    enabled: Some(true),
+                    max_retries: Some(10),
+                    base_delay_ms: Some(1000),
+                    max_delay_ms: Some(1000),
+                    ..Default::default()
+                });
 
-            let auth_path = tempfile::tempdir()
-                .expect("tempdir")
-                .path()
-                .join("auth.json");
-            let auth = AuthStorage::load(auth_path).expect("auth load");
-            let options = RpcOptions {
-                config,
-                resources: ResourceLoader::empty(false),
-                available_models: Vec::new(),
-                scoped_models: Vec::new(),
-                cli_api_key: None,
-                auth,
-                runtime_handle,
-                ask_tool: None,
-            };
-
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
-
-            let ambient_cx = asupersync::Cx::for_testing();
-            let cancel_cx = ambient_cx.clone();
-            let _current = asupersync::Cx::set_current(Some(ambient_cx));
-
-            let client_out_rx = Arc::clone(&out_rx);
-            let client = async move {
-                let send_cx = asupersync::Cx::for_testing();
-                in_tx
-                    .send(
-                        &send_cx,
-                        r#"{"id":"1","type":"prompt","message":"hello"}"#.to_string(),
-                    )
-                    .await
-                    .expect("send prompt command");
-
-                let ack_wait = async {
-                    loop {
-                        let recv_result = {
-                            let rx = client_out_rx.lock().expect("lock rpc output receiver");
-                            rx.try_recv()
-                        };
-
-                        match recv_result {
-                            Ok(line) => {
-                                let value: Value =
-                                    serde_json::from_str(&line).expect("parse rpc output");
-                                if value.get("type").and_then(Value::as_str) == Some("response") {
-                                    break value;
-                                }
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                tracing::warn!(
-                                    "prompt(cancel-inherit): output channel disconnected"
-                                );
-                                break Value::Object(serde_json::Map::new());
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                asupersync::time::sleep(
-                                    asupersync::time::wall_now(),
-                                    Duration::from_millis(5),
-                                )
-                                .await;
-                            }
-                        }
-                    }
+                let auth_path = tempfile::tempdir()
+                    .expect("tempdir")
+                    .path()
+                    .join("auth.json");
+                let auth = AuthStorage::load(auth_path).expect("auth load");
+                let options = RpcOptions {
+                    config,
+                    resources: ResourceLoader::empty(false),
+                    available_models: Vec::new(),
+                    scoped_models: Vec::new(),
+                    cli_api_key: None,
+                    auth,
+                    runtime_handle,
+                    ask_tool: None,
                 };
-                futures::pin_mut!(ack_wait);
-                let ack = asupersync::time::timeout(
-                    asupersync::time::wall_now(),
-                    Duration::from_secs(5),
-                    ack_wait,
-                )
-                .await;
-                let ack = ack.expect("prompt acknowledgement");
-                assert_eq!(ack["command"], "prompt");
-                assert_eq!(ack["success"], true, "prompt should be accepted: {ack}");
 
-                let retry_abort_wait = async {
-                    let mut timeline = Vec::new();
-                    let mut cancellation_requested = false;
-                    loop {
-                        let recv_result = {
-                            let rx = client_out_rx.lock().expect("lock rpc output receiver");
-                            rx.try_recv()
-                        };
+                let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+                let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+                let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
 
-                        match recv_result {
-                            Ok(line) => {
-                                let value: Value =
-                                    serde_json::from_str(&line).expect("parse rpc output");
-                                let Some(kind) = value.get("type").and_then(Value::as_str) else {
-                                    continue;
-                                };
-                                timeline.push(kind.to_string());
-                                if kind == "auto_retry_start" && !cancellation_requested {
-                                    cancel_cx.set_cancel_requested(true);
-                                    cancellation_requested = true;
-                                }
-                                if kind == "agent_end" {
-                                    let agent_end_error = value
-                                        .get("error")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_string);
-                                    if agent_end_error.as_deref() == Some("Retry aborted") {
-                                        break (timeline, agent_end_error);
+                let ambient_cx = asupersync::Cx::for_testing();
+                let cancel_cx = ambient_cx.clone();
+                let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+                let client_out_rx = Arc::clone(&out_rx);
+                let client = async move {
+                    let send_cx = asupersync::Cx::for_testing();
+                    in_tx
+                        .send(
+                            &send_cx,
+                            r#"{"id":"1","type":"prompt","message":"hello"}"#.to_string(),
+                        )
+                        .await
+                        .expect("send prompt command");
+
+                    let ack_wait = async {
+                        loop {
+                            let recv_result = {
+                                let rx = client_out_rx.lock().expect("lock rpc output receiver");
+                                rx.try_recv()
+                            };
+
+                            match recv_result {
+                                Ok(line) => {
+                                    let value: Value =
+                                        serde_json::from_str(&line).expect("parse rpc output");
+                                    if value.get("type").and_then(Value::as_str) == Some("response")
+                                    {
+                                        break value;
                                     }
                                 }
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                tracing::warn!(
-                                    "prompt(cancel-inherit): output channel disconnected"
-                                );
-                                break (timeline, None);
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                asupersync::time::sleep(
-                                    asupersync::time::wall_now(),
-                                    Duration::from_millis(5),
-                                )
-                                .await;
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    tracing::warn!(
+                                        "prompt(cancel-inherit): output channel disconnected"
+                                    );
+                                    break Value::Object(serde_json::Map::new());
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    asupersync::time::sleep(
+                                        asupersync::time::wall_now(),
+                                        Duration::from_millis(5),
+                                    )
+                                    .await;
+                                }
                             }
                         }
-                    }
+                    };
+                    futures::pin_mut!(ack_wait);
+                    let ack = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        ack_wait,
+                    )
+                    .await;
+                    let ack = ack.expect("prompt acknowledgement");
+                    assert_eq!(ack["command"], "prompt");
+                    assert_eq!(ack["success"], true, "prompt should be accepted: {ack}");
+
+                    let retry_abort_wait = async {
+                        let mut timeline = Vec::new();
+                        let mut cancellation_requested = false;
+                        loop {
+                            let recv_result = {
+                                let rx = client_out_rx.lock().expect("lock rpc output receiver");
+                                rx.try_recv()
+                            };
+
+                            match recv_result {
+                                Ok(line) => {
+                                    let value: Value =
+                                        serde_json::from_str(&line).expect("parse rpc output");
+                                    let Some(kind) = value.get("type").and_then(Value::as_str)
+                                    else {
+                                        continue;
+                                    };
+                                    timeline.push(kind.to_string());
+                                    eprintln!("PROBE_CLIENT_SAW kind={kind}");
+                                    if kind == "auto_retry_start" && !cancellation_requested {
+                                        cancel_cx.set_cancel_requested(true);
+                                        cancellation_requested = true;
+                                        eprintln!("PROBE_CLIENT_CANCELLED");
+                                    }
+                                    if kind == "agent_end" {
+                                        let agent_end_error = value
+                                            .get("error")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string);
+                                        if agent_end_error.as_deref() == Some("Retry aborted") {
+                                            break (timeline, agent_end_error);
+                                        }
+                                    }
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    tracing::warn!(
+                                        "prompt(cancel-inherit): output channel disconnected"
+                                    );
+                                    break (timeline, None);
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    eprintln!("PROBE_CLIENT_POLL_SLEEP");
+                                    asupersync::time::sleep(
+                                        asupersync::time::wall_now(),
+                                        Duration::from_millis(5),
+                                    )
+                                    .await;
+                                    eprintln!("PROBE_CLIENT_POLL_WOKE");
+                                }
+                            }
+                        }
+                    };
+                    futures::pin_mut!(retry_abort_wait);
+                    let (timeline, last_agent_end_error) = asupersync::time::timeout(
+                        asupersync::time::wall_now(),
+                        Duration::from_secs(5),
+                        retry_abort_wait,
+                    )
+                    .await
+                    .expect("cancelled prompt should finish before timeout");
+
+                    let retry_start_idx = timeline
+                        .iter()
+                        .position(|kind| kind == "auto_retry_start")
+                        .expect("missing auto_retry_start");
+                    let retry_end_idx = timeline
+                        .iter()
+                        .position(|kind| kind == "auto_retry_end")
+                        .expect("missing auto_retry_end");
+                    let agent_end_idx = timeline
+                        .iter()
+                        .rposition(|kind| kind == "agent_end")
+                        .expect("missing agent_end");
+                    assert!(
+                        retry_start_idx < retry_end_idx && retry_end_idx < agent_end_idx,
+                        "unexpected retry timeline ordering: {timeline:?}"
+                    );
+                    assert_eq!(
+                        last_agent_end_error.as_deref(),
+                        Some("Retry aborted"),
+                        "expected retry-abort terminal error, timeline: {timeline:?}"
+                    );
+
+                    drop(in_tx);
                 };
-                futures::pin_mut!(retry_abort_wait);
-                let (timeline, last_agent_end_error) = asupersync::time::timeout(
-                    asupersync::time::wall_now(),
-                    Duration::from_secs(5),
-                    retry_abort_wait,
-                )
-                .await
-                .expect("cancelled prompt should finish before timeout");
 
-                let retry_start_idx = timeline
-                    .iter()
-                    .position(|kind| kind == "auto_retry_start")
-                    .expect("missing auto_retry_start");
-                let retry_end_idx = timeline
-                    .iter()
-                    .position(|kind| kind == "auto_retry_end")
-                    .expect("missing auto_retry_end");
-                let agent_end_idx = timeline
-                    .iter()
-                    .rposition(|kind| kind == "agent_end")
-                    .expect("missing agent_end");
-                assert!(
-                    retry_start_idx < retry_end_idx && retry_end_idx < agent_end_idx,
-                    "unexpected retry timeline ordering: {timeline:?}"
-                );
-                assert_eq!(
-                    last_agent_end_error.as_deref(),
-                    Some("Retry aborted"),
-                    "expected retry-abort terminal error, timeline: {timeline:?}"
-                );
-
-                drop(in_tx);
-            };
-
-            let (server_result, ()) =
+                let (server_result, ()) =
                 // Boxed: clippy::large_futures.
                 futures::future::join(Box::pin(run(agent_session, options, in_rx, out_tx)), client)
                     .await;
-            assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+                assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+            });
+            let _ = done_tx.send(());
         });
+        match done_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(()) => body.join().expect("test body thread panicked"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The body panicked before signalling: surface that panic.
+                body.join().expect("test body thread panicked");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "rpc_prompt_command_inherits_cancelled_context_from_run hung for 120s: the \
+                 cancelled context never reached the retry timeline, so the agent_end frame the \
+                 client waits for was never emitted (bd-yqo76 hang policy)"
+            ),
+        }
     }
 
     #[test]
