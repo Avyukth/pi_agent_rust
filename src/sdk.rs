@@ -1449,6 +1449,9 @@ impl AgentSessionHandle {
             ask_tool: None,
             workspace: None,
             mcp_manager: None,
+            // A handle built straight from a session has no options to read a
+            // policy from; the caller opts in through `create_agent_session`.
+            retry: None,
             event_runtime: None,
         }
     }
@@ -1712,6 +1715,9 @@ impl AgentSessionHandle {
     }
 
     /// Send one user prompt through the agent loop with an explicit abort signal.
+    ///
+    /// Applies [`SessionOptions::retry`] when one is configured; with none, the
+    /// first outcome is returned unchanged.
     pub async fn prompt_with_abort(
         &mut self,
         input: impl Into<String>,
@@ -1719,10 +1725,14 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.sync_extension_mcp_registrations().await;
-        let combined = self.make_combined_callback(on_event);
-        self.session
-            .run_text_with_abort(input.into(), Some(abort_signal), combined)
-            .await
+        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
+        let first_attempt = Arc::clone(&shared);
+        let combined = self.make_combined_callback(move |event| first_attempt(event));
+        let first = self
+            .session
+            .run_text_with_abort(input.into(), Some(abort_signal.clone()), combined)
+            .await;
+        self.apply_retry_policy(first, &abort_signal, &shared).await
     }
 
     /// Continue the current agent loop without adding a new user prompt.
@@ -1745,19 +1755,178 @@ impl AgentSessionHandle {
     }
 
     /// Continue the current agent loop with an explicit abort signal.
+    ///
+    /// Applies [`SessionOptions::retry`] when one is configured; with none, the
+    /// first outcome is returned unchanged.
     pub async fn continue_turn_with_abort(
         &mut self,
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        let combined = self.make_combined_callback(on_event);
+        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
+        let first_attempt = Arc::clone(&shared);
+        let combined = self.make_combined_callback(move |event| first_attempt(event));
         self.session
             .sync_runtime_selection_from_session_header()
             .await?;
-        self.session
+        let first = self
+            .session
             .agent
-            .run_continue_with_abort(Some(abort_signal), combined)
-            .await
+            .run_continue_with_abort(Some(abort_signal.clone()), combined)
+            .await;
+        self.apply_retry_policy(first, &abort_signal, &shared).await
+    }
+
+    /// Install (or clear) this handle's provider retry policy.
+    ///
+    /// [`create_agent_session`] takes it from [`SessionOptions::retry`]; this is
+    /// for a handle built through [`Self::from_session_with_listeners`], which
+    /// reads no options and would otherwise have no way to opt in.
+    #[must_use]
+    pub const fn with_retry(mut self, policy: Option<crate::failover::RetryPolicy>) -> Self {
+        self.retry = policy;
+        self
+    }
+
+    /// The error text a turn outcome carries, whichever shape it arrived in.
+    fn turn_error_text_for(outcome: &Result<AssistantMessage>) -> Option<String> {
+        match outcome {
+            Ok(message) => message.error_message.clone(),
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    /// Wait out a retry backoff, reporting `false` if the turn was aborted.
+    ///
+    /// Polled rather than slept in one go so an abort lands promptly instead of
+    /// after the full delay. It deliberately does NOT consult context
+    /// cancellation: a task whose context is cancel-requested stops being
+    /// scheduled at all and never reaches another checkpoint (bd-todkd), so the
+    /// abort signal is the only channel that actually works here.
+    async fn await_retry_backoff(delay_ms: u32, abort_signal: &AbortSignal) -> bool {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay_ms));
+        while std::time::Instant::now() < deadline {
+            if abort_signal.is_aborted() {
+                return false;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), POLL).await;
+        }
+        !abort_signal.is_aborted()
+    }
+
+    /// Apply this session's retry policy to a turn that has already run once.
+    ///
+    /// Retries RESUME the turn rather than replaying it: only the failed
+    /// request's incomplete output is stripped, so completed tool cycles are
+    /// neither re-run nor re-billed (pi_agent_rust#125), which is what print
+    /// mode and RPC do. `AutoRetryStart`/`AutoRetryEnd` go through the same
+    /// callback as the turn's own events, so a host that renders them — the
+    /// default FTUI already does — shows the retry without any further wiring.
+    ///
+    /// With no policy configured this hands `first` straight back, which is the
+    /// behaviour every embedder had before [`SessionOptions::retry`] existed.
+    async fn apply_retry_policy(
+        &mut self,
+        first: Result<AssistantMessage>,
+        abort_signal: &AbortSignal,
+        shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+    ) -> Result<AssistantMessage> {
+        let Some(policy) = self.retry else {
+            return first;
+        };
+        let mut progress = crate::failover::TurnProgress {
+            retry_count: 0,
+            // This surface cannot swap providers, so it never spends a failover
+            // budget; `decide` may still answer `FailOver`, and the loop below
+            // treats that as "stop" rather than pretending to walk a chain.
+            failovers_this_turn: 0,
+            stream_can_retry: true,
+        };
+        let mut current = first;
+        loop {
+            // No context window: resolving the active model's window on this
+            // path is a behaviour change of its own, and print mode passes
+            // `None` here too. The cost is that a SILENT context overflow —
+            // transient-looking prose with input tokens over the window — is
+            // retried rather than refused.
+            let decision = match &current {
+                Ok(message) => crate::failover::decide(
+                    crate::failover::TurnOutcome::Completed(message),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+                Err(error) => crate::failover::decide(
+                    crate::failover::TurnOutcome::Failed(error),
+                    &progress,
+                    &policy,
+                    None,
+                ),
+            };
+            let crate::failover::TurnDecision::Retry { attempt, delay_ms } = decision else {
+                if progress.retry_count > 0 {
+                    let success = matches!(&current, Ok(message) if !matches!(
+                        message.stop_reason,
+                        crate::model::StopReason::Error
+                    ));
+                    shared(AgentEvent::AutoRetryEnd {
+                        success,
+                        attempt: progress.retry_count,
+                        final_error: Self::turn_error_text_for(&current),
+                    });
+                }
+                return current;
+            };
+
+            let require_incomplete_tail = current.is_ok();
+            shared(AgentEvent::AutoRetryStart {
+                attempt,
+                max_attempts: policy.max_retries,
+                delay_ms: u64::from(delay_ms),
+                error_message: Self::turn_error_text_for(&current)
+                    .unwrap_or_else(|| "Request error".to_string()),
+            });
+
+            if !Self::await_retry_backoff(delay_ms, abort_signal).await {
+                shared(AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt,
+                    final_error: Some("Aborted".to_string()),
+                });
+                return current;
+            }
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            if let Err(restore_error) = self
+                .session
+                .restore_retry_tail(&cx, require_incomplete_tail)
+                .await
+            {
+                shared(AgentEvent::AutoRetryEnd {
+                    success: false,
+                    attempt,
+                    final_error: Some(restore_error.to_string()),
+                });
+                return Err(restore_error);
+            }
+
+            progress.retry_count = attempt;
+            let per_attempt = Arc::clone(shared);
+            let combined = self.make_combined_callback(move |event| per_attempt(event));
+            // AgentSession's resume, not the bare Agent's: it rehydrates the
+            // transcript from the session path the revert above just moved, so
+            // the retry continues from the last COMPLETED state and the next
+            // failure leaves a tail for the next revert. Print mode and RPC
+            // resume the same way. (The bare Agent call is what
+            // `continue_turn_with_abort` still uses for its first attempt,
+            // which is the session-persistence gap bd-9o9i2 tracks.)
+            current = self
+                .session
+                .run_continue_with_abort(Some(abort_signal.clone()), combined)
+                .await;
+        }
     }
 
     /// Create a new abort handle/signal pair for prompt cancellation.
@@ -2734,6 +2903,202 @@ mod tests {
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
         crate::test_current_dir_lock()
+    }
+
+    /// Fails its first `failures` calls with a retryable provider error, then
+    /// answers normally. Counts calls so a test can prove how many were made.
+    struct FlakyThenOkProvider {
+        failures: usize,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl crate::provider::Provider for FlakyThenOkProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut partial = crate::model::AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: crate::model::Usage::default(),
+                stop_reason: crate::model::StopReason::Error,
+                stop_details: None,
+                error_message: Some("503 service unavailable".to_string()),
+                timestamp: 0,
+            };
+            if call < self.failures {
+                let events = vec![
+                    Ok(crate::model::StreamEvent::Start {
+                        partial: partial.clone(),
+                    }),
+                    Ok(crate::model::StreamEvent::Error {
+                        reason: crate::model::StopReason::Error,
+                        error: partial,
+                    }),
+                ];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
+            partial.stop_reason = crate::model::StopReason::Stop;
+            partial.error_message = None;
+            let events = vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: partial.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: crate::model::StopReason::Stop,
+                    message: partial,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn flaky_handle(failures: usize) -> (AgentSessionHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures,
+            calls: Arc::clone(&calls),
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::in_memory())),
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        (
+            AgentSessionHandle::from_session_with_listeners(session, EventListeners::default()),
+            calls,
+        )
+    }
+
+    fn fast_retry_policy(max_retries: u32) -> crate::failover::RetryPolicy {
+        crate::failover::RetryPolicy {
+            max_retries,
+            max_failovers_per_turn: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+        }
+    }
+
+    /// The gap bd-u2qv4 names: a transient provider failure is a hard error on
+    /// the surfaces most people use, while print mode and RPC retry and finish.
+    /// With a policy installed, the SDK path — which the default FTUI drives —
+    /// now resumes the turn and completes it.
+    #[test]
+    fn a_configured_retry_policy_resumes_a_transient_failure() {
+        let (handle, calls) = flaky_handle(1);
+        let mut handle = handle.with_retry(Some(fast_retry_policy(3)));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen);
+
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(
+            handle.prompt_with_abort("hello", abort_signal, move |event| {
+                let name = match &event {
+                    AgentEvent::AutoRetryStart { .. } => Some("auto_retry_start"),
+                    AgentEvent::AutoRetryEnd { .. } => Some("auto_retry_end"),
+                    _ => None,
+                };
+                if let Some(name) = name {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(name.to_string());
+                }
+            }),
+        )
+        .expect("the retried turn must complete");
+
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Stop,
+            "the turn must finish on the retry, not surface the 503"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one failed attempt plus one retry"
+        );
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let start = events.iter().position(|name| name == "auto_retry_start");
+        let end = events.iter().position(|name| name == "auto_retry_end");
+        assert!(
+            start.is_some() && end.is_some() && start < end,
+            "the host must see the retry, in order: {events:?}"
+        );
+    }
+
+    /// The planted negative, and the compatibility guarantee: with no policy —
+    /// the default for every embedder that existed before this — the identical
+    /// failure comes straight back, unretried.
+    #[test]
+    fn without_a_policy_a_transient_failure_is_returned_unchanged() {
+        let (mut handle, calls) = flaky_handle(1);
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}))
+            .expect("the turn returns its errored message rather than failing the call");
+
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Error,
+            "no policy means no retry"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one provider call"
+        );
+    }
+
+    /// A retry budget bounds the attempts rather than looping on a provider
+    /// that never recovers.
+    #[test]
+    fn the_retry_budget_bounds_a_provider_that_never_recovers() {
+        let (handle, calls) = flaky_handle(usize::MAX);
+        let mut handle = handle.with_retry(Some(fast_retry_policy(2)));
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let message = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}))
+            .expect("the exhausted turn still returns its message");
+
+        assert_eq!(message.stop_reason, crate::model::StopReason::Error);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the first attempt plus max_retries, and no more"
+        );
     }
 
     struct CurrentDirGuard {
