@@ -308,6 +308,97 @@ pub fn provider_is_disabled(
     in_list(disabled)
 }
 
+// ---------------------------------------------------------------------------
+// Shared retry policy (bd-u2qv4)
+//
+// Print mode (`src/main.rs`) and the RPC server (`src/rpc.rs`) each grew their
+// own copy of this policy, and the copies have already drifted. The functions
+// below are the single definition both surfaces call, so a third consumer —
+// the interactive stacks, which today have no provider retry or failover at
+// all — can adopt the same policy instead of becoming a fourth copy.
+//
+// Everything here is pure: no I/O, no surface types, no session mutation.
+// Whether to sleep, what to emit, and how to resume the turn stay with the
+// caller, because those genuinely differ per surface.
+// ---------------------------------------------------------------------------
+
+/// Exponential backoff delay for same-provider retry `attempt` (1-based).
+///
+/// `attempt` 0 and 1 both yield `base_delay_ms`; each later attempt doubles,
+/// capped at `max_delay_ms`. Saturating throughout so a large attempt count
+/// clamps at the cap rather than overflowing.
+#[must_use]
+pub fn retry_delay_ms(base_delay_ms: u32, max_delay_ms: u32, attempt: u32) -> u32 {
+    let base = u64::from(base_delay_ms);
+    let max = u64::from(max_delay_ms);
+    let shift = attempt.saturating_sub(1);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let delay = base.saturating_mul(multiplier).min(max);
+    u32::try_from(delay).unwrap_or(u32::MAX)
+}
+
+/// Terminal marker check (bd-8188r): does this error text describe a
+/// session-persistence failure?
+///
+/// Such a failure means provider or tool side effects may already have
+/// happened while the durable record is missing or stale. Re-entering the
+/// provider — retry, credential rotation, or model failover — could repeat
+/// those effects, so callers must treat this as final regardless of what the
+/// wrapped prose looks like.
+///
+/// `contains`, not `starts_with`: the flattened `Display` form embeds the
+/// marker after `thiserror`'s own "Session error: " prefix. A false positive
+/// merely refuses a retry, which is the safe direction.
+#[must_use]
+pub fn marks_session_persistence(error_text: &str) -> bool {
+    error_text.contains(crate::error::Error::SESSION_PERSISTENCE_PREFIX)
+}
+
+/// Whether a completed turn that ended in [`StopReason::Error`] should be
+/// retried against the same provider.
+///
+/// `context_window` is the active model's context window when the caller knows
+/// it; supplying it lets [`crate::error::is_retryable_error`] recognise a
+/// context overflow, which is never retryable. Print mode passed `None` here
+/// while RPC supplied the real window, so the same overflow was retried on one
+/// surface and refused on the other; callers that can resolve the window
+/// should pass it.
+#[must_use]
+pub fn error_result_is_retryable(
+    message: &crate::model::AssistantMessage,
+    context_window: Option<u32>,
+) -> bool {
+    if !matches!(message.stop_reason, crate::model::StopReason::Error) {
+        return false;
+    }
+    let error_text = message.error_message.as_deref().unwrap_or("Request error");
+    // Session-persistence failures are never retryable, even when the wrapped
+    // message contains transient-looking prose ("connection reset", "500"):
+    // flattening loses the typed boundary, so the stable prefix is checked
+    // before any text classification.
+    if marks_session_persistence(error_text) {
+        return false;
+    }
+    crate::error::is_retryable_error(error_text, Some(message.usage.input), context_window)
+}
+
+/// Whether a failed provider call reported through [`crate::error::Error`]
+/// should be retried against the same provider.
+///
+/// Classifies from the TYPED error first — [`crate::error::Error::is_transient`]
+/// walks the source chain for a transient `io::ErrorKind` (connection
+/// reset/abort/EOF/broken pipe/timeout) without depending on flattened message
+/// text — then falls back to text matching for prose-only errors
+/// (pi_agent_rust#118). No usage or context window is available on this path
+/// because no response was received.
+#[must_use]
+pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
+    if error.is_session_persistence() {
+        return false;
+    }
+    error.is_transient() || crate::error::is_retryable_error(&error.to_string(), None, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +564,105 @@ mod tests {
         };
         assert!(provider_is_disabled(&disabled, Some(&scope), "openai"));
         assert!(provider_is_disabled(&disabled, Some(&scope), "anthropic"));
+    }
+
+    // -- shared retry policy (bd-u2qv4) ------------------------------------
+
+    fn errored_message(error_message: Option<&str>, input_tokens: u64) -> crate::model::AssistantMessage {
+        crate::model::AssistantMessage {
+            content: Vec::new(),
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            usage: crate::model::Usage {
+                input: input_tokens,
+                ..crate::model::Usage::default()
+            },
+            stop_reason: crate::model::StopReason::Error,
+            stop_details: None,
+            error_message: error_message.map(str::to_string),
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn retry_delay_doubles_from_base_and_caps() {
+        assert_eq!(retry_delay_ms(500, 8_000, 0), 500);
+        assert_eq!(retry_delay_ms(500, 8_000, 1), 500);
+        assert_eq!(retry_delay_ms(500, 8_000, 2), 1_000);
+        assert_eq!(retry_delay_ms(500, 8_000, 3), 2_000);
+        assert_eq!(retry_delay_ms(500, 8_000, 4), 4_000);
+        assert_eq!(retry_delay_ms(500, 8_000, 5), 8_000);
+        // Saturates at the cap instead of overflowing the shift.
+        assert_eq!(retry_delay_ms(500, 8_000, 30), 8_000);
+        assert_eq!(retry_delay_ms(500, 8_000, u32::MAX), 8_000);
+    }
+
+    #[test]
+    fn session_persistence_marker_is_recognized_after_a_display_prefix() {
+        let flattened = format!(
+            "Session error: {} could not write session",
+            crate::error::Error::SESSION_PERSISTENCE_PREFIX
+        );
+        assert!(marks_session_persistence(&flattened));
+        assert!(!marks_session_persistence("429 rate limit exceeded"));
+    }
+
+    #[test]
+    fn only_errored_turns_are_retryable() {
+        let mut ok = errored_message(None, 0);
+        ok.stop_reason = crate::model::StopReason::Stop;
+        assert!(!error_result_is_retryable(&ok, None));
+
+        let mut aborted = errored_message(Some("connection reset by peer"), 0);
+        aborted.stop_reason = crate::model::StopReason::Aborted;
+        assert!(!error_result_is_retryable(&aborted, None));
+
+        assert!(error_result_is_retryable(
+            &errored_message(Some("connection reset by peer"), 0),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_session_persistence_turn_is_never_retryable_however_transient_it_reads() {
+        // The prose alone would classify as retryable; the marker must win,
+        // because repeating the turn could repeat side effects already made
+        // against a session whose durable record is missing (bd-8188r).
+        let text = format!(
+            "{} connection reset by peer",
+            crate::error::Error::SESSION_PERSISTENCE_PREFIX
+        );
+        assert!(crate::error::is_retryable_error(
+            "connection reset by peer",
+            None,
+            None
+        ));
+        assert!(!error_result_is_retryable(
+            &errored_message(Some(&text), 0),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_context_overflow_is_retryable_only_while_the_window_is_unknown() {
+        // The drift this policy exists to remove: RPC supplied the active
+        // model's context window here and print mode did not, so the same
+        // overflow was refused on one surface and retried forever on the
+        // other. The window is what makes the classification possible.
+        let overflow = errored_message(Some("prompt is too long: 250000 tokens > 200000"), 250_000);
+        assert!(!error_result_is_retryable(&overflow, Some(200_000)));
+    }
+
+    #[test]
+    fn call_errors_classify_from_the_typed_error_before_its_prose() {
+        let persistence = crate::error::Error::session_persistence("write failed");
+        assert!(!call_error_is_retryable(&persistence));
+
+        let transient = crate::error::Error::Api("503 service unavailable".to_string());
+        assert!(call_error_is_retryable(&transient));
+
+        let loud = crate::error::Error::Api("401 unauthorized: invalid api key".to_string());
+        assert!(!call_error_is_retryable(&loud));
     }
 }

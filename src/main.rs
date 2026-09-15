@@ -8976,14 +8976,17 @@ enum PromptInput {
     },
 }
 
-/// Compute retry delay with exponential backoff (mirrors RPC mode logic).
+/// Compute retry delay with exponential backoff.
+///
+/// Print mode and the RPC server had byte-identical private copies of this
+/// until bd-u2qv4; both now call the one definition in `pi::failover` so the
+/// interactive surfaces can adopt the same policy rather than become a third.
 fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    let base = u64::from(config.retry_base_delay_ms());
-    let max = u64::from(config.retry_max_delay_ms());
-    let shift = attempt.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(multiplier).min(max);
-    u32::try_from(delay).unwrap_or(u32::MAX)
+    pi::failover::retry_delay_ms(
+        config.retry_base_delay_ms(),
+        config.retry_max_delay_ms(),
+        attempt,
+    )
 }
 
 async fn sleep_with_current_timer(duration: Duration) {
@@ -9116,10 +9119,7 @@ fn emit_print_failover_end(
 /// rotation, model failover) could repeat those effects, so callers must
 /// treat this as final regardless of what the wrapped prose looks like.
 fn message_marks_session_persistence(error_text: &str) -> bool {
-    // `contains`, not `starts_with`: the flattened Display form embeds the
-    // marker after thiserror's own "Session error: " prefix. A false
-    // positive here merely refuses a retry — the safe direction.
-    error_text.contains(pi::error::Error::SESSION_PERSISTENCE_PREFIX)
+    pi::failover::marks_session_persistence(error_text)
 }
 
 /// Check whether a prompt result is a retryable error.
@@ -9128,15 +9128,14 @@ fn message_marks_session_persistence(error_text: &str) -> bool {
 /// message contains transient-looking phrases ("connection reset", "500"):
 /// the flattening loses the typed boundary, so the stable prefix is checked
 /// first.
+///
+/// The `None` context window preserves print mode's behaviour exactly through
+/// the bd-u2qv4 extraction; RPC supplies the real window here, so a context
+/// overflow is still refused there and retried here. That drift is real and is
+/// tracked separately — fixing it means resolving the active model's window on
+/// this path, which is a behaviour change and needs its own test.
 fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
-    if !matches!(msg.stop_reason, StopReason::Error) {
-        return false;
-    }
-    let err_msg = msg.error_message.as_deref().unwrap_or("Request error");
-    if message_marks_session_persistence(err_msg) {
-        return false;
-    }
-    pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
+    pi::failover::error_result_is_retryable(msg, None)
 }
 
 async fn restore_print_retry_tail(
@@ -9810,9 +9809,11 @@ where
                 });
                 // Classify from the TYPED error first (transient io::ErrorKind
                 // via the source chain), then fall back to message-text matching
-                // for prose-only errors (pi_agent_rust#118).
+                // for prose-only errors (pi_agent_rust#118). The
+                // session-persistence refusal inside is already satisfied by the
+                // terminal guard above; RPC applies the same predicate.
                 if retry_count < max_retries
-                    && (err.is_transient() || pi::error::is_retryable_error(&err_str, None, None))
+                    && pi::failover::call_error_is_retryable(&err)
                     && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json)
                 {
                     retry_count += 1;

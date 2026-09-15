@@ -5523,18 +5523,11 @@ async fn run_prompt_with_retry(
             }
             Err(err) => {
                 let err_str = err.to_string();
-                if err.is_session_persistence() {
-                    final_error = Some(err_str);
-                    final_error_hints = Some(error_hints_value(&err));
-                    break;
-                }
-                // Classify from the TYPED error first — `is_transient` walks the
-                // source chain for a transient `io::ErrorKind` (connection
-                // reset/abort/EOF/broken pipe/timeout) without depending on the
-                // flattened message text. Fall back to message-text matching for
-                // prose-only errors (pi_agent_rust#118). No usage/context_window
-                // from an `Err` (no response received), so pass None for both.
-                if !err.is_transient() && !crate::error::is_retryable_error(&err_str, None, None) {
+                // `call_error_is_retryable` refuses a session-persistence
+                // failure first (bd-8188r), then classifies from the TYPED
+                // error before its flattened prose (pi_agent_rust#118). Print
+                // mode inlined the same two checks until bd-u2qv4.
+                if !crate::failover::call_error_is_retryable(&err) {
                     final_error = Some(err_str);
                     final_error_hints = Some(error_hints_value(&err));
                     break;
@@ -7760,13 +7753,15 @@ fn rpc_flatten_content_blocks(value: &mut Value) {
     }
 }
 
+/// Exponential retry backoff. Print mode had a byte-identical private copy of
+/// this until bd-u2qv4; both now call the one definition in
+/// [`crate::failover`].
 fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {
-    let base = u64::from(config.retry_base_delay_ms());
-    let max = u64::from(config.retry_max_delay_ms());
-    let shift = attempt.saturating_sub(1);
-    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(multiplier).min(max);
-    u32::try_from(delay).unwrap_or(u32::MAX)
+    crate::failover::retry_delay_ms(
+        config.retry_base_delay_ms(),
+        config.retry_max_delay_ms(),
+        attempt,
+    )
 }
 
 #[cfg(test)]
