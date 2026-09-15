@@ -382,10 +382,11 @@ impl<'a> FailoverWalk<'a> {
     }
 }
 
-/// Resolve one `provider/model` chain spec against the configured model list,
-/// falling back to an ad-hoc entry for a provider/model pair that is well
-/// formed but not configured. `None` means the spec names nothing usable and
-/// the walk should move on.
+/// Resolve one `provider/model` chain spec against the configured model list.
+///
+/// A well-formed pair that is simply not configured falls back to an ad-hoc
+/// entry. `None` means the spec names nothing usable and the walk should move
+/// on.
 #[must_use]
 pub fn resolve_chain_spec(
     spec: &str,

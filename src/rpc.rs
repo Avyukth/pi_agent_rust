@@ -6198,50 +6198,21 @@ async fn try_failover_to_next_chain_entry(
     ) else {
         return Ok(false);
     };
-    let mut position = state.failover_chain_position.unwrap_or(0);
-
-    // The caller enforces max_failovers_per_turn for this turn. `position` is
-    // durable process state across turns and must not be compared with that
-    // per-turn budget, or a cap of one permanently blocks chain entry two.
-    while position < chain.entries.len() {
-        let spec = &chain.entries[position];
-        // The live model itself and a spec already walked earlier in this chain
-        // cannot be a swap: installing them would emit a phantom
-        // FailoverStart/End pair and spend a unit of the per-turn cap on a
-        // no-op (bd-oqo03.1).
-        let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
-            |(provider, model_id)| {
-                crate::provider_metadata::provider_ids_match(&current_provider, provider)
-                    && current_model.eq_ignore_ascii_case(model_id)
-            },
-        );
-        let is_duplicate = chain.entries[..position]
-            .iter()
-            .any(|earlier| earlier.eq_ignore_ascii_case(spec));
-        if is_current || is_duplicate {
-            position += 1;
-            continue;
-        }
-        let candidate = (|| {
-            let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
-            options
-                .available_models
-                .iter()
-                .find(|m| {
-                    crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                        && m.model.id.eq_ignore_ascii_case(model_id)
-                })
-                .cloned()
-                .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
-        })();
-        // Where this candidate sits in the chain, captured before the cursor
-        // advances to the resume position. `position` after this line is where
-        // the NEXT turn starts looking, which is one past the entry being
-        // considered — reporting that as the chain index is off by one
-        // (bd-oqo03).
-        let entry_index = position;
-        position += 1;
-        let Some(entry) = candidate else {
+    // The caller enforces max_failovers_per_turn for this turn. The walk's
+    // position is durable process state across turns and must not be compared
+    // with that per-turn budget, or a cap of one permanently blocks chain entry
+    // two. Print mode walks the same chain with the same cursor rules; both now
+    // use the one definition (bd-u2qv4).
+    let mut walk = crate::failover::FailoverWalk::new(
+        &chain,
+        state.failover_chain_position.unwrap_or(0),
+        &current_provider,
+        &current_model,
+    );
+    while let Some((entry_index, spec)) = walk.next_spec() {
+        let position = walk.position();
+        let Some(entry) = crate::failover::resolve_chain_spec(spec, &options.available_models)
+        else {
             continue;
         };
         let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);

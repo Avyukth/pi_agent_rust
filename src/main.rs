@@ -9402,47 +9402,23 @@ async fn try_print_failover(
     else {
         return Ok(None);
     };
-    let mut cursor = failover_state.chain_position;
-
     // The walk is bounded by the chain, not by `max_failovers_per_turn`: the
     // caller counts successful swaps against that cap (bd-oqo03.1). Bounding
     // the cursor by the cap let malformed, uncredentialed, unconstructible,
     // current, or duplicate entries consume the budget and hide a later valid
-    // entry.
-    while cursor < chain.entries.len() {
-        let spec = &chain.entries[cursor];
-        let is_current = pi::provider_metadata::split_provider_model_spec(spec).is_some_and(
-            |(provider, model_id)| {
-                pi::provider_metadata::provider_ids_match(&from_provider, provider)
-                    && from_model.eq_ignore_ascii_case(model_id)
-            },
-        );
-        let is_duplicate = chain.entries[..cursor]
-            .iter()
-            .any(|earlier| earlier.eq_ignore_ascii_case(spec));
-        if is_current || is_duplicate {
-            cursor += 1;
+    // entry. RPC walks the same chain with the same cursor rules; both now use
+    // the one definition (bd-u2qv4).
+    let mut walk = pi::failover::FailoverWalk::new(
+        &chain,
+        failover_state.chain_position,
+        &from_provider,
+        &from_model,
+    );
+    while let Some((entry_index, spec)) = walk.next_spec() {
+        let cursor = walk.position();
+        let Some(entry) = pi::failover::resolve_chain_spec(spec, ctx.available_models) else {
             continue;
-        }
-        let candidate = (|| {
-            let (provider, model_id) = pi::provider_metadata::split_provider_model_spec(spec)?;
-            ctx.available_models
-                .iter()
-                .find(|m| {
-                    pi::provider_metadata::provider_ids_match(&m.model.provider, provider)
-                        && m.model.id.eq_ignore_ascii_case(model_id)
-                })
-                .cloned()
-                .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
-        })();
-        // Where this candidate sits in the chain, captured before the cursor
-        // advances to the resume position. `cursor` after this line is where
-        // the NEXT turn starts looking, which is one past the entry being
-        // considered — reporting that as the chain index is off by one
-        // (bd-oqo03).
-        let entry_index = cursor;
-        cursor += 1;
-        let Some(entry) = candidate else { continue };
+        };
         let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
         if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
             continue; // never fail over into an auth error
@@ -9584,7 +9560,9 @@ async fn try_print_failover(
 
         return Ok(Some((to_provider, to_model)));
     }
-    failover_state.chain_position = cursor;
+    // Chain exhausted: record the end position so a later turn does not re-walk
+    // entries this turn already rejected.
+    failover_state.chain_position = walk.position();
     Ok(None)
 }
 
