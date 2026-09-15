@@ -733,6 +733,25 @@ def _repository_identity_error(repository: GitRepositoryBinding) -> str | None:
     return None
 
 
+# Issue-tracker database state: never product source, never packaged, and
+# incapable of affecting a measurement. The beads daemon exports `.beads/*` on
+# every issue write and the auto-commit sweeper commits the result, so a
+# whole-worktree cleanliness proxy reports this repository dirty essentially all
+# the time. The exemption is exactly this prefix; anything else still
+# invalidates the binding. `scripts/check_clean_release_commit.py` classifies
+# these paths the same way.
+_TRACKER_STATE_PREFIX = ".beads/"
+
+
+def _is_tracker_state_status_record(entry: bytes) -> bool:
+    """Is this ``git status --porcelain=v1 -z --no-renames`` record a tracker write?
+
+    Every record is ``XY<space>PATH``, so the path begins at byte 3.
+    """
+
+    return entry[3:].startswith(_TRACKER_STATE_PREFIX.encode("utf-8"))
+
+
 def _repository_clean_state_error(repository: GitRepositoryBinding) -> str | None:
     status, git_error = _git_bytes(
         repository,
@@ -746,12 +765,12 @@ def _repository_clean_state_error(repository: GitRepositoryBinding) -> str | Non
     if git_error is not None:
         return f"budget summary repository cleanliness could not be verified: {git_error}"
     assert status is not None
-    if status:
-        entries = [
-            entry.decode("utf-8", "replace")
-            for entry in status.split(b"\0")
-            if entry
-        ]
+    entries = [
+        entry.decode("utf-8", "replace")
+        for entry in status.split(b"\0")
+        if entry and not _is_tracker_state_status_record(entry)
+    ]
+    if entries:
         return f"budget summary repository is not clean: {entries[:3]!r}"
 
     index_listing, git_error = _git_bytes(repository, "ls-files", "-v", "-z")
@@ -1188,6 +1207,10 @@ def performance_source_binding_error(
             "docs/evidence/",
         )
         for path in changed_paths:
+            # Tracker-database churn is not source drift; see
+            # _TRACKER_STATE_PREFIX.
+            if path.startswith(_TRACKER_STATE_PREFIX):
+                continue
             if not path.startswith(allowed_prefixes):
                 return f"non-evidence path changed after budget summary source_commit: {path}"
             try:
@@ -3021,6 +3044,50 @@ def _run_self_test_cases() -> int:
         if binding_error is None or "repository is not clean" not in binding_error:
             print(binding_error)
             print("SELF-TEST FAIL: untracked dirt must invalidate source binding")
+            return 2
+
+        # The beads daemon and the auto-commit sweeper write `.beads/*`
+        # continuously, so the binding must survive tracker churn in every Git
+        # state while still catching real dirt one directory over.
+        tracker_root, _, tracker_source = create_binding_repo(base, "binding-tracker")
+        (tracker_root / ".beads").mkdir(parents=True, exist_ok=True)
+        (tracker_root / ".beads" / "issues.jsonl").write_text(
+            '{"id":"seed"}\n', encoding="utf-8"
+        )
+        git(tracker_root, "add", ".beads")
+        git(tracker_root, "commit", "-m", "record tracker export")
+        for stage_it, label in ((False, "unstaged"), (True, "staged")):
+            (tracker_root / ".beads" / "issues.jsonl").write_text(
+                '{"id":"seed"}\n{"id":"written-mid-run"}\n', encoding="utf-8"
+            )
+            (tracker_root / ".beads" / "beads.db-wal-cert").write_text(
+                "cert\n", encoding="utf-8"
+            )
+            if stage_it:
+                git(tracker_root, "add", ".beads")
+            binding_error = performance_source_binding_error(
+                tracker_root,
+                tracker_source,
+                "tests/perf/reports/budget_summary.json",
+            )
+            if binding_error is not None:
+                print(binding_error)
+                print(
+                    f"SELF-TEST FAIL: {label} tracker writes must not invalidate source binding"
+                )
+                return 2
+        (tracker_root / "Cargo.toml").write_text(
+            (tracker_root / "Cargo.toml").read_text(encoding="utf-8") + "# dirty\n",
+            encoding="utf-8",
+        )
+        binding_error = performance_source_binding_error(
+            tracker_root,
+            tracker_source,
+            "tests/perf/reports/budget_summary.json",
+        )
+        if binding_error is None or "repository is not clean" not in binding_error:
+            print(binding_error)
+            print("SELF-TEST FAIL: the tracker exemption must not excuse real dirt")
             return 2
 
         head_root, _, _ = create_binding_repo(base, "binding-head-dirty")
