@@ -192,30 +192,43 @@ where
     })
 }
 
-/// Build the pair of contexts a spawned turn needs: the one its own awaits run
-/// under, and the one whose cancellation it watches.
+/// Spawn a turn so that cancelling the caller ends it cleanly instead of
+/// stranding the client.
 ///
-/// These must not be the same context. asupersync 0.5 stops polling a task at
-/// its next `.await` once the task's region is cancel-requested, and does NOT
-/// drop it — so a turn spawned into the client's region is parked mid-flight
-/// with no destructor, no `auto_retry_end` and no terminal `agent_end`, and the
-/// client waits forever for a frame that can never be sent. Measured directly
-/// on `rpc_prompt_command_inherits_cancelled_context_from_run`: the retry-delay
-/// poll ticked exactly once, awaited, and was never scheduled again (bd-todkd).
+/// The factory receives two contexts and they must not be the same one:
 ///
-/// The turn therefore gets its own region and OBSERVES the caller's
-/// cancellation at its checkpoints rather than being killed by it, which is
-/// what lets it close its own lifecycle. The caller's budget is inherited so a
-/// deadline still bounds the turn; only the cancellation linkage is broken.
+/// - the TURN's context, a child of the runtime's ROOT region. Every lock,
+///   sleep and provider await runs under it. asupersync 0.5 stops polling a
+///   task at its next `.await` once its region is cancel-requested and does NOT
+///   drop it, so a turn spawned into the caller's region is parked mid-flight
+///   with no destructor, no `auto_retry_end` and no terminal `agent_end` — and
+///   the client blocks forever on a frame that can never be sent. Measured on
+///   `rpc_prompt_command_inherits_cancelled_context_from_run`: the retry-delay
+///   poll ticked once, awaited, and was never scheduled again (bd-todkd).
+/// - the CALLER's context, observed and never awaited on. Its cancellation is
+///   what ends the turn, at the checkpoints in `run_prompt_with_retry`, which
+///   is what lets the turn close its own lifecycle on the way out.
 ///
-/// An in-flight provider call is not interrupted by this — cancellation is seen
-/// when that call returns, or during the retry backoff. Interrupting the call
-/// itself is what the `abort` command's `AbortHandle` is for.
-fn turn_contexts(client_cx: &AgentCx) -> (AgentCx, AgentCx) {
-    (
-        AgentCx::for_request_with_budget(client_cx.budget()),
-        client_cx.clone(),
-    )
+/// It must come from `spawn_with_cx` rather than a synthetic `Cx::for_request`:
+/// a synthetic context carries no runtime capabilities, so `asupersync::time::
+/// sleep` inside the retry backoff registers no wakeup and the turn hangs — the
+/// same symptom as the bug, from the opposite cause. Verified by probe.
+///
+/// The caller's budget still bounds the turn, because `checkpoint()` tests the
+/// budget as well as cancellation and the turn checks the CALLER's. An
+/// in-flight provider call is not interrupted here — cancellation is seen when
+/// it returns, or during the backoff; interrupting the call itself is what the
+/// `abort` command's `AbortHandle` is for.
+fn spawn_turn<F, Fut>(runtime: &asupersync::runtime::RuntimeHandle, client_cx: &AgentCx, factory: F)
+where
+    F: FnOnce(AgentCx, AgentCx) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let cancel_watch = client_cx.clone();
+    runtime.spawn_with_cx(move |task_cx| {
+        let turn_cx = AgentCx::from_cx(task_cx.clone());
+        future_with_current_cx(task_cx, factory(turn_cx, cancel_watch))
+    });
 }
 
 fn normalize_command_type(command_type: &str) -> &str {
@@ -2168,10 +2181,10 @@ pub async fn run(
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
                     let expanded = options.resources.expand_input(&message);
-                    let (turn_cx, cancel_watch) = turn_contexts(&cx);
-                    runtime_handle.spawn(future_with_current_cx(
-                        turn_cx.cx().clone(),
-                        async move {
+                    spawn_turn(
+                        &runtime_handle,
+                        &cx,
+                        move |turn_cx, cancel_watch| async move {
                             run_prompt_with_retry(
                                 session,
                                 shared_state,
@@ -2190,7 +2203,7 @@ pub async fn run(
                             )
                             .await;
                         },
-                    ));
+                    );
                 }
             }
 
@@ -2291,26 +2304,29 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                let (turn_cx, cancel_watch) = turn_contexts(&cx);
-                runtime_handle.spawn(future_with_current_cx(turn_cx.cx().clone(), async move {
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        turn_phase_linearizer,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Some(message),
-                        Vec::new(),
-                        turn_cx,
-                        cancel_watch,
-                    )
-                    .await;
-                }));
+                spawn_turn(
+                    &runtime_handle,
+                    &cx,
+                    move |turn_cx, cancel_watch| async move {
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            turn_phase_linearizer,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            expanded,
+                            Some(message),
+                            Vec::new(),
+                            turn_cx,
+                            cancel_watch,
+                        )
+                        .await;
+                    },
+                );
             }
 
             "follow_up" => {
@@ -2412,26 +2428,29 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                let (turn_cx, cancel_watch) = turn_contexts(&cx);
-                runtime_handle.spawn(future_with_current_cx(turn_cx.cx().clone(), async move {
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        turn_phase_linearizer,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        Some(message),
-                        Vec::new(),
-                        turn_cx,
-                        cancel_watch,
-                    )
-                    .await;
-                }));
+                spawn_turn(
+                    &runtime_handle,
+                    &cx,
+                    move |turn_cx, cancel_watch| async move {
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            turn_phase_linearizer,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            expanded,
+                            Some(message),
+                            Vec::new(),
+                            turn_cx,
+                            cancel_watch,
+                        )
+                        .await;
+                    },
+                );
             }
 
             "abort" => {
@@ -3877,10 +3896,11 @@ pub async fn run(
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
-                let (turn_cx, cancel_watch) = turn_contexts(&cx);
-                options.runtime_handle.clone().spawn(future_with_current_cx(
-                    turn_cx.cx().clone(),
-                    async move {
+                let turn_runtime = options.runtime_handle.clone();
+                spawn_turn(
+                    &turn_runtime,
+                    &cx,
+                    move |turn_cx, cancel_watch| async move {
                         run_prompt_with_retry(
                             session,
                             shared_state,
@@ -3899,7 +3919,7 @@ pub async fn run(
                         )
                         .await;
                     },
-                ));
+                );
             }
 
             "new_session" => {
@@ -5312,7 +5332,13 @@ async fn run_prompt_with_retry(
     message: String,
     keyword_scan_source: Option<String>,
     images: Vec<ImageContent>,
+    // `cx` is the turn's OWN region: every lock and await here runs under it,
+    // and it is deliberately not the caller's, so a cancelled caller cannot park
+    // this task before it closes its own lifecycle. `cancel_watch` is the
+    // caller's region, observed and never awaited on — its cancellation is what
+    // ends the turn, at the checkpoints below. See `turn_contexts`.
     cx: AgentCx,
+    cancel_watch: AgentCx,
 ) {
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
@@ -5350,7 +5376,7 @@ async fn run_prompt_with_retry(
     // prompt was accepted, so it is entitled to exactly one terminal frame no
     // matter how this task ends. Both normal exits disarm it before sending
     // their own.
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
+    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cancel_watch.clone());
 
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
@@ -5367,7 +5393,7 @@ async fn run_prompt_with_retry(
     let mut final_error_hints: Option<Value> = None;
 
     loop {
-        if retry_count > 0 && cx.checkpoint().is_err() {
+        if retry_count > 0 && cancel_watch.checkpoint().is_err() {
             final_error = Some("Retry aborted".to_string());
             final_error_hints = None;
             break;
@@ -5702,15 +5728,24 @@ async fn run_prompt_with_retry(
                 retry_cancelled = true;
                 break;
             }
-            if cx.checkpoint().is_err() {
+            if cancel_watch.checkpoint().is_err() {
                 retry_cancelled = true;
                 break;
             }
+            // Slept on the TURN's context, not the caller's: an await inside a
+            // cancel-requested region never resumes, which would strand the
+            // client exactly where this loop is meant to release it (bd-todkd).
             let now = cx
                 .cx()
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
+            eprintln!(
+                "PROBE_DELAY_TICK watch_cancel={} turn_cancel={}",
+                cancel_watch.is_cancel_requested(),
+                cx.is_cancel_requested()
+            );
             sleep(now, Duration::from_millis(50)).await;
+            eprintln!("PROBE_DELAY_WOKE");
         }
 
         if retry_cancelled || retry_abort.load(Ordering::SeqCst) {
@@ -8070,6 +8105,7 @@ mod retry_tests {
                 None,
                 Vec::new(),
                 AgentCx::for_request(),
+                AgentCx::for_request(),
             )
             .await;
 
@@ -8254,6 +8290,7 @@ mod retry_tests {
                 "hello".to_string(),
                 None,
                 Vec::new(),
+                AgentCx::for_request(),
                 AgentCx::for_request(),
             )
             .await;
@@ -9482,6 +9519,7 @@ mod retry_tests {
                     None,
                     Vec::new(),
                     AgentCx::for_request(),
+                    AgentCx::for_request(),
                 )
                 .await;
                 (session, shared_state)
@@ -9679,6 +9717,9 @@ mod retry_tests {
                 "hello".to_string(),
                 None,
                 Vec::new(),
+                // Same split the spawn sites make: the turn runs under its own
+                // region and WATCHES the cancellable one (`turn_contexts`).
+                AgentCx::for_request(),
                 AgentCx::from_cx(retry_cx),
             )
             .await;
