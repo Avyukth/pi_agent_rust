@@ -1910,10 +1910,19 @@ impl AgentSessionHandle {
     /// entries from ever running. The walk itself, the credential check, the
     /// provider construction and the persisted transition are
     /// `AgentSession::try_failover`, shared with print mode and RPC (bd-u2qv4).
+    /// `retry_attempt_to_end` is the retry lifecycle this swap supersedes, if
+    /// one is open. It is closed HERE, immediately before `FailoverStart`, so a
+    /// host never sees the two lifecycles interleaved (bd-2vmu6). Passing it in
+    /// rather than closing it at the call site is what print mode and RPC both
+    /// do, and it is the only ordering that works: the caller cannot know
+    /// whether the chain had anything installable until this returns, so
+    /// closing the retry before calling would emit an `AutoRetryEnd` for a
+    /// failover that never happened.
     async fn try_chain_failover(
         &mut self,
         current: &Result<AssistantMessage>,
         require_incomplete_tail: bool,
+        retry_attempt_to_end: Option<u32>,
         shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
     ) -> Result<bool> {
         let Some(options) = self.failover.clone() else {
@@ -1982,6 +1991,19 @@ impl AgentSessionHandle {
             (committed.to_provider.clone(), committed.to_model.clone()),
             std::time::Instant::now(),
         );
+        // Close the retry lifecycle before opening the failover one. Both are
+        // now certain: the swap has committed, so this cannot close a retry for
+        // a failover that did not happen.
+        // Close the retry lifecycle before opening the failover one. Both are
+        // now certain: the swap has committed, so this cannot close a retry for
+        // a failover that did not happen.
+        if let Some(attempt) = retry_attempt_to_end {
+            shared(AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_text),
+            });
+        }
         shared(AgentEvent::FailoverStart {
             from_provider: committed.from_provider,
             from_model: committed.from_model,
@@ -2152,16 +2174,16 @@ impl AgentSessionHandle {
             if decision == crate::failover::TurnDecision::FailOver
                 && progress.failovers_this_turn < policy.max_failovers_per_turn
                 && self
-                    .try_chain_failover(&current, current.is_ok(), shared)
+                    .try_chain_failover(
+                        &current,
+                        current.is_ok(),
+                        // The open retry lifecycle this swap supersedes, closed
+                        // inside the swap so it lands before `FailoverStart`.
+                        (progress.retry_count > 0).then_some(progress.retry_count),
+                        shared,
+                    )
                     .await?
             {
-                if progress.retry_count > 0 {
-                    shared(AgentEvent::AutoRetryEnd {
-                        success: false,
-                        attempt: progress.retry_count,
-                        final_error: Self::turn_error_text_for(&current),
-                    });
-                }
                 failed_over = true;
                 progress.failovers_this_turn += 1;
                 progress.retry_count = 0;
@@ -3547,7 +3569,17 @@ mod tests {
         let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
         let _ = run_async(
             handle.prompt_with_abort("hello", abort_signal, move |event| {
+                // Retry events are recorded too, because the ORDER of the two
+                // lifecycles is the thing under test (bd-2vmu6): a host that
+                // sees `FailoverStart` before the `AutoRetryEnd` it supersedes
+                // cannot tell which lifecycle the later events belong to.
                 let name = match &event {
+                    AgentEvent::AutoRetryStart { attempt, .. } => {
+                        Some(format!("auto_retry_start:{attempt}"))
+                    }
+                    AgentEvent::AutoRetryEnd { attempt, .. } => {
+                        Some(format!("auto_retry_end:{attempt}"))
+                    }
                     AgentEvent::FailoverStart { to_provider, .. } => {
                         Some(format!("failover_start:{to_provider}"))
                     }
@@ -3570,10 +3602,13 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                "auto_retry_start:1".to_string(),
+                "auto_retry_end:1".to_string(),
                 "failover_start:openai".to_string(),
                 "failover_end".to_string()
             ],
-            "the chain must be walked and its lifecycle closed: {events:?}"
+            "every Start must be closed before the next opens, in this exact \
+             order: {events:?}"
         );
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
