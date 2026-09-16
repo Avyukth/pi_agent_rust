@@ -15,7 +15,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -101,7 +101,7 @@ pub struct ChildEntry {
     pub name: String,
     /// Spawn surface (`subagent` tool or `/tan`).
     pub kind: ChildKind,
-    /// The task text (truncated for roster display).
+    /// The task text (truncated for roster display, never used for revival).
     pub task: String,
     pub pid: Option<u32>,
     pub status: ChildStatus,
@@ -131,9 +131,12 @@ pub struct BusMessage {
 }
 
 /// Session-scoped registry: one per parent process.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AgentHubRegistry {
     entries: BTreeMap<String, ChildEntry>,
+    /// Complete user assignments, separate from display previews and from
+    /// generated continuation prompts. Kept for the lifetime of this hub.
+    original_tasks: BTreeMap<String, String>,
     seq: u64,
     /// Per-recipient delivered/queued bus messages (in-memory view; the
     /// on-disk steer files are the cross-process channel).
@@ -141,6 +144,19 @@ pub struct AgentHubRegistry {
     bus_seq: u64,
     /// Artifacts dir for this session's hub files.
     dir: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for AgentHubRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Complete assignments and bus bodies must not leak into diagnostics.
+        f.debug_struct("AgentHubRegistry")
+            .field("children", &self.entries.len())
+            .field("original_tasks", &self.original_tasks.len())
+            .field("seq", &self.seq)
+            .field("bus_seq", &self.bus_seq)
+            .field("dir", &self.dir)
+            .finish_non_exhaustive()
+    }
 }
 
 static REGISTRY: OnceLock<Mutex<AgentHubRegistry>> = OnceLock::new();
@@ -190,8 +206,11 @@ impl AgentHubRegistry {
 
     /// Register a child with an explicit spawn kind.
     pub fn register_kind(&mut self, name: &str, task: &str, kind: ChildKind) -> Result<ChildEntry> {
-        self.seq = self.seq.saturating_add(1);
-        let id = format!("{}-{}", sanitize_id(name), self.seq);
+        let seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::validation("hub: child sequence exhausted"))?;
+        let id = format!("{}-{seq}", sanitize_id(name));
         let dir = self.dir()?;
         let entry = ChildEntry {
             id: id.clone(),
@@ -207,21 +226,32 @@ impl AgentHubRegistry {
             steer_path: dir.join(format!("{id}.steer")),
             revived_from: None,
         };
+        self.seq = seq;
+        self.original_tasks.insert(id.clone(), task.to_string());
         self.entries.insert(id, entry.clone());
         Ok(entry)
     }
 
-    /// Mark the child running with its pid.
+    /// Mark a newly spawned child running. A late spawn callback cannot
+    /// resurrect an already killed or cancelled run.
     pub fn mark_running(&mut self, id: &str, pid: u32) {
-        if let Some(entry) = self.entries.get_mut(id) {
+        if let Some(entry) = self.entries.get_mut(id)
+            && entry.status == ChildStatus::Starting
+        {
             entry.pid = Some(pid);
             entry.status = ChildStatus::Running;
         }
     }
 
-    /// Settle a run (terminal status + finish timestamp).
+    /// Latch the first terminal outcome. A process-reaping callback must not
+    /// overwrite an operator kill or a parent cancellation with `Done`.
     pub fn settle(&mut self, id: &str, status: ChildStatus) {
-        if let Some(entry) = self.entries.get_mut(id) {
+        if !status.settled() {
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(id)
+            && !entry.status.settled()
+        {
             entry.status = status;
             entry.finished_ms = Some(now_ms());
         }
@@ -262,17 +292,7 @@ impl AgentHubRegistry {
             .entries
             .get(id)
             .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?;
-        let raw = match fs::read_to_string(&entry.transcript_path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                return Err(Error::tool(
-                    "hub",
-                    format!("read transcript {}: {err}", entry.transcript_path.display()),
-                ));
-            }
-        };
-        let tail = tail_bytes(&raw, TRANSCRIPT_PAGE_BYTES);
+        let tail = read_transcript_tail(&entry.transcript_path, TRANSCRIPT_PAGE_BYTES)?;
         let mut vault = crate::secrets::SecretVault::default();
         let (masked, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
         Ok(masked)
@@ -333,9 +353,9 @@ impl AgentHubRegistry {
         self.settle(id, ChildStatus::Killed);
     }
 
-    /// Register a revived run continuing `from_id`: fresh entry carrying the
-    /// prior transcript as context. Returns the new entry plus the task text
-    /// to launch (original task + transcript tail + continue directive).
+    /// Register a replacement run with the complete original assignment and
+    /// a bounded, redacted transcript tail. Repeated revivals do not nest
+    /// previous continuation prompts or silently discard task requirements.
     pub fn revive(&mut self, from_id: &str) -> Result<(ChildEntry, String)> {
         let prior = self
             .entries
@@ -348,16 +368,22 @@ impl AgentHubRegistry {
                 prior.status.as_str()
             )));
         }
-        let transcript = fs::read_to_string(&prior.transcript_path).unwrap_or_default();
-        let tail = tail_bytes(&transcript, REVIVE_TRANSCRIPT_BUDGET);
+        let original_task = self.original_tasks.get(from_id).cloned().ok_or_else(|| {
+            Error::tool("hub", "complete original assignment unavailable; refusing partial revival")
+        })?;
+        let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
+        let mut vault = crate::secrets::SecretVault::default();
+        let (tail, _audit) = crate::secrets::obfuscate(&tail, &mut vault, &[]);
         let task = format!(
             "{}\n\n[Continuation of a prior run ({}). Its transcript tail follows; \
              pick up where it left off and finish the task.]\n{}",
-            prior.task,
+            original_task,
             prior.status.as_str(),
             tail
         );
-        let mut entry = self.register_kind(&prior.name, &task, prior.kind)?;
+        // Keep the original assignment as this run's revival source, not
+        // the generated prompt containing the previous run's transcript.
+        let mut entry = self.register_kind(&prior.name, &original_task, prior.kind)?;
         entry.revived_from = Some(from_id.to_string());
         self.entries.insert(entry.id.clone(), entry.clone());
         Ok((entry, task))
@@ -396,7 +422,9 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
         .map_err(|e| Error::validation(format!("serialize bus message: {e}")))?;
     line.push(b'\n');
     if line.len() > MAX_STEER_FRAME_BYTES {
-        return Err(Error::validation("hub: serialized steering frame exceeds 64 KiB"));
+        return Err(Error::validation(
+            "hub: serialized steering frame exceeds 64 KiB",
+        ));
     }
     let queue_lock = open_steer_lock(path)
         .map_err(|e| Error::tool("hub", format!("open steer lock {}: {e}", path.display())))?;
@@ -451,7 +479,10 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
         .read_to_string(&mut raw)
         .map_err(|e| Error::tool("hub", format!("read draining queue {}: {e}", path.display())))?;
     if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_STEER_QUEUE_BYTES {
-        return Err(Error::tool("hub", "draining steering batch exceeds the queue limit"));
+        return Err(Error::tool(
+            "hub",
+            "draining steering batch exceeds the queue limit",
+        ));
     }
     // Parse the entire batch before acknowledging any of it. A malformed
     // frame must not silently discard its valid neighbors.
@@ -489,7 +520,10 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
     let draining = path.with_extension("draining");
     let result = (|| -> Result<Vec<String>> {
         let recovering = draining.try_exists().map_err(|e| {
-            Error::tool("hub", format!("stat draining queue {}: {e}", draining.display()))
+            Error::tool(
+                "hub",
+                format!("stat draining queue {}: {e}", draining.display()),
+            )
         })?;
         if !recovering {
             match fs::rename(path, &draining) {
@@ -507,7 +541,10 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
         // overwrite .draining: it may contain accepted, undelivered messages.
         let messages = read_steer_batch(&draining)?;
         fs::remove_file(&draining).map_err(|e| {
-            Error::tool("hub", format!("consume draining queue {}: {e}", draining.display()))
+            Error::tool(
+                "hub",
+                format!("consume draining queue {}: {e}", draining.display()),
+            )
         })?;
         Ok(messages)
     })();
@@ -518,6 +555,44 @@ pub fn drain_steer_file(path: &Path) -> Vec<String> {
             Vec::new()
         }
     }
+}
+
+/// Read only the requested suffix, even if the child has produced gigabytes
+/// of output. Snapshot the end offset so concurrent appends cannot expand the
+/// allocation. A missing transcript is normal before the first output frame;
+/// other I/O failures must not masquerade as an empty continuation context.
+fn read_transcript_tail(path: &Path, max: usize) -> Result<String> {
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(err) => {
+            return Err(Error::tool(
+                "hub",
+                format!("open transcript {}: {err}", path.display()),
+            ));
+        }
+    };
+    let end = file
+        .metadata()
+        .map_err(|e| Error::tool("hub", format!("stat transcript {}: {e}", path.display())))?
+        .len();
+    let start = end.saturating_sub(u64::try_from(max).unwrap_or(u64::MAX));
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| Error::tool("hub", format!("seek transcript {}: {e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.take(end.saturating_sub(start))
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::tool("hub", format!("read transcript {}: {e}", path.display())))?;
+    // A bounded seek may land inside a UTF-8 codepoint. Discard only its
+    // leading continuation bytes; tolerate an in-flight partial final frame.
+    let mut first = 0;
+    if start > 0 {
+        while first < bytes.len() && bytes[first] & 0xc0 == 0x80 {
+            first += 1;
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes[first..]);
+    Ok(tail_bytes(&text, max))
 }
 
 fn sanitize_id(name: &str) -> String {
@@ -563,6 +638,116 @@ mod tests {
     }
 
     #[test]
+    fn revival_preserves_full_assignment_without_nesting_previous_prompts() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let original = format!("{}FINAL REQUIREMENT: preserve all data", "step; ".repeat(200));
+        let child = reg.register("worker", &original).expect("register");
+        assert_eq!(child.task.chars().count(), 500, "roster stays bounded");
+        reg.append_transcript(&child.id, "first progress");
+        reg.settle(&child.id, ChildStatus::Failed);
+        let (next, prompt) = reg.revive(&child.id).expect("revive");
+        assert!(prompt.starts_with(&original));
+        assert!(prompt.contains("first progress"));
+        assert_eq!(next.revived_from.as_deref(), Some(child.id.as_str()));
+        reg.append_transcript(&next.id, "second progress");
+        reg.settle(&next.id, ChildStatus::Failed);
+        let (_, prompt) = reg.revive(&next.id).expect("revive again");
+        assert!(prompt.starts_with(&original));
+        assert!(prompt.contains("second progress"));
+        assert!(!prompt.contains("first progress"));
+        assert_eq!(prompt.matches("Continuation of a prior run").count(), 1);
+        assert!(!format!("{reg:?}").contains("FINAL REQUIREMENT"));
+    }
+
+    #[test]
+    fn revival_refuses_unreadable_transcript_without_registering_a_child() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "complete assignment").expect("register");
+        fs::create_dir(&child.transcript_path).expect("unreadable transcript fixture");
+        reg.settle(&child.id, ChildStatus::Failed);
+        assert!(reg.revive(&child.id).is_err());
+        assert_eq!(reg.roster().len(), 1);
+    }
+
+    #[test]
+    fn revival_redacts_transcript_credentials() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "finish the work").expect("register");
+        reg.append_transcript(
+            &child.id,
+            "key is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        );
+        reg.settle(&child.id, ChildStatus::Failed);
+        let (_, prompt) = reg.revive(&child.id).expect("revive");
+        assert!(!prompt.contains("sk-ant-api03-AAAA"));
+        assert!(prompt.contains("<pi-secret:"));
+    }
+
+    #[test]
+    fn transcript_tail_does_not_read_the_unbounded_prefix() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("large.transcript.jsonl");
+        let mut file = fs::File::create(&path).expect("transcript");
+        file.write_all(&[0xff]).expect("invalid UTF-8 in old prefix");
+        file.set_len(16 * 1024 * 1024).expect("sparse transcript");
+        file.seek(SeekFrom::End(0)).expect("end");
+        file.write_all(b"latest progress\n").expect("tail");
+        drop(file);
+        let tail = read_transcript_tail(&path, 64).expect("bounded suffix");
+        assert!(tail.len() <= 64);
+        assert!(tail.ends_with("latest progress\n"));
+        assert!(!tail.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn transcript_tail_rounds_past_split_utf8_prefix() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let path = temp.path().join("unicode.transcript.jsonl");
+        let text = format!("{}done", "é".repeat(100));
+        fs::write(&path, &text).expect("transcript");
+        for max in 0..=33 {
+            let tail = read_transcript_tail(&path, max).expect("tail");
+            assert!(tail.len() <= max);
+            assert!(text.ends_with(&tail));
+            assert!(!tail.contains('\u{fffd}'));
+        }
+    }
+
+    #[test]
+    fn late_callbacks_cannot_resurrect_or_overwrite_terminal_children() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.mark_killed(&child.id);
+        let killed = reg.get(&child.id).expect("killed entry");
+        reg.mark_running(&child.id, 99);
+        reg.settle(&child.id, ChildStatus::Done);
+        let final_entry = reg.get(&child.id).expect("terminal entry");
+        assert_eq!(final_entry.status, ChildStatus::Killed);
+        assert_eq!(final_entry.finished_ms, killed.finished_ms);
+        assert_eq!(final_entry.pid, killed.pid);
+    }
+
+    #[test]
+    fn nonterminal_settlement_does_not_finish_a_child() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.settle(&child.id, ChildStatus::Running);
+        let entry = reg.get(&child.id).expect("entry");
+        assert_eq!(entry.status, ChildStatus::Starting);
+        assert!(entry.finished_ms.is_none());
+    }
+
+    #[test]
     fn failed_steer_is_not_reported_in_the_inbox() {
         let temp = tempfile::tempdir().expect("hub directory");
         let mut reg = fresh_registry();
@@ -586,7 +771,10 @@ mod tests {
         assert!(drain_steer_file(&child.steer_path).is_empty());
         assert!(child.steer_path.exists());
         drop(lock);
-        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] accepted"]);
+        assert_eq!(
+            drain_steer_file(&child.steer_path),
+            vec!["[hub:parent] accepted"]
+        );
         assert!(drain_steer_file(&child.steer_path).is_empty());
     }
 
@@ -600,9 +788,15 @@ mod tests {
         let draining = child.steer_path.with_extension("draining");
         fs::rename(&child.steer_path, &draining).expect("simulate interrupted drain");
         reg.steer(&child.id, "parent", "second").expect("send second");
-        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] first"]);
+        assert_eq!(
+            drain_steer_file(&child.steer_path),
+            vec!["[hub:parent] first"]
+        );
         assert!(child.steer_path.exists());
-        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] second"]);
+        assert_eq!(
+            drain_steer_file(&child.steer_path),
+            vec!["[hub:parent] second"]
+        );
         assert!(drain_steer_file(&child.steer_path).is_empty());
     }
 
@@ -614,7 +808,10 @@ mod tests {
         let child = reg.register("worker", "task").expect("register");
         reg.steer(&child.id, "parent", "valid").expect("send");
         let original = fs::read(&child.steer_path).expect("queued bytes");
-        let mut file = OpenOptions::new().append(true).open(&child.steer_path).expect("fixture");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&child.steer_path)
+            .expect("fixture");
         file.write_all(b"{broken\n").expect("partial frame");
         drop(file);
         assert!(drain_steer_file(&child.steer_path).is_empty());
@@ -622,7 +819,10 @@ mod tests {
         assert!(draining.exists(), "failed batch must remain recoverable");
         assert!(fs::read(&draining).expect("retained batch").starts_with(&original));
         fs::write(&draining, original).expect("repair fixture");
-        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] valid"]);
+        assert_eq!(
+            drain_steer_file(&child.steer_path),
+            vec!["[hub:parent] valid"]
+        );
         assert!(drain_steer_file(&child.steer_path).is_empty());
     }
 
