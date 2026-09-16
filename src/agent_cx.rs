@@ -353,6 +353,8 @@ mod tests {
         let _parent_guard = parent.clone().set_current_restricted();
         let owner = AgentCx::for_request_with_budget(Budget::new().with_poll_quota(7));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This panic is intentional; do not pollute another test's crash bundle.
+            let _panic_guard = crate::crash::SuppressPanicHook::new();
             let mut scoped = std::pin::pin!(owner.with_current(async {
                 assert_eq!(
                     Cx::current().expect("owner installed").budget(),

@@ -32,10 +32,9 @@ pub const CRASHES_DIR_NAME: &str = "crashes";
 static RING: std::sync::Mutex<Option<VecDeque<String>>> = std::sync::Mutex::new(None);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 thread_local! {
-    /// Set while running code whose panics are recovered internally
-    /// (`catch_unwind` sites such as background compaction). The panic hook
-    /// skips bundle capture for these — a caught panic is not a crash.
-    static PANIC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Number of active synchronous recovery scopes on this thread. A count
+    /// keeps an inner guard from disabling an outer guard's suppression.
+    static PANIC_SUPPRESSION_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Marks the current thread's panics as expected-and-recovered.
@@ -44,12 +43,16 @@ thread_local! {
 /// must not produce "previous run crashed" bundles. Suppression holds for
 /// the guard's lifetime; the crash hook returns early (no bundle, no
 /// chained hook) because the recovery is intentional.
+///
+/// Keep this guard on its creating thread and within synchronous code. For
+/// async recovery, use [`suppress_panic_hook_for_future`] so suppression never
+/// remains active while the task is suspended.
 #[must_use]
 pub struct SuppressPanicHook;
 
 impl SuppressPanicHook {
     pub fn new() -> Self {
-        PANIC_SUPPRESSED.with(|flag| flag.set(true));
+        PANIC_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Self
     }
 }
@@ -62,9 +65,25 @@ impl Default for SuppressPanicHook {
 
 impl Drop for SuppressPanicHook {
     fn drop(&mut self) {
-        PANIC_SUPPRESSED.with(|flag| flag.set(false));
+        PANIC_SUPPRESSION_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
     }
 }
+
+/// Suppress crash capture only while polling a future with a recovery boundary.
+///
+/// This does not catch panics itself. Pair it with `catch_unwind` at the
+/// recovery site. The guard is destroyed before every `Pending` or `Ready`
+/// return, and during unwinding, so unrelated tasks retain normal crash capture
+/// even when the wrapped future migrates between runtime threads.
+pub async fn suppress_panic_hook_for_future<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|cx| {
+        let _guard = SuppressPanicHook::new();
+        std::future::Future::poll(future.as_mut(), cx)
+    })
+    .await
+}
+
 /// Record an operation into the redacted-at-capture recent-operations ring
 /// that crash bundles include as context. Cheap; capped at
 /// [`RING_CAPACITY`] entries.
@@ -239,7 +258,7 @@ pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Recovered-internal panics (catch_unwind sites) are not crashes.
-        if PANIC_SUPPRESSED.with(std::cell::Cell::get) {
+        if PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get) > 0 {
             return;
         }
         let (sha, ts) = build_metadata();
@@ -504,6 +523,101 @@ mod tests {
         let preview = send_preview(&dir).expect("preview");
         assert!(preview.contains(CRASH_SCHEMA));
         assert!(!preview.contains("ghp_dddddd"), "{preview}");
+    }
+
+    #[test]
+    fn nested_suppression_guards_can_drop_in_either_order() {
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        let outer = SuppressPanicHook::new();
+        let inner = SuppressPanicHook::new();
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 2);
+        drop(inner);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+        let inner = SuppressPanicHook::new();
+        drop(outer);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+        drop(inner);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_is_inactive_between_future_polls() {
+        use std::future::Future as _;
+        let mut first_poll = true;
+        let operation = std::future::poll_fn(move |_| {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            if first_poll {
+                first_poll = false;
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(7)
+            }
+        });
+        let mut future = Box::pin(suppress_panic_hook_for_future(operation));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        assert_eq!(future.as_mut().poll(&mut cx), std::task::Poll::Ready(7));
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn dropping_pending_future_leaves_thread_unsuppressed() {
+        use std::future::Future as _;
+        let mut future = Box::pin(suppress_panic_hook_for_future(async {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            std::future::pending::<()>().await;
+        }));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        drop(future);
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_is_restored_after_poll_unwinds() {
+        use std::future::Future as _;
+        let mut future = Box::pin(suppress_panic_hook_for_future(async {
+            let _inner = SuppressPanicHook::new();
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 2);
+            panic!("recovered async panic");
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            let _ = future.as_mut().poll(&mut cx);
+        }));
+        assert!(result.is_err());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    #[test]
+    fn suppression_future_can_resume_on_another_thread() {
+        use std::future::Future as _;
+        let mut first_poll = true;
+        let operation = std::future::poll_fn(move |_| {
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 1);
+            if first_poll {
+                first_poll = false;
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        });
+        let mut future = Box::pin(suppress_panic_hook_for_future(operation));
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        std::thread::spawn(move || {
+            let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+            assert!(future.as_mut().poll(&mut cx).is_ready());
+            assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
+        })
+        .join()
+        .expect("resumed future");
+        assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
     }
 
     #[test]

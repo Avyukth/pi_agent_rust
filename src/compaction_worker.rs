@@ -513,13 +513,18 @@ async fn run_compaction_task(
         Err(Error::session("Background compaction aborted".to_string()))
     }
     .fuse();
-    let compaction_fut = std::panic::AssertUnwindSafe(compaction::compact_auto(
-        preparation,
-        provider,
-        &api_key,
-        custom_instructions.as_deref(),
-    ))
-    .catch_unwind();
+    // Only this provider future has a panic recovery boundary. Suppress
+    // crash capture during its polls, not while it is suspended or while
+    // polling the abort/timeout machinery.
+    let compaction_fut = pi::crash::suppress_panic_hook_for_future(
+        std::panic::AssertUnwindSafe(compaction::compact_auto(
+            preparation,
+            provider,
+            &api_key,
+            custom_instructions.as_deref(),
+        ))
+        .catch_unwind(),
+    );
     let timed_compaction_fut = async move {
         match asupersync::time::timeout(asupersync::time::wall_now(), timeout, compaction_fut).await
         {
@@ -535,11 +540,6 @@ async fn run_compaction_task(
     .fuse();
     futures::pin_mut!(abort_fut, timed_compaction_fut);
 
-    // bd-ajg8l #3: panics inside background compaction are recovered here,
-    // so suppress crash-bundle capture while this future is polled. The
-    // guard lives across the await; thread-local suppression applies on the
-    // polling thread.
-    let _panic_guard = pi::crash::SuppressPanicHook::new();
     match futures::future::select(abort_fut, timed_compaction_fut).await {
         futures::future::Either::Left((abort_result, _)) => abort_result,
         futures::future::Either::Right((result, _)) => result,
@@ -1115,9 +1115,15 @@ mod tests {
 
             let (actual_origin, outcome) = worker.try_recv_bound().await.expect("completed result");
             assert_eq!(actual_origin, Some(origin));
-            assert_eq!(outcome.expect("completed summary must not expire").summary, "summary");
+            assert_eq!(
+                outcome.expect("completed summary must not expire").summary,
+                "summary"
+            );
             assert_eq!(worker.attempt_count, 1, "not durably applied yet");
-            assert!(worker.try_recv_bound().await.is_none(), "consume exactly once");
+            assert!(
+                worker.try_recv_bound().await.is_none(),
+                "consume exactly once"
+            );
         });
     }
 
