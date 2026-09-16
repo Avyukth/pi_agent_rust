@@ -1656,14 +1656,19 @@ pub struct FailoverSwapRequest<'a> {
     pub class: crate::failover::FailoverClass,
     /// Chain index recorded with the transcript entry.
     pub chain_position: usize,
-    /// The level the entry is clamped against.
+    /// The level the entry is clamped against: the level ORIGINALLY REQUESTED,
+    /// captured before any swap — never the live level (bd-jk057, settled).
     ///
-    /// Print mode passes the LIVE level and RPC the level originally requested
-    /// before any swap. They differ only from the second hop of a chain
-    /// onwards, where print's choice ratchets the level down through whatever
-    /// the previous fallback allowed and never recovers it. Passed in rather
-    /// than chosen here so this extraction changes neither surface; the
-    /// divergence is real and tracked separately.
+    /// A clamp exists to respect a MODEL's limit, not to make one model's limit
+    /// sticky across models. Passing the live level ratchets it down through
+    /// whatever the worst model the chain happened to touch allowed, and never
+    /// recovers it — for the turn and, because the level is written into the
+    /// session header, for the session.
+    ///
+    /// Every surface gets this value the same way, from
+    /// `FailoverState::primary_for_swap`, which yields the recorded primary
+    /// while a chain is in flight and the live identity otherwise. Print mode
+    /// passed the live level until bd-jk057; RPC and the SDK never did.
     pub thinking_level_to_clamp: crate::model::ThinkingLevel,
     /// Whether a completed error response must have left a revertible tail.
     pub require_incomplete_tail: bool,

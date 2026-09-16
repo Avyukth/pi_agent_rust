@@ -9227,15 +9227,33 @@ async fn try_print_failover(
         current_provider.name().to_string(),
         current_provider.model_id().to_string(),
     );
-    // Captured before any swap installs the fallback's own clamped level, so a
-    // later restoration gives back what the user asked for rather than what the
-    // detour allowed (bd-gm481.1).
-    let requested_thinking_level = session
-        .agent
-        .stream_options()
-        .thinking_level
-        .unwrap_or_default();
-    let Some(chain) = pi::failover::chain_for(chains, "default", &from_provider, &from_model)
+    // The identity the CHAIN started from, which equals the live model only on
+    // the first hop. From the second hop onwards the live model is itself a
+    // fallback, and resolving from it was two bugs at once:
+    //
+    //   * the thinking level clamped against whatever the previous hop allowed,
+    //     so it ratcheted down through the worst model the chain touched and
+    //     never recovered — for the turn and, because the level is written into
+    //     the session header, for the session (bd-jk057); and
+    //   * an exact `provider/model`-keyed chain stopped resolving at all, since
+    //     the key names the primary and the live model is no longer it, so hop
+    //     two never ran.
+    //
+    // RPC has always resolved both from the recorded primary; this is print
+    // adopting that, not a new rule. `primary_for_swap` returns the recorded
+    // primary when a chain is in flight and the live identity otherwise, so the
+    // first hop is unchanged (bd-gm481.1, bd-oqo03.1).
+    let primary = failover_state.primary_for_swap(PrintFailoverPrimary {
+        provider: from_provider.clone(),
+        model_id: from_model.clone(),
+        requested_thinking_level: session
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default(),
+    });
+    let Some(chain) =
+        pi::failover::chain_for(chains, "default", &primary.provider, &primary.model_id)
     else {
         return Ok(None);
     };
@@ -9251,14 +9269,10 @@ async fn try_print_failover(
         auth: ctx.auth,
         cli_api_key: ctx.cli_api_key,
         class,
-        // The LIVE level, which is what print mode has always clamped against
-        // here. RPC clamps against the level originally requested; see
-        // FailoverSwapRequest::thinking_level_to_clamp.
-        thinking_level_to_clamp: session
-            .agent
-            .stream_options()
-            .thinking_level
-            .unwrap_or_default(),
+        // The level originally requested, not the live one (bd-jk057). A clamp
+        // exists to respect a MODEL's limit, never to make one model's limit
+        // sticky across models.
+        thinking_level_to_clamp: primary.requested_thinking_level,
         require_incomplete_tail,
     };
     let outcome = session.try_failover(&cx, &attempt).await?;
@@ -9274,11 +9288,7 @@ async fn try_print_failover(
     // swap of a chain — a second hop moves away from a fallback, and the
     // identity to restore is still the model the chain started from.
     failover_state.record_swap(
-        PrintFailoverPrimary {
-            provider: committed.from_provider.clone(),
-            model_id: committed.from_model.clone(),
-            requested_thinking_level,
-        },
+        primary,
         (committed.to_provider.clone(), committed.to_model.clone()),
         std::time::Instant::now(),
     );
@@ -12583,6 +12593,167 @@ mod tests {
                 ready.chain_position(),
                 0,
                 "back on the primary, the chain starts over"
+            );
+        });
+    }
+
+    /// bd-jk057 and its unfiled sibling: from the SECOND hop of a chain onwards,
+    /// print mode resolved everything from the LIVE model, which by then is
+    /// itself a fallback. Two things went wrong at once, and this covers both.
+    ///
+    /// A user asking for High, on a chain `primary -> non-reasoning -> reasoning`
+    /// keyed by an exact `provider/model` spec, used to get: hop two never
+    /// running at all (the key names the primary, and the live model is no
+    /// longer it), and — with a role-keyed chain where hop two DID run — the
+    /// level clamped against what hop one allowed, so it ratcheted to Off and
+    /// stayed there for the session.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_resolves_the_chain_and_the_thinking_level_from_the_primary() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry = |provider: &str, model_id: &str, reasoning: bool| ModelEntry {
+                model: pi::provider::Model {
+                    id: model_id.to_string(),
+                    name: model_id.to_string(),
+                    api: if provider == "openai" {
+                        "openai-completions".to_string()
+                    } else {
+                        "anthropic".to_string()
+                    },
+                    provider: provider.to_string(),
+                    base_url: if provider == "openai" {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        "https://api.anthropic.com".to_string()
+                    },
+                    reasoning,
+                    input: vec![InputType::Text],
+                    cost: pi::provider::ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: std::collections::HashMap::new(),
+                },
+                api_key: Some(format!("{model_id}-key")),
+                headers: std::collections::HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            // A thinks; B does NOT, so it clamps any level to Off; C thinks
+            // again. B is the "worst model the chain touched".
+            let primary = model_entry("openai", "primary-model", true);
+            let no_reasoning = model_entry("anthropic", "b-no-reasoning", false);
+            let reasoning_again = model_entry("anthropic", "c-reasoning", true);
+
+            let provider = providers::create_provider(&primary, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-model-key".to_string());
+            agent.stream_options_mut().thinking_level = Some(ThinkingLevel::High);
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(stored)),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![
+                primary.clone(),
+                no_reasoning.clone(),
+                reasoning_again.clone(),
+            ];
+            let failover_ctx = Some(FailoverResolution {
+                available_models: &available_models,
+                auth: &auth,
+                cli_api_key: None,
+            });
+
+            // Keyed by the EXACT primary spec, not "default": this is what makes
+            // hop two depend on resolving the chain from the primary. A
+            // role-keyed chain would hide half the bug.
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "openai/primary-model".to_string(),
+                    vec![
+                        "anthropic/b-no-reasoning".to_string(),
+                        "anthropic/c-reasoning".to_string(),
+                    ],
+                )])),
+                max_failovers_per_turn: Some(2),
+                ..Default::default()
+            });
+            let mut failover_state = PrintFailoverState::new(&config);
+
+            let hop_one = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("hop one");
+            assert_eq!(
+                hop_one,
+                Some(("anthropic".to_string(), "b-no-reasoning".to_string())),
+                "hop one installs the first chain entry"
+            );
+            assert_eq!(
+                session.agent.stream_options().thinking_level,
+                Some(ThinkingLevel::Off),
+                "a non-reasoning model clamps the requested level to Off"
+            );
+
+            let hop_two = try_print_failover(
+                &mut session,
+                &config,
+                failover_ctx,
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                1,
+            )
+            .await
+            .expect("hop two");
+            assert_eq!(
+                hop_two,
+                Some(("anthropic".to_string(), "c-reasoning".to_string())),
+                "the chain is keyed by the PRIMARY, so hop two must still \
+                 resolve it after hop one moved the live model off that key"
+            );
+            assert_eq!(
+                session.agent.stream_options().thinking_level,
+                Some(ThinkingLevel::High),
+                "the clamp respects a MODEL's limit; it must not make hop one's \
+                 limit sticky across the rest of the chain (bd-jk057)"
+            );
+            assert_eq!(
+                failover_state
+                    .primary()
+                    .as_ref()
+                    .map(|p| (p.provider.as_str(), p.model_id.as_str())),
+                Some(("openai", "primary-model")),
+                "two hops in, the identity to restore is still the chain's origin"
             );
         });
     }
