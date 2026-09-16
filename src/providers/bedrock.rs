@@ -32,6 +32,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use url::Url;
 
+mod request_options;
 mod streaming;
 
 const DEFAULT_REGION: &str = "us-east-1";
@@ -620,7 +621,9 @@ impl Provider for BedrockProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let request_body = Self::build_request(context, options);
+        // Apply model controls before hooks, auth discovery, and body signing.
+        let request_body =
+            request_options::prepare(&self.model, self.compat.as_ref(), context, options)?;
 
         let auth_context = self.resolve_auth_context(options).await?;
         // Reject caller-owned signing headers before endpoint parsing or an inference request.
@@ -1100,6 +1103,10 @@ struct BedrockUsage {
     #[serde(default)]
     output_tokens: u64,
     #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
     total_tokens: u64,
 }
 
@@ -1107,12 +1114,18 @@ fn convert_usage(usage: &BedrockUsage) -> Usage {
     let total = if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        usage.input_tokens.saturating_add(usage.output_tokens)
+        usage
+            .input_tokens
+            .saturating_add(usage.output_tokens)
+            .saturating_add(usage.cache_read_input_tokens)
+            .saturating_add(usage.cache_write_input_tokens)
     };
 
     Usage {
         input: usage.input_tokens,
         output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_write: usage.cache_write_input_tokens,
         total_tokens: total,
         ..Usage::default()
     }
@@ -1329,6 +1342,7 @@ mod tests {
     use super::*;
     use crate::auth::AuthCredential;
     use chrono::TimeZone as _;
+    use futures::StreamExt as _;
     use serde_json::json;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
@@ -1970,5 +1984,160 @@ mod tests {
             value["content"][0]["toolResult"]["content"][0]["image"]["format"],
             "webp"
         );
+    }
+
+    #[test]
+    fn model_controls_reach_hook_and_signed_http_body() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let temp_dir = tempfile::tempdir().expect("auth directory");
+        let auth_path = temp_dir.path().join("auth.json");
+        write_test_sigv4_auth(&auth_path);
+        let provider = BedrockProvider::new("us.anthropic.claude-opus-4-6-v1")
+            .with_auth_path(auth_path)
+            .with_base_url(&base_url);
+        let context = test_context_with_tools();
+        let original = serde_json::to_value(context.messages.as_ref()).unwrap();
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            max_tokens: Some(8192),
+            temperature: Some(0.2),
+            cache_retention: crate::provider::CacheRetention::Long,
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |mut event| {
+                    assert_eq!(
+                        event.payload["additionalModelRequestFields"]["thinking"]["type"],
+                        "adaptive"
+                    );
+                    assert_eq!(event.payload["system"][1]["cachePoint"]["ttl"], "1h");
+                    assert!(event.payload["inferenceConfig"].get("temperature").is_none());
+                    event.payload["additionalModelRequestFields"]["output_config"]["effort"] =
+                        json!("low");
+                    event.payload["messages"][0]["content"][0]["text"] = json!("Hook rewrite");
+                    Box::pin(futures::future::ready(Some(event.payload)))
+                },
+            )),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let events = runtime.block_on(async {
+            provider
+                .stream(&context, &options)
+                .await
+                .expect("provider stream")
+                .collect::<Vec<_>>()
+                .await
+        });
+        assert!(events.iter().all(Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
+        assert_eq!(serde_json::to_value(context.messages.as_ref()).unwrap(), original);
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Hook rewrite");
+        assert_eq!(body["additionalModelRequestFields"]["output_config"]["effort"], "low");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 8192);
+        assert_eq!(body["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
+        assert_eq!(body["messages"][2]["content"][1]["cachePoint"]["ttl"], "1h");
+        let signing_time = chrono::NaiveDateTime::parse_from_str(
+            &captured.headers["x-amz-date"],
+            "%Y%m%dT%H%M%SZ",
+        )
+        .unwrap()
+        .and_utc();
+        let expected = build_sigv4_headers(
+            &provider.converse_url("us-west-2").unwrap(),
+            &captured.body,
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("session-token"),
+            "us-west-2",
+            signing_time,
+        )
+        .unwrap();
+        assert_eq!(captured.headers["authorization"], expected.authorization);
+        assert_eq!(captured.headers["x-amz-content-sha256"], expected.payload_hash);
+    }
+
+    #[test]
+    fn rejected_request_hook_preserves_native_controls_on_the_wire() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let provider = BedrockProvider::new("anthropic.claude-3-7-sonnet")
+            .with_base_url(base_url);
+        let context = test_context_with_tools();
+        let options = StreamOptions {
+            api_key: Some("test-bearer".to_string()),
+            thinking_level: Some(crate::model::ThinkingLevel::Low),
+            max_tokens: Some(4096),
+            cache_retention: crate::provider::CacheRetention::Short,
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                Box::pin(futures::future::ready(Some(json!({"invalid": true}))))
+            })),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(async { provider.stream(&context, &options).await });
+        assert!(result.is_ok(), "{:?}", result.err());
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: Value = serde_json::from_slice(&captured.body).unwrap();
+        assert_eq!(body["additionalModelRequestFields"]["thinking"]["type"], "enabled");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 4096);
+        assert_eq!(body["system"][1], json!({"cachePoint": {"type": "default"}}));
+        assert_eq!(body["messages"][0]["content"][0]["text"], "Ping");
+    }
+
+    #[test]
+    fn invalid_thinking_budget_fails_before_endpoint_or_hook() {
+        let provider = BedrockProvider::new("anthropic.claude-sonnet-4-5")
+            .with_base_url("not a valid endpoint URL");
+        let options = StreamOptions {
+            api_key: Some("test-bearer".to_string()),
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            max_tokens: Some(1024),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(|_| {
+                panic!("invalid budget must not reach the request hook")
+            })),
+            ..StreamOptions::default()
+        };
+        let context = test_context_with_tools();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(async { provider.stream(&context, &options).await })
+            .err()
+            .expect("invalid budget");
+        assert!(error.to_string().contains("max_tokens greater than 1024"));
+    }
+
+    #[test]
+    fn json_usage_keeps_cache_counters_and_saturates_total_fallback() {
+        let mut wire = json!({
+            "inputTokens": 10,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 20,
+            "cacheWriteInputTokens": 3
+        });
+        let usage: BedrockUsage = serde_json::from_value(wire.clone()).unwrap();
+        let converted = convert_usage(&usage);
+        assert_eq!(converted.input, 10);
+        assert_eq!(converted.cache_read, 20);
+        assert_eq!(converted.cache_write, 3);
+        assert_eq!(converted.total_tokens, 38);
+        wire["totalTokens"] = json!(50);
+        let usage: BedrockUsage = serde_json::from_value(wire).unwrap();
+        assert_eq!(convert_usage(&usage).total_tokens, 50);
+        let huge: BedrockUsage = serde_json::from_value(json!({
+            "inputTokens": u64::MAX, "outputTokens": 1,
+            "cacheReadInputTokens": 2, "cacheWriteInputTokens": 3
+        }))
+        .unwrap();
+        assert_eq!(convert_usage(&huge).total_tokens, u64::MAX);
     }
 }
