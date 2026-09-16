@@ -262,7 +262,10 @@ impl Provider for VertexProvider {
         // Select the protocol before dispatch. An unknown publisher must not
         // receive a Gemini request with the user's Google credentials.
         if !matches!(self.publisher.as_str(), "google" | "anthropic") {
-            return Err(Error::provider(self.name(), "Unsupported Vertex AI publisher"));
+            return Err(Error::provider(
+                self.name(),
+                "Unsupported Vertex AI publisher",
+            ));
         }
         let authorization = vertex_authorization(options, self.compat.as_ref(), |name| {
             std::env::var(name).ok()
@@ -643,17 +646,18 @@ fn vertex_authorization(
     compat: Option<&CompatConfig>,
     env_lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String> {
-    let explicit = super::first_non_empty_header_value_case_insensitive(
-        &options.headers,
-        &["authorization"],
-    )
-    .or_else(|| {
-        compat
-            .and_then(|compat| compat.custom_headers.as_ref())
-            .and_then(|headers| {
-                super::first_non_empty_header_value_case_insensitive(headers, &["authorization"])
-            })
-    });
+    let explicit =
+        super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+            .or_else(|| {
+                compat
+                    .and_then(|compat| compat.custom_headers.as_ref())
+                    .and_then(|headers| {
+                        super::first_non_empty_header_value_case_insensitive(
+                            headers,
+                            &["authorization"],
+                        )
+                    })
+            });
     if let Some(authorization) = explicit {
         return Ok(authorization);
     }
