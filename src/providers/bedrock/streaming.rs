@@ -7,8 +7,8 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    AssistantMessage, ContentBlock, RedactedThinkingContent, StopReason, StreamEvent,
-    TextContent, ThinkingContent, ToolCall, Usage,
+    AssistantMessage, ContentBlock, RedactedThinkingContent, StopReason, StreamEvent, TextContent,
+    ThinkingContent, ToolCall, Usage,
 };
 use base64::Engine as _;
 use futures::{Stream, StreamExt, stream};
@@ -24,7 +24,10 @@ const MAX_BLOCKS: usize = 1024;
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
 
 fn invalid(message: &str) -> Error {
-    Error::provider("amazon-bedrock", format!("Invalid Bedrock event stream: {message}"))
+    Error::provider(
+        "amazon-bedrock",
+        format!("Invalid Bedrock event stream: {message}"),
+    )
 }
 
 // The table index is bounded to 0..256 before conversion.
@@ -36,7 +39,11 @@ const fn crc_table() -> [u32; 256] {
         let mut crc = index as u32;
         let mut bit = 0;
         while bit < 8 {
-            crc = if crc & 1 == 0 { crc >> 1 } else { (crc >> 1) ^ 0xedb8_8320 };
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xedb8_8320
+            };
             bit += 1;
         }
         table[index] = crc;
@@ -61,7 +68,7 @@ fn take<'a>(bytes: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
     Ok(value)
 }
 
-fn read_u32(bytes: &[u8]) -> u32 {
+const fn read_u32(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
@@ -93,19 +100,36 @@ fn decode_headers(mut bytes: &[u8]) -> Result<BTreeMap<String, Option<String>>> 
         let kind = take(&mut bytes, 1)?[0];
         let value = match kind {
             0 | 1 => None,
-            2 => { take(&mut bytes, 1)?; None }
-            3 => { take(&mut bytes, 2)?; None }
-            4 => { take(&mut bytes, 4)?; None }
-            5 | 8 => { take(&mut bytes, 8)?; None }
-            9 => { take(&mut bytes, 16)?; None }
+            2 => {
+                take(&mut bytes, 1)?;
+                None
+            }
+            3 => {
+                take(&mut bytes, 2)?;
+                None
+            }
+            4 => {
+                take(&mut bytes, 4)?;
+                None
+            }
+            5 | 8 => {
+                take(&mut bytes, 8)?;
+                None
+            }
+            9 => {
+                take(&mut bytes, 16)?;
+                None
+            }
             6 | 7 => {
                 let length = take(&mut bytes, 2)?;
                 let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
                 let value = take(&mut bytes, length)?;
                 if kind == 7 {
-                    Some(std::str::from_utf8(value)
-                        .map_err(|_| invalid("event header value is not UTF-8"))?
-                        .to_string())
+                    Some(
+                        std::str::from_utf8(value)
+                            .map_err(|_| invalid("event header value is not UTF-8"))?
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
@@ -228,16 +252,55 @@ impl MessageState {
 
     fn add_block(&mut self, id: u64, content: ContentBlock) -> Result<usize> {
         if self.seen.len() >= MAX_BLOCKS || !self.seen.insert(id) {
-            return Err(invalid("duplicate content block or local block budget exceeded"));
+            return Err(invalid(
+                "duplicate content block or local block budget exceeded",
+            ));
         }
         let index = self.message.content.len();
         self.message.content.push(content);
-        self.open.insert(id, OpenBlock {
-            index,
-            tool_input: String::new(),
-            redacted: Vec::new(),
-        });
+        self.open.insert(
+            id,
+            OpenBlock {
+                index,
+                tool_input: String::new(),
+                redacted: Vec::new(),
+            },
+        );
         Ok(index)
+    }
+
+    /// The only content-block kind Bedrock opens explicitly is a tool call;
+    /// text and thinking blocks are created by their first delta. Split out of
+    /// `event` so that dispatcher stays under the line budget.
+    fn start_block(&mut self, value: &Value) -> Result<()> {
+        let id = block_id(value)?;
+        let start = value
+            .get("start")
+            .ok_or_else(|| invalid("missing block start"))?;
+        let tool = start
+            .get("toolUse")
+            .ok_or_else(|| invalid("unsupported content block start"))?;
+        let tool_id = string(tool, "toolUseId")?.to_string();
+        let name = string(tool, "name")?.to_string();
+        if tool_id.is_empty() || name.is_empty() {
+            return Err(invalid("tool block has an empty identity"));
+        }
+        self.reserve_content(tool_id.len().saturating_add(name.len()))?;
+        let index = self.add_block(
+            id,
+            ContentBlock::ToolCall(ToolCall {
+                id: tool_id.clone(),
+                name: name.clone(),
+                arguments: Value::Null,
+                thought_signature: None,
+            }),
+        )?;
+        self.pending.push_back(StreamEvent::ToolCallStart {
+            content_index: index,
+            id: tool_id,
+            name,
+        });
+        Ok(())
     }
 
     fn event(&mut self, kind: &str, value: &Value) -> Result<()> {
@@ -246,7 +309,9 @@ impl MessageState {
                 return Err(invalid("duplicate messageStart or non-assistant role"));
             }
             self.started = true;
-            self.pending.push_back(StreamEvent::Start { partial: self.message.clone() });
+            self.pending.push_back(StreamEvent::Start {
+                partial: self.message.clone(),
+            });
             return Ok(());
         }
         if !self.started {
@@ -254,19 +319,32 @@ impl MessageState {
         }
         if kind == "metadata" {
             if !self.stopped || self.metadata_seen {
-                return Err(invalid("metadata arrived before messageStop or more than once"));
+                return Err(invalid(
+                    "metadata arrived before messageStop or more than once",
+                ));
             }
-            let usage = value.get("usage").ok_or_else(|| invalid("metadata has no usage"))?;
+            let usage = value
+                .get("usage")
+                .ok_or_else(|| invalid("metadata has no usage"))?;
             let input = token_count(usage, "inputTokens")?;
             let output = token_count(usage, "outputTokens")?;
             let cache_read = token_count(usage, "cacheReadInputTokens")?;
             let cache_write = token_count(usage, "cacheWriteInputTokens")?;
             let total = match usage.get("totalTokens") {
-                Some(value) => value.as_u64().ok_or_else(|| invalid("invalid totalTokens"))?,
-                None => input.saturating_add(output).saturating_add(cache_read).saturating_add(cache_write),
+                Some(value) => value
+                    .as_u64()
+                    .ok_or_else(|| invalid("invalid totalTokens"))?,
+                None => input
+                    .saturating_add(output)
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_write),
             };
             self.message.usage = Usage {
-                input, output, cache_read, cache_write, total_tokens: total,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                total_tokens: total,
                 ..Usage::default()
             };
             self.metadata_seen = true;
@@ -276,29 +354,14 @@ impl MessageState {
             return Err(invalid("content arrived after messageStop"));
         }
         match kind {
-            "contentBlockStart" => {
-                let id = block_id(value)?;
-                let start = value.get("start").ok_or_else(|| invalid("missing block start"))?;
-                let tool = start.get("toolUse").ok_or_else(|| invalid("unsupported content block start"))?;
-                let tool_id = string(tool, "toolUseId")?.to_string();
-                let name = string(tool, "name")?.to_string();
-                if tool_id.is_empty() || name.is_empty() {
-                    return Err(invalid("tool block has an empty identity"));
-                }
-                self.reserve_content(tool_id.len().saturating_add(name.len()))?;
-                let index = self.add_block(id, ContentBlock::ToolCall(ToolCall {
-                    id: tool_id.clone(), name: name.clone(), arguments: Value::Null,
-                    thought_signature: None,
-                }))?;
-                self.pending.push_back(StreamEvent::ToolCallStart {
-                    content_index: index, id: tool_id, name,
-                });
-            }
+            "contentBlockStart" => self.start_block(value)?,
             "contentBlockDelta" => self.delta(value)?,
             "contentBlockStop" => self.end_block(block_id(value)?)?,
             "messageStop" => {
                 if !self.open.is_empty() {
-                    return Err(invalid("messageStop arrived with unfinished content blocks"));
+                    return Err(invalid(
+                        "messageStop arrived with unfinished content blocks",
+                    ));
                 }
                 let reason = string(value, "stopReason")?;
                 self.message.stop_reason = match reason {
@@ -310,7 +373,8 @@ impl MessageState {
                     _ => StopReason::Error,
                 };
                 if self.message.stop_reason == StopReason::Error {
-                    self.message.error_message = Some("Bedrock returned a non-success stop reason".to_string());
+                    self.message.error_message =
+                        Some("Bedrock returned a non-success stop reason".to_string());
                 }
                 self.stopped = true;
             }
@@ -321,36 +385,49 @@ impl MessageState {
 
     fn delta(&mut self, value: &Value) -> Result<()> {
         let id = block_id(value)?;
-        let delta = value.get("delta").and_then(Value::as_object)
+        let delta = value
+            .get("delta")
+            .and_then(Value::as_object)
             .ok_or_else(|| invalid("missing content delta"))?;
         if delta.len() != 1 {
             return Err(invalid("ambiguous content delta"));
         }
         if let Some(text) = delta.get("text") {
-            let text = text.as_str().ok_or_else(|| invalid("non-string text delta"))?;
+            let text = text
+                .as_str()
+                .ok_or_else(|| invalid("non-string text delta"))?;
             self.reserve_content(text.len())?;
             let index = if let Some(block) = self.open.get(&id) {
                 block.index
             } else {
                 let index = self.add_block(id, ContentBlock::Text(TextContent::new("")))?;
-                self.pending.push_back(StreamEvent::TextStart { content_index: index });
+                self.pending.push_back(StreamEvent::TextStart {
+                    content_index: index,
+                });
                 index
             };
             let ContentBlock::Text(block) = &mut self.message.content[index] else {
                 return Err(invalid("text delta changed the content block type"));
             };
             block.text.push_str(text);
-            self.pending.push_back(StreamEvent::TextDelta { content_index: index, delta: text.to_string() });
+            self.pending.push_back(StreamEvent::TextDelta {
+                content_index: index,
+                delta: text.to_string(),
+            });
         } else if let Some(tool) = delta.get("toolUse") {
             let input = string(tool, "input")?;
             self.reserve_content(input.len())?;
-            let block = self.open.get_mut(&id).ok_or_else(|| invalid("tool delta arrived before tool start"))?;
+            let block = self
+                .open
+                .get_mut(&id)
+                .ok_or_else(|| invalid("tool delta arrived before tool start"))?;
             if !matches!(self.message.content[block.index], ContentBlock::ToolCall(_)) {
                 return Err(invalid("tool delta changed the content block type"));
             }
             block.tool_input.push_str(input);
             self.pending.push_back(StreamEvent::ToolCallDelta {
-                content_index: block.index, delta: input.to_string(),
+                content_index: block.index,
+                delta: input.to_string(),
             });
         } else if let Some(reasoning) = delta.get("reasoningContent") {
             self.reasoning(id, reasoning)?;
@@ -361,27 +438,43 @@ impl MessageState {
     }
 
     fn reasoning(&mut self, id: u64, value: &Value) -> Result<()> {
-        let fields = value.as_object().ok_or_else(|| invalid("invalid reasoning delta"))?;
+        let fields = value
+            .as_object()
+            .ok_or_else(|| invalid("invalid reasoning delta"))?;
         if fields.len() != 1 {
             return Err(invalid("ambiguous reasoning delta"));
         }
         if let Some(encoded) = fields.get("redactedContent") {
-            let encoded = encoded.as_str().ok_or_else(|| invalid("invalid redacted reasoning"))?;
+            let encoded = encoded
+                .as_str()
+                .ok_or_else(|| invalid("invalid redacted reasoning"))?;
             self.reserve_content(encoded.len())?;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
                 .map_err(|_| invalid("invalid redacted reasoning base64"))?;
             let index = if let Some(block) = self.open.get(&id) {
                 block.index
             } else {
-                self.add_block(id, ContentBlock::RedactedThinking(RedactedThinkingContent { data: String::new() }))?
+                self.add_block(
+                    id,
+                    ContentBlock::RedactedThinking(RedactedThinkingContent {
+                        data: String::new(),
+                    }),
+                )?
             };
-            if !matches!(self.message.content[index], ContentBlock::RedactedThinking(_)) {
+            if !matches!(
+                self.message.content[index],
+                ContentBlock::RedactedThinking(_)
+            ) {
                 return Err(invalid("redacted reasoning changed the content block type"));
             }
             // Each JSON blob is independently base64 encoded. Concatenating
             // the encoded strings would corrupt padding and replay bytes.
-            self.open.get_mut(&id).ok_or_else(|| invalid("missing reasoning block"))?
-                .redacted.extend_from_slice(&bytes);
+            self.open
+                .get_mut(&id)
+                .ok_or_else(|| invalid("missing reasoning block"))?
+                .redacted
+                .extend_from_slice(&bytes);
             return Ok(());
         }
         let (signature, text) = if fields.contains_key("signature") {
@@ -393,33 +486,50 @@ impl MessageState {
         let index = if let Some(block) = self.open.get(&id) {
             block.index
         } else {
-            let index = self.add_block(id, ContentBlock::Thinking(ThinkingContent {
-                thinking: String::new(), thinking_signature: None,
-            }))?;
-            self.pending.push_back(StreamEvent::ThinkingStart { content_index: index });
+            let index = self.add_block(
+                id,
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: String::new(),
+                    thinking_signature: None,
+                }),
+            )?;
+            self.pending.push_back(StreamEvent::ThinkingStart {
+                content_index: index,
+            });
             index
         };
         let ContentBlock::Thinking(block) = &mut self.message.content[index] else {
             return Err(invalid("reasoning delta changed the content block type"));
         };
         if signature {
-            block.thinking_signature.get_or_insert_with(String::new).push_str(text);
+            block
+                .thinking_signature
+                .get_or_insert_with(String::new)
+                .push_str(text);
         } else {
             block.thinking.push_str(text);
-            self.pending.push_back(StreamEvent::ThinkingDelta { content_index: index, delta: text.to_string() });
+            self.pending.push_back(StreamEvent::ThinkingDelta {
+                content_index: index,
+                delta: text.to_string(),
+            });
         }
         Ok(())
     }
 
     fn end_block(&mut self, id: u64) -> Result<()> {
-        let block = self.open.remove(&id).ok_or_else(|| invalid("stop for an unopened or closed block"))?;
+        let block = self
+            .open
+            .remove(&id)
+            .ok_or_else(|| invalid("stop for an unopened or closed block"))?;
         let content_index = block.index;
         match &mut self.message.content[content_index] {
             ContentBlock::Text(text) => self.pending.push_back(StreamEvent::TextEnd {
-                content_index, content: text.text.clone(),
+                content_index,
+                content: text.text.clone(),
             }),
             ContentBlock::Thinking(thinking) => self.pending.push_back(StreamEvent::ThinkingEnd {
-                content_index, content: thinking.thinking.clone(),
+                content_index,
+                content: thinking.thinking.clone(),
             }),
             ContentBlock::RedactedThinking(redacted) => {
                 redacted.data = base64::engine::general_purpose::STANDARD.encode(block.redacted);
@@ -428,9 +538,13 @@ impl MessageState {
                 tool.arguments = if block.tool_input.is_empty() {
                     serde_json::json!({})
                 } else {
-                    serde_json::from_str(&block.tool_input).map_err(|_| invalid("malformed tool input JSON"))?
+                    serde_json::from_str(&block.tool_input)
+                        .map_err(|_| invalid("malformed tool input JSON"))?
                 };
-                self.pending.push_back(StreamEvent::ToolCallEnd { content_index, tool_call: tool.clone() });
+                self.pending.push_back(StreamEvent::ToolCallEnd {
+                    content_index,
+                    tool_call: tool.clone(),
+                });
             }
             _ => return Err(invalid("unsupported completed content block")),
         }
@@ -442,36 +556,55 @@ impl MessageState {
             return Err(invalid("unexpected EOF before a complete messageStop"));
         }
         let message = std::mem::take(&mut self.message);
-        Ok(StreamEvent::Done { reason: message.stop_reason, message })
+        Ok(StreamEvent::Done {
+            reason: message.stop_reason,
+            message,
+        })
     }
 }
 
 fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
-    value.get(field).and_then(Value::as_str).ok_or_else(|| invalid("missing or invalid event field"))
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("missing or invalid event field"))
 }
 
 fn block_id(value: &Value) -> Result<u64> {
-    value.get("contentBlockIndex").and_then(Value::as_u64)
+    value
+        .get("contentBlockIndex")
+        .and_then(Value::as_u64)
         .ok_or_else(|| invalid("missing or invalid contentBlockIndex"))
 }
 
 fn token_count(value: &Value, field: &str) -> Result<u64> {
-    match value.get(field) {
-        Some(value) => value.as_u64().ok_or_else(|| invalid("invalid token usage counter")),
-        None => Ok(0),
-    }
+    value.get(field).map_or(Ok(0), |value| {
+        value
+            .as_u64()
+            .ok_or_else(|| invalid("invalid token usage counter"))
+    })
 }
 
-fn dispatch(frame: Frame, state: &mut MessageState, secrets: &[String]) -> Result<()> {
+fn dispatch(frame: &Frame, state: &mut MessageState, secrets: &[String]) -> Result<()> {
     let message_type = frame.header(":message-type")?;
     if message_type == "error" || message_type == "exception" {
         let (code, message) = if message_type == "error" {
-            (frame.header(":error-code")?, frame.header(":error-message")?.to_string())
+            (
+                frame.header(":error-code")?,
+                frame.header(":error-message")?.to_string(),
+            )
         } else {
             let code = frame.header(":exception-type")?;
             let value: Value = serde_json::from_slice(&frame.payload)
                 .map_err(|_| invalid("invalid exception JSON"))?;
-            (code, value.get("message").and_then(Value::as_str).unwrap_or("stream failed").to_string())
+            (
+                code,
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stream failed")
+                    .to_string(),
+            )
         };
         let status = match code {
             "throttlingException" => " (HTTP 429)",
@@ -482,21 +615,29 @@ fn dispatch(frame: Frame, state: &mut MessageState, secrets: &[String]) -> Resul
             _ => "",
         };
         let details = super::bedrock_error_snippet(&format!("{code}{status}: {message}"), secrets);
-        return Err(Error::provider(&state.message.provider, format!("Bedrock stream exception: {details}")));
+        return Err(Error::provider(
+            &state.message.provider,
+            format!("Bedrock stream exception: {details}"),
+        ));
     }
     if message_type != "event" {
         return Err(invalid("unknown event message type"));
     }
     if frame.headers.contains_key(":content-type") {
         let content_type = frame.header(":content-type")?;
-        if !content_type.split(';').next().unwrap_or_default().trim()
+        if !content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
             .eq_ignore_ascii_case("application/json")
         {
             return Err(invalid("unexpected event payload content type"));
         }
     }
     let kind = frame.header(":event-type")?;
-    let value = serde_json::from_slice(&frame.payload).map_err(|_| invalid("invalid event JSON"))?;
+    let value =
+        serde_json::from_slice(&frame.payload).map_err(|_| invalid("invalid event JSON"))?;
     state.event(kind, &value)
 }
 
@@ -514,8 +655,11 @@ pub(super) fn from_bytes(
         finished: bool,
     }
     let state = State {
-        source: Some(source), decoder: Decoder::default(),
-        message: MessageState::new(model, provider), secrets, finished: false,
+        source: Some(source),
+        decoder: Decoder::default(),
+        message: MessageState::new(model, provider),
+        secrets,
+        finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         if state.finished {
@@ -526,7 +670,7 @@ pub(super) fn from_bytes(
                 return Some((Ok(event), state));
             }
             let outcome = match state.decoder.next() {
-                Ok(Some(frame)) => dispatch(frame, &mut state.message, &state.secrets),
+                Ok(Some(frame)) => dispatch(&frame, &mut state.message, &state.secrets),
                 Err(error) => Err(error),
                 Ok(None) => {
                     let chunk = match state.source.as_mut() {
@@ -536,13 +680,18 @@ pub(super) fn from_bytes(
                     match chunk {
                         Some(Ok(bytes)) => state.decoder.push(&bytes),
                         Some(Err(error)) => {
-                            let details = super::bedrock_error_snippet(&error.to_string(), &state.secrets);
-                            Err(Error::provider(&state.message.message.provider, format!("Bedrock stream transport error: {details}")))
+                            let details =
+                                super::bedrock_error_snippet(&error.to_string(), &state.secrets);
+                            Err(Error::provider(
+                                &state.message.message.provider,
+                                format!("Bedrock stream transport error: {details}"),
+                            ))
                         }
                         None => {
                             state.finished = true;
                             state.source = None;
-                            let outcome = state.decoder.finish().and_then(|()| state.message.finish());
+                            let outcome =
+                                state.decoder.finish().and_then(|()| state.message.finish());
                             return Some((outcome, state));
                         }
                     }
@@ -565,7 +714,10 @@ mod tests {
     use super::*;
     use futures::FutureExt as _;
     use serde_json::json;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::task::{Context, Poll};
 
     fn header(name: &str, value: &str, target: &mut Vec<u8>) {
@@ -578,7 +730,11 @@ mod tests {
 
     fn raw_frame(headers: &[u8], payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        frame.extend_from_slice(&u32::try_from(16 + headers.len() + payload.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(
+            &u32::try_from(16 + headers.len() + payload.len())
+                .unwrap()
+                .to_be_bytes(),
+        );
         frame.extend_from_slice(&u32::try_from(headers.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&crc32(&frame).to_be_bytes());
         frame.extend_from_slice(headers);
@@ -587,7 +743,7 @@ mod tests {
         frame
     }
 
-    fn event(kind: &str, payload: Value) -> Vec<u8> {
+    fn event(kind: &str, payload: &Value) -> Vec<u8> {
         let mut headers = Vec::new();
         header(":message-type", "event", &mut headers);
         header(":event-type", kind, &mut headers);
@@ -596,26 +752,34 @@ mod tests {
     }
 
     fn start() -> Vec<u8> {
-        event("messageStart", json!({"role": "assistant"}))
+        event("messageStart", &json!({"role": "assistant"}))
     }
 
     fn stop() -> Vec<u8> {
-        event("messageStop", json!({"stopReason": "end_turn"}))
+        event("messageStop", &json!({"stopReason": "end_turn"}))
     }
 
     fn text() -> Vec<u8> {
-        event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"text": "héllo"}}))
+        event(
+            "contentBlockDelta",
+            &json!({"contentBlockIndex": 0, "delta": {"text": "héllo"}}),
+        )
     }
 
     fn block_stop(index: u64) -> Vec<u8> {
-        event("contentBlockStop", json!({"contentBlockIndex": index}))
+        event("contentBlockStop", &json!({"contentBlockIndex": index}))
     }
 
     fn collect(chunks: Vec<Vec<u8>>) -> Vec<Result<StreamEvent>> {
-        futures::executor::block_on(from_bytes(
-            Box::pin(stream::iter(chunks.into_iter().map(Ok))),
-            "model-a".to_string(), "provider-a".to_string(), Vec::new(),
-        ).collect())
+        futures::executor::block_on(
+            from_bytes(
+                Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+                "model-a".to_string(),
+                "provider-a".to_string(),
+                Vec::new(),
+            )
+            .collect(),
+        )
     }
 
     #[test]
@@ -644,12 +808,21 @@ mod tests {
     #[test]
     fn coalesced_frames_and_single_byte_chunks_produce_identical_messages() {
         let bytes = [start(), text(), block_stop(0), stop()].concat();
-        for chunks in [vec![bytes.clone()], bytes.iter().map(|byte| vec![*byte]).collect()] {
+        for chunks in [
+            vec![bytes.clone()],
+            bytes.iter().map(|byte| vec![*byte]).collect(),
+        ] {
             let result = collect(chunks);
             assert_eq!(result.len(), 5);
-            assert!(matches!(&result[0], Ok(StreamEvent::Start { partial }) if partial.content.is_empty()));
-            assert!(matches!(&result[2], Ok(StreamEvent::TextDelta { delta, .. }) if delta == "héllo"));
-            let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else { panic!("{result:?}") };
+            assert!(
+                matches!(&result[0], Ok(StreamEvent::Start { partial }) if partial.content.is_empty())
+            );
+            assert!(
+                matches!(&result[2], Ok(StreamEvent::TextDelta { delta, .. }) if delta == "héllo")
+            );
+            let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else {
+                panic!("{result:?}")
+            };
             assert_eq!(message.provider, "provider-a");
             assert_eq!(message.model, "model-a");
             assert_eq!(message.api, "bedrock-converse-stream");
@@ -662,15 +835,22 @@ mod tests {
         tx.unbounded_send(Ok([start(), text()].concat())).unwrap();
         let mut output = from_bytes(Box::pin(rx), "m".into(), "p".into(), Vec::new());
         for expected in ["start", "text_start", "delta"] {
-            let item = output.next().now_or_never().expect("must not wait for the tail").unwrap().unwrap();
-            assert!(matches!((expected, item),
-                ("start", StreamEvent::Start { .. }) |
-                ("text_start", StreamEvent::TextStart { .. }) |
-                ("delta", StreamEvent::TextDelta { .. })
+            let item = output
+                .next()
+                .now_or_never()
+                .expect("must not wait for the tail")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                (expected, item),
+                ("start", StreamEvent::Start { .. })
+                    | ("text_start", StreamEvent::TextStart { .. })
+                    | ("delta", StreamEvent::TextDelta { .. })
             ));
         }
         assert!(output.next().now_or_never().is_none());
-        tx.unbounded_send(Ok([block_stop(0), stop()].concat())).unwrap();
+        tx.unbounded_send(Ok([block_stop(0), stop()].concat()))
+            .unwrap();
         drop(tx);
         let rest = futures::executor::block_on(output.collect::<Vec<_>>());
         assert!(matches!(rest.last(), Some(Ok(StreamEvent::Done { .. }))));
@@ -682,7 +862,11 @@ mod tests {
         for end in 1..frame.len() {
             let result = collect(vec![start(), frame[..end].to_vec()]);
             assert!(result.last().unwrap().is_err(), "truncation at {end}");
-            assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::Done { .. }))));
+            assert!(
+                !result
+                    .iter()
+                    .any(|item| matches!(item, Ok(StreamEvent::Done { .. })))
+            );
         }
         for offset in [0, 8, 15, frame.len() - 1] {
             let mut damaged = frame.clone();
@@ -691,9 +875,20 @@ mod tests {
             assert!(result.last().unwrap().is_err());
         }
         let result = collect(vec![start(), text(), block_stop(0)]);
-        assert!(result.last().unwrap().as_ref().unwrap_err().to_string().contains("messageStop"));
+        assert!(
+            result
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("messageStop")
+        );
         let result = collect(vec![start(), stop(), vec![0]]);
-        assert!(result.last().unwrap().is_err(), "partial trailing frame is still corruption");
+        assert!(
+            result.last().unwrap().is_err(),
+            "partial trailing frame is still corruption"
+        );
     }
 
     #[test]
@@ -712,7 +907,16 @@ mod tests {
     #[test]
     fn typed_headers_are_skipped_but_duplicates_and_bad_encodings_are_rejected() {
         let mut headers = Vec::new();
-        for (kind, length) in [(0, 0), (1, 0), (2, 1), (3, 2), (4, 4), (5, 8), (8, 8), (9, 16)] {
+        for (kind, length) in [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 2),
+            (4, 4),
+            (5, 8),
+            (8, 8),
+            (9, 16),
+        ] {
             headers.extend_from_slice(&[1, b'a' + kind, kind]);
             headers.extend(std::iter::repeat_n(0, length));
         }
@@ -722,7 +926,12 @@ mod tests {
         assert_eq!(parsed[":message-type"].as_deref(), Some("event"));
         header(":message-type", "exception", &mut headers);
         assert!(decode_headers(&headers).is_err());
-        for bad in [vec![0], vec![1, 255, 0], vec![1, b'x', 7, 0, 1, 255], vec![1, b'x', 255]] {
+        for bad in [
+            vec![0],
+            vec![1, 255, 0],
+            vec![1, b'x', 7, 0, 1, 255],
+            vec![1, b'x', 255],
+        ] {
             assert!(decode_headers(&bad).is_err());
         }
     }
@@ -731,60 +940,130 @@ mod tests {
     fn tool_arguments_are_assembled_and_validated_before_tool_end() {
         let result = collect(vec![
             start(),
-            event("contentBlockStart", json!({"contentBlockIndex": 7, "start": {"toolUse": {"toolUseId": "call-a", "name": "read"}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 7, "delta": {"toolUse": {"input": "{\"path\":"}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 7, "delta": {"toolUse": {"input": "\"a.txt\"}"}}})),
+            event(
+                "contentBlockStart",
+                &json!({"contentBlockIndex": 7, "start": {"toolUse": {"toolUseId": "call-a", "name": "read"}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 7, "delta": {"toolUse": {"input": "{\"path\":"}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 7, "delta": {"toolUse": {"input": "\"a.txt\"}"}}}),
+            ),
             block_stop(7),
-            event("messageStop", json!({"stopReason": "tool_use"})),
+            event("messageStop", &json!({"stopReason": "tool_use"})),
         ]);
         assert!(result.iter().all(Result::is_ok), "{result:?}");
-        let tool = result.iter().find_map(|item| match item {
-            Ok(StreamEvent::ToolCallEnd { content_index, tool_call }) => { assert_eq!(*content_index, 0); Some(tool_call) }
-            _ => None,
-        }).unwrap();
+        let tool = result
+            .iter()
+            .find_map(|item| match item {
+                Ok(StreamEvent::ToolCallEnd {
+                    content_index,
+                    tool_call,
+                }) => {
+                    assert_eq!(*content_index, 0);
+                    Some(tool_call)
+                }
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(tool.id, "call-a");
         assert_eq!(tool.arguments, json!({"path": "a.txt"}));
-        assert!(matches!(result.last(), Some(Ok(StreamEvent::Done { reason: StopReason::ToolUse, .. }))));
+        assert!(matches!(
+            result.last(),
+            Some(Ok(StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            }))
+        ));
 
         let result = collect(vec![
             start(),
-            event("contentBlockStart", json!({"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "a", "name": "read"}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{"}}})),
-            block_stop(0), stop(),
+            event(
+                "contentBlockStart",
+                &json!({"contentBlockIndex": 0, "start": {"toolUse": {"toolUseId": "a", "name": "read"}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"toolUse": {"input": "{"}}}),
+            ),
+            block_stop(0),
+            stop(),
         ]);
         assert!(result.last().unwrap().is_err());
-        assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. }))));
+        assert!(
+            !result
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::ToolCallEnd { .. })))
+        );
     }
 
     #[test]
     fn reasoning_and_redacted_bytes_survive_without_becoming_visible_text() {
         let result = collect(vec![
             start(),
-            event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"text": "Think."}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "sig-"}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "part2"}}})),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"text": "Think."}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "sig-"}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 0, "delta": {"reasoningContent": {"signature": "part2"}}}),
+            ),
             block_stop(0),
-            event("contentBlockDelta", json!({"contentBlockIndex": 1, "delta": {"reasoningContent": {"redactedContent": "AA=="}}})),
-            event("contentBlockDelta", json!({"contentBlockIndex": 1, "delta": {"reasoningContent": {"redactedContent": "AQ=="}}})),
-            block_stop(1), stop(),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 1, "delta": {"reasoningContent": {"redactedContent": "AA=="}}}),
+            ),
+            event(
+                "contentBlockDelta",
+                &json!({"contentBlockIndex": 1, "delta": {"reasoningContent": {"redactedContent": "AQ=="}}}),
+            ),
+            block_stop(1),
+            stop(),
         ]);
         assert!(result.iter().all(Result::is_ok), "{result:?}");
-        assert!(!result.iter().any(|item| matches!(item, Ok(StreamEvent::TextDelta { .. }))));
-        let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else { panic!("{result:?}") };
-        let ContentBlock::Thinking(thinking) = &message.content[0] else { panic!() };
+        assert!(
+            !result
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::TextDelta { .. })))
+        );
+        let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else {
+            panic!("{result:?}")
+        };
+        let ContentBlock::Thinking(thinking) = &message.content[0] else {
+            panic!()
+        };
         assert_eq!(thinking.thinking, "Think.");
         assert_eq!(thinking.thinking_signature.as_deref(), Some("sig-part2"));
-        let ContentBlock::RedactedThinking(redacted) = &message.content[1] else { panic!() };
+        let ContentBlock::RedactedThinking(redacted) = &message.content[1] else {
+            panic!()
+        };
         assert_eq!(redacted.data, "AAE=");
     }
 
     #[test]
     fn metadata_after_message_stop_is_included_in_done() {
-        let result = collect(vec![start(), stop(), event("metadata", json!({"usage": {
-            "inputTokens": 7, "outputTokens": 3, "cacheReadInputTokens": 20,
-            "cacheWriteInputTokens": 5, "totalTokens": 35
-        }}))]);
-        let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else { panic!("{result:?}") };
+        let result = collect(vec![
+            start(),
+            stop(),
+            event(
+                "metadata",
+                &json!({"usage": {
+                    "inputTokens": 7, "outputTokens": 3, "cacheReadInputTokens": 20,
+                    "cacheWriteInputTokens": 5, "totalTokens": 35
+                }}),
+            ),
+        ]);
+        let Ok(StreamEvent::Done { message, .. }) = result.last().unwrap() else {
+            panic!("{result:?}")
+        };
         assert_eq!(message.usage.input, 7);
         assert_eq!(message.usage.output, 3);
         assert_eq!(message.usage.cache_read, 20);
@@ -801,7 +1080,7 @@ mod tests {
             vec![start(), block_stop(0)],
             vec![start(), text(), block_stop(0), text()],
             vec![start(), stop(), text()],
-            vec![start(), event("metadata", json!({"usage": {}}))],
+            vec![start(), event("metadata", &json!({"usage": {}}))],
         ] {
             let result = collect(frames);
             assert!(result.last().unwrap().is_err(), "{result:?}");
@@ -814,10 +1093,15 @@ mod tests {
         header(":message-type", "exception", &mut headers);
         header(":exception-type", "throttlingException", &mut headers);
         let frame = raw_frame(&headers, br#"{"message":"slow down secret-key-canary"}"#);
-        let result: Vec<_> = futures::executor::block_on(from_bytes(
-            Box::pin(stream::iter(vec![Ok(start()), Ok(frame), Ok(stop())])),
-            "m".into(), "custom-bedrock".into(), vec!["secret-key-canary".into()],
-        ).collect());
+        let result: Vec<_> = futures::executor::block_on(
+            from_bytes(
+                Box::pin(stream::iter(vec![Ok(start()), Ok(frame), Ok(stop())])),
+                "m".into(),
+                "custom-bedrock".into(),
+                vec!["secret-key-canary".into()],
+            )
+            .collect(),
+        );
         assert_eq!(result.len(), 2);
         let error = result[1].as_ref().unwrap_err().to_string();
         assert!(error.contains("HTTP 429"), "{error}");
@@ -833,20 +1117,30 @@ mod tests {
     impl Stream for DropProbe {
         type Item = std::io::Result<Vec<u8>>;
         fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            self.frame.take().map_or(Poll::Pending, |frame| Poll::Ready(Some(Ok(frame))))
+            self.frame
+                .take()
+                .map_or(Poll::Pending, |frame| Poll::Ready(Some(Ok(frame))))
         }
     }
 
     impl Drop for DropProbe {
-        fn drop(&mut self) { self.dropped.store(true, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     #[test]
     fn malformed_stream_releases_transport_before_yielding_error() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut output = from_bytes(Box::pin(DropProbe {
-            frame: Some(vec![0; 12]), dropped: Arc::clone(&dropped),
-        }), "m".into(), "p".into(), Vec::new());
+        let mut output = from_bytes(
+            Box::pin(DropProbe {
+                frame: Some(vec![0; 12]),
+                dropped: Arc::clone(&dropped),
+            }),
+            "m".into(),
+            "p".into(),
+            Vec::new(),
+        );
         assert!(output.next().now_or_never().unwrap().unwrap().is_err());
         assert!(dropped.load(Ordering::SeqCst));
         assert!(output.next().now_or_never().unwrap().is_none());
@@ -855,9 +1149,15 @@ mod tests {
     #[test]
     fn dropping_a_pending_stream_releases_transport() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut output = from_bytes(Box::pin(DropProbe {
-            frame: None, dropped: Arc::clone(&dropped),
-        }), "m".into(), "p".into(), Vec::new());
+        let mut output = from_bytes(
+            Box::pin(DropProbe {
+                frame: None,
+                dropped: Arc::clone(&dropped),
+            }),
+            "m".into(),
+            "p".into(),
+            Vec::new(),
+        );
         assert!(output.next().now_or_never().is_none());
         drop(output);
         assert!(dropped.load(Ordering::SeqCst));
