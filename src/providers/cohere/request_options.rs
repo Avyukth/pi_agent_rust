@@ -26,7 +26,9 @@ pub(super) enum InputContent {
 pub(super) fn user_content(content: &UserContent) -> InputContent {
     match content {
         UserContent::Text(text) => InputContent::Text(text.clone()),
-        UserContent::Blocks(blocks) if blocks.iter().any(|block| matches!(block, ContentBlock::Image(_))) => {
+        UserContent::Blocks(blocks)
+            if blocks.iter().any(|block| matches!(block, ContentBlock::Image(_))) =>
+        {
             let parts = blocks.iter().filter_map(|block| match block {
                 ContentBlock::Text(text) => Some(json!({"type":"text","text":text.text})),
                 ContentBlock::Image(image) => Some(image_part(image)),
@@ -60,7 +62,8 @@ pub(super) fn tool_images(content: &[ContentBlock]) -> Vec<Value> {
 fn reasoning_model(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     ["command-a-reasoning", "command-a-plus"].iter().any(|prefix| {
-        model.strip_prefix(prefix).is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
+        model.strip_prefix(*prefix)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('-'))
     })
 }
 
@@ -118,6 +121,25 @@ pub(super) fn validate_options(model: &str, options: &StreamOptions) -> Result<(
     Ok(())
 }
 
+fn decoded_image_size(encoded: &str, remaining: u64) -> Result<u64> {
+    if encoded.is_empty()
+        || u64::try_from(encoded.len()).unwrap_or(u64::MAX) > remaining.div_ceil(3).saturating_mul(4)
+    {
+        return Err(Error::provider("cohere", "Empty image or image data exceeds the 20 MB request limit"));
+    }
+    // Validate all base64 with a fixed-size I/O buffer, not a second full
+    // decoded copy of every attachment. Read one extra byte to enforce limits.
+    let mut decoder = base64::read::DecoderReader::new(
+        encoded.as_bytes(), &base64::engine::general_purpose::STANDARD,
+    ).take(remaining.saturating_add(1));
+    let size = std::io::copy(&mut decoder, &mut std::io::sink())
+        .map_err(|_| Error::provider("cohere", "Image data is not valid base64"))?;
+    if size == 0 || size > remaining {
+        return Err(Error::provider("cohere", "Empty image or image data exceeds the 20 MB request limit"));
+    }
+    Ok(size)
+}
+
 /// Check the final, possibly rewritten outbound payload. Inspect only actual
 /// message image parts, never similarly named fields inside tool arguments.
 /// This lets request hooks remove/replace images before limits are enforced.
@@ -146,21 +168,7 @@ pub(super) fn validate_images(body: &Value) -> Result<()> {
                     return Err(Error::provider("cohere", "Unsupported image MIME type; use PNG, JPEG, WEBP or GIF"));
                 }
                 let remaining = MAX_IMAGE_BYTES.saturating_sub(decoded_total);
-                if encoded.is_empty() || u64::try_from(encoded.len()).unwrap_or(u64::MAX) > remaining.div_ceil(3).saturating_mul(4) {
-                    return Err(Error::provider("cohere", "Empty image or image data exceeds the 20 MB request limit"));
-                }
-                // Validate the entire base64 stream with a fixed-size I/O buffer,
-                // not a second full decoded copy of every attachment.
-                let mut decoder = base64::read::DecoderReader::new(
-                    encoded.as_bytes(),
-                    &base64::engine::general_purpose::STANDARD,
-                ).take(remaining.saturating_add(1));
-                let size = std::io::copy(&mut decoder, &mut std::io::sink())
-                    .map_err(|_| Error::provider("cohere", "Image data is not valid base64"))?;
-                if size == 0 || size > remaining {
-                    return Err(Error::provider("cohere", "Empty image or image data exceeds the 20 MB request limit"));
-                }
-                decoded_total = decoded_total.saturating_add(size);
+                decoded_total = decoded_total.saturating_add(decoded_image_size(encoded, remaining)?);
             } else {
                 // Hooks may intentionally choose Cohere's native URL image path.
                 // Pi never downloads these URLs or attaches credentials to them.
@@ -224,14 +232,13 @@ mod tests {
         assert_eq!(value["type"], "enabled");
         assert_eq!(value["token_budget"], 3072);
         assert!(thinking("command-r", &options).is_none());
-        assert!(thinking("command-a-plus-imposter".trim_end_matches("-imposter").trim_end_matches("plus"), &options).is_none());
+        assert!(thinking("command-a-reasoningish", &options).is_none());
     }
 
     #[test]
     fn custom_budgets_fit_the_hard_output_cap() {
         let options = StreamOptions {
-            thinking_level: Some(ThinkingLevel::High),
-            max_tokens: Some(5000),
+            thinking_level: Some(ThinkingLevel::High), max_tokens: Some(5000),
             thinking_budgets: Some(ThinkingBudgets { high: 2000, ..ThinkingBudgets::default() }),
             ..StreamOptions::default()
         };
@@ -277,5 +284,381 @@ mod tests {
     fn intentional_remote_image_urls_do_not_require_local_downloads() {
         let body = json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://images.example.invalid/chart.png"}}]}]});
         assert!(validate_images(&body).is_ok());
+    }
+
+    #[test]
+    fn decoded_byte_limit_checks_padding_and_one_byte_overflow() {
+        assert_eq!(decoded_image_size("AAEC", 3).unwrap(), 3);
+        assert!(decoded_image_size("AAEC", 2).is_err());
+        assert_eq!(decoded_image_size("AAE=", 2).unwrap(), 2);
+        assert_eq!(decoded_image_size("AA==", 1).unwrap(), 1);
+        assert!(decoded_image_size("AA==", 0).is_err());
+        assert!(decoded_image_size("AA=!", 3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::model::{ImageContent, Message, StopReason, StreamEvent, TextContent, ToolResultMessage, UserMessage};
+    use crate::provider::{BeforeProviderRequestHook, Context, Provider, ToolDef};
+    use crate::providers::cohere::CohereProvider;
+    use futures::StreamExt as _;
+    use std::collections::HashMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, mpsc};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jf9sAAAAASUVORK5CYII=";
+
+    struct Reply {
+        status: u16,
+        content_type: &'static str,
+        chunks: Vec<String>,
+        after_first: Option<mpsc::Receiver<()>>,
+    }
+
+    impl Reply {
+        fn events(events: &[Value]) -> Self {
+            Self { status: 200, content_type: "text/event-stream", chunks: vec![sse(events)], after_first: None }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Request {
+        headers: HashMap<String, String>,
+        body: Value,
+    }
+
+    fn read_request(socket: &mut TcpStream) -> Request {
+        socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut bytes = Vec::new();
+        let boundary = loop {
+            if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(bytes.len() < 64 * 1024);
+            let mut chunk = [0; 4096];
+            let count = socket.read(&mut chunk).expect("request headers");
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+        };
+        let text = String::from_utf8(bytes[..boundary].to_vec()).unwrap();
+        let headers: HashMap<String, String> = text.lines().skip(1).filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            Some((key.to_ascii_lowercase(), value.trim().to_string()))
+        }).collect();
+        let length = headers.get("content-length").map_or(0, |value| value.parse::<usize>().unwrap());
+        assert!(length < 1024 * 1024);
+        while bytes.len() - boundary < length {
+            let mut chunk = [0; 4096];
+            let count = socket.read(&mut chunk).expect("request body");
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        Request { headers, body: serde_json::from_slice(&bytes[boundary..boundary + length]).unwrap() }
+    }
+
+    struct Server {
+        url: String,
+        stop: Arc<AtomicBool>,
+        requests: mpsc::Receiver<Request>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Server {
+        fn new(replies: Vec<Reply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/v2/chat", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let (tx, requests) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                for reply in replies {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let mut socket = loop {
+                        if stopping.load(Ordering::Relaxed) || Instant::now() >= deadline { return; }
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(1)),
+                            Err(error) => panic!("accept: {error}"),
+                        }
+                    };
+                    tx.send(read_request(&mut socket)).unwrap();
+                    let length: usize = reply.chunks.iter().map(String::len).sum();
+                    write!(socket, "HTTP/1.1 {} Fixture\r\nContent-Type: {}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n", reply.status, reply.content_type).unwrap();
+                    for (index, chunk) in reply.chunks.iter().enumerate() {
+                        socket.write_all(chunk.as_bytes()).unwrap();
+                        socket.flush().unwrap();
+                        if index == 0 && let Some(gate) = &reply.after_first {
+                            gate.recv_timeout(Duration::from_secs(10)).expect("client must see a delta before the server sends completion");
+                        }
+                    }
+                }
+            });
+            Self { url, stop, requests, thread: Some(thread) }
+        }
+
+        fn finish(mut self) -> Vec<Request> {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.take().unwrap().join().expect("server completed");
+            self.requests.try_iter().collect()
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+        }
+    }
+
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 8).build().expect("runtime").block_on(future)
+    }
+
+    fn sse(events: &[Value]) -> String {
+        events.iter().map(|event| format!("data: {event}\n\n")).collect()
+    }
+
+    fn start() -> Value { json!({"type":"message-start"}) }
+    fn done(reason: &str) -> Value {
+        json!({"type":"message-end","delta":{"finish_reason":reason,"usage":{"tokens":{"input_tokens":12,"output_tokens":4}}}})
+    }
+    fn open_text() -> Value {
+        json!({"type":"content-start","index":0,"delta":{"message":{"content":{"type":"text","text":""}}}})
+    }
+    fn text_delta() -> Value {
+        json!({"type":"content-delta","index":0,"delta":{"message":{"content":{"text":"first"}}}})
+    }
+    fn close_text() -> Value { json!({"type":"content-end","index":0}) }
+    fn call_start(index: u32, id: &str) -> Value {
+        json!({"type":"tool-call-start","index":index,"delta":{"message":{"tool_calls":{"id":id,"function":{"name":"read","arguments":"{\"path\":"}}}}})
+    }
+    fn call_delta(index: u32, value: &str) -> Value {
+        json!({"type":"tool-call-delta","index":index,"delta":{"message":{"tool_calls":{"function":{"arguments":value}}}}})
+    }
+    fn image() -> ContentBlock {
+        ContentBlock::Image(ImageContent { data: PNG.to_string(), mime_type: "image/png".to_string() })
+    }
+    fn context() -> Context<'static> {
+        Context::owned(None, vec![Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new("Inspect")), image()]), timestamp: 0,
+        })], vec![ToolDef { name: "read".to_string(), description: "read a file".to_string(), parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}) }])
+    }
+    fn options() -> StreamOptions {
+        StreamOptions { api_key: Some("cohere-http-test-key".to_string()), ..StreamOptions::default() }
+    }
+
+    #[test]
+    fn public_provider_sends_images_thinking_and_the_accepted_hook_rewrite() {
+        let server = Server::new(vec![Reply::events(&[start(), done("COMPLETE")])]);
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+        let context = context();
+        let original = serde_json::to_value(context.messages.as_ref()).unwrap();
+        let mut options = options();
+        options.max_tokens = Some(8192);
+        options.thinking_level = Some(ThinkingLevel::High);
+        options.before_provider_request = Some(BeforeProviderRequestHook::new(|mut event| {
+            assert_eq!(event.payload["thinking"]["type"], "enabled");
+            assert!(event.payload["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+            event.payload["thinking"]["token_budget"] = json!(100);
+            Box::pin(futures::future::ready(Some(event.payload)))
+        }));
+        let events = run(async { provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await });
+        assert!(events.iter().all(Result::is_ok));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
+        assert_eq!(serde_json::to_value(context.messages.as_ref()).unwrap(), original);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["authorization"], "Bearer cohere-http-test-key");
+        assert_eq!(requests[0].body["thinking"]["token_budget"], 100);
+        assert_eq!(requests[0].body["max_tokens"], 8192);
+        assert_eq!(requests[0].body["messages"][0]["content"][1]["image_url"]["url"], format!("data:image/png;base64,{PNG}"));
+    }
+
+    #[test]
+    fn request_hook_can_remove_invalid_images_before_final_payload_validation() {
+        let server = Server::new(vec![Reply::events(&[start(), done("COMPLETE")])]);
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+        let context = Context::owned(None, vec![Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Image(ImageContent { data: "not-base64!".into(), mime_type: "image/png".into() })]), timestamp: 0,
+        })], Vec::new());
+        let options = StreamOptions {
+            before_provider_request: Some(BeforeProviderRequestHook::new(|mut event| {
+                event.payload["messages"][0]["content"] = json!("image intentionally removed");
+                Box::pin(futures::future::ready(Some(event.payload)))
+            })), ..options()
+        };
+        run(async { provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await });
+        assert_eq!(server.finish()[0].body["messages"][0]["content"], "image intentionally removed");
+    }
+
+    #[test]
+    fn rejected_hook_keeps_native_images_and_thinking_disabled() {
+        let server = Server::new(vec![Reply::events(&[start(), done("COMPLETE")])]);
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+        let context = context();
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Off),
+            before_provider_request: Some(BeforeProviderRequestHook::new(|_| Box::pin(futures::future::ready(Some(json!({"invalid":true})))))),
+            ..options()
+        };
+        run(async { provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await });
+        let requests = server.finish();
+        assert_eq!(requests[0].body["thinking"], json!({"type":"disabled"}));
+        assert!(requests[0].body["messages"][0]["content"][1]["image_url"].is_object());
+    }
+
+    #[test]
+    fn first_text_delta_arrives_before_the_server_releases_completion() {
+        let (resume, gate) = mpsc::channel();
+        let server = Server::new(vec![Reply {
+            status: 200, content_type: "text/event-stream; charset=utf-8",
+            chunks: vec![sse(&[start(), open_text(), text_delta()]), sse(&[close_text(), done("COMPLETE")])],
+            after_first: Some(gate),
+        }]);
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+        let context = context();
+        let options = options();
+        run(async {
+            let mut stream = provider.stream(&context, &options).await.unwrap();
+            let mut saw_delta = false;
+            for _ in 0..16 {
+                let Some(event) = stream.next().await else { break; };
+                match event.unwrap() {
+                    StreamEvent::TextDelta { delta, .. } => {
+                        assert_eq!(delta, "first");
+                        saw_delta = true;
+                        resume.send(()).unwrap();
+                    }
+                    StreamEvent::Done { .. } => { assert!(saw_delta); break; }
+                    _ => {}
+                }
+            }
+            assert!(saw_delta);
+            assert!(stream.next().await.is_none());
+            assert!(stream.next().await.is_none());
+        });
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    #[test]
+    fn interleaved_tool_calls_survive_session_roundtrip_and_image_results() {
+        let server = Server::new(vec![
+            Reply::events(&[
+                start(), call_start(2, "a"), call_start(19, "b"),
+                call_delta(19, "\"b.png\"}"), json!({"type":"tool-call-end","index":19}),
+                call_delta(2, "\"a.png\"}"), json!({"type":"tool-call-end","index":2}), done("TOOL_CALL"),
+            ]),
+            Reply::events(&[start(), open_text(), text_delta(), close_text(), done("COMPLETE")]),
+        ]);
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+        let mut context = context();
+        let options = options();
+        run(async {
+            let events = provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await;
+            assert!(events.iter().all(Result::is_ok));
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else { panic!("tool completion"); };
+            assert_eq!(*reason, StopReason::ToolUse);
+            let stored = serde_json::to_string(&Message::assistant(message.clone())).unwrap();
+            let replay: Message = serde_json::from_str(&stored).unwrap();
+            let mut history = context.messages.into_owned();
+            history.push(replay);
+            for block in &message.content {
+                if let ContentBlock::ToolCall(call) = block {
+                    history.push(Message::tool_result(ToolResultMessage {
+                        tool_call_id: call.id.clone(), tool_name: call.name.clone(),
+                        content: vec![ContentBlock::Text(TextContent::new("screenshot")), image()],
+                        details: None, is_error: false, timestamp: 1,
+                    }));
+                }
+            }
+            context = Context::owned(None, history, Vec::new());
+            let final_events = provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await;
+            assert!(matches!(final_events.last(), Some(Ok(StreamEvent::Done { reason: StopReason::Stop, .. }))));
+        });
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        let messages = requests[1].body["messages"].as_array().unwrap();
+        assert_eq!(messages.iter().map(|m| m["role"].as_str().unwrap()).collect::<Vec<_>>(), vec!["user", "assistant", "tool", "tool", "user"]);
+        let calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["id"], "a");
+        assert_eq!(calls[1]["id"], "b");
+        assert_eq!(serde_json::from_str::<Value>(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap()["path"], "a.png");
+        assert_eq!(serde_json::from_str::<Value>(calls[1]["function"]["arguments"].as_str().unwrap()).unwrap()["path"], "b.png");
+        assert_eq!(messages[2]["tool_call_id"], "a");
+        assert_eq!(messages[3]["tool_call_id"], "b");
+        let images = messages[4]["content"].as_array().unwrap().iter().filter(|p| p["type"] == "image_url").collect::<Vec<_>>();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0]["image_url"]["url"], format!("data:image/png;base64,{PNG}"));
+    }
+
+    #[test]
+    fn truncated_and_invalid_tool_streams_emit_one_error_without_done() {
+        for events in [
+            vec![start(), open_text(), text_delta()],
+            vec![start(), call_start(0, "a"), json!({"type":"tool-call-end","index":0}), done("TOOL_CALL")],
+        ] {
+            let server = Server::new(vec![Reply::events(&events)]);
+            let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+            let context = context();
+            let options = options();
+            let events = run(async { provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await });
+            assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+            assert!(events.last().unwrap().is_err());
+            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn terminal_failure_and_length_are_not_successful_tool_turns() {
+        for (finish, expected) in [("ERROR", StopReason::Error), ("MAX_TOKENS", StopReason::Length)] {
+            let server = Server::new(vec![Reply::events(&[start(), done(finish)])]);
+            let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+            let context = context();
+            let options = options();
+            let events = run(async { provider.stream(&context, &options).await.unwrap().take(32).collect::<Vec<_>>().await });
+            let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else { panic!("terminal event"); };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn http_failures_redact_credentials_and_json_success_is_not_an_sse_stream() {
+        for reply in [
+            Reply { status: 500, content_type: "text/plain", chunks: vec!["echo cohere-http-test-key".to_string()], after_first: None },
+            Reply { status: 200, content_type: "application/json", chunks: vec!["{}".to_string()], after_first: None },
+        ] {
+            let server = Server::new(vec![reply]);
+            let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url(&server.url);
+            let context = context();
+            let options = options();
+            let error = run(async { provider.stream(&context, &options).await.err().expect("request rejected") }).to_string();
+            assert!(!error.contains("cohere-http-test-key"));
+            assert!(error.contains("HTTP 500") || error.contains("text/event-stream"));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn impossible_thinking_budget_fails_before_the_request_hook_or_endpoint() {
+        let provider = CohereProvider::new("command-a-plus-05-2026").with_base_url("not a URL");
+        let context = context();
+        let options = StreamOptions {
+            max_tokens: Some(1), thinking_level: Some(ThinkingLevel::High),
+            before_provider_request: Some(BeforeProviderRequestHook::new(|_| panic!("must fail before request hook"))),
+            ..options()
+        };
+        let error = run(async { provider.stream(&context, &options).await.err().expect("invalid budget") }).to_string();
+        assert!(error.contains("max_tokens"));
     }
 }
