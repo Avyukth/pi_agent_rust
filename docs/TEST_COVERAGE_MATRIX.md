@@ -16,8 +16,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock and memory modules are now represented below.
-- Source-file rows below: 234 (230 recorded rows plus two Bedrock and two memory modules).
+- Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock, memory, and Cohere modules are now represented below.
+- Source-file rows below: 236 (230 recorded rows plus two Bedrock, two memory, and two Cohere modules).
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -42,13 +42,13 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/agent_hub.rs` | Agent hub registry (bd-cv653.5.3): session-scoped roster of spawned child agents | Unit (7 tests); `tests/agent_hub.rs`. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
 | `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
-| `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs` and RPC suites. |
+| `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs`. |
 | `src/ast_tools.rs` | AST tools | `tests/ast_tools.rs`, `tests/e2e_ast_tools.rs`. |
 | `src/auth.rs` | Auth and OAuth | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`. |
 | `src/autocomplete.rs` | Prompt autocomplete | Unit; interactive coverage via `tests/tui_state.rs`. |
 | `src/bash_mediation.rs` | Bash mediation | `tests/bash_mediation.rs`. |
-| `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Unit; opt-in capture utility, not a default user path. |
-| `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived glue; test-support binary driven by `tests/mcp.rs`. |
+| `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Waived glue; opt-in capture utility, not a default user path. |
+| `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived test-support binary driven by `tests/mcp.rs`. |
 | `src/bpe.rs` | Vendored tiktoken BPE core (bd-w8q6u): rank tables loaded from gzip assets for token counting | Unit (2 tests); exercised through `src/token_count.rs` and its tests. |
 | `src/browser.rs` | Opt-in headless Chromium automation tool via CDP attach (bd-cv653.2.4) | `tests/browser.rs`, `tests/cross_surface_parity.rs`. |
 | `src/btw.rs` | `/btw` ephemeral side questions (bd-cv653.3.16) | Unit (6 tests); `tests/btw_tan.rs`. |
@@ -69,7 +69,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/context_files.rs` | Context file loading | Covered through agent/session suites and `tests/config_precedence.rs`. |
 | `src/crash.rs` | Crash capture: redacted crash bundles from panics and fatal signals | Unit (6 tests); `tests/fault_injection_persistence.rs`, `tests/e2e_golden_path.rs`, `tests/adversarial_extensions.rs`, `tests/e2e_ftui.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
-| `src/current_time.rs` | `current_time` tool, the shipped implementation since 82fd0468 (2026-09-02) routed the registry to this module; `src/tools.rs` still carries an older in-file `CurrentTimeTool` that nothing constructs (its own unit tests keep it compiling) pending the maintainer's decision | Unit tests in the module (offset rendering, snapshot fields); registry membership in `src/tools.rs` tests; `src/xdev.rs` one-liner drift test; CLI default-list goldens; `tests/readme_tool_inventory.rs`. |
+| `src/current_time.rs` | `current_time` tool, the shipped implementation since 82fd0468 (2026-09-02) routed the registry to this module; `src/tools.rs` still carries an older in-file `CurrentTimeTool` that nothing constructs (its own unit tests keep it compiling) pending the maintainer's decision | Unit tests in the module (offset rendering, snapshot fields); registry membership in `src/tools.rs` tests; CLI default-list goldens; `tests/readme_tool_inventory.rs`. |
 | `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
 | `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
 | `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |
@@ -95,7 +95,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extension_scoring.rs` | Extension scoring | Unit; `tests/extension_scoring.rs`, `tests/extension_scoring_ope.rs`, `tests/extension_scoring_voi_meanfield.rs`. |
 | `src/extension_tools.rs` | Extension tools | Unit; `tests/e2e_extension_registration.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/extension_validation.rs` | Extension validation | Unit; `tests/extension_validation.rs`, `tests/extension_lockfile_provenance.rs`, `tests/ext_provenance_verification.rs`. |
-| `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/e2e_extension_registration.rs`. |
+| `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/ext_conformance`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/extensions/compatibility.rs` | Extension compatibility contracts and scanner | Unit; compatibility scanner tests in this module plus `tests/ext_entry_scan.rs` and extension conformance suites. |
 | `src/extensions/event_coalescer_impl.rs` | Extension event coalescer | Extension event suites (`tests/extensions_event_wiring.rs`). |
 | `src/extensions/exec_mediation.rs` | Extension exec mediation | `tests/bash_mediation.rs`; in-source exec-security tests. |
@@ -208,7 +208,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites; public-provider HTTP tests cover native thinking/cache controls, hook fallback, exact rewritten-body SigV4 signing, and JSON cache accounting (added, not executed on the editing host). |
 | `src/providers/bedrock/request_options.rs` | Model-aware Bedrock thinking budgets/adaptive effort and native prompt-cache checkpoints | Unit (12 in-module request-shape tests); public-provider HTTP coverage in `src/providers/bedrock.rs`. These tests were added but not executed on the editing host because DSR is unavailable. |
 | `src/providers/bedrock/streaming.rs` | Incremental AWS binary event-stream validation and ConverseStream message lifecycle | Unit; `tests/provider_bedrock_streaming.rs` exercises public-provider incremental delivery, signed/redacted reasoning replay, malformed frames, and terminal handling. No fresh DSR execution is claimed by this inventory update. |
-| `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites. |
+| `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites; public-provider multimodal/tool HTTP tests in `src/providers/cohere/request_options.rs`. |
+| `src/providers/cohere/request_options.rs` | Native Cohere image payloads and thinking budgets | Unit (10 request/validation tests plus 9 public-provider HTTP tests), including first-delta delivery before completion, parallel tool/image replay, request hooks and credential redaction. Added, not executed: DSR unavailable. |
+| `src/providers/cohere/streaming.rs` | Bounded Cohere v2 indexed content/tool lifecycle and terminal stream handling | Unit (16 tests), including interleaved calls, malformed arguments, sparse indices, byte/block limits, native completion and one-error-then-EOF behavior. Added, not executed: DSR unavailable. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
@@ -294,7 +296,7 @@ Representative high-signal suites:
 | TUI | `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`, `tests/e2e_tui_features.rs`, `tests/e2e_tui_perf.rs` | Interactive state, view, rendering, keybindings |
 | Sessions | `tests/session_conformance.rs`, `tests/session_index_tests.rs`, `tests/session_sqlite.rs`, `tests/session_store_v2.rs`, `tests/e2e_session_persistence.rs` | JSONL/tree/index/sqlite/store v2 persistence |
 | Tools | `tests/tools_conformance.rs`, `tests/e2e_tools.rs`, `tests/tools_hardened.rs` | Built-in tools and tool I/O contracts |
-| Resources/scheduler | `tests/resource_loader.rs`, `tests/resource_edge_cases.rs`, `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs` | Resources, resource governor, scheduler/admission |
+| Resources/scheduler | `tests/resource_loader.rs`, `tests/resource_edge_cases.rs`, `tests/cargo_headroom_admission.rs` | Resources, resource governor, scheduler/admission |
 | Shims | `tests/node_buffer_shim.rs`, `tests/node_crypto_shim.rs`, `tests/node_http_shim.rs`, `tests/node_fs_shim.rs`, `tests/node_child_process_shim.rs` | Node compatibility shims |
 
 ---
