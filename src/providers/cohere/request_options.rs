@@ -441,13 +441,51 @@ mod transport_tests {
         body: Value,
     }
 
+    /// Read into `chunk`, treating a socket read timeout as "keep waiting"
+    /// until `deadline` rather than as a hard error.
+    ///
+    /// macOS surfaces a read timeout as EAGAIN/`WouldBlock` (errno 35), not
+    /// `TimedOut`, so `read().expect(..)` failed the test outright whenever a
+    /// client had merely not been scheduled in time. Observed failing as
+    /// `terminal_failure_and_length_are_not_successful_tool_turns` under the
+    /// full lib suite; the same shape took seven tests out of the Gemini and
+    /// Vertex fixtures (bd-eg6ng).
+    fn read_with_deadline(
+        socket: &mut TcpStream,
+        chunk: &mut [u8],
+        deadline: Instant,
+        what: &str,
+    ) -> usize {
+        loop {
+            match socket.read(chunk) {
+                Ok(count) => return count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for {what}"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(error) => panic!("{what}: {error}"),
+            }
+        }
+    }
+
     fn read_request(socket: &mut TcpStream) -> Request {
+        // The socket timeout is the POLLING interval; the deadline is the
+        // budget for the whole exchange.
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         socket
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut bytes = Vec::new();
         let boundary = loop {
             if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -455,7 +493,7 @@ mod transport_tests {
             }
             assert!(bytes.len() < 64 * 1024);
             let mut chunk = [0; 4096];
-            let count = socket.read(&mut chunk).expect("request headers");
+            let count = read_with_deadline(socket, &mut chunk, deadline, "request headers");
             assert!(count > 0);
             bytes.extend_from_slice(&chunk[..count]);
         };
@@ -474,7 +512,7 @@ mod transport_tests {
         assert!(length < 1024 * 1024);
         while bytes.len() - boundary < length {
             let mut chunk = [0; 4096];
-            let count = socket.read(&mut chunk).expect("request body");
+            let count = read_with_deadline(socket, &mut chunk, deadline, "request body");
             assert!(count > 0);
             bytes.extend_from_slice(&chunk[..count]);
         }

@@ -880,6 +880,7 @@ mod tests {
                         "fixture timed out waiting for {what}"
                     );
                 }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
                 Err(error) => panic!("{what}: {error}"),
             }
         }
