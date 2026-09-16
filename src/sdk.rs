@@ -1877,6 +1877,19 @@ impl AgentSessionHandle {
         self
     }
 
+    /// The session store this handle drives, for the rare caller that needs
+    /// NON-BLOCKING access to it.
+    ///
+    /// `/share` is the reason this exists: exporting a session must report
+    /// "the session is busy, retry" rather than park a user-cancellable
+    /// subprocess flow behind a mutex another task is holding. Anything that
+    /// can afford to wait should use [`Self::with_session`] instead, which
+    /// cannot leave the lock held across a caller's await.
+    #[must_use]
+    pub fn session_store(&self) -> Arc<asupersync::sync::Mutex<crate::session::Session>> {
+        Arc::clone(&self.session.session)
+    }
+
     /// Install (or clear) this handle's provider retry policy.
     ///
     /// [`create_agent_session`] takes it from [`SessionOptions::retry`]; this is

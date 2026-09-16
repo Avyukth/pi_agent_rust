@@ -2604,7 +2604,12 @@ async fn run(
                 cli.inline,
                 ftui_models,
                 ftui_sessions,
-                config.markdown_spacing(),
+                pi::interactive_ftui::FtuiSettings {
+                    markdown_spacing: config.markdown_spacing(),
+                    // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
+                    // the classic stack does, so it reads the same setting.
+                    gh_path: config.gh_path.clone(),
+                },
                 pi::interactive_ftui::AutocompleteLaunch {
                     catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
                     cwd: cwd.clone(),
