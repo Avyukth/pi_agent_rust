@@ -516,10 +516,12 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
         .collect()
 }
 
-/// Child-side drain, in delivery order. A busy writer never blocks the agent's
-/// polling path. Interrupted/read-failed batches remain available for retry.
-/// This acknowledges disk consumption, not processing by the model: a process
-/// crash after return still requires a higher-level delivery acknowledgment.
+/// Child-side drain, in delivery order.
+///
+/// A busy writer never blocks the agent's polling path, and interrupted or
+/// read-failed batches remain available for retry. This acknowledges disk
+/// consumption, not processing by the model: a process crash after return
+/// still requires a higher-level delivery acknowledgment.
 pub fn drain_steer_file(path: &Path) -> Vec<String> {
     let queue_lock = match open_steer_lock(path) {
         Ok(lock) => lock,

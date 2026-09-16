@@ -411,6 +411,11 @@ impl FileCache {
                 last_used: used,
             },
         );
+        // Released before returning rather than at the end of the expression:
+        // the caller immediately awaits on the slot, and holding the cache lock
+        // a moment longer than the map mutation needs it serialises every other
+        // request's cache lookup behind this one.
+        drop(cache);
         Ok(slot)
     }
 
@@ -801,11 +806,11 @@ mod tests {
     }
 
     impl Reply {
-        fn json(body: Value) -> Self {
+        fn json(body: &Value) -> Self {
             Self {
                 status: 200,
                 headers: Vec::new(),
-                body: serde_json::to_vec(&body).unwrap(),
+                body: serde_json::to_vec(body).unwrap(),
             }
         }
 
@@ -1182,15 +1187,16 @@ mod tests {
         assert_eq!(cache.state.lock().unwrap().entries.len(), MAX_CACHE_ENTRIES);
         drop(active.remove(0));
         assert!(cache.slot([255; 32]).is_ok());
+        let mut retained_key = [0; 32];
+        retained_key[0] = 1;
         let state = cache.state.lock().unwrap();
         assert_eq!(state.entries.len(), MAX_CACHE_ENTRIES);
         assert!(!state.entries.contains_key(&[0; 32]));
-        let mut retained_key = [0; 32];
-        retained_key[0] = 1;
         assert!(Arc::ptr_eq(
             &active[0],
             &state.entries.get(&retained_key).unwrap().slot,
         ));
+        drop(state);
     }
 
     #[test]
@@ -1198,8 +1204,8 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 4)})),
-                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 4)),
+                Reply::json(&json!({"file": file_metadata(endpoint, "one", "ACTIVE", 4)})),
+                Reply::json(&file_metadata(endpoint, "one", "ACTIVE", 4)),
             ]
         });
         let cache = cache();
@@ -1265,9 +1271,9 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "one", "PROCESSING", 3)})),
-                Reply::json(file_metadata(endpoint, "one", "PROCESSING", 3)),
-                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
+                Reply::json(&json!({"file": file_metadata(endpoint, "one", "PROCESSING", 3)})),
+                Reply::json(&file_metadata(endpoint, "one", "PROCESSING", 3)),
+                Reply::json(&file_metadata(endpoint, "one", "ACTIVE", 3)),
             ]
         });
         let mut body = media_body(b"abc");
@@ -1288,7 +1294,7 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "one", "FAILED", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "one", "FAILED", 3)})),
             ]
         });
         let original = media_body(b"abc");
@@ -1312,10 +1318,10 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
                 Reply::status(404),
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
             ]
         });
         let cache = cache();
@@ -1345,7 +1351,7 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
             ]
         });
         let cache = cache();
@@ -1379,8 +1385,8 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
-                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
+                Reply::json(&json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
+                Reply::json(&file_metadata(endpoint, "one", "ACTIVE", 3)),
             ]
         });
         let cache = cache();
@@ -1413,9 +1419,9 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "project-a", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "project-a", "ACTIVE", 3)})),
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "project-b", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "project-b", "ACTIVE", 3)})),
             ]
         });
         let cache = cache();
@@ -1441,7 +1447,7 @@ mod tests {
         let server = Server::start(|endpoint| {
             vec![
                 Reply::start(endpoint),
-                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
+                Reply::json(&json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
                 Reply::status(403),
             ]
         });
@@ -1569,7 +1575,7 @@ mod tests {
     #[test]
     fn previously_processing_upload_resumes_without_reupload() {
         let server = Server::start(|endpoint| {
-            vec![Reply::json(file_metadata(
+            vec![Reply::json(&file_metadata(
                 endpoint, "existing", "ACTIVE", 3,
             ))]
         });
