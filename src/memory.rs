@@ -29,7 +29,9 @@ use serde::Serialize;
 use crate::error::{Error, Result};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
 
+mod reflection;
 mod transactions;
+pub use reflection::ReflectTool;
 
 /// Tool-result schema tag for memory operations (stable audit contract).
 pub const MEMORY_SCHEMA: &str = "pi.memory.v1";
@@ -425,7 +427,9 @@ impl MemoryStore {
                 .query_sync("SELECT last_insert_rowid()", &[])
                 .map_err(|e| Error::tool("memory", format!("rowid lookup failed: {e}")))?;
             let id = row_i64(
-                id_rows.first().ok_or_else(|| Error::tool("memory", "missing inserted row id"))?,
+                id_rows
+                    .first()
+                    .ok_or_else(|| Error::tool("memory", "missing inserted row id"))?,
                 0,
             )?;
             conn.execute_sync(
@@ -479,7 +483,9 @@ impl MemoryStore {
     /// Named `PI_MEMORY_UNKNOWN_ID` for unknown ids.
     pub fn edit(&self, id: i64, op: MemoryEditOp, content: Option<&str>) -> Result<()> {
         if op == MemoryEditOp::Update && content.is_none_or(|text| text.trim().is_empty()) {
-            return Err(Error::validation("memory_edit update requires non-empty content"));
+            return Err(Error::validation(
+                "memory_edit update requires non-empty content",
+            ));
         }
         let new_content = content.map(screen_secrets);
         self.with_write_conn(move |conn| {
@@ -630,7 +636,7 @@ const SECRET_PATTERNS: &[(&str, &str)] = &[
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         "[REDACTED_PRIVATE_KEY]",
     ),
-    (r"AIza[0-9A-Za-z0-9_\-]{20,}", "[REDACTED_GOOGLE_API_KEY]"),
+    (r"AIza[0-9A-Za-z_\-]{20,}", "[REDACTED_GOOGLE_API_KEY]"),
     (r"xox[baprs]-[A-Za-z0-9\-]{10,}", "[REDACTED_SLACK_TOKEN]"),
 ];
 
@@ -665,10 +671,7 @@ pub fn screen_secrets(content: &str) -> String {
 // Tools
 // ---------------------------------------------------------------------------
 
-use futures::StreamExt as _;
-
 use crate::model::{ContentBlock, TextContent};
-use crate::provider::{Context, StreamEvent, StreamOptions};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 
 fn text_output(text: String, details: serde_json::Value, is_error: bool) -> ToolOutput {
@@ -772,16 +775,20 @@ impl Tool for RetainTool {
         match result {
             Ok(memory) => {
                 let details = serde_json::to_value(&memory)?;
-                let redaction_note = if memory.content.as_str() == input.content && memory.tags == tags {
-                    ""
-                } else {
-                    " (secret redacted before storage)"
-                };
+                let redaction_note =
+                    if memory.content.as_str() == input.content && memory.tags == tags {
+                        ""
+                    } else {
+                        " (secret redacted before storage)"
+                    };
                 let replacement_note = memory.supersedes.map_or_else(String::new, |id| {
                     format!("; superseded [{id}]")
                 });
                 Ok(text_output(
-                    format!("Remembered [{}] {}{redaction_note}{replacement_note}", memory.id, memory.kind),
+                    format!(
+                        "Remembered [{}] {}{redaction_note}{replacement_note}",
+                        memory.id, memory.kind
+                    ),
                     details,
                     false,
                 ))
@@ -964,186 +971,6 @@ impl Tool for MemoryEditTool {
     }
 }
 
-/// `reflect`: synthesize an answer over the bank with citation ids.
-pub struct ReflectTool {
-    store: Arc<MemoryStore>,
-    /// Injectable provider for tests; when None the tool resolves the
-    /// session's default provider lazily.
-    provider: Option<Arc<dyn crate::provider::Provider>>,
-}
-
-impl ReflectTool {
-    #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
-        Self {
-            store,
-            provider: None,
-        }
-    }
-
-    /// Inject a provider (tests and scripted harnesses).
-    #[must_use]
-    pub fn with_provider(
-        store: Arc<MemoryStore>,
-        provider: Arc<dyn crate::provider::Provider>,
-    ) -> Self {
-        Self {
-            store,
-            provider: Some(provider),
-        }
-    }
-
-    /// Union recall over the question's tokens (frequency then recency),
-    /// capped — natural questions AND poorly against FTS.
-    fn gather(&self, question: &str, cap: usize) -> Result<Vec<Memory>> {
-        let mut hits: std::collections::HashMap<i64, (usize, Memory)> =
-            std::collections::HashMap::new();
-        for token in question.split_whitespace() {
-            let token = token.trim_matches(|c: char| !c.is_alphanumeric()); // ubs:ignore punctuation trim, not a secret
-            if token.len() < 2 {
-                continue;
-            }
-            for memory in self.store.recall(token, Some(cap))? {
-                hits.entry(memory.id)
-                    .and_modify(|(count, _)| *count += 1)
-                    .or_insert((1, memory));
-            }
-        }
-        let mut ranked: Vec<(usize, Memory)> = hits.into_values().collect();
-        ranked.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then(b.1.updated_at_ms.cmp(&a.1.updated_at_ms))
-        });
-        Ok(ranked
-            .into_iter()
-            .take(cap)
-            .map(|(_, memory)| memory)
-            .collect())
-    }
-
-    fn resolve_provider(&self) -> Result<Arc<dyn crate::provider::Provider>> {
-        if let Some(provider) = &self.provider {
-            return Ok(Arc::clone(provider));
-        }
-        // Lazy resolution (reflect calls are rare): load auth + the model
-        // registry and use the session-default (first) model entry, the
-        // same fallback the role resolver uses.
-        let auth_path = crate::config::Config::global_dir().join("auth.json");
-        let auth = crate::auth::AuthStorage::load(auth_path)
-            .map_err(|e| Error::tool("reflect", format!("auth load failed: {e}")))?;
-        let registry = crate::models::ModelRegistry::load(&auth, None);
-        let entry = registry.models().first().ok_or_else(|| {
-            Error::tool(
-                "reflect",
-                "no model available for synthesis (configure a default model)".to_string(),
-            )
-        })?;
-        crate::providers::create_provider(entry, None)
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReflectInput {
-    question: String,
-}
-
-#[async_trait::async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
-impl Tool for ReflectTool {
-    fn name(&self) -> &str {
-        "reflect"
-    }
-
-    fn label(&self) -> &str {
-        "reflect"
-    }
-
-    fn description(&self) -> &str {
-        "Answer a question using this project's memories. Gathers the most \
-         relevant memories, synthesizes an answer with the session model, \
-         and cites the memory ids used."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "question": { "type": "string", "description": "The question to answer from memory" }
-            },
-            "required": ["question"]
-        })
-    }
-
-    fn effects(&self) -> ToolEffects {
-        ToolEffects::read()
-    }
-
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        input: serde_json::Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
-    ) -> Result<ToolOutput> {
-        let input: ReflectInput =
-            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        // Gather top-K: natural questions AND poorly, so recall per token
-        // and union (frequency then recency), capped at 8.
-        let corpus = self.gather(&input.question, 8)?;
-        if corpus.is_empty() {
-            return Ok(text_output(
-                "No memories to reflect on yet — retain some facts first.".to_string(),
-                serde_json::json!({ "schema": MEMORY_SCHEMA, "citations": [] }),
-                false,
-            ));
-        }
-        let provider = self.resolve_provider()?;
-        let mut prompt = String::from(
-            "Answer the question using ONLY the memories below. Cite memory ids in \
-             square brackets (e.g. [3]) for every claim. If the memories do not \
-             answer the question, say so.\n\nMemories:\n",
-        );
-        for memory in &corpus {
-            let _ = std::fmt::Write::write_fmt(
-                &mut prompt,
-                format_args!("- [{}] ({}): {}\n", memory.id, memory.kind, memory.content),
-            );
-        }
-        let _ = std::fmt::Write::write_fmt(
-            &mut prompt,
-            format_args!("\nQuestion: {}\n", input.question),
-        );
-        let context = Context {
-            system_prompt: Some(std::borrow::Cow::Borrowed(
-                "You are a precise memory synthesizer. Cite memory ids for every claim.",
-            )),
-            messages: std::borrow::Cow::Owned(vec![crate::model::Message::User(
-                crate::model::UserMessage {
-                    content: crate::model::UserContent::Text(prompt),
-                    timestamp: now_ms(),
-                },
-            )]),
-            tools: std::borrow::Cow::Borrowed(&[]),
-        };
-        let options = StreamOptions::default();
-        let mut stream = provider.stream(&context, &options).await?;
-        let mut answer = String::new();
-        while let Some(event) = stream.next().await {
-            if let Ok(StreamEvent::TextDelta { delta, .. }) = event {
-                answer.push_str(&delta);
-            }
-        }
-        let citations: Vec<i64> = corpus.iter().map(|memory| memory.id).collect();
-        let details = serde_json::json!({
-            "schema": MEMORY_SCHEMA,
-            "question": input.question,
-            "citations": citations,
-            "memories": corpus,
-        });
-        Ok(text_output(answer, details, false))
-    }
-}
-
 use sha2::Digest;
 
 #[cfg(test)]
@@ -1268,7 +1095,6 @@ mod tests {
                 .expect("retain")
                 .id
         };
-        // A fresh store instance (new session) sees the same bank.
         let store = MemoryStore::open(&root).expect("open second");
         let hits = store.recall("cargo check", None).expect("recall");
         assert!(
