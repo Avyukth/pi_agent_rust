@@ -781,9 +781,9 @@ impl Tool for RetainTool {
                     } else {
                         " (secret redacted before storage)"
                     };
-                let replacement_note = memory.supersedes.map_or_else(String::new, |id| {
-                    format!("; superseded [{id}]")
-                });
+                let replacement_note = memory
+                    .supersedes
+                    .map_or_else(String::new, |id| format!("; superseded [{id}]"));
                 Ok(text_output(
                     format!(
                         "Remembered [{}] {}{redaction_note}{replacement_note}",

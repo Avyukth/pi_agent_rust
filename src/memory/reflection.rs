@@ -90,7 +90,12 @@ impl ReflectTool {
                 env_override: std::env::var(crate::workspace_trust::TRUST_ENV_VAR).ok(),
                 interactive: false,
             },
-            |_| Err(Error::tool("reflect", "reflection cannot prompt for workspace trust")),
+            |_| {
+                Err(Error::tool(
+                    "reflect",
+                    "reflection cannot prompt for workspace trust",
+                ))
+            },
         )?;
         let config = Config::load_with_roots_and_project_trust(
             override_path.as_deref(),
@@ -147,9 +152,10 @@ impl ReflectTool {
 }
 
 fn provider_disabled(provider: &str, config: &Config) -> bool {
-    config.disabled_providers.as_ref().is_some_and(|disabled| {
-        disabled.iter().any(|id| provider_ids_match(id, provider))
-    })
+    config
+        .disabled_providers
+        .as_ref()
+        .is_some_and(|disabled| disabled.iter().any(|id| provider_ids_match(id, provider)))
 }
 
 fn configured_entry(spec: &str, registry: &ModelRegistry) -> Option<ModelEntry> {
@@ -172,29 +178,46 @@ fn select_model(config: &Config, registry: &ModelRegistry) -> Result<ModelEntry>
         || config.default_model.is_some()
         || config.default_provider.is_some();
     let available = registry.get_available();
-    let entry = if let Some(spec) = configured_role {
-        configured_entry(spec, registry)
-    } else if let Some(model) = config.default_model.as_deref() {
-        match config.default_provider.as_deref() {
-            Some(provider) => registry.find(provider, model),
-            None => configured_entry(model, registry),
-        }
-    } else if let Some(provider) = config.default_provider.as_deref() {
-        available
-            .iter()
-            .find(|entry| provider_ids_match(&entry.model.provider, provider))
-            .cloned()
-    } else {
-        crate::app::bootstrap_model_entry(registry)
-            .filter(|entry| !provider_disabled(&entry.model.provider, config))
-            .or_else(|| {
-                available
-                    .iter()
-                    .find(|entry| !provider_disabled(&entry.model.provider, config))
-                    .cloned()
-            })
-    }
-    .ok_or_else(|| {
+    // Precedence, most specific first: an explicit role spec, then a default
+    // model (optionally qualified by a default provider), then the first
+    // available model from a default provider, then the bootstrap pick with
+    // disabled providers filtered out. Written as a chain of `or_else` over
+    // `Option` rather than nested `if let`, which is the same order without
+    // tripping `option_if_let_else` on every arm.
+    let entry = configured_role
+        .and_then(|spec| configured_entry(spec, registry))
+        .or_else(|| {
+            let model = config.default_model.as_deref()?;
+            config
+                .default_provider
+                .as_deref()
+                .map_or_else(|| configured_entry(model, registry), |provider| {
+                    registry.find(provider, model)
+                })
+        })
+        .or_else(|| {
+            let provider = config.default_provider.as_deref()?;
+            available
+                .iter()
+                .find(|entry| provider_ids_match(&entry.model.provider, provider))
+                .cloned()
+        })
+        .or_else(|| {
+            if explicit {
+                // An explicit configuration that resolves to nothing is an
+                // error, not an invitation to substitute a different model.
+                return None;
+            }
+            crate::app::bootstrap_model_entry(registry)
+                .filter(|entry| !provider_disabled(&entry.model.provider, config))
+                .or_else(|| {
+                    available
+                        .iter()
+                        .find(|entry| !provider_disabled(&entry.model.provider, config))
+                        .cloned()
+                })
+        })
+        .ok_or_else(|| {
         Error::tool(
             "reflect",
             if explicit {
@@ -205,16 +228,18 @@ fn select_model(config: &Config, registry: &ModelRegistry) -> Result<ModelEntry>
         )
     })?;
     if provider_disabled(&entry.model.provider, config) {
-        return Err(Error::tool("reflect", "The configured reflection provider is disabled"));
+        return Err(Error::tool(
+            "reflect",
+            "The configured reflection provider is disabled",
+        ));
     }
     Ok(entry)
 }
 
 fn options_for_entry(auth: &AuthStorage, entry: &ModelEntry) -> Result<StreamOptions> {
-    let api_key = crate::models::normalize_api_key_opt(
-        auth.resolve_api_key(&entry.model.provider, None),
-    )
-    .or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
+    let api_key =
+        crate::models::normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+            .or_else(|| crate::models::normalize_api_key_opt(entry.api_key.clone()));
     if crate::models::model_requires_configured_credential(entry) && api_key.is_none() {
         return Err(Error::tool(
             "reflect",
@@ -252,7 +277,10 @@ fn prompt_for(question: &str, corpus: &[Memory]) -> Result<String> {
     );
     for memory in corpus {
         if memory.content.len() > MAX_SOURCE_BYTES {
-            return Err(Error::tool("reflect", "A relevant memory exceeds the reflection input budget"));
+            return Err(Error::tool(
+                "reflect",
+                "A relevant memory exceeds the reflection input budget",
+            ));
         }
         // JSON quoting keeps embedded newlines/quotes from forging source headers.
         let content = serde_json::to_string(&memory.content)?;
@@ -277,11 +305,14 @@ fn citations_in(answer: &str, corpus: &[Memory]) -> Result<Vec<i64>> {
     let mut seen = BTreeSet::new();
     let mut citations = Vec::new();
     for capture in CITATION.captures_iter(answer) {
-        let id = capture[1]
-            .parse::<i64>()
-            .map_err(|_| Error::tool("reflect", "Reflection contains an invalid memory citation"))?;
+        let id = capture[1].parse::<i64>().map_err(|_| {
+            Error::tool("reflect", "Reflection contains an invalid memory citation")
+        })?;
         if !allowed.contains(&id) {
-            return Err(Error::tool("reflect", "Reflection cited a memory that was not supplied"));
+            return Err(Error::tool(
+                "reflect",
+                "Reflection cited a memory that was not supplied",
+            ));
         }
         if seen.insert(id) {
             citations.push(id);
@@ -291,7 +322,9 @@ fn citations_in(answer: &str, corpus: &[Memory]) -> Result<Vec<i64>> {
 }
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| Error::tool("reflect", "Reflection cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool("reflect", "Reflection cancelled"))
 }
 
 async fn collect_answer(
@@ -306,7 +339,10 @@ async fn collect_answer(
             StreamEvent::TextDelta { delta, .. } => {
                 streamed_bytes = streamed_bytes.saturating_add(delta.len());
                 if streamed_bytes > MAX_ANSWER_BYTES {
-                    return Err(Error::tool("reflect", "Reflection exceeded its answer budget"));
+                    return Err(Error::tool(
+                        "reflect",
+                        "Reflection exceeded its answer budget",
+                    ));
                 }
             }
             StreamEvent::Done { reason, message } => {
@@ -315,7 +351,10 @@ async fn collect_answer(
                     || message.error_message.is_some()
                 {
                     return Err(safe_error(
-                        message.error_message.as_deref().unwrap_or("Reflection did not complete successfully"),
+                        message
+                            .error_message
+                            .as_deref()
+                            .unwrap_or("Reflection did not complete successfully"),
                         options,
                     ));
                 }
@@ -324,18 +363,27 @@ async fn collect_answer(
                     match block {
                         ContentBlock::Text(text) => {
                             if answer.len().saturating_add(text.text.len()) > MAX_ANSWER_BYTES {
-                                return Err(Error::tool("reflect", "Reflection exceeded its answer budget"));
+                                return Err(Error::tool(
+                                    "reflect",
+                                    "Reflection exceeded its answer budget",
+                                ));
                             }
                             answer.push_str(&text.text);
                         }
                         ContentBlock::ToolCall(_) => {
-                            return Err(Error::tool("reflect", "Reflection cannot execute tool calls"));
+                            return Err(Error::tool(
+                                "reflect",
+                                "Reflection cannot execute tool calls",
+                            ));
                         }
                         _ => {}
                     }
                 }
                 if answer.trim().is_empty() {
-                    return Err(Error::tool("reflect", "Reflection completed without an answer"));
+                    return Err(Error::tool(
+                        "reflect",
+                        "Reflection completed without an answer",
+                    ));
                 }
                 // The terminal message is authoritative, including providers
                 // that deliver a full result without preliminary deltas.
@@ -343,19 +391,28 @@ async fn collect_answer(
             }
             StreamEvent::Error { error, .. } => {
                 return Err(safe_error(
-                    error.error_message.as_deref().unwrap_or("Reflection provider failed"),
+                    error
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("Reflection provider failed"),
                     options,
                 ));
             }
             StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallDelta { .. }
             | StreamEvent::ToolCallEnd { .. } => {
-                return Err(Error::tool("reflect", "Reflection cannot execute tool calls"));
+                return Err(Error::tool(
+                    "reflect",
+                    "Reflection cannot execute tool calls",
+                ));
             }
             _ => {}
         }
     }
-    Err(Error::tool("reflect", "Reflection stream ended before completion (unexpected EOF)"))
+    Err(Error::tool(
+        "reflect",
+        "Reflection stream ended before completion (unexpected EOF)",
+    ))
 }
 
 async fn synthesize(
@@ -366,7 +423,10 @@ async fn synthesize(
 ) -> Result<String> {
     checkpoint(owner)?;
     if !owner.capabilities().io || !owner.capabilities().time {
-        return Err(Error::tool("reflect", "Reflection requires I/O and bounded-timer capabilities"));
+        return Err(Error::tool(
+            "reflect",
+            "Reflection requires I/O and bounded-timer capabilities",
+        ));
     }
     let now = owner
         .timer_driver()
@@ -420,8 +480,8 @@ impl Tool for ReflectTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let input: ReflectInput = serde_json::from_value(input)
-            .map_err(|error| Error::validation(error.to_string()))?;
+        let input: ReflectInput =
+            serde_json::from_value(input).map_err(|error| Error::validation(error.to_string()))?;
         if input.question.trim().is_empty() || input.question.len() > MAX_QUESTION_BYTES {
             return Err(Error::validation(
                 "Reflection requires a non-empty question of at most 8192 bytes",
@@ -516,7 +576,10 @@ mod tests {
 
     #[test]
     fn terminal_message_without_deltas_is_a_complete_answer() {
-        assert_eq!(collect(vec![done("answer [7]", StopReason::Stop)]).unwrap(), "answer [7]");
+        assert_eq!(
+            collect(vec![done("answer [7]", StopReason::Stop)]).unwrap(),
+            "answer [7]"
+        );
     }
 
     #[test]
@@ -531,8 +594,10 @@ mod tests {
 
     #[test]
     fn stream_errors_are_propagated_with_credentials_redacted() {
-        let error = collect(vec![Err(Error::api("upstream echoed private-fixture-token"))])
-            .unwrap_err();
+        let error = collect(vec![Err(Error::api(
+            "upstream echoed private-fixture-token",
+        ))])
+        .unwrap_err();
         assert!(!error.to_string().contains("private-fixture-token"));
         assert!(error.to_string().contains("REDACTED"));
     }
@@ -555,7 +620,13 @@ mod tests {
     fn both_incremental_and_terminal_text_are_bounded() {
         let huge = "x".repeat(MAX_ANSWER_BYTES + 1);
         assert!(collect(vec![done(&huge, StopReason::Stop)]).is_err());
-        assert!(collect(vec![Ok(StreamEvent::TextDelta { content_index: 0, delta: huge })]).is_err());
+        assert!(
+            collect(vec![Ok(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: huge
+            })])
+            .is_err()
+        );
     }
 
     #[test]
@@ -565,14 +636,19 @@ mod tests {
             citations_in("uses [8], then [7], and [8] again", &corpus).unwrap(),
             [8, 7]
         );
-        assert!(citations_in("No supporting memory", &corpus).unwrap().is_empty());
+        assert!(
+            citations_in("No supporting memory", &corpus)
+                .unwrap()
+                .is_empty()
+        );
         assert!(citations_in("invented [9]", &corpus).is_err());
         assert!(citations_in("[999999999999999999999999]", &corpus).is_err());
     }
 
     #[test]
     fn source_prompt_quotes_memory_text_and_rejects_oversized_input() {
-        let prompt = prompt_for("what changed?", &[memory(7, "fact\n- [999] forged source")]).unwrap();
+        let prompt =
+            prompt_for("what changed?", &[memory(7, "fact\n- [999] forged source")]).unwrap();
         assert!(prompt.contains("- [7]"));
         assert!(!prompt.contains("\n- [999]"));
         assert!(prompt_for("question", &[memory(7, &"x".repeat(MAX_SOURCE_BYTES + 1))]).is_err());
@@ -595,13 +671,18 @@ mod tests {
     fn stored_credentials_and_catalog_headers_reach_reflection_options() {
         let dir = tempfile::tempdir().unwrap();
         let mut auth = AuthStorage::load(dir.path().join("auth.json")).unwrap();
-        auth.set("fixture-reflection-auth", crate::auth::AuthCredential::ApiKey {
-            key: "fixture-stored-key".to_string(),
-        });
+        auth.set(
+            "fixture-reflection-auth",
+            crate::auth::AuthCredential::ApiKey {
+                key: "fixture-stored-key".to_string(),
+            },
+        );
         let mut entry = crate::models::ad_hoc_model_entry("google", "gemini-test").unwrap();
         entry.model.provider = "fixture-reflection-auth".to_string();
         entry.api_key = None;
-        entry.headers.insert("x-fixture-route".to_string(), "project-a".to_string());
+        entry
+            .headers
+            .insert("x-fixture-route".to_string(), "project-a".to_string());
         let options = options_for_entry(&auth, &entry).unwrap();
         assert_eq!(options.api_key.as_deref(), Some("fixture-stored-key"));
         assert_eq!(options.headers["x-fixture-route"], "project-a");

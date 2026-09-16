@@ -2009,7 +2009,11 @@ mod tests {
                         "adaptive"
                     );
                     assert_eq!(event.payload["system"][1]["cachePoint"]["ttl"], "1h");
-                    assert!(event.payload["inferenceConfig"].get("temperature").is_none());
+                    assert!(
+                        event.payload["inferenceConfig"]
+                            .get("temperature")
+                            .is_none()
+                    );
                     event.payload["additionalModelRequestFields"]["output_config"]["effort"] =
                         json!("low");
                     event.payload["messages"][0]["content"][0]["text"] = json!("Hook rewrite");
@@ -2031,13 +2035,19 @@ mod tests {
         });
         assert!(events.iter().all(Result::is_ok));
         assert!(matches!(events.last(), Some(Ok(StreamEvent::Done { .. }))));
-        assert_eq!(serde_json::to_value(context.messages.as_ref()).unwrap(), original);
+        assert_eq!(
+            serde_json::to_value(context.messages.as_ref()).unwrap(),
+            original
+        );
         let captured = captured_request
             .recv_timeout(Duration::from_secs(2))
             .expect("captured request");
         let body: Value = serde_json::from_slice(&captured.body).unwrap();
         assert_eq!(body["messages"][0]["content"][0]["text"], "Hook rewrite");
-        assert_eq!(body["additionalModelRequestFields"]["output_config"]["effort"], "low");
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "low"
+        );
         assert_eq!(body["inferenceConfig"]["maxTokens"], 8192);
         assert_eq!(body["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
         assert_eq!(body["messages"][2]["content"][1]["cachePoint"]["ttl"], "1h");
@@ -2058,14 +2068,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(captured.headers["authorization"], expected.authorization);
-        assert_eq!(captured.headers["x-amz-content-sha256"], expected.payload_hash);
+        assert_eq!(
+            captured.headers["x-amz-content-sha256"],
+            expected.payload_hash
+        );
     }
 
     #[test]
     fn rejected_request_hook_preserves_native_controls_on_the_wire() {
         let (base_url, captured_request) = spawn_bedrock_test_server();
-        let provider = BedrockProvider::new("anthropic.claude-3-7-sonnet")
-            .with_base_url(base_url);
+        let provider = BedrockProvider::new("anthropic.claude-3-7-sonnet").with_base_url(base_url);
         let context = test_context_with_tools();
         let options = StreamOptions {
             api_key: Some("test-bearer".to_string()),
@@ -2086,9 +2098,15 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("captured request");
         let body: Value = serde_json::from_slice(&captured.body).unwrap();
-        assert_eq!(body["additionalModelRequestFields"]["thinking"]["type"], "enabled");
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "enabled"
+        );
         assert_eq!(body["inferenceConfig"]["maxTokens"], 4096);
-        assert_eq!(body["system"][1], json!({"cachePoint": {"type": "default"}}));
+        assert_eq!(
+            body["system"][1],
+            json!({"cachePoint": {"type": "default"}})
+        );
         assert_eq!(body["messages"][0]["content"][0]["text"], "Ping");
     }
 

@@ -2512,7 +2512,11 @@ async fn run(
                 // creates its own session file; the default stack's early
                 // session was dropped above without writing anything.
                 no_session: cli.no_session,
-                session_path: cli.session.as_ref().map(PathBuf::from),
+                session_path: cli
+                    .session
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or(continue_session_path),
                 session_dir: cli.session_dir.as_ref().map(PathBuf::from),
                 // Explicit -e extension files load with UI prompts bridged
                 workspace: Some(workspace.clone()),

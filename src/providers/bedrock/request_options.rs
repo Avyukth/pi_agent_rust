@@ -126,11 +126,7 @@ fn thinking_is_required(id: &str) -> bool {
         .any(|prefix| family(id, prefix))
 }
 
-fn effort(
-    level: ThinkingLevel,
-    id: Option<&str>,
-    compat: Option<&CompatConfig>,
-) -> Result<String> {
+fn effort(level: ThinkingLevel, id: Option<&str>, compat: Option<&CompatConfig>) -> Result<String> {
     if let Some(mapped) = compat
         .and_then(|config| config.thinking_level_map.as_ref())
         .and_then(|map| map.get(&level.to_string()))
@@ -265,9 +261,7 @@ fn cache_support(id: &str) -> Option<bool> {
             .any(|prefix| family(id, prefix))
     {
         Some(true)
-    } else if family(id, "claude-3-7-sonnet")
-        || family(id, "claude-3-5-sonnet-20241022-v2")
-    {
+    } else if family(id, "claude-3-7-sonnet") || family(id, "claude-3-5-sonnet-20241022-v2") {
         Some(false)
     } else {
         None
@@ -469,18 +463,18 @@ mod tests {
     #[test]
     fn adaptive_effort_tiers_and_catalog_overrides_are_distinct() {
         assert_eq!(
-            build("anthropic.claude-opus-4-6", &options(ThinkingLevel::XHigh))
-                ["additionalModelRequestFields"]["output_config"]["effort"],
+            build("anthropic.claude-opus-4-6", &options(ThinkingLevel::XHigh))["additionalModelRequestFields"]
+                ["output_config"]["effort"],
             "high"
         );
         assert_eq!(
-            build("anthropic.claude-opus-5", &options(ThinkingLevel::XHigh))
-                ["additionalModelRequestFields"]["output_config"]["effort"],
+            build("anthropic.claude-opus-5", &options(ThinkingLevel::XHigh))["additionalModelRequestFields"]
+                ["output_config"]["effort"],
             "xhigh"
         );
         assert_eq!(
-            build("anthropic.claude-opus-5", &options(ThinkingLevel::Max))
-                ["additionalModelRequestFields"]["output_config"]["effort"],
+            build("anthropic.claude-opus-5", &options(ThinkingLevel::Max))["additionalModelRequestFields"]
+                ["output_config"]["effort"],
             "max"
         );
         let mut compat = CompatConfig {
@@ -495,7 +489,10 @@ mod tests {
             &options(ThinkingLevel::XHigh),
         )
         .unwrap();
-        assert_eq!(body["additionalModelRequestFields"]["output_config"]["effort"], "max");
+        assert_eq!(
+            body["additionalModelRequestFields"]["output_config"]["effort"],
+            "max"
+        );
         compat
             .thinking_level_map
             .as_mut()
@@ -518,7 +515,10 @@ mod tests {
             &options(ThinkingLevel::Low),
         )
         .unwrap();
-        assert_eq!(body["additionalModelRequestFields"]["thinking"]["type"], "enabled");
+        assert_eq!(
+            body["additionalModelRequestFields"]["thinking"]["type"],
+            "enabled"
+        );
     }
 
     #[test]
@@ -550,7 +550,8 @@ mod tests {
             cache_retention: CacheRetention::Long,
             ..options(ThinkingLevel::High)
         };
-        let original = serde_json::to_value(BedrockProvider::build_request(&context(), &opts)).unwrap();
+        let original =
+            serde_json::to_value(BedrockProvider::build_request(&context(), &opts)).unwrap();
         for model in [
             "amazon.nova-pro-v1:0",
             "deepseek.r1-v1:0",
@@ -588,7 +589,10 @@ mod tests {
         let modern = build("eu.anthropic.claude-opus-4-6-v1", &opts);
         assert_eq!(modern["system"][1]["cachePoint"]["ttl"], "1h");
         assert_eq!(modern["toolConfig"]["tools"][1]["cachePoint"]["ttl"], "1h");
-        assert_eq!(modern["messages"][0]["content"][1]["cachePoint"]["ttl"], "1h");
+        assert_eq!(
+            modern["messages"][0]["content"][1]["cachePoint"]["ttl"],
+            "1h"
+        );
         let old = build("anthropic.claude-3-7-sonnet", &opts);
         assert_eq!(old["system"][1], json!({"cachePoint": {"type": "default"}}));
     }
@@ -604,7 +608,10 @@ mod tests {
         let first = prepare("anthropic.claude-sonnet-4-5", None, &context, &opts).unwrap();
         let second = prepare("anthropic.claude-sonnet-4-5", None, &context, &opts).unwrap();
         assert_eq!(first, second);
-        assert_eq!(serde_json::to_value(context.messages.as_ref()).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(context.messages.as_ref()).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -612,15 +619,19 @@ mod tests {
         let mut context = context();
         context.system_prompt = None;
         context.tools.to_mut().clear();
-        context.messages.to_mut().push(Message::assistant(AssistantMessage {
-            content: vec![ContentBlock::Text(TextContent::new("Assistant prefix"))],
-            ..AssistantMessage::default()
-        }));
+        context
+            .messages
+            .to_mut()
+            .push(Message::assistant(AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("Assistant prefix"))],
+                ..AssistantMessage::default()
+            }));
         let opts = StreamOptions {
             cache_retention: CacheRetention::Short,
             ..StreamOptions::default()
         };
-        let original = serde_json::to_value(BedrockProvider::build_request(&context, &opts)).unwrap();
+        let original =
+            serde_json::to_value(BedrockProvider::build_request(&context, &opts)).unwrap();
         let body = prepare("anthropic.claude-sonnet-4-5", None, &context, &opts).unwrap();
         assert_eq!(body, original);
     }

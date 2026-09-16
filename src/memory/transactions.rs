@@ -222,7 +222,10 @@ mod store_tests {
             assert_eq!(listed[0].content, original.content);
             assert_eq!(listed[0].status, "active");
             assert_eq!(listed[0].updated_at_ms, original.updated_at_ms);
-            assert_eq!(reopened.recall("original", None).unwrap()[0].id, original.id);
+            assert_eq!(
+                reopened.recall("original", None).unwrap()[0].id,
+                original.id
+            );
             assert!(reopened.recall("replacement", None).unwrap().is_empty());
         }
     }
@@ -253,13 +256,27 @@ mod store_tests {
         assert!(reopened.mental_model().unwrap().contains("modern grammar"));
         assert!(!reopened.mental_model().unwrap().contains("legacy grammar"));
         let history = reopened.list(10).unwrap();
-        assert!(history.iter().any(|row| row.id == old.id && row.status == "superseded"));
+        assert!(
+            history
+                .iter()
+                .any(|row| row.id == old.id && row.status == "superseded")
+        );
         assert_eq!(audit_ops(&reopened, old.id), ["retain", "supersede"]);
         assert_eq!(audit_ops(&reopened, new.id), ["retain"]);
         let error = reopened
-            .supersede(old.id, MemoryKind::Fact, "stale competing replacement", &[], None)
+            .supersede(
+                old.id,
+                MemoryKind::Fact,
+                "stale competing replacement",
+                &[],
+                None,
+            )
             .unwrap_err();
-        assert!(error.to_string().contains("PI_MEMORY_SUPERSESSION_CONFLICT"));
+        assert!(
+            error
+                .to_string()
+                .contains("PI_MEMORY_SUPERSESSION_CONFLICT")
+        );
         assert_eq!(reopened.list(10).unwrap().len(), 2);
     }
 
@@ -271,9 +288,10 @@ mod store_tests {
             .retain(MemoryKind::Fact, "original parser", &[], None)
             .unwrap();
         break_audit_schema(&bank);
-        assert!(bank
-            .supersede(old.id, MemoryKind::Fact, "new parser", &[], None)
-            .is_err());
+        assert!(
+            bank.supersede(old.id, MemoryKind::Fact, "new parser", &[], None)
+                .is_err()
+        );
         let reopened = store(dir.path());
         let history = reopened.list(10).unwrap();
         assert_eq!(history.len(), 1);
@@ -318,8 +336,11 @@ mod store_tests {
     fn update_repairs_a_missing_legacy_index_without_creating_duplicate_content() {
         let dir = tempfile::tempdir().unwrap();
         let bank = store(dir.path());
-        let first = bank.retain(MemoryKind::Fact, "first fact", &[], None).unwrap();
-        bank.retain(MemoryKind::Fact, "second fact", &[], None).unwrap();
+        let first = bank
+            .retain(MemoryKind::Fact, "first fact", &[], None)
+            .unwrap();
+        bank.retain(MemoryKind::Fact, "second fact", &[], None)
+            .unwrap();
         bank.with_conn(|conn| {
             conn.execute_sync(
                 "DELETE FROM memories_fts WHERE rowid = ?1",
@@ -332,9 +353,15 @@ mod store_tests {
         bank.edit(first.id, MemoryEditOp::Update, Some("repaired fact"))
             .unwrap();
         assert_eq!(bank.recall("repaired", None).unwrap()[0].id, first.id);
-        assert!(bank.edit(first.id, MemoryEditOp::Update, Some("second fact")).is_err());
+        assert!(
+            bank.edit(first.id, MemoryEditOp::Update, Some("second fact"))
+                .is_err()
+        );
         assert_eq!(bank.recall("repaired", None).unwrap()[0].id, first.id);
-        assert!(bank.edit(first.id, MemoryEditOp::Update, Some("   ")).is_err());
+        assert!(
+            bank.edit(first.id, MemoryEditOp::Update, Some("   "))
+                .is_err()
+        );
         assert_eq!(audit_ops(&bank, first.id), ["retain", "update"]);
     }
 
@@ -342,7 +369,9 @@ mod store_tests {
     fn retain_tool_supersedes_and_screens_tags_before_storage() {
         let dir = tempfile::tempdir().unwrap();
         let bank = Arc::new(store(dir.path()));
-        let old = bank.retain(MemoryKind::Fact, "old endpoint", &[], None).unwrap();
+        let old = bank
+            .retain(MemoryKind::Fact, "old endpoint", &[], None)
+            .unwrap();
         let tool = RetainTool::new(Arc::clone(&bank));
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -361,17 +390,21 @@ mod store_tests {
         let details = output.details.unwrap();
         assert_eq!(details["supersedes"], old.id);
         assert_eq!(details["tags"][0], "[REDACTED_OPENAI_KEY]");
-        assert!(!serde_json::to_string(&bank.list(10).unwrap())
-            .unwrap()
-            .contains("sk-abcdef"));
+        assert!(
+            !serde_json::to_string(&bank.list(10).unwrap())
+                .unwrap()
+                .contains("sk-abcdef")
+        );
     }
 
     #[test]
     fn oversized_latest_fact_does_not_hide_smaller_startup_memories() {
         let dir = tempfile::tempdir().unwrap();
         let bank = store(dir.path());
-        bank.retain(MemoryKind::Fact, "small useful fact", &[], None).unwrap();
-        bank.retain(MemoryKind::Fact, &"large".repeat(1000), &[], None).unwrap();
+        bank.retain(MemoryKind::Fact, "small useful fact", &[], None)
+            .unwrap();
+        bank.retain(MemoryKind::Fact, &"large".repeat(1000), &[], None)
+            .unwrap();
         let model = bank.mental_model().unwrap();
         assert!(model.contains("small useful fact"));
         assert!(model.len() <= crate::memory::MENTAL_MODEL_BUDGET);

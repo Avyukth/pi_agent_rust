@@ -37,7 +37,9 @@ fn finish_case(harness: &TestHarness, case: &str) {
         .log()
         .info("verify", format!("case '{case}' assertions passed"));
     let path = harness.temp_path(format!("{case}.jsonl"));
-    harness.write_jsonl_logs(&path).expect("write JSONL test logs");
+    harness
+        .write_jsonl_logs(&path)
+        .expect("write JSONL test logs");
     let payload = std::fs::read_to_string(&path).expect("read JSONL test logs");
     let errors = validate_jsonl_v2_only(&payload);
     assert!(errors.is_empty(), "JSONL v2 validation errors: {errors:?}");
@@ -98,8 +100,12 @@ impl ReflectionServer {
                     Err(error) => panic!("reflection accept: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(30))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
             let header_end = loop {
@@ -132,15 +138,26 @@ impl ReflectionServer {
                 "HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            socket.write_all(response.as_bytes()).expect("write reflection response");
+            socket
+                .write_all(response.as_bytes())
+                .expect("write reflection response");
             Some(request)
         });
-        Self { base_url, stop, join: Some(join) }
+        Self {
+            base_url,
+            stop,
+            join: Some(join),
+        }
     }
 
     fn finish(mut self) -> CapturedRequest {
         self.stop.store(true, Ordering::Relaxed);
-        self.join.take().unwrap().join().expect("server thread").expect("captured request")
+        self.join
+            .take()
+            .unwrap()
+            .join()
+            .expect("server thread")
+            .expect("captured request")
     }
 }
 
@@ -154,18 +171,29 @@ impl Drop for ReflectionServer {
 }
 
 fn gemini_body(answer: &str, finish: Option<&str>) -> String {
-    let mut body = format!("data: {}\n\n", json!({
-        "candidates": [{"content": {"parts": [{"text": answer}]}}]
-    }));
+    let mut body = format!(
+        "data: {}\n\n",
+        json!({
+            "candidates": [{"content": {"parts": [{"text": answer}]}}]
+        })
+    );
     if let Some(finish) = finish {
-        body.push_str(&format!("data: {}\n\n", json!({
-            "candidates": [{"finishReason": finish}]
-        })));
+        use std::fmt::Write as _;
+        let _ = write!(
+            body,
+            "data: {}\n\n",
+            json!({
+                "candidates": [{"finishReason": finish}]
+            })
+        );
     }
     body
 }
 
-fn reflection_tool(store: Arc<pi::memory::MemoryStore>, server: &ReflectionServer) -> pi::memory::ReflectTool {
+fn reflection_tool(
+    store: Arc<pi::memory::MemoryStore>,
+    server: &ReflectionServer,
+) -> pi::memory::ReflectTool {
     let provider = pi::providers::gemini::GeminiProvider::new("reflection-test")
         .with_base_url(&server.base_url);
     pi::memory::ReflectTool::with_provider_and_options(
@@ -173,7 +201,10 @@ fn reflection_tool(store: Arc<pi::memory::MemoryStore>, server: &ReflectionServe
         Arc::new(provider),
         StreamOptions {
             api_key: Some("reflection-fixture-key".to_string()),
-            headers: HashMap::from([("x-session-binding".to_string(), "fixture-session".to_string())]),
+            headers: HashMap::from([(
+                "x-session-binding".to_string(),
+                "fixture-session".to_string(),
+            )]),
             max_tokens: Some(2048),
             ..StreamOptions::default()
         },
@@ -194,7 +225,9 @@ fn retain_tool_redacts_secrets() {
     ))
     .expect("execute");
     let text = first_text(&out);
-    harness.log().info("verify", format!("retain output: {text}"));
+    harness
+        .log()
+        .info("verify", format!("retain output: {text}"));
     assert!(text.contains("secret redacted"), "{text}");
     assert!(!text.contains("sk-abcdef"), "{text}");
     let details = out.details.as_ref().expect("details");
@@ -211,18 +244,29 @@ fn backend_gate_controls_tool_presence() {
     let root = project_dir(&harness, "proj");
     let local = ToolRegistry::new(&["read"], &root, Some(&memory_config("local")));
     let local_names: Vec<&str> = local.tools().iter().map(|tool| tool.name()).collect();
-    harness.log().info("verify", format!("local tools: {local_names:?}"));
+    harness
+        .log()
+        .info("verify", format!("local tools: {local_names:?}"));
     for expected in ["retain", "recall", "reflect", "memory_edit"] {
-        assert!(local_names.contains(&expected), "backend=local must expose {expected}: {local_names:?}");
+        assert!(
+            local_names.contains(&expected),
+            "backend=local must expose {expected}: {local_names:?}"
+        );
     }
     let off = ToolRegistry::new(&["read"], &root, Some(&memory_config("off")));
     let off_names: Vec<&str> = off.tools().iter().map(|tool| tool.name()).collect();
     for absent in ["retain", "recall", "reflect", "memory_edit"] {
-        assert!(!off_names.contains(&absent), "backend=off must hide {absent}: {off_names:?}");
+        assert!(
+            !off_names.contains(&absent),
+            "backend=off must hide {absent}: {off_names:?}"
+        );
     }
     let default = ToolRegistry::new(&["read"], &root, None::<&pi::config::Config>);
     let default_names: Vec<&str> = default.tools().iter().map(|tool| tool.name()).collect();
-    assert!(!default_names.contains(&"retain"), "default posture must be off: {default_names:?}");
+    assert!(
+        !default_names.contains(&"retain"),
+        "default posture must be off: {default_names:?}"
+    );
     finish_case(&harness, case);
 }
 
@@ -232,21 +276,36 @@ fn reflect_cites_memory_ids_through_provider_http() {
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
     let store = Arc::new(pi::memory::MemoryStore::open(&root).expect("open"));
-    let memory = store.retain(
-        pi::memory::MemoryKind::Lesson,
-        "always run cargo check before committing", &[], None,
-    ).expect("retain");
-    let other = store.retain(
-        pi::memory::MemoryKind::Lesson,
-        "run tests before committing", &[], None,
-    ).expect("retain another source");
-    let server = ReflectionServer::start(200, gemini_body(
-        &format!("Run cargo check first [{}].", memory.id), Some("STOP"),
-    ));
+    let memory = store
+        .retain(
+            pi::memory::MemoryKind::Lesson,
+            "always run cargo check before committing",
+            &[],
+            None,
+        )
+        .expect("retain");
+    let other = store
+        .retain(
+            pi::memory::MemoryKind::Lesson,
+            "run tests before committing",
+            &[],
+            None,
+        )
+        .expect("retain another source");
+    let server = ReflectionServer::start(
+        200,
+        gemini_body(
+            &format!("Run cargo check first [{}].", memory.id),
+            Some("STOP"),
+        ),
+    );
     let tool = reflection_tool(store, &server);
     let out = block_on_local(tool.execute(
-        "call-1", json!({"question": "what should run before committing?"}), None,
-    )).expect("execute");
+        "call-1",
+        json!({"question": "what should run before committing?"}),
+        None,
+    ))
+    .expect("execute");
     assert!(!out.is_error);
     assert!(first_text(&out).contains(&format!("[{}]", memory.id)));
     let details = out.details.as_ref().expect("details");
@@ -259,7 +318,9 @@ fn reflect_cites_memory_ids_through_provider_http() {
     assert_eq!(request.headers["x-goog-api-key"], "reflection-fixture-key");
     assert_eq!(request.headers["x-session-binding"], "fixture-session");
     assert_eq!(request.body["generationConfig"]["maxOutputTokens"], 2048);
-    let prompt = request.body["contents"][0]["parts"][0]["text"].as_str().unwrap();
+    let prompt = request.body["contents"][0]["parts"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(prompt.contains(&format!("- [{}]", memory.id)));
     assert!(prompt.contains(&format!("- [{}]", other.id)));
     assert!(request.body.get("tools").is_none());
@@ -271,16 +332,27 @@ fn reflect_rejects_truncated_failed_and_invented_citation_responses() {
     let harness = TestHarness::new("reflect_terminal_errors");
     let root = project_dir(&harness, "proj");
     let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
-    let memory = store.retain(pi::memory::MemoryKind::Fact, "parser is incremental", &[], None).unwrap();
+    let memory = store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "parser is incremental",
+            &[],
+            None,
+        )
+        .unwrap();
     for (body, expected) in [
         (gemini_body("partial", None), "unexpected EOF"),
         (gemini_body("blocked", Some("SAFETY")), "successfully"),
         (gemini_body("truncated", Some("MAX_TOKENS")), "successfully"),
-        (gemini_body(&format!("invented [{}]", memory.id + 1), Some("STOP")), "not supplied"),
+        (
+            gemini_body(&format!("invented [{}]", memory.id + 1), Some("STOP")),
+            "not supplied",
+        ),
     ] {
         let server = ReflectionServer::start(200, body);
         let tool = reflection_tool(Arc::clone(&store), &server);
-        let error = block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None)).unwrap_err();
+        let error = block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None))
+            .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
         server.finish();
     }
@@ -291,10 +363,18 @@ fn reflect_redacts_credentials_in_http_failures() {
     let harness = TestHarness::new("reflect_redacted_http_error");
     let root = project_dir(&harness, "proj");
     let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
-    store.retain(pi::memory::MemoryKind::Fact, "parser is incremental", &[], None).unwrap();
+    store
+        .retain(
+            pi::memory::MemoryKind::Fact,
+            "parser is incremental",
+            &[],
+            None,
+        )
+        .unwrap();
     let server = ReflectionServer::start(500, "upstream echoed reflection-fixture-key".to_string());
     let tool = reflection_tool(store, &server);
-    let error = block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None)).unwrap_err();
+    let error =
+        block_on_local(tool.execute("call-1", json!({"question": "parser?"}), None)).unwrap_err();
     assert!(!error.to_string().contains("reflection-fixture-key"));
     assert!(error.to_string().contains("REDACTED"));
     server.finish();
@@ -307,8 +387,13 @@ fn reflect_validates_input_and_skips_provider_resolution_without_sources() {
     let store = Arc::new(pi::memory::MemoryStore::open(&root).unwrap());
     let tool = pi::memory::ReflectTool::new(store);
     assert!(block_on_local(tool.execute("call-1", json!({"question": "   "}), None)).is_err());
-    assert!(block_on_local(tool.execute("call-1", json!({"question": "x".repeat(8193)}), None)).is_err());
-    let output = block_on_local(tool.execute("call-1", json!({"question": "unknown parser"}), None)).unwrap();
+    assert!(
+        block_on_local(tool.execute("call-1", json!({"question": "x".repeat(8193)}), None))
+            .is_err()
+    );
+    let output =
+        block_on_local(tool.execute("call-1", json!({"question": "unknown parser"}), None))
+            .unwrap();
     assert!(!output.is_error);
     assert_eq!(output.details.unwrap()["citations"], json!([]));
 }
@@ -320,25 +405,46 @@ fn cross_instance_persistence_and_tombstones() {
     let root = project_dir(&harness, "proj");
     let (kept_id, tomb_id) = {
         let store = pi::memory::MemoryStore::open(&root).expect("open A");
-        let kept = store.retain(
-            pi::memory::MemoryKind::Fact,
-            "the agent loop lives in src/agent.rs", &[], None,
-        ).expect("retain kept");
-        let tomb = store.retain(
-            pi::memory::MemoryKind::Fact,
-            "temporary scaffolding note", &[], None,
-        ).expect("retain tomb");
-        store.edit(tomb.id, pi::memory::MemoryEditOp::Invalidate, None).expect("invalidate");
+        let kept = store
+            .retain(
+                pi::memory::MemoryKind::Fact,
+                "the agent loop lives in src/agent.rs",
+                &[],
+                None,
+            )
+            .expect("retain kept");
+        let tomb = store
+            .retain(
+                pi::memory::MemoryKind::Fact,
+                "temporary scaffolding note",
+                &[],
+                None,
+            )
+            .expect("retain tomb");
+        store
+            .edit(tomb.id, pi::memory::MemoryEditOp::Invalidate, None)
+            .expect("invalidate");
         (kept.id, tomb.id)
     };
     let store_b = pi::memory::MemoryStore::open(&root).expect("open B");
     let hits = store_b.recall("agent loop", None).expect("recall");
-    assert!(hits.iter().any(|hit| hit.id == kept_id), "session B must recall session A's fact: {hits:?}");
+    assert!(
+        hits.iter().any(|hit| hit.id == kept_id),
+        "session B must recall session A's fact: {hits:?}"
+    );
     let tomb_hits = store_b.recall("scaffolding", None).expect("tomb recall");
-    assert!(tomb_hits.iter().all(|hit| hit.id != tomb_id), "tombstone must be excluded: {tomb_hits:?}");
-    store_b.edit(tomb_id, pi::memory::MemoryEditOp::Forget, None).expect("forget");
+    assert!(
+        tomb_hits.iter().all(|hit| hit.id != tomb_id),
+        "tombstone must be excluded: {tomb_hits:?}"
+    );
+    store_b
+        .edit(tomb_id, pi::memory::MemoryEditOp::Forget, None)
+        .expect("forget");
     let listed = store_b.list(50).expect("list");
-    assert!(listed.iter().all(|hit| hit.id != tomb_id), "forget must hard-delete: {listed:?}");
+    assert!(
+        listed.iter().all(|hit| hit.id != tomb_id),
+        "forget must hard-delete: {listed:?}"
+    );
     finish_case(&harness, case);
 }
 
@@ -348,16 +454,35 @@ fn startup_injection_includes_mental_model_when_local() {
     let harness = TestHarness::new(case);
     let root = project_dir(&harness, "proj");
     let store = pi::memory::MemoryStore::open(&root).expect("open");
-    store.retain(
-        pi::memory::MemoryKind::Decision,
-        "chose fsqlite over rusqlite for the store", &[], None,
-    ).expect("retain");
+    store
+        .retain(
+            pi::memory::MemoryKind::Decision,
+            "chose fsqlite over rusqlite for the store",
+            &[],
+            None,
+        )
+        .expect("retain");
     let prompt = build_prompt_for_test(&root, &memory_config("local"));
-    harness.log().info("verify", format!("prompt contains memory block: {}", prompt.contains("Project Memory")));
-    assert!(prompt.contains("Project Memory"), "backend=local must inject the mental model");
-    assert!(prompt.contains("fsqlite over rusqlite"), "mental model must carry the retained decision");
+    harness.log().info(
+        "verify",
+        format!(
+            "prompt contains memory block: {}",
+            prompt.contains("Project Memory")
+        ),
+    );
+    assert!(
+        prompt.contains("Project Memory"),
+        "backend=local must inject the mental model"
+    );
+    assert!(
+        prompt.contains("fsqlite over rusqlite"),
+        "mental model must carry the retained decision"
+    );
     let off_prompt = build_prompt_for_test(&root, &memory_config("off"));
-    assert!(!off_prompt.contains("Project Memory"), "backend=off must not inject");
+    assert!(
+        !off_prompt.contains("Project Memory"),
+        "backend=off must not inject"
+    );
     finish_case(&harness, case);
 }
 
