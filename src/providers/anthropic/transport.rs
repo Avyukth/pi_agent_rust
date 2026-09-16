@@ -17,7 +17,7 @@ use std::pin::Pin;
 
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 
-pub(crate) type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
+pub(super) type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>;
 
 /// Restore host-owned transport fields after an extension rewrites the body.
 /// The endpoint, not a body field, chooses the Vertex model.
@@ -31,10 +31,10 @@ fn vertex_request(value: Value) -> std::result::Result<Value, String> {
             ("anthropic_version", json!(VERTEX_ANTHROPIC_VERSION)),
         ],
     )?;
-    if !value
+    if value
         .get("max_tokens")
         .and_then(Value::as_u64)
-        .is_some_and(|n| n > 0)
+        .is_none_or(|n| n == 0)
     {
         return Err("Vertex Anthropic request requires a positive max_tokens".to_string());
     }
@@ -145,7 +145,9 @@ impl StreamLifecycle {
         initial_tool_input: Option<Value>,
     ) -> Result<()> {
         if !self.started || index != self.blocks.len() {
-            return Err(protocol_error("content block start has an invalid message or index"));
+            return Err(protocol_error(
+                "content block start has an invalid message or index",
+            ));
         }
         self.blocks.push(ContentState {
             kind,
@@ -182,9 +184,18 @@ impl StreamLifecycle {
             StreamEvent::ThinkingStart { content_index } => {
                 self.open(*content_index, ContentKind::Thinking, None)?;
             }
-            StreamEvent::ToolCallStart { content_index, id, name } => {
-                if id.trim().is_empty() || name.trim().is_empty() || !self.tool_ids.insert(id.clone()) {
-                    return Err(protocol_error("tool call has an empty or duplicate identity"));
+            StreamEvent::ToolCallStart {
+                content_index,
+                id,
+                name,
+            } => {
+                if id.trim().is_empty()
+                    || name.trim().is_empty()
+                    || !self.tool_ids.insert(id.clone())
+                {
+                    return Err(protocol_error(
+                        "tool call has an empty or duplicate identity",
+                    ));
                 }
                 // Only tool starts need the original input object. Token deltas
                 // are decoded once, by the existing parser, with no extra parse.
@@ -207,7 +218,8 @@ impl StreamLifecycle {
                 self.active(*content_index, ContentKind::Thinking)?;
             }
             StreamEvent::ToolCallDelta { content_index, .. } => {
-                self.active(*content_index, ContentKind::Tool)?.saw_tool_delta = true;
+                self.active(*content_index, ContentKind::Tool)?
+                    .saw_tool_delta = true;
             }
             StreamEvent::TextEnd { content_index, .. } => {
                 self.active(*content_index, ContentKind::Text)?.closed = true;
@@ -215,23 +227,33 @@ impl StreamLifecycle {
             StreamEvent::ThinkingEnd { content_index, .. } => {
                 self.active(*content_index, ContentKind::Thinking)?.closed = true;
             }
-            StreamEvent::ToolCallEnd { content_index, tool_call } => {
+            StreamEvent::ToolCallEnd {
+                content_index,
+                tool_call,
+            } => {
                 let block = self.active(*content_index, ContentKind::Tool)?;
                 if !block.saw_tool_delta {
                     // A zero-argument call can close without any JSON deltas.
                     // Preserve an initial object rather than treating the empty
                     // accumulator as malformed JSON or inventing null arguments.
-                    tool_call.arguments = block.initial_tool_input.take()
+                    tool_call.arguments = block
+                        .initial_tool_input
+                        .take()
                         .ok_or_else(|| protocol_error("tool call lost its initial input"))?;
                 }
                 if !tool_call.arguments.is_object() {
                     return Err(protocol_error("tool input is not a complete JSON object"));
                 }
-                let Some(ContentBlock::ToolCall(stored)) = partial.content.get_mut(*content_index) else {
-                    return Err(protocol_error("tool call does not match accumulated content"));
+                let Some(ContentBlock::ToolCall(stored)) = partial.content.get_mut(*content_index)
+                else {
+                    return Err(protocol_error(
+                        "tool call does not match accumulated content",
+                    ));
                 };
                 if stored.id != tool_call.id || stored.name != tool_call.name {
-                    return Err(protocol_error("tool call identity changed during streaming"));
+                    return Err(protocol_error(
+                        "tool call identity changed during streaming",
+                    ));
                 }
                 stored.arguments.clone_from(&tool_call.arguments);
                 block.closed = true;
@@ -241,10 +263,14 @@ impl StreamLifecycle {
                     return Err(protocol_error("message_stop arrived before message_start"));
                 }
                 if self.blocks.iter().any(|block| !block.closed) {
-                    return Err(protocol_error("message_stop left unfinished content (unexpected EOF)"));
+                    return Err(protocol_error(
+                        "message_stop left unfinished content (unexpected EOF)",
+                    ));
                 }
                 if message.content.len() != self.blocks.len() {
-                    return Err(protocol_error("completed message does not match streamed content"));
+                    return Err(protocol_error(
+                        "completed message does not match streamed content",
+                    ));
                 }
             }
             // Provider errors are valid terminal events even before message_start.
@@ -289,7 +315,9 @@ where
                         }
                         match state.process_event(&msg.data) {
                             Ok(Some(mut event)) => {
-                                if let Err(error) = lifecycle.accept(&mut event, &msg.data, &mut state.partial) {
+                                if let Err(error) =
+                                    lifecycle.accept(&mut event, &msg.data, &mut state.partial)
+                                {
                                     state.done = true;
                                     return Some((Err(error), (state, lifecycle)));
                                 }
@@ -368,7 +396,12 @@ mod tests {
         assert_eq!(body["anthropic_version"], VERTEX_ANTHROPIC_VERSION);
         assert_eq!(body["stream"], true);
         for key in [
-            "messages", "tools", "thinking", "output_config", "metadata", "max_tokens",
+            "messages",
+            "tools",
+            "thinking",
+            "output_config",
+            "metadata",
+            "max_tokens",
         ] {
             assert_eq!(body[key], original[key], "{key}");
         }
@@ -397,12 +430,15 @@ mod tests {
         RuntimeBuilder::current_thread()
             .build()
             .expect("runtime")
-            .block_on(wire_stream(
-                stream::iter(chunks),
-                "claude-test".to_string(),
-                "anthropic-messages".to_string(),
-                "anthropic".to_string(),
-            ).collect())
+            .block_on(
+                wire_stream(
+                    stream::iter(chunks),
+                    "claude-test".to_string(),
+                    "anthropic-messages".to_string(),
+                    "anthropic".to_string(),
+                )
+                .collect(),
+            )
     }
 
     fn start() -> Value {
@@ -416,7 +452,7 @@ mod tests {
         ]
     }
 
-    fn tool_start(index: usize, id: &str, input: Value) -> Value {
+    fn tool_start(index: usize, id: &str, input: &Value) -> Value {
         json!({"type": "content_block_start", "index": index, "content_block": {
             "type": "tool_use", "id": id, "name": "read", "input": input
         }})
@@ -433,21 +469,35 @@ mod tests {
     }
 
     fn assert_terminal_error(events: &[Result<StreamEvent>]) {
-        assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1, "{events:?}");
+        assert_eq!(
+            events.iter().filter(|event| event.is_err()).count(),
+            1,
+            "{events:?}"
+        );
         assert!(events.last().is_some_and(Result::is_err), "{events:?}");
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. }))),
+            "{events:?}"
+        );
     }
 
     #[test]
     fn zero_argument_calls_are_objects_in_events_and_final_message() {
-        let events = collect_wire([
-            start(), tool_start(0, "call-a", json!({})), stop(0),
-        ].into_iter().chain(finish()));
+        let events = collect_wire(
+            [start(), tool_start(0, "call-a", &json!({})), stop(0)]
+                .into_iter()
+                .chain(finish()),
+        );
         assert!(events.iter().all(Result::is_ok), "{events:?}");
-        let call = events.iter().find_map(|event| match event {
-            Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
-            _ => None,
-        }).expect("completed tool");
+        let call = events
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
+                _ => None,
+            })
+            .expect("completed tool");
         assert_eq!(call.arguments, json!({}));
         let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
             panic!("expected Done");
@@ -462,9 +512,11 @@ mod tests {
     #[test]
     fn initial_input_is_preserved_when_no_argument_deltas_arrive() {
         let input = json!({"path": "initial.txt"});
-        let events = collect_wire([
-            start(), tool_start(0, "call-a", input.clone()), stop(0),
-        ].into_iter().chain(finish()));
+        let events = collect_wire(
+            [start(), tool_start(0, "call-a", &input), stop(0)]
+                .into_iter()
+                .chain(finish()),
+        );
         assert!(events.iter().all(Result::is_ok), "{events:?}");
         let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
             panic!("expected Done");
@@ -477,20 +529,27 @@ mod tests {
 
     #[test]
     fn interleaved_calls_keep_initial_and_streamed_inputs_separate() {
-        let events = collect_wire([
-            start(),
-            tool_start(0, "call-a", json!({"path": "initial.txt"})),
-            tool_start(1, "call-b", json!({})),
-            tool_delta(1, "{\"path\":"),
-            stop(0),
-            tool_delta(1, "\"streamed.txt\"}"),
-            stop(1),
-        ].into_iter().chain(finish()));
+        let events = collect_wire(
+            [
+                start(),
+                tool_start(0, "call-a", &json!({"path": "initial.txt"})),
+                tool_start(1, "call-b", &json!({})),
+                tool_delta(1, "{\"path\":"),
+                stop(0),
+                tool_delta(1, "\"streamed.txt\"}"),
+                stop(1),
+            ]
+            .into_iter()
+            .chain(finish()),
+        );
         assert!(events.iter().all(Result::is_ok), "{events:?}");
-        let calls: Vec<_> = events.iter().filter_map(|event| match event {
-            Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
-            _ => None,
-        }).collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
+                _ => None,
+            })
+            .collect();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "call-a");
         assert_eq!(calls[0].arguments, json!({"path": "initial.txt"}));
@@ -501,36 +560,65 @@ mod tests {
     #[test]
     fn incomplete_or_non_object_arguments_never_emit_completed_calls() {
         for data in ["{\"path\":", "{bad}", "null", "[]", "42", "\"text\"", ""] {
-            let events = collect_wire([
-                start(), tool_start(0, "call-a", json!({})), tool_delta(0, data), stop(0),
-            ].into_iter().chain(finish()));
+            let events = collect_wire(
+                [
+                    start(),
+                    tool_start(0, "call-a", &json!({})),
+                    tool_delta(0, data),
+                    stop(0),
+                ]
+                .into_iter()
+                .chain(finish()),
+            );
             assert_terminal_error(&events);
-            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+            );
         }
     }
 
     #[test]
     fn malformed_initial_tool_input_is_not_replaced_with_empty_arguments() {
         for input in [json!(null), json!([]), json!("not-an-object")] {
-            let events = collect_wire([
-                start(), tool_start(0, "call-a", input), stop(0),
-            ].into_iter().chain(finish()));
+            let events = collect_wire(
+                [start(), tool_start(0, "call-a", &input), stop(0)]
+                    .into_iter()
+                    .chain(finish()),
+            );
             assert_terminal_error(&events);
-            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+            );
         }
     }
 
     #[test]
     fn message_stop_cannot_complete_unclosed_text_thinking_or_tool_blocks() {
         for kind in ["text", "thinking", "tool_use"] {
-            let events = collect_wire([
-                start(),
-                json!({"type": "content_block_start", "index": 0, "content_block": {
-                    "type": kind, "id": "call-a", "name": "read", "input": {}
-                }}),
-            ].into_iter().chain(finish()));
+            let events = collect_wire(
+                [
+                    start(),
+                    json!({"type": "content_block_start", "index": 0, "content_block": {
+                        "type": kind, "id": "call-a", "name": "read", "input": {}
+                    }}),
+                ]
+                .into_iter()
+                .chain(finish()),
+            );
             assert_terminal_error(&events);
-            assert!(events.last().unwrap().as_ref().unwrap_err().to_string().contains("unfinished content"));
+            assert!(
+                events
+                    .last()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unfinished content")
+            );
         }
     }
 
@@ -571,12 +659,25 @@ mod tests {
     #[test]
     fn duplicate_tool_ids_and_empty_tool_identities_are_rejected() {
         for id in ["", "  ", "call-a"] {
-            let events = collect_wire([
-                start(), tool_start(0, "call-a", json!({})), stop(0),
-                tool_start(1, id, json!({})), stop(1),
-            ].into_iter().chain(finish()));
+            let events = collect_wire(
+                [
+                    start(),
+                    tool_start(0, "call-a", &json!({})),
+                    stop(0),
+                    tool_start(1, id, &json!({})),
+                    stop(1),
+                ]
+                .into_iter()
+                .chain(finish()),
+            );
             assert_terminal_error(&events);
-            assert_eq!(events.iter().filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))).count(), 1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. })))
+                    .count(),
+                1
+            );
         }
     }
 
@@ -585,7 +686,9 @@ mod tests {
         for input in [
             vec![json!({"type": "message_stop"})],
             vec![start(), start(), json!({"type": "message_stop"})],
-            vec![json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "orphan"}})],
+            vec![
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "orphan"}}),
+            ],
         ] {
             assert_terminal_error(&collect_wire(input));
         }

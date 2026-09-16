@@ -53,8 +53,12 @@ impl WireServer {
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
-                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
                 let mut bytes = Vec::new();
                 let mut chunk = [0; 4096];
                 let header_end = loop {
@@ -162,10 +166,12 @@ fn options() -> StreamOptions {
 }
 
 fn frames(events: &[Value]) -> String {
-    events
-        .iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect()
+    use std::fmt::Write as _;
+
+    events.iter().fold(String::new(), |mut out, event| {
+        let _ = write!(out, "data: {event}\n\n");
+        out
+    })
 }
 
 fn success() -> String {
@@ -222,7 +228,11 @@ fn vertex_anthropic_request_and_stream_use_anthropic_not_gemini_shapes() {
     assert!(!request.headers.contains_key("x-api-key"));
     assert!(!request.headers.contains_key("anthropic-version"));
     assert!(!request.headers.contains_key("anthropic-beta"));
-    assert!(!request.headers.contains_key("anthropic-dangerous-direct-browser-access"));
+    assert!(
+        !request
+            .headers
+            .contains_key("anthropic-dangerous-direct-browser-access")
+    );
     let body = request.body;
     assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
     assert_eq!(body["stream"], true);
@@ -291,7 +301,10 @@ fn vertex_tool_round_trip_preserves_thinking_signature_arguments_and_cache_usage
         let events = collect(&provider, &next, &opts).await;
         assert!(events.iter().all(Result::is_ok));
         assert_eq!(
-            events.iter().filter(|event| matches!(event, Ok(StreamEvent::Done { .. }))).count(),
+            events
+                .iter()
+                .filter(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+                .count(),
             1
         );
     });
@@ -299,9 +312,15 @@ fn vertex_tool_round_trip_preserves_thinking_signature_arguments_and_cache_usage
     let body = server.captured().body;
     assert_eq!(body["messages"][1]["content"][0]["signature"], "c2lnbmVk");
     assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
-    assert_eq!(body["messages"][1]["content"][1]["input"], json!({"path": "a.txt"}));
+    assert_eq!(
+        body["messages"][1]["content"][1]["input"],
+        json!({"path": "a.txt"})
+    );
     assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "tool-1");
-    assert_eq!(body["messages"][2]["content"][0]["content"][0]["text"], "file contents");
+    assert_eq!(
+        body["messages"][2]["content"][0]["content"][0]["text"],
+        "file contents"
+    );
 }
 
 #[test]
@@ -340,9 +359,7 @@ fn invalid_vertex_rewrite_falls_back_to_original_anthropic_body() {
     let server = WireServer::new(vec![(200, success())]);
     let opts = StreamOptions {
         before_provider_request: Some(BeforeProviderRequestHook::new(|_| {
-            Box::pin(async {
-                Some(json!({"messages": "not-an-array", "max_tokens": 10}))
-            })
+            Box::pin(async { Some(json!({"messages": "not-an-array", "max_tokens": 10})) })
         })),
         ..options()
     };
@@ -356,27 +373,42 @@ fn invalid_vertex_rewrite_falls_back_to_original_anthropic_body() {
 #[test]
 fn vertex_authorization_override_precedence_is_google_scoped() {
     let compat = CompatConfig {
-        custom_headers: Some(HashMap::from([
-            ("Authorization".to_string(), "Bearer compat".to_string()),
-        ])),
+        custom_headers: Some(HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer compat".to_string(),
+        )])),
         ..Default::default()
     };
     let mut opts = options();
-    opts.headers.insert("aUtHoRiZaTiOn".to_string(), "Bearer request".to_string());
+    opts.headers
+        .insert("aUtHoRiZaTiOn".to_string(), "Bearer request".to_string());
     let no_env = |_: &str| -> Option<String> {
         panic!("explicit authorization must not consult environment");
     };
-    assert_eq!(vertex_authorization(&opts, Some(&compat), no_env).unwrap(), "Bearer request");
-    opts.headers.insert("aUtHoRiZaTiOn".to_string(), "  ".to_string());
-    assert_eq!(vertex_authorization(&opts, Some(&compat), no_env).unwrap(), "Bearer compat");
-    assert_eq!(vertex_authorization(&opts, None, no_env).unwrap(), "Bearer google-test-token");
+    assert_eq!(
+        vertex_authorization(&opts, Some(&compat), no_env).unwrap(),
+        "Bearer request"
+    );
+    opts.headers
+        .insert("aUtHoRiZaTiOn".to_string(), "  ".to_string());
+    assert_eq!(
+        vertex_authorization(&opts, Some(&compat), no_env).unwrap(),
+        "Bearer compat"
+    );
+    assert_eq!(
+        vertex_authorization(&opts, None, no_env).unwrap(),
+        "Bearer google-test-token"
+    );
     opts.api_key = Some(" ".to_string());
     let env = |name: &str| match name {
         "GOOGLE_CLOUD_API_KEY" => Some(" ".to_string()),
         "VERTEX_API_KEY" => Some("vertex-env".to_string()),
         _ => panic!("must not load another provider's credentials"),
     };
-    assert_eq!(vertex_authorization(&opts, None, env).unwrap(), "Bearer vertex-env");
+    assert_eq!(
+        vertex_authorization(&opts, None, env).unwrap(),
+        "Bearer vertex-env"
+    );
     assert!(vertex_authorization(&opts, None, |_| None).is_err());
 }
 
@@ -386,15 +418,23 @@ fn header_only_vertex_auth_works_without_api_key_and_blank_override_cannot_erase
         let response = if publisher == "anthropic" {
             success()
         } else {
-            frames(&[json!({"candidates": [{"content": {"parts": [{"text": "done"}]}, "finishReason": "STOP"}]})])
+            frames(&[
+                json!({"candidates": [{"content": {"parts": [{"text": "done"}]}, "finishReason": "STOP"}]}),
+            ])
         };
         let server = WireServer::new(vec![(200, response)]);
         let provider = provider(&server)
             .with_publisher(publisher)
             .with_compat(Some(CompatConfig {
                 custom_headers: Some(HashMap::from([
-                    ("Authorization".to_string(), "Bearer google-header".to_string()),
-                    ("x-goog-user-project".to_string(), "quota-project".to_string()),
+                    (
+                        "Authorization".to_string(),
+                        "Bearer google-header".to_string(),
+                    ),
+                    (
+                        "x-goog-user-project".to_string(),
+                        "quota-project".to_string(),
+                    ),
                 ])),
                 ..Default::default()
             }));
@@ -407,19 +447,30 @@ fn header_only_vertex_auth_works_without_api_key_and_blank_override_cannot_erase
         let request = server.captured();
         assert_eq!(request.headers["authorization"], "Bearer google-header");
         assert_eq!(request.headers["x-goog-user-project"], "quota-project");
-        assert_eq!(request.body.get("messages").is_some(), publisher == "anthropic");
-        assert_eq!(request.body.get("contents").is_some(), publisher == "google");
+        assert_eq!(
+            request.body.get("messages").is_some(),
+            publisher == "anthropic"
+        );
+        assert_eq!(
+            request.body.get("contents").is_some(),
+            publisher == "google"
+        );
     }
 }
 
 #[test]
 fn vertex_anthropic_http_failure_preserves_status_and_provider() {
-    let server = WireServer::new(vec![
-        (403, json!({"error": {"message": "permission denied"}}).to_string()),
-    ]);
+    let server = WireServer::new(vec![(
+        403,
+        json!({"error": {"message": "permission denied"}}).to_string(),
+    )]);
     let provider = provider(&server);
     let error = run(async {
-        provider.stream(&context(), &options()).await.err().expect("HTTP error")
+        provider
+            .stream(&context(), &options())
+            .await
+            .err()
+            .expect("HTTP error")
     });
     assert!(error.to_string().contains("google-vertex"));
     assert!(error.to_string().contains("HTTP 403"));
@@ -443,8 +494,17 @@ fn vertex_anthropic_truncation_and_parse_errors_never_report_success() {
             event,
             Ok(StreamEvent::TextDelta { delta, .. }) if delta == "partial"
         )));
-        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))));
-        let error = events.last().unwrap().as_ref().expect_err("terminal error").to_string();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Done { .. })))
+        );
+        let error = events
+            .last()
+            .unwrap()
+            .as_ref()
+            .expect_err("terminal error")
+            .to_string();
         if malformed {
             assert!(error.contains("JSON parse error"), "{error}");
         } else {
@@ -456,10 +516,13 @@ fn vertex_anthropic_truncation_and_parse_errors_never_report_success() {
 
 #[test]
 fn vertex_anthropic_error_event_terminates_before_a_later_message_stop() {
-    let server = WireServer::new(vec![(200, frames(&[
-        json!({"type": "error", "error": {"message": "overloaded"}}),
-        json!({"type": "message_stop"}),
-    ]))]);
+    let server = WireServer::new(vec![(
+        200,
+        frames(&[
+            json!({"type": "error", "error": {"message": "overloaded"}}),
+            json!({"type": "message_stop"}),
+        ]),
+    )]);
     let events = run(collect(&provider(&server), &context(), &options()));
     assert_eq!(events.len(), 1);
     let Ok(StreamEvent::Error { error, .. }) = &events[0] else {
@@ -478,10 +541,20 @@ fn unknown_vertex_publisher_is_rejected_before_network_dispatch() {
         .with_publisher("unimplemented")
         .with_endpoint_url(format!("http://{}", listener.local_addr().unwrap()));
     let error = run(async {
-        provider.stream(&context(), &options()).await.err().expect("unsupported")
+        provider
+            .stream(&context(), &options())
+            .await
+            .err()
+            .expect("unsupported")
     });
-    assert!(error.to_string().contains("Unsupported Vertex AI publisher"));
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    assert!(
+        error
+            .to_string()
+            .contains("Unsupported Vertex AI publisher")
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
 }
 
 #[test]
@@ -491,20 +564,39 @@ fn global_vertex_routes_use_the_global_host_for_both_publishers() {
         ("anthropic", "streamRawPredict"),
     ] {
         let provider = VertexProvider::new("test-model").with_publisher(publisher);
-        assert_eq!(provider.streaming_url("p", "global"), format!(
-            "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/{publisher}/models/test-model:{method}"
-        ));
-        assert!(provider.streaming_url("p", "us-east5").starts_with("https://us-east5-aiplatform.googleapis.com/"));
+        assert_eq!(
+            provider.streaming_url("p", "global"),
+            format!(
+                "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/{publisher}/models/test-model:{method}"
+            )
+        );
+        assert!(
+            provider
+                .streaming_url("p", "us-east5")
+                .starts_with("https://us-east5-aiplatform.googleapis.com/")
+        );
     }
 }
 
 #[test]
 fn vertex_endpoint_parsing_keeps_complete_regions_and_explicit_path_precedence() {
     for (url, expected) in [
-        ("https://us-east5-aiplatform.googleapis.com/v1/projects/p", Some("us-east5")),
-        ("https://europe-west1-aiplatform.googleapis.com/v1/projects/p", Some("europe-west1")),
-        ("https://aiplatform.googleapis.com/v1/projects/p", Some("global")),
-        ("https://us-east5-aiplatform.googleapis.com/v1/projects/p/locations/global", Some("global")),
+        (
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/p",
+            Some("us-east5"),
+        ),
+        (
+            "https://europe-west1-aiplatform.googleapis.com/v1/projects/p",
+            Some("europe-west1"),
+        ),
+        (
+            "https://aiplatform.googleapis.com/v1/projects/p",
+            Some("global"),
+        ),
+        (
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/p/locations/global",
+            Some("global"),
+        ),
         ("https://proxy.example/v1/projects/p", None),
     ] {
         let (_, location, _) = parse_vertex_base_url(url);
