@@ -1,24 +1,21 @@
 //! Workspace isolation for subagents (bd-cv653.5.2).
 //!
-//! `worktree` mode: `git worktree add` a temp branch at HEAD into
-//! `<tmp>/pi-iso-<id>`; the child runs there; on completion the parent
-//! gets {worktree_path, diff_stat, patch} and applies per mode:
-//! `keep` (leave for the user), `apply` (git apply into the parent tree,
-//! serialized process-wide so sibling patches land in task order), `drop`
-//! (remove after reporting the patch). A failing apply reports the
-//! conflicting files and leaves the worktree — never force.
+//! `worktree` mode creates a private Git snapshot of the parent's effective
+//! working files, then checks it out on a temporary `pi-iso-` branch. Neither
+//! the parent's HEAD nor its real index is modified. Child changes are collected
+//! against that baseline using another private index, preserving staged work.
 //!
-//! Dirty-tree strategy (round-7 correctness): `git worktree add` starts
-//! from HEAD, so uncommitted parent changes would be invisible to isolated
-//! children. `isolate` materializes the working-tree state into the copy:
-//! a tracked-diff patch (`git diff HEAD`) applied into the worktree plus
-//! an untracked-file copy list. CoW backends (APFS clonefile, btrfs
-//! reflink, overlayfs) are the documented full-fidelity path when they
-//! land — same interface.
+//! `keep` leaves the worktree for inspection; `apply` serializes patch application
+//! into the parent and removes the completed worktree; `drop` removes it after
+//! reporting its patch. Conflicts are never forced. Temporary patch files live
+//! outside both working trees, so user files cannot collide with control files.
 //!
-//! Cleanup: only `pi-iso-` prefix-tagged worktrees are ever reaped;
-//! foreign worktrees are untouchable.
+//! Gitlinks and sparse checkouts are explicitly refused rather than launching
+//! a child with a silently incomplete workspace. Ignored untracked files are not
+//! part of the snapshot. Concurrent external file writes are not a filesystem-
+//! wide atomic snapshot; changes to parent HEAD/index during capture are detected.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,11 +23,14 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
+
 /// Tool-result schema tag for isolation outcomes.
 pub const ISO_SCHEMA: &str = "pi.worktree_iso.v1";
 
-/// Branch/path prefix that marks worktrees created by us. The reaper only
-/// ever touches this prefix.
+/// Branch/path prefix that marks worktrees created by us.
 const ISO_PREFIX: &str = "pi-iso-";
 
 /// What to do with the worktree after the child completes.
@@ -72,8 +72,8 @@ pub struct IsoHandle {
     pub branch: String,
     pub path: PathBuf,
     pub repo_root: PathBuf,
-    /// Commit recording the materialized parent state (HEAD + dirty
-    /// materialization). The child's own work is the diff from here.
+    /// Commit recording the materialized parent state. The child's own work
+    /// is the diff from here, not from the parent's possibly older HEAD.
     pub baseline: String,
 }
 
@@ -85,7 +85,7 @@ pub struct IsoOutcome {
     pub worktree_path: String,
     pub branch: String,
     pub diff_stat: String,
-    /// The full unified diff (worktree state vs parent HEAD).
+    /// The full unified diff against the launch baseline, including binary patches.
     pub patch: String,
     /// Files that failed to apply (conflict path only).
     pub conflicted_files: Vec<String>,
@@ -93,15 +93,22 @@ pub struct IsoOutcome {
     pub applied: bool,
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
+fn git_command(repo: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(repo)
+        .args(["-c", "core.quotePath=true", "-c", "core.fsmonitor=false"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+        .stderr(std::process::Stdio::piped());
+    for key in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
+    git_command(repo).args(args).output()
         .map_err(|e| Error::tool("subagent", format!("Failed to run git: {e}")))
 }
 
@@ -117,12 +124,18 @@ fn git_ok(repo: &Path, args: &[&str]) -> Result<String> {
             ),
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    // A patch is executable file data, not display text. Lossy decoding can
+    // silently replace source bytes, so an unrepresentable textual diff must
+    // remain in the worktree for manual handling. Git binary patches are ASCII.
+    String::from_utf8(output.stdout).map_err(|_| Error::tool(
+        "subagent",
+        "PI_ISO_TEXT_ENCODING: Git output contains non-UTF8 text; the worktree was preserved rather than applying a lossy patch",
+    ))
 }
 
 fn sanitize_id(task_id: &str) -> String {
     let mut out = String::with_capacity(task_id.len().min(32));
-    for ch in task_id.chars() {
+    for ch in task_id.chars().take(32) {
         if ch.is_ascii_alphanumeric() || ch == '-' {
             out.push(ch.to_ascii_lowercase());
         } else {
@@ -133,17 +146,14 @@ fn sanitize_id(task_id: &str) -> String {
     if trimmed.is_empty() {
         "task".to_string()
     } else {
-        trimmed.chars().take(32).collect()
+        trimmed.to_string()
     }
 }
 
-/// Create an isolated worktree for a child task, materializing the parent's
-/// uncommitted state into it.
+/// Create an isolated worktree carrying the parent's effective working files.
 ///
 /// # Errors
-static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Named `PI_ISO_NOT_GIT` for non-git directories; git failures otherwise.
+/// Named `PI_ISO_NOT_GIT` for non-git directories; snapshot/checkout errors otherwise.
 pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
     let is_git = git(repo_root, &["rev-parse", "--is-inside-work-tree"])
         .is_ok_and(|output| output.status.success());
@@ -157,119 +167,103 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
             ),
         ));
     }
-
-    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let id = format!(
-        "{ISO_PREFIX}{}-{}-{seq}",
-        sanitize_id(task_id),
-        std::process::id()
-    );
+    let repo_root = snapshot::repository_root(repo_root)?;
+    let id = format!("{ISO_PREFIX}{}-{}", sanitize_id(task_id), uuid::Uuid::new_v4().simple());
     let path = std::env::temp_dir().join(&id);
-
-    // Branch from HEAD into the temp path.
-    git_ok(
-        repo_root,
-        &["worktree", "add", &path.to_string_lossy(), "-b", &id],
-    )?;
-
-    // Everything after worktree creation must clean up on failure, or every
-    // failed spawn leaks a worktree + branch with no automatic reaper.
-    let cleanup_on_err = |err: Error| -> Error {
-        let handle = IsoHandle {
-            branch: id.clone(),
-            id: id.clone(),
-            path: path.clone(),
-            repo_root: repo_root.to_path_buf(),
-            baseline: String::new(),
-        };
-        let _ = drop_worktree(&handle);
-        err
-    };
-    // Dirty-tree materialization: tracked diff + untracked files.
-    let tracked_patch =
-        git_ok(repo_root, &["diff", "--binary", "HEAD"]).map_err(&cleanup_on_err)?;
-    if !tracked_patch.trim().is_empty() {
-        let patch_file = path.join(".pi-iso-parent.patch");
-        std::fs::write(&patch_file, &tracked_patch)
-            .map_err(|e| Error::tool("subagent", format!("Failed to stage parent patch: {e}")))
-            .map_err(&cleanup_on_err)?;
-        git_ok(&path, &["apply", &patch_file.to_string_lossy()]).map_err(&cleanup_on_err)?;
-        let _ = std::fs::remove_file(&patch_file);
-    }
-    let untracked = git_ok(repo_root, &["ls-files", "--others", "--exclude-standard"])
-        .map_err(&cleanup_on_err)?;
-    for relative in untracked.lines().filter(|line| !line.is_empty()) {
-        let source = repo_root.join(relative);
-        let target = path.join(relative);
-        if source.is_file() {
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::copy(&source, &target);
-        }
-    }
-
-    // Commit the materialized baseline so the child's own work is a clean
-    // diff against it (and the parent's dirty state never double-applies).
-    git_ok(&path, &["add", "-A"]).map_err(&cleanup_on_err)?;
-    git_ok(
-        &path,
-        &[
-            "commit",
-            "--allow-empty",
-            "--no-verify",
-            "-m",
-            &format!("pi-iso baseline {id}"),
-        ],
-    )
-    .map_err(&cleanup_on_err)?;
-    let baseline = git_ok(&path, &["rev-parse", "HEAD"])
-        .map_err(&cleanup_on_err)?
-        .trim()
-        .to_string();
-
+    // Capture first: unsupported modes and read failures must not launch an
+    // incomplete child or create a half-materialized worktree.
+    let captured = snapshot::capture(&repo_root, &id)?;
+    captured.checkout(&repo_root, &path, &id).map_err(|error| Error::tool(
+        "subagent",
+        format!("{error}; inspect {} for any incomplete checkout before retrying", path.display()),
+    ))?;
     Ok(IsoHandle {
         branch: id.clone(),
         id,
         path,
-        repo_root: repo_root.to_path_buf(),
-        baseline,
+        repo_root,
+        baseline: captured.baseline.clone(),
     })
 }
 
-/// Collect the child's worktree state as a patch vs the materialized
-/// baseline (so the parent's dirty state never double-applies).
+/// Collect the child's effective file state against its launch baseline.
+/// Both staged and unstaged changes are included without modifying its index.
 ///
 /// # Errors
-/// git failures.
+/// Git/snapshot failures, including textual patches that cannot be represented
+/// losslessly as UTF-8. The caller retains the worktree on those failures.
 pub fn collect_diff(handle: &IsoHandle) -> Result<(String, String)> {
-    // Stage everything so untracked work appears in the diff.
-    git_ok(&handle.path, &["add", "-A"])?;
+    let current = snapshot::capture(&handle.path, &handle.id)?;
     let patch = git_ok(
         &handle.path,
-        &["diff", "--binary", "--cached", &handle.baseline],
+        &[
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary",
+            "--full-index", "--src-prefix=a/", "--dst-prefix=b/",
+            &handle.baseline, &current.baseline, "--",
+        ],
     )?;
     let diff_stat = git_ok(
         &handle.path,
-        &["diff", "--cached", "--stat", &handle.baseline],
+        &[
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat",
+            &handle.baseline, &current.baseline, "--",
+        ],
     )?;
     Ok((patch, diff_stat))
 }
 
-/// Serialize parent-tree application across sibling children (they apply
-/// in task order, never concurrently).
+/// Serialize parent-tree application across sibling children. This mutex
+/// prevents simultaneous application, not ordering by task index.
 fn parent_apply_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
     &LOCK
 }
 
-/// Apply the collected patch into the parent tree. On conflict, report the
-/// conflicting files and leave the worktree for manual resolution — never
-/// force.
+struct PatchFile {
+    path: PathBuf,
+}
+
+impl PatchFile {
+    fn new(patch: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("pi-iso-patch-{}", uuid::Uuid::new_v4().simple()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)
+            .map_err(|error| Error::tool("subagent", format!("Cannot create private patch file: {error}")))?;
+        let staged = Self { path };
+        let written = file.write_all(patch.as_bytes());
+        drop(file);
+        written.map_err(|error| Error::tool("subagent", format!("Cannot stage patch: {error}")))?;
+        Ok(staged)
+    }
+
+    fn apply(&self, repo: &Path, check: bool) -> Result<std::process::Output> {
+        let mut command = git_command(repo);
+        command.arg("apply");
+        if check { command.arg("--check"); }
+        command.arg("--").arg(&self.path).output()
+            .map_err(|error| Error::tool("subagent", format!("Cannot run git apply: {error}")))
+    }
+}
+
+impl Drop for PatchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Apply a patch without overwriting temporary/control filenames in either
+/// workspace. The real apply rechecks its preconditions after --check, so an
+/// external edit during that gap is rejected rather than forced.
 ///
 /// # Errors
-/// Named `PI_ISO_CONFLICT` listing conflicted files.
+/// Named `PI_ISO_CONFLICT` on a rejected patch; the worktree remains inspectable.
 pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
     if patch.trim().is_empty() {
         return Ok(());
@@ -277,64 +271,44 @@ pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
     let _guard = parent_apply_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // --check first so a failing apply reports files without partial writes.
-    let patch_file = handle.path.join(".pi-iso-outgoing.patch");
-    std::fs::write(&patch_file, patch)
-        .map_err(|e| Error::tool("subagent", format!("Failed to stage patch: {e}")))?;
-    let check = git(
-        &handle.repo_root,
-        &["apply", "--check", &patch_file.to_string_lossy()],
-    )?;
-    if !check.status.success() {
-        let stderr = String::from_utf8_lossy(&check.stderr).into_owned();
-        let mut files: Vec<String> = stderr
-            .lines()
-            .filter_map(|line| {
-                line.strip_prefix("error: ")
-                    .and_then(|rest| rest.split(':').nth(1))
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            })
-            .collect();
-        files.sort();
-        files.dedup();
-        let _ = std::fs::remove_file(&patch_file);
-        return Err(Error::tool(
-            "subagent",
-            format!(
-                "PI_ISO_CONFLICT: patch from {} does not apply cleanly to the parent tree. \
-                 Conflicted files: {}. The worktree is left at {} for manual resolution.",
-                handle.branch,
-                if files.is_empty() {
-                    "(see git apply output)".to_string()
-                } else {
-                    files.join(", ")
-                },
-                handle.path.display()
-            ),
-        ));
+    let staged = PatchFile::new(patch)?;
+    for check in [true, false] {
+        let output = staged.apply(&handle.repo_root, check)?;
+        if !output.status.success() {
+            let diagnostic: String = String::from_utf8_lossy(&output.stderr).chars().take(4096).collect();
+            return Err(Error::tool(
+                "subagent",
+                format!(
+                    "PI_ISO_CONFLICT: patch from {} does not apply cleanly to the parent tree. \
+                     The worktree is left at {} for manual resolution. Git apply: {}",
+                    handle.branch, handle.path.display(), diagnostic.trim()
+                ),
+            ));
+        }
     }
-    git_ok(&handle.repo_root, &["apply", &patch_file.to_string_lossy()])?;
-    let _ = std::fs::remove_file(&patch_file);
     Ok(())
 }
 
-/// Remove the worktree and its branch.
+/// Remove a matching pi-iso worktree and its branch. A basename prefix alone
+/// is not enough: a foreign branch in a similarly named directory is preserved.
 ///
 /// # Errors
-/// git failures.
+/// Ownership-shape mismatch or git failures.
 pub fn drop_worktree(handle: &IsoHandle) -> Result<()> {
-    git_ok(
-        &handle.repo_root,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            &handle.path.to_string_lossy(),
-        ],
-    )?;
-    // Branch deletion is best-effort (the worktree removal usually drops it).
+    if !handle.id.starts_with(ISO_PREFIX)
+        || handle.branch != handle.id
+        || handle.path.file_name() != Some(std::ffi::OsStr::new(&handle.id))
+    {
+        return Err(Error::tool("subagent", "PI_ISO_NOT_OWNED: refusing to remove a non-matching isolation worktree"));
+    }
+    let output = git_command(&handle.repo_root)
+        .args(["worktree", "remove", "--force", "--"]).arg(&handle.path).output()
+        .map_err(|error| Error::tool("subagent", format!("Cannot remove worktree: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::tool("subagent", format!(
+            "Cannot remove isolation worktree: {}", String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     let _ = git(&handle.repo_root, &["branch", "-D", &handle.branch]);
     Ok(())
 }
@@ -434,8 +408,7 @@ fn worktree_age_ms(path: &Path) -> u64 {
     u64::try_from(newest).unwrap_or(u64::MAX)
 }
 
-/// Reap our stale worktrees (prefix-tagged only; foreign worktrees are
-/// never touched).
+/// Reap our stale worktrees (matching prefix, branch and basename only).
 ///
 /// # Errors
 /// git failures on the first worktree that cannot be listed.
