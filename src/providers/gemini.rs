@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::pin::Pin;
 
+mod files;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -75,6 +77,7 @@ pub struct GeminiProvider {
     api: String,
     google_cli_mode: bool,
     compat: Option<CompatConfig>,
+    files: files::FileCache,
 }
 
 impl GeminiProvider {
@@ -88,6 +91,7 @@ impl GeminiProvider {
             api: "google-generative-ai".to_string(),
             google_cli_mode: false,
             compat: None,
+            files: files::FileCache::default(),
         }
     }
 
@@ -123,6 +127,7 @@ impl GeminiProvider {
     #[must_use]
     pub fn with_client(mut self, client: Client) -> Self {
         self.client = client;
+        self.files = files::FileCache::default();
         self
     }
 
@@ -501,6 +506,11 @@ impl Provider for GeminiProvider {
             )
         };
 
+        let upload_auth = files::UploadAuth::for_request(
+            options,
+            self.compat.as_ref(),
+            auth_value.as_deref(),
+        );
         if let Some(auth_value) = auth_value {
             request = request.header("x-goog-api-key", &auth_value);
         }
@@ -533,10 +543,23 @@ impl Provider for GeminiProvider {
             |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
         )
         .await;
-        let request = match &rewritten_body {
-            Some(body) => request.json(body)?,
-            None => request.json(&request_body)?,
+        let mut body = match rewritten_body {
+            Some(body) => body,
+            None => serde_json::to_value(&request_body)?,
         };
+        // Release the typed payload before decoding large base64 attachments.
+        drop(request_body);
+        // Stage the final payload after extension rewrites. Session originals
+        // stay inline and portable; remote file URIs are transport-only state.
+        // Cloud Code Assist returned above; Vertex uses its separate provider.
+        Box::pin(self.files.prepare(
+            &self.client,
+            &self.base_url,
+            &upload_auth,
+            &mut body,
+        ))
+        .await?;
+        let request = request.json(&body)?;
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
