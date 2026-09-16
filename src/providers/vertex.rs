@@ -452,6 +452,15 @@ where
                 "Vertex AI stream ended before finishReason (unexpected EOF)",
             ));
         }
+        if self.partial.stop_reason == StopReason::Stop
+            && self
+                .partial
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
         let reason = self.partial.stop_reason;
         let message = std::mem::take(&mut self.partial);
         Ok(StreamEvent::Done { reason, message })
@@ -536,7 +545,10 @@ where
                             delta: text,
                         });
                     }
-                    GeminiPart::FunctionCall { function_call } => {
+                    GeminiPart::FunctionCall {
+                        function_call,
+                        thought_signature,
+                    } => {
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
                         let args_str = serde_json::to_string(&function_call.args)
@@ -547,7 +559,7 @@ where
                             id,
                             name,
                             arguments: args,
-                            thought_signature: None,
+                            thought_signature,
                         };
 
                         self.partial
@@ -555,7 +567,9 @@ where
                             .push(ContentBlock::ToolCall(tool_call.clone()));
                         let content_index = self.partial.content.len() - 1;
 
-                        self.partial.stop_reason = StopReason::ToolUse;
+                        if self.partial.stop_reason == StopReason::Stop {
+                            self.partial.stop_reason = StopReason::ToolUse;
+                        }
 
                         self.ensure_started();
 
@@ -1098,6 +1112,88 @@ mod tests {
             message.error_message.as_deref(),
             Some("Vertex AI blocked the prompt: PROHIBITED_CONTENT")
         );
+    }
+
+    #[test]
+    fn signed_tool_call_survives_vertex_stream_session_and_replay() {
+        let events = [
+            serde_json::json!({"candidates": [{"content": {"parts": [{
+                "functionCall": {"name": "read", "args": {"path": "a.txt"}},
+                "thoughtSignature": "dmVydGV4"
+            }]}}]}),
+            serde_json::json!({"candidates": [{"finishReason": "STOP"}]}),
+        ];
+        let stream_events = collect_events(&events);
+        let call = stream_events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("completed tool call");
+        assert_eq!(call.thought_signature.as_deref(), Some("dmVydGV4"));
+        let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+        let stored = serde_json::to_string(&Message::assistant(message.clone())).unwrap();
+        let replay: Message = serde_json::from_str(&stored).unwrap();
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Read a.txt".to_string()),
+                    timestamp: 0,
+                }),
+                replay,
+                Message::tool_result(crate::model::ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 1,
+                }),
+            ],
+            Vec::new(),
+        );
+        let provider = VertexProvider::new("gemini-3-pro");
+        let wire = serde_json::to_value(
+            provider.build_gemini_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["thoughtSignature"],
+            "dmVydGV4"
+        );
+        assert_eq!(
+            wire["contents"][1]["parts"][0]["functionCall"]["args"],
+            serde_json::json!({"path": "a.txt"})
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+    }
+
+    #[test]
+    fn vertex_terminal_failure_is_preserved_with_a_tool_call() {
+        for (finish, expected) in [
+            ("SAFETY", StopReason::Error),
+            ("MAX_TOKENS", StopReason::Length),
+        ] {
+            let events = [serde_json::json!({"candidates": [{
+                "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]},
+                "finishReason": finish
+            }]})];
+            let stream_events = collect_events(&events);
+            let Some(StreamEvent::Done { reason, message }) = stream_events.last() else {
+                panic!("expected Done");
+            };
+            assert_eq!(*reason, expected);
+            assert_eq!(message.stop_reason, expected);
+        }
     }
 
     // ─── Test helpers ────────────────────────────────────────────────────

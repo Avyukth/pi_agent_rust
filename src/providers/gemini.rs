@@ -704,6 +704,17 @@ where
                 "Gemini stream ended before finishReason (unexpected EOF)",
             ));
         }
+        // Gemini commonly sends STOP in a separate final chunk after the
+        // function calls. It completes the model step, not the agent's turn.
+        if self.partial.stop_reason == StopReason::Stop
+            && self
+                .partial
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall(_)))
+        {
+            self.partial.stop_reason = StopReason::ToolUse;
+        }
         let reason = self.partial.stop_reason;
         let message = std::mem::take(&mut self.partial);
         Ok(StreamEvent::Done { reason, message })
@@ -812,7 +823,10 @@ where
                             delta: text,
                         });
                     }
-                    GeminiPart::FunctionCall { function_call } => {
+                    GeminiPart::FunctionCall {
+                        function_call,
+                        thought_signature,
+                    } => {
                         // Generate a unique ID for this tool call
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
@@ -825,7 +839,7 @@ where
                             id,
                             name,
                             arguments: args,
-                            thought_signature: None,
+                            thought_signature,
                         };
 
                         self.partial
@@ -833,8 +847,11 @@ where
                             .push(ContentBlock::ToolCall(tool_call.clone()));
                         let content_index = self.partial.content.len() - 1;
 
-                        // Update stop reason for tool use
-                        self.partial.stop_reason = StopReason::ToolUse;
+                        // Preserve explicit failure/length outcomes, even when
+                        // the terminal candidate also contains function calls.
+                        if self.partial.stop_reason == StopReason::Stop {
+                            self.partial.stop_reason = StopReason::ToolUse;
+                        }
 
                         self.ensure_started();
 
@@ -933,6 +950,15 @@ pub(crate) enum GeminiPart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: GeminiFunctionCall,
+        /// Opaque model state attached to this exact call, not its arguments.
+        /// Gemini 3 requires it on replay; unsigned parallel calls stay unsigned.
+        #[serde(
+            default,
+            rename = "thoughtSignature",
+            alias = "thought_signature",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thought_signature: Option<String>,
     },
     FunctionResponse {
         #[serde(rename = "functionResponse")]
@@ -1093,6 +1119,7 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                                 name: tc.name.clone(),
                                 args: tc.arguments.clone(),
                             },
+                            thought_signature: tc.thought_signature.clone(),
                         });
                     }
                     ContentBlock::Thinking(_)
@@ -2154,7 +2181,7 @@ mod tests {
             _ => panic!(),
         }
         match &converted[0].parts[1] {
-            GeminiPart::FunctionCall { function_call } => {
+            GeminiPart::FunctionCall { function_call, .. } => {
                 assert_eq!(function_call.name, "read");
                 assert_eq!(function_call.args["path"], "/tmp/test.txt");
             }
@@ -2382,6 +2409,153 @@ mod tests {
             contents[2]["parts"][0]["functionResponse"]["response"]["result"],
             "file contents"
         );
+    }
+
+    #[test]
+    fn signed_parallel_calls_survive_stream_session_and_replay() {
+        const SIGNATURE: &str = "c2lnbmVkLXRvb2w=";
+        let body = [
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"a.txt"}},"thoughtSignature":"c2lnbmVkLXRvb2w="},{"functionCall":{"name":"read","args":{"path":"b.txt"}}}]}}]}"#,
+            "",
+            r#"data: {"candidates":[{"finishReason":"STOP"}]}"#,
+            "",
+            "",
+        ]
+        .join("\n");
+        let events = collect_stream_items_from_body(&body);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let signatures: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => {
+                    Some(tool_call.thought_signature.as_deref())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, vec![Some(SIGNATURE), None]);
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("expected completed tool step: {events:?}");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        assert_eq!(message.stop_reason, StopReason::ToolUse);
+
+        let stored = serde_json::to_string(&Message::assistant(message.clone())).unwrap();
+        let replay: Message = serde_json::from_str(&stored).expect("session replay");
+        let mut messages = vec![
+            Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Read a.txt and b.txt".to_string()),
+                timestamp: 0,
+            }),
+            replay,
+        ];
+        for block in &message.content {
+            if let ContentBlock::ToolCall(call) = block {
+                messages.push(Message::tool_result(crate::model::ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: vec![ContentBlock::Text(TextContent::new("contents"))],
+                    details: None,
+                    is_error: false,
+                    timestamp: 1,
+                }));
+            }
+        }
+        let context = Context::owned(None, messages, Vec::new());
+        let provider = GeminiProvider::new("gemini-3-pro");
+        let wire = serde_json::to_value(
+            provider.build_request(&context, &StreamOptions::default()),
+        )
+        .unwrap();
+        let parts = wire["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thoughtSignature"], SIGNATURE);
+        assert!(parts[1].get("thoughtSignature").is_none());
+        assert_eq!(parts[0]["functionCall"]["args"], serde_json::json!({"path": "a.txt"}));
+        assert_eq!(parts[1]["functionCall"]["args"], serde_json::json!({"path": "b.txt"}));
+        assert_eq!(wire["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
+        assert_eq!(wire["contents"][3]["parts"][0]["functionResponse"]["name"], "read");
+    }
+
+    #[test]
+    fn function_call_signature_accepts_both_spellings_without_fabrication() {
+        for key in ["thoughtSignature", "thought_signature"] {
+            let mut wire = serde_json::json!({
+                "functionCall": {"name": "read", "args": {"path": "a.txt"}}
+            });
+            wire[key] = serde_json::json!("c2lnbmF0dXJl");
+            let part: GeminiPart = serde_json::from_value(wire).unwrap();
+            let replay = serde_json::to_value(part).unwrap();
+            assert_eq!(replay["thoughtSignature"], "c2lnbmF0dXJl");
+            assert!(replay.get("thought_signature").is_none());
+            assert_eq!(replay["functionCall"]["args"], serde_json::json!({"path": "a.txt"}));
+        }
+        let unsigned = serde_json::json!({"functionCall": {"name": "read", "args": {}}});
+        let part: GeminiPart = serde_json::from_value(unsigned.clone()).unwrap();
+        assert_eq!(serde_json::to_value(part).unwrap(), unsigned);
+    }
+
+    #[test]
+    fn cloud_code_assist_preserves_tool_call_signatures() {
+        let source = stream::empty::<std::io::Result<Vec<u8>>>();
+        let mut state = StreamState::new(
+            SseStream::new(source),
+            "gemini-test".to_string(),
+            "google-gemini-cli".to_string(),
+            "google-gemini-cli".to_string(),
+        );
+        state
+            .process_cloud_code_event(
+                r#"{"response":{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{}},"thoughtSignature":"Y2xvdWQ="}]}}]}}"#,
+            )
+            .unwrap();
+        state
+            .process_cloud_code_event(r#"{"response":{"candidates":[{"finishReason":"STOP"}]}}"#)
+            .unwrap();
+        let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {
+            panic!("expected Done");
+        };
+        assert_eq!(reason, StopReason::ToolUse);
+        let ContentBlock::ToolCall(call) = &message.content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(call.thought_signature.as_deref(), Some("Y2xvdWQ="));
+    }
+
+    #[test]
+    fn terminal_failure_or_length_is_not_overwritten_by_function_calls() {
+        for (finish, expected) in [("SAFETY", StopReason::Error), ("MAX_TOKENS", StopReason::Length)] {
+            for separate_terminal_chunk in [false, true] {
+                let source = stream::empty::<std::io::Result<Vec<u8>>>();
+                let mut state = StreamState::new(
+                    SseStream::new(source),
+                    "gemini-test".to_string(),
+                    "google".to_string(),
+                    "google".to_string(),
+                );
+                let mut candidate = serde_json::json!({
+                    "content": {"parts": [{"functionCall": {"name": "read", "args": {}}}]}
+                });
+                if !separate_terminal_chunk {
+                    candidate["finishReason"] = serde_json::json!(finish);
+                }
+                state
+                    .process_event(&serde_json::json!({"candidates": [candidate]}).to_string())
+                    .unwrap();
+                if separate_terminal_chunk {
+                    state
+                        .process_event(&serde_json::json!({
+                            "candidates": [{"finishReason": finish}]
+                        }).to_string())
+                        .unwrap();
+                }
+                let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {
+                    panic!("expected Done");
+                };
+                assert_eq!(reason, expected);
+                assert_eq!(message.stop_reason, expected);
+            }
+        }
     }
 
     // ========================================================================
