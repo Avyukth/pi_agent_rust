@@ -506,11 +506,8 @@ impl Provider for GeminiProvider {
             )
         };
 
-        let upload_auth = files::UploadAuth::for_request(
-            options,
-            self.compat.as_ref(),
-            auth_value.as_deref(),
-        );
+        let upload_auth =
+            files::UploadAuth::for_request(options, self.compat.as_ref(), auth_value.as_deref());
         if let Some(auth_value) = auth_value {
             request = request.header("x-goog-api-key", &auth_value);
         }
@@ -552,12 +549,10 @@ impl Provider for GeminiProvider {
         // Stage the final payload after extension rewrites. Session originals
         // stay inline and portable; remote file URIs are transport-only state.
         // Cloud Code Assist returned above; Vertex uses its separate provider.
-        Box::pin(self.files.prepare(
-            &self.client,
-            &self.base_url,
-            &upload_auth,
-            &mut body,
-        ))
+        Box::pin(
+            self.files
+                .prepare(&self.client, &self.base_url, &upload_auth, &mut body),
+        )
         .await?;
         let request = request.json(&body)?;
 
@@ -2463,18 +2458,29 @@ mod tests {
         }
         let context = Context::owned(None, messages, Vec::new());
         let provider = GeminiProvider::new("gemini-3-pro");
-        let wire = serde_json::to_value(
-            provider.build_request(&context, &StreamOptions::default()),
-        )
-        .unwrap();
+        let wire =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .unwrap();
         let parts = wire["contents"][1]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["thoughtSignature"], SIGNATURE);
         assert!(parts[1].get("thoughtSignature").is_none());
-        assert_eq!(parts[0]["functionCall"]["args"], serde_json::json!({"path": "a.txt"}));
-        assert_eq!(parts[1]["functionCall"]["args"], serde_json::json!({"path": "b.txt"}));
-        assert_eq!(wire["contents"][2]["parts"][0]["functionResponse"]["name"], "read");
-        assert_eq!(wire["contents"][3]["parts"][0]["functionResponse"]["name"], "read");
+        assert_eq!(
+            parts[0]["functionCall"]["args"],
+            serde_json::json!({"path": "a.txt"})
+        );
+        assert_eq!(
+            parts[1]["functionCall"]["args"],
+            serde_json::json!({"path": "b.txt"})
+        );
+        assert_eq!(
+            wire["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
+        assert_eq!(
+            wire["contents"][3]["parts"][0]["functionResponse"]["name"],
+            "read"
+        );
     }
 
     #[test]
@@ -2488,7 +2494,10 @@ mod tests {
             let replay = serde_json::to_value(part).unwrap();
             assert_eq!(replay["thoughtSignature"], "c2lnbmF0dXJl");
             assert!(replay.get("thought_signature").is_none());
-            assert_eq!(replay["functionCall"]["args"], serde_json::json!({"path": "a.txt"}));
+            assert_eq!(
+                replay["functionCall"]["args"],
+                serde_json::json!({"path": "a.txt"})
+            );
         }
         let unsigned = serde_json::json!({"functionCall": {"name": "read", "args": {}}});
         let part: GeminiPart = serde_json::from_value(unsigned.clone()).unwrap();
@@ -2524,7 +2533,10 @@ mod tests {
 
     #[test]
     fn terminal_failure_or_length_is_not_overwritten_by_function_calls() {
-        for (finish, expected) in [("SAFETY", StopReason::Error), ("MAX_TOKENS", StopReason::Length)] {
+        for (finish, expected) in [
+            ("SAFETY", StopReason::Error),
+            ("MAX_TOKENS", StopReason::Length),
+        ] {
             for separate_terminal_chunk in [false, true] {
                 let source = stream::empty::<std::io::Result<Vec<u8>>>();
                 let mut state = StreamState::new(
@@ -2544,9 +2556,12 @@ mod tests {
                     .unwrap();
                 if separate_terminal_chunk {
                     state
-                        .process_event(&serde_json::json!({
-                            "candidates": [{"finishReason": finish}]
-                        }).to_string())
+                        .process_event(
+                            &serde_json::json!({
+                                "candidates": [{"finishReason": finish}]
+                            })
+                            .to_string(),
+                        )
                         .unwrap();
                 }
                 let StreamEvent::Done { reason, message } = state.finish_at_eof().unwrap() else {

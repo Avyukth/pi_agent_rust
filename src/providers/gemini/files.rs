@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder, Response};
 use crate::models::CompatConfig;
 use crate::provider::StreamOptions;
-use asupersync::sync::Mutex as AsyncMutex;
+use asupersync::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -150,9 +150,9 @@ impl Endpoint {
             .filter(|id| {
                 !id.is_empty()
                     && id.len() <= 128
-                    && id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
-                    })
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
             })
             .ok_or_else(|| files_error("invalid file resource name"))?;
         self.base
@@ -173,7 +173,9 @@ impl Endpoint {
             || url.password().is_some()
             || url.fragment().is_some()
         {
-            return Err(files_error("refused an off-origin or unexpected upload URL"));
+            return Err(files_error(
+                "refused an off-origin or unexpected upload URL",
+            ));
         }
         Ok(url)
     }
@@ -201,17 +203,23 @@ impl RemoteFile {
         let expected_uri = endpoint.metadata_url(&name)?;
         let uri = required_string(file, "uri")?;
         if uri != expected_uri.as_str() {
-            return Err(files_error("file metadata returned an unexpected resource URI"));
+            return Err(files_error(
+                "file metadata returned an unexpected resource URI",
+            ));
         }
         if !required_string(file, "mimeType")?.eq_ignore_ascii_case(mime) {
-            return Err(files_error("uploaded file MIME type does not match the input"));
+            return Err(files_error(
+                "uploaded file MIME type does not match the input",
+            ));
         }
         let returned_size = file
             .get("sizeBytes")
             .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
             .ok_or_else(|| files_error("file metadata has no valid byte count"))?;
         if returned_size != u64::try_from(size).unwrap_or(u64::MAX) {
-            return Err(files_error("uploaded file byte count does not match the input"));
+            return Err(files_error(
+                "uploaded file byte count does not match the input",
+            ));
         }
         let expires_at = DateTime::parse_from_rfc3339(required_string(file, "expirationTime")?)
             .map_err(|_| files_error("file metadata has an invalid expiry"))?
@@ -414,14 +422,25 @@ impl FileCache {
         bytes: Vec<u8>,
     ) -> Result<String> {
         let slot = self.slot(key)?;
-        let mut cached = slot.lock(context.owner.cx()).await.map_err(|_| {
-            files_error("media upload cancelled while waiting for its content lock")
-        })?;
+        // OWNED guard, not a borrowed one: this is held across the metadata
+        // fetch, the upload and the processing poll below, and
+        // `asupersync::sync::MutexGuard` is not `Send` — which made this whole
+        // future non-`Send`, and with it `FileCache::prepare` and the
+        // `Provider::stream` that awaits it, so the crate did not compile.
+        // `OwnedMutexGuard` is `Send` for `T: Send` and keeps the lock held for
+        // exactly the same span, so two requests for the same content still
+        // cannot upload it twice.
+        let mut cached = OwnedMutexGuard::lock(slot, context.owner.cx())
+            .await
+            .map_err(|_| {
+                files_error("media upload cancelled while waiting for its content lock")
+            })?;
         checkpoint(context.owner)?;
         let size = bytes.len();
-        if cached.as_ref().is_some_and(|file| {
-            file.expires_soon(Utc::now()) || file.state == FileState::Failed
-        }) {
+        if cached
+            .as_ref()
+            .is_some_and(|file| file.expires_soon(Utc::now()) || file.state == FileState::Failed)
+        {
             *cached = None;
         }
         // Do not assume a still-live URI exists just because its TTL has not
@@ -430,9 +449,10 @@ impl FileCache {
             let name = file.name.clone();
             *cached = get_metadata(context, &name, mime, size).await?;
         }
-        if cached.as_ref().is_some_and(|file| {
-            file.expires_soon(Utc::now()) || file.state == FileState::Failed
-        }) {
+        if cached
+            .as_ref()
+            .is_some_and(|file| file.expires_soon(Utc::now()) || file.state == FileState::Failed)
+        {
             *cached = None;
         }
         if cached.is_none() {
@@ -487,15 +507,15 @@ fn staging_plan(body: &Value, policy: StagingPolicy) -> Result<Vec<Candidate>> {
             collect_candidates(content, &format!("/{key}"), &mut candidates)?;
         }
     }
-    let mut remaining = candidates.iter().fold(0_usize, |sum, item| {
-        sum.saturating_add(item.encoded_bytes)
-    });
+    let mut remaining = candidates
+        .iter()
+        .fold(0_usize, |sum, item| sum.saturating_add(item.encoded_bytes));
     // Largest first minimizes the number of Files API resources required to
     // bring aggregate inline data under the bandwidth budget.
     candidates.sort_by_key(|item| std::cmp::Reverse(item.encoded_bytes));
     candidates.retain(|item| {
-        let upload = item.encoded_bytes >= policy.inline_part_bytes
-            || remaining > policy.inline_total_bytes;
+        let upload =
+            item.encoded_bytes >= policy.inline_part_bytes || remaining > policy.inline_total_bytes;
         if upload {
             remaining = remaining.saturating_sub(item.encoded_bytes);
         }
@@ -536,13 +556,17 @@ fn collect_candidates(content: &Value, prefix: &str, out: &mut Vec<Candidate>) -
 
 fn decode_media(data: &str) -> Result<Vec<u8>> {
     if data.len() > MAX_UPLOAD_BYTES.div_ceil(3) * 4 {
-        return Err(files_error("one media upload exceeds the 64 MiB staging limit"));
+        return Err(files_error(
+            "one media upload exceeds the 64 MiB staging limit",
+        ));
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|_| files_error("inline media is not valid base64"))?;
     if bytes.len() > MAX_UPLOAD_BYTES {
-        return Err(files_error("one media upload exceeds the 64 MiB staging limit"));
+        return Err(files_error(
+            "one media upload exceeds the 64 MiB staging limit",
+        ));
     }
     if bytes.is_empty() {
         return Err(files_error("cannot upload empty media"));
@@ -563,12 +587,7 @@ fn valid_mime(mime: &str) -> bool {
     mime.len() <= 128 && token(kind) && token(subtype)
 }
 
-fn content_key(
-    endpoint: &Endpoint,
-    auth: &UploadAuth,
-    mime: &str,
-    bytes: &[u8],
-) -> ContentKey {
+fn content_key(endpoint: &Endpoint, auth: &UploadAuth, mime: &str, bytes: &[u8]) -> ContentKey {
     let mut hash = Sha256::new();
     let mut field = |value: &[u8]| {
         hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
@@ -594,7 +613,9 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
-    owner.checkpoint().map_err(|_| files_error("media upload cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| files_error("media upload cancelled"))
 }
 
 fn files_error(message: &str) -> Error {
@@ -638,11 +659,7 @@ async fn get_metadata(
     Ok(Some(file))
 }
 
-async fn upload(
-    context: &UploadContext<'_>,
-    mime: &str,
-    bytes: Vec<u8>,
-) -> Result<RemoteFile> {
+async fn upload(context: &UploadContext<'_>, mime: &str, bytes: Vec<u8>) -> Result<RemoteFile> {
     use std::fmt::Write as _;
     checkpoint(context.owner)?;
     let size = bytes.len();
@@ -692,7 +709,9 @@ async fn upload(
         .map_err(|_| files_error("media transfer failed"))?;
     let status = response.status();
     if !(200..300).contains(&status) {
-        return Err(files_error(&format!("media transfer failed (HTTP {status})")));
+        return Err(files_error(&format!(
+            "media transfer failed (HTTP {status})"
+        )));
     }
     let value = metadata_body(response).await?;
     RemoteFile::parse(&value, context.endpoint, mime, size)
@@ -819,8 +838,12 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedRequest {
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         let mut data = Vec::new();
         let end = loop {
             if let Some(index) = data.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -937,7 +960,11 @@ mod tests {
 
     #[test]
     fn only_official_developer_api_is_staged_automatically() {
-        for base in ["", API_BASE, "https://generativelanguage.googleapis.com:443/v1beta/"] {
+        for base in [
+            "",
+            API_BASE,
+            "https://generativelanguage.googleapis.com:443/v1beta/",
+        ] {
             assert!(Endpoint::for_provider(base).is_some(), "{base}");
         }
         for base in [
@@ -959,7 +986,11 @@ mod tests {
     #[test]
     fn upload_capabilities_cannot_redirect_media_or_credentials() {
         let endpoint = Endpoint::for_provider(API_BASE).unwrap();
-        assert!(endpoint.validate_upload_url(&format!("{}?upload_id=x", endpoint.upload)).is_ok());
+        assert!(
+            endpoint
+                .validate_upload_url(&format!("{}?upload_id=x", endpoint.upload))
+                .is_ok()
+        );
         for target in [
             "https://attacker.test/upload/v1beta/files?upload_id=secret",
             "http://generativelanguage.googleapis.com/upload/v1beta/files",
@@ -968,7 +999,11 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/files",
             "https://generativelanguage.googleapis.com/upload/v1beta/files\r\nX-Key: secret",
         ] {
-            let error = endpoint.validate_upload_url(target).err().unwrap().to_string();
+            let error = endpoint
+                .validate_upload_url(target)
+                .err()
+                .unwrap()
+                .to_string();
             assert!(!error.contains("secret"));
         }
     }
@@ -976,43 +1011,89 @@ mod tests {
     #[test]
     fn resource_names_cannot_escape_the_files_collection() {
         let endpoint = Endpoint::for_provider(API_BASE).unwrap();
-        for name in ["files/", "files/../models", "files/a/b", "files/%2e%2e", "files/a?key=x", "models/a"] {
+        for name in [
+            "files/",
+            "files/../models",
+            "files/a/b",
+            "files/%2e%2e",
+            "files/a?key=x",
+            "models/a",
+        ] {
             assert!(endpoint.metadata_url(name).is_err(), "{name}");
         }
-        assert_eq!(endpoint.metadata_url("files/a-1_b").unwrap().path(), "/v1beta/files/a-1_b");
+        assert_eq!(
+            endpoint.metadata_url("files/a-1_b").unwrap().path(),
+            "/v1beta/files/a-1_b"
+        );
     }
 
     #[test]
     fn cache_identity_includes_content_mime_and_credentials() {
         let endpoint = Endpoint::for_provider(API_BASE).unwrap();
         let original = content_key(&endpoint, &auth("a"), "audio/wav", b"abc");
-        assert_eq!(original, content_key(&endpoint, &auth("a"), "audio/wav", b"abc"));
-        assert_ne!(original, content_key(&endpoint, &auth("b"), "audio/wav", b"abc"));
-        assert_ne!(original, content_key(&endpoint, &auth("a"), "audio/mpeg", b"abc"));
-        assert_ne!(original, content_key(&endpoint, &auth("a"), "audio/wav", b"abd"));
+        assert_eq!(
+            original,
+            content_key(&endpoint, &auth("a"), "audio/wav", b"abc")
+        );
+        assert_ne!(
+            original,
+            content_key(&endpoint, &auth("b"), "audio/wav", b"abc")
+        );
+        assert_ne!(
+            original,
+            content_key(&endpoint, &auth("a"), "audio/mpeg", b"abc")
+        );
+        assert_ne!(
+            original,
+            content_key(&endpoint, &auth("a"), "audio/wav", b"abd")
+        );
         let mut quota_auth = auth("a");
-        quota_auth.headers.push(("x-goog-user-project".into(), "other-project".into()));
-        assert_ne!(original, content_key(&endpoint, &quota_auth, "audio/wav", b"abc"));
+        quota_auth
+            .headers
+            .push(("x-goog-user-project".into(), "other-project".into()));
+        assert_ne!(
+            original,
+            content_key(&endpoint, &quota_auth, "audio/wav", b"abc")
+        );
     }
 
     #[test]
     fn request_auth_overrides_do_not_reintroduce_a_fallback_key() {
         let mut options = StreamOptions::default();
-        options.headers.insert("Authorization".into(), "Bearer caller".into());
-        options.headers.insert("X-Goog-User-Project".into(), "quota-project".into());
+        options
+            .headers
+            .insert("Authorization".into(), "Bearer caller".into());
+        options
+            .headers
+            .insert("X-Goog-User-Project".into(), "quota-project".into());
         let auth = UploadAuth::for_request(&options, None, Some("must-not-leak"));
         assert!(!auth.headers.iter().any(|(key, _)| key == "x-goog-api-key"));
-        assert!(auth.headers.contains(&("authorization".into(), "Bearer caller".into())));
-        assert!(auth.headers.contains(&("x-goog-user-project".into(), "quota-project".into())));
-        options.headers.insert("X-Goog-Api-Key".into(), "override".into());
+        assert!(
+            auth.headers
+                .contains(&("authorization".into(), "Bearer caller".into()))
+        );
+        assert!(
+            auth.headers
+                .contains(&("x-goog-user-project".into(), "quota-project".into()))
+        );
+        options
+            .headers
+            .insert("X-Goog-Api-Key".into(), "override".into());
         let auth = UploadAuth::for_request(&options, None, Some("fallback"));
-        assert!(auth.headers.contains(&("x-goog-api-key".into(), "override".into())));
+        assert!(
+            auth.headers
+                .contains(&("x-goog-api-key".into(), "override".into()))
+        );
         assert!(!auth.headers.iter().any(|(_, value)| value == "fallback"));
     }
 
     #[test]
     fn small_requests_do_not_create_file_resources() {
-        assert!(staging_plan(&media_body(b"abc"), StagingPolicy::default()).unwrap().is_empty());
+        assert!(
+            staging_plan(&media_body(b"abc"), StagingPolicy::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1024,11 +1105,15 @@ mod tests {
                 "inlineData": {"mimeType": "audio/wav", "data": "cccccccccccccccc"}
             }}}
         ]}]});
-        let plan = staging_plan(&body, StagingPolicy {
-            inline_part_bytes: 100,
-            inline_total_bytes: 5,
-            ..StagingPolicy::default()
-        }).unwrap();
+        let plan = staging_plan(
+            &body,
+            StagingPolicy {
+                inline_part_bytes: 100,
+                inline_total_bytes: 5,
+                ..StagingPolicy::default()
+            },
+        )
+        .unwrap();
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].pointer, "/contents/0/parts/0");
     }
@@ -1039,7 +1124,9 @@ mod tests {
             json!({"inlineData": {"data": "YQ=="}, "inline_data": {"data": "Yg=="}}),
             json!({"inlineData": {"data": "YQ=="}, "fileData": {"fileUri": "elsewhere"}}),
         ] {
-            assert!(staging_plan(&json!({"contents": [{"parts": [part]}]}), cache().policy).is_err());
+            assert!(
+                staging_plan(&json!({"contents": [{"parts": [part]}]}), cache().policy).is_err()
+            );
         }
     }
 
@@ -1050,7 +1137,13 @@ mod tests {
         assert!(decode_media("not-base64!").is_err());
         assert!(valid_mime("audio/x-wav"));
         assert!(valid_mime("application/pdf"));
-        for mime in ["audio", "/wav", "audio/", "audio/wav\r\nX-Key: x", "audio/a/b"] {
+        for mime in [
+            "audio",
+            "/wav",
+            "audio/",
+            "audio/wav\r\nX-Key: x",
+            "audio/a/b",
+        ] {
             assert!(!valid_mime(mime));
         }
     }
@@ -1069,7 +1162,10 @@ mod tests {
         ] {
             let mut value = good.clone();
             value[field] = bad;
-            assert!(RemoteFile::parse(&value, &endpoint, "audio/wav", 3).is_err(), "{field}");
+            assert!(
+                RemoteFile::parse(&value, &endpoint, "audio/wav", 3).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -1099,36 +1195,64 @@ mod tests {
 
     #[test]
     fn upload_reuses_content_across_parts_and_turns_and_keeps_other_fields() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 4)})),
-            Reply::json(file_metadata(endpoint, "one", "ACTIVE", 4)),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 4)})),
+                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 4)),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("key-a");
         let original = media_body(&[0, 255, 128, 42]);
         let mut body = original.clone();
         let duplicate = body["contents"][0]["parts"][1].clone();
-        body["contents"][0]["parts"].as_array_mut().unwrap().push(duplicate);
+        body["contents"][0]["parts"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
         run_async(async {
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
             let mut next_turn = original.clone();
-            stage(&cache, &client, &server.endpoint, &auth, &mut next_turn).await.unwrap();
-            assert_eq!(body["contents"][0]["parts"][1], next_turn["contents"][0]["parts"][1]);
+            stage(&cache, &client, &server.endpoint, &auth, &mut next_turn)
+                .await
+                .unwrap();
+            assert_eq!(
+                body["contents"][0]["parts"][1],
+                next_turn["contents"][0]["parts"][1]
+            );
         });
-        assert_eq!(body["contents"][0]["parts"][1], body["contents"][0]["parts"][2]);
-        assert_eq!(body["contents"][0]["parts"][1]["thoughtSignature"], "keep-this-field");
+        assert_eq!(
+            body["contents"][0]["parts"][1],
+            body["contents"][0]["parts"][2]
+        );
+        assert_eq!(
+            body["contents"][0]["parts"][1]["thoughtSignature"],
+            "keep-this-field"
+        );
         assert!(body["contents"][0]["parts"][1].get("inlineData").is_none());
-        assert!(original["contents"][0]["parts"][1].get("inlineData").is_some());
+        assert!(
+            original["contents"][0]["parts"][1]
+                .get("inlineData")
+                .is_some()
+        );
         let requests = server.finish();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0].method, "POST");
         assert_eq!(requests[0].path, "/upload/v1beta/files");
         assert_eq!(requests[0].headers["x-goog-api-key"], "key-a");
-        assert_eq!(requests[0].headers["x-goog-upload-header-content-length"], "4");
+        assert_eq!(
+            requests[0].headers["x-goog-upload-header-content-length"],
+            "4"
+        );
         assert_eq!(requests[1].body, [0, 255, 128, 42]);
-        assert_eq!(requests[1].headers["x-goog-upload-command"], "upload, finalize");
+        assert_eq!(
+            requests[1].headers["x-goog-upload-command"],
+            "upload, finalize"
+        );
         assert_eq!(requests[1].headers["x-goog-upload-offset"], "0");
         assert!(!requests[1].headers.contains_key("x-goog-api-key"));
         assert!(!requests[1].headers.contains_key("authorization"));
@@ -1138,28 +1262,46 @@ mod tests {
 
     #[test]
     fn processing_upload_is_not_exposed_until_active() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "one", "PROCESSING", 3)})),
-            Reply::json(file_metadata(endpoint, "one", "PROCESSING", 3)),
-            Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "one", "PROCESSING", 3)})),
+                Reply::json(file_metadata(endpoint, "one", "PROCESSING", 3)),
+                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
+            ]
+        });
         let mut body = media_body(b"abc");
-        run_async(stage(&cache(), &Client::new(), &server.endpoint, &auth("a"), &mut body)).unwrap();
+        run_async(stage(
+            &cache(),
+            &Client::new(),
+            &server.endpoint,
+            &auth("a"),
+            &mut body,
+        ))
+        .unwrap();
         assert!(body["contents"][0]["parts"][1].get("fileData").is_some());
         assert_eq!(server.finish().len(), 4);
     }
 
     #[test]
     fn failed_processing_does_not_replace_inline_media_or_start_generation() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "one", "FAILED", 3)})),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "one", "FAILED", 3)})),
+            ]
+        });
         let original = media_body(b"abc");
         let mut body = original.clone();
-        let error = run_async(stage(&cache(), &Client::new(), &server.endpoint, &auth("a"), &mut body))
-            .unwrap_err().to_string();
+        let error = run_async(stage(
+            &cache(),
+            &Client::new(),
+            &server.endpoint,
+            &auth("a"),
+            &mut body,
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("processing failed"), "{error}");
         assert_eq!(body, original);
         assert_eq!(server.finish().len(), 2);
@@ -1167,32 +1309,45 @@ mod tests {
 
     #[test]
     fn deleted_remote_file_is_reuploaded_on_the_next_turn() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
-            Reply::status(404),
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "old", "ACTIVE", 3)})),
+                Reply::status(404),
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("a");
         let mut body = media_body(b"abc");
         run_async(async {
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
             body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
         });
-        assert!(body["contents"][0]["parts"][1]["fileData"]["fileUri"].as_str().unwrap().ends_with("/new"));
+        assert!(
+            body["contents"][0]["parts"][1]["fileData"]["fileUri"]
+                .as_str()
+                .unwrap()
+                .ends_with("/new")
+        );
         assert_eq!(server.finish().len(), 5);
     }
 
     #[test]
     fn expired_cache_entry_is_reuploaded_without_using_the_stale_uri() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "new", "ACTIVE", 3)})),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("a");
@@ -1203,11 +1358,16 @@ mod tests {
             let slot = cache.slot(key).unwrap();
             let mut old = RemoteFile::parse(
                 &file_metadata(&server.endpoint, "old", "ACTIVE", 3),
-                &server.endpoint, "audio/wav", 3,
-            ).unwrap();
+                &server.endpoint,
+                "audio/wav",
+                3,
+            )
+            .unwrap();
             old.expires_at = Utc::now() - chrono::Duration::seconds(1);
             *slot.lock(owner.cx()).await.unwrap() = Some(old);
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
         });
         let requests = server.finish();
         assert_eq!(requests.len(), 2);
@@ -1216,11 +1376,13 @@ mod tests {
 
     #[test]
     fn concurrent_requests_upload_identical_content_only_once() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
-            Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
+                Reply::json(file_metadata(endpoint, "one", "ACTIVE", 3)),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("a");
@@ -1237,24 +1399,36 @@ mod tests {
         assert_eq!(left, right);
         let requests = server.finish();
         assert_eq!(requests.len(), 3);
-        assert_eq!(requests.iter().filter(|request| request.method == "POST").count(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == "POST")
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn changed_credentials_never_reuse_another_projects_file() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "project-a", "ACTIVE", 3)})),
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "project-b", "ACTIVE", 3)})),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "project-a", "ACTIVE", 3)})),
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "project-b", "ACTIVE", 3)})),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         run_async(async {
             let mut body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth("key-a"), &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth("key-a"), &mut body)
+                .await
+                .unwrap();
             let mut body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth("key-b"), &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth("key-b"), &mut body)
+                .await
+                .unwrap();
         });
         let requests = server.finish();
         assert_eq!(requests.len(), 4);
@@ -1264,19 +1438,25 @@ mod tests {
 
     #[test]
     fn authorization_errors_do_not_trigger_duplicate_uploads() {
-        let server = Server::start(|endpoint| vec![
-            Reply::start(endpoint),
-            Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
-            Reply::status(403),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![
+                Reply::start(endpoint),
+                Reply::json(json!({"file": file_metadata(endpoint, "one", "ACTIVE", 3)})),
+                Reply::status(403),
+            ]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("a");
         let error = run_async(async {
             let mut body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
             let mut body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap_err()
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap_err()
         });
         assert!(error.to_string().contains("HTTP 403"));
         assert_eq!(server.finish().len(), 3);
@@ -1284,14 +1464,26 @@ mod tests {
 
     #[test]
     fn unsafe_upload_url_is_rejected_before_sending_file_bytes() {
-        let server = Server::start(|_| vec![Reply {
-            status: 200,
-            headers: vec![("x-goog-upload-url".into(), "https://attacker.test/upload/v1beta/files?upload_id=secret".into())],
-            body: b"{}".to_vec(),
-        }]);
+        let server = Server::start(|_| {
+            vec![Reply {
+                status: 200,
+                headers: vec![(
+                    "x-goog-upload-url".into(),
+                    "https://attacker.test/upload/v1beta/files?upload_id=secret".into(),
+                )],
+                body: b"{}".to_vec(),
+            }]
+        });
         let mut body = media_body(b"abc");
-        let error = run_async(stage(&cache(), &Client::new(), &server.endpoint, &auth("a"), &mut body))
-            .unwrap_err().to_string();
+        let error = run_async(stage(
+            &cache(),
+            &Client::new(),
+            &server.endpoint,
+            &auth("a"),
+            &mut body,
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("off-origin"));
         assert!(!error.contains("secret"));
         assert!(body["contents"][0]["parts"][1].get("inlineData").is_some());
@@ -1315,7 +1507,10 @@ mod tests {
             let cache = cache();
             let mut body = media_body(b"abc");
             let plan = staging_plan(&body, cache.policy).unwrap();
-            let error = cache.prepare_inner(&context, &mut body, plan).await.unwrap_err();
+            let error = cache
+                .prepare_inner(&context, &mut body, plan)
+                .await
+                .unwrap_err();
             assert!(error.to_string().contains("cancelled"));
             assert!(cache.state.lock().unwrap().entries.is_empty());
         });
@@ -1326,7 +1521,13 @@ mod tests {
         let cache = cache();
         let original = media_body(b"abc");
         let mut body = original.clone();
-        run_async(cache.prepare(&Client::new(), "https://gateway.example/v1beta", &auth("a"), &mut body)).unwrap();
+        run_async(cache.prepare(
+            &Client::new(),
+            "https://gateway.example/v1beta",
+            &auth("a"),
+            &mut body,
+        ))
+        .unwrap();
         assert_eq!(body, original);
         assert!(cache.state.lock().unwrap().entries.is_empty());
     }
@@ -1356,7 +1557,10 @@ mod tests {
                 .unwrap_err();
             assert!(error.to_string().contains("timed out"));
             assert_eq!(body, original);
-            assert!(held.is_none(), "deadline must not disturb the existing owner");
+            assert!(
+                held.is_none(),
+                "deadline must not disturb the existing owner"
+            );
             drop(held);
             assert!(slot.lock(owner.cx()).await.unwrap().is_none());
         });
@@ -1364,9 +1568,11 @@ mod tests {
 
     #[test]
     fn previously_processing_upload_resumes_without_reupload() {
-        let server = Server::start(|endpoint| vec![
-            Reply::json(file_metadata(endpoint, "existing", "ACTIVE", 3)),
-        ]);
+        let server = Server::start(|endpoint| {
+            vec![Reply::json(file_metadata(
+                endpoint, "existing", "ACTIVE", 3,
+            ))]
+        });
         let cache = cache();
         let client = Client::new();
         let auth = auth("a");
@@ -1379,10 +1585,13 @@ mod tests {
                 &server.endpoint,
                 "audio/wav",
                 3,
-            ).unwrap();
+            )
+            .unwrap();
             *slot.lock(owner.cx()).await.unwrap() = Some(processing);
             let mut body = media_body(b"abc");
-            stage(&cache, &client, &server.endpoint, &auth, &mut body).await.unwrap();
+            stage(&cache, &client, &server.endpoint, &auth, &mut body)
+                .await
+                .unwrap();
         });
         let requests = server.finish();
         assert_eq!(requests.len(), 1);

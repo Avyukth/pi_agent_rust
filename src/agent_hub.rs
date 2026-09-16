@@ -369,7 +369,10 @@ impl AgentHubRegistry {
             )));
         }
         let original_task = self.original_tasks.get(from_id).cloned().ok_or_else(|| {
-            Error::tool("hub", "complete original assignment unavailable; refusing partial revival")
+            Error::tool(
+                "hub",
+                "complete original assignment unavailable; refusing partial revival",
+            )
         })?;
         let tail = read_transcript_tail(&prior.transcript_path, REVIVE_TRANSCRIPT_BUDGET)?;
         let mut vault = crate::secrets::SecretVault::default();
@@ -472,12 +475,21 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
 }
 
 fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
-    let file = fs::File::open(path)
-        .map_err(|e| Error::tool("hub", format!("open draining queue {}: {e}", path.display())))?;
+    let file = fs::File::open(path).map_err(|e| {
+        Error::tool(
+            "hub",
+            format!("open draining queue {}: {e}", path.display()),
+        )
+    })?;
     let mut raw = String::new();
     file.take(MAX_STEER_QUEUE_BYTES + 1)
         .read_to_string(&mut raw)
-        .map_err(|e| Error::tool("hub", format!("read draining queue {}: {e}", path.display())))?;
+        .map_err(|e| {
+            Error::tool(
+                "hub",
+                format!("read draining queue {}: {e}", path.display()),
+            )
+        })?;
     if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_STEER_QUEUE_BYTES {
         return Err(Error::tool(
             "hub",
@@ -493,7 +505,10 @@ fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
             let message: BusMessage = serde_json::from_str(line).map_err(|_| {
                 Error::tool(
                     "hub",
-                    format!("invalid steering frame at line {}; batch retained", index + 1),
+                    format!(
+                        "invalid steering frame at line {}; batch retained",
+                        index + 1
+                    ),
                 )
             })?;
             Ok(format!("[hub:{}] {}", message.from, message.body))
@@ -642,7 +657,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("hub directory");
         let mut reg = fresh_registry();
         reg.set_dir_for_tests(temp.path().to_path_buf());
-        let original = format!("{}FINAL REQUIREMENT: preserve all data", "step; ".repeat(200));
+        let original = format!(
+            "{}FINAL REQUIREMENT: preserve all data",
+            "step; ".repeat(200)
+        );
         let child = reg.register("worker", &original).expect("register");
         assert_eq!(child.task.chars().count(), 500, "roster stays bounded");
         reg.append_transcript(&child.id, "first progress");
@@ -666,7 +684,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("hub directory");
         let mut reg = fresh_registry();
         reg.set_dir_for_tests(temp.path().to_path_buf());
-        let child = reg.register("worker", "complete assignment").expect("register");
+        let child = reg
+            .register("worker", "complete assignment")
+            .expect("register");
         fs::create_dir(&child.transcript_path).expect("unreadable transcript fixture");
         reg.settle(&child.id, ChildStatus::Failed);
         assert!(reg.revive(&child.id).is_err());
@@ -694,7 +714,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("hub directory");
         let path = temp.path().join("large.transcript.jsonl");
         let mut file = fs::File::create(&path).expect("transcript");
-        file.write_all(&[0xff]).expect("invalid UTF-8 in old prefix");
+        file.write_all(&[0xff])
+            .expect("invalid UTF-8 in old prefix");
         file.set_len(16 * 1024 * 1024).expect("sparse transcript");
         file.seek(SeekFrom::End(0)).expect("end");
         file.write_all(b"latest progress\n").expect("tail");
@@ -787,7 +808,8 @@ mod tests {
         reg.steer(&child.id, "parent", "first").expect("send first");
         let draining = child.steer_path.with_extension("draining");
         fs::rename(&child.steer_path, &draining).expect("simulate interrupted drain");
-        reg.steer(&child.id, "parent", "second").expect("send second");
+        reg.steer(&child.id, "parent", "second")
+            .expect("send second");
         assert_eq!(
             drain_steer_file(&child.steer_path),
             vec!["[hub:parent] first"]
@@ -817,7 +839,11 @@ mod tests {
         assert!(drain_steer_file(&child.steer_path).is_empty());
         let draining = child.steer_path.with_extension("draining");
         assert!(draining.exists(), "failed batch must remain recoverable");
-        assert!(fs::read(&draining).expect("retained batch").starts_with(&original));
+        assert!(
+            fs::read(&draining)
+                .expect("retained batch")
+                .starts_with(&original)
+        );
         fs::write(&draining, original).expect("repair fixture");
         assert_eq!(
             drain_steer_file(&child.steer_path),
