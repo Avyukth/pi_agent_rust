@@ -29,6 +29,9 @@ use futures::stream::{self, Stream};
 use std::collections::VecDeque;
 use std::pin::Pin;
 
+#[cfg(test)]
+mod tests_transport;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -161,16 +164,20 @@ impl VertexProvider {
         let method = if self.publisher == "anthropic" {
             "streamRawPredict"
         } else {
-            "streamGenerateContent"
+            "streamGenerateContent?alt=sse"
+        };
+        // Global requests use the unprefixed host, not the non-existent
+        // global-aiplatform.googleapis.com endpoint.
+        let host = if location == "global" {
+            "aiplatform.googleapis.com".to_string()
+        } else {
+            format!("{location}-aiplatform.googleapis.com")
         };
 
         format!(
-            "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{method}",
-            location = location,
-            project = project,
+            "https://{host}/v1/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{method}",
             publisher = self.publisher,
             model = self.model,
-            method = method,
         )
     }
 
@@ -252,47 +259,47 @@ impl Provider for VertexProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        // Resolve auth: Bearer token for Vertex AI.
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("GOOGLE_CLOUD_API_KEY").ok())
-            .or_else(|| std::env::var("VERTEX_API_KEY").ok())
-            .ok_or_else(|| {
-                Error::provider(
-                    "google-vertex",
-                    "Missing Vertex AI API key / access token. \
-                     Set GOOGLE_CLOUD_API_KEY or VERTEX_API_KEY.",
-                )
-            })?;
-
+        // Select the protocol before dispatch. An unknown publisher must not
+        // receive a Gemini request with the user's Google credentials.
+        if !matches!(self.publisher.as_str(), "google" | "anthropic") {
+            return Err(Error::provider(self.name(), "Unsupported Vertex AI publisher"));
+        }
+        let authorization = vertex_authorization(options, self.compat.as_ref(), |name| {
+            std::env::var(name).ok()
+        })?;
         let project = self.resolve_project()?;
         let location = self.resolve_location();
         let url = self.streaming_url(&project, &location);
 
-        // Build request body in Gemini format (Google-native models).
+        if self.publisher == "anthropic" {
+            let provider = super::anthropic::AnthropicProvider::new(self.model.clone())
+                .with_provider_name(self.name())
+                .with_base_url(url)
+                .with_client(self.client.clone())
+                .with_compat(self.compat.clone());
+            return Box::pin(provider.stream_vertex(context, options, &authorization)).await;
+        }
+
+        // Google-native models retain their Gemini request and stream parser.
         let request_body = self.build_gemini_request(context, options);
-
-        // Build HTTP request with Bearer auth.
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .header("Authorization", format!("Bearer {auth_value}"));
-
-        // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat
-            && let Some(custom_headers) = &compat.custom_headers
+        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
+        if let Some(headers) = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.custom_headers.as_ref())
         {
-            for (key, value) in custom_headers {
-                request = request.header(key, value);
-            }
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                headers,
+                &["authorization"],
+            );
         }
-
-        // Per-request headers from `StreamOptions` (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
+        request = request.header("Authorization", authorization);
 
         let rewritten_body = super::offer_before_provider_request(
             options,
@@ -629,6 +636,46 @@ where
     }
 }
 
+/// Resolve only Google-scoped credentials, with case-insensitive non-empty
+/// request headers taking precedence over compatibility headers and tokens.
+fn vertex_authorization(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let explicit = super::first_non_empty_header_value_case_insensitive(
+        &options.headers,
+        &["authorization"],
+    )
+    .or_else(|| {
+        compat
+            .and_then(|compat| compat.custom_headers.as_ref())
+            .and_then(|headers| {
+                super::first_non_empty_header_value_case_insensitive(headers, &["authorization"])
+            })
+    });
+    if let Some(authorization) = explicit {
+        return Ok(authorization);
+    }
+    let non_empty = |value: String| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let token = options
+        .api_key
+        .clone()
+        .and_then(non_empty)
+        .or_else(|| env_lookup("GOOGLE_CLOUD_API_KEY").and_then(non_empty))
+        .or_else(|| env_lookup("VERTEX_API_KEY").and_then(non_empty))
+        .ok_or_else(|| {
+            Error::provider(
+                "google-vertex",
+                "Missing Vertex AI access token. Configure Google credentials, an Authorization header, or GOOGLE_CLOUD_API_KEY / VERTEX_API_KEY.",
+            )
+        })?;
+    Ok(format!("Bearer {token}"))
+}
+
 // ============================================================================
 // Vertex Runtime Resolution (similar to Azure runtime resolution)
 // ============================================================================
@@ -691,19 +738,18 @@ fn parse_vertex_base_url(base_url: &str) -> (Option<String>, Option<String>, Opt
         return (None, None, None);
     }
 
-    // Extract location from hostname: "{location}-aiplatform.googleapis.com"
-    let location_from_host = base_url
-        .strip_prefix("https://")
-        .or_else(|| base_url.strip_prefix("http://"))
-        .and_then(|rest| rest.split('-').next())
-        .and_then(|loc| {
-            // Validate it looks like a region (e.g. "us", "europe", "asia").
-            if loc.chars().all(|c| c.is_ascii_lowercase() || c == '-') && !loc.is_empty() {
-                Some(loc.to_string())
-            } else {
-                None
-            }
-        });
+    // Keep the complete region (us-east5, not just us), and never infer a
+    // location from an unrelated custom hostname. Explicit path fields below
+    // still take precedence over this host-derived fallback.
+    let location_from_host = url::Url::parse(base_url).ok().and_then(|url| {
+        let host = url.host_str()?;
+        if host == "aiplatform.googleapis.com" {
+            return Some("global".to_string());
+        }
+        host.strip_suffix("-aiplatform.googleapis.com")
+            .filter(|location| !location.is_empty())
+            .map(ToString::to_string)
+    });
 
     // Extract project, location, publisher from path segments.
     let path_segments: Vec<&str> = base_url.split('/').collect();
@@ -760,7 +806,7 @@ mod tests {
         let url = provider.streaming_url("my-project", "us-central1");
         assert_eq!(
             url,
-            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent"
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash:streamGenerateContent?alt=sse"
         );
     }
 

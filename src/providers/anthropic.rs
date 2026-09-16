@@ -15,13 +15,14 @@ use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef}
 use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::stream::{self, Stream};
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::pin::Pin;
+
+mod transport;
 
 // ============================================================================
 // Constants
@@ -787,93 +788,12 @@ impl Provider for AnthropicProvider {
             ));
         }
 
-        // Create SSE stream for streaming responses.
-        let event_source = SseStream::new(response.bytes_stream());
-
-        // Create stream state
-        let model = self.model.clone();
-        let api = self.api().to_string();
-        let provider = self.name().to_string();
-
-        let stream = stream::unfold(
-            StreamState::new(event_source, model, api, provider),
-            |mut state| async move {
-                if state.done {
-                    return None;
-                }
-                loop {
-                    match state.event_source.next().await {
-                        Some(Ok(msg)) => {
-                            state.transient_error_count = 0;
-                            if msg.event == "ping" {
-                                // Skip ping events
-                            } else {
-                                match state.process_event(&msg.data) {
-                                    Ok(Some(event)) => {
-                                        if matches!(
-                                            &event,
-                                            StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                                        ) {
-                                            state.done = true;
-                                        }
-                                        return Some((Ok(event), state));
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        state.done = true;
-                                        return Some((Err(e), state));
-                                    }
-                                }
-                            }
-                        }
-                        Some(Err(e)) => {
-                            // WriteZero, WouldBlock, and TimedOut errors are transient (e.g. empty SSE
-                            // frames when TLS buffers are full). Skip them and
-                            // keep reading, but cap consecutive occurrences to
-                            // avoid infinite loops.
-                            const MAX_CONSECUTIVE_TRANSIENT_ERRORS: usize = 5;
-                            if e.kind() == std::io::ErrorKind::WriteZero
-                                || e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut
-                            {
-                                state.transient_error_count += 1;
-                                if state.transient_error_count <= MAX_CONSECUTIVE_TRANSIENT_ERRORS {
-                                    tracing::warn!(
-                                        kind = ?e.kind(),
-                                        count = state.transient_error_count,
-                                        "Transient error in SSE stream, continuing"
-                                    );
-                                    continue;
-                                }
-                                tracing::warn!(
-                                    kind = ?e.kind(),
-                                    "Error persisted after {MAX_CONSECUTIVE_TRANSIENT_ERRORS} \
-                                     consecutive attempts, treating as fatal"
-                                );
-                            }
-                            state.done = true;
-                            let err = Error::sse(&e);
-                            return Some((Err(err), state));
-                        }
-                        // A clean transport EOF is not a successful Anthropic
-                        // completion unless message_stop was observed. Return a
-                        // retry-classifiable error; the agent loop retains the
-                        // partial message while marking the turn as failed.
-                        None => {
-                            state.done = true;
-                            return Some((
-                                Err(Error::api(
-                                    "Anthropic stream ended before message_stop (unexpected EOF)",
-                                )),
-                                state,
-                            ));
-                        }
-                    }
-                }
-            },
-        );
-
-        Ok(Box::pin(stream))
+        Ok(transport::response_stream(
+            response,
+            self.model.clone(),
+            self.api().to_string(),
+            self.name().to_string(),
+        ))
     }
 }
 
