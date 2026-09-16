@@ -7,7 +7,7 @@ use asupersync::runtime::RuntimeBuilder;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
@@ -54,11 +54,39 @@ impl WireServer {
                     }
                 };
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .set_read_timeout(Some(Duration::from_millis(250)))
                     .unwrap();
                 socket
                     .set_write_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
+                // The socket timeout above is the POLLING interval; this is the
+                // budget. A read that times out means "nothing yet" and must
+                // not be fatal — macOS surfaces it as EAGAIN/WouldBlock, so
+                // `read().expect(..)` failed the test outright whenever a
+                // client had merely not been scheduled within three seconds,
+                // which is common under the full lib suite. The accept loop
+                // above has always been patient this way; the reads were not
+                // (bd-eg6ng).
+                let read_deadline = Instant::now() + Duration::from_secs(30);
+                let read_patiently = |socket: &mut TcpStream, chunk: &mut [u8], what: &str| {
+                    loop {
+                        match socket.read(chunk) {
+                            Ok(count) => return count,
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                assert!(
+                                    Instant::now() < read_deadline,
+                                    "fixture timed out waiting for {what}"
+                                );
+                            }
+                            Err(error) => panic!("{what}: {error}"),
+                        }
+                    }
+                };
                 let mut bytes = Vec::new();
                 let mut chunk = [0; 4096];
                 let header_end = loop {
@@ -66,7 +94,7 @@ impl WireServer {
                         break index + 4;
                     }
                     assert!(bytes.len() < 64 * 1024, "bounded headers");
-                    let count = socket.read(&mut chunk).expect("read headers");
+                    let count = read_patiently(&mut socket, &mut chunk, "read headers");
                     assert!(count > 0, "EOF before headers");
                     bytes.extend_from_slice(&chunk[..count]);
                 };
@@ -83,7 +111,7 @@ impl WireServer {
                 let length: usize = headers["content-length"].parse().unwrap();
                 assert!(length < 1024 * 1024, "bounded fixture body");
                 while bytes.len() - header_end < length {
-                    let count = socket.read(&mut chunk).expect("read body");
+                    let count = read_patiently(&mut socket, &mut chunk, "read body");
                     assert!(count > 0, "EOF before body");
                     bytes.extend_from_slice(&chunk[..count]);
                 }

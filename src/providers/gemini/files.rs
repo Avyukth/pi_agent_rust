@@ -842,13 +842,57 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// Wall-clock budget for one fixture request/response exchange.
+    ///
+    /// The socket read timeout below is the POLLING interval, not the budget:
+    /// a read that times out means "nothing yet", and the only thing that ends
+    /// the wait is this deadline (bd-eg6ng).
+    const FIXTURE_EXCHANGE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Read into `chunk`, treating a socket read timeout as "keep waiting"
+    /// until `deadline` rather than as a hard error.
+    ///
+    /// macOS surfaces a read timeout as EAGAIN/`WouldBlock` (errno 35), not
+    /// `TimedOut`, so `read().expect(..)` turned every slow exchange into
+    /// `request headers: Os { code: 35, kind: WouldBlock }`. Under the full lib
+    /// suite dozens of these fixtures run at once — each spins a listener
+    /// thread and its own current_thread runtime — and a client that has simply
+    /// not been scheduled yet routinely misses a three-second window. The
+    /// accept loop in `Server::start` has always been patient this way; the
+    /// reads were not (bd-eg6ng).
+    fn read_with_deadline(
+        stream: &mut TcpStream,
+        chunk: &mut [u8],
+        deadline: Instant,
+        what: &str,
+    ) -> usize {
+        loop {
+            match stream.read(chunk) {
+                Ok(count) => return count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for {what}"
+                    );
+                }
+                Err(error) => panic!("{what}: {error}"),
+            }
+        }
+    }
+
     fn read_request(stream: &mut TcpStream) -> CapturedRequest {
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_millis(250)))
             .unwrap();
         stream
             .set_write_timeout(Some(Duration::from_secs(3)))
             .unwrap();
+        let deadline = Instant::now() + FIXTURE_EXCHANGE_BUDGET;
         let mut data = Vec::new();
         let end = loop {
             if let Some(index) = data.windows(4).position(|part| part == b"\r\n\r\n") {
@@ -856,7 +900,7 @@ mod tests {
             }
             assert!(data.len() < 64 * 1024, "request headers bounded");
             let mut chunk = [0; 4096];
-            let count = stream.read(&mut chunk).expect("request headers");
+            let count = read_with_deadline(stream, &mut chunk, deadline, "request headers");
             assert!(count > 0, "request closed before headers");
             data.extend_from_slice(&chunk[..count]);
         };
@@ -878,7 +922,7 @@ mod tests {
         let mut body = data[end..].to_vec();
         while body.len() < length {
             let mut chunk = [0; 4096];
-            let count = stream.read(&mut chunk).expect("request body");
+            let count = read_with_deadline(stream, &mut chunk, deadline, "request body");
             assert!(count > 0, "request closed before body");
             body.extend_from_slice(&chunk[..count]);
         }
