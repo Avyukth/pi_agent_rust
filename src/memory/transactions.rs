@@ -93,7 +93,6 @@ mod tests {
             });
             assert!(result.unwrap_err().to_string().contains("audit failed"));
             assert_eq!(count(&conn), 0);
-            // Failure releases the transaction; the next mutation can commit.
             run(&conn, |conn| {
                 conn.execute_raw("INSERT INTO facts VALUES (2, 'retry')")
                     .unwrap();
@@ -131,5 +130,250 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use crate::memory::{MemoryEditOp, MemoryKind, MemoryStore, RetainTool};
+    use crate::tools::Tool as _;
+    use std::path::Path;
+    use std::sync::{Arc, Barrier};
+
+    fn store(root: &Path) -> MemoryStore {
+        // The entire real bank stays in a unique test directory, not global state.
+        MemoryStore {
+            db_path: root.join("bank.sqlite"),
+            project_key: "transaction-fixture".to_string(),
+            project_root: root.to_path_buf(),
+        }
+    }
+
+    fn break_audit_schema(bank: &MemoryStore) {
+        bank.with_conn(|conn| {
+            conn.execute_raw(
+                "ALTER TABLE memory_audit RENAME TO previous_audit; \
+                 CREATE TABLE memory_audit (wrong_column INTEGER)",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn audit_ops(bank: &MemoryStore, id: i64) -> Vec<String> {
+        bank.with_conn(|conn| {
+            let rows = conn
+                .query_sync(
+                    "SELECT op FROM memory_audit WHERE memory_id = ?1 ORDER BY id",
+                    &[fsqlite::SqliteValue::Integer(id)],
+                )
+                .unwrap();
+            rows.iter()
+                .map(|row| crate::memory::row_text(row, 0))
+                .collect()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_retain_audit_rolls_back_primary_and_fts_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        break_audit_schema(&bank);
+        let error = bank
+            .retain(MemoryKind::Fact, "uncommitted discovery", &[], None)
+            .unwrap_err();
+        assert!(error.to_string().contains("audit write failed"));
+        let reopened = store(dir.path());
+        assert!(reopened.list(10).unwrap().is_empty());
+        assert!(reopened.recall("discovery", None).unwrap().is_empty());
+        reopened
+            .with_conn(|conn| {
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) FROM memories_fts", &[])
+                    .unwrap();
+                assert_eq!(crate::memory::row_i64(&rows[0], 0)?, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_edit_audit_preserves_original_record_and_search_index() {
+        for operation in [
+            MemoryEditOp::Update,
+            MemoryEditOp::Invalidate,
+            MemoryEditOp::Forget,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let bank = store(dir.path());
+            let original = bank
+                .retain(MemoryKind::Fact, "original searchable fact", &[], None)
+                .unwrap();
+            break_audit_schema(&bank);
+            let error = bank
+                .edit(original.id, operation, Some("replacement wording"))
+                .unwrap_err();
+            assert!(error.to_string().contains("audit write failed"), "{error}");
+            let reopened = store(dir.path());
+            let listed = reopened.list(10).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].content, original.content);
+            assert_eq!(listed[0].status, "active");
+            assert_eq!(listed[0].updated_at_ms, original.updated_at_ms);
+            assert_eq!(reopened.recall("original", None).unwrap()[0].id, original.id);
+            assert!(reopened.recall("replacement", None).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn supersession_commits_a_linked_active_fact_and_keeps_auditable_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        let old = bank
+            .retain(MemoryKind::Fact, "parser uses legacy grammar", &[], None)
+            .unwrap();
+        let new = bank
+            .supersede(
+                old.id,
+                MemoryKind::Decision,
+                "parser uses modern grammar",
+                &[],
+                Some("session-b"),
+            )
+            .unwrap();
+        assert_ne!(new.id, old.id);
+        assert_eq!(new.supersedes, Some(old.id));
+        assert_eq!(new.session_id.as_deref(), Some("session-b"));
+        let reopened = store(dir.path());
+        let hits = reopened.recall("parser", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, new.id);
+        assert!(reopened.mental_model().unwrap().contains("modern grammar"));
+        assert!(!reopened.mental_model().unwrap().contains("legacy grammar"));
+        let history = reopened.list(10).unwrap();
+        assert!(history.iter().any(|row| row.id == old.id && row.status == "superseded"));
+        assert_eq!(audit_ops(&reopened, old.id), ["retain", "supersede"]);
+        assert_eq!(audit_ops(&reopened, new.id), ["retain"]);
+        let error = reopened
+            .supersede(old.id, MemoryKind::Fact, "stale competing replacement", &[], None)
+            .unwrap_err();
+        assert!(error.to_string().contains("PI_MEMORY_SUPERSESSION_CONFLICT"));
+        assert_eq!(reopened.list(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_supersession_does_not_tombstone_the_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        let old = bank
+            .retain(MemoryKind::Fact, "original parser", &[], None)
+            .unwrap();
+        break_audit_schema(&bank);
+        assert!(bank
+            .supersede(old.id, MemoryKind::Fact, "new parser", &[], None)
+            .is_err());
+        let reopened = store(dir.path());
+        let history = reopened.list(10).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].status, "active");
+        assert_eq!(reopened.recall("original", None).unwrap()[0].id, old.id);
+        assert!(reopened.recall("new", None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_store_instances_cannot_commit_duplicate_active_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        bank.list(1).unwrap();
+        let barrier = Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let other = store(dir.path());
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        other.retain(MemoryKind::Fact, "one durable fact", &[], None)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(error.to_string().contains("PI_MEMORY_DUPLICATE"), "{error}");
+        assert_eq!(bank.recall("durable", None).unwrap().len(), 1);
+        assert_eq!(bank.list(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_repairs_a_missing_legacy_index_without_creating_duplicate_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        let first = bank.retain(MemoryKind::Fact, "first fact", &[], None).unwrap();
+        bank.retain(MemoryKind::Fact, "second fact", &[], None).unwrap();
+        bank.with_conn(|conn| {
+            conn.execute_sync(
+                "DELETE FROM memories_fts WHERE rowid = ?1",
+                &[fsqlite::SqliteValue::Integer(first.id)],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        bank.edit(first.id, MemoryEditOp::Update, Some("repaired fact"))
+            .unwrap();
+        assert_eq!(bank.recall("repaired", None).unwrap()[0].id, first.id);
+        assert!(bank.edit(first.id, MemoryEditOp::Update, Some("second fact")).is_err());
+        assert_eq!(bank.recall("repaired", None).unwrap()[0].id, first.id);
+        assert!(bank.edit(first.id, MemoryEditOp::Update, Some("   ")).is_err());
+        assert_eq!(audit_ops(&bank, first.id), ["retain", "update"]);
+    }
+
+    #[test]
+    fn retain_tool_supersedes_and_screens_tags_before_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = Arc::new(store(dir.path()));
+        let old = bank.retain(MemoryKind::Fact, "old endpoint", &[], None).unwrap();
+        let tool = RetainTool::new(Arc::clone(&bank));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "call-a",
+                serde_json::json!({
+                    "content": "new endpoint", "supersedes": old.id,
+                    "tags": ["sk-abcdefghijklmnopqrstuvwxyz"]
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(!output.is_error);
+        let details = output.details.unwrap();
+        assert_eq!(details["supersedes"], old.id);
+        assert_eq!(details["tags"][0], "[REDACTED_OPENAI_KEY]");
+        assert!(!serde_json::to_string(&bank.list(10).unwrap())
+            .unwrap()
+            .contains("sk-abcdef"));
+    }
+
+    #[test]
+    fn oversized_latest_fact_does_not_hide_smaller_startup_memories() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        bank.retain(MemoryKind::Fact, "small useful fact", &[], None).unwrap();
+        bank.retain(MemoryKind::Fact, &"large".repeat(1000), &[], None).unwrap();
+        let model = bank.mental_model().unwrap();
+        assert!(model.contains("small useful fact"));
+        assert!(model.len() <= crate::memory::MENTAL_MODEL_BUDGET);
     }
 }
