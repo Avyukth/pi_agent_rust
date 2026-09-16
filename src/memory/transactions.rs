@@ -45,8 +45,9 @@ pub(super) fn run<T>(
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let result = action(conn)?;
-        conn.execute_raw("COMMIT")
-            .map_err(|error| Error::tool("memory", format!("commit transaction failed: {error}")))?;
+        conn.execute_raw("COMMIT").map_err(|error| {
+            Error::tool("memory", format!("commit transaction failed: {error}"))
+        })?;
         pending.committed = true;
         Ok(result)
     }));
