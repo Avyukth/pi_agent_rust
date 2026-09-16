@@ -16,7 +16,7 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::jobs::JobSessionScope;
 use crate::session_sqlite::SqliteConnection;
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use fsqlite::{Row, SqliteValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,6 +76,17 @@ fn validate_key(key: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn valid_revision(revision: &str) -> bool {
+    revision.len() == 32 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn conflict() -> Error {
+    failure(
+        "PI_SHARED_MEMORY_CONFLICT",
+        "The key changed or already exists; read it and retry with its current revision",
+    )
 }
 
 fn text(value: &str) -> SqliteValue {
@@ -188,6 +199,7 @@ impl SharedMemoryStore {
     /// only; another revision replaces only that exact version; `None` opts in
     /// to last-writer-wins. Every successful write creates a fresh revision,
     /// including identical content, preventing an ABA overwrite of newer work.
+    #[allow(clippy::too_many_lines)] // Keep reservation, preconditions and mutation adjacent.
     pub fn write(
         &self,
         key: &str,
@@ -198,10 +210,7 @@ impl SharedMemoryStore {
         if content.len() > MAX_VALUE_BYTES {
             return Err(failure("PI_SHARED_MEMORY_VALUE_LIMIT", "Shared values are limited to 65536 UTF-8 bytes"));
         }
-        if expected_revision.is_some_and(|revision| {
-            revision != "absent"
-                && (revision.len() != 32 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        }) {
+        if expected_revision.is_some_and(|revision| revision != "absent" && !valid_revision(revision)) {
             return Err(failure("PI_SHARED_MEMORY_INVALID_REVISION", "Use a returned revision or 'absent'"));
         }
         let bytes = i64::try_from(content.len()).map_err(|_| storage_error())?;
@@ -218,12 +227,7 @@ impl SharedMemoryStore {
                 Some("absent") => old.is_none(),
                 Some(expected) => old_revision.as_deref() == Some(expected),
             };
-            if !matches {
-                return Err(failure(
-                    "PI_SHARED_MEMORY_CONFLICT",
-                    "The key changed or already exists; read it and retry with its current revision",
-                ));
-            }
+            if !matches { return Err(conflict()); }
             let old_bytes = old.map(|row| integer_column(row, 1)).transpose()?.unwrap_or(0);
             check_quota(conn, Some(&self.session_id), old.is_none(), old_bytes, bytes)?;
             check_quota(conn, None, old.is_none(), old_bytes, bytes)?;
@@ -246,6 +250,29 @@ impl SharedMemoryStore {
                 ).map_err(|_| storage_error())?;
             }
             Ok(SharedMemoryVersion { key: key.to_string(), revision, bytes: content.len(), updated_at_ms })
+        }))
+    }
+
+    /// Explicit host cleanup: remove only the observed version of a key in
+    /// this session. No automatic eviction or cross-session garbage collection.
+    /// Returns false for an absent key; a different live revision is a conflict.
+    pub fn remove(&self, key: &str, expected_revision: &str) -> Result<bool> {
+        validate_key(key)?;
+        if !valid_revision(expected_revision) {
+            return Err(failure("PI_SHARED_MEMORY_INVALID_REVISION", "Removal requires the observed revision"));
+        }
+        self.with_conn(|conn| super::transactions::run(conn, |conn| {
+            let rows = conn.query_sync(
+                "SELECT revision FROM pi_shared_memory WHERE session_id = ?1 AND memory_key = ?2",
+                &[text(&self.session_id), text(key)],
+            ).map_err(|_| storage_error())?;
+            let Some(row) = rows.first() else { return Ok(false); };
+            if string_column(row, 0)? != expected_revision { return Err(conflict()); }
+            conn.execute_sync(
+                "DELETE FROM pi_shared_memory WHERE session_id = ?1 AND memory_key = ?2",
+                &[text(&self.session_id), text(key)],
+            ).map_err(|_| storage_error())?;
+            Ok(true)
         }))
     }
 
@@ -316,7 +343,7 @@ fn check_quota(
     let count = integer_column(row, 0)?;
     let used = integer_column(row, 1)?;
     if used < previous_bytes
-        || count.saturating_add(i64::from(creates_key)) > max_keys
+        || count.saturating_add(if creates_key { 1 } else { 0 }) > max_keys
         || used.saturating_sub(previous_bytes).saturating_add(next_bytes) > max_bytes
     {
         return Err(failure(
@@ -336,18 +363,26 @@ pub(super) fn session_requested(input: &Value) -> Result<bool> {
     }
 }
 
+fn invalid_input() -> Error {
+    failure("PI_SHARED_MEMORY_INVALID_INPUT", "Invalid shared-memory arguments; session identity is host-controlled")
+}
+
 fn scoped_input(mut input: Value) -> Result<Value> {
     if input.get("scope").is_some() && !session_requested(&input)? {
         return Err(failure("PI_SHARED_MEMORY_INVALID_SCOPE", "This operation requires session scope"));
     }
+    // Optional means absent, not a null value that silently weakens a write
+    // precondition or turns a read into a list when called outside validation.
+    for key in ["key", "expectedRevision", "prefix", "after"] {
+        if input.get(key).is_some_and(|value| !value.is_string()) { return Err(invalid_input()); }
+    }
+    if input.get("limit").is_some_and(|value| value.as_u64().is_none()) { return Err(invalid_input()); }
     if let Some(object) = input.as_object_mut() { object.remove("scope"); }
     Ok(input)
 }
 
 fn parse_input<T: serde::de::DeserializeOwned>(input: Value) -> Result<T> {
-    serde_json::from_value(scoped_input(input)?).map_err(|_| {
-        failure("PI_SHARED_MEMORY_INVALID_INPUT", "Invalid shared-memory arguments; session identity is host-controlled")
-    })
+    serde_json::from_value(scoped_input(input)?).map_err(|_| invalid_input())
 }
 
 async fn bound_store(bank: &Arc<MemoryStore>, scope: Option<&JobSessionScope>) -> Result<SharedMemoryStore> {
@@ -455,6 +490,27 @@ impl SharedMemoryTool {
     }
 }
 
+impl ToolRegistry {
+    /// Install all three native shared-memory tools in this registry. They
+    /// inherit its live session binding, including later session changes.
+    /// Collision preflight leaves the registry unchanged rather than shadowing
+    /// an existing or temporarily inactive extension tool.
+    pub fn enable_shared_memory(&mut self, bank: Arc<MemoryStore>) -> Result<()> {
+        for name in ["read_memory", "write_memory", "list_memory"] {
+            if self.get(name).is_some() || self.inactive_tools().iter().any(|tool| tool.name() == name) {
+                return Err(failure("PI_SHARED_MEMORY_TOOL_COLLISION", "A shared-memory tool name is already registered"));
+            }
+        }
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(SharedMemoryTool::read(Arc::clone(&bank))),
+            Box::new(SharedMemoryTool::write(Arc::clone(&bank))),
+            Box::new(SharedMemoryTool::list(bank)),
+        ];
+        self.extend(tools);
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for SharedMemoryTool {
@@ -488,7 +544,7 @@ impl Tool for SharedMemoryTool {
     async fn execute(&self, _id: &str, input: Value, _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput> {
         match self.operation {
             Operation::Write => write_output(&self.bank, self.scope.as_ref(), input).await,
-            Operation::Read if input.get("key").is_none() => Err(failure("PI_SHARED_MEMORY_INVALID_INPUT", "read_memory requires key")),
+            Operation::Read if input.get("key").and_then(Value::as_str).is_none() => Err(failure("PI_SHARED_MEMORY_INVALID_INPUT", "read_memory requires key")),
             Operation::List if input.get("key").is_some() => Err(failure("PI_SHARED_MEMORY_INVALID_INPUT", "list_memory does not accept key")),
             _ => read_or_list_output(&self.bank, self.scope.as_ref(), input).await,
         }
