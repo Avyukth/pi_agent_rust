@@ -7,14 +7,15 @@
 //! per child (`<id>.steer`); the child's print-mode loop drains that file
 //! through a steering [`crate::agent::MessageFetcher`] between turns. The
 //! parent's in-memory registry is the roster of record; the on-disk queue
-//! files are the delivery mechanism.
+//! files are the delivery mechanism. Writers and readers coordinate through
+//! a stable sidecar lock, including recovery of interrupted draining batches.
 //!
 //! NTM layer distinction: this hub manages pi's OWN spawned children in this
 //! process. It does not rebuild ntm's cross-tmux fleet orchestration.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -28,6 +29,9 @@ const TRANSCRIPT_PAGE_BYTES: usize = 32 * 1024;
 const REVIVE_TRANSCRIPT_BUDGET: usize = 16 * 1024;
 /// Maximum queued steering messages retained per child in memory.
 const MAX_QUEUE_PER_CHILD: usize = 64;
+/// Bound both a single serialized steering frame and the pending disk queue.
+const MAX_STEER_FRAME_BYTES: usize = 64 * 1024;
+const MAX_STEER_QUEUE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Lifecycle states for a registered child run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,8 +278,8 @@ impl AgentHubRegistry {
         Ok(masked)
     }
 
-    /// Queue a steering message for a running child: in-memory record +
-    /// append to the child's steer file (the cross-process channel).
+    /// Queue steering for a live child. Report it in the inbox only after
+    /// the cross-process queue has accepted the complete frame.
     pub fn steer(&mut self, id: &str, from: &str, body: &str) -> Result<BusMessage> {
         let entry = self
             .entries
@@ -289,8 +293,24 @@ impl AgentHubRegistry {
                 entry.status.as_str()
             )));
         }
-        let message = self.enqueue_bus(id, from, body);
+        let seq = self
+            .bus_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::validation("hub: steering sequence exhausted"))?;
+        let message = BusMessage {
+            seq,
+            from: from.to_string(),
+            to: id.to_string(),
+            body: body.to_string(),
+            sent_ms: now_ms(),
+        };
         append_steer_line(&entry.steer_path, &message)?;
+        self.bus_seq = seq;
+        let queue = self.bus.entry(id.to_string()).or_default();
+        if queue.len() >= MAX_QUEUE_PER_CHILD {
+            queue.pop_front();
+        }
+        queue.push_back(message.clone());
         Ok(message)
     }
 
@@ -306,23 +326,6 @@ impl AgentHubRegistry {
             .get(id)
             .map(|q| q.iter().cloned().collect())
             .unwrap_or_default()
-    }
-
-    fn enqueue_bus(&mut self, to: &str, from: &str, body: &str) -> BusMessage {
-        self.bus_seq = self.bus_seq.saturating_add(1);
-        let message = BusMessage {
-            seq: self.bus_seq,
-            from: from.to_string(),
-            to: to.to_string(),
-            body: body.to_string(),
-            sent_ms: now_ms(),
-        };
-        let queue = self.bus.entry(to.to_string()).or_default();
-        if queue.len() >= MAX_QUEUE_PER_CHILD {
-            queue.pop_front();
-        }
-        queue.push_back(message.clone());
-        message
     }
 
     /// Mark a child killed by the operator.
@@ -369,45 +372,152 @@ impl AgentHubRegistry {
     }
 }
 
-/// Append one steering frame to the child's queue file. The child drains the
-/// file between turns; each line is one JSON message.
-fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|e| Error::tool("hub", format!("append steer queue {}: {e}", path.display())))?;
-    let line = serde_json::to_string(message)
-        .map_err(|e| Error::validation(format!("serialize bus message: {e}")))?;
-    writeln!(file, "{line}")
-        .map_err(|e| Error::tool("hub", format!("write steer queue {}: {e}", path.display())))
+/// The lock inode must never be renamed with the queue: otherwise a writer
+/// that already opened the old inode could append after the reader deleted it.
+/// Opening read/write also permits native Windows file locking.
+fn open_steer_lock(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path.with_extension("steer.lock"))
 }
 
-/// Child-side drain: consume the steer file, returning queued bodies in
-/// delivery order. Called by the print-mode steering fetcher.
-pub fn drain_steer_file(path: &Path) -> Vec<String> {
-    // Rename-consume: read-then-truncate loses any line the parent appends
-    // between the read and the truncating write (the parent appends from a
-    // different process). rename is atomic, and a parent append racing the
-    // rename lands wholly in the old file (drained now) or a fresh steer
-    // file (drained next poll) — never destroyed.
-    let draining = path.with_extension("draining");
-    if fs::rename(path, &draining).is_err() {
-        // Nothing queued (file absent) or transient; retry next poll.
-        return Vec::new();
+/// Append a complete frame while holding the same stable lock as the reader.
+/// A reported write failure does not become an in-memory delivery receipt.
+fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
+    if message.body.len() > MAX_STEER_FRAME_BYTES {
+        return Err(Error::validation("hub: steering message exceeds 64 KiB"));
     }
-    let raw = fs::read_to_string(&draining).unwrap_or_default();
-    let _ = fs::remove_file(&draining);
-    if raw.is_empty() {
-        return Vec::new();
+    let mut line = serde_json::to_vec(message)
+        .map_err(|e| Error::validation(format!("serialize bus message: {e}")))?;
+    line.push(b'\n');
+    if line.len() > MAX_STEER_FRAME_BYTES {
+        return Err(Error::validation("hub: serialized steering frame exceeds 64 KiB"));
     }
+    let queue_lock = open_steer_lock(path)
+        .map_err(|e| Error::tool("hub", format!("open steer lock {}: {e}", path.display())))?;
+    queue_lock
+        .lock()
+        .map_err(|e| Error::tool("hub", format!("lock steer queue {}: {e}", path.display())))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|e| Error::tool("hub", format!("append steer queue {}: {e}", path.display())))?;
+    let original_len = file
+        .metadata()
+        .map_err(|e| Error::tool("hub", format!("stat steer queue {}: {e}", path.display())))?
+        .len();
+    if original_len.saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+        > MAX_STEER_QUEUE_BYTES
+    {
+        return Err(Error::tool(
+            "hub",
+            "steering queue is full; retry after the child consumes pending messages",
+        ));
+    }
+    if let Err(err) = file.write_all(&line).and_then(|()| file.sync_data()) {
+        // No reader or cooperating writer can observe the partial append
+        // before this rollback. Keep the earlier accepted frames intact.
+        let rollback = file.set_len(original_len).and_then(|()| file.sync_data());
+        return Err(Error::tool(
+            "hub",
+            match rollback {
+                Ok(()) => format!("write steer queue {}: {err}", path.display()),
+                Err(rollback_err) => format!(
+                    "write steer queue {}: {err}; rollback failed: {rollback_err}",
+                    path.display()
+                ),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn read_steer_batch(path: &Path) -> Result<Vec<String>> {
+    let file = fs::File::open(path)
+        .map_err(|e| Error::tool("hub", format!("open draining queue {}: {e}", path.display())))?;
+    let mut raw = String::new();
+    file.take(MAX_STEER_QUEUE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .map_err(|e| Error::tool("hub", format!("read draining queue {}: {e}", path.display())))?;
+    if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_STEER_QUEUE_BYTES {
+        return Err(Error::tool("hub", "draining steering batch exceeds the queue limit"));
+    }
+    // Parse the entire batch before acknowledging any of it. A malformed
+    // frame must not silently discard its valid neighbors.
     raw.lines()
-        .filter_map(|line| {
-            serde_json::from_str::<BusMessage>(line)
-                .ok()
-                .map(|m| format!("[hub:{}] {}", m.from, m.body))
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let message: BusMessage = serde_json::from_str(line).map_err(|_| {
+                Error::tool(
+                    "hub",
+                    format!("invalid steering frame at line {}; batch retained", index + 1),
+                )
+            })?;
+            Ok(format!("[hub:{}] {}", message.from, message.body))
         })
         .collect()
+}
+
+/// Child-side drain, in delivery order. A busy writer never blocks the agent's
+/// polling path. Interrupted/read-failed batches remain available for retry.
+/// This acknowledges disk consumption, not processing by the model: a process
+/// crash after return still requires a higher-level delivery acknowledgment.
+pub fn drain_steer_file(path: &Path) -> Vec<String> {
+    let queue_lock = match open_steer_lock(path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            tracing::debug!(error = %err, "steering queue lock unavailable; retrying later");
+            return Vec::new();
+        }
+    };
+    if let Err(err) = queue_lock.try_lock() {
+        tracing::debug!(error = %err, "steering queue busy or unavailable; retrying later");
+        return Vec::new();
+    }
+    let draining = path.with_extension("draining");
+    let result = (|| -> Result<Vec<String>> {
+        let recovering = draining.try_exists().map_err(|e| {
+            Error::tool("hub", format!("stat draining queue {}: {e}", draining.display()))
+        })?;
+        if !recovering {
+            match fs::rename(path, &draining) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(err) => {
+                    return Err(Error::tool(
+                        "hub",
+                        format!("claim steer queue {}: {err}", path.display()),
+                    ));
+                }
+            }
+        }
+        // Recover an old batch before touching the next queue file. Never
+        // overwrite .draining: it may contain accepted, undelivered messages.
+        let messages = read_steer_batch(&draining)?;
+        fs::remove_file(&draining).map_err(|e| {
+            Error::tool("hub", format!("consume draining queue {}: {e}", draining.display()))
+        })?;
+        Ok(messages)
+    })();
+    match result {
+        Ok(messages) => messages,
+        Err(err) => {
+            tracing::warn!(error = %err, "steering batch retained for recovery");
+            Vec::new()
+        }
+    }
 }
 
 fn sanitize_id(name: &str) -> String {
@@ -450,6 +560,84 @@ mod tests {
 
     fn fresh_registry() -> AgentHubRegistry {
         AgentHubRegistry::default()
+    }
+
+    #[test]
+    fn failed_steer_is_not_reported_in_the_inbox() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        fs::create_dir(&child.steer_path).expect("block queue file creation");
+        assert!(reg.steer(&child.id, "parent", "not delivered").is_err());
+        assert!(reg.inbox(&child.id).is_empty());
+        assert_eq!(reg.bus_seq, 0);
+    }
+
+    #[test]
+    fn drain_defers_while_a_writer_owns_the_queue_lock() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "accepted").expect("send");
+        let lock = open_steer_lock(&child.steer_path).expect("lock file");
+        lock.lock().expect("writer lock");
+        assert!(drain_steer_file(&child.steer_path).is_empty());
+        assert!(child.steer_path.exists());
+        drop(lock);
+        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] accepted"]);
+        assert!(drain_steer_file(&child.steer_path).is_empty());
+    }
+
+    #[test]
+    fn interrupted_drain_is_recovered_before_newer_messages() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "first").expect("send first");
+        let draining = child.steer_path.with_extension("draining");
+        fs::rename(&child.steer_path, &draining).expect("simulate interrupted drain");
+        reg.steer(&child.id, "parent", "second").expect("send second");
+        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] first"]);
+        assert!(child.steer_path.exists());
+        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] second"]);
+        assert!(drain_steer_file(&child.steer_path).is_empty());
+    }
+
+    #[test]
+    fn malformed_batch_is_retained_without_losing_valid_frames() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        reg.steer(&child.id, "parent", "valid").expect("send");
+        let original = fs::read(&child.steer_path).expect("queued bytes");
+        let mut file = OpenOptions::new().append(true).open(&child.steer_path).expect("fixture");
+        file.write_all(b"{broken\n").expect("partial frame");
+        drop(file);
+        assert!(drain_steer_file(&child.steer_path).is_empty());
+        let draining = child.steer_path.with_extension("draining");
+        assert!(draining.exists(), "failed batch must remain recoverable");
+        assert!(fs::read(&draining).expect("retained batch").starts_with(&original));
+        fs::write(&draining, original).expect("repair fixture");
+        assert_eq!(drain_steer_file(&child.steer_path), vec!["[hub:parent] valid"]);
+        assert!(drain_steer_file(&child.steer_path).is_empty());
+    }
+
+    #[test]
+    fn oversized_steer_is_rejected_before_recording_delivery() {
+        let temp = tempfile::tempdir().expect("hub directory");
+        let mut reg = fresh_registry();
+        reg.set_dir_for_tests(temp.path().to_path_buf());
+        let child = reg.register("worker", "task").expect("register");
+        let body = "x".repeat(MAX_STEER_FRAME_BYTES + 1);
+        assert!(reg.steer(&child.id, "parent", &body).is_err());
+        assert!(reg.inbox(&child.id).is_empty());
+        assert!(!child.steer_path.exists());
+        reg.steer(&child.id, "parent", "small").expect("later send");
+        assert_eq!(reg.inbox(&child.id)[0].seq, 1);
     }
 
     #[test]
