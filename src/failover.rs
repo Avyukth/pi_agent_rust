@@ -308,6 +308,146 @@ pub fn provider_is_disabled(
     in_list(disabled)
 }
 
+/// The identity a fallback chain started from, recorded so a cooldown has
+/// something to return to.
+///
+/// Neither the Session header nor the newest `ModelChange` can answer this
+/// after a committed failover: both advance to the fallback. The thinking level
+/// is the one the user actually asked for, not the level a fallback clamped it
+/// to, so restoring gives back what they configured rather than what the detour
+/// allowed (bd-gm481.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverPrimary {
+    /// Provider id the chain started from.
+    pub provider: String,
+    /// Model id the chain started from.
+    pub model_id: String,
+    /// The level requested before any swap clamped it.
+    pub requested_thinking_level: crate::model::ThinkingLevel,
+}
+
+/// Cross-turn failover bookkeeping: where the chain walk left off, what to
+/// return to, and when the cooldown on returning started.
+///
+/// Print mode and the RPC server each grew their own copy of these four fields
+/// and the operations over them, down to the same "record the primary only on
+/// the FIRST swap" rule. Keeping one definition is what lets a third surface —
+/// the interactive stacks, where a configured chain is currently inert — adopt
+/// failover without becoming a third copy (bd-u2qv4).
+///
+/// Per-process by design, matching both existing surfaces: a reopened session
+/// starts empty and stays on whatever the Session header says. Recovering the
+/// primary across a restart would need it durably recorded, which neither
+/// surface does today.
+#[derive(Debug, Default)]
+pub struct FailoverState {
+    cooldown: Option<CooldownTracker>,
+    primary: Option<FailoverPrimary>,
+    active: Option<(String, String)>,
+    chain_position: usize,
+}
+
+impl FailoverState {
+    /// Build from configuration. The cooldown tracker is absent when no
+    /// fallback chain is configured: with no chain there is nothing to fail
+    /// over to and nothing to restore from.
+    #[must_use]
+    pub fn new(config: &crate::config::Config) -> Self {
+        Self {
+            cooldown: config
+                .retry
+                .as_ref()
+                .and_then(|retry| retry.fallback_chains.as_ref())
+                .map(|_| CooldownTracker::new(config.failover_cooldown_secs())),
+            primary: None,
+            active: None,
+            chain_position: 0,
+        }
+    }
+
+    /// Build with an explicit cooldown, for a caller that configures failover
+    /// directly rather than from a [`crate::config::Config`].
+    #[must_use]
+    pub fn with_cooldown_secs(cooldown_secs: u64) -> Self {
+        Self {
+            cooldown: Some(CooldownTracker::new(cooldown_secs)),
+            ..Self::default()
+        }
+    }
+
+    /// The identity the chain started from, once a swap has committed.
+    #[must_use]
+    pub const fn primary(&self) -> Option<&FailoverPrimary> {
+        self.primary.as_ref()
+    }
+
+    /// The fallback currently installed, if any.
+    #[must_use]
+    pub const fn active(&self) -> Option<&(String, String)> {
+        self.active.as_ref()
+    }
+
+    /// Where the next walk resumes, carried across turns so a later turn
+    /// continues the chain instead of restarting it.
+    #[must_use]
+    pub const fn chain_position(&self) -> usize {
+        self.chain_position
+    }
+
+    /// Record where a walk finished, whether or not it swapped.
+    pub const fn set_chain_position(&mut self, position: usize) {
+        self.chain_position = position;
+    }
+
+    /// The identity a fresh swap should record as its primary: the one already
+    /// recorded when a chain is in flight, else the live identity.
+    ///
+    /// A second hop moves away from a FALLBACK, and the identity to return to
+    /// is still the model the chain started from (bd-oqo03.1).
+    #[must_use]
+    pub fn primary_for_swap(&self, live: FailoverPrimary) -> FailoverPrimary {
+        self.primary.clone().unwrap_or(live)
+    }
+
+    /// Record a committed swap away from `primary` onto `active`, starting the
+    /// cooldown on returning to the primary.
+    pub fn record_swap(
+        &mut self,
+        primary: FailoverPrimary,
+        active: (String, String),
+        now: std::time::Instant,
+    ) {
+        if self.primary.is_none() {
+            self.primary = Some(primary);
+        }
+        self.active = Some(active);
+        if let Some(tracker) = self.cooldown.as_mut() {
+            tracker.record_primary_failure(now);
+        }
+    }
+
+    /// Whether the primary may be used again at `now`. False with no chain
+    /// configured and nothing to restore.
+    #[must_use]
+    pub fn should_restore_primary(&self, now: std::time::Instant) -> bool {
+        self.primary.is_some()
+            && self
+                .cooldown
+                .as_ref()
+                .is_some_and(|tracker| tracker.should_use_primary(now))
+    }
+
+    /// The primary is back; the chain starts over from the top next time.
+    pub fn clear(&mut self) {
+        self.primary = None;
+        self.active = None;
+        self.chain_position = 0;
+        if let Some(tracker) = self.cooldown.as_mut() {
+            tracker.reset();
+        }
+    }
+}
+
 /// Cursor over a fallback chain that yields only the specs worth considering.
 ///
 /// The live model and any spec already walked earlier in the same chain are
@@ -822,6 +962,87 @@ mod tests {
         };
         assert!(provider_is_disabled(&disabled, Some(&scope), "openai"));
         assert!(provider_is_disabled(&disabled, Some(&scope), "anthropic"));
+    }
+
+    // -- cross-turn bookkeeping (bd-u2qv4) ---------------------------------
+
+    fn primary(provider: &str, model_id: &str) -> FailoverPrimary {
+        FailoverPrimary {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            requested_thinking_level: crate::model::ThinkingLevel::High,
+        }
+    }
+
+    fn state_with_chain() -> FailoverState {
+        let mut config = crate::config::Config::default();
+        config.retry = Some(crate::config::RetrySettings {
+            fallback_chains: Some(std::collections::HashMap::from([(
+                "default".to_string(),
+                vec!["openai/gpt-y".to_string()],
+            )])),
+            failover_cooldown_secs: Some(300),
+            ..crate::config::RetrySettings::default()
+        });
+        FailoverState::new(&config)
+    }
+
+    #[test]
+    fn a_second_hop_still_records_the_model_the_chain_started_from() {
+        // bd-oqo03.1: a later hop moves away from a FALLBACK, and the identity
+        // to return to is the primary, not the fallback being left.
+        let mut state = state_with_chain();
+        let now = Instant::now();
+        state.record_swap(
+            state.primary_for_swap(primary("anthropic", "claude-x")),
+            ("openai".to_string(), "gpt-y".to_string()),
+            now,
+        );
+        let second = state.primary_for_swap(primary("openai", "gpt-y"));
+        assert_eq!(second, primary("anthropic", "claude-x"));
+        state.record_swap(second, ("google".to_string(), "gemini-z".to_string()), now);
+        assert_eq!(state.primary(), Some(&primary("anthropic", "claude-x")));
+        assert_eq!(
+            state.active(),
+            Some(&("google".to_string(), "gemini-z".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_primary_is_restorable_only_after_the_cooldown_elapses() {
+        let mut state = state_with_chain();
+        let now = Instant::now();
+        assert!(
+            !state.should_restore_primary(now),
+            "nothing has failed over, so there is nothing to restore"
+        );
+        state.record_swap(
+            primary("anthropic", "claude-x"),
+            ("openai".to_string(), "gpt-y".to_string()),
+            now,
+        );
+        assert!(!state.should_restore_primary(now));
+        assert!(state.should_restore_primary(now + Duration::from_secs(301)));
+
+        state.clear();
+        assert_eq!(state.primary(), None);
+        assert_eq!(state.chain_position(), 0);
+        assert!(!state.should_restore_primary(now + Duration::from_secs(301)));
+    }
+
+    #[test]
+    fn with_no_chain_configured_there_is_no_cooldown_and_nothing_to_restore() {
+        let mut state = FailoverState::new(&crate::config::Config::default());
+        let now = Instant::now();
+        state.record_swap(
+            primary("anthropic", "claude-x"),
+            ("openai".to_string(), "gpt-y".to_string()),
+            now,
+        );
+        assert!(
+            !state.should_restore_primary(now + Duration::from_secs(100_000)),
+            "with no chain there is nothing to fail over to and nothing to restore from"
+        );
     }
 
     // -- shared chain walk (bd-u2qv4) --------------------------------------

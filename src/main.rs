@@ -9033,86 +9033,22 @@ fn print_mode_json_record(event: &AgentEvent) -> serde_json::Result<String> {
     event.to_json_stream_line()
 }
 
-/// The provider/model print mode was on before the first failover of the
-/// current chain (bd-gm481.1).
-///
-/// Recorded explicitly because neither the Session header nor the newest
-/// `ModelChange` can answer the question after a committed failover: both
-/// advance to the fallback. The thinking level is the one the user actually
-/// asked for, not the level the fallback clamped it to, so restoring gives
-/// back what they configured rather than what the detour allowed.
-#[derive(Debug, Clone)]
-struct PrintFailoverPrimary {
-    provider: String,
-    model_id: String,
-    requested_thinking_level: ThinkingLevel,
-}
-
 /// Cross-prompt failover state for print mode (bd-gm481.1).
 ///
-/// RPC keeps the equivalent on `RpcSharedState`. Print had nowhere to put it,
-/// and three things were wrong at once as a result. A `--message` sequence that
-/// failed over stayed pinned to the fallback for every later prompt with no
-/// path back. The chain cursor was a per-prompt local, so prompt two restarted
-/// its walk at entry zero and could reinstall the fallback it was already on.
-/// And nothing recorded what the primary had been, so even an attempt to
-/// restore had no identity to return to.
+/// Print had nowhere to put this, and three things were wrong at once as a
+/// result. A `--message` sequence that failed over stayed pinned to the
+/// fallback for every later prompt with no path back. The chain cursor was a
+/// per-prompt local, so prompt two restarted its walk at entry zero and could
+/// reinstall the fallback it was already on. And nothing recorded what the
+/// primary had been, so even an attempt to restore had no identity to return
+/// to.
 ///
-/// Per-process, like RPC's: a reopened session starts empty and stays on
-/// whatever the Session header says. Recovering the primary across a restart
-/// would need it durably recorded, which neither surface does today.
-#[derive(Debug, Default)]
-struct PrintFailoverState {
-    /// `None` when no fallback chain is configured, matching RPC — with no
-    /// chain there is nothing to fail over to and nothing to restore from.
-    cooldown: Option<pi::failover::CooldownTracker>,
-    primary: Option<PrintFailoverPrimary>,
-    /// The fallback currently installed, if any.
-    active: Option<(String, String)>,
-    /// Where the walk left off, carried across prompts so a later prompt
-    /// resumes the chain instead of restarting it.
-    chain_position: usize,
-}
-
-impl PrintFailoverState {
-    fn new(config: &Config) -> Self {
-        Self {
-            cooldown: config
-                .retry
-                .as_ref()
-                .and_then(|retry| retry.fallback_chains.as_ref())
-                .map(|_| pi::failover::CooldownTracker::new(config.failover_cooldown_secs())),
-            primary: None,
-            active: None,
-            chain_position: 0,
-        }
-    }
-
-    /// Record a committed swap away from `primary` onto `active`.
-    ///
-    /// The primary is recorded only on the FIRST swap of a chain: a second hop
-    /// moves away from a fallback, and the identity to return to is still the
-    /// model the chain started from.
-    fn record_swap(&mut self, primary: PrintFailoverPrimary, active: (String, String)) {
-        if self.primary.is_none() {
-            self.primary = Some(primary);
-        }
-        self.active = Some(active);
-        if let Some(tracker) = self.cooldown.as_mut() {
-            tracker.record_primary_failure(std::time::Instant::now());
-        }
-    }
-
-    /// The primary is back; the chain starts over from the top next time.
-    fn clear(&mut self) {
-        self.primary = None;
-        self.active = None;
-        self.chain_position = 0;
-        if let Some(tracker) = self.cooldown.as_mut() {
-            tracker.reset();
-        }
-    }
-}
+/// The state itself is `pi::failover::FailoverState`, shared so the interactive
+/// stacks can adopt failover without a third copy of the same four fields and
+/// the same "record the primary only on the FIRST swap" rule (bd-u2qv4). RPC
+/// keeps its equivalent inline on `RpcSharedState` and has not been re-pointed.
+type PrintFailoverState = pi::failover::FailoverState;
+type PrintFailoverPrimary = pi::failover::FailoverPrimary;
 
 /// Failover lifecycle (bd-2vmu6.1): a turn that swapped to a fallback chain
 /// entry closes its `FailoverStart` before the turn's terminal output,
@@ -9191,17 +9127,13 @@ async fn maybe_restore_print_primary(
     let Some(ctx) = failover_ctx else {
         return false;
     };
-    let Some((active_provider, active_model)) = state.active.clone() else {
+    let Some((active_provider, active_model)) = state.active().cloned() else {
         return false;
     };
-    let Some(primary) = state.primary.clone() else {
+    let Some(primary) = state.primary().cloned() else {
         return false;
     };
-    if !state
-        .cooldown
-        .as_ref()
-        .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()))
-    {
+    if !state.should_restore_primary(std::time::Instant::now()) {
         return false;
     }
 
@@ -9386,7 +9318,7 @@ async fn try_print_failover(
     // the one definition (bd-u2qv4).
     let mut walk = pi::failover::FailoverWalk::new(
         &chain,
-        failover_state.chain_position,
+        failover_state.chain_position(),
         &from_provider,
         &from_model,
     );
@@ -9433,7 +9365,7 @@ async fn try_print_failover(
             require_incomplete_tail,
         };
         session.commit_failover(&cx, &request).await?;
-        failover_state.chain_position = cursor;
+        failover_state.set_chain_position(cursor);
         // Cross-prompt record (bd-gm481.1): what to return to, and when the
         // cooldown on doing so started. The primary is only captured on the
         // first swap of a chain — a second hop moves away from a fallback, and
@@ -9445,6 +9377,7 @@ async fn try_print_failover(
                 requested_thinking_level,
             },
             (to_provider.clone(), to_model.clone()),
+            std::time::Instant::now(),
         );
 
         if is_json {
@@ -9473,7 +9406,7 @@ async fn try_print_failover(
     }
     // Chain exhausted: record the end position so a later turn does not re-walk
     // entries this turn already rejected.
-    failover_state.chain_position = walk.position();
+    failover_state.set_chain_position(walk.position());
     Ok(None)
 }
 
@@ -12351,7 +12284,7 @@ mod tests {
                     .agent
                     .replace_messages(inner.to_messages_for_current_path());
             }
-            failover_state.chain_position = 0;
+            failover_state.set_chain_position(0);
             assert!(
                 try_print_failover(
                     &mut agent_session,
@@ -12571,18 +12504,18 @@ mod tests {
                 Some(("anthropic".to_string(), "fallback-model".to_string())),
                 "the current model must not consume the walk"
             );
-            assert_eq!(failover_state.chain_position, 2);
+            assert_eq!(failover_state.chain_position(), 2);
             // bd-gm481.1: the swap records what to come back to.
             assert_eq!(
                 failover_state
-                    .primary
+                    .primary()
                     .as_ref()
                     .map(|p| (p.provider.as_str(), p.model_id.as_str())),
                 Some(("openai", "primary-model")),
                 "the model the chain started from is the one to restore"
             );
             assert_eq!(
-                failover_state.active,
+                failover_state.active().cloned(),
                 Some(("anthropic".to_string(), "fallback-model".to_string()))
             );
             assert_eq!(session.agent.provider().name(), "anthropic");
@@ -12616,7 +12549,7 @@ mod tests {
                 swapped,
                 Some(("anthropic".to_string(), "fallback-model".to_string()))
             );
-            assert_eq!(failover_state.chain_position, 3);
+            assert_eq!(failover_state.chain_position(), 3);
             let again = try_print_failover(
                 &mut session,
                 &config,
@@ -12632,7 +12565,8 @@ mod tests {
             .expect("second walk");
             assert_eq!(again, None, "the trailing duplicate is not a new swap");
             assert_eq!(
-                failover_state.chain_position, 4,
+                failover_state.chain_position(),
+                4,
                 "the walk is bounded by the chain length"
             );
 
@@ -12654,8 +12588,7 @@ mod tests {
 
             // Cooldown still holding: the primary just told us it was unwell.
             let (mut swapped, _keep) = build_session();
-            let mut holding = PrintFailoverState::new(&config);
-            holding.cooldown = Some(pi::failover::CooldownTracker::new(600));
+            let mut holding = PrintFailoverState::with_cooldown_secs(600);
             assert!(
                 try_print_failover(
                     &mut swapped,
@@ -12678,15 +12611,14 @@ mod tests {
             );
             assert_eq!(swapped.agent.provider().model_id(), "fallback-model");
             assert!(
-                holding.active.is_some(),
+                holding.active().is_some(),
                 "a refused restoration keeps the recorded fallback"
             );
 
             // The live model is no longer the fallback we recorded: something
             // else moved it, and undoing that is not ours to do.
             let (mut moved, _keep) = build_session();
-            let mut elapsed = PrintFailoverState::new(&config);
-            elapsed.cooldown = Some(pi::failover::CooldownTracker::new(0));
+            let mut elapsed = PrintFailoverState::with_cooldown_secs(0);
             assert!(
                 try_print_failover(
                     &mut moved,
@@ -12703,7 +12635,16 @@ mod tests {
                 .expect("swap for the drift case")
                 .is_some()
             );
-            elapsed.active = Some(("anthropic".to_string(), "some-other-model".to_string()));
+            // Drift: the recorded fallback is no longer what is installed.
+            let recorded_primary = elapsed
+                .primary()
+                .cloned()
+                .expect("the swap above recorded a primary"); // ubs:ignore test assertion
+            elapsed.record_swap(
+                recorded_primary,
+                ("anthropic".to_string(), "some-other-model".to_string()),
+                std::time::Instant::now(),
+            );
             assert!(
                 !maybe_restore_print_primary(&mut moved, &mut elapsed, failover_ctx, false).await,
                 "a runtime that does not match the recorded fallback must not be swapped"
@@ -12712,8 +12653,7 @@ mod tests {
 
             // And the control: cooldown elapsed, everything consistent.
             let (mut restorable, _keep) = build_session();
-            let mut ready = PrintFailoverState::new(&config);
-            ready.cooldown = Some(pi::failover::CooldownTracker::new(0));
+            let mut ready = PrintFailoverState::with_cooldown_secs(0);
             assert!(
                 try_print_failover(
                     &mut restorable,
@@ -12741,9 +12681,10 @@ mod tests {
                 Some("primary-key"),
                 "restoring installs the primary's credential, not the fallback's"
             );
-            assert!(ready.primary.is_none() && ready.active.is_none());
+            assert!(ready.primary().is_none() && ready.active().is_none());
             assert_eq!(
-                ready.chain_position, 0,
+                ready.chain_position(),
+                0,
                 "back on the primary, the chain starts over"
             );
         });
@@ -12899,13 +12840,14 @@ mod tests {
                     .contains("SESSION_PERSISTENCE_FAILED")
             );
             assert_eq!(
-                failover_state.chain_position, 0,
+                failover_state.chain_position(),
+                0,
                 "failed persistence must not consume the fallback"
             );
             // bd-gm481.1: nor may it record anything to restore later — there
             // is no committed swap to come back from.
-            assert!(failover_state.primary.is_none());
-            assert!(failover_state.active.is_none());
+            assert!(failover_state.primary().is_none());
+            assert!(failover_state.active().is_none());
             assert_eq!(agent_session.agent.provider().name(), "openai");
             assert_eq!(agent_session.agent.provider().model_id(), "primary-model");
             assert_eq!(
