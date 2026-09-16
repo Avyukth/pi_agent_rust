@@ -697,7 +697,10 @@ impl Provider for BedrockProvider {
             .await
             .map_err(|err| {
                 let detail = bedrock_error_snippet(&err.to_string(), &response_secrets);
-                Error::provider(self.name(), format!("Failed to read Bedrock response: {detail}"))
+                Error::provider(
+                    self.name(),
+                    format!("Failed to read Bedrock response: {detail}"),
+                )
             })?;
         let parsed: BedrockConverseResponse =
             serde_json::from_str(&response_text).map_err(|err| {
@@ -938,7 +941,9 @@ fn convert_assistant_message(message: &AssistantMessage) -> Option<BedrockMessag
                     },
                 });
             }
-            ContentBlock::RedactedThinking(redacted) if message.api == "bedrock-converse-stream" => {
+            ContentBlock::RedactedThinking(redacted)
+                if message.api == "bedrock-converse-stream" =>
+            {
                 content.push(BedrockContent::ReasoningContent {
                     reasoning_content: BedrockReasoningContent::Redacted {
                         redacted_content: redacted.data.clone(),
@@ -1713,8 +1718,8 @@ mod tests {
         let signing_time = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
             .expect("parse x-amz-date")
             .and_utc();
-        let request_url =
-            Url::parse(&format!("{base_url}/model/model/converse-stream")).expect("Bedrock request URL");
+        let request_url = Url::parse(&format!("{base_url}/model/model/converse-stream"))
+            .expect("Bedrock request URL");
         let expected = build_sigv4_headers(
             &request_url,
             &captured.body,
