@@ -16,8 +16,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock streaming and request-control modules are now represented below.
-- Source-file rows below: 232 (230 recorded rows plus the two Bedrock modules).
+- Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock and memory modules are now represented below.
+- Source-file rows below: 234 (230 recorded rows plus two Bedrock and two memory modules).
 - The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -183,7 +183,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
 | `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
 | `src/media_tools.rs` | Opt-in media trio tools `inspect_image` / `generate_image` / `tts` (bd-cv653.2.7) | `tests/media_tools.rs`, `tests/conformance_fixtures.rs`. |
-| `src/memory.rs` | Memory files | `tests/memory.rs`. |
+| `src/memory.rs` | Project memory bank and atomic supersession | Unit; `tests/memory.rs` exercises the public tools, registry gate and startup injection. Mutation tests are also in `src/memory/transactions.rs`. New coverage added, not executed on the editing host. |
+| `src/memory/reflection.rs` | Authenticated bounded memory synthesis and citation identity checks | Unit (10 tests); `tests/memory.rs` uses the public tool and Gemini over loopback HTTP for successful synthesis, terminal failures, unknown citations and credential redaction. Added, not executed: DSR unavailable. |
+| `src/memory/transactions.rs` | Atomic primary/FTS/audit writes and supersession | Unit (11 real-SQLite tests), including late audit failure, rollback after reopening, competing writers, stale supersession, index repair and the retain tool. Added, not executed: DSR unavailable. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
 | `src/model_routing.rs` | Model-routing policy and evidence | Unit; model-routing tests in this module plus `tests/model_selector_cycling.rs`. |
