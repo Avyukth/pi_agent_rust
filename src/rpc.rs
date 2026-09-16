@@ -6082,13 +6082,17 @@ async fn try_failover_to_next_chain_entry(
         .try_failover_swap(cx, &attempt, Some(&admission))
         .await?;
     let Some(committed) = outcome.committed else {
-        // Deliberately NOT recorded on an exhausted chain, which is what RPC
-        // has always done: the next turn re-walks from the last COMMITTED
-        // position, so an entry rejected only because its credential was
-        // missing gets another look once that credential appears. Print mode
-        // records the exhausted position instead and skips those entries for
-        // the life of the process. Preserved rather than unified here; the
-        // divergence is real and tracked separately.
+        // Deliberately NOT recorded on an exhausted chain: the next turn
+        // re-walks from the last COMMITTED position, so an entry rejected only
+        // because its credential was missing gets another look once that
+        // credential appears. Recording it instead would make a transient
+        // rejection permanent for the life of the process, silently shrinking
+        // the chain the user configured.
+        //
+        // Print mode used to record it and was brought into line here
+        // (bd-gr6fk); the SDK has always matched. All three surfaces agree now,
+        // and `rpc_failover_walk_skips_current_and_duplicate_entries` pins this
+        // half, which nothing did while it was merely a convention.
         return Ok(false);
     };
     state.failover_chain_position = Some(outcome.next_position);
@@ -8108,6 +8112,15 @@ mod retry_tests {
                 compat: None,
                 oauth_config: None,
             };
+            // A trailing entry with NO credential (bd-gr6fk). It sits after the
+            // one that commits, so the second walk has something real to
+            // reject — without it the cursor is already at the end of the chain
+            // and an exhausted walk cannot move it, which would make the
+            // "records nothing" assertion below pass under either behaviour.
+            let mut keyless = fallback.clone();
+            keyless.model.id = "keyless-model".to_string();
+            keyless.model.name = "keyless-model".to_string();
+            keyless.api_key = None;
             let mut config = Config::default();
             config.retry = Some(crate::config::RetrySettings {
                 fallback_chains: Some(HashMap::from([(
@@ -8116,6 +8129,7 @@ mod retry_tests {
                         "test-provider/test-model".to_string(),
                         "test-provider/test-model".to_string(),
                         "openai/fallback-model".to_string(),
+                        "openai/keyless-model".to_string(),
                     ],
                 )])),
                 max_failovers_per_turn: Some(1),
@@ -8126,7 +8140,7 @@ mod retry_tests {
             let options = RpcOptions {
                 config,
                 resources: ResourceLoader::empty(false),
-                available_models: vec![fallback],
+                available_models: vec![fallback, keyless],
                 scoped_models: Vec::new(),
                 cli_api_key: None,
                 auth: AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load"),
@@ -8176,6 +8190,40 @@ mod retry_tests {
                 state.failover_chain_position,
                 Some(3),
                 "the cursor advanced past the skipped entries and the swap"
+            );
+            drop(state);
+
+            // bd-gr6fk: a walk that finds NOTHING installable records nothing,
+            // so the cursor stays where the last committed swap left it. This
+            // is what lets an entry rejected only for a missing credential be
+            // reconsidered once that credential appears; recording the
+            // exhausted position would make a transient rejection permanent for
+            // the life of the process. RPC has always behaved this way and
+            // nothing pinned it until now — print mode diverged here and was
+            // brought into line against this assertion.
+            let (exhausted_tx, _exhausted_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            assert!(
+                !try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    exhausted_tx,
+                    &options,
+                    Some("server error"),
+                    false,
+                    None,
+                    0,
+                    &cx,
+                )
+                .await
+                .expect("second walk over an exhausted chain"),
+                "the chain held nothing else installable"
+            );
+            let state = shared_state.lock(&cx).await.expect("shared state lock");
+            assert_eq!(
+                state.failover_chain_position,
+                Some(3),
+                "an exhausted walk must not advance the cursor past the \
+                 keyless entry it only rejected transiently"
             );
         });
     }

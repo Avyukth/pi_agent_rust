@@ -9276,12 +9276,23 @@ async fn try_print_failover(
         require_incomplete_tail,
     };
     let outcome = session.try_failover(&cx, &attempt).await?;
-    // Recorded either way, so a later prompt does not re-walk entries this one
-    // already rejected.
-    failover_state.set_chain_position(outcome.next_position);
     let Some(committed) = outcome.committed else {
+        // An exhausted walk records NOTHING (bd-gr6fk). Entries are rejected
+        // for five reasons and they are not alike: a malformed spec, a
+        // duplicate, and the live model itself are permanent, but a missing
+        // credential and a failed provider construction are TRANSIENT — a key
+        // can be added or an OAuth token refreshed mid-session. Recording the
+        // exhausted position made those two permanent for the life of the
+        // process, silently shrinking the chain the user configured. The skip
+        // checks are pure and cheap (a string compare, a registry lookup, a key
+        // lookup), so re-walking next prompt costs nothing measurable.
+        //
+        // RPC and the SDK have always behaved this way; print was the outlier.
         return Ok(None);
     };
+    // Only a committed swap advances the cursor, so a later prompt resumes past
+    // the entry it actually installed.
+    failover_state.set_chain_position(outcome.next_position);
 
     // Cross-prompt record (bd-gm481.1): what to return to, and when the
     // cooldown on doing so started. The primary is only captured on the first
@@ -12471,10 +12482,18 @@ mod tests {
             .await
             .expect("second walk");
             assert_eq!(again, None, "the trailing duplicate is not a new swap");
+            // bd-gr6fk: an exhausted walk records nothing, so the cursor stays
+            // where the last COMMITTED swap left it. This assertion previously
+            // read 4 — print advanced the cursor past every rejected entry,
+            // which made a transient rejection (a credential that arrives
+            // later) permanent for the life of the process. RPC and the SDK
+            // never did that; this is print joining them, and the changed
+            // number is the behaviour change, not a loosened assertion.
             assert_eq!(
                 failover_state.chain_position(),
-                4,
-                "the walk is bounded by the chain length"
+                3,
+                "an exhausted walk must not advance the cursor past entries it \
+                 only rejected transiently"
             );
 
             // bd-gm481.1: the restoration REFUSALS, which the e2e pair cannot
@@ -12594,6 +12613,142 @@ mod tests {
                 0,
                 "back on the primary, the chain starts over"
             );
+        });
+    }
+
+    /// bd-gr6fk: an entry skipped because it had no usable credential must be
+    /// reconsidered once one appears.
+    ///
+    /// Print mode used to record the exhausted walk position, which made that
+    /// rejection permanent for the life of the process: configure a chain,
+    /// start without a key for one of its entries, and print would walk past it
+    /// once and never look again — silently shrinking the chain the user
+    /// configured. The cursor number is the mechanism; THIS is the consequence,
+    /// so this is what the test asserts.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn print_failover_reconsiders_an_entry_whose_credential_arrives_later() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let model_entry = |provider: &str, model_id: &str, key: Option<&str>| ModelEntry {
+                model: pi::provider::Model {
+                    id: model_id.to_string(),
+                    name: model_id.to_string(),
+                    api: if provider == "openai" {
+                        "openai-completions".to_string()
+                    } else {
+                        "anthropic".to_string()
+                    },
+                    provider: provider.to_string(),
+                    base_url: if provider == "openai" {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        "https://api.anthropic.com".to_string()
+                    },
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: pi::provider::ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 8_192,
+                    max_tokens: 1_024,
+                    headers: std::collections::HashMap::new(),
+                },
+                api_key: key.map(str::to_string),
+                headers: std::collections::HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+            let primary = model_entry("openai", "primary-model", Some("primary-key"));
+            let keyless = model_entry("anthropic", "keyless-model", None);
+
+            let provider = providers::create_provider(&primary, None).expect("primary provider");
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.stream_options_mut().api_key = Some("primary-key".to_string());
+            let session_temp = tempfile::tempdir().expect("session tempdir");
+            let stored = Session::create_with_dir(Some(session_temp.path().join("sessions")));
+            let mut session = AgentSession::new(
+                agent,
+                Arc::new(Mutex::new(stored)),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let auth_temp = tempfile::tempdir().expect("auth tempdir");
+            let auth = AuthStorage::load(auth_temp.path().join("auth.json")).expect("auth load");
+            let available_models = vec![primary, keyless];
+            let mut config = Config::default();
+            config.retry = Some(pi::config::RetrySettings {
+                fallback_chains: Some(std::collections::HashMap::from([(
+                    "default".to_string(),
+                    vec!["anthropic/keyless-model".to_string()],
+                )])),
+                max_failovers_per_turn: Some(1),
+                ..Default::default()
+            });
+            let mut failover_state = PrintFailoverState::new(&config);
+
+            // No credential anywhere: the only entry is skipped and the walk
+            // finds nothing. Failing over into an auth error would be strictly
+            // worse than the error that started this.
+            let refused = try_print_failover(
+                &mut session,
+                &config,
+                Some(FailoverResolution {
+                    available_models: &available_models,
+                    auth: &auth,
+                    cli_api_key: None,
+                }),
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("first walk");
+            assert_eq!(refused, None, "an entry with no credential is not usable");
+            assert_eq!(
+                failover_state.chain_position(),
+                0,
+                "a transient rejection must not advance the cursor"
+            );
+
+            // The credential appears. The SAME state, the SAME chain — and the
+            // entry must now be reachable.
+            let installed = try_print_failover(
+                &mut session,
+                &config,
+                Some(FailoverResolution {
+                    available_models: &available_models,
+                    auth: &auth,
+                    cli_api_key: Some("late-key"),
+                }),
+                &mut failover_state,
+                Some("server error"),
+                false,
+                false,
+                None,
+                0,
+            )
+            .await
+            .expect("second walk");
+            assert_eq!(
+                installed,
+                Some(("anthropic".to_string(), "keyless-model".to_string())),
+                "an entry rejected only for a missing credential must be \
+                 reconsidered once that credential exists (bd-gr6fk)"
+            );
+            assert_eq!(session.agent.provider().model_id(), "keyless-model");
         });
     }
 
