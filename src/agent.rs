@@ -1587,6 +1587,55 @@ pub fn context_window_tokens_for_entry(entry: &crate::models::ModelEntry) -> u32
     entry.model.context_window
 }
 
+/// A walk of a fallback chain looking for an entry worth swapping to.
+pub struct FailoverSwapAttempt<'a> {
+    /// The chain resolved for the live model.
+    pub chain: &'a crate::failover::FailoverChain,
+    /// Where to resume the walk, from the caller's cross-turn state.
+    pub start_position: usize,
+    /// Models a chain spec can resolve against.
+    pub available_models: &'a [crate::models::ModelEntry],
+    /// Credential store consulted for each candidate.
+    pub auth: &'a crate::auth::AuthStorage,
+    /// An explicit `--api-key`, which pins and never rotates.
+    pub cli_api_key: Option<&'a str>,
+    /// Why the swap is happening, recorded in the transcript.
+    pub class: crate::failover::FailoverClass,
+    /// The level a candidate is clamped against; see
+    /// [`FailoverSwapRequest::thinking_level_to_clamp`].
+    pub thinking_level_to_clamp: crate::model::ThinkingLevel,
+    /// Whether a completed error response must have left a revertible tail.
+    pub require_incomplete_tail: bool,
+}
+
+/// A swap that committed, with what the caller needs for its own events and
+/// cross-turn bookkeeping.
+#[derive(Debug, Clone)]
+pub struct CommittedFailover {
+    /// Where the installed entry sits in the chain. Note this is the entry's
+    /// index, not the resume position — reporting the latter is off by one
+    /// (bd-oqo03).
+    pub entry_index: usize,
+    /// Provider left behind.
+    pub from_provider: String,
+    /// Model left behind.
+    pub from_model: String,
+    /// Provider now installed.
+    pub to_provider: String,
+    /// Model now installed.
+    pub to_model: String,
+}
+
+/// The result of a chain walk, swapped or not.
+#[derive(Debug, Clone)]
+pub struct FailoverSwapOutcome {
+    /// Where the NEXT walk resumes. Record it either way, so a later turn does
+    /// not re-walk entries this one already rejected.
+    pub next_position: usize,
+    /// `None` means the chain held nothing installable.
+    pub committed: Option<CommittedFailover>,
+}
+
 /// One fallback-chain swap, as [`AgentSession::commit_failover_swap`] needs it.
 ///
 /// The caller has already classified the failure, walked the chain, resolved a
@@ -12816,6 +12865,97 @@ impl AgentSession {
         request: &FailoverSwapRequest<'_>,
     ) -> Result<crate::model::ThinkingLevel> {
         self.commit_failover_swap(cx, request, None).await
+    }
+
+    /// Walk a fallback chain and install the first entry that is actually
+    /// usable, or report that the chain held nothing.
+    ///
+    /// The walk is bounded by the chain, never by `max_failovers_per_turn`: the
+    /// caller counts committed swaps against that cap. Bounding the cursor by
+    /// the cap let malformed, uncredentialed, unconstructible, current or
+    /// duplicate entries consume the budget and hide a later valid entry
+    /// (bd-oqo03.1). An entry with no usable credential is skipped rather than
+    /// installed — failing over into an auth error is strictly worse than the
+    /// quota error that started this.
+    ///
+    /// Print mode and the RPC server each had this loop, and it is what a third
+    /// surface would otherwise copy: the interactive stacks, where a configured
+    /// chain is currently inert (bd-u2qv4). Classification, chain resolution
+    /// and event emission stay with the caller, because those genuinely differ.
+    pub async fn try_failover(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+    ) -> Result<FailoverSwapOutcome> {
+        self.try_failover_swap(cx, attempt, None).await
+    }
+
+    /// [`Self::try_failover`] with RPC's provider-admission gate. The gate type
+    /// is internal, so this stays crate-visible while the plain form above is
+    /// what print mode and any embedder call.
+    pub(crate) async fn try_failover_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        attempt: &FailoverSwapAttempt<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<FailoverSwapOutcome> {
+        let (from_provider, from_model) = {
+            let provider = self.agent.provider();
+            (provider.name().to_string(), provider.model_id().to_string())
+        };
+        let mut walk = crate::failover::FailoverWalk::new(
+            attempt.chain,
+            attempt.start_position,
+            &from_provider,
+            &from_model,
+        );
+        while let Some((entry_index, spec)) = walk.next_spec() {
+            let next_position = walk.position();
+            let Some(entry) = crate::failover::resolve_chain_spec(spec, attempt.available_models)
+            else {
+                continue;
+            };
+            let api_key =
+                crate::models::resolve_model_key(attempt.cli_api_key, attempt.auth, &entry);
+            if crate::models::model_requires_configured_credential(&entry) && api_key.is_none() {
+                continue;
+            }
+            let Ok(provider) = crate::providers::create_provider(
+                &entry,
+                self.extensions.as_ref().map(ExtensionRegion::manager),
+            ) else {
+                continue;
+            };
+
+            let to_provider = entry.model.provider.clone();
+            let to_model = entry.model.id.clone();
+            let request = FailoverSwapRequest {
+                entry: &entry,
+                api_key,
+                provider,
+                from_provider: &from_provider,
+                from_model: &from_model,
+                class: attempt.class,
+                chain_position: next_position,
+                thinking_level_to_clamp: attempt.thinking_level_to_clamp,
+                require_incomplete_tail: attempt.require_incomplete_tail,
+            };
+            self.commit_failover_swap(cx, &request, admission).await?;
+            return Ok(FailoverSwapOutcome {
+                next_position,
+                committed: Some(CommittedFailover {
+                    entry_index,
+                    from_provider,
+                    from_model,
+                    to_provider,
+                    to_model,
+                }),
+            });
+        }
+        Ok(FailoverSwapOutcome {
+            next_position: walk.position(),
+            committed: None,
+        })
     }
 
     /// The private `Session` candidate a swap would install, plus the message

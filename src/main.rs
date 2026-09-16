@@ -9310,104 +9310,72 @@ async fn try_print_failover(
     else {
         return Ok(None);
     };
-    // The walk is bounded by the chain, not by `max_failovers_per_turn`: the
-    // caller counts successful swaps against that cap (bd-oqo03.1). Bounding
-    // the cursor by the cap let malformed, uncredentialed, unconstructible,
-    // current, or duplicate entries consume the budget and hide a later valid
-    // entry. RPC walks the same chain with the same cursor rules; both now use
-    // the one definition (bd-u2qv4).
-    let mut walk = pi::failover::FailoverWalk::new(
-        &chain,
-        failover_state.chain_position(),
-        &from_provider,
-        &from_model,
+    // The walk, the credential check, the provider construction and the
+    // persisted transition are all `AgentSession::try_failover_swap`, shared
+    // with RPC (bd-u2qv4). What stays here is print mode's own: classification
+    // above, its JSON events below, and its cross-prompt bookkeeping.
+    let cx = pi::agent_cx::AgentCx::for_request();
+    let attempt = pi::agent::FailoverSwapAttempt {
+        chain: &chain,
+        start_position: failover_state.chain_position(),
+        available_models: ctx.available_models,
+        auth: ctx.auth,
+        cli_api_key: ctx.cli_api_key,
+        class,
+        // The LIVE level, which is what print mode has always clamped against
+        // here. RPC clamps against the level originally requested; see
+        // FailoverSwapRequest::thinking_level_to_clamp.
+        thinking_level_to_clamp: session
+            .agent
+            .stream_options()
+            .thinking_level
+            .unwrap_or_default(),
+        require_incomplete_tail,
+    };
+    let outcome = session.try_failover(&cx, &attempt).await?;
+    // Recorded either way, so a later prompt does not re-walk entries this one
+    // already rejected.
+    failover_state.set_chain_position(outcome.next_position);
+    let Some(committed) = outcome.committed else {
+        return Ok(None);
+    };
+
+    // Cross-prompt record (bd-gm481.1): what to return to, and when the
+    // cooldown on doing so started. The primary is only captured on the first
+    // swap of a chain — a second hop moves away from a fallback, and the
+    // identity to restore is still the model the chain started from.
+    failover_state.record_swap(
+        PrintFailoverPrimary {
+            provider: committed.from_provider.clone(),
+            model_id: committed.from_model.clone(),
+            requested_thinking_level,
+        },
+        (committed.to_provider.clone(), committed.to_model.clone()),
+        std::time::Instant::now(),
     );
-    while let Some((entry_index, spec)) = walk.next_spec() {
-        let cursor = walk.position();
-        let Some(entry) = pi::failover::resolve_chain_spec(spec, ctx.available_models) else {
-            continue;
-        };
-        let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
-        if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
-            continue; // never fail over into an auth error
-        }
 
-        let Ok(provider_impl) = providers::create_provider(
-            &entry,
-            session.extensions.as_ref().map(ExtensionRegion::manager),
-        ) else {
-            continue;
-        };
-
-        // The whole persisted transition — revert, transcript record, save,
-        // install — is `AgentSession::commit_failover`, shared with RPC
-        // (bd-u2qv4). The live transcript and provider/options stay untouched
-        // if any of it fails.
-        let to_provider = entry.model.provider.clone();
-        let to_model = entry.model.id.clone();
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let request = pi::agent::FailoverSwapRequest {
-            entry: &entry,
-            api_key: key.clone(),
-            provider: provider_impl,
-            from_provider: &from_provider,
-            from_model: &from_model,
-            class,
-            chain_position: cursor,
-            // The LIVE level, which is what print mode has always clamped
-            // against here. RPC clamps against the level originally requested;
-            // see FailoverSwapRequest::thinking_level_to_clamp.
-            thinking_level_to_clamp: session
-                .agent
-                .stream_options()
-                .thinking_level
-                .unwrap_or_default(),
-            require_incomplete_tail,
-        };
-        session.commit_failover(&cx, &request).await?;
-        failover_state.set_chain_position(cursor);
-        // Cross-prompt record (bd-gm481.1): what to return to, and when the
-        // cooldown on doing so started. The primary is only captured on the
-        // first swap of a chain — a second hop moves away from a fallback, and
-        // the identity to restore is still the model the chain started from.
-        failover_state.record_swap(
-            PrintFailoverPrimary {
-                provider: from_provider.clone(),
-                model_id: from_model.clone(),
-                requested_thinking_level,
-            },
-            (to_provider.clone(), to_model.clone()),
-            std::time::Instant::now(),
-        );
-
-        if is_json {
-            if let Some(attempt) = retry_attempt_to_end {
-                emit_json_event(&AgentEvent::AutoRetryEnd {
-                    success: false,
-                    attempt,
-                    final_error: Some(error_text.to_string()),
-                });
-            }
-            emit_json_event(&AgentEvent::FailoverStart {
-                from_provider: from_provider.clone(),
-                from_model: from_model.clone(),
-                to_provider: to_provider.clone(),
-                to_model: to_model.clone(),
-                class: format!("{class:?}").to_ascii_lowercase(),
-                // Budget position, not chain position: this swap is the
-                // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn`
-                // (bd-oqo03).
-                attempt: swaps_so_far.saturating_add(1),
-                chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
+    if is_json {
+        if let Some(attempt) = retry_attempt_to_end {
+            emit_json_event(&AgentEvent::AutoRetryEnd {
+                success: false,
+                attempt,
+                final_error: Some(error_text.to_string()),
             });
         }
-
-        return Ok(Some((to_provider, to_model)));
+        emit_json_event(&AgentEvent::FailoverStart {
+            from_provider: committed.from_provider.clone(),
+            from_model: committed.from_model.clone(),
+            to_provider: committed.to_provider.clone(),
+            to_model: committed.to_model.clone(),
+            class: format!("{class:?}").to_ascii_lowercase(),
+            // Budget position, not chain position: this swap is the
+            // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
+            attempt: swaps_so_far.saturating_add(1),
+            chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
+        });
     }
-    // Chain exhausted: record the end position so a later turn does not re-walk
-    // entries this turn already rejected.
-    failover_state.set_chain_position(walk.position());
-    Ok(None)
+
+    Ok(Some((committed.to_provider, committed.to_model)))
 }
 
 /// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`

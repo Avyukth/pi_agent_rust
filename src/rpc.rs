@@ -6171,96 +6171,69 @@ async fn try_failover_to_next_chain_entry(
     // with that per-turn budget, or a cap of one permanently blocks chain entry
     // two. Print mode walks the same chain with the same cursor rules; both now
     // use the one definition (bd-u2qv4).
-    let mut walk = crate::failover::FailoverWalk::new(
-        &chain,
-        state.failover_chain_position.unwrap_or(0),
-        &current_provider,
-        &current_model,
-    );
-    while let Some((entry_index, spec)) = walk.next_spec() {
-        let position = walk.position();
-        let Some(entry) = crate::failover::resolve_chain_spec(spec, &options.available_models)
-        else {
-            continue;
-        };
-        let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
-        if model_requires_configured_credential(&entry) && key.is_none() {
-            // Skip entries we cannot authenticate: failing over into an
-            // auth error would be strictly worse than the quota error.
-            continue;
-        }
+    // The walk, the credential check, the provider construction and the
+    // persisted transition are all AgentSession::try_failover_swap, shared with
+    // print mode (bd-u2qv4). What stays here is RPC's own: the admission gate
+    // it passes in, its shared-state bookkeeping, and its event frames.
+    let attempt = crate::agent::FailoverSwapAttempt {
+        chain: &chain,
+        start_position: state.failover_chain_position.unwrap_or(0),
+        available_models: &options.available_models,
+        auth: &options.auth,
+        cli_api_key: options.cli_api_key.as_deref(),
+        class,
+        // The level originally requested, before any swap: clamping against the
+        // LIVE level instead would ratchet it down through whatever the previous
+        // fallback allowed. Print mode does the latter; see
+        // FailoverSwapRequest::thinking_level_to_clamp.
+        thinking_level_to_clamp: primary_model.requested_thinking_level,
+        require_incomplete_tail,
+    };
+    let admission = state.provider_admission.clone();
+    let outcome = guard
+        .try_failover_swap(cx, &attempt, Some(&admission))
+        .await?;
+    let Some(committed) = outcome.committed else {
+        // Deliberately NOT recorded on an exhausted chain, which is what RPC
+        // has always done: the next turn re-walks from the last COMMITTED
+        // position, so an entry rejected only because its credential was
+        // missing gets another look once that credential appears. Print mode
+        // records the exhausted position instead and skips those entries for
+        // the life of the process. Preserved rather than unified here; the
+        // divergence is real and tracked separately.
+        return Ok(false);
+    };
+    state.failover_chain_position = Some(outcome.next_position);
 
-        let Ok(provider_impl) = providers::create_provider(
-            &entry,
-            guard
-                .extensions
-                .as_ref()
-                .map(crate::extensions::ExtensionRegion::manager),
-        ) else {
-            continue;
-        };
-
-        let to_provider = entry.model.provider.clone();
-        let to_model = entry.model.id.clone();
-
-        // The whole persisted transition — revert, transcript record, save,
-        // install — is AgentSession::commit_failover_swap, shared with print
-        // mode (bd-u2qv4). The live transcript, provider/options, shared
-        // cooldown and event stream remain untouched if any of it fails; the
-        // admission gate passed in is what keeps provider re-entry quarantined
-        // if the process dies between persistence and installation.
-        let request = crate::agent::FailoverSwapRequest {
-            entry: &entry,
-            api_key: key.clone(),
-            provider: provider_impl,
-            from_provider: &current_provider,
-            from_model: &current_model,
-            class,
-            chain_position: position,
-            // The level originally requested, before any swap: clamping against
-            // the LIVE level instead would ratchet it down through whatever the
-            // previous fallback allowed. Print mode does the latter; see
-            // FailoverSwapRequest::thinking_level_to_clamp.
-            thinking_level_to_clamp: primary_model.requested_thinking_level,
-            require_incomplete_tail,
-        };
-        let admission = state.provider_admission.clone();
-        guard
-            .commit_failover_swap(cx, &request, Some(&admission))
-            .await?;
-
-        state.failover_primary = Some(primary_model.clone());
-        state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
-        state.failover_chain_position = Some(position);
-        if let Some(tracker) = state.failover_cooldown.as_mut() {
-            tracker.record_primary_failure(std::time::Instant::now());
-        }
-        state.provider_admission.clear();
-
-        let event = agent_event(AgentEvent::FailoverStart {
-            from_provider: current_provider.clone(),
-            from_model: current_model.clone(),
-            to_provider: to_provider.clone(),
-            to_model: to_model.clone(),
-            class: format!("{class:?}").to_ascii_lowercase(),
-            // Budget position, not chain position: this swap is the
-            // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
-            attempt: swaps_so_far.saturating_add(1),
-            chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
-        });
-        drop(state);
-        drop(guard);
-        if let Some(attempt) = retry_attempt_to_end {
-            let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
-                success: false,
-                attempt,
-                final_error: Some(error_text.to_string()),
-            }));
-        }
-        let _ = out_tx.send(event);
-        return Ok(true);
+    state.failover_primary = Some(primary_model.clone());
+    state.active_failover_model = Some((committed.to_provider.clone(), committed.to_model.clone()));
+    if let Some(tracker) = state.failover_cooldown.as_mut() {
+        tracker.record_primary_failure(std::time::Instant::now());
     }
-    Ok(false)
+    state.provider_admission.clear();
+
+    let event = agent_event(AgentEvent::FailoverStart {
+        from_provider: committed.from_provider.clone(),
+        from_model: committed.from_model.clone(),
+        to_provider: committed.to_provider.clone(),
+        to_model: committed.to_model.clone(),
+        class: format!("{class:?}").to_ascii_lowercase(),
+        // Budget position, not chain position: this swap is the
+        // (swaps_so_far + 1)-th of `retry.maxFailoversPerTurn` (bd-oqo03).
+        attempt: swaps_so_far.saturating_add(1),
+        chain_index: u32::try_from(committed.entry_index).unwrap_or(u32::MAX),
+    });
+    drop(state);
+    drop(guard);
+    if let Some(attempt) = retry_attempt_to_end {
+        let _ = out_tx.send(agent_event(AgentEvent::AutoRetryEnd {
+            success: false,
+            attempt,
+            final_error: Some(error_text.to_string()),
+        }));
+    }
+    let _ = out_tx.send(event);
+    Ok(true)
 }
 
 async fn run_extension_command(
