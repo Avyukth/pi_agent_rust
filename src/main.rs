@@ -2560,10 +2560,21 @@ async fn run(
                 // user has set `retry.enabled = false`, so turning it off
                 // still means nobody re-enters the provider on their behalf.
                 // The retry events it emits already render here as system
-                // notes. A configured fallback CHAIN is still inert: walking
-                // it needs the provider swap, which has not moved out of this
-                // binary yet.
+                // notes.
                 retry: pi::failover::RetryPolicy::from_config(&config),
+                // Cross-model failover (bd-u2qv4). A configured
+                // `retry.fallbackChains` used to be inert on this stack: the
+                // chain the user set up never ran on the surface they set it
+                // up for, while the identical request in print mode or over
+                // RPC walked it. `from_config` yields None when no chain is
+                // configured, which is the same condition under which the
+                // other surfaces decline.
+                failover: pi::sdk::FailoverOptions::from_config(
+                    &config,
+                    model_registry.get_available(),
+                    auth.clone(),
+                    cli.api_key.clone(),
+                ),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
