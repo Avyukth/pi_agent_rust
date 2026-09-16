@@ -6,12 +6,13 @@
 use super::{AnthropicProvider, StreamState};
 use crate::error::{Error, Result};
 use crate::http::client::Response;
-use crate::model::StreamEvent;
+use crate::model::{AssistantMessage, ContentBlock, StreamEvent};
 use crate::provider::{Context, Provider, StreamOptions};
 use crate::sse::SseStream;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::pin::Pin;
 
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
@@ -112,6 +113,151 @@ impl AnthropicProvider {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentKind {
+    Text,
+    Thinking,
+    Tool,
+}
+
+struct ContentState {
+    kind: ContentKind,
+    closed: bool,
+    initial_tool_input: Option<Value>,
+    saw_tool_delta: bool,
+}
+
+/// Check the public event boundary, not just JSON syntax. A terminal marker
+/// does not make an unfinished block or invalid tool argument object usable.
+/// The underlying parser remains shared with existing fixtures and fuzzing.
+#[derive(Default)]
+struct StreamLifecycle {
+    started: bool,
+    blocks: Vec<ContentState>,
+    tool_ids: HashSet<String>,
+}
+
+impl StreamLifecycle {
+    fn open(
+        &mut self,
+        index: usize,
+        kind: ContentKind,
+        initial_tool_input: Option<Value>,
+    ) -> Result<()> {
+        if !self.started || index != self.blocks.len() {
+            return Err(protocol_error("content block start has an invalid message or index"));
+        }
+        self.blocks.push(ContentState {
+            kind,
+            closed: false,
+            initial_tool_input,
+            saw_tool_delta: false,
+        });
+        Ok(())
+    }
+
+    fn active(&mut self, index: usize, kind: ContentKind) -> Result<&mut ContentState> {
+        self.blocks
+            .get_mut(index)
+            .filter(|block| !block.closed && block.kind == kind)
+            .ok_or_else(|| protocol_error("content event does not match an open block"))
+    }
+
+    fn accept(
+        &mut self,
+        event: &mut StreamEvent,
+        raw: &str,
+        partial: &mut AssistantMessage,
+    ) -> Result<()> {
+        match event {
+            StreamEvent::Start { .. } => {
+                if self.started {
+                    return Err(protocol_error("duplicate message_start"));
+                }
+                self.started = true;
+            }
+            StreamEvent::TextStart { content_index } => {
+                self.open(*content_index, ContentKind::Text, None)?;
+            }
+            StreamEvent::ThinkingStart { content_index } => {
+                self.open(*content_index, ContentKind::Thinking, None)?;
+            }
+            StreamEvent::ToolCallStart { content_index, id, name } => {
+                if id.trim().is_empty() || name.trim().is_empty() || !self.tool_ids.insert(id.clone()) {
+                    return Err(protocol_error("tool call has an empty or duplicate identity"));
+                }
+                // Only tool starts need the original input object. Token deltas
+                // are decoded once, by the existing parser, with no extra parse.
+                let wire: Value = serde_json::from_str(raw)
+                    .map_err(|_| protocol_error("invalid tool start JSON"))?;
+                let input = wire
+                    .get("content_block")
+                    .and_then(|block| block.get("input"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if !input.is_object() {
+                    return Err(protocol_error("initial tool input is not a JSON object"));
+                }
+                self.open(*content_index, ContentKind::Tool, Some(input))?;
+            }
+            StreamEvent::TextDelta { content_index, .. } => {
+                self.active(*content_index, ContentKind::Text)?;
+            }
+            StreamEvent::ThinkingDelta { content_index, .. } => {
+                self.active(*content_index, ContentKind::Thinking)?;
+            }
+            StreamEvent::ToolCallDelta { content_index, .. } => {
+                self.active(*content_index, ContentKind::Tool)?.saw_tool_delta = true;
+            }
+            StreamEvent::TextEnd { content_index, .. } => {
+                self.active(*content_index, ContentKind::Text)?.closed = true;
+            }
+            StreamEvent::ThinkingEnd { content_index, .. } => {
+                self.active(*content_index, ContentKind::Thinking)?.closed = true;
+            }
+            StreamEvent::ToolCallEnd { content_index, tool_call } => {
+                let block = self.active(*content_index, ContentKind::Tool)?;
+                if !block.saw_tool_delta {
+                    // A zero-argument call can close without any JSON deltas.
+                    // Preserve an initial object rather than treating the empty
+                    // accumulator as malformed JSON or inventing null arguments.
+                    tool_call.arguments = block.initial_tool_input.take()
+                        .ok_or_else(|| protocol_error("tool call lost its initial input"))?;
+                }
+                if !tool_call.arguments.is_object() {
+                    return Err(protocol_error("tool input is not a complete JSON object"));
+                }
+                let Some(ContentBlock::ToolCall(stored)) = partial.content.get_mut(*content_index) else {
+                    return Err(protocol_error("tool call does not match accumulated content"));
+                };
+                if stored.id != tool_call.id || stored.name != tool_call.name {
+                    return Err(protocol_error("tool call identity changed during streaming"));
+                }
+                stored.arguments.clone_from(&tool_call.arguments);
+                block.closed = true;
+            }
+            StreamEvent::Done { message, .. } => {
+                if !self.started {
+                    return Err(protocol_error("message_stop arrived before message_start"));
+                }
+                if self.blocks.iter().any(|block| !block.closed) {
+                    return Err(protocol_error("message_stop left unfinished content (unexpected EOF)"));
+                }
+                if message.content.len() != self.blocks.len() {
+                    return Err(protocol_error("completed message does not match streamed content"));
+                }
+            }
+            // Provider errors are valid terminal events even before message_start.
+            StreamEvent::Error { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn protocol_error(message: &str) -> Error {
+    Error::api(format!("Anthropic stream protocol error: {message}"))
+}
+
 /// Both native Anthropic and Vertex use this exact stream driver. Owning the
 /// response keeps socket cleanup tied to the stream's lifetime (including drop).
 pub(super) fn response_stream(
@@ -120,10 +266,17 @@ pub(super) fn response_stream(
     api: String,
     provider: String,
 ) -> EventStream {
-    let event_source = SseStream::new(response.bytes_stream());
+    wire_stream(response.bytes_stream(), model, api, provider)
+}
+
+fn wire_stream<S>(source: S, model: String, api: String, provider: String) -> EventStream
+where
+    S: Stream<Item = std::io::Result<Vec<u8>>> + Unpin + Send + 'static,
+{
+    let state = StreamState::new(SseStream::new(source), model, api, provider);
     Box::pin(stream::unfold(
-        StreamState::new(event_source, model, api, provider),
-        |mut state| async move {
+        (state, StreamLifecycle::default()),
+        |(mut state, mut lifecycle)| async move {
             if state.done {
                 return None;
             }
@@ -135,19 +288,23 @@ pub(super) fn response_stream(
                             continue;
                         }
                         match state.process_event(&msg.data) {
-                            Ok(Some(event)) => {
+                            Ok(Some(mut event)) => {
+                                if let Err(error) = lifecycle.accept(&mut event, &msg.data, &mut state.partial) {
+                                    state.done = true;
+                                    return Some((Err(error), (state, lifecycle)));
+                                }
                                 if matches!(
                                     &event,
                                     StreamEvent::Done { .. } | StreamEvent::Error { .. }
                                 ) {
                                     state.done = true;
                                 }
-                                return Some((Ok(event), state));
+                                return Some((Ok(event), (state, lifecycle)));
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 state.done = true;
-                                return Some((Err(error), state));
+                                return Some((Err(error), (state, lifecycle)));
                             }
                         }
                     }
@@ -170,7 +327,7 @@ pub(super) fn response_stream(
                             }
                         }
                         state.done = true;
-                        return Some((Err(Error::sse(&error)), state));
+                        return Some((Err(Error::sse(&error)), (state, lifecycle)));
                     }
                     None => {
                         state.done = true;
@@ -178,7 +335,7 @@ pub(super) fn response_stream(
                             Err(Error::api(
                                 "Anthropic stream ended before message_stop (unexpected EOF)",
                             )),
-                            state,
+                            (state, lifecycle),
                         ));
                     }
                 }
@@ -190,6 +347,8 @@ pub(super) fn response_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::StopReason;
+    use asupersync::runtime::RuntimeBuilder;
 
     #[test]
     fn vertex_wire_format_keeps_messages_tools_thinking_and_cache() {
@@ -228,5 +387,248 @@ mod tests {
         ] {
             assert!(vertex_request(body).is_err());
         }
+    }
+
+    fn collect_wire(events: impl IntoIterator<Item = Value>) -> Vec<Result<StreamEvent>> {
+        let chunks: Vec<_> = events
+            .into_iter()
+            .map(|event| Ok::<_, std::io::Error>(format!("data: {event}\n\n").into_bytes()))
+            .collect();
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(wire_stream(
+                stream::iter(chunks),
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            ).collect())
+    }
+
+    fn start() -> Value {
+        json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}})
+    }
+
+    fn finish() -> [Value; 2] {
+        [
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}),
+            json!({"type": "message_stop"}),
+        ]
+    }
+
+    fn tool_start(index: usize, id: &str, input: Value) -> Value {
+        json!({"type": "content_block_start", "index": index, "content_block": {
+            "type": "tool_use", "id": id, "name": "read", "input": input
+        }})
+    }
+
+    fn tool_delta(index: usize, json: &str) -> Value {
+        json!({"type": "content_block_delta", "index": index, "delta": {
+            "type": "input_json_delta", "partial_json": json
+        }})
+    }
+
+    fn stop(index: usize) -> Value {
+        json!({"type": "content_block_stop", "index": index})
+    }
+
+    fn assert_terminal_error(events: &[Result<StreamEvent>]) {
+        assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1, "{events:?}");
+        assert!(events.last().is_some_and(Result::is_err), "{events:?}");
+        assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::Done { .. }))), "{events:?}");
+    }
+
+    #[test]
+    fn zero_argument_calls_are_objects_in_events_and_final_message() {
+        let events = collect_wire([
+            start(), tool_start(0, "call-a", json!({})), stop(0),
+        ].into_iter().chain(finish()));
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let call = events.iter().find_map(|event| match event {
+            Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
+            _ => None,
+        }).expect("completed tool");
+        assert_eq!(call.arguments, json!({}));
+        let Some(Ok(StreamEvent::Done { reason, message })) = events.last() else {
+            panic!("expected Done");
+        };
+        assert_eq!(*reason, StopReason::ToolUse);
+        let ContentBlock::ToolCall(stored) = &message.content[0] else {
+            panic!("expected stored call");
+        };
+        assert_eq!(stored.arguments, call.arguments);
+    }
+
+    #[test]
+    fn initial_input_is_preserved_when_no_argument_deltas_arrive() {
+        let input = json!({"path": "initial.txt"});
+        let events = collect_wire([
+            start(), tool_start(0, "call-a", input.clone()), stop(0),
+        ].into_iter().chain(finish()));
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+            panic!("expected Done");
+        };
+        let ContentBlock::ToolCall(stored) = &message.content[0] else {
+            panic!("expected stored call");
+        };
+        assert_eq!(stored.arguments, input);
+    }
+
+    #[test]
+    fn interleaved_calls_keep_initial_and_streamed_inputs_separate() {
+        let events = collect_wire([
+            start(),
+            tool_start(0, "call-a", json!({"path": "initial.txt"})),
+            tool_start(1, "call-b", json!({})),
+            tool_delta(1, "{\"path\":"),
+            stop(0),
+            tool_delta(1, "\"streamed.txt\"}"),
+            stop(1),
+        ].into_iter().chain(finish()));
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let calls: Vec<_> = events.iter().filter_map(|event| match event {
+            Ok(StreamEvent::ToolCallEnd { tool_call, .. }) => Some(tool_call),
+            _ => None,
+        }).collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call-a");
+        assert_eq!(calls[0].arguments, json!({"path": "initial.txt"}));
+        assert_eq!(calls[1].id, "call-b");
+        assert_eq!(calls[1].arguments, json!({"path": "streamed.txt"}));
+    }
+
+    #[test]
+    fn incomplete_or_non_object_arguments_never_emit_completed_calls() {
+        for data in ["{\"path\":", "{bad}", "null", "[]", "42", "\"text\"", ""] {
+            let events = collect_wire([
+                start(), tool_start(0, "call-a", json!({})), tool_delta(0, data), stop(0),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))));
+        }
+    }
+
+    #[test]
+    fn malformed_initial_tool_input_is_not_replaced_with_empty_arguments() {
+        for input in [json!(null), json!([]), json!("not-an-object")] {
+            let events = collect_wire([
+                start(), tool_start(0, "call-a", input), stop(0),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+            assert!(!events.iter().any(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))));
+        }
+    }
+
+    #[test]
+    fn message_stop_cannot_complete_unclosed_text_thinking_or_tool_blocks() {
+        for kind in ["text", "thinking", "tool_use"] {
+            let events = collect_wire([
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {
+                    "type": kind, "id": "call-a", "name": "read", "input": {}
+                }}),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+            assert!(events.last().unwrap().as_ref().unwrap_err().to_string().contains("unfinished content"));
+        }
+    }
+
+    #[test]
+    fn wrong_delta_kind_and_deltas_after_block_close_are_terminal() {
+        for wrong_kind in [true, false] {
+            let mut input = vec![
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+            ];
+            if wrong_kind {
+                input.push(json!({"type": "content_block_delta", "index": 0, "delta": {
+                    "type": "thinking_delta", "thinking": "wrong block"
+                }}));
+            } else {
+                input.push(stop(0));
+                input.push(json!({"type": "content_block_delta", "index": 0, "delta": {
+                    "type": "text_delta", "text": "late text"
+                }}));
+            }
+            input.extend(finish());
+            assert_terminal_error(&collect_wire(input));
+        }
+    }
+
+    #[test]
+    fn sparse_and_duplicate_block_indices_are_rejected_without_padding() {
+        for index in [0, 2, u32::MAX] {
+            let events = collect_wire([
+                start(),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+                json!({"type": "content_block_start", "index": index, "content_block": {"type": "text"}}),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_ids_and_empty_tool_identities_are_rejected() {
+        for id in ["", "  ", "call-a"] {
+            let events = collect_wire([
+                start(), tool_start(0, "call-a", json!({})), stop(0),
+                tool_start(1, id, json!({})), stop(1),
+            ].into_iter().chain(finish()));
+            assert_terminal_error(&events);
+            assert_eq!(events.iter().filter(|event| matches!(event, Ok(StreamEvent::ToolCallEnd { .. }))).count(), 1);
+        }
+    }
+
+    #[test]
+    fn message_and_content_events_require_a_single_message_start() {
+        for input in [
+            vec![json!({"type": "message_stop"})],
+            vec![start(), start(), json!({"type": "message_stop"})],
+            vec![json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "orphan"}})],
+        ] {
+            assert_terminal_error(&collect_wire(input));
+        }
+    }
+
+    #[test]
+    fn signature_only_and_redacted_thinking_blocks_remain_valid() {
+        let events = collect_wire([
+            start(),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "c2ln"}}),
+            stop(0),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "b3BhcXVl"}}),
+            stop(1),
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            json!({"type": "message_stop"}),
+        ]);
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let Some(Ok(StreamEvent::Done { message, .. })) = events.last() else {
+            panic!("expected Done");
+        };
+        let ContentBlock::Thinking(thinking) = &message.content[0] else {
+            panic!("expected thinking");
+        };
+        assert!(thinking.thinking.is_empty());
+        assert_eq!(thinking.thinking_signature.as_deref(), Some("c2ln"));
+        let ContentBlock::RedactedThinking(redacted) = &message.content[1] else {
+            panic!("expected opaque thinking");
+        };
+        assert_eq!(redacted.data, "b3BhcXVl");
+    }
+
+    #[test]
+    fn provider_errors_before_message_start_remain_terminal_provider_errors() {
+        let events = collect_wire([
+            json!({"type": "error", "error": {"message": "overloaded"}}),
+            start(),
+            json!({"type": "message_stop"}),
+        ]);
+        assert_eq!(events.len(), 1);
+        let Ok(StreamEvent::Error { error, .. }) = &events[0] else {
+            panic!("expected provider Error");
+        };
+        assert_eq!(error.error_message.as_deref(), Some("overloaded"));
     }
 }
