@@ -50,10 +50,9 @@ fn object_id(bytes: &[u8]) -> Result<String> {
     Ok(id.to_string())
 }
 
-/// Resolve the actual repository root, including when called from a subdirectory.
-/// Strip only Git's record terminator, never whitespace belonging to the path.
-pub(super) fn repository_root(cwd: &Path) -> Result<PathBuf> {
-    let mut bytes = run(command(cwd).args(["rev-parse", "--show-toplevel"]), "locate repository root")?;
+/// Strip only Git's record terminator, never whitespace belonging to a path.
+fn repository_path(cwd: &Path, flag: &str) -> Result<PathBuf> {
+    let mut bytes = run(command(cwd).args(["rev-parse", flag]), "locate repository path")?;
     if bytes.last() == Some(&b'\n') { bytes.pop(); }
     #[cfg(windows)]
     if bytes.last() == Some(&b'\r') { bytes.pop(); }
@@ -69,13 +68,21 @@ pub(super) fn repository_root(cwd: &Path) -> Result<PathBuf> {
     path.canonicalize().map_err(|error| failure("PI_ISO_SNAPSHOT", &format!("Cannot resolve repository root: {error}")))
 }
 
+/// Resolve the actual repository root, including subdirectory callers.
+pub(super) fn repository_root(cwd: &Path) -> Result<PathBuf> {
+    repository_path(cwd, "--show-toplevel")
+}
+
 struct Scratch {
     root: PathBuf,
 }
 
 impl Scratch {
-    fn new() -> Result<Self> {
-        let root = std::env::temp_dir().join(format!("pi-iso-index-{}", uuid::Uuid::new_v4().simple()));
+    fn new(repo: &Path) -> Result<Self> {
+        // TMPDIR can itself be inside the working tree. Snapshot internals
+        // must never be staged into the very tree they are recording.
+        let root = repository_path(repo, "--absolute-git-dir")?
+            .join(format!("pi-iso-index-{}", uuid::Uuid::new_v4().simple()));
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -140,8 +147,15 @@ pub(super) struct Snapshot {
 
 impl Snapshot {
     pub(super) fn checkout(&self, repo: &Path, path: &Path, branch: &str) -> Result<()> {
+        let parent = path.parent().ok_or_else(|| failure("PI_ISO_WORKTREE_PATH", "Missing worktree parent directory"))?
+            .canonicalize().map_err(|_| failure("PI_ISO_WORKTREE_PATH", "Cannot resolve worktree parent directory"))?;
+        if !path.is_absolute() || parent.starts_with(repository_root(repo)?) {
+            return Err(failure("PI_ISO_NESTED_TEMP", "Choose an absolute temporary directory outside the source repository; a nested child checkout would contaminate later snapshots"));
+        }
+        let mut hook_setting = std::ffi::OsString::from("core.hooksPath=");
+        hook_setting.push(self.scratch.root.join("hooks"));
         run(command(repo)
-            .arg("-c").arg(format!("core.hooksPath={}", self.scratch.root.join("hooks").display()))
+            .arg("-c").arg(hook_setting)
             .args(["worktree", "add", "-b", branch]).arg(path).arg(&self.baseline),
             "create isolated checkout")?;
         Ok(())
@@ -161,7 +175,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         return Err(failure("PI_ISO_SNAPSHOT", "Cannot inspect checkout mode"));
     }
     let head = object_id(&run(command(repo).args(["rev-parse", "--verify", "HEAD^{commit}"]), "resolve parent commit")?)?;
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new(repo)?;
     let parent_entries = scratch.entries(command(repo), "parent")?;
     reject_gitlinks(&parent_entries)?;
     run(scratch.command(repo).args(["read-tree", "--empty"]), "initialize private index")?;
@@ -187,4 +201,52 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         return Err(failure("PI_ISO_PARENT_CHANGED", "Parent HEAD or index changed while capturing isolation; retry the delegation"));
     }
     Ok(Snapshot { baseline, scratch })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repository() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        run(command(repo.path()).args(["init", "-b", "main"]), "initialize fixture").unwrap();
+        fs::write(repo.path().join("base.txt"), "source\n").unwrap();
+        run(command(repo.path()).args(["add", "."]), "stage fixture").unwrap();
+        run(command(repo.path()).args([
+            "-c", "user.name=Isolation Fixture", "-c", "user.email=isolation@localhost",
+            "-c", "commit.gpgSign=false", "commit", "-m", "initial",
+        ]), "commit fixture").unwrap();
+        repo
+    }
+
+    #[test]
+    fn private_index_files_stay_in_git_metadata_and_are_not_snapshotted() {
+        let repo = repository();
+        let snapshot = capture(repo.path(), "private-index-location").unwrap();
+        let scratch = snapshot.scratch.root.clone();
+        assert!(scratch.starts_with(repository_path(repo.path(), "--absolute-git-dir").unwrap()));
+        assert!(scratch.join("index").is_file());
+        let names = run(command(repo.path()).args([
+            "ls-tree", "--name-only", "-r", &snapshot.baseline,
+        ]), "inspect snapshot").unwrap();
+        assert_eq!(names, b"base.txt\n");
+        drop(snapshot);
+        assert!(!scratch.exists(), "only private scratch files are cleaned up");
+    }
+
+    #[test]
+    fn nested_temporary_checkout_is_rejected_before_worktree_creation() {
+        let repo = repository();
+        let temporary = repo.path().join("temporary");
+        fs::create_dir(&temporary).unwrap();
+        let snapshot = capture(repo.path(), "nested-temp").unwrap();
+        let path = temporary.join("pi-iso-nested");
+        let error = snapshot.checkout(repo.path(), &path, "pi-iso-nested").unwrap_err();
+        assert!(error.to_string().contains("PI_ISO_NESTED_TEMP"), "{error}");
+        assert!(!path.exists());
+        let branches = run(command(repo.path()).args([
+            "for-each-ref", "--format=%(refname)", "refs/heads/pi-iso-nested",
+        ]), "inspect refs").unwrap();
+        assert!(branches.is_empty());
+    }
 }
