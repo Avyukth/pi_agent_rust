@@ -6,6 +6,11 @@
 //! ids, and `memory_edit` updates/invalidates/forgets by id. Project-scoped
 //! by default: the bank for this repo stays with this repo.
 //!
+//! `retain` and `recall` also accept `scope: "session"` for exact-text shared
+//! keys. These use the host registry's live session identity, not tool input.
+//! Shared values survive compaction but never enter the project-fact index,
+//! startup mental model, or reflection corpus. See [`shared`] (bd-1i2pn).
+//!
 //! Store: per-project SQLite under the agent config dir
 //! (`<global_dir>/memory/<project-key>.sqlite`), project-key = SHA-256 of
 //! the canonicalized primary root path — the config dir is the stable
@@ -16,10 +21,9 @@
 //! engine (frankensearch-style) can replace FTS scoring without tool-schema
 //! changes.
 //!
-//! Privacy: `retain` screens content through a dedicated secret screener.
-//! bd-cv653.7.9 (pattern vault + entropy rules) has not landed yet, so the
-//! in-module screener is the interim floor; TODO(.7.9): swap to the shared
-//! vault when it lands so one detector serves every surface.
+//! Privacy: project facts and tags are screened before retention. Shared
+//! session values preserve exact text and are only returned on explicit read
+//! or listing; they are not a secret vault. Errors never echo shared values.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +34,9 @@ use crate::error::{Error, Result};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
 
 mod reflection;
+pub mod shared;
+#[cfg(test)]
+mod shared_tests;
 mod transactions;
 pub use reflection::ReflectTool;
 
@@ -657,7 +664,7 @@ fn secret_patterns() -> &'static Vec<(regex::Regex, &'static str)> {
 }
 
 /// Replace any detected credential in `content` with a placeholder.
-/// Memories never store detected secrets.
+/// Project facts never store detected secrets; shared session values are exact.
 #[must_use]
 pub fn screen_secrets(content: &str) -> String {
     let mut screened = content.to_string();
@@ -682,15 +689,16 @@ fn text_output(text: String, details: serde_json::Value, is_error: bool) -> Tool
     }
 }
 
-/// `retain`: queue a durable fact/lesson/preference/decision.
+/// `retain`: project facts by default, or exact shared session keys on request.
 pub struct RetainTool {
     store: Arc<MemoryStore>,
+    session_scope: Option<crate::jobs::JobSessionScope>,
 }
 
 impl RetainTool {
     #[must_use]
     pub const fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self { store, session_scope: None }
     }
 }
 
@@ -715,31 +723,35 @@ impl Tool for RetainTool {
     }
 
     fn description(&self) -> &str {
-        "Store a durable memory for this project (fact, lesson, preference, \
-         or decision). Set supersedes to an active memory id to atomically \
-         replace an outdated fact while preserving its history. Secret-looking \
-         content and tags are redacted before storage."
+        "Store a durable project fact, lesson, preference or decision (default scope: project). \
+         Set supersedes to atomically replace an active fact; project content and tags are screened for secrets. \
+         For agent coordination, use scope=session with key and exact-text content instead. Shared keys survive \
+         compaction, stay isolated from other sessions and project facts, and support expectedRevision \
+         ('absent' to create only, or a revision from recall to avoid overwriting newer work)."
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "content": { "type": "string", "description": "The fact or lesson to remember" },
+                "content": { "type": "string", "description": "Project fact, or exact shared text (session values: at most 65536 UTF-8 bytes)" },
+                "scope": { "type": "string", "enum": ["project", "session"], "description": "Default project; session selects shared key-value storage using the host's current session" },
+                "key": { "type": "string", "maxLength": 128, "description": "Required for session scope; letters/digits first, then letters, digits, dot, underscore or hyphen" },
+                "expectedRevision": { "type": "string", "description": "Session scope only: current revision from recall, or absent for create-only. Omitted opts into last-writer-wins" },
                 "kind": {
                     "type": "string",
                     "enum": ["fact", "lesson", "preference", "decision"],
-                    "description": "Memory kind (default: fact)"
+                    "description": "Project scope only: memory kind (default fact)"
                 },
                 "tags": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional tags for later filtering"
+                    "description": "Project scope only: optional tags"
                 },
                 "supersedes": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Active memory id to replace atomically; the old fact remains in history"
+                    "description": "Project scope only: active memory id to replace atomically, preserving history"
                 }
             },
             "required": ["content"]
@@ -750,12 +762,22 @@ impl Tool for RetainTool {
         ToolEffects::write()
     }
 
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.session_scope = Some(scope);
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if shared::session_requested(&input)? {
+            return shared::write_output(&self.store, self.session_scope.as_ref(), input).await;
+        }
+        if input.get("key").is_some() || input.get("expectedRevision").is_some() {
+            return Err(Error::validation("Shared keys and revisions require scope=session"));
+        }
         let input: RetainInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         if input.content.trim().is_empty() {
@@ -802,15 +824,16 @@ impl Tool for RetainTool {
     }
 }
 
-/// `recall`: search raw memories.
+/// `recall`: project search by default, or a shared-session key read/list.
 pub struct RecallTool {
     store: Arc<MemoryStore>,
+    session_scope: Option<crate::jobs::JobSessionScope>,
 }
 
 impl RecallTool {
     #[must_use]
     pub const fn new(store: Arc<MemoryStore>) -> Self {
-        Self { store }
+        Self { store, session_scope: None }
     }
 }
 
@@ -833,23 +856,36 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Search this project's memories (full-text, ranked by recency). \
-         Returns matching memory ids, kinds, and content."
+        "Search project facts by query (default scope=project, full-text ranked by recency). \
+         With scope=session, provide key to read exact shared text and its revision, or omit key \
+         to list shared keys using optional prefix, after and limit. Session keys are isolated \
+         from project facts and other sessions; session identity cannot be chosen in arguments."
     }
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Search text (FTS, AND across words)" },
-                "limit": { "type": "integer", "description": "Max results (default 10, max 100)" }
+                "scope": { "type": "string", "enum": ["project", "session"], "description": "Default project; session reads or lists the current session's shared keys" },
+                "query": { "type": "string", "description": "Required for project scope: search text (FTS, AND across words)" },
+                "key": { "type": "string", "maxLength": 128, "description": "Session scope only: exact key to read; cannot be combined with listing options" },
+                "prefix": { "type": "string", "description": "Session listing only: literal key prefix" },
+                "after": { "type": "string", "description": "Session listing only: nextCursor from the previous page" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Project search: default 10/max 100; session listing: default 25/max 50" }
             },
-            "required": ["query"]
+            "anyOf": [
+                { "required": ["query"] },
+                { "required": ["scope"], "properties": { "scope": { "const": "session" } } }
+            ]
         })
     }
 
     fn effects(&self) -> ToolEffects {
         ToolEffects::read()
+    }
+
+    fn bind_job_session_scope(&mut self, scope: crate::jobs::JobSessionScope) {
+        self.session_scope = Some(scope);
     }
 
     async fn execute(
@@ -858,6 +894,12 @@ impl Tool for RecallTool {
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
+        if shared::session_requested(&input)? {
+            return shared::read_or_list_output(&self.store, self.session_scope.as_ref(), input).await;
+        }
+        if ["key", "prefix", "after"].iter().any(|key| input.get(*key).is_some()) {
+            return Err(Error::validation("Shared key and listing options require scope=session"));
+        }
         let input: RecallInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
         let memories = self.store.recall(&input.query, input.limit)?;
