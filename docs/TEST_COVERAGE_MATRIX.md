@@ -16,8 +16,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Current `src/` inventory: 226 files.
-- Source-file rows below: 226.
+- Current `src/` inventory: 230 files.
+- Source-file rows below: 230.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -201,18 +201,22 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/provider.rs` | Provider trait/schema | Unit; `tests/provider_factory.rs`, `tests/provider_contract.rs`, `tests/provider_native_contract.rs`. |
 | `src/provider_metadata.rs` | Provider metadata | Unit; `tests/provider_metadata_comprehensive.rs`, `tests/provider_registry_guardrails.rs`. |
 | `src/providers/anthropic.rs` | Anthropic provider | Unit; `tests/provider_streaming/anthropic.rs`, `tests/e2e_provider_streaming.rs`. |
+| `src/providers/anthropic/transport.rs` | Anthropic Messages transport shared with Vertex (SSE lifecycle validation) | Unit (in-module, 15 tests). |
 | `src/providers/azure.rs` | Azure provider | Unit; `tests/provider_streaming/azure.rs`, provider error/path suites. |
 | `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites. |
 | `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
+| `src/providers/gemini/files.rs` | Credential-scoped Gemini Files API staging for large inline media | Unit (in-module, loopback HTTP fixtures); two concurrency cases are timing-flaky, see bd-eg6ng. |
+| `src/providers/gemini/thinking.rs` | Gemini thinking-budget mapping | Unit (in-module). |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; provider native/contract suites. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
 | `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
 | `src/providers/vertex.rs` | Vertex provider | Unit; provider native/contract suites. |
+| `src/providers/vertex/tests_transport.rs` | Vertex Anthropic transport tests over real loopback HTTP/SSE | Test module; one case is timing-flaky under parallel execution, see bd-eg6ng. |
 | `src/resource_governor.rs` | Resource governor | Unit; `tests/cargo_headroom_admission.rs`, `tests/resource_edge_cases.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/resources.rs` | Resource loading | Unit; `tests/resource_loader.rs`, `tests/resource_edge_cases.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/review.rs` | Review workflow | `tests/review.rs`. |
