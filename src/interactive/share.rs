@@ -880,8 +880,187 @@ mod tests {
     }
 }
 
+/// What a share attempt ended up doing, independent of which stack asked.
+///
+/// The classic stack maps these onto its `PiMsg` channel; the ftui driver maps
+/// them onto transcript entries. Keeping the `gh` driver free of both is what
+/// lets one implementation serve both stacks, instead of the default stack
+/// growing a second copy of a 250-line external-process flow (bd-ydz1t.1).
+#[derive(Debug, Clone)]
+pub enum ShareOutcome {
+    /// The gist exists. The string is the full user-facing report, and its
+    /// "Share URL:" / "Gist:" paragraphs are what the e2e scenarios match on.
+    Created(String),
+    /// The user aborted. Every surface reports this as a note, never an error.
+    Cancelled,
+    /// The attempt failed; the string explains it to the user.
+    Failed(String),
+}
+
+/// Export the session and publish it as a secret gist through `gh`.
+///
+/// Cancellable throughout: `abort_signal` is checked between stages and handed
+/// to every subprocess, and the temp file is released on all paths. Nothing
+/// here touches UI state, so the caller owns busy/idle and rendering.
+///
+/// `gh_path_override` is the `ghPath` setting; empty or unset means `gh` from
+/// `PATH`. A `public` argument is rejected by the caller, before this runs —
+/// the gist is always created with `--public=false`.
+#[allow(clippy::too_many_lines)]
+pub async fn run_share(
+    gh_path_override: Option<String>,
+    session: &Arc<Mutex<Session>>,
+    cwd: &Path,
+    abort_signal: &crate::agent::AbortSignal,
+) -> ShareOutcome {
+    let gh = gh_path_override
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "gh".to_string());
+    let mut share_viewer_url = match validated_share_viewer_url("pending") {
+        Ok(url) => url,
+        Err(err) => {
+            let details = sanitize_command_diagnostic(&err.to_string());
+            return ShareOutcome::Failed(format!("Refusing unsafe share viewer URL: {details}"));
+        }
+    };
+
+    let auth_args = vec![OsString::from("auth"), OsString::from("status")];
+    match run_command_output_with_timeout(&gh, &auth_args, cwd, abort_signal, SHARE_AUTH_TIMEOUT)
+        .await
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                let details = format_command_output(&output);
+                return ShareOutcome::Failed(format!(
+                    "`gh` is not authenticated.\n\
+                     Run `gh auth login` to authenticate, then retry `/share`.\n\n\
+                     {details}"
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ShareOutcome::Failed(
+                "GitHub CLI `gh` not found.\n\
+                 Install it from https://cli.github.com, then run `gh auth login`."
+                    .to_string(),
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+            return ShareOutcome::Cancelled;
+        }
+        Err(err) => {
+            let details = sanitize_command_diagnostic(&err.to_string());
+            return ShareOutcome::Failed(format!("Failed to run `gh auth status`: {details}"));
+        }
+    }
+
+    if abort_signal.is_aborted() {
+        return ShareOutcome::Cancelled;
+    }
+
+    // Sharing is user-cancellable and must not become an unbounded wait on a
+    // mutex held by another task. The caller has already marked itself busy, so
+    // brief contention is best surfaced as a retryable error.
+    let (html, session_name) = match capture_share_snapshot(session) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return ShareOutcome::Failed(
+                "Session is busy; retry `/share` after the current session update finishes."
+                    .to_string(),
+            );
+        }
+        Err(err) => {
+            let details = sanitize_command_diagnostic(&err.to_string());
+            return ShareOutcome::Failed(format!("Session cannot be shared: {details}"));
+        }
+    };
+
+    if abort_signal.is_aborted() {
+        return ShareOutcome::Cancelled;
+    }
+
+    let gist_desc = share_gist_description(session_name.as_deref());
+
+    let temp_file = match tempfile::Builder::new()
+        .prefix("pi-share-")
+        .suffix(".html")
+        .tempfile()
+    {
+        Ok(file) => file,
+        Err(err) => {
+            let details = sanitize_command_diagnostic(&err.to_string());
+            return ShareOutcome::Failed(format!("Failed to create temp file: {details}"));
+        }
+    };
+    let temp_path = temp_file.into_temp_path();
+    if let Err(err) = asupersync::fs::write(&temp_path, html.as_bytes()).await {
+        let details = sanitize_command_diagnostic(&err.to_string());
+        return ShareOutcome::Failed(format!("Failed to write temp file: {details}"));
+    }
+
+    let gist_args = vec![
+        OsString::from("gist"),
+        OsString::from("create"),
+        OsString::from("--public=false"),
+        OsString::from("--desc"),
+        OsString::from(&gist_desc),
+        temp_path.as_os_str().to_os_string(),
+    ];
+    let output = match run_command_output(&gh, &gist_args, cwd, abort_signal).await {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ShareOutcome::Failed(
+                "GitHub CLI `gh` not found.\n\
+                 Install it from https://cli.github.com, then run `gh auth login`."
+                    .to_string(),
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+            return ShareOutcome::Cancelled;
+        }
+        Err(err) => {
+            let details = sanitize_command_diagnostic(&err.to_string());
+            return ShareOutcome::Failed(format!("Failed to run `gh gist create`: {details}"));
+        }
+    };
+
+    if !output.status.success() {
+        let details = format_command_output(&output);
+        return ShareOutcome::Failed(format!("`gh gist create` failed.\n\n{details}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let Some((gist_url, gist_id)) = parse_gist_url_and_id(&stdout) else {
+        let details = format_command_output(&output);
+        return ShareOutcome::Failed(format!(
+            "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
+        ));
+    };
+
+    share_viewer_url.set_fragment(Some(&gist_id));
+    let share_url = share_viewer_url.to_string();
+    drop(temp_path);
+
+    // Copy viewer URL to clipboard (best-effort).
+    #[cfg(feature = "clipboard")]
+    {
+        if let Ok(mut clipboard) = ArboardClipboard::new() {
+            let _ = clipboard.set_text(share_url.clone());
+        }
+    }
+
+    // Paragraph breaks: the TUI renders this as markdown, and a single newline
+    // soft-wraps into the warning sentence, which can split "Share URL:" or the
+    // link itself across two terminal lines.
+    ShareOutcome::Created(format!(
+        "Created secret gist (not private; anyone with the URL can view it). Recognized secrets and the exact workspace cwd were redacted, but the transcript may still contain sensitive local context.\n\n\
+         Share URL: {share_url}\n\nGist: {gist_url}"
+    ))
+}
+
 impl PiApp {
-    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_share(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot share while processing".to_string());
@@ -912,258 +1091,19 @@ impl PiApp {
         let gh_path_override = self.config.gh_path.clone();
 
         runtime_handle.spawn(async move {
-            let gh = gh_path_override
-                .as_ref()
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "gh".to_string());
-            let mut share_viewer_url = match validated_share_viewer_url("pending") {
-                Ok(url) => url,
-                Err(err) => {
-                    let details = sanitize_command_diagnostic(&err.to_string());
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(format!("Refusing unsafe share viewer URL: {details}")),
-                    )
-                    .await;
-                    return;
-                }
+            // The `gh` driver itself is `run_share`, shared with the ftui stack
+            // (bd-ydz1t.1). What stays here is what is genuinely this stack's:
+            // mapping the outcome onto its PiMsg channel. A cancellation is a
+            // note, not an error, on every surface.
+            let message = match run_share(gh_path_override, &session, &cwd, &abort_signal).await {
+                ShareOutcome::Created(report) => PiMsg::System(report),
+                ShareOutcome::Cancelled => PiMsg::System("Share cancelled".to_string()),
+                ShareOutcome::Failed(reason) => PiMsg::AgentError(reason),
             };
-
-            let auth_args = vec![OsString::from("auth"), OsString::from("status")];
-            match run_command_output_with_timeout(
-                &gh,
-                &auth_args,
-                &cwd,
-                &abort_signal,
-                SHARE_AUTH_TIMEOUT,
-            )
-            .await
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        let details = format_command_output(&output);
-                        let message = format!(
-                            "`gh` is not authenticated.\n\
-                             Run `gh auth login` to authenticate, then retry `/share`.\n\n\
-                             {details}"
-                        );
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    let message = "GitHub CLI `gh` not found.\n\
-                             Install it from https://cli.github.com, then run `gh auth login`."
-                        .to_string();
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(message),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::System("Share cancelled".to_string()),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    let details = sanitize_command_diagnostic(&err.to_string());
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(format!("Failed to run `gh auth status`: {details}")),
-                    )
-                    .await;
-                    return;
-                }
-            }
-
-            if abort_signal.is_aborted() {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::System("Share cancelled".to_string()),
-                )
-                .await;
-                return;
-            }
-
-            // Sharing is user-cancellable and must not become an unbounded wait
-            // on a mutex held by another task. The app is already marked busy,
-            // so brief contention is best surfaced as a retryable error.
-            let (html, session_name) = match capture_share_snapshot(&session) {
-                Ok(Some(snapshot)) => snapshot,
-                Ok(None) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current()
-                            .unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(
-                            "Session is busy; retry `/share` after the current session update finishes."
-                                .to_string(),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    let details = sanitize_command_diagnostic(&err.to_string());
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current()
-                            .unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(format!("Session cannot be shared: {details}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            if abort_signal.is_aborted() {
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::System("Share cancelled".to_string()),
-                )
-                .await;
-                return;
-            }
-
-            let gist_desc = share_gist_description(session_name.as_deref());
-
-            let temp_file = match tempfile::Builder::new()
-                .prefix("pi-share-")
-                .suffix(".html")
-                .tempfile()
-            {
-                Ok(file) => file,
-                Err(err) => {
-                    let details = sanitize_command_diagnostic(&err.to_string());
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(format!("Failed to create temp file: {details}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            let temp_path = temp_file.into_temp_path();
-            if let Err(err) = asupersync::fs::write(&temp_path, html.as_bytes()).await {
-                let details = sanitize_command_diagnostic(&err.to_string());
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::AgentError(format!("Failed to write temp file: {details}")),
-                )
-                .await;
-                return;
-            }
-
-            let gist_args = vec![
-                OsString::from("gist"),
-                OsString::from("create"),
-                OsString::from("--public=false"),
-                OsString::from("--desc"),
-                OsString::from(&gist_desc),
-                temp_path.as_os_str().to_os_string(),
-            ];
-            let output = match run_command_output(&gh, &gist_args, &cwd, &abort_signal).await {
-                Ok(output) => output,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    let message = "GitHub CLI `gh` not found.\n\
-                             Install it from https://cli.github.com, then run `gh auth login`."
-                        .to_string();
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(message),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::System("Share cancelled".to_string()),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    let details = sanitize_command_diagnostic(&err.to_string());
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::AgentError(format!("Failed to run `gh gist create`: {details}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            if !output.status.success() {
-                let details = format_command_output(&output);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::AgentError(format!("`gh gist create` failed.\n\n{details}")),
-                )
-                .await;
-                return;
-            }
-
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let Some((gist_url, gist_id)) = parse_gist_url_and_id(&stdout) else {
-                let details = format_command_output(&output);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::AgentError(format!(
-                        "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
-                    )),
-                )
-                .await;
-                return;
-            };
-
-            share_viewer_url.set_fragment(Some(&gist_id));
-            let share_url = share_viewer_url.to_string();
-            drop(temp_path);
-
-            // Copy viewer URL to clipboard (best-effort).
-            #[cfg(feature = "clipboard")]
-            {
-                if let Ok(mut clipboard) = ArboardClipboard::new() {
-                    let _ = clipboard.set_text(share_url.clone());
-                }
-            }
-
-            // Paragraph breaks: the TUI renders this as markdown, and a single
-            // newline soft-wraps into the warning sentence, which can split
-            // "Share URL:" or the link itself across two terminal lines.
-            let message = format!(
-                "Created secret gist (not private; anyone with the URL can view it). Recognized secrets and the exact workspace cwd were redacted, but the transcript may still contain sensitive local context.\n\n\
-                 Share URL: {share_url}\n\nGist: {gist_url}"
-            );
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                PiMsg::System(message),
+                message,
             )
             .await;
         });
