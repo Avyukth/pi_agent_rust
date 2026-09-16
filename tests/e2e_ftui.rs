@@ -937,10 +937,87 @@ const FTUI_VCR_PROMPT: &str = "ftui vcr prompt: say the marker";
 const FTUI_VCR_RESPONSE: &str = "ftui-vcr-response-marker alpha beta gamma";
 const FTUI_VCR_SYSTEM_PROMPT_ARG: &str = "pi e2e ftui vcr harness";
 
-fn ftui_vcr_args() -> Vec<&'static str> {
-    vec![
-        "--ftui",
-        "--no-session",
+fn ftui_vcr_args() -> Vec<String> {
+    ftui_vcr_args_with_session(false, false)
+}
+
+/// Write the launch wrapper a VCR scenario starts `pi` through, and return its
+/// path.
+///
+/// Stderr goes to a file because tracing output otherwise interleaves with the
+/// pane, and on failure that log is the diagnostic. Extracted so a scenario can
+/// launch more than once — relaunching with different args against the same
+/// env root is how the `--continue` case is expressed.
+#[allow(clippy::too_many_arguments)]
+fn write_ftui_vcr_launcher(
+    script_path: &std::path::Path,
+    env_root: &std::path::Path,
+    cassette_dir: &std::path::Path,
+    stderr_log: &std::path::Path,
+    test_name: &str,
+    args: &[String],
+) {
+    use std::fmt::Write as _;
+    let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    for (key, sub) in [
+        ("PI_CODING_AGENT_DIR", "agent"),
+        ("PI_CONFIG_PATH", "config.toml"),
+        ("PI_SESSIONS_DIR", "sessions"),
+        ("PI_PACKAGE_DIR", "packages"),
+    ] {
+        let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+    }
+    script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
+    let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
+    let _ = writeln!(
+        script,
+        "export {}={}",
+        pi::vcr::VCR_ENV_DIR,
+        cassette_dir.display()
+    );
+    let _ = writeln!(script, "export PI_VCR_TEST_NAME={test_name}");
+    script.push_str("export VCR_DEBUG_BODY=1\n");
+    // Stable path: the harness temp dir is deleted on drop, and the debug
+    // bodies are exactly what we need after a failure.
+    script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
+    let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
+    let _ = write!(
+        script,
+        "exec {}",
+        std::path::PathBuf::from(binary).display()
+    );
+    for arg in args {
+        let _ = write!(script, " '{arg}'");
+    }
+    let _ = writeln!(script, " 2>{}", stderr_log.display());
+    std::fs::write(script_path, &script).expect("write vcr script"); // ubs:ignore test setup expect
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(script_path)
+            .expect("stat vcr script") // ubs:ignore test setup expect
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(script_path, perms).expect("chmod vcr script"); // ubs:ignore test setup expect
+    }
+}
+
+/// The VCR arg list, optionally with session persistence on and `--continue`
+/// requested.
+///
+/// `persist` drops `--no-session`, which the other VCR scenarios want precisely
+/// because they must not leave session files behind; the continue scenario
+/// needs the opposite. Sessions land under the harness's `PI_SESSIONS_DIR`, so
+/// nothing escapes the temp root either way.
+fn ftui_vcr_args_with_session(persist: bool, continue_recent: bool) -> Vec<String> {
+    let mut args: Vec<String> = vec!["--ftui".to_string()];
+    if !persist {
+        args.push("--no-session".to_string());
+    }
+    if continue_recent {
+        args.push("--continue".to_string());
+    }
+    for arg in [
         "--provider",
         "anthropic",
         "--model",
@@ -954,17 +1031,31 @@ fn ftui_vcr_args() -> Vec<&'static str> {
         "off",
         "--system-prompt",
         FTUI_VCR_SYSTEM_PROMPT_ARG,
-    ]
+    ] {
+        args.push(arg.to_string());
+    }
+    args
 }
 
 /// Effective system prompt for the ftui VCR args, computed with the same
 /// builder the session uses (mirrors build_vcr_system_prompt_for_args in
 /// tests/e2e_tui.rs).
 fn ftui_vcr_system_prompt(workdir: &std::path::Path, env_root: &std::path::Path) -> String {
+    ftui_vcr_system_prompt_for(&ftui_vcr_args(), workdir, env_root)
+}
+
+/// The same builder for an arbitrary arg list, so a scenario that changes the
+/// CLI (session persistence, `--continue`) still computes the system prompt the
+/// session will actually send and its cassette still matches on the body.
+fn ftui_vcr_system_prompt_for(
+    args: &[String],
+    workdir: &std::path::Path,
+    env_root: &std::path::Path,
+) -> String {
     use clap::Parser as _;
-    let mut args: Vec<&str> = vec!["pi"];
-    args.extend(ftui_vcr_args());
-    let cli = pi::cli::Cli::try_parse_from(args).expect("parse ftui vcr args"); // ubs:ignore test setup expect
+    let mut parsed: Vec<&str> = vec!["pi"];
+    parsed.extend(args.iter().map(String::as_str));
+    let cli = pi::cli::Cli::try_parse_from(parsed).expect("parse ftui vcr args"); // ubs:ignore test setup expect
     let enabled_tools = cli.enabled_tools();
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
@@ -1101,55 +1192,18 @@ fn e2e_ftui_vcr_streamed_turn() {
     // otherwise interleaves with the pane, and on failure the log is the
     // diagnostic.
     let stderr_log = session.harness.temp_path("pi-stderr.log");
-    {
-        use std::fmt::Write as _;
-        let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
-        for (key, sub) in [
-            ("PI_CODING_AGENT_DIR", "agent"),
-            ("PI_CONFIG_PATH", "config.toml"),
-            ("PI_SESSIONS_DIR", "sessions"),
-            ("PI_PACKAGE_DIR", "packages"),
-        ] {
-            let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
-        }
-        script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
-        let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
-        let _ = writeln!(
-            script,
-            "export {}={}",
-            pi::vcr::VCR_ENV_DIR,
-            cassette_dir.display()
-        );
-        let _ = writeln!(script, "export PI_VCR_TEST_NAME={FTUI_VCR_TEST_NAME}");
-        script.push_str("export VCR_DEBUG_BODY=1\n");
-        // Stable path: the harness temp dir is deleted on drop, and the
-        // debug bodies are exactly what we need after a failure.
-        script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
-        let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
-        let _ = write!(
-            script,
-            "exec {}",
-            std::path::PathBuf::from(binary).display()
-        );
-        for arg in ftui_vcr_args() {
-            let _ = write!(script, " '{arg}'");
-        }
-        let _ = writeln!(script, " 2>{}", stderr_log.display());
-        let script_path = session.harness.temp_path("vcr-run.sh");
-        std::fs::write(&script_path, &script).expect("write vcr script"); // ubs:ignore test setup expect
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)
-                .expect("stat vcr script") // ubs:ignore test setup expect
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).expect("chmod vcr script"); // ubs:ignore test setup expect
-        }
-        session
-            .tmux
-            .start_session(session.harness.temp_dir(), &script_path);
-    }
+    let script_path = session.harness.temp_path("vcr-run.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_VCR_TEST_NAME,
+        &ftui_vcr_args(),
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
     session
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
@@ -1168,6 +1222,127 @@ fn e2e_ftui_vcr_streamed_turn() {
 
     quit_and_assert_clean(&session);
     session.write_artifacts();
+}
+
+// ── `--continue` reopens the latest session (bd-ydz1t.3) ───────────────────
+
+const FTUI_CONTINUE_TEST_NAME: &str = "e2e_ftui_continue";
+
+/// `pi -c` was silently ignored on this stack: the classic path resolves it
+/// inside `Session::from_cli`, which the FTUI branch does not use, and
+/// `SessionOptions` carried no "reopen the latest" concept — so the flag fell
+/// on the floor and the user got a fresh session (bd-ydz1t.3).
+///
+/// The unit test pins which PATH `--continue` resolves to. This pins the thing
+/// the user actually cares about: after quitting and relaunching with `-c`, the
+/// previous turn is on screen. It relaunches with NO prompt, so the marker can
+/// only come from restored history — a second provider turn would need a
+/// cassette hit that never happens.
+#[test]
+fn e2e_ftui_continue_reopens_the_previous_session() {
+    let Some((_lock, session)) = new_locked_session(FTUI_CONTINUE_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let first_args = ftui_vcr_args_with_session(true, false);
+    let system_prompt =
+        ftui_vcr_system_prompt_for(&first_args, session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    let cassette_path = write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_CONTINUE_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
+    session
+        .harness
+        .record_artifact("ftui-continue-cassette.json", &cassette_path);
+
+    // First launch: a real turn, persisted under the harness's sessions dir.
+    let stderr_log = session.harness.temp_path("pi-stderr-first.log");
+    let script_path = session.harness.temp_path("continue-first.sh");
+    write_ftui_vcr_launcher(
+        &script_path,
+        &env_root,
+        &cassette_dir,
+        &stderr_log,
+        FTUI_CONTINUE_TEST_NAME,
+        &first_args,
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    quit_and_assert_clean(&session);
+
+    // The session file must exist before the relaunch can mean anything: with
+    // nothing saved, `--continue` correctly starts fresh and the assertion
+    // below would be testing the fallback rather than the feature.
+    let sessions_root = env_root.join("sessions");
+    let saved = walk_session_files(&sessions_root);
+    assert!(
+        !saved.is_empty(),
+        "first launch saved no session under {}; --continue has nothing to reopen",
+        sessions_root.display()
+    );
+
+    // Second launch: `-c`, and NO prompt. Anything on screen came from history.
+    let resume_stderr = session.harness.temp_path("pi-stderr-continue.log");
+    let resume_script = session.harness.temp_path("continue-second.sh");
+    write_ftui_vcr_launcher(
+        &resume_script,
+        &env_root,
+        &cassette_dir,
+        &resume_stderr,
+        FTUI_CONTINUE_TEST_NAME,
+        &ftui_vcr_args_with_session(true, true),
+    );
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &resume_script);
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    let stderr_tail = std::fs::read_to_string(&resume_stderr).unwrap_or_default();
+    assert!(
+        pane.contains(FTUI_VCR_PROMPT),
+        "the restored transcript must show the earlier USER turn too; pane:\n{pane}\nstderr tail:\n{}",
+        &stderr_tail[stderr_tail.len().saturating_sub(2000)..]
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// Every `*.jsonl` under the harness sessions root, at any depth: sessions are
+/// filed under an encoded-cwd subdirectory.
+fn walk_session_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 // ── Mid-STREAM SIGTERM (bd-pb4fw follow-through via VCR chunk pacing) ───────
