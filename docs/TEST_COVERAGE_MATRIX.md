@@ -16,9 +16,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Current Drift Check
 
-- Current `src/` inventory: 230 files.
-- Source-file rows below: 230.
-- Source files omitted from this document: 0.
+- Latest recorded full `src/` inventory: 230 files; the subsequent Bedrock streaming and request-control modules are now represented below.
+- Source-file rows below: 232 (230 recorded rows plus the two Bedrock modules).
+- The whole-tree omitted-file check has not been rerun for this update. DSR is unavailable on the editing host; added test coverage is not a passing test or quality result.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
 
@@ -152,7 +152,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive/commands.rs` | Interactive commands | Unit; `tests/interactive_commands_unit.rs`, `tests/interactive_extension_ui.rs`. |
 | `src/interactive/conversation.rs` | Conversation model | Unit; `tests/tui_state.rs`. |
 | `src/interactive/ext_session.rs` | Extension session UI | Unit; `tests/interactive_extension_ui.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
-| `src/interactive/file_refs.rs` | File references | Unit; `tests/tui_state.rs`. |
+| `src/interactive/file_refs.rs` | File references | `tests/tui_state.rs`. |
 | `src/interactive/keybindings.rs` | Interactive keybindings | Unit; `tests/tui_state.rs`. |
 | `src/interactive/model_selector_ui.rs` | Model selector UI | Unit; `tests/model_selector_cycling.rs`, `tests/tui_state.rs`. |
 | `src/interactive/perf.rs` | TUI performance telemetry | Unit; `tests/e2e_tui_perf.rs`, `tests/perf_regression.rs`. |
@@ -203,7 +203,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/anthropic.rs` | Anthropic provider | Unit; `tests/provider_streaming/anthropic.rs`, `tests/e2e_provider_streaming.rs`. |
 | `src/providers/anthropic/transport.rs` | Anthropic Messages transport shared with Vertex (SSE lifecycle validation) | Unit (in-module, 15 tests). |
 | `src/providers/azure.rs` | Azure provider | Unit; `tests/provider_streaming/azure.rs`, provider error/path suites. |
-| `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites. |
+| `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites; public-provider HTTP tests cover native thinking/cache controls, hook fallback, exact rewritten-body SigV4 signing, and JSON cache accounting (added, not executed on the editing host). |
+| `src/providers/bedrock/request_options.rs` | Model-aware Bedrock thinking budgets/adaptive effort and native prompt-cache checkpoints | Unit (12 in-module request-shape tests); public-provider HTTP coverage in `src/providers/bedrock.rs`. These tests were added but not executed on the editing host because DSR is unavailable. |
+| `src/providers/bedrock/streaming.rs` | Incremental AWS binary event-stream validation and ConverseStream message lifecycle | Unit; `tests/provider_bedrock_streaming.rs` exercises public-provider incremental delivery, signed/redacted reasoning replay, malformed frames, and terminal handling. No fresh DSR execution is claimed by this inventory update. |
 | `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
