@@ -3,7 +3,7 @@
 use super::shared::{MAX_VALUE_BYTES, SharedMemoryStore, SharedMemoryTool};
 use super::{MemoryStore, RecallTool, RetainTool};
 use crate::jobs::JobSessionScope;
-use crate::tools::Tool;
+use crate::tools::{Tool, ToolRegistry};
 use serde_json::json;
 use std::path::Path;
 use std::sync::{Arc, Barrier, Mutex};
@@ -267,4 +267,104 @@ fn shared_values_survive_a_compaction_entry_and_bank_reopen() {
     let fork = Session::in_memory();
     reader.bind_job_session_scope(JobSessionScope::fixed(fork.header.id));
     assert!(run(reader.execute("r2", json!({"key":"handoff"}), None)).unwrap_err().to_string().contains("PI_SHARED_MEMORY_NOT_FOUND"));
+}
+
+#[test]
+fn registry_installs_all_aliases_and_rebinds_older_snapshots_without_manual_tool_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = bank(dir.path());
+    let mut registry = ToolRegistry::from_tools(Vec::new());
+    registry.bind_job_session_resolver(Arc::new(|| {
+        Box::pin(async { Some("registry-a".to_string()) })
+    }));
+    registry.enable_shared_memory(Arc::clone(&project)).unwrap();
+    registry.push(Box::new(RetainTool::new(Arc::clone(&project))));
+    registry.push(Box::new(RecallTool::new(Arc::clone(&project))));
+    let snapshot = registry.clone_shallow();
+    let before = registry.tools().len();
+    let error = registry.enable_shared_memory(Arc::clone(&project)).unwrap_err();
+    assert!(error.to_string().contains("PI_SHARED_MEMORY_TOOL_COLLISION"));
+    assert_eq!(registry.tools().len(), before, "collision cannot partially register tools");
+    for name in ["read_memory", "write_memory", "list_memory"] {
+        assert_eq!(registry.tools().iter().filter(|tool| tool.name() == name).count(), 1);
+    }
+    run(async {
+        registry.get("write_memory").unwrap().execute(
+            "a1", json!({"key":"handoff","content":"A","expectedRevision":"absent"}), None,
+        ).await.unwrap();
+        let read = snapshot.get("recall").unwrap().execute(
+            "a2", json!({"scope":"session","key":"handoff"}), None,
+        ).await.unwrap();
+        assert_eq!(read.details.unwrap()["value"]["content"], "A");
+        registry.bind_job_session_resolver(Arc::new(|| {
+            Box::pin(async { Some("registry-b".to_string()) })
+        }));
+        let missing = snapshot.get("read_memory").unwrap().execute(
+            "b1", json!({"key":"handoff"}), None,
+        ).await.unwrap_err();
+        assert!(missing.to_string().contains("PI_SHARED_MEMORY_NOT_FOUND"));
+        snapshot.get("retain").unwrap().execute(
+            "b2", json!({"scope":"session","key":"handoff","content":"B"}), None,
+        ).await.unwrap();
+        let page = registry.get("list_memory").unwrap().execute("b3", json!({}), None).await.unwrap();
+        assert_eq!(page.details.unwrap()["entries"].as_array().unwrap().len(), 1);
+        registry.bind_job_session_resolver(Arc::new(|| {
+            Box::pin(async { Some("registry-a".to_string()) })
+        }));
+        let read = snapshot.get("read_memory").unwrap().execute(
+            "a3", json!({"key":"handoff"}), None,
+        ).await.unwrap();
+        assert_eq!(read.details.unwrap()["value"]["content"], "A");
+    });
+    assert!(project.list(10).unwrap().is_empty());
+}
+
+#[test]
+fn explicit_null_arguments_never_weaken_write_preconditions_or_turn_reads_into_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = bank(dir.path());
+    let shared = SharedMemoryStore::new(Arc::clone(&project), "session").unwrap();
+    let original = shared.write("plan", "kept", None).unwrap();
+    let mut writer = SharedMemoryTool::write(Arc::clone(&project));
+    let mut reader = SharedMemoryTool::read(Arc::clone(&project));
+    let mut list = SharedMemoryTool::list(project);
+    for tool in [&mut writer as &mut dyn Tool, &mut reader, &mut list] {
+        tool.bind_job_session_scope(JobSessionScope::fixed("session"));
+    }
+    run(async {
+        let error = writer.execute(
+            "w", json!({"key":"plan","content":"must not overwrite","expectedRevision":null}), None,
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("PI_SHARED_MEMORY_INVALID_INPUT"));
+        assert!(!error.to_string().contains("must not overwrite"));
+        assert!(reader.execute("r", json!({"key":null}), None).await.is_err());
+        for input in [json!({"prefix":null}), json!({"after":null}), json!({"limit":null})] {
+            assert!(list.execute("l", input, None).await.is_err());
+        }
+    });
+    let current = shared.read("plan").unwrap().unwrap();
+    assert_eq!(current.version.revision, original.revision);
+    assert_eq!(current.content, "kept");
+}
+
+#[test]
+fn host_cleanup_requires_current_revision_and_cannot_remove_another_sessions_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = bank(dir.path());
+    let a = SharedMemoryStore::new(Arc::clone(&project), "session-a").unwrap();
+    let b = SharedMemoryStore::new(project, "session-b").unwrap();
+    let first = a.write("plan", "old", Some("absent")).unwrap();
+    let current = a.write("plan", "new", Some(&first.revision)).unwrap();
+    assert!(a.remove("plan", &first.revision).unwrap_err().to_string().contains("PI_SHARED_MEMORY_CONFLICT"));
+    assert!(!b.remove("plan", &current.revision).unwrap());
+    assert_eq!(a.read("plan").unwrap().unwrap().content, "new");
+    assert!(a.remove("plan", &current.revision).unwrap());
+    assert!(a.read("plan").unwrap().is_none());
+    assert!(a.list("", None, 10).unwrap().entries.is_empty());
+    assert!(!a.remove("plan", &current.revision).unwrap());
+    let replacement = a.write("plan", "replacement", Some("absent")).unwrap();
+    assert_ne!(replacement.revision, current.revision);
+    assert!(a.remove("plan", &current.revision).is_err());
+    assert_eq!(a.read("plan").unwrap().unwrap().content, "replacement");
+    assert!(a.remove("plan", "absent").is_err());
 }
