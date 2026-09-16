@@ -1669,6 +1669,65 @@ pub struct FailoverSwapRequest<'a> {
     pub require_incomplete_tail: bool,
 }
 
+/// One restoration of the captured primary after a failover cooldown, as
+/// [`AgentSession::restore_primary_swap`] needs it.
+///
+/// The mirror image of [`FailoverSwapRequest`]: same staged-candidate
+/// transition, but the transcript records `primary_restore` rather than
+/// `failover`, and there is no incomplete tail to revert because the turn that
+/// ran on the fallback completed.
+pub struct PrimaryRestoreRequest<'a> {
+    /// The primary captured at the first swap, to be reinstalled.
+    pub primary: &'a crate::failover::FailoverPrimary,
+    /// The fallback the caller believes is live, as `(provider, model)`. Both
+    /// the runtime and the persisted Session must still agree with it, or the
+    /// caller's model of the session is stale and nothing is installed.
+    pub active: &'a (String, String),
+    /// Whether the cooldown has actually elapsed. Passed in rather than
+    /// computed here because the cooldown lives in each surface's own
+    /// cross-turn state, and it is checked at the point RPC checks it so a
+    /// stale-runtime session is still reported before this short-circuits.
+    pub cooldown_elapsed: bool,
+    /// Models the primary can resolve against.
+    pub available_models: &'a [crate::models::ModelEntry],
+    /// Credential store consulted for the primary.
+    pub auth: &'a crate::auth::AuthStorage,
+    /// An explicit `--api-key`, which pins and never rotates.
+    pub cli_api_key: Option<&'a str>,
+    /// How a refusal is reported, which is the one place print and RPC
+    /// genuinely disagree.
+    ///
+    /// RPC treats a mismatch between its recorded fallback and the live
+    /// runtime or the persisted Session as a corrupted model of the session:
+    /// it blocks provider admission and fails the call, because re-entering a
+    /// provider against a session nobody can describe is how work gets
+    /// re-billed against a record that no longer matches it. Print has no
+    /// admission gate and no long-lived state to corrupt, so it declines and
+    /// runs the next prompt on the fallback, which is a correct outcome there.
+    ///
+    /// Preserved rather than unified, because unifying it would silently
+    /// change a surface people depend on; the divergence is tracked
+    /// separately.
+    pub strict_invariants: bool,
+    /// Whether to discard an in-flight background compaction.
+    ///
+    /// RPC does; print never has. The restoration changes the context window
+    /// in the same transition, so a compaction computed against the fallback's
+    /// window is stale by construction and print's omission looks like a bug —
+    /// but fixing it is a behaviour change on a working surface, so it is a
+    /// flag here and a separate bead, not a silent edit.
+    pub invalidate_background_compaction: bool,
+}
+
+/// What a restoration actually installed.
+#[derive(Debug, Clone)]
+pub struct RestoredPrimary {
+    /// Provider now installed.
+    pub provider: String,
+    /// Model now installed.
+    pub model: String,
+}
+
 /// The agent runtime that orchestrates LLM calls and tool execution.
 pub struct Agent {
     /// The LLM provider.
@@ -12888,6 +12947,279 @@ impl AgentSession {
         attempt: &FailoverSwapAttempt<'_>,
     ) -> Result<FailoverSwapOutcome> {
         self.try_failover_swap(cx, attempt, None).await
+    }
+
+    /// Reinstall the primary captured at the first swap, once its cooldown has
+    /// elapsed.
+    ///
+    /// The counterpart to [`Self::try_failover`]: a failover is only half a
+    /// policy if nothing ever goes back. Without this a single 429 pins a
+    /// long-lived session to a fallback model for as long as it runs, which on
+    /// an interactive surface can be hours.
+    ///
+    /// Returns `Ok(None)` when nothing was installed — the cooldown has not
+    /// elapsed, there is no fallback live, the primary no longer resolves, it
+    /// has no usable credential, or (in lenient mode) the caller's record of
+    /// the live model is stale. Every one of those leaves the working fallback
+    /// installed, which is the right outcome: restoring into an auth error or a
+    /// half-written transition is strictly worse than staying on a model that
+    /// works.
+    ///
+    /// Print mode and the RPC server each had their own copy of this, and the
+    /// interactive stacks had none at all (bd-u2qv4, bd-gm481).
+    pub async fn restore_primary(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+    ) -> Result<Option<RestoredPrimary>> {
+        self.restore_primary_swap(cx, request, None).await
+    }
+
+    /// [`Self::restore_primary`] with RPC's provider-admission gate. The gate
+    /// type is internal, so this stays crate-visible while the plain form above
+    /// is what print mode and any embedder call.
+    pub(crate) async fn restore_primary_swap(
+        &mut self,
+        cx: &crate::agent_cx::AgentCx,
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+    ) -> Result<Option<RestoredPrimary>> {
+        let (active_provider, active_model) = request.active;
+
+        // The runtime must still be on the fallback the caller recorded.
+        let runtime_provider = self.agent.provider();
+        if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), active_provider)
+            || !runtime_provider
+                .model_id()
+                .eq_ignore_ascii_case(active_model)
+        {
+            return Self::refuse_restore(
+                request,
+                admission,
+                format!(
+                    "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
+                    runtime_provider.name(),
+                    runtime_provider.model_id()
+                ),
+            );
+        }
+
+        let session_store = Arc::clone(&self.session);
+        let mut inner = OwnedMutexGuard::lock(session_store, cx)
+            .await
+            .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
+        let session_matches_active = inner.effective_model_for_current_path().is_some_and(
+            |(session_provider, session_model)| {
+                crate::provider_metadata::provider_ids_match(&session_provider, active_provider)
+                    && session_model.eq_ignore_ascii_case(active_model)
+            },
+        );
+        if !session_matches_active {
+            return Self::refuse_restore(
+                request,
+                admission,
+                format!(
+                    "primary restore invariant failed: Session path does not match recorded fallback {active_provider}/{active_model}"
+                ),
+            );
+        }
+
+        // Checked here, after the invariants, so a session whose runtime has
+        // drifted is still reported rather than hidden behind a live cooldown.
+        if !request.cooldown_elapsed {
+            return Ok(None);
+        }
+
+        let Some((entry, key)) = Self::resolve_restore_target(request)? else {
+            return Ok(None);
+        };
+        let provider_impl = match crate::providers::create_provider(
+            &entry,
+            self.extensions.as_ref().map(ExtensionRegion::manager),
+        ) {
+            Ok(provider_impl) => provider_impl,
+            Err(err) if request.strict_invariants => return Err(err),
+            Err(_) => return Ok(None),
+        };
+
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let (mut candidate, target_thinking) =
+            Self::prepare_restore_candidate(&inner, &entry, request.primary);
+
+        let save_enabled = self.save_enabled();
+        if request.invalidate_background_compaction {
+            self.invalidate_background_compaction();
+        }
+        let _provider_transition = match admission {
+            Some(gate) => Some(
+                gate.begin_transition(
+                    "primary restore persistence was interrupted before live installation completed"
+                        .to_string(),
+                    cx,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        if save_enabled
+            && let Err(first_err) = candidate.save().await
+            && let Err(retry_err) = candidate.save().await
+        {
+            // Leave the fallback installed. A half-written restoration is worse
+            // than a working session on the wrong model.
+            let reason = format!(
+                "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
+            );
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            if request.strict_invariants {
+                return Err(Error::session_persistence(reason));
+            }
+            return Ok(None);
+        }
+
+        // No fallible operation remains after installing the candidate.
+        *inner = candidate;
+        self.install_restored_entry(&entry, provider_impl, key, target_thinking);
+        if let Some(gate) = admission {
+            gate.clear();
+        }
+        drop(inner);
+        Ok(Some(RestoredPrimary {
+            provider: to_provider,
+            model: to_model,
+        }))
+    }
+
+    /// Resolve the primary to a model entry and a credential, or decline.
+    ///
+    /// `Ok(None)` is the lenient decline; the same conditions are hard errors
+    /// under `strict_invariants`, with the error kinds RPC has always returned
+    /// for them.
+    fn resolve_restore_target(
+        request: &PrimaryRestoreRequest<'_>,
+    ) -> Result<Option<(crate::models::ModelEntry, Option<String>)>> {
+        let primary = request.primary;
+        let Some(entry) = request
+            .available_models
+            .iter()
+            .find(|m| {
+                crate::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
+                    && m.model.id.eq_ignore_ascii_case(&primary.model_id)
+            })
+            .cloned()
+            .or_else(|| crate::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
+        else {
+            if request.strict_invariants {
+                return Err(Error::validation(format!(
+                    "Unable to restore primary provider/model {}/{}",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        };
+
+        let key = crate::models::resolve_model_key(request.cli_api_key, request.auth, &entry);
+        if crate::models::model_requires_configured_credential(&entry) && key.is_none() {
+            // Restoring into an auth error would be strictly worse than staying
+            // on a working fallback.
+            if request.strict_invariants {
+                return Err(Error::auth(format!(
+                    "Missing credentials for primary provider/model {}/{}",
+                    primary.provider, primary.model_id
+                )));
+            }
+            return Ok(None);
+        }
+        Ok(Some((entry, key)))
+    }
+
+    /// Stage the restoration on a private `Session` candidate, so the live
+    /// transcript is untouched unless its persistence succeeds.
+    fn prepare_restore_candidate(
+        inner: &Session,
+        entry: &crate::models::ModelEntry,
+        primary: &crate::failover::FailoverPrimary,
+    ) -> (Session, crate::model::ThinkingLevel) {
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
+        let target_thinking_text = target_thinking.to_string();
+        let mut candidate = inner.clone();
+        let thinking_changed = candidate
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            != Some(target_thinking_text.as_str());
+        candidate.set_model_header(
+            Some(to_provider.clone()),
+            Some(to_model.clone()),
+            Some(target_thinking_text.clone()),
+        );
+        candidate.append_model_change_with_role(
+            to_provider,
+            to_model,
+            Some("primary_restore".to_string()),
+        );
+        if thinking_changed {
+            candidate.append_thinking_level_change(target_thinking_text);
+        }
+        (candidate, target_thinking)
+    }
+
+    /// The infallible half of the transition: no operation here can fail, so
+    /// the live agent can never be left describing a model it is not using.
+    fn install_restored_entry(
+        &mut self,
+        entry: &crate::models::ModelEntry,
+        provider_impl: Arc<dyn Provider>,
+        key: Option<String>,
+        target_thinking: crate::model::ThinkingLevel,
+    ) {
+        self.agent.set_provider(provider_impl);
+        self.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
+        self.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        self.agent.set_model_accepts_images(
+            entry
+                .model
+                .input
+                .contains(&crate::provider::InputType::Image),
+        );
+        {
+            let stream_options = self.agent.stream_options_mut();
+            stream_options.api_key = key;
+            stream_options.headers.clone_from(&entry.headers);
+            stream_options.max_tokens = Some(entry.model.max_tokens);
+            stream_options.thinking_level = Some(target_thinking);
+        }
+        self.set_compaction_context_window(context_window_tokens_for_entry(entry));
+        self.refresh_extension_completion_host_state();
+        if let Some(region) = &self.extensions {
+            region.manager().set_current_model(
+                Some(entry.model.provider.clone()),
+                Some(entry.model.id.clone()),
+            );
+        }
+    }
+
+    /// A refused restoration: a hard, admission-blocking failure where the
+    /// caller keeps long-lived state that is now known to be wrong, and a plain
+    /// decline where it does not.
+    fn refuse_restore(
+        request: &PrimaryRestoreRequest<'_>,
+        admission: Option<&ProviderAdmissionGate>,
+        reason: String,
+    ) -> Result<Option<RestoredPrimary>> {
+        if request.strict_invariants {
+            if let Some(gate) = admission {
+                gate.block(reason.clone());
+            }
+            return Err(Error::session_persistence(reason));
+        }
+        Ok(None)
     }
 
     /// [`Self::try_failover`] with RPC's provider-admission gate. The gate type

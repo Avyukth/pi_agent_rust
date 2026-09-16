@@ -1783,7 +1783,14 @@ impl AgentSessionHandle {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.sync_extension_mcp_registrations().await;
-        let combined = self.make_combined_callback(on_event);
+        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
+        // This path applies no retry policy, but an earlier
+        // [`Self::prompt_with_abort`] may still have left a fallback installed,
+        // and a session that never goes back to its primary is the failure this
+        // prevents.
+        self.maybe_restore_primary(&shared).await;
+        let forwarded = Arc::clone(&shared);
+        let combined = self.make_combined_callback(move |event| forwarded(event));
         self.session.run_text(input.into(), combined).await
     }
 
@@ -1799,6 +1806,10 @@ impl AgentSessionHandle {
     ) -> Result<AssistantMessage> {
         self.sync_extension_mcp_registrations().await;
         let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
+        // Between-prompt lifecycle (bd-gm481.1): the previous prompt's turn has
+        // finished and its own `FailoverEnd { restoredPrimary: false }` already
+        // closed, so this can open and close its own without interleaving.
+        self.maybe_restore_primary(&shared).await;
         let first_attempt = Arc::clone(&shared);
         let combined = self.make_combined_callback(move |event| first_attempt(event));
         let first = self
@@ -1988,6 +1999,61 @@ impl AgentSessionHandle {
             provider: provider.name().to_string(),
             model: provider.model_id().to_string(),
             restored_primary: false,
+        });
+    }
+
+    /// Reinstall the primary captured at the first swap, once its cooldown has
+    /// elapsed.
+    ///
+    /// A failover is only half a policy if nothing ever goes back. Print mode
+    /// and RPC both restore; without this an interactive session that took one
+    /// 429 would stay pinned to the fallback for as long as it runs, which here
+    /// means hours rather than the lifetime of a script (bd-gm481).
+    ///
+    /// Called BETWEEN prompts, never inside a turn: restoring mid-turn would
+    /// undo the swap the turn in progress is depending on. Every refusal leaves
+    /// the working fallback installed and the prompt simply runs on it, which
+    /// is the correct outcome and not something this can improve on.
+    async fn maybe_restore_primary(&mut self, shared: &Arc<dyn Fn(AgentEvent) + Send + Sync>) {
+        let Some(options) = self.failover.clone() else {
+            return;
+        };
+        let Some(active) = self.failover_state.active().cloned() else {
+            return;
+        };
+        let Some(primary) = self.failover_state.primary().cloned() else {
+            return;
+        };
+
+        let request = crate::agent::PrimaryRestoreRequest {
+            primary: &primary,
+            active: &active,
+            cooldown_elapsed: self
+                .failover_state
+                .should_restore_primary(std::time::Instant::now()),
+            available_models: &options.available_models,
+            auth: &options.auth,
+            cli_api_key: options.cli_api_key.as_deref(),
+            // Like print mode: no admission gate and no cross-process record to
+            // corrupt, so a stale record declines rather than failing the call.
+            strict_invariants: false,
+            // Unlike print mode: the restoration changes the context window in
+            // the same transition, so a background compaction computed against
+            // the fallback's window is stale by construction. This path is new,
+            // so there is no prior behaviour to preserve and it takes the one
+            // RPC takes.
+            invalidate_background_compaction: true,
+        };
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let Ok(Some(restored)) = self.session.restore_primary(&cx, &request).await else {
+            return;
+        };
+        self.failover_state.clear();
+        shared(AgentEvent::FailoverEnd {
+            success: true,
+            provider: restored.provider,
+            model: restored.model,
+            restored_primary: true,
         });
     }
 
@@ -3181,21 +3247,27 @@ mod tests {
     struct FlakyThenOkProvider {
         failures: usize,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Identity this double reports. The retry tests use a synthetic one;
+        /// the restoration tests need a REAL provider id, because restoring
+        /// reconstructs the primary through `providers::create_provider` and a
+        /// synthetic id has no route to reconstruct.
+        name: String,
+        model: String,
     }
 
     #[async_trait::async_trait]
-    #[allow(clippy::unnecessary_literal_bound)]
     impl crate::provider::Provider for FlakyThenOkProvider {
         fn name(&self) -> &str {
-            "test-provider"
+            &self.name
         }
 
+        #[allow(clippy::unnecessary_literal_bound)]
         fn api(&self) -> &str {
             "test-api"
         }
 
         fn model_id(&self) -> &str {
-            "test-model"
+            &self.model
         }
 
         async fn stream(
@@ -3250,10 +3322,20 @@ mod tests {
     }
 
     fn flaky_handle(failures: usize) -> (AgentSessionHandle, Arc<std::sync::atomic::AtomicUsize>) {
+        flaky_handle_as(failures, "test-provider", "test-model")
+    }
+
+    fn flaky_handle_as(
+        failures: usize,
+        name: &str,
+        model: &str,
+    ) -> (AgentSessionHandle, Arc<std::sync::atomic::AtomicUsize>) {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(FlakyThenOkProvider {
             failures,
             calls: Arc::clone(&calls),
+            name: name.to_string(),
+            model: model.to_string(),
         });
         let agent = crate::agent::Agent::new(
             provider,
@@ -3275,6 +3357,17 @@ mod tests {
     /// Install a failover policy whose chain names `spec`, with no credential
     /// requirement, so the walk reaches provider construction.
     fn with_chain(handle: AgentSessionHandle, spec: &str) -> AgentSessionHandle {
+        with_chain_cooldown(handle, spec, 300)
+    }
+
+    /// [`with_chain`] with an explicit cooldown. Zero means the primary is
+    /// restorable the moment it is captured, which is how the restoration path
+    /// is exercised without a sleep.
+    fn with_chain_cooldown(
+        handle: AgentSessionHandle,
+        spec: &str,
+        cooldown_secs: u64,
+    ) -> AgentSessionHandle {
         let auth_path = tempdir().expect("tempdir").path().join("auth.json");
         let auth = crate::auth::AuthStorage::load(auth_path).expect("auth load");
         handle.with_failover(Some(FailoverOptions {
@@ -3285,8 +3378,56 @@ mod tests {
             available_models: Vec::new(),
             auth,
             cli_api_key: Some("test-key".to_string()),
-            cooldown_secs: 300,
+            cooldown_secs,
         }))
+    }
+
+    /// Run one turn that fails over, and report the handle sitting on the
+    /// fallback with the primary captured.
+    fn handle_after_one_failover(cooldown_secs: u64) -> AgentSessionHandle {
+        // A real primary identity: restoring RECONSTRUCTS it through
+        // `providers::create_provider`, so a synthetic id would decline there
+        // and the test would pass for the wrong reason.
+        let (handle, _calls) = flaky_handle_as(usize::MAX, "anthropic", "claude-3-5-haiku-latest");
+        let mut handle = with_chain_cooldown(
+            handle.with_retry(Some(crate::failover::RetryPolicy {
+                max_retries: 1,
+                max_failovers_per_turn: 1,
+                base_delay_ms: 1,
+                max_delay_ms: 1,
+            })),
+            "openai/gpt-4o-mini",
+            cooldown_secs,
+        );
+        let (_abort_handle, abort_signal) = AgentSessionHandle::new_abort_handle();
+        let _ = run_async(handle.prompt_with_abort("hello", abort_signal, |_| {}));
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "gpt-4o-mini",
+            "the setup turn must have installed the fallback"
+        );
+        handle
+    }
+
+    /// Record every `FailoverEnd` as `(restored_primary, model)`.
+    type RestoreLog = Arc<Mutex<Vec<(bool, String)>>>;
+    fn restore_recorder() -> (RestoreLog, Arc<dyn Fn(AgentEvent) + Send + Sync>) {
+        let seen: RestoreLog = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
+            if let AgentEvent::FailoverEnd {
+                restored_primary,
+                model,
+                ..
+            } = event
+            {
+                recorder
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((restored_primary, model));
+            }
+        });
+        (seen, shared)
     }
 
     fn fast_retry_policy(max_retries: u32) -> crate::failover::RetryPolicy {
@@ -3424,6 +3565,73 @@ mod tests {
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "the failing provider was called at least once before the swap"
+        );
+    }
+
+    /// The half of the policy nothing on this stack had: going BACK. Print mode
+    /// and RPC both reinstall the captured primary once its cooldown expires;
+    /// without it a session that took a single 429 stays pinned to the fallback
+    /// for as long as it runs, which on an interactive surface is hours
+    /// (bd-gm481). With a zero cooldown the next prompt restores.
+    #[test]
+    fn the_captured_primary_is_restored_once_its_cooldown_expires() {
+        let mut handle = handle_after_one_failover(0);
+        let captured = handle
+            .failover_state
+            .primary()
+            .cloned()
+            .expect("a swap records the primary it left");
+        assert_eq!(captured.model_id, "claude-3-5-haiku-latest");
+
+        let (seen, shared) = restore_recorder();
+        run_async(handle.maybe_restore_primary(&shared));
+
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "claude-3-5-haiku-latest",
+            "the cooldown expired, so the primary must be live again"
+        );
+        assert!(
+            handle.failover_state.primary().is_none(),
+            "a restored primary clears the chain state, so a later failure walks the chain from \
+             the top instead of resuming past entries it never used"
+        );
+        let events = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            events,
+            vec![(true, "claude-3-5-haiku-latest".to_string())],
+            "the host must be told the primary is back, or the model indicator lies: {events:?}"
+        );
+    }
+
+    /// The planted negative for the restoration half: while the cooldown is
+    /// still live the fallback stays installed. Restoring early would send the
+    /// next prompt straight back into the error that caused the failover, which
+    /// is worse than running on a model that works.
+    #[test]
+    fn a_live_cooldown_keeps_the_fallback_installed() {
+        let mut handle = handle_after_one_failover(300);
+
+        let (seen, shared) = restore_recorder();
+        run_async(handle.maybe_restore_primary(&shared));
+
+        assert_eq!(
+            handle.session.agent.provider().model_id(),
+            "gpt-4o-mini",
+            "the cooldown is live, so the fallback must stay installed"
+        );
+        assert!(
+            handle.failover_state.primary().is_some(),
+            "the primary must stay captured for a later restoration"
+        );
+        assert!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing was restored, so no restoration must be reported"
         );
     }
 
