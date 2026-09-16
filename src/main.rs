@@ -2481,6 +2481,25 @@ async fn run(
         drop(agent_session);
         #[cfg(feature = "ftui")]
         {
+            // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
+            // Session::from_cli, which this path does not use; SessionOptions
+            // has no "reopen the latest" concept, so the flag was silently
+            // dropped and the user got a fresh session instead of their last
+            // one. Resolve it to a concrete path here, through the same lookup
+            // the classic stack uses, and hand it over as `session_path`.
+            //
+            // `--session` still wins, and `--no-session` short-circuits below,
+            // which is Session::from_cli's own precedence. `None` means this
+            // directory has nothing continuable, and a new session is exactly
+            // what the classic stack produces there too.
+            let continue_session_path = if cli.r#continue && cli.session.is_none() {
+                pi::session::Session::recent_session_path_in_dir(
+                    cli.session_dir.as_ref().map(Path::new),
+                )
+                .await?
+            } else {
+                None
+            };
             let options = pi::sdk::SessionOptions {
                 provider: cli.provider.clone(),
                 model: cli.model.clone(),
@@ -2493,7 +2512,11 @@ async fn run(
                 // creates its own session file; the default stack's early
                 // session was dropped above without writing anything.
                 no_session: cli.no_session,
-                session_path: cli.session.as_ref().map(PathBuf::from),
+                session_path: cli
+                    .session
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or(continue_session_path),
                 session_dir: cli.session_dir.as_ref().map(PathBuf::from),
                 // Explicit -e extension files load with UI prompts bridged
                 workspace: Some(workspace.clone()),
