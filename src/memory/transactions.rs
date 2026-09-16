@@ -14,15 +14,25 @@ struct PendingTransaction<'a> {
 
 impl Drop for PendingTransaction<'_> {
     fn drop(&mut self) {
-        if !self.committed && self.conn.execute_raw("ROLLBACK").is_err() {
+        if !self.committed
+            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.conn.execute_raw("ROLLBACK")
+            }))
+            .map_or(true, |result| result.is_err())
+        {
+            // Cleanup must not replace the original failure or double-panic.
             // Do not log SQL or retained content from an engine diagnostic.
-            tracing::warn!("memory transaction rollback failed; connection will be discarded");
+            tracing::warn!("memory transaction rollback failed");
         }
     }
 }
 
-/// Publish a mutation only after all its statements have committed. The guard
-/// also rolls back an early return, a failed commit, or a panic in the action.
+/// Publish a mutation only after all its statements have committed.
+///
+/// Keep the transaction guard outside the unwind boundary: engine cleanup must
+/// run after the action's unwind has stopped, not from a destructor on that
+/// unwind. Resume the original panic only after rollback has been attempted.
+/// This does not claim to repair an engine already poisoned by its own panic.
 pub(super) fn run<T>(
     conn: &SqliteConnection,
     action: impl FnOnce(&SqliteConnection) -> Result<T>,
@@ -33,11 +43,20 @@ pub(super) fn run<T>(
         conn,
         committed: false,
     };
-    let result = action(conn)?;
-    conn.execute_raw("COMMIT")
-        .map_err(|error| Error::tool("memory", format!("commit transaction failed: {error}")))?;
-    pending.committed = true;
-    Ok(result)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = action(conn)?;
+        conn.execute_raw("COMMIT")
+            .map_err(|error| Error::tool("memory", format!("commit transaction failed: {error}")))?;
+        pending.committed = true;
+        Ok(result)
+    }));
+    // Deliberately before resume_unwind, on success as well as failure. Rolling
+    // back inside a catch nested in Drop would still run on the outer unwind.
+    drop(pending);
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 #[cfg(test)]
@@ -123,10 +142,24 @@ mod tests {
                     panic!("intentional memory mutation failure");
                 });
             }));
-            assert!(result.is_err());
+            let payload = result.expect_err("the original panic must be propagated");
+            assert_eq!(
+                payload.downcast_ref::<&str>(),
+                Some(&"intentional memory mutation failure")
+            );
+            assert!(!std::thread::panicking());
             assert_eq!(count(&conn), 0);
-            run(&conn, |_| Ok(()))?;
+            run(&conn, |conn| {
+                conn.execute_raw("INSERT INTO facts VALUES (2, 'retry after panic')")
+                    .unwrap();
+                Ok(())
+            })?;
             conn.close().unwrap();
+            let reopened = SqliteConnection::open_read_write(&path).unwrap();
+            assert_eq!(count(&reopened), 1);
+            let rows = reopened.query_sync("SELECT id FROM facts", &[]).unwrap();
+            assert_eq!(crate::memory::row_i64(&rows[0], 0)?, 2);
+            reopened.close().unwrap();
             Ok(())
         })
         .unwrap();
@@ -408,5 +441,46 @@ mod store_tests {
         let model = bank.mental_model().unwrap();
         assert!(model.contains("small useful fact"));
         assert!(model.len() <= crate::memory::MENTAL_MODEL_BUDGET);
+    }
+
+    #[test]
+    fn writer_panic_rolls_back_primary_index_and_audit_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = store(dir.path());
+        bank.with_conn(|conn| {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _panic_guard = crate::crash::SuppressPanicHook::new();
+                let _: crate::error::Result<()> = super::run(conn, |conn| {
+                    conn.execute_raw(
+                        "INSERT INTO memories (kind, content, tags, created_at_ms, updated_at_ms, status) \
+                         VALUES ('fact', 'uncommitted evidence', '[]', 1, 1, 'active')",
+                    )
+                    .unwrap();
+                    conn.execute_raw(
+                        "INSERT INTO memories_fts (rowid, content) VALUES (1, 'uncommitted evidence'); \
+                         INSERT INTO memory_audit (memory_id, op, at_ms) VALUES (1, 'retain', 1)",
+                    )
+                    .unwrap();
+                    std::panic::panic_any(731_u32);
+                });
+            }))
+            .expect_err("writer panic is not swallowed");
+            assert_eq!(panic.downcast_ref::<u32>(), Some(&731));
+            for table in ["memories", "memories_fts", "memory_audit"] {
+                let rows = conn.query_sync(&format!("SELECT COUNT(*) FROM {table}"), &[]).unwrap();
+                assert_eq!(crate::memory::row_i64(&rows[0], 0)?, 0, "{table}");
+            }
+            super::run(conn, |_| Ok(()))?;
+            Ok(())
+        })
+        .unwrap();
+        let reopened = store(dir.path());
+        assert!(reopened.list(10).unwrap().is_empty());
+        assert!(reopened.recall("uncommitted", None).unwrap().is_empty());
+        let retained = reopened
+            .retain(MemoryKind::Fact, "durable evidence", &[], None)
+            .unwrap();
+        assert_eq!(audit_ops(&reopened, retained.id), ["retain"]);
+        assert_eq!(reopened.recall("durable", None).unwrap()[0].id, retained.id);
     }
 }
