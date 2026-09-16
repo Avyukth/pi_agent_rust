@@ -413,7 +413,6 @@
       "correlation_id_missing",
       "data_contract_failure",
       "run_id_missing",
-      "source_commit_unbound",
       "strict_mode_disabled"
     ],
     "performance_claims_authorized": false,
@@ -448,12 +447,12 @@
       "remediation": "re-run the benchmark with a correlation id and strict mode, then regenerate the budget report"
     }
   ],
-  "generated_at": "2026-09-16T03:05:35.474Z",
+  "generated_at": "2026-09-16T03:06:50.606Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v2",
-  "source_commit": null,
+  "source_commit": "77c74a8df1406f12c1df72e10dcdcb7c803c38fe",
   "strict_mode": false,
   "total_budgets": 19
 }
