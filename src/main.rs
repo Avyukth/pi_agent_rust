@@ -635,16 +635,10 @@ fn build_extension_bootstrap_selection(
     })
 }
 
+/// Print mode's entry to the shared reader. RPC had a byte-alike copy of this
+/// that logged nothing; both now call the one definition (bd-u2qv4).
 fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
-    if entry.model.context_window.eq(&0) {
-        tracing::warn!(
-            "Model {} reported context_window=0; falling back to default compaction window",
-            entry.model.id
-        );
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        entry.model.context_window
-    }
+    pi::agent::context_window_tokens_for_entry(entry)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2487,6 +2481,25 @@ async fn run(
         drop(agent_session);
         #[cfg(feature = "ftui")]
         {
+            // `--continue` (bd-ydz1t.3). The classic stack resolves it inside
+            // Session::from_cli, which this path does not use; SessionOptions
+            // has no "reopen the latest" concept, so the flag was silently
+            // dropped and the user got a fresh session instead of their last
+            // one. Resolve it to a concrete path here, through the same lookup
+            // the classic stack uses, and hand it over as `session_path`.
+            //
+            // `--session` still wins, and `--no-session` short-circuits below,
+            // which is Session::from_cli's own precedence. `None` means this
+            // directory has nothing continuable, and a new session is exactly
+            // what the classic stack produces there too.
+            let continue_session_path = if cli.r#continue && cli.session.is_none() {
+                pi::session::Session::recent_session_path_in_dir(
+                    cli.session_dir.as_ref().map(Path::new),
+                )
+                .await?
+            } else {
+                None
+            };
             let options = pi::sdk::SessionOptions {
                 provider: cli.provider.clone(),
                 model: cli.model.clone(),
@@ -2499,7 +2512,11 @@ async fn run(
                 // creates its own session file; the default stack's early
                 // session was dropped above without writing anything.
                 no_session: cli.no_session,
-                session_path: cli.session.as_ref().map(PathBuf::from),
+                session_path: cli
+                    .session
+                    .as_ref()
+                    .map(PathBuf::from)
+                    .or(continue_session_path),
                 session_dir: cli.session_dir.as_ref().map(PathBuf::from),
                 // Explicit -e extension files load with UI prompts bridged
                 workspace: Some(workspace.clone()),
@@ -2536,6 +2553,17 @@ async fn run(
                 // the classic stack uses so `ask`/`write` modes gate here
                 // too, prompting through the ask-card bridge.
                 approval_state: Some(approval_state.clone()),
+                // Provider retry (bd-u2qv4). Until now a 429 or a 529 was a
+                // hard error on this stack while the same request in print
+                // mode or over RPC retried and completed, and this is the
+                // stack most people run. `from_config` returns None when the
+                // user has set `retry.enabled = false`, so turning it off
+                // still means nobody re-enters the provider on their behalf.
+                // The retry events it emits already render here as system
+                // notes. A configured fallback CHAIN is still inert: walking
+                // it needs the provider swap, which has not moved out of this
+                // binary yet.
+                retry: pi::failover::RetryPolicy::from_config(&config),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
@@ -9383,96 +9411,32 @@ async fn try_print_failover(
             continue;
         };
 
-        // Build and persist the complete transition on a private Session
-        // candidate. The live transcript and provider/options stay untouched
-        // if restoration, the inner lock, or persistence fails.
-        let session_store = Arc::clone(&session.session);
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(session_store, &cx)
-            .await
-            .map_err(|err| anyhow::anyhow!("failover session lock failed: {err}"))?;
-        let mut candidate = inner.clone();
-        let reverted = candidate.revert_incomplete_response();
-        if require_incomplete_tail && !reverted {
-            bail!(
-                "failover restoration invariant failed: the completed error response had no incomplete assistant tail"
-            );
-        }
-        let restored_messages = candidate.to_messages_for_current_path();
+        // The whole persisted transition — revert, transcript record, save,
+        // install — is `AgentSession::commit_failover`, shared with RPC
+        // (bd-u2qv4). The live transcript and provider/options stay untouched
+        // if any of it fails.
         let to_provider = entry.model.provider.clone();
         let to_model = entry.model.id.clone();
-        let target_thinking = entry.clamp_thinking_level(
-            session
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let request = pi::agent::FailoverSwapRequest {
+            entry: &entry,
+            api_key: key.clone(),
+            provider: provider_impl,
+            from_provider: &from_provider,
+            from_model: &from_model,
+            class,
+            chain_position: cursor,
+            // The LIVE level, which is what print mode has always clamped
+            // against here. RPC clamps against the level originally requested;
+            // see FailoverSwapRequest::thinking_level_to_clamp.
+            thinking_level_to_clamp: session
                 .agent
                 .stream_options()
                 .thinking_level
                 .unwrap_or_default(),
-        );
-        let target_thinking_text = target_thinking.to_string();
-        let thinking_changed = candidate
-            .effective_thinking_level_for_current_path()
-            .as_deref()
-            != Some(target_thinking_text.as_str());
-        candidate.set_model_header(
-            Some(to_provider.clone()),
-            Some(to_model.clone()),
-            Some(target_thinking_text.clone()),
-        );
-        candidate.append_custom_entry(
-            "failover".to_string(),
-            Some(serde_json::json!({
-                "from": format!("{from_provider}/{from_model}"),
-                "to": format!("{to_provider}/{to_model}"),
-                "class": format!("{class:?}").to_ascii_lowercase(),
-                "attempt": cursor,
-            })),
-        );
-        candidate.append_model_change_with_role(
-            to_provider.clone(),
-            to_model.clone(),
-            Some("failover".to_string()),
-        );
-        if thinking_changed {
-            candidate.append_thinking_level_change(target_thinking_text);
-        }
-        if session.save_enabled()
-            && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            return Err(anyhow::Error::new(pi::error::Error::session_persistence(
-                format!(
-                    "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-                ),
-            )));
-        }
-
-        // No fallible operation remains after installing the candidate.
-        *inner = candidate;
-        session.agent.replace_messages(restored_messages);
-        session.agent.set_provider(provider_impl);
-        session.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
-        );
-        session
-            .agent
-            .set_tool_call_dialect(entry.tool_call_dialect());
-        session
-            .agent
-            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-        {
-            let stream_options = session.agent.stream_options_mut();
-            stream_options.api_key.clone_from(&key);
-            stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
-            stream_options.thinking_level = Some(target_thinking);
-        }
-        session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-        session.refresh_extension_completion_host_state();
-        if let Some(region) = &session.extensions {
-            region
-                .manager()
-                .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
-        }
+            require_incomplete_tail,
+        };
+        session.commit_failover(&cx, &request).await?;
         failover_state.chain_position = cursor;
         // Cross-prompt record (bd-gm481.1): what to return to, and when the
         // cooldown on doing so started. The primary is only captured on the
@@ -9486,7 +9450,6 @@ async fn try_print_failover(
             },
             (to_provider.clone(), to_model.clone()),
         );
-        drop(inner);
 
         if is_json {
             if let Some(attempt) = retry_attempt_to_end {

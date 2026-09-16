@@ -555,6 +555,29 @@ pub struct RetryPolicy {
     pub max_delay_ms: u32,
 }
 
+impl RetryPolicy {
+    /// Read the policy a surface should apply out of configuration.
+    ///
+    /// `None` means the user turned retry off, and a surface that gets `None`
+    /// must hand a failed turn straight back rather than quietly substituting a
+    /// default — the whole point of `retry.enabled = false` is that nobody
+    /// re-enters the provider on the user's behalf.
+    ///
+    /// One reader for the four config keys, so a surface adopting this policy
+    /// cannot accidentally consult a different set (bd-u2qv4). Print mode
+    /// supplies its own `max_retries` from the CLI and so builds its policy
+    /// directly.
+    #[must_use]
+    pub fn from_config(config: &crate::config::Config) -> Option<Self> {
+        config.retry_enabled().then(|| Self {
+            max_retries: config.retry_max_retries(),
+            max_failovers_per_turn: config.max_failovers_per_turn(),
+            base_delay_ms: config.retry_base_delay_ms(),
+            max_delay_ms: config.retry_max_delay_ms(),
+        })
+    }
+}
+
 /// Where this turn has got to.
 #[derive(Debug, Clone, Copy)]
 pub struct TurnProgress {
@@ -980,6 +1003,31 @@ mod tests {
             failovers_this_turn,
             stream_can_retry: true,
         }
+    }
+
+    #[test]
+    fn a_policy_is_read_from_config_and_absent_when_retry_is_disabled() {
+        let settings = |enabled: bool| crate::config::Config {
+            retry: Some(crate::config::RetrySettings {
+                enabled: Some(enabled),
+                max_retries: Some(4),
+                base_delay_ms: Some(250),
+                max_delay_ms: Some(9_000),
+                max_failovers_per_turn: Some(2),
+                ..crate::config::RetrySettings::default()
+            }),
+            ..crate::config::Config::default()
+        };
+
+        let policy = RetryPolicy::from_config(&settings(true)).expect("retry enabled");
+        assert_eq!(policy.max_retries, 4);
+        assert_eq!(policy.base_delay_ms, 250);
+        assert_eq!(policy.max_delay_ms, 9_000);
+        assert_eq!(policy.max_failovers_per_turn, 2);
+
+        // "off" must mean off. A surface that substituted a default here would
+        // re-enter the provider on behalf of a user who said not to.
+        assert!(RetryPolicy::from_config(&settings(false)).is_none());
     }
 
     #[test]

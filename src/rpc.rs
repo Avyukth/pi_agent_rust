@@ -192,45 +192,6 @@ where
     })
 }
 
-/// Spawn a turn so that cancelling the caller ends it cleanly instead of
-/// stranding the client.
-///
-/// The factory receives two contexts and they must not be the same one:
-///
-/// - the TURN's context, a child of the runtime's ROOT region. Every lock,
-///   sleep and provider await runs under it. asupersync 0.5 stops polling a
-///   task at its next `.await` once its region is cancel-requested and does NOT
-///   drop it, so a turn spawned into the caller's region is parked mid-flight
-///   with no destructor, no `auto_retry_end` and no terminal `agent_end` — and
-///   the client blocks forever on a frame that can never be sent. Measured on
-///   `rpc_prompt_command_inherits_cancelled_context_from_run`: the retry-delay
-///   poll ticked once, awaited, and was never scheduled again (bd-todkd).
-/// - the CALLER's context, observed and never awaited on. Its cancellation is
-///   what ends the turn, at the checkpoints in `run_prompt_with_retry`, which
-///   is what lets the turn close its own lifecycle on the way out.
-///
-/// It must come from `spawn_with_cx` rather than a synthetic `Cx::for_request`:
-/// a synthetic context carries no runtime capabilities, so `asupersync::time::
-/// sleep` inside the retry backoff registers no wakeup and the turn hangs — the
-/// same symptom as the bug, from the opposite cause. Verified by probe.
-///
-/// The caller's budget still bounds the turn, because `checkpoint()` tests the
-/// budget as well as cancellation and the turn checks the CALLER's. An
-/// in-flight provider call is not interrupted here — cancellation is seen when
-/// it returns, or during the backoff; interrupting the call itself is what the
-/// `abort` command's `AbortHandle` is for.
-fn spawn_turn<F, Fut>(runtime: &asupersync::runtime::RuntimeHandle, client_cx: &AgentCx, factory: F)
-where
-    F: FnOnce(AgentCx, AgentCx) -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + Send + 'static,
-{
-    let cancel_watch = client_cx.clone();
-    runtime.spawn_with_cx(move |task_cx| {
-        let turn_cx = AgentCx::from_cx(task_cx.clone());
-        future_with_current_cx(task_cx, factory(turn_cx, cancel_watch))
-    });
-}
-
 fn normalize_command_type(command_type: &str) -> &str {
     match command_type {
         "follow-up" | "followUp" | "queue-follow-up" | "queueFollowUp" => "follow_up",
@@ -277,12 +238,11 @@ fn command_can_queue_while_rpc_agent_streams(command_type: &str) -> bool {
     matches!(command_type, "prompt" | "steer" | "follow_up")
 }
 
+/// RPC's entry to the shared reader. This copy used to fall back silently; the
+/// shared one warns, which is worth having wherever a model reports no window
+/// (bd-u2qv4).
 fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
-    if entry.model.context_window == 0 {
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        entry.model.context_window
-    }
+    crate::agent::context_window_tokens_for_entry(entry)
 }
 
 fn command_resumes_rpc_agent(
@@ -2181,10 +2141,10 @@ pub async fn run(
                     let retry_abort = retry_abort.clone();
                     let options = options.clone();
                     let expanded = options.resources.expand_input(&message);
-                    spawn_turn(
-                        &runtime_handle,
-                        &cx,
-                        move |turn_cx, cancel_watch| async move {
+                    let prompt_cx = cx.clone();
+                    runtime_handle.spawn(future_with_current_cx(
+                        prompt_cx.cx().clone(),
+                        async move {
                             run_prompt_with_retry(
                                 session,
                                 shared_state,
@@ -2198,12 +2158,11 @@ pub async fn run(
                                 expanded,
                                 Some(message),
                                 images,
-                                turn_cx,
-                                cancel_watch,
+                                prompt_cx,
                             )
                             .await;
                         },
-                    );
+                    ));
                 }
             }
 
@@ -2304,29 +2263,25 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                spawn_turn(
-                    &runtime_handle,
-                    &cx,
-                    move |turn_cx, cancel_watch| async move {
-                        run_prompt_with_retry(
-                            session,
-                            shared_state,
-                            is_streaming,
-                            is_compacting,
-                            turn_phase_linearizer,
-                            abort_handle_slot,
-                            out_tx,
-                            retry_abort,
-                            options,
-                            expanded,
-                            Some(message),
-                            Vec::new(),
-                            turn_cx,
-                            cancel_watch,
-                        )
-                        .await;
-                    },
-                );
+                let prompt_cx = cx.clone();
+                runtime_handle.spawn(future_with_current_cx(prompt_cx.cx().clone(), async move {
+                    run_prompt_with_retry(
+                        session,
+                        shared_state,
+                        is_streaming,
+                        is_compacting,
+                        turn_phase_linearizer,
+                        abort_handle_slot,
+                        out_tx,
+                        retry_abort,
+                        options,
+                        expanded,
+                        Some(message),
+                        Vec::new(),
+                        prompt_cx,
+                    )
+                    .await;
+                }));
             }
 
             "follow_up" => {
@@ -2428,29 +2383,25 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                spawn_turn(
-                    &runtime_handle,
-                    &cx,
-                    move |turn_cx, cancel_watch| async move {
-                        run_prompt_with_retry(
-                            session,
-                            shared_state,
-                            is_streaming,
-                            is_compacting,
-                            turn_phase_linearizer,
-                            abort_handle_slot,
-                            out_tx,
-                            retry_abort,
-                            options,
-                            expanded,
-                            Some(message),
-                            Vec::new(),
-                            turn_cx,
-                            cancel_watch,
-                        )
-                        .await;
-                    },
-                );
+                let prompt_cx = cx.clone();
+                runtime_handle.spawn(future_with_current_cx(prompt_cx.cx().clone(), async move {
+                    run_prompt_with_retry(
+                        session,
+                        shared_state,
+                        is_streaming,
+                        is_compacting,
+                        turn_phase_linearizer,
+                        abort_handle_slot,
+                        out_tx,
+                        retry_abort,
+                        options,
+                        expanded,
+                        Some(message),
+                        Vec::new(),
+                        prompt_cx,
+                    )
+                    .await;
+                }));
             }
 
             "abort" => {
@@ -3896,11 +3847,10 @@ pub async fn run(
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
-                let turn_runtime = options.runtime_handle.clone();
-                spawn_turn(
-                    &turn_runtime,
-                    &cx,
-                    move |turn_cx, cancel_watch| async move {
+                let prompt_cx = cx.clone();
+                options.runtime_handle.clone().spawn(future_with_current_cx(
+                    prompt_cx.cx().clone(),
+                    async move {
                         run_prompt_with_retry(
                             session,
                             shared_state,
@@ -3914,12 +3864,11 @@ pub async fn run(
                             text,
                             Some(String::new()),
                             Vec::new(),
-                            turn_cx,
-                            cancel_watch,
+                            prompt_cx,
                         )
                         .await;
                     },
-                );
+                ));
             }
 
             "new_session" => {
@@ -5332,13 +5281,7 @@ async fn run_prompt_with_retry(
     message: String,
     keyword_scan_source: Option<String>,
     images: Vec<ImageContent>,
-    // `cx` is the turn's OWN region: every lock and await here runs under it,
-    // and it is deliberately not the caller's, so a cancelled caller cannot park
-    // this task before it closes its own lifecycle. `cancel_watch` is the
-    // caller's region, observed and never awaited on — its cancellation is what
-    // ends the turn, at the checkpoints below. See `turn_contexts`.
     cx: AgentCx,
-    cancel_watch: AgentCx,
 ) {
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
@@ -5376,7 +5319,7 @@ async fn run_prompt_with_retry(
     // prompt was accepted, so it is entitled to exactly one terminal frame no
     // matter how this task ends. Both normal exits disarm it before sending
     // their own.
-    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cancel_watch.clone());
+    let mut terminal_guard = TerminalAgentEndOnDrop::new(out_tx.clone(), cx.clone());
 
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
@@ -5393,7 +5336,7 @@ async fn run_prompt_with_retry(
     let mut final_error_hints: Option<Value> = None;
 
     loop {
-        if retry_count > 0 && cancel_watch.checkpoint().is_err() {
+        if retry_count > 0 && cx.checkpoint().is_err() {
             final_error = Some("Retry aborted".to_string());
             final_error_hints = None;
             break;
@@ -5728,24 +5671,15 @@ async fn run_prompt_with_retry(
                 retry_cancelled = true;
                 break;
             }
-            if cancel_watch.checkpoint().is_err() {
+            if cx.checkpoint().is_err() {
                 retry_cancelled = true;
                 break;
             }
-            // Slept on the TURN's context, not the caller's: an await inside a
-            // cancel-requested region never resumes, which would strand the
-            // client exactly where this loop is meant to release it (bd-todkd).
             let now = cx
                 .cx()
                 .timer_driver()
                 .map_or_else(wall_now, |timer| timer.now());
-            eprintln!(
-                "PROBE_DELAY_TICK watch_cancel={} turn_cancel={}",
-                cancel_watch.is_cancel_requested(),
-                cx.is_cancel_requested()
-            );
             sleep(now, Duration::from_millis(50)).await;
-            eprintln!("PROBE_DELAY_WOKE");
         }
 
         if retry_cancelled || retry_abort.load(Ordering::SeqCst) {
@@ -6269,95 +6203,31 @@ async fn try_failover_to_next_chain_entry(
         let to_provider = entry.model.provider.clone();
         let to_model = entry.model.id.clone();
 
-        // Mutate and persist a private Session candidate. The live transcript,
-        // provider/options, shared cooldown, and event stream remain untouched
-        // if restoration, the inner lock, or persistence fails.
-        let session_store = Arc::clone(&guard.session);
-        let mut inner = OwnedMutexGuard::lock(session_store, cx)
-            .await
-            .map_err(|err| Error::session(format!("failover inner session lock failed: {err}")))?;
-        let mut candidate = inner.clone();
-        let reverted = candidate.revert_incomplete_response();
-        if require_incomplete_tail && !reverted {
-            return Err(Error::session(
-                "failover restoration invariant failed: the completed error response had no incomplete assistant tail",
-            ));
-        }
-        let restored_messages = candidate.to_messages_for_current_path();
-        let target_thinking = entry.clamp_thinking_level(primary_model.requested_thinking_level);
-        let target_thinking_text = target_thinking.to_string();
-        let thinking_changed = candidate
-            .effective_thinking_level_for_current_path()
-            .as_deref()
-            != Some(target_thinking_text.as_str());
-        candidate.set_model_header(
-            Some(to_provider.clone()),
-            Some(to_model.clone()),
-            Some(target_thinking_text.clone()),
-        );
-        candidate.append_custom_entry(
-            "failover".to_string(),
-            Some(serde_json::json!({
-                "from": format!("{current_provider}/{current_model}"),
-                "to": format!("{to_provider}/{to_model}"),
-                "class": format!("{class:?}").to_ascii_lowercase(),
-                "attempt": position,
-            })),
-        );
-        candidate.append_model_change_with_role(
-            to_provider.clone(),
-            to_model.clone(),
-            Some("failover".to_string()),
-        );
-        if thinking_changed {
-            candidate.append_thinking_level_change(target_thinking_text);
-        }
-        let save_enabled = guard.save_enabled();
-        guard.invalidate_background_compaction();
-        let _provider_transition = state
-            .provider_admission
-            .begin_transition(
-                "failover Session persistence was interrupted before live installation completed"
-                    .to_string(),
-                cx,
-            )
-            .await?;
-        if save_enabled
-            && let Err(first_err) = candidate.save().await
-            && let Err(retry_err) = candidate.save().await
-        {
-            let reason = format!(
-                "failover Session persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-            );
-            state.provider_admission.block(reason.clone());
-            return Err(Error::session_persistence(reason));
-        }
-
-        // No fallible operation remains in the transition after installation.
-        *inner = candidate;
-        guard.agent.replace_messages(restored_messages);
-        guard.agent.set_provider(provider_impl);
-        guard.agent.set_keyword_max_thinking_level(
-            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-        );
-        guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
+        // The whole persisted transition — revert, transcript record, save,
+        // install — is AgentSession::commit_failover_swap, shared with print
+        // mode (bd-u2qv4). The live transcript, provider/options, shared
+        // cooldown and event stream remain untouched if any of it fails; the
+        // admission gate passed in is what keeps provider re-entry quarantined
+        // if the process dies between persistence and installation.
+        let request = crate::agent::FailoverSwapRequest {
+            entry: &entry,
+            api_key: key.clone(),
+            provider: provider_impl,
+            from_provider: &current_provider,
+            from_model: &current_model,
+            class,
+            chain_position: position,
+            // The level originally requested, before any swap: clamping against
+            // the LIVE level instead would ratchet it down through whatever the
+            // previous fallback allowed. Print mode does the latter; see
+            // FailoverSwapRequest::thinking_level_to_clamp.
+            thinking_level_to_clamp: primary_model.requested_thinking_level,
+            require_incomplete_tail,
+        };
+        let admission = state.provider_admission.clone();
         guard
-            .agent
-            .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-        {
-            let stream_options = guard.agent.stream_options_mut();
-            stream_options.api_key.clone_from(&key);
-            stream_options.headers.clone_from(&entry.headers);
-            stream_options.max_tokens = Some(entry.model.max_tokens);
-            stream_options.thinking_level = Some(target_thinking);
-        }
-        guard.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-        guard.refresh_extension_completion_host_state();
-        if let Some(region) = &guard.extensions {
-            region
-                .manager()
-                .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
-        }
+            .commit_failover_swap(cx, &request, Some(&admission))
+            .await?;
 
         state.failover_primary = Some(primary_model.clone());
         state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
@@ -6378,7 +6248,6 @@ async fn try_failover_to_next_chain_entry(
             attempt: swaps_so_far.saturating_add(1),
             chain_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
         });
-        drop(inner);
         drop(state);
         drop(guard);
         if let Some(attempt) = retry_attempt_to_end {
@@ -8105,7 +7974,6 @@ mod retry_tests {
                 None,
                 Vec::new(),
                 AgentCx::for_request(),
-                AgentCx::for_request(),
             )
             .await;
 
@@ -8290,7 +8158,6 @@ mod retry_tests {
                 "hello".to_string(),
                 None,
                 Vec::new(),
-                AgentCx::for_request(),
                 AgentCx::for_request(),
             )
             .await;
@@ -9519,7 +9386,6 @@ mod retry_tests {
                     None,
                     Vec::new(),
                     AgentCx::for_request(),
-                    AgentCx::for_request(),
                 )
                 .await;
                 (session, shared_state)
@@ -9717,9 +9583,6 @@ mod retry_tests {
                 "hello".to_string(),
                 None,
                 Vec::new(),
-                // Same split the spawn sites make: the turn runs under its own
-                // region and WATCHES the cancellable one (`turn_contexts`).
-                AgentCx::for_request(),
                 AgentCx::from_cx(retry_cx),
             )
             .await;

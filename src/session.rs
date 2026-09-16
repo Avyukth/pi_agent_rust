@@ -4107,12 +4107,48 @@ impl Session {
         })
     }
 
-    /// Continue the most recent session.
+    /// Continue the most recent session, or start a new one when there is
+    /// nothing in this directory to continue.
     pub async fn continue_recent_in_dir(
         override_dir: Option<&Path>,
         config: &Config,
     ) -> Result<Self> {
         let store_kind = SessionStoreKind::from_config(config);
+        let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
+        match Self::resolve_recent_session_in_dir(override_dir).await? {
+            Some((session, _)) => Ok(session),
+            None => Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind)),
+        }
+    }
+
+    /// The path `--continue` would reopen, or `None` when this directory has
+    /// nothing continuable.
+    ///
+    /// Surfaces that build a session from a PATH rather than from a `Session`
+    /// need this: the SDK's [`SessionOptions`](crate::sdk::SessionOptions) has
+    /// no "reopen the latest" concept, so the default FTUI stack silently
+    /// ignored `--continue` and handed the user a fresh session
+    /// (bd-ydz1t.3). Resolution goes through the same candidate scan,
+    /// index pruning and open-and-skip-unreadable walk as
+    /// [`Self::continue_recent_in_dir`], because answering "which session?"
+    /// differently from "open which session?" is how the two drift.
+    pub async fn recent_session_path_in_dir(
+        override_dir: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(Self::resolve_recent_session_in_dir(override_dir)
+            .await?
+            .map(|(_, path)| path))
+    }
+
+    /// The most recent openable session in this directory, with its path.
+    ///
+    /// `None` means there is nothing to continue: the project directory is
+    /// absent, or no candidate could be opened. Unreadable candidates are
+    /// pruned from the index on the way past, which is why this both selects
+    /// and opens rather than merely ranking paths.
+    async fn resolve_recent_session_in_dir(
+        override_dir: Option<&Path>,
+    ) -> Result<Option<(Self, PathBuf)>> {
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
         let cwd_display = cwd.display().to_string();
@@ -4157,7 +4193,7 @@ impl Session {
         }
 
         if project_session_dir_missing {
-            return Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind));
+            return Ok(None);
         }
 
         let scanned = scan_sessions_on_disk(&project_session_dir, indexed_sessions.clone()).await?;
@@ -4188,7 +4224,7 @@ impl Session {
             match Self::open(entry.path.to_string_lossy().as_ref()).await {
                 Ok(mut session) => {
                     session.session_dir = Some(base_dir.clone());
-                    return Ok(session);
+                    return Ok(Some((session, entry.path.clone())));
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -4205,7 +4241,7 @@ impl Session {
             }
         }
 
-        Ok(Self::create_with_dir_and_store(Some(base_dir), store_kind))
+        Ok(None)
     }
 
     /// Save the session to disk.
@@ -13486,6 +13522,74 @@ mod tests {
         assert!(scanned.entries.is_empty());
         assert!(scanned.refreshed_entries.is_empty());
         assert_eq!(scanned.failed_paths, vec![path]);
+    }
+
+    /// `--continue` on a surface that builds from a PATH must land on exactly
+    /// the session `--continue` on a surface that builds from a `Session`
+    /// would open. The default FTUI stack is the former and silently ignored
+    /// the flag entirely (bd-ydz1t.3); answering "which session?" separately
+    /// from "open which session?" is how the two would drift apart again.
+    #[test]
+    fn recent_session_path_matches_what_continue_recent_opens() {
+        let _lock = current_dir_lock();
+        let process_cwd = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let temp = tempfile::tempdir().unwrap();
+        // Two sessions, so "most recent" is a real choice rather than the only
+        // one available.
+        let mut older = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        older.append_message(make_test_message("older"));
+        run_async(async { older.save().await }).expect("save older session");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut newer = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        newer.append_message(make_test_message("newer"));
+        run_async(async { newer.save().await }).expect("save newer session");
+        let newer_path = newer.path.clone().expect("newer session path");
+
+        let resolved =
+            run_async(async { Session::recent_session_path_in_dir(Some(temp.path())).await })
+                .expect("resolve recent session path")
+                .expect("a saved session in this directory is continuable");
+        let opened = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+
+        assert_eq!(
+            resolved, newer_path,
+            "the newest session is the one to continue"
+        );
+        assert_eq!(
+            opened.path.as_ref(),
+            Some(&resolved),
+            "the path surfaces resolve must be the one continue_recent_in_dir opens"
+        );
+    }
+
+    /// Nothing to continue is not an error: the classic stack starts a new
+    /// session there, and a path-driven surface must be told `None` rather than
+    /// a path that does not exist.
+    #[test]
+    fn recent_session_path_is_absent_when_nothing_is_continuable() {
+        let _lock = current_dir_lock();
+        let process_cwd = tempfile::tempdir().unwrap();
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let temp = tempfile::tempdir().unwrap();
+        let resolved =
+            run_async(async { Session::recent_session_path_in_dir(Some(temp.path())).await })
+                .expect("resolve recent session path");
+        assert_eq!(resolved, None);
+
+        let opened = run_async(async {
+            Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
+        })
+        .expect("continue recent");
+        assert!(
+            opened.path.is_none(),
+            "the session-returning form starts a fresh unsaved session in the same case"
+        );
     }
 
     #[test]
