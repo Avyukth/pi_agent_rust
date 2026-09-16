@@ -1021,6 +1021,10 @@ pub enum UiCommand {
     /// Show session info (`/session`): file, id, name, model, thinking
     /// level, and message count — a read-only snapshot of the live session.
     SessionInfo,
+    /// Export the session to a secret gist through `gh` (`/share`,
+    /// bd-ydz1t.1). Takes no arguments: the UI rejects `/share public`
+    /// before this is ever sent, and the gist is always `--public=false`.
+    Share,
     /// Print a textual branch-tree summary (`/tree`). The interactive tree
     /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
     /// branches/entries instead of falling through to extension dispatch.
@@ -2328,6 +2332,30 @@ impl PiFtuiModel {
             }
             "/session" | "/info" => {
                 self.send_command(UiCommand::SessionInfo);
+                return true;
+            }
+            "/share" => {
+                // Refused HERE, before `gh` is ever invoked: a user who typed
+                // `/share public` is asking for the opposite of what this does,
+                // and the safe answer must not depend on the driver, the
+                // subprocess, or the network (bd-ydz1t.1).
+                if !cmd_args.trim().is_empty() {
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from(
+                            "Usage: /share (uploads a secret, unlisted gist; anyone with its URL can view it; public sharing is disabled)",
+                        ),
+                    );
+                    return true;
+                }
+                self.push_entry(
+                    EntryRole::System,
+                    String::from(
+                        "Sharing session... (secret gist, not private; transcript may still contain sensitive local context; Ctrl-C to cancel)",
+                    ),
+                );
+                self.begin_busy(String::from("sharing session ..."));
+                self.send_command(UiCommand::Share);
                 return true;
             }
             "/tree" => {
@@ -3754,6 +3782,41 @@ fn spawn_ask_reply_pump(
 
 /// Run one agent turn for a submitted prompt, translating events back to the
 /// UI and surfacing turn errors as transcript entries.
+/// Handle `/share` in the driver: export the session and publish it as a
+/// secret gist through `gh`.
+///
+/// The `gh` flow itself is `crate::interactive::share::run_share`, shared with
+/// the classic stack rather than copied (bd-ydz1t.1). What this contributes is
+/// the abort slot — so Ctrl-C cancels a share the same way it cancels a turn,
+/// instead of leaving the user watching a subprocess they cannot stop — and
+/// the mapping from outcome to transcript entry.
+///
+/// A cancellation is a system note, not an error: the user asked for it.
+async fn run_share_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    gh_path: Option<String>,
+    turn_abort: &TurnAbortSlot,
+    agent_tx: &Sender<PiMsg>,
+) {
+    use crate::interactive::share::ShareOutcome;
+
+    let (abort_handle, abort_signal) = crate::agent::AbortHandle::new();
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(abort_handle);
+    let store = handle.session_store();
+    let outcome = crate::interactive::share::run_share(gh_path, &store, cwd, &abort_signal).await;
+    *turn_abort
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let _ = agent_tx.send(match outcome {
+        ShareOutcome::Created(report) => PiMsg::System(report),
+        ShareOutcome::Cancelled => PiMsg::System(String::from("Share cancelled")),
+        ShareOutcome::Failed(reason) => PiMsg::AgentError(reason),
+    });
+}
+
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -4622,6 +4685,16 @@ fn terminal_replacement_error(
     ))
 }
 
+/// Config values this stack reads directly rather than through the SDK session
+/// options, grouped so `run` keeps a signature someone can read.
+pub struct FtuiSettings {
+    /// Conversation spacing for the markdown renderer.
+    pub markdown_spacing: crate::config::MarkdownSpacing,
+    /// The `ghPath` setting, for `/share`. Empty or `None` means `gh` from
+    /// `PATH`; the e2e scenarios point it at a mock.
+    pub gh_path: Option<String>,
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run(
     session_options: crate::sdk::SessionOptions,
@@ -4629,10 +4702,14 @@ pub fn run(
     inline: bool,
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
-    markdown_spacing: crate::config::MarkdownSpacing,
+    settings: FtuiSettings,
     autocomplete: AutocompleteLaunch,
 ) -> std::io::Result<()> {
     const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+    let FtuiSettings {
+        markdown_spacing,
+        gh_path,
+    } = settings;
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
     let driver_catalog = autocomplete.catalog.clone();
@@ -4774,6 +4851,16 @@ pub fn run(
                         }
                         Ok(UiCommand::SessionInfo) => {
                             run_session_info_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Share) => {
+                            run_share_command(
+                                &handle,
+                                &bash_cwd,
+                                gh_path.clone(),
+                                &driver_turn_abort,
+                                &agent_tx,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::TreeSummary) => {
                             run_tree_summary_command(&handle, &agent_tx).await;
@@ -6632,6 +6719,54 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("compacting")),
             "compact note missing"
+        );
+    }
+
+    /// bd-ydz1t.1: `/share` existed only on the classic stack, so on the stack
+    /// most people run it fell through to extension dispatch and reported
+    /// "Unknown command".
+    #[test]
+    fn slash_share_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/share");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::Share);
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("Sharing session")),
+            "share note missing"
+        );
+    }
+
+    /// The planted negative, and the one that matters most: `/share public` is
+    /// asking for the opposite of what this does. It must be refused in the UI,
+    /// BEFORE anything reaches the driver — so the safe answer never depends on
+    /// the driver, the `gh` subprocess, or the network.
+    #[test]
+    fn slash_share_refuses_an_argument_without_reaching_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/share public");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "/share public must never reach the driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("public sharing is disabled")),
+            "the refusal must say why"
         );
     }
 

@@ -29,8 +29,7 @@ use crate::extensions::{
     ExtensionUiResponse,
 };
 use crate::model::{
-    ContentBlock, ImageContent, Message, StopReason, TextContent, ThinkingLevel, UserContent,
-    UserMessage,
+    ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::provider::InputType;
@@ -786,12 +785,10 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
     }
 }
 
-#[derive(Debug, Clone)]
-struct RpcFailoverPrimary {
-    provider: String,
-    model_id: String,
-    requested_thinking_level: ThinkingLevel,
-}
+/// Field-identical to the shared definition, which is what it now is
+/// (bd-u2qv4). Kept as an alias so the existing construction sites and the
+/// `failover_primary` field keep reading the way they always have.
+type RpcFailoverPrimary = crate::failover::FailoverPrimary;
 
 #[derive(Debug)]
 struct RpcSharedState {
@@ -5923,152 +5920,43 @@ async fn maybe_restore_primary(
         state.provider_admission.block(reason.clone());
         return Err(Error::session_persistence(reason));
     };
-    let provider = primary.provider;
-    let model_id = primary.model_id;
-
-    let runtime_provider = guard.agent.provider();
-    if !crate::provider_metadata::provider_ids_match(runtime_provider.name(), &active_provider)
-        || !runtime_provider
-            .model_id()
-            .eq_ignore_ascii_case(&active_model)
-    {
-        let reason = format!(
-            "primary restore invariant failed: runtime {}/{} does not match recorded fallback {active_provider}/{active_model}",
-            runtime_provider.name(),
-            runtime_provider.model_id()
-        );
-        state.provider_admission.block(reason.clone());
-        return Err(Error::session_persistence(reason));
-    }
-
-    let session_store = Arc::clone(&guard.session);
-    let mut inner = OwnedMutexGuard::lock(session_store, cx)
-        .await
-        .map_err(|err| Error::session(format!("primary restore inner lock failed: {err}")))?;
-    let session_matches_active = inner.effective_model_for_current_path().is_some_and(
-        |(session_provider, session_model)| {
-            crate::provider_metadata::provider_ids_match(&session_provider, &active_provider)
-                && session_model.eq_ignore_ascii_case(&active_model)
-        },
-    );
-    if !session_matches_active {
-        let reason = format!(
-            "primary restore invariant failed: Session path does not match recorded fallback {active_provider}/{active_model}"
-        );
-        state.provider_admission.block(reason.clone());
-        return Err(Error::session_persistence(reason));
-    }
-    if !state
+    let cooldown_elapsed = state
         .failover_cooldown
         .as_ref()
-        .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()))
-    {
-        return Ok(());
-    }
+        .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()));
 
-    let Some(entry) = options
-        .available_models
-        .iter()
-        .find(|m| {
-            crate::provider_metadata::provider_ids_match(&m.model.provider, &provider)
-                && m.model.id.eq_ignore_ascii_case(&model_id)
-        })
-        .cloned()
-        .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id))
-    else {
-        return Err(Error::validation(format!(
-            "Unable to restore primary provider/model {provider}/{model_id}"
-        )));
+    // The persisted transition is `AgentSession::restore_primary_swap`, shared
+    // with print mode and the SDK (bd-u2qv4, bd-gm481). What stays here is what
+    // is genuinely RPC's: the shared-state bookkeeping, the admission gate, and
+    // the strict contract where a record that no longer describes the live
+    // session fails the call instead of declining, because this process keeps
+    // that record across turns and would otherwise re-enter a provider against
+    // a session nobody can describe.
+    let active = (active_provider, active_model);
+    let request = crate::agent::PrimaryRestoreRequest {
+        primary: &primary,
+        active: &active,
+        cooldown_elapsed,
+        available_models: &options.available_models,
+        auth: &options.auth,
+        cli_api_key: options.cli_api_key.as_deref(),
+        strict_invariants: true,
+        invalidate_background_compaction: true,
     };
-
-    let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
-    if model_requires_configured_credential(&entry) && key.is_none() {
-        return Err(Error::auth(format!(
-            "Missing credentials for primary provider/model {provider}/{model_id}"
-        )));
-    }
-    let provider_impl = providers::create_provider(
-        &entry,
-        guard
-            .extensions
-            .as_ref()
-            .map(crate::extensions::ExtensionRegion::manager),
-    )?;
-
-    let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
-    let target_thinking_text = target_thinking.to_string();
-    let mut candidate = inner.clone();
-    let thinking_changed = candidate
-        .effective_thinking_level_for_current_path()
-        .as_deref()
-        != Some(target_thinking_text.as_str());
-    candidate.set_model_header(
-        Some(provider.clone()),
-        Some(model_id.clone()),
-        Some(target_thinking_text.clone()),
-    );
-    candidate.append_model_change_with_role(
-        provider.clone(),
-        model_id.clone(),
-        Some("primary_restore".to_string()),
-    );
-    if thinking_changed {
-        candidate.append_thinking_level_change(target_thinking_text);
-    }
-    let save_enabled = guard.save_enabled();
-    guard.invalidate_background_compaction();
-    let _provider_transition = state
-        .provider_admission
-        .begin_transition(
-            "primary restore persistence was interrupted before live installation completed"
-                .to_string(),
-            cx,
-        )
-        .await?;
-    if save_enabled
-        && let Err(first_err) = candidate.save().await
-        && let Err(retry_err) = candidate.save().await
-    {
-        let reason = format!(
-            "primary restore persistence remained indeterminate after an idempotent retry: first failure: {first_err}; retry failure: {retry_err}"
-        );
-        state.provider_admission.block(reason.clone());
-        return Err(Error::session_persistence(reason));
-    }
-
-    *inner = candidate;
-    guard.agent.set_provider(provider_impl);
-    guard.agent.set_keyword_max_thinking_level(
-        entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
-    );
-    guard.agent.set_tool_call_dialect(entry.tool_call_dialect());
-    guard
-        .agent
-        .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-    {
-        let stream_options = guard.agent.stream_options_mut();
-        stream_options.api_key.clone_from(&key);
-        stream_options.headers.clone_from(&entry.headers);
-        stream_options.max_tokens = Some(entry.model.max_tokens);
-        stream_options.thinking_level = Some(target_thinking);
-    }
-    guard.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-    guard.refresh_extension_completion_host_state();
-    if let Some(region) = &guard.extensions {
-        region
-            .manager()
-            .set_current_model(Some(provider.clone()), Some(model_id.clone()));
-    }
+    let Some(restored) = guard
+        .restore_primary_swap(cx, &request, Some(&state.provider_admission))
+        .await?
+    else {
+        return Ok(());
+    };
     state.clear_failover_lifecycle();
-    state.provider_admission.clear();
 
-    drop(inner);
     drop(state);
     drop(guard);
     let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
         success: true,
-        provider,
-        model: model_id,
+        provider: restored.provider,
+        model: restored.model,
         restored_primary: true,
     }));
     Ok(())
@@ -7690,7 +7578,7 @@ mod retry_tests {
     use super::tests::{build_test_rpc_options, dummy_entry};
     use super::*;
     use crate::agent::{Agent, AgentConfig, AgentSession};
-    use crate::model::{AssistantMessage, Usage};
+    use crate::model::{AssistantMessage, ThinkingLevel, Usage};
     use crate::provider::{InputType, Model, ModelCost, Provider};
     use crate::resources::ResourceLoader;
     use crate::session::Session;

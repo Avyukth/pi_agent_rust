@@ -473,9 +473,76 @@ Common auth issues and their fixes: [provider-auth-troubleshooting.md](provider-
 
 ---
 
+## Retry and Cross-Model Failover
+
+When a provider returns a transient failure — a 429, a quota rejection, a 529 or
+another overload — pi can retry the same model, and then continue the turn on a
+different one. Both are off unless you configure them.
+
+```jsonc
+{
+  "retry": {
+    // Every value below is shown at its default, so this block reproduces
+    // stock behaviour except for the chain, which has no default.
+    "enabled": true,           // false disables retry AND failover
+    "maxRetries": 3,           // same-model attempts before the chain is consulted
+    "baseDelayMs": 2000,       // exponential backoff starts here
+    "maxDelayMs": 60000,
+
+    // Cross-model failover. Keys are a role name ("default", "smol", "slow",
+    // "plan", "commit") or an exact "provider/model" spec; values are ordered
+    // fallbacks. The ROLE key is checked first, so if both could match the
+    // active model, the role wins and the exact spec is never consulted.
+    "fallbackChains": {
+      "default": ["openai/gpt-5", "google/gemini-2.5-pro"],
+      "anthropic/claude-sonnet-4-5": ["anthropic/claude-haiku-4-5"]
+    },
+    "failoverCooldownSecs": 300,  // how long before the primary is tried again
+    "maxFailoversPerTurn": 8
+  }
+}
+```
+
+A retry RESUMES the turn rather than replaying it: only the failed request's
+incomplete output is stripped, so completed tool calls are neither re-run nor
+re-billed. A failover swaps the model, records the swap in the transcript, and
+restores your original model once `failoverCooldownSecs` has elapsed.
+
+Auth errors never fail over, and neither do aborts — falling back into an
+authentication failure is strictly worse than the quota error that started it.
+A session-persistence failure is terminal on every surface and is never retried.
+
+### Which surfaces honour this
+
+This has NOT historically been uniform, so check the row for the way you run pi:
+
+| How you run pi | Retry | Failover chain | Primary restored |
+|---|---|---|---|
+| Default interactive TUI | yes | yes | yes |
+| `-p` / `--print` | yes | yes | yes |
+| RPC server (`--mode rpc`) | yes | yes | yes |
+| Embedders using `pi::sdk` | opt-in | opt-in | opt-in |
+| Classic interactive stack | **no** | **no** | **no** |
+
+Two caveats worth knowing:
+
+- **The classic interactive stack has none of this.** A `fallbackChains` entry
+  is silently inert there: the turn fails with the provider's error. Tracked as
+  bd-u2qv4.
+- **Embedders opt in.** `pi::sdk::SessionOptions` defaults `retry` and
+  `failover` to `None`, so a host that builds its own session gets the old
+  behaviour until it sets them (`RetryPolicy::from_config` and
+  `FailoverOptions::from_config` read the same config block shown above).
+
+Until recently the default TUI was in the "no" row too, which is why this table
+exists rather than a sentence saying it always works.
+
+---
+
 ## Related Docs
 
 - Auth troubleshooting: [provider-auth-troubleshooting.md](provider-auth-troubleshooting.md)
 - Longtail evidence: [provider-longtail-evidence.md](provider-longtail-evidence.md)
 - Onboarding playbook: [provider-onboarding-playbook.md](provider-onboarding-playbook.md)
 - Provider metadata source: `src/provider_metadata.rs`
+- Retry/failover policy source: `src/failover.rs`

@@ -77,7 +77,10 @@ mod file_refs;
 mod keybindings;
 mod model_selector_ui;
 mod perf;
-mod share;
+/// Crate-visible because the ftui stack drives the same `/share` implementation
+/// rather than growing a second copy of it (bd-ydz1t.1). Only `run_share` and
+/// `ShareOutcome` are exported; everything else stays private to this stack.
+pub(crate) mod share;
 mod state;
 mod text_utils;
 mod tool_render;

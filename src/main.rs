@@ -2560,10 +2560,21 @@ async fn run(
                 // user has set `retry.enabled = false`, so turning it off
                 // still means nobody re-enters the provider on their behalf.
                 // The retry events it emits already render here as system
-                // notes. A configured fallback CHAIN is still inert: walking
-                // it needs the provider swap, which has not moved out of this
-                // binary yet.
+                // notes.
                 retry: pi::failover::RetryPolicy::from_config(&config),
+                // Cross-model failover (bd-u2qv4). A configured
+                // `retry.fallbackChains` used to be inert on this stack: the
+                // chain the user set up never ran on the surface they set it
+                // up for, while the identical request in print mode or over
+                // RPC walked it. `from_config` yields None when no chain is
+                // configured, which is the same condition under which the
+                // other surfaces decline.
+                failover: pi::sdk::FailoverOptions::from_config(
+                    &config,
+                    model_registry.get_available(),
+                    auth.clone(),
+                    cli.api_key.clone(),
+                ),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
@@ -2593,7 +2604,12 @@ async fn run(
                 cli.inline,
                 ftui_models,
                 ftui_sessions,
-                config.markdown_spacing(),
+                pi::interactive_ftui::FtuiSettings {
+                    markdown_spacing: config.markdown_spacing(),
+                    // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
+                    // the classic stack does, so it reads the same setting.
+                    gh_path: config.gh_path.clone(),
+                },
                 pi::interactive_ftui::AutocompleteLaunch {
                     catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
                     cwd: cwd.clone(),
@@ -9131,132 +9147,41 @@ async fn maybe_restore_print_primary(
     let Some(ctx) = failover_ctx else {
         return false;
     };
-    let Some((active_provider, active_model)) = state.active().cloned() else {
+    let Some(active) = state.active().cloned() else {
         return false;
     };
     let Some(primary) = state.primary().cloned() else {
         return false;
     };
-    if !state.should_restore_primary(std::time::Instant::now()) {
-        return false;
-    }
 
-    let runtime_provider = session.agent.provider();
-    if !pi::provider_metadata::provider_ids_match(runtime_provider.name(), &active_provider)
-        || !runtime_provider
-            .model_id()
-            .eq_ignore_ascii_case(&active_model)
-    {
-        return false;
-    }
-
-    let Some(entry) = ctx
-        .available_models
-        .iter()
-        .find(|m| {
-            pi::provider_metadata::provider_ids_match(&m.model.provider, &primary.provider)
-                && m.model.id.eq_ignore_ascii_case(&primary.model_id)
-        })
-        .cloned()
-        .or_else(|| pi::models::ad_hoc_model_entry(&primary.provider, &primary.model_id))
-    else {
-        return false;
+    // The persisted transition is `AgentSession::restore_primary`, shared with
+    // RPC and the SDK (bd-u2qv4, bd-gm481). What stays here is what is actually
+    // print's: no admission gate, so a record that no longer describes the live
+    // session declines and the next prompt runs on the fallback rather than
+    // failing the call, and the `FailoverEnd` is emitted as a json event.
+    let request = pi::agent::PrimaryRestoreRequest {
+        primary: &primary,
+        active: &active,
+        cooldown_elapsed: state.should_restore_primary(std::time::Instant::now()),
+        available_models: ctx.available_models,
+        auth: ctx.auth,
+        cli_api_key: ctx.cli_api_key,
+        strict_invariants: false,
+        // Print has never discarded an in-flight background compaction here.
+        // See `PrimaryRestoreRequest::invalidate_background_compaction`.
+        invalidate_background_compaction: false,
     };
-    let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
-    if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
-        // Restoring into an auth error would be strictly worse than staying on
-        // a working fallback.
-        return false;
-    }
-    let Ok(provider_impl) = providers::create_provider(
-        &entry,
-        session.extensions.as_ref().map(ExtensionRegion::manager),
-    ) else {
-        return false;
-    };
-
-    let session_store = Arc::clone(&session.session);
     let cx = pi::agent_cx::AgentCx::for_request();
-    let Ok(mut inner) = OwnedMutexGuard::lock(session_store, &cx).await else {
+    let Ok(Some(restored)) = session.restore_primary(&cx, &request).await else {
         return false;
     };
-    let session_matches_active = inner.effective_model_for_current_path().is_some_and(
-        |(session_provider, session_model)| {
-            pi::provider_metadata::provider_ids_match(&session_provider, &active_provider)
-                && session_model.eq_ignore_ascii_case(&active_model)
-        },
-    );
-    if !session_matches_active {
-        return false;
-    }
-
-    // Build the whole transition on a private candidate; the live transcript
-    // and provider stay untouched if persistence fails.
-    let to_provider = entry.model.provider.clone();
-    let to_model = entry.model.id.clone();
-    let target_thinking = entry.clamp_thinking_level(primary.requested_thinking_level);
-    let target_thinking_text = target_thinking.to_string();
-    let mut candidate = inner.clone();
-    let thinking_changed = candidate
-        .effective_thinking_level_for_current_path()
-        .as_deref()
-        != Some(target_thinking_text.as_str());
-    candidate.set_model_header(
-        Some(to_provider.clone()),
-        Some(to_model.clone()),
-        Some(target_thinking_text.clone()),
-    );
-    candidate.append_model_change_with_role(
-        to_provider.clone(),
-        to_model.clone(),
-        Some("primary_restore".to_string()),
-    );
-    if thinking_changed {
-        candidate.append_thinking_level_change(target_thinking_text);
-    }
-    if session.save_enabled()
-        && let Err(_first) = candidate.save().await
-        && let Err(_retry) = candidate.save().await
-    {
-        // Leave the fallback installed. A half-written restoration is worse
-        // than a working session on the wrong model.
-        return false;
-    }
-
-    // No fallible operation remains after installing the candidate.
-    *inner = candidate;
-    session.agent.set_provider(provider_impl);
-    session
-        .agent
-        .set_keyword_max_thinking_level(entry.clamp_thinking_level(ThinkingLevel::Max));
-    session
-        .agent
-        .set_tool_call_dialect(entry.tool_call_dialect());
-    session
-        .agent
-        .set_model_accepts_images(entry.model.input.contains(&InputType::Image));
-    {
-        let stream_options = session.agent.stream_options_mut();
-        stream_options.api_key.clone_from(&key);
-        stream_options.headers.clone_from(&entry.headers);
-        stream_options.max_tokens = Some(entry.model.max_tokens);
-        stream_options.thinking_level = Some(target_thinking);
-    }
-    session.set_compaction_context_window(context_window_tokens_for_entry(&entry));
-    session.refresh_extension_completion_host_state();
-    if let Some(region) = &session.extensions {
-        region
-            .manager()
-            .set_current_model(Some(to_provider.clone()), Some(to_model.clone()));
-    }
-    drop(inner);
     state.clear();
 
     if is_json {
         emit_json_event(&AgentEvent::FailoverEnd {
             success: true,
-            provider: to_provider,
-            model: to_model,
+            provider: restored.provider,
+            model: restored.model,
             restored_primary: true,
         });
     }

@@ -365,6 +365,18 @@ impl FailoverState {
         }
     }
 
+    /// Build with no cooldown tracker, for a session that has no chain
+    /// configured: there is nothing to fail over to and nothing to restore.
+    #[must_use]
+    pub const fn new_empty() -> Self {
+        Self {
+            cooldown: None,
+            primary: None,
+            active: None,
+            chain_position: 0,
+        }
+    }
+
     /// Build with an explicit cooldown, for a caller that configures failover
     /// directly rather than from a [`crate::config::Config`].
     #[must_use]
