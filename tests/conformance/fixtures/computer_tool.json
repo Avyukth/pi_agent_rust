@@ -1,31 +1,40 @@
 {
   "version": "1.0",
   "tool": "computer",
-  "description": "Computer desktop automation contract for bd-cv653.2.5 and bd-cv653.8.1: hermetic success, coordinate boundary, and named error behavior.",
+  "description": "Desktop automation contract for bd-cv653.2.5: explicit fixtures, required coordinates and named errors.",
   "cases": [
     {
       "name": "computer_mock_lists_displays",
-      "description": "the mock backend returns its deterministic two-display inventory",
+      "description": "Explicit mock mode returns a marked deterministic inventory",
       "requirement_ids": ["COMP-1"],
       "input": {"action": "list_displays"},
       "expected": {
         "content_contains": ["Found 2 display(s)", "Built-in Retina Display", "External 4K Monitor"],
-        "details_contains": ["\"width\": 2560", "\"width\": 3840"]
+        "details_contains": ["\"width\": 2560", "\"width\": 3840", "\"mock\": true"]
       }
     },
     {
       "name": "computer_mouse_move_zero_boundary",
-      "description": "omitted coordinates resolve deterministically to the origin",
+      "description": "Explicit zero coordinates remain valid; omission is not accidental input at the origin",
       "requirement_ids": ["COMP-2"],
-      "input": {"action": "mouse_move"},
+      "input": {"action": "mouse_move", "x": 0, "y": 0},
       "expected": {
-        "content_contains": ["Moved cursor to (0, 0)"],
-        "details_exact": {"action": "mouse_move", "x": 0, "y": 0}
+        "content_contains": ["mouse_move", "mock"],
+        "details_exact": {"action": "mouse_move", "x": 0, "y": 0, "button": "left", "mock": true}
       }
     },
     {
+      "name": "computer_mouse_move_requires_coordinates",
+      "description": "Missing coordinates fail before desktop access",
+      "requirement_ids": ["COMP-2"],
+      "expect_error": true,
+      "error_contains": "both x and y",
+      "input": {"action": "mouse_move"},
+      "expected": {}
+    },
+    {
       "name": "computer_unknown_action_error",
-      "description": "unsupported action produces a named dispatch error",
+      "description": "Unsupported action produces a named dispatch error",
       "requirement_ids": ["COMP-3"],
       "expect_error": true,
       "error_contains": "unknown",
