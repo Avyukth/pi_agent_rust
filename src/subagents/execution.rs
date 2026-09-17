@@ -194,6 +194,12 @@ impl ChildRunner {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
+        // A host progress callback may cancel the owner while handling
+        // Starting. Recheck after callbacks, immediately before dispatch.
+        if owner.checkpoint().is_err() {
+            cancel(&mut attempt.result, CANCELLED);
+            return attempt;
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
