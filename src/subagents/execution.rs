@@ -376,7 +376,7 @@ struct Attempt {
 }
 
 impl Attempt {
-    fn new(result: SubagentResult) -> Self {
+    const fn new(result: SubagentResult) -> Self {
         Self {
             result,
             isolation: None,
@@ -592,15 +592,15 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             };
             let line = match kind {
                 PipeKind::Stderr => String::from_utf8_lossy(&bytes).into_owned(),
-                PipeKind::Stdout => match String::from_utf8(bytes) {
-                    Ok(line) => line,
-                    Err(_) => {
+                PipeKind::Stdout => {
+                    let Ok(line) = String::from_utf8(bytes) else {
                         let _ = sender.send(PipeFrame::Error(
                             "PI_SUBAGENT_PROTOCOL: child stdout is not UTF-8",
                         ));
                         break;
-                    }
-                },
+                    };
+                    line
+                }
             };
             if sender.send(PipeFrame::Data(kind, line)).is_err() {
                 break;
@@ -623,7 +623,7 @@ fn drain_child_frames(
         match frame {
             PipeFrame::Error(error) if !result.is_error => result.fail(error.to_string()),
             PipeFrame::Data(PipeKind::Stderr, line) => {
-                append_bounded_line(&mut result.stderr, &line)
+                append_bounded_line(&mut result.stderr, &line);
             }
             PipeFrame::Data(PipeKind::Stdout, line) if !result.is_error => {
                 match protocol.ingest(&line, &mut result.output) {

@@ -12,10 +12,12 @@ fn quote(value: &str) -> String {
 }
 
 fn emit(events: &[Value]) -> String {
-    events
-        .iter()
-        .map(|event| format!("printf '%s\\n' {}\n", quote(&event.to_string())))
-        .collect()
+    use std::fmt::Write as _;
+
+    events.iter().fold(String::new(), |mut script, event| {
+        let _ = writeln!(script, "printf '%s\\n' {}", quote(&event.to_string()));
+        script
+    })
 }
 
 fn assistant(text: &str, reason: &str) -> Value {
@@ -475,9 +477,11 @@ fn apply_conflict_marks_result_and_hub_failed() {
         .find(|entry| entry.pid.map(u64::from) == Some(pid))
         .unwrap();
     assert_eq!(entry.status, crate::agent_hub::ChildStatus::Failed);
-    let statuses = statuses.lock().unwrap();
-    assert_eq!(statuses.last().map(String::as_str), Some("failed"));
-    assert!(!statuses.iter().any(|status| status == "completed"));
+    {
+        let statuses = statuses.lock().unwrap();
+        assert_eq!(statuses.last().map(String::as_str), Some("failed"));
+        assert!(!statuses.iter().any(|status| status == "completed"));
+    }
 }
 
 #[test]

@@ -69,6 +69,44 @@ impl ChildProtocol {
         outcome
     }
 
+    /// The `message_update` arm: one streaming assistant event.
+    ///
+    /// Split out of [`Self::ingest_inner`], which the nested match over the
+    /// update's own type pushed past the line limit. It is the only arm that
+    /// has to distinguish several event shapes rather than one.
+    fn ingest_message_update(event: &Value, output: &mut String) -> Result<bool, &'static str> {
+        let update = event.get("assistantMessageEvent").ok_or(INVALID_FRAME)?;
+        match update.get("type").and_then(Value::as_str) {
+            Some("start") => {
+                output.clear();
+                Ok(true)
+            }
+            Some("text_delta") => {
+                let delta = update
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or(INVALID_FRAME)?;
+                append_answer(output, delta)?;
+                Ok(!delta.is_empty())
+            }
+            // The final message, not accumulated previews, is the authority.
+            // A provider may revise text before completion.
+            Some("done") => {
+                replace_answer(update.get("message").ok_or(INVALID_MESSAGE)?, output)?;
+                Ok(true)
+            }
+            Some("error") => {
+                // The agent may retry a provider failure. A subsequent
+                // successful agent_end must still explicitly prove it.
+                Ok(false)
+            }
+            // Never interpret a bare delta as prose: both thinking and tool
+            // argument events also contain a `delta` field.
+            Some(_) => Ok(false),
+            None => Err(INVALID_FRAME),
+        }
+    }
+
     fn ingest_inner(&mut self, line: &str, output: &mut String) -> Result<bool, &'static str> {
         if line.len() > MAX_FRAME_BYTES {
             return Err(FRAME_LIMIT);
@@ -94,36 +132,7 @@ impl ChildProtocol {
             }
             "message_update" => {
                 self.completed = false;
-                let update = event.get("assistantMessageEvent").ok_or(INVALID_FRAME)?;
-                match update.get("type").and_then(Value::as_str) {
-                    Some("start") => {
-                        output.clear();
-                        Ok(true)
-                    }
-                    Some("text_delta") => {
-                        let delta = update
-                            .get("delta")
-                            .and_then(Value::as_str)
-                            .ok_or(INVALID_FRAME)?;
-                        append_answer(output, delta)?;
-                        Ok(!delta.is_empty())
-                    }
-                    // The final message, not accumulated previews, is the
-                    // authority. A provider may revise text before completion.
-                    Some("done") => {
-                        replace_answer(update.get("message").ok_or(INVALID_MESSAGE)?, output)?;
-                        Ok(true)
-                    }
-                    Some("error") => {
-                        // The agent may retry a provider failure. A subsequent
-                        // successful agent_end must still explicitly prove it.
-                        Ok(false)
-                    }
-                    // Never interpret a bare delta as prose: both thinking
-                    // and tool argument events also contain a `delta` field.
-                    Some(_) => Ok(false),
-                    None => Err(INVALID_FRAME),
-                }
+                Self::ingest_message_update(&event, output)
             }
             "message_end" => {
                 self.completed = false;
@@ -201,7 +210,7 @@ impl ChildProtocol {
         }
     }
 
-    pub(super) fn finish(&self) -> Result<(), &'static str> {
+    pub(super) const fn finish(&self) -> Result<(), &'static str> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -259,7 +268,7 @@ mod tests {
     fn feed(
         state: &mut ChildProtocol,
         output: &mut String,
-        event: Value,
+        event: &Value,
     ) -> Result<bool, &'static str> {
         state.ingest(&event.to_string(), output)
     }
@@ -269,9 +278,9 @@ mod tests {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
         for kind in ["thinking_delta", "toolcall_delta", "future_delta"] {
-            assert!(!feed(&mut state, &mut output, json!({"type":"message_update","assistantMessageEvent":{"type":kind,"delta":"not answer text"}})).unwrap());
+            assert!(!feed(&mut state, &mut output, &json!({"type":"message_update","assistantMessageEvent":{"type":kind,"delta":"not answer text"}})).unwrap());
         }
-        feed(&mut state, &mut output, json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"preview"}})).unwrap();
+        feed(&mut state, &mut output, &json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"preview"}})).unwrap();
         assert_eq!(output, "preview");
         assert!(state.finish().is_err());
     }
@@ -322,7 +331,7 @@ mod tests {
         )
         .unwrap();
         assert!(output.is_empty());
-        feed(&mut state, &mut output, end("final answer", "stop")).unwrap();
+        feed(&mut state, &mut output, &end("final answer", "stop")).unwrap();
         assert_eq!(output, "final answer");
         state.finish().unwrap();
     }
@@ -331,9 +340,9 @@ mod tests {
     fn an_old_completion_does_not_authorize_a_new_incomplete_run() {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
-        feed(&mut state, &mut output, end("first answer", "stop")).unwrap();
+        feed(&mut state, &mut output, &end("first answer", "stop")).unwrap();
         state.finish().unwrap();
-        feed(&mut state, &mut output, json!({"type":"agent_start"})).unwrap();
+        feed(&mut state, &mut output, &json!({"type":"agent_start"})).unwrap();
         assert!(output.is_empty());
         assert!(state.finish().is_err());
     }
@@ -352,7 +361,7 @@ mod tests {
             let mut state = ChildProtocol::default();
             let mut output = String::new();
             assert!(
-                feed(&mut state, &mut output, end("partial answer", reason)).is_err(),
+                feed(&mut state, &mut output, &end("partial answer", reason)).is_err(),
                 "{reason}"
             );
             assert!(state.finish().is_err(), "{reason}");
@@ -369,7 +378,7 @@ mod tests {
             let mut output = String::new();
             let mut event = end("looks successful", "stop");
             event["error"] = error;
-            let error = feed(&mut state, &mut output, event).unwrap_err();
+            let error = feed(&mut state, &mut output, &event).unwrap_err();
             assert!(!error.contains("secret-value"));
             assert!(state.finish().is_err());
         }
@@ -415,7 +424,7 @@ mod tests {
         let mut output = String::new();
         let original = state.ingest("not JSON", &mut output).unwrap_err();
         assert_eq!(
-            feed(&mut state, &mut output, end("cannot rescue", "stop")).unwrap_err(),
+            feed(&mut state, &mut output, &end("cannot rescue", "stop")).unwrap_err(),
             original
         );
         assert_eq!(state.finish().unwrap_err(), original);
@@ -428,7 +437,7 @@ mod tests {
         let mut output = String::new();
         let event = end(&"x".repeat(MAX_ANSWER_BYTES + 1), "stop");
         assert_eq!(
-            feed(&mut state, &mut output, event).unwrap_err(),
+            feed(&mut state, &mut output, &event).unwrap_err(),
             ANSWER_LIMIT
         );
         assert!(output.len() <= MAX_ANSWER_BYTES);
@@ -445,8 +454,8 @@ mod tests {
             json!({"type":"future_telemetry","data":42}),
         )
         .unwrap();
-        feed(&mut state, &mut output, end("done", "stop")).unwrap();
-        feed(&mut state, &mut output, json!({"type":"usage","tokens":5})).unwrap();
+        feed(&mut state, &mut output, &end("done", "stop")).unwrap();
+        feed(&mut state, &mut output, &json!({"type":"usage","tokens":5})).unwrap();
         state.finish().unwrap();
     }
 
@@ -503,10 +512,10 @@ mod tests {
     fn done_snapshot_is_only_a_preview_until_agent_end() {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
-        feed(&mut state, &mut output, json!({"type":"message_update","assistantMessageEvent":{"type":"done","message":message("revised answer", "stop")}})).unwrap();
+        feed(&mut state, &mut output, &json!({"type":"message_update","assistantMessageEvent":{"type":"done","message":message("revised answer", "stop")}})).unwrap();
         assert_eq!(output, "revised answer");
         assert!(state.finish().is_err());
-        feed(&mut state, &mut output, end("revised answer", "stop")).unwrap();
+        feed(&mut state, &mut output, &end("revised answer", "stop")).unwrap();
         state.finish().unwrap();
     }
 }
