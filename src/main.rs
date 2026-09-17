@@ -2578,9 +2578,20 @@ async fn run(
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
+            // Same `disabledProviders` filter the classic stack applies when it
+            // builds its model list: without it the setting was silently
+            // ignored on this frontend and every catalog provider still
+            // appeared in the picker.
             let ftui_models = model_registry
                 .get_available()
                 .into_iter()
+                .filter(|entry| {
+                    !pi::failover::provider_is_disabled(
+                        &disabled_providers,
+                        scope_override,
+                        &entry.model.provider,
+                    )
+                })
                 .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
                 .collect::<Vec<_>>();
             // /resume picker entries: this cwd's saved sessions, newest first
@@ -2606,6 +2617,12 @@ async fn run(
                 ftui_sessions,
                 pi::interactive_ftui::FtuiSettings {
                     markdown_spacing: config.markdown_spacing(),
+                    // Resolved exactly as the classic stack resolves it; the
+                    // `--no-mouse-capture` flag has already been folded into
+                    // `config.disable_mouse_capture` above.
+                    disable_mouse_capture: config.disable_mouse_capture.unwrap_or_else(|| {
+                        std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
+                    }),
                     // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
                     // the classic stack does, so it reads the same setting.
                     gh_path: config.gh_path.clone(),
