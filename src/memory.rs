@@ -343,9 +343,9 @@ impl MemoryStore {
 
     fn with_write_conn<T: Send>(
         &self,
-        action: impl FnOnce(&SqliteConnection) -> Result<T> + Send,
+        mut action: impl FnMut(&SqliteConnection) -> Result<T> + Send,
     ) -> Result<T> {
-        self.with_conn(|conn| transactions::run(conn, action))
+        self.with_conn(|conn| transactions::run(conn, &mut action))
     }
 
     /// Insert a fact/lesson/preference/decision after dedupe + secret
@@ -395,6 +395,10 @@ impl MemoryStore {
         let tags_json = serde_json::to_string(&tags)?;
         let session_id = session_id.map(str::to_string);
         self.with_write_conn(move |conn| {
+            let content = content.clone();
+            let tags = tags.clone();
+            let tags_json = tags_json.clone();
+            let session_id = session_id.clone();
             let now = now_ms();
             if let Some(id) = supersedes {
                 let rows = conn
@@ -496,6 +500,7 @@ impl MemoryStore {
         }
         let new_content = content.map(screen_secrets);
         self.with_write_conn(move |conn| {
+            let new_content = new_content.clone();
             let now = now_ms();
             let exists = conn
                 .query_sync(

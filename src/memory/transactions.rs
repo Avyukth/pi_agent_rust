@@ -1,11 +1,12 @@
 //! Atomic memory mutations across the primary row, FTS index, and audit log.
 //!
-//! Take the writer reservation before reading for deduplication or checking a
-//! superseded row. A deferred transaction would allow concurrent callers to
-//! make decisions from the same stale snapshot.
+//! Begin before reading for deduplication or checking a superseded row. Engines
+//! using optimistic snapshots can still reject COMMIT; restart those conflicts
+//! so the action rechecks its invariants against the winning transaction.
 
 use crate::error::{Error, Result};
 use crate::session_sqlite::SqliteConnection;
+use fsqlite::FrankenError as SqliteError;
 
 struct PendingTransaction<'a> {
     conn: &'a SqliteConnection,
@@ -26,37 +27,57 @@ impl Drop for PendingTransaction<'_> {
         }
     }
 }
-
 /// Publish a mutation only after all its statements have committed.
 ///
 /// Keep the transaction guard outside the unwind boundary: engine cleanup must
 /// run after the action's unwind has stopped, not from a destructor on that
 /// unwind. Resume the original panic only after rollback has been attempted.
 /// This does not claim to repair an engine already poisoned by its own panic.
+///
+/// Restart commit-time snapshot conflicts at most twice. The action must keep
+/// its effects inside the transaction; each retry rechecks reads on a fresh
+/// snapshot. Action errors and non-conflict commit errors are never retried.
 pub(super) fn run<T>(
     conn: &SqliteConnection,
-    action: impl FnOnce(&SqliteConnection) -> Result<T>,
+    mut action: impl FnMut(&SqliteConnection) -> Result<T>,
 ) -> Result<T> {
-    conn.execute_raw("BEGIN IMMEDIATE")
-        .map_err(|error| Error::tool("memory", format!("begin transaction failed: {error}")))?;
-    let mut pending = PendingTransaction {
-        conn,
-        committed: false,
-    };
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let result = action(conn)?;
-        conn.execute_raw("COMMIT").map_err(|error| {
-            Error::tool("memory", format!("commit transaction failed: {error}"))
-        })?;
-        pending.committed = true;
-        Ok(result)
-    }));
-    // Deliberately before resume_unwind, on success as well as failure. Rolling
-    // back inside a catch nested in Drop would still run on the outer unwind.
-    drop(pending);
-    match outcome {
-        Ok(result) => result,
-        Err(payload) => std::panic::resume_unwind(payload),
+    const MAX_ATTEMPTS: usize = 3;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        conn.execute_raw("BEGIN IMMEDIATE")
+            .map_err(|error| Error::tool("memory", format!("begin transaction failed: {error}")))?;
+        let mut pending = PendingTransaction {
+            conn,
+            committed: false,
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = action(conn)?;
+            Ok::<_, Error>(conn.execute_raw("COMMIT").map(|()| {
+                pending.committed = true;
+                result
+            }))
+        }));
+        // Deliberately before resume_unwind, on success as well as failure.
+        // Rolling back inside a catch nested in Drop would still run on the
+        // outer unwind.
+        drop(pending);
+        match outcome {
+            Ok(Ok(Ok(result))) => return Ok(result),
+            Ok(Ok(Err(error)))
+                if matches!(
+                    error,
+                    SqliteError::BusySnapshot { .. } | SqliteError::SerializationFailure { .. }
+                ) && attempt < MAX_ATTEMPTS => {}
+            Ok(Ok(Err(error))) => {
+                return Err(Error::tool(
+                    "memory",
+                    format!("commit transaction failed: {error}"),
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 
