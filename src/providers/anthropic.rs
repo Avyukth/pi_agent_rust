@@ -3042,9 +3042,15 @@ mod tests {
 
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept");
+            // 250ms is the POLLING interval; the deadline below is the budget.
+            // Treating a timed-out read as end-of-request truncated `bytes` and
+            // the header scan then failed as "request header boundary", which
+            // reads as a malformed request rather than a slow one — the reason
+            // this shape is worse than an outright panic (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("set read timeout");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
 
             let mut bytes = Vec::new();
             let mut chunk = [0_u8; 4096];
@@ -3061,7 +3067,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for request headers"
+                        );
                     }
                     Err(err) => panic!(),
                 }
@@ -3087,7 +3096,10 @@ mod tests {
                         if err.kind() == std::io::ErrorKind::WouldBlock
                             || err.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        break;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request body"
+                        );
                     }
                     Err(err) => panic!(),
                 }

@@ -744,37 +744,58 @@ mod settled_queue_tests {
     use std::path::Path;
 
     fn drain_fixture(trailing_failure: bool) -> (SubagentResult, protocol::ChildProtocol) {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
         let agent = super::super::tan_agent_definition();
-        let task: SubagentTask = serde_json::from_value(json!({"agent":"tan","task":"fixture"})).unwrap();
-        let mut result = SubagentResult::starting(&agent, task, None, Path::new("pi"), Path::new("."), &[]);
+        let task: SubagentTask =
+            serde_json::from_value(json!({"agent":"tan","task":"fixture"})).unwrap();
+        let mut result =
+            SubagentResult::starting(&agent, task, None, Path::new("pi"), Path::new("."), &[]);
         let mut protocol = protocol::ChildProtocol::default();
         let (sender, receiver) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
         let completion = json!({"type":"agent_end","messages":[{
             "role":"assistant","stopReason":"stop","content":[{"type":"text","text":"final answer"}]
-        }]}).to_string();
+        }]})
+        .to_string();
         for index in 0..protocol::PIPE_QUEUE_CAPACITY {
             let line = if index == 0 && trailing_failure {
                 completion.clone()
             } else if index + 1 == protocol::PIPE_QUEUE_CAPACITY {
-                if trailing_failure { "not-json".to_string() } else { completion.clone() }
+                if trailing_failure {
+                    "not-json".to_string()
+                } else {
+                    completion.clone()
+                }
             } else {
                 json!({"type":"usage","tokens":index}).to_string()
             };
-            sender.send(PipeFrame::Data(PipeKind::Stdout, line)).unwrap();
+            sender
+                .send(PipeFrame::Data(PipeKind::Stdout, line))
+                .unwrap();
         }
         drop(sender);
         let stdout = thread::spawn(|| {});
         let stderr = thread::spawn(|| {});
         let wait_until = Instant::now() + Duration::from_secs(2);
         while !stdout.is_finished() || !stderr.is_finished() {
-            assert!(Instant::now() < wait_until, "fixture readers did not settle");
+            assert!(
+                Instant::now() < wait_until,
+                "fixture readers did not settle"
+            );
             thread::yield_now();
         }
         runtime.block_on(drain_until_reader_exit(
-            receiver, &mut protocol, &mut result, None, stdout, stderr, &owner, deadline,
+            receiver,
+            &mut protocol,
+            &mut result,
+            None,
+            stdout,
+            stderr,
+            &owner,
+            deadline,
         ));
         (result, protocol)
     }
