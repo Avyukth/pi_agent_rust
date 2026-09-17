@@ -1767,7 +1767,10 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
                 "subagent-fixture",
                 json!({"agent": "scout", "task": "verify child protocol"}),
                 Some(Box::new(move |update| {
-                    captured.lock().unwrap().push_str(&serde_json::to_string(&update).unwrap());
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push_str(&serde_json::to_string(&update).unwrap());
                 })),
             ))
             .expect("child execution succeeds");

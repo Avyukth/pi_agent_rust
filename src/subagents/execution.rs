@@ -42,7 +42,13 @@ impl ChildRunner {
         role_model_spec: Option<String>,
         hub_kind: ChildKind,
     ) -> Self {
-        Self { cwd, global_dir, child_binary, role_model_spec, hub_kind }
+        Self {
+            cwd,
+            global_dir,
+            child_binary,
+            role_model_spec,
+            hub_kind,
+        }
     }
 
     /// At most one fresh corrective run. The first attempt's isolated edits
@@ -57,15 +63,25 @@ impl ChildRunner {
         let Some(agent) = agents.get(&task.agent) else {
             return SubagentResult::unknown(task, step);
         };
-        let schema = task.output_schema.clone().or_else(|| agent.output_schema.clone());
+        let schema = task
+            .output_schema
+            .clone()
+            .or_else(|| agent.output_schema.clone());
         if let Some(schema) = &schema
             && let Err(error) = compile_output_schema(schema)
         {
-            return SubagentResult::failed(agent, task, step, format!("Invalid outputSchema: {error}"));
+            return SubagentResult::failed(
+                agent,
+                task,
+                step,
+                format!("Invalid outputSchema: {error}"),
+            );
         }
         let owner = AgentCx::for_current_or_request();
         let update = on_update.as_ref();
-        let mut attempt = self.run_child_process(agent, task.clone(), step, update, schema.as_ref(), &owner).await;
+        let mut attempt = self
+            .run_child_process(agent, task.clone(), step, update, schema.as_ref(), &owner)
+            .await;
         if attempt.result.is_error || schema.is_none() {
             return attempt.finish(&owner, true, update);
         }
@@ -90,7 +106,9 @@ impl ChildRunner {
             task: corrective_retry_task(&task.task, &errors),
             ..task.clone()
         };
-        let mut retry = self.run_child_process(agent, corrective, step, update, Some(schema), &owner).await;
+        let mut retry = self
+            .run_child_process(agent, corrective, step, update, Some(schema), &owner)
+            .await;
         retry.result.schema_retries = Some(1);
         // Keep the public assignment stable; corrective prompt text is a
         // transport detail, not a replacement for the user's original task.
@@ -134,27 +152,47 @@ impl ChildRunner {
     ) -> Attempt {
         let cwd = task.cwd.as_ref().map_or_else(
             || self.cwd.clone(),
-            |path| if path.is_absolute() { path.clone() } else { self.cwd.join(path) },
+            |path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.cwd.join(path)
+                }
+            },
         );
         let args = child_args(agent, &task.task, self.role_model_spec.as_deref(), schema);
         let policy = isolation_policy(&task);
         let mut attempt = Attempt::new(SubagentResult::starting(
-            agent, task, step, &self.child_binary, &cwd, &args,
+            agent,
+            task,
+            step,
+            &self.child_binary,
+            &cwd,
+            &args,
         ));
         if owner.checkpoint().is_err() {
             cancel(&mut attempt.result, CANCELLED);
             return attempt;
         }
         if !owner.capabilities().io || !owner.capabilities().time {
-            attempt.result.fail("PI_SUBAGENT_PERMISSION: child execution requires I/O and timer capabilities".to_string());
+            attempt.result.fail(
+                "PI_SUBAGENT_PERMISSION: child execution requires I/O and timer capabilities"
+                    .to_string(),
+            );
             return attempt;
         }
         let (isolated, mode) = match policy {
             Ok(policy) => policy,
-            Err(error) => { attempt.result.fail(error); return attempt; }
+            Err(error) => {
+                attempt.result.fail(error);
+                return attempt;
+            }
         };
         if !cwd.is_dir() {
-            attempt.result.fail(format!("Working directory does not exist: {}", cwd.display()));
+            attempt.result.fail(format!(
+                "Working directory does not exist: {}",
+                cwd.display()
+            ));
             return attempt;
         }
         if isolated {
@@ -163,30 +201,43 @@ impl ChildRunner {
                     attempt.result.cwd.clone_from(&handle.path);
                     attempt.isolation = Some((handle, mode));
                 }
-                Err(error) => { attempt.result.fail(error.to_string()); return attempt; }
+                Err(error) => {
+                    attempt.result.fail(error.to_string());
+                    return attempt;
+                }
             }
         }
         if owner.checkpoint().is_err() {
             cancel(&mut attempt.result, CANCELLED);
             return attempt;
         }
-        let hub_entry = crate::agent_hub::registry().lock().ok().and_then(|mut registry| {
-            registry.register_kind(&agent.name, &attempt.result.task, self.hub_kind).ok()
-        });
+        let hub_entry = crate::agent_hub::registry()
+            .lock()
+            .ok()
+            .and_then(|mut registry| {
+                registry
+                    .register_kind(&agent.name, &attempt.result.task, self.hub_kind)
+                    .ok()
+            });
         attempt.result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
         attempt.hub.id.clone_from(&attempt.result.hub_id);
         emit_progress(update, &attempt.result);
 
         let mut command = Command::new(&self.child_binary);
-        command.args(&args).current_dir(&attempt.result.cwd)
-            .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        command
+            .args(&args)
+            .current_dir(&attempt.result.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .env("PI_CODING_AGENT_DIR", &self.global_dir)
             .env("PI_SUBAGENT_PARENT_PID", std::process::id().to_string())
             .env("PI_SUBAGENT_DEPTH", child_depth().to_string())
             .env_remove("PI_SUBAGENT_STEER_FILE")
             .env_remove("PI_SUBAGENT_RUN_ID");
         if let Some(entry) = &hub_entry {
-            command.env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
+            command
+                .env("PI_SUBAGENT_STEER_FILE", &entry.steer_path)
                 .env("PI_SUBAGENT_RUN_ID", &entry.id);
         }
         #[cfg(unix)]
@@ -203,7 +254,10 @@ impl ChildRunner {
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                attempt.result.fail(format!("Failed to launch {}: {error}", self.child_binary.display()));
+                attempt.result.fail(format!(
+                    "Failed to launch {}: {error}",
+                    self.child_binary.display()
+                ));
                 return attempt;
             }
         };
@@ -218,11 +272,15 @@ impl ChildRunner {
         }
         emit_progress(update, &attempt.result);
         let Some(stdout) = child.child.as_mut().and_then(|child| child.stdout.take()) else {
-            attempt.result.fail("Child stdout was not piped.".to_string());
+            attempt
+                .result
+                .fail("Child stdout was not piped.".to_string());
             return attempt;
         };
         let Some(stderr) = child.child.as_mut().and_then(|child| child.stderr.take()) else {
-            attempt.result.fail("Child stderr was not piped.".to_string());
+            attempt
+                .result
+                .fail("Child stderr was not piped.".to_string());
             return attempt;
         };
         let (tx, rx) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
@@ -249,7 +307,9 @@ impl ChildRunner {
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    attempt.result.fail(format!("Failed while waiting for child: {error}"));
+                    attempt
+                        .result
+                        .fail(format!("Failed while waiting for child: {error}"));
                     child.terminate();
                     break;
                 }
@@ -259,10 +319,22 @@ impl ChildRunner {
         // No descendant should keep writing or hold the pipes open after its
         // root exits. The guard still owns cleanup if this drain is cancelled.
         child.stop_descendants();
-        drain_until_reader_exit(rx, &mut protocol, &mut attempt.result, update, stdout, stderr, owner).await;
+        drain_until_reader_exit(
+            rx,
+            &mut protocol,
+            &mut attempt.result,
+            update,
+            stdout,
+            stderr,
+            owner,
+        )
+        .await;
         if !attempt.result.is_error {
             if attempt.result.exit_code != Some(0) {
-                attempt.result.fail(format!("Child exited with code {}.", attempt.result.exit_code.unwrap_or(-1)));
+                attempt.result.fail(format!(
+                    "Child exited with code {}.",
+                    attempt.result.exit_code.unwrap_or(-1)
+                ));
             } else if let Err(error) = protocol.finish() {
                 attempt.result.fail(error.to_string());
             } else {
@@ -275,7 +347,14 @@ impl ChildRunner {
 }
 
 fn isolation_policy(task: &SubagentTask) -> Result<(bool, IsoApplyMode), String> {
-    let isolated = match task.isolation.as_deref().unwrap_or("none").trim().to_ascii_lowercase().as_str() {
+    let isolated = match task
+        .isolation
+        .as_deref()
+        .unwrap_or("none")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "none" => false,
         "worktree" => true,
         _ => return Err("PI_SUBAGENT_ISOLATION: isolation must be none or worktree".to_string()),
@@ -298,22 +377,36 @@ struct Attempt {
 
 impl Attempt {
     fn new(result: SubagentResult) -> Self {
-        Self { result, isolation: None, hub: HubLease { id: None } }
+        Self {
+            result,
+            isolation: None,
+            hub: HubLease { id: None },
+        }
     }
 
-    fn finish(mut self, owner: &AgentCx, accepted: bool, update: Option<&UpdateCallback>) -> SubagentResult {
+    fn finish(
+        mut self,
+        owner: &AgentCx,
+        accepted: bool,
+        update: Option<&UpdateCallback>,
+    ) -> SubagentResult {
         if owner.checkpoint().is_err() {
             cancel(&mut self.result, CANCELLED);
         }
         if self.hub.was_killed() {
             cancel(&mut self.result, "Child was killed by the operator.");
         }
-        let accepted = accepted && !self.result.is_error
+        let accepted = accepted
+            && !self.result.is_error
             && matches!(self.result.status, SubagentStatus::Completed);
         if let Some((handle, requested)) = self.isolation.take() {
             // Both apply and explicit drop require an accepted result. A
             // failure keeps the evidence; no failed attempt is auto-deleted.
-            let mode = if accepted { requested } else { IsoApplyMode::Keep };
+            let mode = if accepted {
+                requested
+            } else {
+                IsoApplyMode::Keep
+            };
             let mut outcome = IsoOutcome {
                 schema: crate::worktree_iso::ISO_SCHEMA.to_string(),
                 worktree_path: handle.path.display().to_string(),
@@ -342,20 +435,24 @@ impl Attempt {
                                 }
                             }
                             Err(error) => {
-                                outcome.conflicted_files = error.to_string().lines().map(str::to_string).collect();
+                                outcome.conflicted_files =
+                                    error.to_string().lines().map(str::to_string).collect();
                                 self.result.fail(error.to_string());
                             }
                         }
                     } else if mode == IsoApplyMode::Drop
                         && let Err(error) = crate::worktree_iso::drop_worktree(&handle)
                     {
-                        self.result.fail(format!("Isolated worktree cleanup failed: {error}"));
+                        self.result
+                            .fail(format!("Isolated worktree cleanup failed: {error}"));
                     }
                 }
                 Err(error) => {
                     outcome.apply_mode = "keep".to_string();
                     if !matches!(self.result.status, SubagentStatus::Cancelled) {
-                        self.result.fail(format!("Failed to collect isolated diff; worktree preserved: {error}"));
+                        self.result.fail(format!(
+                            "Failed to collect isolated diff; worktree preserved: {error}"
+                        ));
                     }
                 }
             }
@@ -369,12 +466,16 @@ impl Attempt {
 
 /// Independent of process ownership: a future can be dropped before spawn or
 /// after process exit but before its result is accepted and written back.
-struct HubLease { id: Option<String> }
+struct HubLease {
+    id: Option<String>,
+}
 
 impl HubLease {
     fn was_killed(&self) -> bool {
         self.id.as_ref().is_some_and(|id| {
-            crate::agent_hub::registry().lock().ok()
+            crate::agent_hub::registry()
+                .lock()
+                .ok()
                 .and_then(|registry| registry.get(id))
                 .is_some_and(|entry| entry.status == ChildStatus::Killed)
         })
@@ -383,7 +484,9 @@ impl HubLease {
     fn settle(&mut self, result: &SubagentResult) {
         if let Some(id) = self.id.take()
             && let Ok(mut registry) = crate::agent_hub::registry().lock()
-            && registry.get(&id).is_some_and(|entry| entry.status != ChildStatus::Killed)
+            && registry
+                .get(&id)
+                .is_some_and(|entry| entry.status != ChildStatus::Killed)
         {
             let status = match result.status {
                 SubagentStatus::Cancelled => ChildStatus::Cancelled,
@@ -399,7 +502,9 @@ impl Drop for HubLease {
     fn drop(&mut self) {
         if let Some(id) = self.id.take()
             && let Ok(mut registry) = crate::agent_hub::registry().lock()
-            && registry.get(&id).is_some_and(|entry| matches!(entry.status, ChildStatus::Starting | ChildStatus::Running))
+            && registry.get(&id).is_some_and(|entry| {
+                matches!(entry.status, ChildStatus::Starting | ChildStatus::Running)
+            })
         {
             registry.settle(&id, ChildStatus::Cancelled);
         }
@@ -413,14 +518,23 @@ struct ChildProcessGuard {
 
 impl ChildProcessGuard {
     const fn new(child: std::process::Child) -> Self {
-        Self { child: Some(child), descendants_stopped: false }
+        Self {
+            child: Some(child),
+            descendants_stopped: false,
+        }
     }
-    fn id(&self) -> u32 { self.child.as_ref().map_or(0, std::process::Child::id) }
+    fn id(&self) -> u32 {
+        self.child.as_ref().map_or(0, std::process::Child::id)
+    }
     fn stop_descendants(&mut self) {
-        if self.descendants_stopped { return; }
+        if self.descendants_stopped {
+            return;
+        }
         self.descendants_stopped = true;
         let pid = self.id();
-        if pid == 0 { return; }
+        if pid == 0 {
+            return;
+        }
         #[cfg(unix)]
         if let Ok(pid) = i32::try_from(pid)
             && let Some(group) = rustix::process::Pid::from_raw(pid)
@@ -438,15 +552,22 @@ impl ChildProcessGuard {
             let _ = child.wait();
         }
     }
-    fn disarm(&mut self) { let _ = self.child.take(); }
+    fn disarm(&mut self) {
+        let _ = self.child.take();
+    }
 }
 
 impl Drop for ChildProcessGuard {
-    fn drop(&mut self) { self.terminate(); }
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 #[derive(Clone, Copy)]
-enum PipeKind { Stdout, Stderr }
+enum PipeKind {
+    Stdout,
+    Stderr,
+}
 
 enum PipeFrame {
     Data(PipeKind, String),
@@ -454,7 +575,9 @@ enum PipeFrame {
 }
 
 fn spawn_pipe_reader<R: Read + Send + 'static>(
-    pipe: R, kind: PipeKind, sender: mpsc::SyncSender<PipeFrame>,
+    pipe: R,
+    kind: PipeKind,
+    sender: mpsc::SyncSender<PipeFrame>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(pipe);
@@ -462,33 +585,46 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             let bytes = match protocol::read_frame(&mut reader) {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => break,
-                Err(error) => { let _ = sender.send(PipeFrame::Error(error)); break; }
+                Err(error) => {
+                    let _ = sender.send(PipeFrame::Error(error));
+                    break;
+                }
             };
             let line = match kind {
                 PipeKind::Stderr => String::from_utf8_lossy(&bytes).into_owned(),
                 PipeKind::Stdout => match String::from_utf8(bytes) {
                     Ok(line) => line,
                     Err(_) => {
-                        let _ = sender.send(PipeFrame::Error("PI_SUBAGENT_PROTOCOL: child stdout is not UTF-8"));
+                        let _ = sender.send(PipeFrame::Error(
+                            "PI_SUBAGENT_PROTOCOL: child stdout is not UTF-8",
+                        ));
                         break;
                     }
                 },
             };
-            if sender.send(PipeFrame::Data(kind, line)).is_err() { break; }
+            if sender.send(PipeFrame::Data(kind, line)).is_err() {
+                break;
+            }
         }
     })
 }
 
 fn drain_child_frames(
-    receiver: &Receiver<PipeFrame>, protocol: &mut protocol::ChildProtocol,
-    result: &mut SubagentResult, update: Option<&UpdateCallback>,
+    receiver: &Receiver<PipeFrame>,
+    protocol: &mut protocol::ChildProtocol,
+    result: &mut SubagentResult,
+    update: Option<&UpdateCallback>,
 ) {
     // A continuously producing child cannot starve cancellation or exit checks.
     for _ in 0..DRAIN_BATCH {
-        let Ok(frame) = receiver.try_recv() else { break; };
+        let Ok(frame) = receiver.try_recv() else {
+            break;
+        };
         match frame {
             PipeFrame::Error(error) if !result.is_error => result.fail(error.to_string()),
-            PipeFrame::Data(PipeKind::Stderr, line) => append_bounded_line(&mut result.stderr, &line),
+            PipeFrame::Data(PipeKind::Stderr, line) => {
+                append_bounded_line(&mut result.stderr, &line)
+            }
             PipeFrame::Data(PipeKind::Stdout, line) if !result.is_error => {
                 match protocol.ingest(&line, &mut result.output) {
                     Ok(changed) => {
@@ -497,7 +633,9 @@ fn drain_child_frames(
                         {
                             registry.append_transcript(id, &line);
                         }
-                        if changed { emit_progress(update, result); }
+                        if changed {
+                            emit_progress(update, result);
+                        }
                     }
                     Err(error) => result.fail(error.to_string()),
                 }
@@ -508,15 +646,22 @@ fn drain_child_frames(
 }
 
 async fn poll_pause(owner: &AgentCx) {
-    let now = owner.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    let now = owner
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
     asupersync::time::sleep(now, Duration::from_millis(10)).await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn drain_until_reader_exit(
-    receiver: Receiver<PipeFrame>, protocol: &mut protocol::ChildProtocol,
-    result: &mut SubagentResult, update: Option<&UpdateCallback>,
-    stdout: JoinHandle<()>, stderr: JoinHandle<()>, owner: &AgentCx,
+    receiver: Receiver<PipeFrame>,
+    protocol: &mut protocol::ChildProtocol,
+    result: &mut SubagentResult,
+    update: Option<&UpdateCallback>,
+    stdout: JoinHandle<()>,
+    stderr: JoinHandle<()>,
+    owner: &AgentCx,
 ) {
     let deadline = Instant::now() + PIPE_DRAIN_TIMEOUT;
     loop {
@@ -536,7 +681,10 @@ async fn drain_until_reader_exit(
         }
         if Instant::now() >= deadline {
             if !result.is_error {
-                result.fail("PI_SUBAGENT_PIPE_TIMEOUT: child pipes did not close after process termination".to_string());
+                result.fail(
+                    "PI_SUBAGENT_PIPE_TIMEOUT: child pipes did not close after process termination"
+                        .to_string(),
+                );
             }
             return;
         }

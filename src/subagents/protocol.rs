@@ -14,23 +14,17 @@ pub(super) const PIPE_QUEUE_CAPACITY: usize = 2;
 const MAX_ANSWER_BYTES: usize = 256 * 1024;
 const MAX_CONTENT_BLOCKS: usize = 4096;
 
-pub(super) const FRAME_LIMIT: &str =
-    "PI_SUBAGENT_FRAME_LIMIT: child output frame exceeds 8 MiB";
-pub(super) const PIPE_ERROR: &str =
-    "PI_SUBAGENT_PIPE_ERROR: failed to read child output";
-const INVALID_FRAME: &str =
-    "PI_SUBAGENT_PROTOCOL: child stdout is not a valid JSONL event";
+pub(super) const FRAME_LIMIT: &str = "PI_SUBAGENT_FRAME_LIMIT: child output frame exceeds 8 MiB";
+pub(super) const PIPE_ERROR: &str = "PI_SUBAGENT_PIPE_ERROR: failed to read child output";
+const INVALID_FRAME: &str = "PI_SUBAGENT_PROTOCOL: child stdout is not a valid JSONL event";
 const INVALID_MESSAGE: &str =
     "PI_SUBAGENT_PROTOCOL: child completion has an invalid assistant message";
-const ANSWER_LIMIT: &str =
-    "PI_SUBAGENT_OUTPUT_LIMIT: child answer exceeds 256 KiB; it cannot be accepted or schema-validated";
+const ANSWER_LIMIT: &str = "PI_SUBAGENT_OUTPUT_LIMIT: child answer exceeds 256 KiB; it cannot be accepted or schema-validated";
 
 /// Read a complete line without first allocating an unbounded `String` through
 /// `BufRead::lines`. CRLF and a complete final line without a newline are legal.
 /// The caller decides whether a non-UTF-8 diagnostic is lossy or fatal.
-pub(super) fn read_frame<R: BufRead>(
-    reader: &mut R,
-) -> Result<Option<Vec<u8>>, &'static str> {
+pub(super) fn read_frame<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>, &'static str> {
     let mut frame = Vec::new();
     loop {
         let chunk = reader.fill_buf().map_err(|_| PIPE_ERROR)?;
@@ -63,11 +57,7 @@ pub(super) struct ChildProtocol {
 impl ChildProtocol {
     /// Update a bounded preview. `true` means callers should publish an update.
     /// A protocol failure is sticky and can never be rescued by a later frame.
-    pub(super) fn ingest(
-        &mut self,
-        line: &str,
-        output: &mut String,
-    ) -> Result<bool, &'static str> {
+    pub(super) fn ingest(&mut self, line: &str, output: &mut String) -> Result<bool, &'static str> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -84,7 +74,10 @@ impl ChildProtocol {
             return Err(FRAME_LIMIT);
         }
         let event: Value = serde_json::from_str(line).map_err(|_| INVALID_FRAME)?;
-        let kind = event.get("type").and_then(Value::as_str).ok_or(INVALID_FRAME)?;
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(INVALID_FRAME)?;
         match kind {
             "agent_start" => {
                 self.completed = false;
@@ -108,7 +101,10 @@ impl ChildProtocol {
                         Ok(true)
                     }
                     Some("text_delta") => {
-                        let delta = update.get("delta").and_then(Value::as_str).ok_or(INVALID_FRAME)?;
+                        let delta = update
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .ok_or(INVALID_FRAME)?;
                         append_answer(output, delta)?;
                         Ok(!delta.is_empty())
                     }
@@ -142,29 +138,53 @@ impl ChildProtocol {
                 if event.get("error").is_some_and(|error| !error.is_null()) {
                     return Err("PI_SUBAGENT_FAILED: child agent reported an unsuccessful run");
                 }
-                let last = event.get("messages").and_then(Value::as_array)
-                    .and_then(|messages| messages.last()).ok_or(INVALID_MESSAGE)?;
+                let last = event
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| messages.last())
+                    .ok_or(INVALID_MESSAGE)?;
                 // Searching backwards could accept an old answer while the
                 // actual run ended on an unresolved tool result or new input.
                 if last.get("role").and_then(Value::as_str) != Some("assistant") {
-                    return Err("PI_SUBAGENT_INCOMPLETE: child ended without a final assistant answer");
+                    return Err(
+                        "PI_SUBAGENT_INCOMPLETE: child ended without a final assistant answer",
+                    );
                 }
                 replace_answer(last, output)?;
                 match last.get("stopReason").and_then(Value::as_str) {
                     Some("stop") => {}
-                    Some("length") => return Err("PI_SUBAGENT_TRUNCATED: child answer hit its output limit"),
-                    Some("toolUse" | "pauseTurn") => return Err("PI_SUBAGENT_INCOMPLETE: child requires another tool or continuation turn"),
+                    Some("length") => {
+                        return Err("PI_SUBAGENT_TRUNCATED: child answer hit its output limit");
+                    }
+                    Some("toolUse" | "pauseTurn") => {
+                        return Err(
+                            "PI_SUBAGENT_INCOMPLETE: child requires another tool or continuation turn",
+                        );
+                    }
                     Some("refusal") => return Err("PI_SUBAGENT_REFUSAL: child declined the task"),
-                    Some("error" | "aborted") => return Err("PI_SUBAGENT_FAILED: child generation failed or was aborted"),
+                    Some("error" | "aborted") => {
+                        return Err("PI_SUBAGENT_FAILED: child generation failed or was aborted");
+                    }
                     _ => return Err(INVALID_MESSAGE),
                 }
-                if last.get("errorMessage").is_some_and(|error| !error.is_null()) {
+                if last
+                    .get("errorMessage")
+                    .is_some_and(|error| !error.is_null())
+                {
                     return Err("PI_SUBAGENT_FAILED: child final message contains an error");
                 }
-                if last.get("content").and_then(Value::as_array).is_some_and(|blocks| {
-                    blocks.iter().any(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
-                }) {
-                    return Err("PI_SUBAGENT_INCOMPLETE: child final answer contains unresolved tool calls");
+                if last
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("toolCall")
+                        })
+                    })
+                {
+                    return Err(
+                        "PI_SUBAGENT_INCOMPLETE: child final answer contains unresolved tool calls",
+                    );
                 }
                 if output.trim().is_empty() {
                     return Err("PI_SUBAGENT_EMPTY_RESULT: child completed without an answer");
@@ -201,14 +221,20 @@ fn append_answer(output: &mut String, text: &str) -> Result<(), &'static str> {
 }
 
 fn replace_answer(message: &Value, output: &mut String) -> Result<(), &'static str> {
-    let blocks = message.get("content").and_then(Value::as_array).ok_or(INVALID_MESSAGE)?;
+    let blocks = message
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or(INVALID_MESSAGE)?;
     if blocks.len() > MAX_CONTENT_BLOCKS {
         return Err(INVALID_MESSAGE);
     }
     let mut answer = String::new();
     for block in blocks {
         if block.get("type").and_then(Value::as_str) == Some("text") {
-            let text = block.get("text").and_then(Value::as_str).ok_or(INVALID_MESSAGE)?;
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or(INVALID_MESSAGE)?;
             append_answer(&mut answer, text)?;
         }
     }
@@ -230,7 +256,11 @@ mod tests {
         json!({"type":"agent_end","messages":[message(text, reason)]})
     }
 
-    fn feed(state: &mut ChildProtocol, output: &mut String, event: Value) -> Result<bool, &'static str> {
+    fn feed(
+        state: &mut ChildProtocol,
+        output: &mut String,
+        event: Value,
+    ) -> Result<bool, &'static str> {
         state.ingest(&event.to_string(), output)
     }
 
@@ -254,10 +284,23 @@ mod tests {
             {"type":"text","text":"first "}, {"type":"thinking","thinking":"private"},
             {"type":"text","text":"日本語"}, {"type":"redacted_thinking","data":"opaque"}
         ]});
-        feed(&mut state, &mut output, json!({"type":"message_end","message":final_message})).unwrap();
+        feed(
+            &mut state,
+            &mut output,
+            json!({"type":"message_end","message":final_message}),
+        )
+        .unwrap();
         assert_eq!(output, "first 日本語");
-        assert!(state.finish().is_err(), "message_end alone is not agent completion");
-        feed(&mut state, &mut output, json!({"type":"agent_end","messages":[final_message]})).unwrap();
+        assert!(
+            state.finish().is_err(),
+            "message_end alone is not agent completion"
+        );
+        feed(
+            &mut state,
+            &mut output,
+            json!({"type":"agent_end","messages":[final_message]}),
+        )
+        .unwrap();
         assert_eq!(output, "first 日本語");
         state.finish().unwrap();
     }
@@ -266,8 +309,18 @@ mod tests {
     fn separate_assistant_turns_do_not_concatenate_planning_and_final_answers() {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
-        feed(&mut state, &mut output, json!({"type":"message_end","message":message("planning", "toolUse")})).unwrap();
-        feed(&mut state, &mut output, json!({"type":"message_start","message":{"role":"assistant"}})).unwrap();
+        feed(
+            &mut state,
+            &mut output,
+            json!({"type":"message_end","message":message("planning", "toolUse")}),
+        )
+        .unwrap();
+        feed(
+            &mut state,
+            &mut output,
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+        )
+        .unwrap();
         assert!(output.is_empty());
         feed(&mut state, &mut output, end("final answer", "stop")).unwrap();
         assert_eq!(output, "final answer");
@@ -287,17 +340,31 @@ mod tests {
 
     #[test]
     fn unsuccessful_terminal_reasons_are_never_completed_delegations() {
-        for reason in ["length", "toolUse", "pauseTurn", "refusal", "error", "aborted", "unknown"] {
+        for reason in [
+            "length",
+            "toolUse",
+            "pauseTurn",
+            "refusal",
+            "error",
+            "aborted",
+            "unknown",
+        ] {
             let mut state = ChildProtocol::default();
             let mut output = String::new();
-            assert!(feed(&mut state, &mut output, end("partial answer", reason)).is_err(), "{reason}");
+            assert!(
+                feed(&mut state, &mut output, end("partial answer", reason)).is_err(),
+                "{reason}"
+            );
             assert!(state.finish().is_err(), "{reason}");
         }
     }
 
     #[test]
     fn run_errors_are_rejected_without_echoing_child_diagnostics() {
-        for error in [json!("api key secret-value"), json!({"details":"secret-value"})] {
+        for error in [
+            json!("api key secret-value"),
+            json!({"details":"secret-value"}),
+        ] {
             let mut state = ChildProtocol::default();
             let mut output = String::new();
             let mut event = end("looks successful", "stop");
@@ -317,7 +384,14 @@ mod tests {
             json!({"role":"assistant","stopReason":"stop","content":[{"type":"toolCall","id":"call","name":"write","arguments":{}},{"type":"text","text":"plan"}]}),
         ] {
             let mut state = ChildProtocol::default();
-            assert!(feed(&mut state, &mut String::new(), json!({"type":"agent_end","messages":[message("earlier", "stop"), last]})).is_err());
+            assert!(
+                feed(
+                    &mut state,
+                    &mut String::new(),
+                    json!({"type":"agent_end","messages":[message("earlier", "stop"), last]})
+                )
+                .is_err()
+            );
         }
     }
 
@@ -326,7 +400,12 @@ mod tests {
         let mut final_message = message("answer", "stop");
         final_message["errorMessage"] = json!("secret diagnostic");
         let mut state = ChildProtocol::default();
-        let error = feed(&mut state, &mut String::new(), json!({"type":"agent_end","messages":[final_message]})).unwrap_err();
+        let error = feed(
+            &mut state,
+            &mut String::new(),
+            json!({"type":"agent_end","messages":[final_message]}),
+        )
+        .unwrap_err();
         assert!(!error.contains("secret diagnostic"));
     }
 
@@ -335,7 +414,10 @@ mod tests {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
         let original = state.ingest("not JSON", &mut output).unwrap_err();
-        assert_eq!(feed(&mut state, &mut output, end("cannot rescue", "stop")).unwrap_err(), original);
+        assert_eq!(
+            feed(&mut state, &mut output, end("cannot rescue", "stop")).unwrap_err(),
+            original
+        );
         assert_eq!(state.finish().unwrap_err(), original);
         assert!(output.is_empty());
     }
@@ -345,7 +427,10 @@ mod tests {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
         let event = end(&"x".repeat(MAX_ANSWER_BYTES + 1), "stop");
-        assert_eq!(feed(&mut state, &mut output, event).unwrap_err(), ANSWER_LIMIT);
+        assert_eq!(
+            feed(&mut state, &mut output, event).unwrap_err(),
+            ANSWER_LIMIT
+        );
         assert!(output.len() <= MAX_ANSWER_BYTES);
         assert!(state.finish().is_err());
     }
@@ -354,7 +439,12 @@ mod tests {
     fn unknown_events_do_not_break_a_valid_completion() {
         let mut state = ChildProtocol::default();
         let mut output = String::new();
-        feed(&mut state, &mut output, json!({"type":"future_telemetry","data":42})).unwrap();
+        feed(
+            &mut state,
+            &mut output,
+            json!({"type":"future_telemetry","data":42}),
+        )
+        .unwrap();
         feed(&mut state, &mut output, end("done", "stop")).unwrap();
         feed(&mut state, &mut output, json!({"type":"usage","tokens":5})).unwrap();
         state.finish().unwrap();
@@ -362,10 +452,20 @@ mod tests {
 
     #[test]
     fn bare_or_malformed_delta_frames_are_not_treated_as_text() {
-        for update in [json!({"delta":"private"}), json!({"type":"text_delta","delta":null})] {
+        for update in [
+            json!({"delta":"private"}),
+            json!({"type":"text_delta","delta":null}),
+        ] {
             let mut state = ChildProtocol::default();
             let mut output = String::new();
-            assert!(feed(&mut state, &mut output, json!({"type":"message_update","assistantMessageEvent":update})).is_err());
+            assert!(
+                feed(
+                    &mut state,
+                    &mut output,
+                    json!({"type":"message_update","assistantMessageEvent":update})
+                )
+                .is_err()
+            );
             assert!(output.is_empty());
         }
     }
@@ -392,7 +492,10 @@ mod tests {
         let mut input = vec![b'x'; MAX_FRAME_BYTES];
         input.push(b'\n');
         let mut reader = BufReader::new(Cursor::new(input));
-        assert_eq!(read_frame(&mut reader).unwrap().unwrap().len(), MAX_FRAME_BYTES);
+        assert_eq!(
+            read_frame(&mut reader).unwrap().unwrap().len(),
+            MAX_FRAME_BYTES
+        );
         assert!(read_frame(&mut reader).unwrap().is_none());
     }
 
