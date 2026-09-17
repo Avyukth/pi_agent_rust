@@ -8,14 +8,25 @@ pub(super) fn check_navigation(raw: &str, allowlist: Option<&[String]>) -> Resul
         return Ok(());
     }
     let url = Url::parse(raw).map_err(|e| Error::tool("browser", format!("invalid URL: {e}")))?;
-    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
-        return Err(Error::tool("browser", "navigation requires HTTP(S) without URL credentials, or about:blank"));
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(Error::tool(
+            "browser",
+            "navigation requires HTTP(S) without URL credentials, or about:blank",
+        ));
     }
-    let host = url.host_str().ok_or_else(|| Error::tool("browser", "navigation URL has no host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::tool("browser", "navigation URL has no host"))?;
     if let Some(allowed) = allowlist
         && !allowed.iter().any(|rule| host_matches(host, rule))
     {
-        return Err(Error::tool("browser", format!("navigation to {raw} blocked by domain allowlist")));
+        return Err(Error::tool(
+            "browser",
+            format!("navigation to {raw} blocked by domain allowlist"),
+        ));
     }
     Ok(())
 }
@@ -26,7 +37,9 @@ fn host_matches(host: &str, rule: &str) -> bool {
         return true;
     }
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let (subdomains, domain) = rule.strip_prefix("*.").map_or((false, rule.as_str()), |s| (true, s));
+    let (subdomains, domain) = rule
+        .strip_prefix("*.")
+        .map_or((false, rule.as_str()), |s| (true, s));
     // Parse rules as hosts, never as substrings of a URL. This also normalizes IDNA.
     let Ok(parsed) = url::Host::parse(domain.trim_end_matches('.')) else {
         return false;
@@ -42,7 +55,8 @@ fn host_matches(host: &str, rule: &str) -> bool {
 /// CDP is a powerful unauthenticated local control channel. Do not let endpoint
 /// discovery turn an explicit loopback attachment into arbitrary remote access.
 pub(super) fn endpoint(raw: &str, websocket: bool) -> Result<Url> {
-    let url = Url::parse(raw).map_err(|e| Error::tool("browser", format!("invalid CDP endpoint: {e}")))?;
+    let url = Url::parse(raw)
+        .map_err(|e| Error::tool("browser", format!("invalid CDP endpoint: {e}")))?;
     let local = match url.host() {
         Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -50,13 +64,19 @@ pub(super) fn endpoint(raw: &str, websocket: bool) -> Result<Url> {
         // authorities reliably. Require IPv4 loopback rather than misroute it.
         _ => false,
     };
-    if !local || url.scheme() != if websocket { "ws" } else { "http" }
-        || !url.username().is_empty() || url.password().is_some()
-        || url.query().is_some() || url.fragment().is_some()
+    if !local
+        || url.scheme() != if websocket { "ws" } else { "http" }
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
         || (!websocket && url.path() != "/")
         || (websocket && !url.path().starts_with("/devtools/browser/"))
     {
-        return Err(Error::tool("browser", "CDP endpoint must be an unauthenticated IPv4-loopback or localhost URL (HTTP discovery / WebSocket browser target)"));
+        return Err(Error::tool(
+            "browser",
+            "CDP endpoint must be an unauthenticated IPv4-loopback or localhost URL (HTTP discovery / WebSocket browser target)",
+        ));
     }
     Ok(url)
 }
@@ -72,10 +92,15 @@ mod tests {
             assert!(check_navigation(url, Some(&rules)).is_ok(), "{url}");
         }
         for url in [
-            "https://evil.test/?next=example.com", "https://evil.test/example.com",
-            "https://example.com.evil.test", "https://notexample.com",
-            "https://example.com@evil.test", "https://sub.example.com",
-            "file:///etc/passwd", "javascript:alert(1)", "data:text/html,hello",
+            "https://evil.test/?next=example.com",
+            "https://evil.test/example.com",
+            "https://example.com.evil.test",
+            "https://notexample.com",
+            "https://example.com@evil.test",
+            "https://sub.example.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "data:text/html,hello",
         ] {
             assert!(check_navigation(url, Some(&rules)).is_err(), "{url}");
         }
@@ -95,9 +120,14 @@ mod tests {
     fn cdp_discovery_rejects_remote_credentialed_and_ambiguous_endpoints() {
         assert!(endpoint("http://127.0.0.1:9222", false).is_ok());
         assert!(endpoint("ws://localhost:9222/devtools/browser/uuid", true).is_ok());
-        for raw in ["http://example.com:9222", "http://127.0.0.1.evil.test:9222",
-            "http://user:pass@localhost:9222", "http://localhost:9222/?token=x",
-            "http://localhost:9222/proxy", "file:///json/version"] {
+        for raw in [
+            "http://example.com:9222",
+            "http://127.0.0.1.evil.test:9222",
+            "http://user:pass@localhost:9222",
+            "http://localhost:9222/?token=x",
+            "http://localhost:9222/proxy",
+            "file:///json/version",
+        ] {
             assert!(endpoint(raw, false).is_err(), "{raw}");
         }
     }

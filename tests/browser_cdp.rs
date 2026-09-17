@@ -13,8 +13,12 @@ use std::time::Duration;
 type Script = Vec<(&'static str, Value)>;
 
 fn headers(stream: &mut TcpStream) -> String {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         assert!(bytes.len() < 16384);
@@ -31,8 +35,16 @@ fn read_frame(stream: &mut TcpStream) -> Value {
     assert_eq!(head[0], 0x81, "client sends one final text frame");
     assert_ne!(head[1] & 0x80, 0, "client frames must be masked");
     let size = match head[1] & 0x7f {
-        126 => { let mut size = [0; 2]; stream.read_exact(&mut size).unwrap(); usize::from(u16::from_be_bytes(size)) }
-        127 => { let mut size = [0; 8]; stream.read_exact(&mut size).unwrap(); usize::try_from(u64::from_be_bytes(size)).unwrap() }
+        126 => {
+            let mut size = [0; 2];
+            stream.read_exact(&mut size).unwrap();
+            usize::from(u16::from_be_bytes(size))
+        }
+        127 => {
+            let mut size = [0; 8];
+            stream.read_exact(&mut size).unwrap();
+            usize::try_from(u64::from_be_bytes(size)).unwrap()
+        }
         size => usize::from(size),
     };
     assert!(size < 1024 * 1024);
@@ -40,7 +52,9 @@ fn read_frame(stream: &mut TcpStream) -> Value {
     stream.read_exact(&mut mask).unwrap();
     let mut bytes = vec![0; size];
     stream.read_exact(&mut bytes).unwrap();
-    for (index, byte) in bytes.iter_mut().enumerate() { *byte ^= mask[index % 4]; }
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= mask[index % 4];
+    }
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -48,10 +62,14 @@ fn write_frame(stream: &mut TcpStream, value: &Value) {
     let bytes = serde_json::to_vec(value).unwrap();
     stream.write_all(&[0x81]).unwrap();
     if bytes.len() < 126 {
-        stream.write_all(&[u8::try_from(bytes.len()).unwrap()]).unwrap();
+        stream
+            .write_all(&[u8::try_from(bytes.len()).unwrap()])
+            .unwrap();
     } else {
         stream.write_all(&[126]).unwrap();
-        stream.write_all(&u16::try_from(bytes.len()).unwrap().to_be_bytes()).unwrap();
+        stream
+            .write_all(&u16::try_from(bytes.len()).unwrap().to_be_bytes())
+            .unwrap();
     }
     stream.write_all(&bytes).unwrap();
 }
@@ -62,16 +80,21 @@ fn peer(script: Script) -> (String, thread::JoinHandle<()>) {
     let handle = thread::spawn(move || {
         let (mut discovery, _) = listener.accept().unwrap();
         assert!(headers(&mut discovery).starts_with("GET /json/version "));
-        let body = json!({"webSocketDebuggerUrl": format!("ws://{addr}/devtools/browser/fixture")}).to_string();
+        let body = json!({"webSocketDebuggerUrl": format!("ws://{addr}/devtools/browser/fixture")})
+            .to_string();
         write!(discovery, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         drop(discovery);
         let (mut socket, _) = listener.accept().unwrap();
         let request = headers(&mut socket);
         assert!(request.starts_with("GET /devtools/browser/fixture "));
-        let key = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("sec-websocket-key").then(|| value.trim())
-        }).unwrap();
+        let key = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .unwrap();
         let accept = asupersync::net::websocket::compute_accept_key(key);
         write!(socket, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").unwrap();
         for (method, response) in script {
@@ -81,21 +104,29 @@ fn peer(script: Script) -> (String, thread::JoinHandle<()>) {
                 assert_eq!(request["sessionId"], "session-1");
             }
             // An asynchronous event before the reply must not be mistaken for it.
-            write_frame(&mut socket, &json!({"method": "Target.targetInfoChanged", "params": {}}));
+            write_frame(
+                &mut socket,
+                &json!({"method": "Target.targetInfoChanged", "params": {}}),
+            );
             if method == "Runtime.evaluate" {
                 let expression = request["params"]["expression"].as_str().unwrap();
-                assert!(matches!(expression,
-                    "({answer: 6 * 7})" | "({url: location.href, title: document.title})"));
+                assert!(matches!(
+                    expression,
+                    "({answer: 6 * 7})" | "({url: location.href, title: document.title})"
+                ));
             }
             // Chromium may publish DOMContentLoaded before the Page.navigate
             // reply. The adapter must retain it and correlate the loader ID.
             if method == "Page.navigate" && response["result"]["loaderId"].is_string() {
                 for loader in [json!("old-loader"), response["result"]["loaderId"].clone()] {
-                    write_frame(&mut socket, &json!({
-                        "sessionId": "session-1", "method": "Page.lifecycleEvent",
-                        "params": {"frameId": response["result"]["frameId"],
-                                   "loaderId": loader, "name": "DOMContentLoaded"}
-                    }));
+                    write_frame(
+                        &mut socket,
+                        &json!({
+                            "sessionId": "session-1", "method": "Page.lifecycleEvent",
+                            "params": {"frameId": response["result"]["frameId"],
+                                       "loaderId": loader, "name": "DOMContentLoaded"}
+                        }),
+                    );
                 }
             }
             let mut reply = response;
@@ -108,24 +139,43 @@ fn peer(script: Script) -> (String, thread::JoinHandle<()>) {
 
 fn attached_script() -> Script {
     vec![
-        ("Target.getTargets", json!({"result": {"targetInfos": [
-            {"targetId": "page-1", "type": "page", "url": "https://example.com/", "title": "Real peer"}
-        ]}})),
-        ("Target.attachToTarget", json!({"result": {"sessionId": "session-1"}})),
+        (
+            "Target.getTargets",
+            json!({"result": {"targetInfos": [
+                {"targetId": "page-1", "type": "page", "url": "https://example.com/", "title": "Real peer"}
+            ]}}),
+        ),
+        (
+            "Target.attachToTarget",
+            json!({"result": {"sessionId": "session-1"}}),
+        ),
     ]
 }
 
 #[test]
 fn native_browser_evaluates_over_http_and_masked_websocket_not_canned_script_matching() {
     let mut script = attached_script();
-    script.push(("Runtime.evaluate", json!({"result": {"result": {"type": "object", "value": {"answer": 42}}}})));
+    script.push((
+        "Runtime.evaluate",
+        json!({"result": {"result": {"type": "object", "value": {"answer": 42}}}}),
+    ));
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let result = runtime.block_on(tool.execute("native-eval", json!({
-        "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
-    }), None)).unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let result = runtime
+        .block_on(tool.execute(
+            "native-eval",
+            json!({
+                "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
+            }),
+            None,
+        ))
+        .unwrap();
     assert_eq!(result.details.as_ref().unwrap()["result"]["answer"], 42);
     assert_eq!(result.details.as_ref().unwrap()["backend"], "cdp");
     handle.join().unwrap();
@@ -134,14 +184,27 @@ fn native_browser_evaluates_over_http_and_masked_websocket_not_canned_script_mat
 #[test]
 fn native_browser_surfaces_protocol_errors() {
     let mut script = attached_script();
-    script.push(("Runtime.evaluate", json!({"error": {"code": -32000, "message": "Execution context destroyed"}})));
+    script.push((
+        "Runtime.evaluate",
+        json!({"error": {"code": -32000, "message": "Execution context destroyed"}}),
+    ));
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let error = runtime.block_on(tool.execute("native-error", json!({
-        "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
-    }), None)).unwrap_err();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(tool.execute(
+            "native-error",
+            json!({
+                "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
+            }),
+            None,
+        ))
+        .unwrap_err();
     assert!(error.to_string().contains("Execution context destroyed"));
     handle.join().unwrap();
 }
@@ -149,9 +212,15 @@ fn native_browser_surfaces_protocol_errors() {
 #[test]
 fn native_browser_never_falls_back_to_mock_when_endpoint_is_invalid() {
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint("http://example.com:9222");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let error = runtime.block_on(tool.execute("no-fallback", json!({"action": "screenshot"}), None)).unwrap_err();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint("http://example.com:9222");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(tool.execute("no-fallback", json!({"action": "screenshot"}), None))
+        .unwrap_err();
     assert!(error.to_string().contains("loopback"));
     assert!(!dir.path().join("screenshots").exists());
 }
@@ -161,17 +230,35 @@ fn native_screenshot_preserves_peer_pixels_and_returns_an_image_block() {
     use base64::Engine as _;
     use pi::model::ContentBlock;
     let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC";
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
     let mut script = attached_script();
-    script.push(("Page.captureScreenshot", json!({"result": {"data": encoded}})));
+    script.push((
+        "Page.captureScreenshot",
+        json!({"result": {"data": encoded}}),
+    ));
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let result = runtime.block_on(tool.execute("native-screenshot", json!({
-        "action": "screenshot", "tab": "page-1", "output_path": "capture.png"
-    }), None)).unwrap();
-    assert_eq!(std::fs::read(dir.path().join("capture.png")).unwrap(), bytes);
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let result = runtime
+        .block_on(tool.execute(
+            "native-screenshot",
+            json!({
+                "action": "screenshot", "tab": "page-1", "output_path": "capture.png"
+            }),
+            None,
+        ))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("capture.png")).unwrap(),
+        bytes
+    );
     assert!(result.content.iter().any(|block| matches!(block,
         ContentBlock::Image(image) if image.mime_type == "image/png" && image.data == encoded)));
     handle.join().unwrap();
@@ -183,23 +270,42 @@ fn native_navigation_handles_load_events_that_arrive_before_the_command_reply() 
     script.extend([
         ("Page.enable", json!({"result": {}})),
         ("Page.setLifecycleEventsEnabled", json!({"result": {}})),
-        ("Page.navigate", json!({"result": {"frameId": "frame-1", "loaderId": "new-loader"}})),
-        ("Runtime.evaluate", json!({"result": {"result": {"type": "object", "value": {
-            "url": "about:blank", "title": "Loaded target"
-        }}}})),
+        (
+            "Page.navigate",
+            json!({"result": {"frameId": "frame-1", "loaderId": "new-loader"}}),
+        ),
+        (
+            "Runtime.evaluate",
+            json!({"result": {"result": {"type": "object", "value": {
+                "url": "about:blank", "title": "Loaded target"
+            }}}}),
+        ),
     ]);
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let result = runtime.block_on(tool.execute("native-navigation", json!({
-        "action": "goto", "tab": "page-1", "url": "about:blank", "timeout_ms": 3000
-    }), None)).unwrap();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let result = runtime
+        .block_on(tool.execute(
+            "native-navigation",
+            json!({
+                "action": "goto", "tab": "page-1", "url": "about:blank", "timeout_ms": 3000
+            }),
+            None,
+        ))
+        .unwrap();
     let details = result.details.as_ref().unwrap();
     assert_eq!(details["loaded"], true);
     assert_eq!(details["title"], "Loaded target");
     assert_eq!(details["url"], "about:blank");
-    assert!(details.get("status").is_none(), "do not manufacture an HTTP status");
+    assert!(
+        details.get("status").is_none(),
+        "do not manufacture an HTTP status"
+    );
     handle.join().unwrap();
 }
 
@@ -209,15 +315,28 @@ fn native_navigation_refusals_are_not_reported_as_loaded_pages() {
     script.extend([
         ("Page.enable", json!({"result": {}})),
         ("Page.setLifecycleEventsEnabled", json!({"result": {}})),
-        ("Page.navigate", json!({"result": {"errorText": "net::ERR_BLOCKED_BY_ADMINISTRATOR"}})),
+        (
+            "Page.navigate",
+            json!({"result": {"errorText": "net::ERR_BLOCKED_BY_ADMINISTRATOR"}}),
+        ),
     ]);
     let (endpoint, handle) = peer(script);
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let error = runtime.block_on(tool.execute("native-navigation-refused", json!({
-        "action": "goto", "tab": "page-1", "url": "about:blank"
-    }), None)).unwrap_err();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(tool.execute(
+            "native-navigation-refused",
+            json!({
+                "action": "goto", "tab": "page-1", "url": "about:blank"
+            }),
+            None,
+        ))
+        .unwrap_err();
     assert!(error.to_string().contains("ERR_BLOCKED_BY_ADMINISTRATOR"));
     handle.join().unwrap();
 }
@@ -227,11 +346,21 @@ fn native_browser_does_not_invent_results_after_peer_disconnects() {
     // The peer closes immediately after attachment, before evaluating anything.
     let (endpoint, handle) = peer(attached_script());
     let dir = tempfile::tempdir().unwrap();
-    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-    let error = runtime.block_on(tool.execute("native-disconnected", json!({
-        "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
-    }), None)).unwrap_err();
+    let tool = BrowserTool::new(dir.path())
+        .with_mock(false)
+        .with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let error = runtime
+        .block_on(tool.execute(
+            "native-disconnected",
+            json!({
+                "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
+            }),
+            None,
+        ))
+        .unwrap_err();
     assert!(error.to_string().contains("CDP"));
     handle.join().unwrap();
 }
