@@ -180,6 +180,12 @@ pub(super) fn source_path(cwd: &Path, file: &str) -> Result<String> {
     }
     let path = cwd.join(file);
     let path = if path.is_absolute() { path } else { std::env::current_dir()?.join(path) };
+    // Resolve existing paths before lexical cleanup: link/../file follows the
+    // link's target parent, not the parent of the link's directory entry.
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical.into_os_string().into_string()
+            .map_err(|_| tool_err("DAP_USAGE", "DAP source paths must be valid UTF-8"));
+    }
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -306,5 +312,20 @@ mod tests {
             {"file":"missing.rs","line":3}, {"file":"./missing.rs","line":3}
         ])).unwrap();
         assert!(initial(dir.path(), &inputs).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_path_resolves_symlinks_before_parent_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let actual = dir.path().join("actual");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(actual.join("nested")).unwrap();
+        std::fs::write(workspace.join("file.rs"), "wrong source").unwrap();
+        std::fs::write(actual.join("file.rs"), "correct source").unwrap();
+        std::os::unix::fs::symlink(actual.join("nested"), workspace.join("link")).unwrap();
+        assert_eq!(source_path(&workspace, "link/../file.rs").unwrap(),
+            std::fs::canonicalize(actual.join("file.rs")).unwrap().display().to_string());
     }
 }

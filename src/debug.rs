@@ -119,7 +119,12 @@ impl DebugTool {
         let payload = json!({
             "action": input.action, "program": program.as_ref().map(|path| path.display().to_string()),
             "pid": input.pid, "adapter": adapter.id,
-            "state": match &state { ExecState::Stopped { .. } => "stopped_entry", ExecState::Running => "running", ExecState::Exited => "exited" },
+            "state": match &state {
+                ExecState::Stopped { reason, .. } if reason == "entry" => "stopped_entry",
+                ExecState::Stopped { .. } => "stopped",
+                ExecState::Running => "running",
+                ExecState::Exited => "exited"
+            },
             "execution": state, "capabilities": session.capabilities()
         });
         *lock(&self.session) = Some(Arc::new(session));
