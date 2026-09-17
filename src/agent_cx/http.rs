@@ -165,7 +165,6 @@ impl AgentHttpResponse {
         self.response.headers()
     }
 
-    #[must_use]
     pub fn bytes_stream(self) -> ByteStream {
         Box::pin(OwnedBody::new(self.owner, self.response.bytes_stream()))
     }
@@ -277,14 +276,21 @@ mod tests {
             .unwrap();
         let raw = runtime.request_cx_with_budget(Budget::new());
         let owner = {
-            let _guard = raw.restrict::<asupersync::cx::cap::None>().set_current_restricted();
+            let _guard = raw
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
             AgentCx::for_current_or_request()
         };
         let client = AgentHttpClient::new(owner, Client::new());
         runtime.block_on(async {
             let caller = Cx::current().expect("caller installed");
             assert!(caller.capabilities().io);
-            let error = client.get("not a URL").send().await.err().expect("denied request");
+            let error = client
+                .get("not a URL")
+                .send()
+                .await
+                .err()
+                .expect("denied request");
             assert!(error.to_string().contains("capabilities"));
             assert!(!error.to_string().contains("not a URL"));
             assert_eq!(Cx::current().unwrap().capabilities(), caller.capabilities());
@@ -294,7 +300,10 @@ mod tests {
     #[test]
     fn cancelled_request_is_rejected_before_url_parsing_or_dispatch() {
         let owner = AgentCx::for_request();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancellation"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("test cancellation"),
+        );
         let client = AgentHttpClient::new(owner, Client::new());
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -318,7 +327,10 @@ mod tests {
         type Item = std::io::Result<Vec<u8>>;
 
         fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            assert_eq!(Cx::current().expect("owner installed").budget(), self.owner_budget);
+            assert_eq!(
+                Cx::current().expect("owner installed").budget(),
+                self.owner_budget
+            );
             self.polled.store(true, Ordering::SeqCst);
             if self.fail {
                 Poll::Ready(Some(Err(std::io::Error::other("transport failed"))))
@@ -343,12 +355,15 @@ mod tests {
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(budget));
         let polled = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut body = OwnedBody::new(owner, Box::pin(ObservedStream {
-            owner_budget: budget,
-            polled: Arc::clone(&polled),
-            dropped: Arc::clone(&dropped),
-            fail: true,
-        }));
+        let mut body = OwnedBody::new(
+            owner,
+            Box::pin(ObservedStream {
+                owner_budget: budget,
+                polled: Arc::clone(&polled),
+                dropped: Arc::clone(&dropped),
+                fail: true,
+            }),
+        );
         runtime.block_on(async {
             let caller = Cx::current().unwrap();
             assert!(body.next().await.unwrap().is_err());
@@ -380,27 +395,39 @@ mod tests {
         let _parent_guard = parent.clone().set_current_restricted();
         let polled = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut body = OwnedBody::new(owner.clone(), Box::pin(ObservedStream {
-            owner_budget: budget,
-            polled: Arc::clone(&polled),
-            dropped: Arc::clone(&dropped),
-            fail: false,
-        }));
+        let mut body = OwnedBody::new(
+            owner.clone(),
+            Box::pin(ObservedStream {
+                owner_budget: budget,
+                polled: Arc::clone(&polled),
+                dropped: Arc::clone(&dropped),
+                fail: false,
+            }),
+        );
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
         let mut task = Context::from_waker(&waker);
         assert!(Pin::new(&mut body).poll_next(&mut task).is_pending());
         assert!(polled.load(Ordering::SeqCst));
         assert_eq!(Cx::current().unwrap().budget(), parent.budget());
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("idle cancellation"));
-        assert!(counter.0.load(Ordering::SeqCst) > 0, "owner cancellation must wake the consumer");
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("idle cancellation"),
+        );
+        assert!(
+            counter.0.load(Ordering::SeqCst) > 0,
+            "owner cancellation must wake the consumer"
+        );
         let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_next(&mut task) else {
             panic!("expected terminal cancellation");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert!(dropped.load(Ordering::SeqCst));
         assert!(body.cancellation.is_none());
-        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
         assert_eq!(Cx::current().unwrap().budget(), parent.budget());
         assert!(!parent.is_cancel_requested());
     }
@@ -416,7 +443,10 @@ mod tests {
             panic!("expected exact bytes");
         };
         assert_eq!(bytes, [0, 255, 1]);
-        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut task),
+            Poll::Ready(None)
+        ));
         assert!(body.stream.is_none());
         assert!(body.cancellation.is_none());
     }
@@ -426,12 +456,15 @@ mod tests {
         let budget = Budget::new().with_poll_quota(1000);
         let owner = AgentCx::for_request_with_budget(budget);
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut body = OwnedBody::new(owner.clone(), Box::pin(ObservedStream {
-            owner_budget: budget,
-            polled: Arc::new(AtomicBool::new(false)),
-            dropped: Arc::clone(&dropped),
-            fail: false,
-        }));
+        let mut body = OwnedBody::new(
+            owner.clone(),
+            Box::pin(ObservedStream {
+                owner_budget: budget,
+                polled: Arc::new(AtomicBool::new(false)),
+                dropped: Arc::clone(&dropped),
+                fail: false,
+            }),
+        );
         let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
         let waker = Waker::from(Arc::clone(&counter));
         let mut task = Context::from_waker(&waker);

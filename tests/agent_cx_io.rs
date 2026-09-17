@@ -36,7 +36,9 @@ fn read_request(socket: &mut TcpStream) -> io::Result<CapturedRequest> {
             break index + 4;
         }
         if wire.len() > 64 * 1024 {
-            return Err(io::Error::other("fixture request headers exceeded their bound"));
+            return Err(io::Error::other(
+                "fixture request headers exceeded their bound",
+            ));
         }
         let mut chunk = [0_u8; 4096];
         let length = socket.read(&mut chunk)?;
@@ -56,7 +58,8 @@ fn read_request(socket: &mut TcpStream) -> io::Result<CapturedRequest> {
         })
         .collect();
     let length = match headers.get("content-length") {
-        Some(length) => length.parse::<usize>()
+        Some(length) => length
+            .parse::<usize>()
             .map_err(|_| io::Error::other("invalid fixture content length"))?,
         None => 0,
     };
@@ -74,14 +77,25 @@ fn read_request(socket: &mut TcpStream) -> io::Result<CapturedRequest> {
         body.extend_from_slice(&chunk[..count]);
     }
     body.truncate(length);
-    Ok(CapturedRequest { first_line, headers, body })
+    Ok(CapturedRequest {
+        first_line,
+        headers,
+        body,
+    })
 }
 
 fn peer_closed(socket: &mut TcpStream) -> io::Result<()> {
     let mut byte = [0_u8; 1];
     match socket.read(&mut byte) {
         Ok(0) => Ok(()),
-        Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(())
+        }
         Ok(_) => Err(io::Error::other("unexpected data after fixture request")),
         Err(error) => Err(error),
     }
@@ -94,9 +108,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(
-        handler: impl FnOnce(&mut TcpStream) -> io::Result<()> + Send + 'static,
-    ) -> Self {
+    fn start(handler: impl FnOnce(&mut TcpStream) -> io::Result<()> + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -106,7 +118,9 @@ impl Server {
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut socket = loop {
                 if stopped.load(Ordering::SeqCst) || Instant::now() >= deadline {
-                    return Err(io::Error::other("fixture stopped before accepting a request"));
+                    return Err(io::Error::other(
+                        "fixture stopped before accepting a request",
+                    ));
                 }
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
@@ -122,7 +136,11 @@ impl Server {
             handler(&mut socket)?;
             Ok(request)
         });
-        Self { address, stop, worker: Some(worker) }
+        Self {
+            address,
+            stop,
+            worker: Some(worker),
+        }
     }
 
     fn url(&self) -> String {
@@ -130,7 +148,11 @@ impl Server {
     }
 
     fn finish(mut self) -> CapturedRequest {
-        self.worker.take().unwrap().join().expect("fixture thread panicked")
+        self.worker
+            .take()
+            .unwrap()
+            .join()
+            .expect("fixture thread panicked")
             .expect("fixture request/response failed")
     }
 }
@@ -157,14 +179,19 @@ async fn under_owner<F: Future>(owner: &AgentCx, future: F) -> F::Output {
     poll_fn(|task| {
         let _guard = owner.cx().clone().set_current_restricted();
         future.as_mut().poll(task)
-    }).await
+    })
+    .await
 }
 
 fn context() -> ProviderContext<'static> {
-    ProviderContext::owned(None, vec![Message::User(UserMessage {
-        content: UserContent::Text("Respond with a short answer".to_string()),
-        timestamp: 0,
-    })], Vec::new())
+    ProviderContext::owned(
+        None,
+        vec![Message::User(UserMessage {
+            content: UserContent::Text("Respond with a short answer".to_string()),
+            timestamp: 0,
+        })],
+        Vec::new(),
+    )
 }
 
 #[test]
@@ -178,25 +205,32 @@ fn configured_request_preserves_headers_payload_and_exact_response_bytes() {
     let owner = owner(&runtime);
     let raw = Client::new();
     let payload = json!({"message":"kept intact"});
-    let request = raw.post(&server.url())
+    let request = raw
+        .post(&server.url())
         .header("Authorization", "Bearer fixture-only")
         .header("X-Configured", "retained")
         .no_timeout()
-        .json(&payload).unwrap();
+        .json(&payload)
+        .unwrap();
     let scoped = owner.http().request(request);
     runtime.block_on(async {
         let response = scoped.send().await.unwrap();
         assert_eq!(response.status(), 201);
-        assert!(response.headers().iter().any(|(key, value)| {
-            key.eq_ignore_ascii_case("x-fixture") && value == "retained"
-        }));
+        assert!(
+            response.headers().iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("x-fixture") && value == "retained"
+            })
+        );
         assert_eq!(response.bytes_limited(4).await.unwrap(), [0, 255, 10, 128]);
     });
     let captured = server.finish();
     assert_eq!(captured.first_line, "POST /fixture HTTP/1.1");
     assert_eq!(captured.headers["authorization"], "Bearer fixture-only");
     assert_eq!(captured.headers["x-configured"], "retained");
-    assert_eq!(serde_json::from_slice::<serde_json::Value>(&captured.body).unwrap(), payload);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&captured.body).unwrap(),
+        payload
+    );
 }
 
 #[test]
@@ -208,17 +242,24 @@ fn cloned_client_observes_owner_cancellation_before_any_socket_is_opened() {
     let client = owner.http().bind(&Client::new()).clone();
     owner.cancel_with(asupersync::types::CancelKind::User, Some("before dispatch"));
     let url = format!("http://{}/", listener.local_addr().unwrap());
-    let error = runtime.block_on(client.get(&url).no_timeout().send())
-        .err().expect("cancelled request");
+    let error = runtime
+        .block_on(client.get(&url).no_timeout().send())
+        .err()
+        .expect("cancelled request");
     assert!(error.to_string().contains("cancelled"));
-    assert_eq!(listener.accept().err().unwrap().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        listener.accept().err().unwrap().kind(),
+        io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]
 fn owner_cancellation_interrupts_silent_response_headers() {
     let (received, ready) = oneshot::channel();
     let server = Server::start(move |socket| {
-        received.send(()).map_err(|_| io::Error::other("missing cancellation observer"))?;
+        received
+            .send(())
+            .map_err(|_| io::Error::other("missing cancellation observer"))?;
         peer_closed(socket)
     });
     let runtime = runtime();
@@ -227,7 +268,10 @@ fn owner_cancellation_interrupts_silent_response_headers() {
     runtime.block_on(async {
         let cancel = async {
             ready.await.unwrap();
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("waiting for headers"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("waiting for headers"),
+            );
         };
         let (response, ()) = futures::join!(client.get(&server.url()).no_timeout().send(), cancel);
         let error = response.err().expect("cancelled header wait");
@@ -239,7 +283,8 @@ fn owner_cancellation_interrupts_silent_response_headers() {
 #[test]
 fn owner_cancellation_closes_a_silent_body_and_fuses_the_error() {
     let server = Server::start(|socket| {
-        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")?;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nx")?;
         socket.flush()?;
         peer_closed(socket)
     });
@@ -251,7 +296,10 @@ fn owner_cancellation_closes_a_silent_body_and_fuses_the_error() {
         let mut body = response.bytes_stream();
         assert_eq!(body.next().await.unwrap().unwrap(), b"x");
         let consumer = asupersync::Cx::current().unwrap();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("body cancellation"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("body cancellation"),
+        );
         let error = body.next().await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(body.next().await.is_none());
@@ -265,7 +313,9 @@ fn owner_cancellation_closes_a_silent_body_and_fuses_the_error() {
 fn dropping_a_body_and_exceeding_its_limit_both_release_the_transport() {
     for collect in [false, true] {
         let server = Server::start(|socket| {
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n1234")?;
+            socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n1234",
+            )?;
             socket.flush()?;
             peer_closed(socket)
         });
@@ -288,7 +338,9 @@ fn dropping_a_body_and_exceeding_its_limit_both_release_the_transport() {
 #[test]
 fn native_anthropic_body_keeps_its_owner_when_consumed_by_another_task_context() {
     let server = Server::start(|socket| {
-        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")?;
+        socket.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+        )?;
         for event in [
             json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
             json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
@@ -308,18 +360,30 @@ fn native_anthropic_body_keeps_its_owner_when_consumed_by_another_task_context()
     };
     runtime.block_on(async {
         let context = context();
-        let mut stream = under_owner(&owner, provider.stream(&context, &options)).await.unwrap();
+        let mut stream = under_owner(&owner, provider.stream(&context, &options))
+            .await
+            .unwrap();
         loop {
-            match stream.next().await.expect("text before cancellation").unwrap() {
+            match stream
+                .next()
+                .await
+                .expect("text before cancellation")
+                .unwrap()
+            {
                 StreamEvent::TextDelta { delta, .. } => {
                     assert_eq!(delta, "partial");
                     break;
                 }
-                StreamEvent::Done { .. } | StreamEvent::Error { .. } => panic!("premature terminal"),
+                StreamEvent::Done { .. } | StreamEvent::Error { .. } => {
+                    panic!("premature terminal")
+                }
                 _ => {}
             }
         }
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel original owner"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel original owner"),
+        );
         let error = stream.next().await.unwrap().unwrap_err();
         assert!(error.to_string().contains("cancelled"));
         assert!(stream.next().await.is_none());
@@ -331,7 +395,9 @@ fn native_anthropic_body_keeps_its_owner_when_consumed_by_another_task_context()
 fn vertex_claude_dispatch_keeps_owner_cancellation_before_headers_arrive() {
     let (received, ready) = oneshot::channel();
     let server = Server::start(move |socket| {
-        received.send(()).map_err(|_| io::Error::other("missing cancellation observer"))?;
+        received
+            .send(())
+            .map_err(|_| io::Error::other("missing cancellation observer"))?;
         peer_closed(socket)
     });
     let runtime = runtime();
@@ -348,7 +414,10 @@ fn vertex_claude_dispatch_keeps_owner_cancellation_before_headers_arrive() {
         let context = context();
         let cancel = async {
             ready.await.unwrap();
-            owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel Vertex request"));
+            owner.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel Vertex request"),
+            );
         };
         let (response, ()) = futures::join!(
             under_owner(&owner, provider.stream(&context, &options)),
@@ -358,7 +427,10 @@ fn vertex_claude_dispatch_keeps_owner_cancellation_before_headers_arrive() {
         assert!(error.to_string().contains("cancelled"));
     });
     let captured = server.finish();
-    assert_eq!(captured.headers["authorization"], "Bearer google-fixture-only");
+    assert_eq!(
+        captured.headers["authorization"],
+        "Bearer google-fixture-only"
+    );
     let body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
     assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
     assert!(body.get("model").is_none());

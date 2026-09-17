@@ -14,7 +14,10 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 use std::time::Duration;
 
 fn cancelled() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "agent process operation cancelled")
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "agent process operation cancelled",
+    )
 }
 
 fn check_spawn(owner: &AgentCx) -> io::Result<()> {
@@ -280,9 +283,9 @@ impl Drop for AgentChild {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::Cx;
     #[cfg(unix)]
     use asupersync::Budget;
+    use asupersync::Cx;
 
     fn restricted_owner() -> AgentCx {
         let restricted = Cx::for_request().restrict::<asupersync::cx::cap::None>();
@@ -303,7 +306,10 @@ mod tests {
     fn cancellation_between_construction_and_spawn_prevents_dispatch() {
         let owner = AgentCx::for_request();
         let mut command = AgentCommand::new(owner.clone(), "must-not-be-executed");
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel before spawn"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel before spawn"),
+        );
         let error = command.spawn().err().expect("cancelled spawn");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
@@ -312,18 +318,32 @@ mod tests {
     fn command_inspection_and_configuration_preserve_owner() {
         let owner = restricted_owner();
         let mut command = AgentCommand::new(owner, "fixture");
-        command.args(["one", "two"]).env_clear().env("PI_TEST", "value");
+        command
+            .args(["one", "two"])
+            .env_clear()
+            .env("PI_TEST", "value");
         assert_eq!(command.get_program(), OsStr::new("fixture"));
-        assert_eq!(command.get_args().collect::<Vec<_>>(), [OsStr::new("one"), OsStr::new("two")]);
-        assert_eq!(command.spawn().err().unwrap().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("one"), OsStr::new("two")]
+        );
+        assert_eq!(
+            command.spawn().err().unwrap().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn wait_returns_real_status_and_keeps_it_after_reaping() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
-        let mut child = AgentCommand::new(owner, "sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let mut child = AgentCommand::new(owner, "sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
         let status = runtime.block_on(child.wait()).unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(child.try_wait().unwrap(), Some(status));
@@ -335,9 +355,17 @@ mod tests {
     fn cancelled_wait_terminates_and_reaps_the_child() {
         let owner = AgentCx::for_request();
         let mut child = AgentCommand::new(owner.clone(), "sh")
-            .args(["-c", "exec sleep 30"]).spawn().unwrap();
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel running child"));
-        assert_eq!(child.try_wait().unwrap_err().kind(), io::ErrorKind::Interrupted);
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .unwrap();
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel running child"),
+        );
+        assert_eq!(
+            child.try_wait().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
         assert!(child.child.is_none());
         assert!(child.status.is_some());
         assert!(child.descendants_stopped);
@@ -347,18 +375,26 @@ mod tests {
     #[test]
     fn dropping_an_owned_child_does_not_leave_its_root_running() {
         let child = AgentCommand::new(AgentCx::for_request(), "sh")
-            .args(["-c", "exec sleep 30"]).spawn().unwrap();
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .unwrap();
         let pid = child.id().to_string();
         drop(child);
-        let status = Command::new("kill").args(["-0", &pid])
-            .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        let status = Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
         assert!(!status.success(), "the owned root must already be reaped");
     }
 
     #[cfg(unix)]
     #[test]
     fn wait_closes_unclaimed_stdin_before_waiting_for_eof() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
         let mut child = AgentCommand::new(owner, "sh")
             .args(["-c", "read value; test $? -ne 0"])
