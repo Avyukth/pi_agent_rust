@@ -59,7 +59,13 @@ pub struct SharedMemoryBinding {
 impl SharedMemoryBinding {
     #[must_use]
     pub const fn new(bank: Arc<MemoryStore>, scope: JobSessionScope) -> Self {
-        Self { bank, scope, access: Access::ReadWrite, source_root: None, allowed_tools: ALL_TOOLS }
+        Self {
+            bank,
+            scope,
+            access: Access::ReadWrite,
+            source_root: None,
+            allowed_tools: ALL_TOOLS,
+        }
     }
 
     /// Restrict this binding. No API upgrades an inherited read-only grant.
@@ -74,24 +80,40 @@ impl SharedMemoryBinding {
     /// per child. A failed resolution must not fall back to a different session.
     pub async fn resolve(&self, timeout: Duration) -> Result<SharedMemoryGrant> {
         if timeout < Duration::from_millis(1) || timeout > Duration::from_secs(86_400) {
-            return Err(failure("PI_SHARED_MEMORY_TIMEOUT", "Resolution requires a budget from 1 ms to 24 hours"));
+            return Err(failure(
+                "PI_SHARED_MEMORY_TIMEOUT",
+                "Resolution requires a budget from 1 ms to 24 hours",
+            ));
         }
         let owner = AgentCx::for_current_or_request();
         checkpoint(&owner)?;
         if !owner.capabilities().io || !owner.capabilities().time {
-            return Err(failure("PI_SHARED_MEMORY_PERMISSION", "Delegation requires I/O and timer capabilities"));
+            return Err(failure(
+                "PI_SHARED_MEMORY_PERMISSION",
+                "Delegation requires I/O and timer capabilities",
+            ));
         }
-        let now = owner.cx().timer_driver()
+        let now = owner
+            .cx()
+            .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         let session_id = asupersync::time::timeout(now, timeout, self.scope.session_id())
             .await
-            .map_err(|_| failure("PI_SHARED_MEMORY_TIMEOUT", "Shared-memory owner resolution timed out"))?
+            .map_err(|_| {
+                failure(
+                    "PI_SHARED_MEMORY_TIMEOUT",
+                    "Shared-memory owner resolution timed out",
+                )
+            })?
             .map_err(|_| invalid_grant())?;
         checkpoint(&owner)?;
         Ok(SharedMemoryGrant {
             store: SharedMemoryStore::new(Arc::clone(&self.bank), session_id)?,
             access: self.access,
-            source_root: self.source_root.clone().unwrap_or_else(|| self.bank.project_root.clone()),
+            source_root: self
+                .source_root
+                .clone()
+                .unwrap_or_else(|| self.bank.project_root.clone()),
             allowed_tools: self.allowed_tools,
         })
     }
@@ -99,16 +121,25 @@ impl SharedMemoryBinding {
 
 fn checkpoint(owner: &AgentCx) -> Result<()> {
     owner.checkpoint().map_err(|_| {
-        failure("PI_SHARED_MEMORY_CANCELLED", "Shared-memory delegation cancelled before dispatch")
+        failure(
+            "PI_SHARED_MEMORY_CANCELLED",
+            "Shared-memory delegation cancelled before dispatch",
+        )
     })
 }
 
 fn invalid_grant() -> crate::error::Error {
-    failure("PI_SHARED_MEMORY_DELEGATION", "Invalid or unavailable shared-memory grant; no fallback namespace is used")
+    failure(
+        "PI_SHARED_MEMORY_DELEGATION",
+        "Invalid or unavailable shared-memory grant; no fallback namespace is used",
+    )
 }
 
 fn read_only_error() -> crate::error::Error {
-    failure("PI_SHARED_MEMORY_READ_ONLY", "This child may read shared keys but cannot modify them")
+    failure(
+        "PI_SHARED_MEMORY_READ_ONLY",
+        "This child may read shared keys but cannot modify them",
+    )
 }
 
 /// Captured parent namespace. Safe to clone across concurrent children and
@@ -138,8 +169,11 @@ struct WireGrant {
 }
 
 fn valid_run_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 256
-        && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl SharedMemoryGrant {
@@ -177,10 +211,16 @@ impl SharedMemoryGrant {
     /// Check the requested source before creating an isolated worktree. The
     /// caller must not substitute an arbitrary external directory as a worktree.
     pub fn check_source_directory(&self, cwd: &Path) -> Result<()> {
-        let root = self.source_root.canonicalize().map_err(|_| invalid_grant())?;
+        let root = self
+            .source_root
+            .canonicalize()
+            .map_err(|_| invalid_grant())?;
         let cwd = cwd.canonicalize().map_err(|_| invalid_grant())?;
         if !cwd.starts_with(root) {
-            return Err(failure("PI_SHARED_MEMORY_DELEGATION_SCOPE", "The source directory is outside the authorized project"));
+            return Err(failure(
+                "PI_SHARED_MEMORY_DELEGATION_SCOPE",
+                "The source directory is outside the authorized project",
+            ));
         }
         Ok(())
     }
@@ -193,7 +233,9 @@ impl SharedMemoryGrant {
         // A caller that mistakenly continues after an error must not inherit a
         // broader ambient grant. Parent/run markers are set only on success.
         command.env_remove(GRANT_ENV);
-        if !valid_run_id(run_id) { return Err(invalid_grant()); }
+        if !valid_run_id(run_id) {
+            return Err(invalid_grant());
+        }
         validate_session(&self.store.session_id).map_err(|_| invalid_grant())?;
         let grant = WireGrant {
             version: GRANT_VERSION,
@@ -201,18 +243,29 @@ impl SharedMemoryGrant {
             run_id: run_id.to_string(),
             working_directory: cwd.canonicalize().map_err(|_| invalid_grant())?,
             database: self.store.bank.db_path.clone(),
-            project_root: self.store.bank.project_root.canonicalize().map_err(|_| invalid_grant())?,
+            project_root: self
+                .store
+                .bank
+                .project_root
+                .canonicalize()
+                .map_err(|_| invalid_grant())?,
             project_key: self.store.bank.project_key.clone(),
             session_id: self.store.session_id.clone(),
             access: self.access,
             allowed_tools: self.allowed_tools,
         };
-        if !grant.database.is_absolute() || grant.project_key.is_empty() || grant.project_key.len() > 128 {
+        if !grant.database.is_absolute()
+            || grant.project_key.is_empty()
+            || grant.project_key.len() > 128
+        {
             return Err(invalid_grant());
         }
         let encoded = serde_json::to_string(&grant).map_err(|_| invalid_grant())?;
-        if encoded.len() > MAX_GRANT_BYTES { return Err(invalid_grant()); }
-        command.current_dir(&grant.working_directory)
+        if encoded.len() > MAX_GRANT_BYTES {
+            return Err(invalid_grant());
+        }
+        command
+            .current_dir(&grant.working_directory)
             .env(GRANT_ENV, encoded)
             .env(PARENT_ENV, grant.parent_pid.to_string())
             .env(RUN_ENV, run_id);
@@ -228,24 +281,42 @@ impl SharedMemoryGrant {
     /// malformed means an error, never a new local/global namespace. The host
     /// should call this once during startup, before accepting tool requests.
     pub fn from_environment(cwd: &Path) -> Result<Option<Self>> {
-        let Some(raw) = std::env::var_os(GRANT_ENV) else { return Ok(None); };
+        let Some(raw) = std::env::var_os(GRANT_ENV) else {
+            return Ok(None);
+        };
         let parent_pid = std::env::var_os(PARENT_ENV);
         let run_id = std::env::var_os(RUN_ENV);
         Self::decode(&raw, cwd, parent_pid.as_deref(), run_id.as_deref()).map(Some)
     }
 
-    fn decode(raw: &OsStr, cwd: &Path, parent_pid: Option<&OsStr>, run_id: Option<&OsStr>) -> Result<Self> {
-        let raw = raw.to_str().filter(|value| value.len() <= MAX_GRANT_BYTES).ok_or_else(invalid_grant)?;
+    fn decode(
+        raw: &OsStr,
+        cwd: &Path,
+        parent_pid: Option<&OsStr>,
+        run_id: Option<&OsStr>,
+    ) -> Result<Self> {
+        let raw = raw
+            .to_str()
+            .filter(|value| value.len() <= MAX_GRANT_BYTES)
+            .ok_or_else(invalid_grant)?;
         let grant: WireGrant = serde_json::from_str(raw).map_err(|_| invalid_grant())?;
-        let parent_pid = parent_pid.and_then(OsStr::to_str)
-            .and_then(|value| value.parse::<u32>().ok()).ok_or_else(invalid_grant)?;
+        let parent_pid = parent_pid
+            .and_then(OsStr::to_str)
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(invalid_grant)?;
         let run_id = run_id.and_then(OsStr::to_str).ok_or_else(invalid_grant)?;
-        if grant.version != GRANT_VERSION || parent_pid == 0 || grant.parent_pid != parent_pid
-            || !valid_run_id(run_id) || grant.run_id != run_id
-            || !grant.database.is_absolute() || !grant.project_root.is_absolute()
+        if grant.version != GRANT_VERSION
+            || parent_pid == 0
+            || grant.parent_pid != parent_pid
+            || !valid_run_id(run_id)
+            || grant.run_id != run_id
+            || !grant.database.is_absolute()
+            || !grant.project_root.is_absolute()
             || !grant.working_directory.is_absolute()
-            || grant.project_key.is_empty() || grant.project_key.len() > 128
-            || grant.allowed_tools == 0 || grant.allowed_tools & !ALL_TOOLS != 0
+            || grant.project_key.is_empty()
+            || grant.project_key.len() > 128
+            || grant.allowed_tools == 0
+            || grant.allowed_tools & !ALL_TOOLS != 0
             || cwd.canonicalize().map_err(|_| invalid_grant())? != grant.working_directory
         {
             return Err(invalid_grant());
@@ -269,28 +340,53 @@ impl SharedMemoryGrant {
     /// Existing tools, tier choices and host settings are not reconstructed.
     /// A selected writer on a read-only grant is installed but rejects execution.
     pub fn install_tools(&self, registry: &mut ToolRegistry, enabled: &[&str]) -> Result<()> {
-        let selected: Vec<_> = TOOL_NAMES.into_iter().filter(|name| enabled.contains(name)).collect();
+        let selected: Vec<_> = TOOL_NAMES
+            .into_iter()
+            .filter(|name| enabled.contains(name))
+            .collect();
         // The exact role pin travels with the grant. A nested host cannot gain
         // list/read access merely by presenting a wider local enabled set.
-        if selected.iter().any(|name| self.allowed_tools & tool_bit(name) == 0) {
-            return Err(failure("PI_SHARED_MEMORY_TOOL_SCOPE", "A requested shared-memory tool is outside the inherited role selection"));
+        if selected
+            .iter()
+            .any(|name| self.allowed_tools & tool_bit(name) == 0)
+        {
+            return Err(failure(
+                "PI_SHARED_MEMORY_TOOL_SCOPE",
+                "A requested shared-memory tool is outside the inherited role selection",
+            ));
         }
-        if selected.is_empty() { return Ok(()); }
+        if selected.is_empty() {
+            return Ok(());
+        }
         for name in TOOL_NAMES {
-            if registry.get(name).is_some() || registry.inactive_tools().iter().any(|tool| tool.name() == name) {
-                return Err(failure("PI_SHARED_MEMORY_TOOL_COLLISION", "A delegated shared-memory tool name is already registered"));
+            if registry.get(name).is_some()
+                || registry
+                    .inactive_tools()
+                    .iter()
+                    .any(|tool| tool.name() == name)
+            {
+                return Err(failure(
+                    "PI_SHARED_MEMORY_TOOL_COLLISION",
+                    "A delegated shared-memory tool name is already registered",
+                ));
             }
         }
-        let tools: Vec<Box<dyn Tool>> = selected.into_iter().map(|name| {
-            let bank = Arc::clone(&self.store.bank);
-            let mut inner = match name {
-                "read_memory" => SharedMemoryTool::read(bank),
-                "write_memory" => SharedMemoryTool::write(bank),
-                _ => SharedMemoryTool::list(bank),
-            };
-            inner.bind_job_session_scope(JobSessionScope::fixed(self.store.session_id.clone()));
-            Box::new(DelegatedTool { inner, writable: self.access == Access::ReadWrite }) as Box<dyn Tool>
-        }).collect();
+        let tools: Vec<Box<dyn Tool>> = selected
+            .into_iter()
+            .map(|name| {
+                let bank = Arc::clone(&self.store.bank);
+                let mut inner = match name {
+                    "read_memory" => SharedMemoryTool::read(bank),
+                    "write_memory" => SharedMemoryTool::write(bank),
+                    _ => SharedMemoryTool::list(bank),
+                };
+                inner.bind_job_session_scope(JobSessionScope::fixed(self.store.session_id.clone()));
+                Box::new(DelegatedTool {
+                    inner,
+                    writable: self.access == Access::ReadWrite,
+                }) as Box<dyn Tool>
+            })
+            .collect();
         registry.extend(tools);
         Ok(())
     }
@@ -303,20 +399,41 @@ struct DelegatedTool {
 
 #[async_trait::async_trait]
 impl Tool for DelegatedTool {
-    fn name(&self) -> &str { self.inner.name() }
-    fn label(&self) -> &str { self.inner.label() }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
     fn description(&self) -> &'static str {
         match self.name() {
-            "read_memory" => "Read a key and revision from this task's parent-shared namespace, separate from its transcript and jobs.",
-            "write_memory" => "Write exact text to the parent-shared namespace. Use expectedRevision (or absent for create-only). Read-only grants reject writes.",
-            _ => "List parent-shared keys, revisions and bounded previews with literal prefix filtering and key cursors.",
+            "read_memory" => {
+                "Read a key and revision from this task's parent-shared namespace, separate from its transcript and jobs."
+            }
+            "write_memory" => {
+                "Write exact text to the parent-shared namespace. Use expectedRevision (or absent for create-only). Read-only grants reject writes."
+            }
+            _ => {
+                "List parent-shared keys, revisions and bounded previews with literal prefix filtering and key cursors."
+            }
         }
     }
-    fn parameters(&self) -> Value { self.inner.parameters() }
-    fn effects(&self) -> ToolEffects { self.inner.effects() }
+    fn parameters(&self) -> Value {
+        self.inner.parameters()
+    }
+    fn effects(&self) -> ToolEffects {
+        self.inner.effects()
+    }
     // Do not forward bind_job_session_scope: the child's jobs do not own these keys.
-    async fn execute(&self, id: &str, input: Value, update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput> {
-        if self.name() == "write_memory" && !self.writable { return Err(read_only_error()); }
+    async fn execute(
+        &self,
+        id: &str,
+        input: Value,
+        update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        if self.name() == "write_memory" && !self.writable {
+            return Err(read_only_error());
+        }
         self.inner.execute(id, input, update).await
     }
 }
