@@ -763,7 +763,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn workspace_keys_preserve_non_utf8_canonical_path_identity() {
+    fn workspace_keys_preserve_non_utf8_canonical_path_identity() -> std::io::Result<()> {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
@@ -774,8 +774,21 @@ mod tests {
         let second = dir
             .path()
             .join(OsString::from_vec(vec![b'w', b's', b'-', 0x81]));
-        std::fs::create_dir_all(&first).expect("create first workspace");
-        std::fs::create_dir_all(&second).expect("create second workspace");
+        for workspace in [&first, &second] {
+            match std::fs::create_dir(workspace) {
+                Ok(()) => {}
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) =>
+                {
+                    eprintln!(
+                        "SKIP non-UTF-8 workspace {workspace:?}: filesystem returned {error}"
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        eprintln!("Exercising distinct non-UTF-8 workspaces: {first:?}, {second:?}");
 
         let first_key = workspace_key(&first);
         let second_key = workspace_key(&second);
@@ -785,6 +798,7 @@ mod tests {
         );
         assert!(first_key.starts_with("path-v3:unix:"));
         assert!(first_key.is_ascii(), "store keys must remain JSON-safe");
+        Ok(())
     }
 
     #[cfg(windows)]

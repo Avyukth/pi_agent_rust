@@ -96,20 +96,28 @@ fn tracked_ignored_additions_survive_without_copying_ignored_untracked_files() {
 
 #[cfg(unix)]
 #[test]
-fn unusual_untracked_names_and_binary_diffs_round_trip_without_loss() {
+fn unusual_untracked_names_and_binary_diffs_round_trip_without_loss() -> std::io::Result<()> {
     use std::os::unix::ffi::OsStringExt as _;
 
     let repo = repository();
-    let names = [
+    let mut names = vec![
         std::ffi::OsString::from("line\nbreak.bin"),
         std::ffi::OsString::from("tab\tand\"quote.bin"),
         std::ffi::OsString::from("日本語 space.bin"),
-        std::ffi::OsString::from_vec(b"nonutf8-\xff.bin".to_vec()),
     ];
     let original: Vec<u8> = (0..=255).collect();
     for name in &names {
         fs::write(repo.path().join(name), &original).unwrap();
     }
+    let non_utf8 = std::ffi::OsString::from_vec(b"nonutf8-\xff.bin".to_vec());
+    match fs::write(repo.path().join(&non_utf8), &original) {
+        Ok(()) => names.push(non_utf8),
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
+            eprintln!("SKIP non-UTF-8 filename {non_utf8:?}: filesystem returned {error}");
+        }
+        Err(error) => return Err(error),
+    }
+    eprintln!("Exercising snapshot filenames: {names:?}");
     let handle = isolate(repo.path(), "filenames").unwrap();
     let changed = [0, 254, 127, 1, 0];
     for name in &names {
@@ -123,6 +131,7 @@ fn unusual_untracked_names_and_binary_diffs_round_trip_without_loss() {
         assert_eq!(fs::read(repo.path().join(name)).unwrap(), changed);
     }
     drop_worktree(&handle).unwrap();
+    Ok(())
 }
 
 #[cfg(unix)]
