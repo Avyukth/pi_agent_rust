@@ -89,7 +89,7 @@ impl Tool for InspectImageTool {
                 "provider": {"type": "string", "enum": ["openai", "anthropic", "gemini"]},
                 "model": {"type": "string", "description": "Vision model ID; overrides media.vision_model"},
                 "detail": {"type": "string", "enum": ["low", "high", "auto"], "description": "OpenAI image detail (default auto)"},
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000, "default": 120000}
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300_000, "default": 120_000}
             }
         })
     }
@@ -280,8 +280,7 @@ fn parse_analysis(provider: &str, response: &Value) -> Result<String> {
             let content = &choice["message"]["content"];
             content
                 .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| text_blocks(content, true))
+                .map_or_else(|| text_blocks(content, true), str::to_string)
         }
         "anthropic" => {
             if !matches!(

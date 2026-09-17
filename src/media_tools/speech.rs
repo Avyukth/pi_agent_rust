@@ -101,7 +101,7 @@ impl Tool for TtsTool {
                 "language": {"type": "string", "description": "xAI only: BCP-47 language code or auto (default)"},
                 "instructions": {"type": "string", "description": "OpenAI gpt-4o-mini-tts only: style/delivery instructions"},
                 "output_path": {"type": "string", "description": "New audio file with the requested format's extension; never overwritten"},
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000, "default": 120000}
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300_000, "default": 120_000}
             }
         })
     }
@@ -179,21 +179,18 @@ impl Tool for TtsTool {
                 ));
             }
         }
-        let (bytes, mime) = match api.as_ref() {
-            Some(api) => {
-                let response = api.post(endpoint, &body, MAX_AUDIO_BYTES).await?;
-                let mime = validate_audio(&response.bytes, format, &response.content_type)?;
-                (response.bytes, mime)
+        let (bytes, mime) = if let Some(api) = api.as_ref() {
+            let response = api.post(endpoint, &body, MAX_AUDIO_BYTES).await?;
+            let mime = validate_audio(&response.bytes, format, &response.content_type)?;
+            (response.bytes, mime)
+        } else {
+            if format != "wav" {
+                return Err(Error::tool(
+                    NAME,
+                    "deterministic speech fixtures support WAV only; native synthesis supports the advertised provider formats",
+                ));
             }
-            None => {
-                if format != "wav" {
-                    return Err(Error::tool(
-                        NAME,
-                        "deterministic speech fixtures support WAV only; native synthesis supports the advertised provider formats",
-                    ));
-                }
-                (super::MIN_VALID_WAV.to_vec(), "audio/wav")
-            }
+            (super::MIN_VALID_WAV.to_vec(), "audio/wav")
         };
         let path = artifact::publish(
             &self.cwd,
@@ -430,8 +427,7 @@ fn wav_has_samples(bytes: &[u8]) -> bool {
 }
 
 fn mp3_has_frame(bytes: &[u8]) -> bool {
-    let mut offset = 0usize;
-    if bytes.starts_with(b"ID3") {
+    let offset = if bytes.starts_with(b"ID3") {
         if bytes.len() < 10 || bytes[6..10].iter().any(|byte| byte & 0x80 != 0) {
             return false;
         }
@@ -441,8 +437,10 @@ fn mp3_has_frame(bytes: &[u8]) -> bool {
         let Some(end) = length.checked_add(10 + if bytes[5] & 0x10 != 0 { 10 } else { 0 }) else {
             return false;
         };
-        offset = end;
-    }
+        end
+    } else {
+        0usize
+    };
     let Some(audio) = bytes.get(offset..) else {
         return false;
     };

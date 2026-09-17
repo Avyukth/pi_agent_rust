@@ -164,7 +164,7 @@ impl Tool for BrowserTool {
                 "output_path": {"type": "string", "description": "Destination path for a real PNG screenshot"},
                 "delta_x": {"type": "number", "description": "Horizontal scroll delta in CSS pixels"},
                 "delta_y": {"type": "number", "description": "Vertical scroll delta in CSS pixels; default 600"},
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000,
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120_000,
                                "description": "Whole-operation deadline, including connection and lock wait"}
             }
         })

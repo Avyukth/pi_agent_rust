@@ -35,28 +35,20 @@ async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
     })
 }
 
-pub(super) async fn snapshot(
+/// Walks the accessibility tree, describes each element and assigns stable
+/// `@eN` references, reusing names from `previous` while the document is
+/// unchanged. Returns the compact element inventory plus whether it hit the
+/// `MAX_ELEMENTS` cap.
+async fn collect_elements(
     owner: &AgentCx,
     cdp: &mut Cdp,
-    tab: &str,
+    nodes: &[Value],
     previous: Option<&References>,
+    doc: &Document,
     next_ref: &mut u64,
-    include_tree: bool,
-) -> Result<(ToolOutput, References)> {
-    let doc = document(owner, cdp).await?;
-    let response = cdp
-        .command(
-            owner,
-            "Accessibility.getFullAXTree",
-            json!({"frameId": doc.frame}),
-        )
-        .await?;
-    let nodes = response
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::tool("browser", "accessibility tree has no nodes"))?;
+) -> Result<(Vec<BrowserElementRef>, References, bool)> {
     let old_ids: BTreeMap<u64, &String> = previous
-        .filter(|refs| refs.document.as_ref() == Some(&doc))
+        .filter(|refs| refs.document.as_ref() == Some(doc))
         .map(|refs| refs.nodes.iter().map(|(name, id)| (*id, name)).collect())
         .unwrap_or_default();
     let mut refs = References {
@@ -101,7 +93,7 @@ pub(super) async fn snapshot(
             .ok_or_else(|| Error::tool("browser", "DOM node has no name"))?
             .to_owned();
         let id = if let Some(id) = old_ids.get(&backend_id) {
-            id.to_string()
+            (*id).clone()
         } else {
             *next_ref = next_ref
                 .checked_add(1)
@@ -125,6 +117,31 @@ pub(super) async fn snapshot(
             selector: id,
         });
     }
+    Ok((elements, refs, truncated))
+}
+
+pub(super) async fn snapshot(
+    owner: &AgentCx,
+    cdp: &mut Cdp,
+    tab: &str,
+    previous: Option<&References>,
+    next_ref: &mut u64,
+    include_tree: bool,
+) -> Result<(ToolOutput, References)> {
+    let doc = document(owner, cdp).await?;
+    let response = cdp
+        .command(
+            owner,
+            "Accessibility.getFullAXTree",
+            json!({"frameId": doc.frame}),
+        )
+        .await?;
+    let nodes = response
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::tool("browser", "accessibility tree has no nodes"))?;
+    let (elements, refs, truncated) =
+        collect_elements(owner, cdp, nodes, previous, &doc, next_ref).await?;
     let metadata = cdp
         .evaluate(owner, "({url: location.href, title: document.title})")
         .await?;
@@ -399,9 +416,8 @@ pub(super) async fn execute(
 }
 
 pub(super) fn delta(args: &Value, key: &str, default: f64) -> Result<f64> {
-    match args.get(key) {
-        None => Ok(default),
-        Some(value) => value
+    args.get(key).map_or(Ok(default), |value| {
+        value
             .as_f64()
             .filter(|v| v.is_finite() && v.abs() <= 100_000.0)
             .ok_or_else(|| {
@@ -409,8 +425,8 @@ pub(super) fn delta(args: &Value, key: &str, default: f64) -> Result<f64> {
                     "browser",
                     format!("{key} must be a finite number in -100000..=100000"),
                 )
-            }),
-    }
+            })
+    })
 }
 
 pub(super) fn key_event(key: &str) -> Result<Value> {
@@ -484,7 +500,7 @@ pub(super) fn key_event(key: &str) -> Result<Value> {
         _ => return Err(Error::tool("browser", format!("unsupported key: {base}"))),
     };
     let mut event = json!({"key": name, "code": code, "windowsVirtualKeyCode": virtual_key, "modifiers": modifiers});
-    if modifiers & 7 == 0
+    if modifiers.trailing_zeros() >= 3
         && let Some(text) = text
     {
         event["text"] = json!(text);
@@ -530,7 +546,7 @@ mod tests {
     #[test]
     fn invalid_scroll_parameters_are_not_silently_accepted() {
         assert!(delta(&json!({"delta_y": "far"}), "delta_y", 600.0).is_err());
-        assert!(delta(&json!({"delta_y": 100001}), "delta_y", 600.0).is_err());
+        assert!(delta(&json!({"delta_y": 100_001}), "delta_y", 600.0).is_err());
         assert_eq!(delta(&json!({}), "delta_y", 600.0).unwrap(), 600.0);
     }
 }
