@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::Command;
 use std::sync::Arc;
 
@@ -734,7 +734,7 @@ fn load_agent_dir(
             },
         );
     }
-    Ok(agents)
+    Ok(())
 }
 
 fn required_agent_field(
