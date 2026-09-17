@@ -3688,6 +3688,37 @@ mod tests {
         );
     }
 
+    /// bd-9o9i2 criterion 3, and the half that matters for safety rather than
+    /// bookkeeping: the raw `Agent` loop does not consult the provider
+    /// admission gate, so a continuation could issue against a provider that
+    /// had been quarantined — re-billing work against a session record nobody
+    /// can describe, which is the exact failure the gate exists to prevent.
+    ///
+    /// Asserted on the CALL COUNT, not just the error: a continuation that
+    /// returned an error after reaching the provider would still have done the
+    /// damage.
+    #[test]
+    fn a_continuation_cannot_issue_against_a_quarantined_provider() {
+        let (handle, calls) = flaky_handle(0);
+        let mut handle = handle;
+        handle
+            .session
+            .provider_admission_gate()
+            .block("quarantined for this test".to_string());
+
+        let result = run_async(handle.continue_turn(|_| {}));
+
+        assert!(
+            result.is_err(),
+            "a quarantined provider must refuse the continuation"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the provider must never be reached at all"
+        );
+    }
+
     /// The half of the policy nothing on this stack had: going BACK. Print mode
     /// and RPC both reinstall the captured primary once its cooldown expires;
     /// without it a session that took a single 429 stays pinned to the fallback
