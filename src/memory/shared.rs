@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+pub mod delegation;
+
 pub const SHARED_MEMORY_SCHEMA: &str = "pi.memory.shared.v1";
 pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 const MAX_KEY_BYTES: usize = 128;
