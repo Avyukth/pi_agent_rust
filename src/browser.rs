@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod cdp;
+mod exports;
 mod interaction;
 mod launch;
 mod mock;
@@ -153,9 +154,10 @@ impl Tool for BrowserTool {
 
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
-         through PI_BROWSER_CDP_URL. Supports named tabs, navigation, JavaScript, snapshots, \
-         input and screenshots. start launches or attaches; status never launches; stop only \
-         stops a Pi-owned browser. Failures are errors, never simulated successes."
+         through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
+         workspace file uploads, screenshots and PDF export. start launches or attaches; \
+         status never launches; stop only stops a Pi-owned browser. Failures are errors, \
+         never simulated successes. Selecting upload files exposes them to page scripts."
     }
 
     fn parameters(&self) -> Value {
@@ -167,8 +169,8 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
-                             "scroll", "wait_for", "screenshot"],
-                    "description": "Browser automation action; ordinary actions lazily start the managed browser"
+                             "scroll", "wait_for", "upload", "screenshot", "print_pdf"],
+                    "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
@@ -176,7 +178,13 @@ impl Tool for BrowserTool {
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1"},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
-                "output_path": {"type": "string", "description": "Destination path for a real PNG screenshot"},
+                "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
+                          "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
+                "output_path": {"type": "string", "description": "New .png or .pdf destination; existing files are never overwritten"},
+                "full_page": {"type": "boolean", "description": "screenshot: capture beyond the viewport (default false)"},
+                "landscape": {"type": "boolean", "description": "print_pdf: landscape paper orientation (default false)"},
+                "print_background": {"type": "boolean", "description": "print_pdf: include background graphics (default true)"},
+                "page_ranges": {"type": "string", "description": "print_pdf: page ranges such as 1-3,5; omit for all pages"},
                 "delta_x": {"type": "number", "description": "Horizontal scroll delta in CSS pixels"},
                 "delta_y": {"type": "number", "description": "Vertical scroll delta in CSS pixels; default 600"},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120_000,
@@ -186,7 +194,8 @@ impl Tool for BrowserTool {
     }
 
     fn effects(&self) -> ToolEffects {
-        ToolEffects::write()
+        ToolEffects::read()
+            .union(ToolEffects::write())
             .union(ToolEffects::network())
             .union(ToolEffects::process())
     }
@@ -199,10 +208,12 @@ impl Tool for BrowserTool {
     ) -> Result<ToolOutput> {
         let action = required(&args, "action")?;
         if self.is_mock() {
-            if matches!(action, "start" | "status" | "stop") {
+            if matches!(action, "start" | "status" | "stop" | "upload" | "print_pdf")
+                || args.get("full_page").is_some()
+            {
                 return Err(Error::tool(
                     "browser",
-                    "browser process lifecycle is unavailable in mock mode",
+                    "browser lifecycle, file uploads and page exports require the native backend",
                 ));
             }
             return self
