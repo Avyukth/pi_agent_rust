@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 mod cdp;
+mod interaction;
 mod mock;
 mod policy;
 
@@ -158,6 +159,8 @@ impl Tool for BrowserTool {
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
                 "output_path": {"type": "string", "description": "Destination path for a real PNG screenshot"},
+                "delta_x": {"type": "number", "description": "Horizontal scroll delta in CSS pixels"},
+                "delta_y": {"type": "number", "description": "Vertical scroll delta in CSS pixels; default 600"},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000,
                                "description": "Whole-operation deadline, including connection and lock wait"}
             }

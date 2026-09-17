@@ -142,3 +142,24 @@ fn native_browser_never_falls_back_to_mock_when_endpoint_is_invalid() {
     assert!(error.to_string().contains("loopback"));
     assert!(!dir.path().join("screenshots").exists());
 }
+
+#[test]
+fn native_screenshot_preserves_peer_pixels_and_returns_an_image_block() {
+    use base64::Engine as _;
+    use pi::model::ContentBlock;
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIMDP///wMAH+4F+Yo3CNgAAAAASUVORK5CYII=";
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+    let mut script = attached_script();
+    script.push(("Page.captureScreenshot", json!({"result": {"data": encoded}})));
+    let (endpoint, handle) = peer(script);
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let result = runtime.block_on(tool.execute("native-screenshot", json!({
+        "action": "screenshot", "tab": "page-1", "output_path": "capture.png"
+    }), None)).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("capture.png")).unwrap(), bytes);
+    assert!(result.content.iter().any(|block| matches!(block,
+        ContentBlock::Image(image) if image.mime_type == "image/png" && image.data == encoded)));
+    handle.join().unwrap();
+}

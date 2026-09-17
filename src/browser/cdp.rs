@@ -1,9 +1,10 @@
 //! Native, bounded CDP transport. A connection belongs to one tool operation;
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
-use super::{BrowserTabInfo, output, policy, required};
+use super::{BrowserTabInfo, interaction, output, policy, required};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
+use crate::model::{ContentBlock, ImageContent};
 use crate::tools::ToolOutput;
 use asupersync::net::TcpStream;
 use asupersync::net::websocket::{Message, WebSocket, WebSocketConfig};
@@ -23,6 +24,8 @@ pub(super) struct Session {
     tabs: BTreeMap<String, String>,
     active: Option<String>,
     endpoint: Option<String>,
+    references: BTreeMap<String, interaction::References>,
+    next_ref: u64,
 }
 
 pub(super) async fn execute(
@@ -36,14 +39,15 @@ pub(super) async fn execute(
     match action {
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
         "evaluate" => { required(args, "script")?; }
-        "close" | "list_tabs" | "screenshot" => {}
-        "snapshot" | "ax_tree" | "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
-            return Err(Error::tool("browser", format!("{action} is not yet implemented by the native CDP backend")));
-        }
+        "close" | "list_tabs" | "screenshot" | "snapshot" | "ax_tree" => {}
+        "click" | "wait_for" => { required(args, "selector")?; }
+        "type" | "fill" => { required(args, "selector")?; required(args, "text")?; }
+        "press" => { interaction::key_event(required(args, "key")?)?; }
+        "scroll" => { interaction::delta(args, "delta_x", 0.0)?; interaction::delta(args, "delta_y", 600.0)?; }
         _ => return Err(Error::tool("browser", format!("unknown action: {action}"))),
     }
     let timeout_ms = match args.get("timeout_ms") {
-        None => 30_000,
+        None => if action == "wait_for" { 5000 } else { 30_000 },
         Some(value) => value.as_u64().filter(|n| (1..=120_000).contains(n))
             .ok_or_else(|| Error::tool("browser", "timeout_ms must be an integer in 1..=120000"))?,
     };
@@ -52,10 +56,12 @@ pub(super) async fn execute(
     {
         return Err(Error::tool("browser", "tab must be a nonempty string of at most 256 bytes"));
     }
-    if let Some(script) = args.get("script").and_then(Value::as_str)
-        && script.len() > 64 * 1024
-    {
-        return Err(Error::tool("browser", "script exceeds the 64 KiB limit"));
+    for field in ["script", "text", "selector", "output_path"] {
+        if let Some(value) = args.get(field)
+            && value.as_str().is_none_or(|s| s.len() > 64 * 1024 || (matches!(field, "selector" | "output_path") && s.is_empty()))
+        {
+            return Err(Error::tool("browser", format!("{field} must be a string of at most 64 KiB (selectors and paths cannot be empty)")));
+        }
     }
     let endpoint_text = endpoint_override.map(str::to_owned)
         .or_else(|| std::env::var("PI_BROWSER_CDP_URL").ok())
@@ -72,10 +78,12 @@ pub(super) async fn execute(
             .map_err(|e| Error::tool("browser", format!("browser session lock: {e}")))?;
         if state.endpoint.as_deref() != Some(endpoint.as_str()) {
             state.tabs.clear();
+            state.references.clear();
             state.active = None;
             state.endpoint = Some(endpoint.to_string());
         }
         let mut cdp = Cdp::connect(&owner, &endpoint).await?;
+        cdp.timeout_ms = timeout_ms;
         state.execute(&owner, &mut cdp, cwd, allowlist, args).await
     };
     // Register owner cancellation even while the peer is silent or the lock is
@@ -86,8 +94,8 @@ pub(super) async fn execute(
         drop(sender);
     };
     let watchdog = async {
-        let time = owner.time();
-        match select(Box::pin(time.sleep(Duration::from_millis(timeout_ms))), Box::pin(cancelled)).await {
+        let delay = async { owner.time().sleep(Duration::from_millis(timeout_ms)).await; };
+        match select(Box::pin(delay), Box::pin(cancelled)).await {
             Either::Left(_) => "browser operation timed out; remote side effects may already have occurred",
             Either::Right(_) => "browser operation cancelled; remote side effects may already have occurred",
         }
@@ -106,6 +114,7 @@ pub(super) struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     loaded: BTreeSet<(String, String)>,
+    timeout_ms: u64,
 }
 
 impl Cdp {
@@ -131,7 +140,7 @@ impl Cdp {
             .connect_timeout(Some(Duration::from_secs(5)));
         let socket = WebSocket::connect_with_config(owner.cx(), websocket.as_str(), config).await
             .map_err(|e| Error::tool("browser", format!("CDP WebSocket connection failed: {e}")))?;
-        Ok(Self { socket, next_id: 0, session_id: None, loaded: BTreeSet::new() })
+        Ok(Self { socket, next_id: 0, session_id: None, loaded: BTreeSet::new(), timeout_ms: 30_000 })
     }
 
     async fn receive(&mut self, owner: &AgentCx) -> Result<Value> {
@@ -191,7 +200,7 @@ impl Cdp {
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
         let response = self.command(owner, "Runtime.evaluate", json!({
             "expression": expression, "returnByValue": true, "awaitPromise": true,
-            "timeout": 25_000, "allowUnsafeEvalBlockedByCSP": false
+            "timeout": self.timeout_ms, "allowUnsafeEvalBlockedByCSP": false
         })).await?;
         evaluation_value(&response)
     }
@@ -220,7 +229,7 @@ impl Cdp {
     }
 }
 
-fn evaluation_value(response: &Value) -> Result<Value> {
+pub(super) fn evaluation_value(response: &Value) -> Result<Value> {
     if let Some(exception) = response.get("exceptionDetails") {
         return Err(Error::tool("browser", format!("JavaScript exception: {exception}")));
     }
@@ -244,6 +253,7 @@ impl Session {
         let pages: BTreeMap<String, Value> = targets.iter().filter(|v| v["type"] == "page")
             .filter_map(|v| v["targetId"].as_str().map(|id| (id.to_owned(), v.clone()))).collect();
         self.tabs.retain(|_, id| pages.contains_key(id));
+        self.references.retain(|id, _| pages.contains_key(id));
         if self.active.as_ref().is_some_and(|name| !self.tabs.contains_key(name)) { self.active = None; }
         let tab = args.get("tab").and_then(Value::as_str).or(self.active.as_deref()).unwrap_or("default").to_owned();
         if action == "list_tabs" {
@@ -271,7 +281,8 @@ impl Session {
             let response = cdp.call(owner, "Target.closeTarget", json!({"targetId": target}), false).await?;
             if response["success"] != true { return Err(Error::tool("browser", "Chromium refused to close the target")); }
             self.tabs.retain(|_, id| id != &target);
-            if self.active.as_ref() == Some(&tab) { self.active = self.tabs.keys().next().cloned(); }
+            self.references.remove(&target);
+            if self.active.as_ref().is_some_and(|name| !self.tabs.contains_key(name)) { self.active = self.tabs.keys().next().cloned(); }
             return Ok(output(format!("Closed tab {tab}"), json!({"closed_tab": tab, "remaining_count": self.tabs.len(), "backend": "cdp"})));
         }
         if !matches!(action, "open" | "goto") {
@@ -280,7 +291,7 @@ impl Session {
         }
         let attached = cdp.call(owner, "Target.attachToTarget", json!({"targetId": target, "flatten": true}), false).await?;
         cdp.session_id = Some(required(&attached, "sessionId")?.to_owned());
-        self.tabs.insert(tab.clone(), target);
+        self.tabs.insert(tab.clone(), target.clone());
         self.active = Some(tab.clone());
         match action {
             "open" | "goto" => {
@@ -291,6 +302,14 @@ impl Session {
                 policy::check_navigation(final_url, allowlist)?;
                 let title = required(&info, "title")?;
                 Ok(output(format!("Navigated tab {tab} to {final_url} (Title: \"{title}\")"), json!({"tab": tab, "url": final_url, "title": title, "loaded": true, "backend": "cdp"})))
+            }
+            "snapshot" | "ax_tree" => {
+                let (result, references) = interaction::snapshot(owner, cdp, &tab, self.references.get(&target), &mut self.next_ref, action == "ax_tree").await?;
+                self.references.insert(target.clone(), references);
+                Ok(result)
+            }
+            "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
+                interaction::execute(owner, cdp, &tab, self.references.get(&target), args).await
             }
             "evaluate" => {
                 let value = cdp.evaluate(owner, required(args, "script")?).await?;
@@ -310,8 +329,13 @@ impl Session {
                 let path = if path.is_absolute() { path } else { cwd.join(path) };
                 if let Some(parent) = path.parent() { owner.fs().create_dir_all(parent).await?; }
                 owner.fs().write(&path, &bytes).await?;
-                Ok(output(format!("Captured tab {tab} screenshot to {}\nSize: {} bytes", path.display(), bytes.len()),
-                    json!({"tab": tab, "saved_path": path.display().to_string(), "size_bytes": bytes.len(), "backend": "cdp"})))
+                let mut result = output(format!("Captured tab {tab} screenshot to {}\nSize: {} bytes", path.display(), bytes.len()),
+                    json!({"tab": tab, "saved_path": path.display().to_string(), "size_bytes": bytes.len(), "backend": "cdp"}));
+                result.content.push(ContentBlock::Image(ImageContent {
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    mime_type: "image/png".into(),
+                }));
+                Ok(result)
             }
             _ => Err(Error::tool("browser", format!("unsupported CDP action: {action}"))),
         }
