@@ -196,6 +196,7 @@ fn initialize_git(root: &Path) {
         vec!["init", "--quiet"],
         vec!["config", "user.name", "Pi Test"],
         vec!["config", "user.email", "pi-test@example.invalid"],
+        vec!["config", "commit.gpgSign", "false"],
     ] {
         assert!(Command::new("git").args(args).current_dir(root).status().unwrap().success());
     }
@@ -228,4 +229,169 @@ fn invalid_typed_output_keeps_worktree_edits_even_in_permissive_mode() {
     assert_eq!(result(&output)["iso"]["applyMode"], "keep");
     assert_eq!(result(&output)["iso"]["applied"], false);
     assert_eq!(std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(), "original\n");
+}
+
+#[test]
+fn valid_corrective_retry_applies_only_accepted_edits() {
+    // Retry state must not become part of either workspace snapshot.
+    let retry_state = tempfile::tempdir().unwrap();
+    let marker = quote(retry_state.path().join("attempted").to_str().unwrap());
+    let script = format!(
+        "if [ -f {marker} ]; then\n\
+         test \"$(cat tracked.txt)\" = original || exit 8\n\
+         test ! -e rejected.txt || exit 8\n\
+         printf 'accepted\\n' > tracked.txt\n\
+         {}\
+         else\n\
+         : > {marker}\n\
+         printf 'rejected\\n' > tracked.txt\n\
+         printf 'first-only\\n' > rejected.txt\n\
+         {}\
+         fi\n",
+        emit(&[ended(r#"{"accepted":true}"#, "stop")]),
+        emit(&[ended("not JSON", "stop")]),
+    );
+    let (_dir, tool) = fixture(&script);
+    initialize_git(&tool.cwd);
+    let output = run(&tool, json!({"tasks":[{
+        "agent":"worker","task":"produce an accepted change",
+        "isolation":"worktree","isoApply":"apply","schemaMode":"strict",
+        "outputSchema":{
+            "type":"object","required":["accepted"],
+            "properties":{"accepted":{"type":"boolean"}}
+        }
+    }]}));
+    assert!(!output.is_error, "{output:?}");
+    let result = result(&output);
+    assert_eq!(result["task"], "produce an accepted change");
+    assert_eq!(result["schemaValid"], true);
+    assert_eq!(result["schemaRetries"], 1);
+    assert_eq!(result["data"]["accepted"], true);
+    assert_eq!(result["iso"]["applied"], true);
+    assert_eq!(std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(), "accepted\n");
+    assert!(!tool.cwd.join("rejected.txt").exists());
+    let preserved = result["preservedWorktrees"].as_array().unwrap();
+    assert_eq!(preserved.len(), 1);
+    assert_eq!(preserved[0]["applyMode"], "keep");
+    assert_eq!(preserved[0]["applied"], false);
+    let path = Path::new(preserved[0]["worktreePath"].as_str().unwrap());
+    assert_eq!(std::fs::read_to_string(path.join("tracked.txt")).unwrap(), "rejected\n");
+    assert_eq!(std::fs::read_to_string(path.join("rejected.txt")).unwrap(), "first-only\n");
+}
+
+#[test]
+fn apply_conflict_marks_result_and_hub_failed() {
+    let (_dir, tool) = fixture("");
+    initialize_git(&tool.cwd);
+    let parent_file = quote(tool.cwd.join("tracked.txt").to_str().unwrap());
+    // The absolute parent write represents an independent editor changing the
+    // original checkout while the child changes its isolated copy.
+    let script = format!(
+        "#!/bin/sh\nprintf 'child change\\n' > tracked.txt\n\
+         printf 'concurrent parent change\\n' > {parent_file}\n{}",
+        emit(&[ended("completed child edit", "stop")]),
+    );
+    std::fs::write(&tool.child_binary, script).unwrap();
+    let statuses = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&statuses);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let output = runtime.block_on(tool.execute(
+        "conflict",
+        json!({"tasks":[{
+            "agent":"worker","task":"change file","isolation":"worktree","isoApply":"apply"
+        }]}),
+        Some(Box::new(move |update| {
+            if let Some(status) = update.details.as_ref()
+                .and_then(|value| value["result"]["status"].as_str())
+            {
+                captured.lock().unwrap().push(status.to_string());
+            }
+        })),
+    )).unwrap();
+    assert!(output.is_error, "{output:?}");
+    assert_eq!(result(&output)["status"], "failed");
+    assert_eq!(result(&output)["iso"]["applied"], false);
+    assert!(result(&output)["error"].as_str().unwrap().contains("PI_ISO_CONFLICT"));
+    assert_eq!(std::fs::read_to_string(tool.cwd.join("tracked.txt")).unwrap(), "concurrent parent change\n");
+    let pid = result(&output)["pid"].as_u64().unwrap();
+    let entry = crate::agent_hub::registry().lock().unwrap().roster().into_iter()
+        .find(|entry| entry.pid.map(u64::from) == Some(pid)).unwrap();
+    assert_eq!(entry.status, crate::agent_hub::ChildStatus::Failed);
+    let statuses = statuses.lock().unwrap();
+    assert_eq!(statuses.last().map(String::as_str), Some("failed"));
+    assert!(!statuses.iter().any(|status| status == "completed"));
+}
+
+#[test]
+fn invalid_isolation_settings_do_not_launch() {
+    let (_dir, tool) = fixture(&format!(
+        "printf 'launched\\n' > launched\n{}", emit(&[ended("answer", "stop")]),
+    ));
+    for (isolation, apply) in [("worktre", "apply"), ("worktree", "aply")] {
+        let output = run(&tool, json!({"tasks":[{
+            "agent":"worker","task":"must not launch","isolation":isolation,"isoApply":apply
+        }]}));
+        assert!(output.is_error, "{output:?}");
+        assert_eq!(result(&output)["status"], "failed");
+        assert!(result(&output)["pid"].is_null());
+        assert!(!tool.cwd.join("launched").exists());
+    }
+}
+
+#[test]
+fn descendants_holding_pipes_are_stopped_after_root_exit() {
+    let (_dir, tool) = fixture(&format!(
+        "sleep 30 &\n{}exit 0\n", emit(&[ended("answer", "stop")]),
+    ));
+    // Without process-group cleanup the background sleep retains the pipes,
+    // and the explicit pipe-drain deadline makes this a failed delegation.
+    let output = run(&tool, request());
+    assert!(!output.is_error, "{output:?}");
+    assert_eq!(result(&output)["status"], "completed");
+    assert_eq!(result(&output)["output"], "answer");
+}
+
+#[test]
+fn oversized_frame_fails_without_waiting_for_newline() {
+    let (_dir, tool) = fixture("cat oversized-frame\nsleep 30");
+    std::fs::write(
+        tool.cwd.join("oversized-frame"),
+        vec![b'x'; protocol::MAX_FRAME_BYTES + 1],
+    ).unwrap();
+    let output = run(&tool, request());
+    assert!(output.is_error, "{output:?}");
+    assert!(result(&output)["error"].as_str().unwrap().contains("PI_SUBAGENT_FRAME_LIMIT"));
+    assert!(result(&output)["output"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn starting_callback_cancellation_prevents_spawn() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, tool) = fixture(&format!(
+        "printf 'launched\\n' > launched\n{}", emit(&[ended("answer", "stop")]),
+    ));
+    let owner = crate::agent_cx::AgentCx::for_request();
+    let cancel_owner = owner.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&started);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let output = runtime.block_on(async {
+        let future = tool.execute("pre-spawn-cancel", request(), Some(Box::new(move |update| {
+            if update.details.as_ref().is_some_and(|value| value["result"]["status"] == "starting") {
+                observed.store(true, Ordering::SeqCst);
+                cancel_owner.cancel_with(asupersync::types::CancelKind::User, Some("fixture cancellation"));
+            }
+        })));
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|task_cx| {
+            let _guard = owner.cx().clone().set_current_restricted();
+            std::future::Future::poll(future.as_mut(), task_cx)
+        }).await
+    }).unwrap();
+    assert!(started.load(Ordering::SeqCst), "the Starting callback must actually run");
+    assert!(output.is_error);
+    assert_eq!(result(&output)["status"], "cancelled");
+    assert!(result(&output)["pid"].is_null());
+    assert!(!tool.cwd.join("launched").exists());
 }
