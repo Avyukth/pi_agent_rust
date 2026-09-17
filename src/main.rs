@@ -2617,6 +2617,12 @@ async fn run(
                 ftui_sessions,
                 pi::interactive_ftui::FtuiSettings {
                     markdown_spacing: config.markdown_spacing(),
+                    // Resolved exactly as the classic stack resolves it; the
+                    // `--no-mouse-capture` flag has already been folded into
+                    // `config.disable_mouse_capture` above.
+                    disable_mouse_capture: config.disable_mouse_capture.unwrap_or_else(|| {
+                        std::env::var("PI_NO_MOUSE_CAPTURE").is_ok_and(|val| val == "1")
+                    }),
                     // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
                     // the classic stack does, so it reads the same setting.
                     gh_path: config.gh_path.clone(),
