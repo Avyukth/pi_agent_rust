@@ -1,6 +1,7 @@
-//! Unix helper transport: bounded nonblocking pipes, literal argv/stdin, and
-//! AgentChild ownership. No shell expansion, detached reader threads or disk
-//! spooling of an unbounded helper response.
+//! Unix helper transport: bounded nonblocking stdout, literal argv/stdin, and
+//! AgentChild ownership. Stderr is discarded at spawn: desktop helpers may echo
+//! private text, and a long-lived clipboard owner must never block on an unread
+//! diagnostic pipe. No shell expansion, reader threads or unbounded spooling.
 
 use super::{error, native};
 use crate::agent_cx::{AgentChild, AgentCx};
@@ -9,20 +10,16 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
-use std::process::{ChildStderr, ChildStdout, ExitStatus, Stdio};
+use std::process::{ChildStdout, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 pub(super) const TEXT_LIMIT: usize = 256 * 1024;
-const STDERR_LIMIT: usize = 8192;
 
 pub(super) struct Running {
     pub(super) child: AgentChild,
     stdout: ChildStdout,
-    stderr: ChildStderr,
     bytes: Vec<u8>,
-    errors: Vec<u8>,
     stdout_eof: bool,
-    stderr_eof: bool,
 }
 
 fn nonblocking(fd: &impl AsFd) -> std::io::Result<()> {
@@ -51,26 +48,21 @@ pub(super) fn start(
     let program = helpers.get(name).map_or_else(|| Path::new(name), PathBuf::as_path);
     let mut command = owner.process().command(program);
     command.args(args).current_dir(cwd).env_remove("XDOTOOL_DEBUG")
-        .stdin(Stdio::from(stdin)).stdout(Stdio::piped()).stderr(Stdio::piped());
+        .stdin(Stdio::from(stdin)).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().map_err(|failure| error(format!(
         "cannot start desktop helper {name}: {failure}; install the required OS helper or configure its trusted path",
     )))?;
     let stdout = child.take_stdout().ok_or_else(|| error("missing helper stdout pipe"))?;
-    let stderr = child.take_stderr().ok_or_else(|| error("missing helper stderr pipe"))?;
     nonblocking(&stdout)?;
-    nonblocking(&stderr)?;
-    Ok(Running {
-        child, stdout, stderr, bytes: Vec::new(), errors: Vec::new(),
-        stdout_eof: false, stderr_eof: false,
-    })
+    Ok(Running { child, stdout, bytes: Vec::new(), stdout_eof: false })
 }
 
 // Bound work per tick as well as retained bytes, so a busy writer cannot starve
-// the other pipe or owner cancellation. Exact-limit output is allowed at EOF.
+// owner cancellation. Exact-limit output is allowed if the next read is EOF.
 fn drain(reader: &mut impl Read, bytes: &mut Vec<u8>, limit: usize) -> Result<bool> {
     let mut buffer = [0_u8; 8192];
     for _ in 0..8 {
-        let capacity = (limit.saturating_sub(bytes.len()) + 1).min(buffer.len());
+        let capacity = limit.saturating_sub(bytes.len()).saturating_add(1).min(buffer.len());
         match reader.read(&mut buffer[..capacity]) {
             Ok(0) => return Ok(true),
             Ok(count) => {
@@ -92,9 +84,6 @@ impl Running {
         if !self.stdout_eof {
             self.stdout_eof = drain(&mut self.stdout, &mut self.bytes, limit)?;
         }
-        if !self.stderr_eof {
-            self.stderr_eof = drain(&mut self.stderr, &mut self.errors, STDERR_LIMIT)?;
-        }
         Ok(self.child.try_wait()?)
     }
 
@@ -106,11 +95,9 @@ impl Running {
                 return Err(error(format!("desktop helper {name} timed out; side effects may already have occurred")));
             }
             if let Some(status) = self.poll(limit)?
-                && self.stdout_eof && self.stderr_eof
+                && self.stdout_eof
             {
                 if !status.success() {
-                    // A helper may echo clipboard contents, typed text or window
-                    // titles to stderr. Do not put those bytes in diagnostics.
                     return Err(error(format!(
                         "desktop helper {name} failed ({status}); check the display session and OS permissions",
                     )));
@@ -177,8 +164,8 @@ mod tests {
             &strings(&["-c", "exit 0"]), b"").is_err());
     }
     #[test]
-    fn stdout_and_stderr_are_drained_without_a_pipe_deadlock() {
-        let bytes = run_script("i=0; while [ $i -lt 1000 ]; do printf x; printf y >&2; i=$((i+1)); done", b"", 1024).unwrap();
-        assert_eq!(bytes, vec![b'x'; 1000]);
+    fn helper_diagnostics_cannot_fill_a_pipe_or_leak_private_text() {
+        let bytes = run_script("i=0; while [ $i -lt 20000 ]; do printf private-secret >&2; i=$((i+1)); done; printf done", b"", 1024).unwrap();
+        assert_eq!(bytes, b"done");
     }
 }
