@@ -1,5 +1,7 @@
 //! DAP session state, launch sequencing and retained breakpoint configuration.
 
+mod execution;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,6 +14,7 @@ use super::dap::{DapError, DapEvent, DapTransport};
 use super::tool_err;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
+use execution::Execution;
 
 pub const DEFAULT_DAP_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZED_WAIT: Duration = Duration::from_secs(10);
@@ -31,32 +34,19 @@ enum Origin {
 }
 
 struct State {
-    execution: ExecState,
+    execution: Execution,
     initialized: bool,
-    revision: u64,
     capabilities: Value,
     origin: Option<Origin>,
+    fault: Option<String>,
+    /// Resume/pause waits must observe a fresh stop, not an already stopped peer.
+    stop_wait: Option<(u64, Option<u64>)>,
 }
 
 impl State {
-    fn event(&mut self, event: DapEvent) {
+    fn event(&mut self, event: DapEvent) -> Result<()> {
         match event.event.as_str() {
             "initialized" => self.initialized = true,
-            "stopped" if self.execution != ExecState::Exited => {
-                self.execution = ExecState::Stopped {
-                    thread_id: event.body["threadId"].as_u64().unwrap_or(0),
-                    reason: event.body["reason"].as_str().unwrap_or("unknown").to_string(),
-                };
-                self.revision = self.revision.wrapping_add(1);
-            }
-            "continued" if self.execution != ExecState::Exited => {
-                self.execution = ExecState::Running;
-                self.revision = self.revision.wrapping_add(1);
-            }
-            "terminated" | "exited" => {
-                self.execution = ExecState::Exited;
-                self.revision = self.revision.wrapping_add(1);
-            }
             "capabilities" => {
                 if let (Some(current), Some(update)) = (
                     self.capabilities.as_object_mut(), event.body["capabilities"].as_object(),
@@ -64,8 +54,16 @@ impl State {
                     current.extend(update.clone());
                 }
             }
-            _ => {}
+            _ => self.execution.event(&event.event, &event.body)?,
         }
+        Ok(())
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(fault) = &self.fault {
+            return Err(tool_err("DAP_PROTOCOL", fault.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -91,8 +89,8 @@ impl DapSession {
         Ok(Self {
             transport,
             state: Mutex::new(State {
-                execution: ExecState::Running, initialized: false, revision: 0,
-                capabilities, origin: None,
+                execution: Execution::default(), initialized: false,
+                capabilities, origin: None, fault: None, stop_wait: None,
             }),
             breakpoints: Arc::new(asupersync::sync::Mutex::new(Store::default())),
             _launch_artifacts: None,
@@ -125,7 +123,18 @@ impl DapSession {
     #[must_use]
     pub fn state(&self) -> ExecState {
         self.pump_events();
-        Self::lock(&self.state).execution.clone()
+        Self::lock(&self.state).execution.aggregate()
+    }
+
+    /// Aggregate state is only a convenience. This view includes every known
+    /// thread's individual state and the actual stop reason/exception metadata.
+    #[must_use]
+    pub fn execution_snapshot(&self) -> Value {
+        self.pump_events();
+        let state = Self::lock(&self.state);
+        let mut snapshot = state.execution.snapshot();
+        if let Some(fault) = &state.fault { snapshot["fault"] = json!(fault); }
+        snapshot
     }
 
     #[must_use]
@@ -144,9 +153,21 @@ impl DapSession {
     }
 
     pub fn pump_events(&self) {
-        let mut state = Self::lock(&self.state);
-        for event in self.transport.drain_events() { state.event(event); }
-        if !self.transport.is_alive() { state.execution = ExecState::Exited; }
+        let failed = {
+            let mut state = Self::lock(&self.state);
+            for event in self.transport.drain_events() {
+                if let Err(error) = state.event(event) {
+                    state.fault = Some(error.to_string());
+                    state.execution.exit();
+                    break;
+                }
+            }
+            if !self.transport.is_alive() { state.execution.exit(); }
+            state.fault.is_some()
+        };
+        // Retire malformed/overflowed control state; never continue with a
+        // guessed suspension map. Drop the state mutex before process cleanup.
+        if failed { self.transport.kill(); }
     }
 
     /// One startup budget covers compilation, initialization and all initial
@@ -194,6 +215,7 @@ impl DapSession {
             };
             futures::future::try_join(launch, configure).await?;
             self.pump_events();
+            Self::lock(&self.state).check()?;
             Ok(())
         };
         let owner = AgentCx::for_current_or_request();
@@ -220,8 +242,9 @@ impl DapSession {
             self.pump_events();
             {
                 let state = Self::lock(&self.state);
+                state.check()?;
                 if state.initialized { return Ok(()); }
-                if state.execution == ExecState::Exited {
+                if state.execution.aggregate() == ExecState::Exited {
                     return Err(tool_err("DAP_TRANSPORT", "adapter ended before initialization"));
                 }
             }
@@ -234,16 +257,25 @@ impl DapSession {
         }
     }
 
+    /// After resume/pause, only a newly observed stop satisfies this wait. In
+    /// single-thread mode it must belong to the requested thread, not a peer.
     pub async fn wait_stopped(&self, wait: Duration) -> Option<(u64, String)> {
         let owner = AgentCx::for_current_or_request();
         let start = owner.cx().timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         loop {
             if owner.checkpoint().is_err() { return None; }
-            match self.state() {
-                ExecState::Stopped { thread_id, reason } => return Some((thread_id, reason)),
-                ExecState::Exited => return None,
-                ExecState::Running => {}
+            self.pump_events();
+            {
+                let state = Self::lock(&self.state);
+                if state.execution.aggregate() == ExecState::Exited { return None; }
+                if let Some((revision, thread)) = state.stop_wait {
+                    if let Some(stop) = state.execution.stopped_since(revision, thread) {
+                        return Some(stop);
+                    }
+                } else if let ExecState::Stopped { thread_id, reason } = state.execution.aggregate() {
+                    return Some((thread_id, reason));
+                }
             }
             let now = owner.cx().timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
@@ -253,58 +285,83 @@ impl DapSession {
     }
 
     pub(super) fn require_stopped(&self) -> Result<u64> {
-        match self.state() {
-            ExecState::Stopped { thread_id, .. } => Ok(thread_id),
-            ExecState::Running => Err(tool_err("DAP_STATE_RUNNING", "debuggee is running; pause or wait for a breakpoint first")),
-            ExecState::Exited => Err(tool_err("DAP_STATE_EXITED", "debuggee has exited; start a new session")),
-        }
+        self.require_thread(None)
+    }
+
+    pub(super) fn require_thread(&self, thread: Option<u64>) -> Result<u64> {
+        self.pump_events();
+        let state = Self::lock(&self.state);
+        state.check()?;
+        state.execution.require(thread)
     }
 
     pub async fn call(&self, command: &str, arguments: Value) -> Result<Value> {
         self.pump_events();
-        let previous = if matches!(command, "continue" | "next" | "stepIn" | "stepOut" | "stepBack" | "reverseContinue" | "restartFrame") {
-            self.require_stopped()?;
+        let resuming = matches!(command, "continue" | "next" | "stepIn" | "stepOut" | "stepBack" | "reverseContinue" | "restartFrame");
+        let single = match arguments.get("singleThread") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| tool_err("DAP_USAGE", "singleThread must be boolean"))?,
+        };
+        if single && resuming { self.require_capability("supportsSingleThreadExecutionRequests")?; }
+        let (previous, revision, previous_wait, own_wait) = {
             let mut state = Self::lock(&self.state);
-            let previous = state.execution.clone();
-            state.execution = ExecState::Running;
-            Some((previous, state.revision))
-        } else { None };
+            state.check()?;
+            let previous_wait = state.stop_wait;
+            let previous = if resuming {
+                let thread = state.execution.require(arguments.get("threadId").and_then(Value::as_u64))?;
+                Some(state.execution.resume(thread, single)?)
+            } else { None };
+            let revision = state.execution.revision();
+            let own_wait = if resuming || command == "pause" {
+                Some((revision, if single || command == "pause" {
+                    arguments.get("threadId").and_then(Value::as_u64)
+                } else { None }))
+            } else { None };
+            if own_wait.is_some() { state.stop_wait = own_wait; }
+            (previous, revision, previous_wait, own_wait)
+        };
         let result = self.transport.request(command, arguments, DEFAULT_DAP_TIMEOUT).await;
         self.pump_events();
-        if matches!(&result, Err(DapError::Adapter { .. }))
-            && let Some((previous, revision)) = previous
-        {
-            let mut state = Self::lock(&self.state);
-            if state.revision == revision && state.execution != ExecState::Exited {
-                state.execution = previous;
+        let mut state = Self::lock(&self.state);
+        state.check()?;
+        if matches!(&result, Err(DapError::Adapter { .. })) {
+            if let Some(previous) = &previous { state.execution.restore(previous, false); }
+            if own_wait.is_some() && state.stop_wait == own_wait { state.stop_wait = previous_wait; }
+        }
+        if let Ok(body) = &result {
+            if command == "threads" { state.execution.observe_threads(body, revision)?; }
+            if command == "continue" && let Some(previous) = &previous {
+                match body.get("allThreadsContinued") {
+                    Some(Value::Bool(false)) => state.execution.restore(previous, true),
+                    None | Some(Value::Bool(true)) => state.execution.continued_all(previous),
+                    _ => return Err(tool_err("DAP_PROTOCOL", "allThreadsContinued reply must be boolean")),
+                }
             }
         }
+        // Timeout, cancellation and disconnected requests never restore an old
+        // stop: the adapter may already have accepted the execution command.
         result.map_err(crate::error::Error::from)
     }
 
     pub async fn call_stopped(&self, command: &str, arguments: Value) -> Result<Value> {
-        self.require_stopped()?;
+        self.require_thread(arguments.get("threadId").and_then(Value::as_u64))?;
         self.call(command, arguments).await
     }
 
-    /// Checked end-of-session operation used by the agent-facing tool. A
-    /// rejection is not permission to force-kill an attached user's process.
     pub(super) async fn disconnect(&self, terminate_debuggee: bool) -> Result<()> {
         let capabilities = self.capabilities();
         let origin = Self::lock(&self.state).origin;
         let arguments = disconnect_arguments(origin, &capabilities, terminate_debuggee)?;
         self.transport.request("disconnect", arguments, DEFAULT_DAP_TIMEOUT).await?;
         self.transport.kill();
-        Self::lock(&self.state).execution = ExecState::Exited;
+        Self::lock(&self.state).execution.exit();
         Ok(())
     }
 
-    /// Low-level best-effort teardown for SDK callers and fixture cleanup.
-    /// The tool uses the checked disconnect path above and surfaces rejection.
     pub async fn terminate(&self) {
         let _ = self.call("terminate", json!({})).await;
         self.transport.kill();
-        Self::lock(&self.state).execution = ExecState::Exited;
+        Self::lock(&self.state).execution.exit();
     }
 }
 
@@ -317,11 +374,7 @@ fn disconnect_arguments(origin: Option<Origin>, caps: &Value, terminate: bool) -
         return Err(tool_err("DAP_UNSUPPORTED", "adapter cannot guarantee the requested termination of an attached target; disconnect to leave it running"));
     }
     let mut args = json!({"restart":false});
-    if caps["supportTerminateDebuggee"] == true {
-        args["terminateDebuggee"] = json!(terminate);
-    }
-    // Without the optional capability, DAP's implicit rule terminates launch
-    // targets and preserves attach targets. Never rely on an ignored override.
+    if caps["supportTerminateDebuggee"] == true { args["terminateDebuggee"] = json!(terminate); }
     Ok(args)
 }
 
@@ -330,7 +383,10 @@ mod tests {
     use super::*;
 
     fn state() -> State {
-        State { execution: ExecState::Running, initialized: false, revision: 0, capabilities: json!({}), origin: None }
+        State {
+            execution: Execution::default(), initialized: false, capabilities: json!({}),
+            origin: None, fault: None, stop_wait: None,
+        }
     }
 
     #[test]
@@ -344,23 +400,23 @@ mod tests {
     #[test]
     fn initialized_and_stopped_in_the_same_batch_are_both_retained() {
         let mut state = state();
-        state.event(DapEvent { event: "initialized".into(), body: json!({}) });
-        state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":7,"reason":"entry"}) });
+        state.event(DapEvent { event: "initialized".into(), body: json!({}) }).unwrap();
+        state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":7,"reason":"entry"}) }).unwrap();
         assert!(state.initialized);
-        assert!(matches!(state.execution, ExecState::Stopped { thread_id:7, .. }));
-        state.event(DapEvent { event: "continued".into(), body: json!({}) });
+        assert!(matches!(state.execution.aggregate(), ExecState::Stopped { thread_id:7, .. }));
+        state.event(DapEvent { event: "continued".into(), body: json!({}) }).unwrap();
         assert!(state.initialized);
-        assert_eq!(state.execution, ExecState::Running);
+        assert_eq!(state.execution.aggregate(), ExecState::Running);
     }
 
     #[test]
     fn terminal_state_is_not_resurrected_and_capabilities_merge() {
         let mut state = state();
-        state.event(DapEvent { event: "capabilities".into(), body: json!({"capabilities":{"supportsLogPoints":true}}) });
+        state.event(DapEvent { event: "capabilities".into(), body: json!({"capabilities":{"supportsLogPoints":true}}) }).unwrap();
         assert_eq!(state.capabilities["supportsLogPoints"], true);
-        state.event(DapEvent { event: "exited".into(), body: json!({}) });
-        state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":3}) });
-        assert_eq!(state.execution, ExecState::Exited);
+        state.event(DapEvent { event: "exited".into(), body: json!({}) }).unwrap();
+        state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":3}) }).unwrap();
+        assert_eq!(state.execution.aggregate(), ExecState::Exited);
     }
 
     #[test]
