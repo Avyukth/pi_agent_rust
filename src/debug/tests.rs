@@ -196,3 +196,5 @@ fn evaluation_retains_expandable_references_and_variable_paging() {
     assert_eq!(variables["arguments"],json!({"variablesReference":66,"start":1,"count":2,"filter":"named"}));
     run(&tool,&runtime,json!({"action":"terminate"})).unwrap();
 }
+
+include!("delve_tests.rs");

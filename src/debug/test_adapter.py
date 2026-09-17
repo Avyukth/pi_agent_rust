@@ -1,13 +1,21 @@
-"""Deterministic stdio DAP peer for Rust protocol tests, never a live adapter."""
+"""Deterministic stdio/TCP DAP peer for Rust tests, never a live debugger."""
 import json
+import os
+from pathlib import Path
+import socket
 import sys
 import threading
+import time
 
-MODE = sys.argv[1] if len(sys.argv) > 1 else "normal"
+TCP = len(sys.argv) > 1 and sys.argv[1] == "tcp"
+MODE_INDEX = 2 if TCP else 1
+MODE = sys.argv[MODE_INDEX] if len(sys.argv) > MODE_INDEX else "normal"
 LOCK = threading.Lock()
 SEQUENCE = 0
 REQUESTS = []
 LAUNCH = None
+INPUT = sys.stdin.buffer
+OUTPUT = sys.stdout.buffer
 
 
 def send(message):
@@ -16,8 +24,8 @@ def send(message):
         SEQUENCE += 1
         message["seq"] = SEQUENCE
         payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
-        sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
-        sys.stdout.buffer.flush()
+        OUTPUT.write(b"Content-Length: %d\r\n\r\n" % len(payload) + payload)
+        OUTPUT.flush()
 
 
 def reply(request, body=None, error=None):
@@ -32,8 +40,12 @@ def event(name, body=None):
 
 def read():
     length = None
+    header_bytes = 0
     while True:
-        line = sys.stdin.buffer.readline()
+        line = INPUT.readline(4097)
+        header_bytes += len(line)
+        if header_bytes > 16384 or len(line) > 4096:
+            raise ValueError("oversized DAP test header")
         if not line:
             return None
         if line == b"\r\n":
@@ -43,7 +55,7 @@ def read():
             length = int(value)
     if length is None or not 0 < length <= 2 * 1024 * 1024:
         raise ValueError("invalid DAP test frame")
-    payload = sys.stdin.buffer.read(length)
+    payload = INPUT.read(length)
     if len(payload) != length:
         raise ValueError("incomplete DAP test frame")
     return json.loads(payload)
@@ -64,14 +76,19 @@ def main():
                 "supportsInstructionBreakpoints", "supportsDataBreakpoints",
                 "supportsConditionalBreakpoints", "supportsHitConditionalBreakpoints",
                 "supportsLogPoints", "supportsDisassembleRequest", "supportsReadMemoryRequest",
-                "supportsWriteMemoryRequest", "supportsModulesRequest", "supportsLoadedSourcesRequest"
+                "supportsWriteMemoryRequest", "supportsModulesRequest", "supportsLoadedSourcesRequest",
+                "supportTerminateDebuggee"
             ]}
             caps["exceptionBreakpointFilters"] = [{"filter": "raised", "label": "Raised"}]
             if MODE == "no_configuration_done":
                 caps.pop("supportsConfigurationDoneRequest")
+            if MODE == "no_terminate_attached":
+                caps.pop("supportTerminateDebuggee")
             reply(request, caps)
         elif command in ("launch", "attach"):
             LAUNCH = request
+            if MODE == "slow_build":
+                time.sleep(0.2)
             event("initialized")
             if MODE == "no_configuration_done":
                 event("stopped", {"threadId": 7, "reason": "entry"})
@@ -79,6 +96,8 @@ def main():
         elif command == "configurationDone":
             if MODE == "configuration_error":
                 reply(request, error="configuration rejected by test adapter")
+                continue
+            if MODE == "configuration_stall":
                 continue
             event("stopped", {"threadId": 7, "reason": "entry"})
             reply(request)
@@ -128,6 +147,14 @@ def main():
                 event("output", {"category": "stdout", "output": "progress\n"})
             event("stopped", {"threadId": 9, "reason": "breakpoint"})
             reply(request)
+        elif command == "disconnect":
+            if MODE == "disconnect_error":
+                reply(request, error="disconnect rejected by test adapter")
+                continue
+            Path("disconnect.json").write_text(json.dumps(args), encoding="utf-8")
+            reply(request)
+            event("terminated")
+            return
         elif command == "terminate":
             reply(request)
             event("terminated")
@@ -136,5 +163,33 @@ def main():
             reply(request, error="unexpected test command: " + command)
 
 
+def tcp_main():
+    global INPUT, OUTPUT
+    assert "--listen=127.0.0.1:0" in sys.argv
+    assert "--only-same-user=true" in sys.argv
+    Path("adapter.pid").write_text(str(os.getpid()), encoding="ascii")
+    if MODE == "never_ready":
+        time.sleep(30)
+        return
+    if MODE == "bad_endpoint":
+        print("DAP server listening at: 192.0.2.1:9", flush=True)
+        time.sleep(30)
+        return
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(10)
+        sys.stdout.write("DAP server listen")
+        sys.stdout.flush()
+        time.sleep(0.01)
+        print("ing at: 127.0.0.1:%d" % listener.getsockname()[1], flush=True)
+        with listener.accept()[0] as connection:
+            connection.settimeout(30)
+            print("debuggee stdout is not a DAP frame", flush=True)
+            with connection.makefile("rwb") as stream:
+                INPUT = OUTPUT = stream
+                main()
+
+
 if __name__ == "__main__":
-    main()
+    tcp_main() if TCP else main()

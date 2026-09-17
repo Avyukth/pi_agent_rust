@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::future::{Either, select};
 use serde_json::{Value, json};
 
 use super::breakpoints::{self, Change, Group, Store};
@@ -12,11 +13,9 @@ use super::tool_err;
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 
-/// Default per-request timeout.
 pub const DEFAULT_DAP_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIALIZED_WAIT: Duration = Duration::from_secs(10);
 
-/// The debuggee's execution state.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ExecState {
@@ -25,11 +24,18 @@ pub enum ExecState {
     Exited,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Launch,
+    Attach,
+}
+
 struct State {
     execution: ExecState,
     initialized: bool,
     revision: u64,
     capabilities: Value,
+    origin: Option<Origin>,
 }
 
 impl State {
@@ -63,12 +69,12 @@ impl State {
     }
 }
 
-/// One live debug session. Breakpoint requests are serialized independently of
-/// state polling; no blocking mutex guard crosses an await.
+/// Field order matters: stop the owned adapter before removing build outputs.
 pub struct DapSession {
     transport: DapTransport,
     state: Mutex<State>,
     pub(super) breakpoints: Arc<asupersync::sync::Mutex<Store>>,
+    _launch_artifacts: Option<tempfile::TempDir>,
 }
 
 impl DapSession {
@@ -85,10 +91,17 @@ impl DapSession {
         Ok(Self {
             transport,
             state: Mutex::new(State {
-                execution: ExecState::Running, initialized: false, revision: 0, capabilities,
+                execution: ExecState::Running, initialized: false, revision: 0,
+                capabilities, origin: None,
             }),
             breakpoints: Arc::new(asupersync::sync::Mutex::new(Store::default())),
+            _launch_artifacts: None,
         })
+    }
+
+    pub(super) fn with_launch_artifacts(mut self, directory: Option<tempfile::TempDir>) -> Self {
+        self._launch_artifacts = directory;
+        self
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -126,23 +139,34 @@ impl DapSession {
         self.transport.is_alive() && self.state() != ExecState::Exited
     }
 
+    pub(super) fn is_connected(&self) -> bool {
+        self.transport.is_alive()
+    }
+
     pub fn pump_events(&self) {
-        // Serialize draining as well as applying: concurrent callers cannot
-        // apply a later batch before an earlier batch. initialized is latched,
-        // and processing it never discards the rest of the drained events.
         let mut state = Self::lock(&self.state);
         for event in self.transport.drain_events() { state.event(event); }
         if !self.transport.is_alive() { state.execution = ExecState::Exited; }
     }
 
-    /// Dispatch launch/attach concurrently with configuration. Adapters such
-    /// as debugpy reply to launch only after configurationDone is answered.
+    /// One startup budget covers compilation, initialization and all initial
+    /// breakpoint configuration, not a fresh timeout for each handshake step.
     pub(super) async fn start(
         &self, command: &str, arguments: Value,
         initial: &BTreeMap<String, Vec<Value>>, exception_filters: Option<&[String]>,
+        timeout: Duration,
     ) -> Result<()> {
+        let origin = match command {
+            "launch" => Origin::Launch,
+            "attach" => Origin::Attach,
+            _ => return Err(tool_err("DAP_USAGE", "startup must be launch or attach")),
+        };
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(tool_err("DAP_USAGE", "startup timeout must be in 1..=300000 ms"));
+        }
+        Self::lock(&self.state).origin = Some(origin);
         let configure = async {
-            self.wait_initialized().await?;
+            self.wait_initialized_for(timeout).await?;
             for (path, entries) in initial {
                 for entry in entries { breakpoints::check_options(self, entry)?; }
                 breakpoints::apply(self, Group::Source(path.clone()), Change::Replace(entries.clone())).await?;
@@ -163,14 +187,31 @@ impl DapSession {
             }
             Ok::<(), crate::error::Error>(())
         };
-        futures::future::try_join(self.call(command, arguments), configure).await?;
-        self.pump_events();
-        Ok(())
+        let operation = async {
+            let launch = async {
+                self.transport.request(command, arguments, timeout).await
+                    .map_err(crate::error::Error::from)
+            };
+            futures::future::try_join(launch, configure).await?;
+            self.pump_events();
+            Ok(())
+        };
+        let owner = AgentCx::for_current_or_request();
+        let deadline = async { owner.time().sleep(timeout).await; };
+        match select(Box::pin(operation), Box::pin(deadline)).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), pending)) => {
+                drop(pending);
+                Err(tool_err("DAP_STARTUP_TIMEOUT", "debug launch/attach configuration exceeded its startup budget"))
+            }
+        }
     }
 
-    /// Readiness is a latched event, not a one-shot queue item a state query
-    /// can consume. Missing readiness, cancellation and disconnect are errors.
     pub async fn wait_initialized(&self) -> Result<()> {
+        self.wait_initialized_for(INITIALIZED_WAIT).await
+    }
+
+    async fn wait_initialized_for(&self, wait: Duration) -> Result<()> {
         let owner = AgentCx::for_current_or_request();
         let start = owner.cx().timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
@@ -186,7 +227,7 @@ impl DapSession {
             }
             let now = owner.cx().timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-            if Duration::from_nanos(now.duration_since(start)) >= INITIALIZED_WAIT {
+            if Duration::from_nanos(now.duration_since(start)) >= wait {
                 return Err(tool_err("DAP_INITIALIZE_TIMEOUT", "adapter did not emit initialized"));
             }
             owner.time().sleep(Duration::from_millis(10)).await;
@@ -219,8 +260,6 @@ impl DapSession {
         }
     }
 
-    /// Resuming invalidates the old stop before dispatch. A new stopped event
-    /// may precede the command reply and must win over the resume transition.
     pub async fn call(&self, command: &str, arguments: Value) -> Result<Value> {
         self.pump_events();
         let previous = if matches!(command, "continue" | "next" | "stepIn" | "stepOut" | "stepBack" | "reverseContinue" | "restartFrame") {
@@ -240,8 +279,6 @@ impl DapSession {
                 state.execution = previous;
             }
         }
-        // On timeout/transport loss/cancel, do not restore stale frame access:
-        // the adapter may already have resumed the debuggee.
         result.map_err(crate::error::Error::from)
     }
 
@@ -250,6 +287,20 @@ impl DapSession {
         self.call(command, arguments).await
     }
 
+    /// Checked end-of-session operation used by the agent-facing tool. A
+    /// rejection is not permission to force-kill an attached user's process.
+    pub(super) async fn disconnect(&self, terminate_debuggee: bool) -> Result<()> {
+        let capabilities = self.capabilities();
+        let origin = Self::lock(&self.state).origin;
+        let arguments = disconnect_arguments(origin, &capabilities, terminate_debuggee)?;
+        self.transport.request("disconnect", arguments, DEFAULT_DAP_TIMEOUT).await?;
+        self.transport.kill();
+        Self::lock(&self.state).execution = ExecState::Exited;
+        Ok(())
+    }
+
+    /// Low-level best-effort teardown for SDK callers and fixture cleanup.
+    /// The tool uses the checked disconnect path above and surfaces rejection.
     pub async fn terminate(&self) {
         let _ = self.call("terminate", json!({})).await;
         self.transport.kill();
@@ -257,12 +308,29 @@ impl DapSession {
     }
 }
 
+fn disconnect_arguments(origin: Option<Origin>, caps: &Value, terminate: bool) -> Result<Value> {
+    let origin = origin.ok_or_else(|| tool_err("DAP_NO_SESSION", "debug session did not complete a start request"))?;
+    if !terminate && origin == Origin::Launch {
+        return Err(tool_err("DAP_USAGE", "disconnect preserves attached targets only; use terminate for a Pi-launched program"));
+    }
+    if terminate && origin == Origin::Attach && caps["supportTerminateDebuggee"] != true {
+        return Err(tool_err("DAP_UNSUPPORTED", "adapter cannot guarantee the requested termination of an attached target; disconnect to leave it running"));
+    }
+    let mut args = json!({"restart":false});
+    if caps["supportTerminateDebuggee"] == true {
+        args["terminateDebuggee"] = json!(terminate);
+    }
+    // Without the optional capability, DAP's implicit rule terminates launch
+    // targets and preserves attach targets. Never rely on an ignored override.
+    Ok(args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn state() -> State {
-        State { execution: ExecState::Running, initialized: false, revision: 0, capabilities: json!({}) }
+        State { execution: ExecState::Running, initialized: false, revision: 0, capabilities: json!({}), origin: None }
     }
 
     #[test]
@@ -293,5 +361,15 @@ mod tests {
         state.event(DapEvent { event: "exited".into(), body: json!({}) });
         state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":3}) });
         assert_eq!(state.execution, ExecState::Exited);
+    }
+
+    #[test]
+    fn disconnect_respects_target_origin_and_optional_capabilities() {
+        assert_eq!(disconnect_arguments(Some(Origin::Launch), &json!({}), true).unwrap(), json!({"restart":false}));
+        assert_eq!(disconnect_arguments(Some(Origin::Attach), &json!({}), false).unwrap(), json!({"restart":false}));
+        assert!(disconnect_arguments(Some(Origin::Attach), &json!({}), true).is_err());
+        assert!(disconnect_arguments(Some(Origin::Launch), &json!({"supportTerminateDebuggee":true}), false).is_err());
+        assert_eq!(disconnect_arguments(Some(Origin::Attach), &json!({"supportTerminateDebuggee":true}), true).unwrap()["terminateDebuggee"], true);
+        assert_eq!(disconnect_arguments(Some(Origin::Attach), &json!({"supportTerminateDebuggee":true}), false).unwrap()["terminateDebuggee"], false);
     }
 }

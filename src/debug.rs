@@ -57,8 +57,7 @@ impl DebugTool {
         }
     }
 
-    /// Trusted SDK adapter definitions; executable selection is not a tool
-    /// argument. Unspecified IDs retain the built-in adapter registry behavior.
+    /// Trusted SDK adapter definitions; executable selection is not a tool argument.
     #[must_use]
     pub fn with_adapters(mut self, adapters: Vec<AdapterSpec>) -> Self {
         self.adapters = adapters;
@@ -71,15 +70,18 @@ impl DebugTool {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_start(&self, input: &DebugInput) -> Result<ToolOutput> {
         if lock(&self.session).is_some() {
-            return Err(tool_err("DAP_SESSION_EXISTS", "terminate the existing debug session before launch or attach"));
+            return Err(tool_err("DAP_SESSION_EXISTS", "terminate or disconnect the existing debug session before launch or attach"));
         }
         let program = if input.action == "launch" {
-            let program = input.required("program", input.program.as_deref())?;
-            let path = self.cwd.join(program);
-            if !path.is_file() {
-                return Err(tool_err("DAP_TARGET_MISSING", format!("program does not exist: {}", path.display())));
+            let name = input.required("program", input.program.as_deref())?;
+            let path = std::fs::canonicalize(self.cwd.join(name)).map_err(|error| {
+                tool_err("DAP_TARGET_MISSING", format!("cannot resolve launch target: {error}"))
+            })?;
+            if !path.is_file() && !path.is_dir() {
+                return Err(tool_err("DAP_TARGET_MISSING", "program must be a regular file or a Go package directory"));
             }
             Some(path)
         } else {
@@ -88,8 +90,15 @@ impl DebugTool {
             None
         };
         let initial = breakpoints::initial(&self.cwd, input.initial_breakpoints.as_deref().unwrap_or(&[]))?;
-        let adapter = adapters::select_adapter(program.as_deref(), input.adapter.as_deref(), &self.adapters)
+        let requested = input.adapter.as_deref().or(input.go_mode.as_ref().map(|_| "dlv"));
+        let adapter = adapters::select_adapter(program.as_deref(), requested, &self.adapters)
             .ok_or_else(|| tool_err("DAP_ADAPTER_MISSING", "no matching debug adapter; install lldb-dap, debugpy, or dlv"))?;
+        if input.go_mode.is_some() && adapter.id != "dlv" {
+            return Err(tool_err("DAP_USAGE", "goMode requires the dlv adapter"));
+        }
+        if program.as_ref().is_some_and(|path| path.is_dir()) && adapter.id != "dlv" {
+            return Err(tool_err("DAP_USAGE", "directory launch targets require the dlv adapter"));
+        }
         let command = adapter.resolve_command().ok_or_else(|| {
             tool_err("DAP_ADAPTER_MISSING", format!("adapter {} not on PATH. hint: {}", adapter.id, adapter.install_hint))
         })?;
@@ -98,19 +107,41 @@ impl DebugTool {
             return Err(tool_err("DAP_PERMISSION", "debug launch requires I/O, spawn and timer capabilities"));
         }
         owner.checkpoint().map_err(|_| tool_err("DAP_CANCELLED", "debug launch cancelled"))?;
-        let arguments = if let Some(program) = &program {
-            let mut args = adapters::launch_arguments(&adapter, program,
-                input.args.as_deref().unwrap_or(&[]), &self.cwd);
-            if let Some(stop) = input.stop_on_entry { args["stopOnEntry"] = json!(stop); }
-            args
+        let mut arguments = if let Some(program) = &program {
+            adapters::launch_arguments(&adapter, program, input.args.as_deref().unwrap_or(&[]), &self.cwd)
         } else {
             adapters::attach_arguments(&adapter, input.pid.expect("validated pid"))
         };
-        let transport = dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &self.cwd)?;
-        let session = DapSession::begin(transport).await?;
-        // A failed configuration drops this local session, never publishes it
-        // as running, and never swallows a configurationDone rejection.
-        session.start(&input.action, arguments, &initial, input.exception_filters.as_deref()).await?;
+        if let Some(stop) = input.stop_on_entry { arguments["stopOnEntry"] = json!(stop); }
+        if let Some(mode) = &input.go_mode { arguments["mode"] = json!(mode); }
+        let mut artifacts = None;
+        if adapter.id == "dlv" && let Some(program) = &program {
+            if arguments["mode"] == "exec" {
+                if !program.is_file() {
+                    return Err(tool_err("DAP_USAGE", "Go exec mode requires a prebuilt binary, not a directory"));
+                }
+            } else {
+                if !program.is_dir() && !program.extension().is_some_and(|extension| extension == "go") {
+                    return Err(tool_err("DAP_USAGE", "Go debug/test mode requires a .go file or package directory"));
+                }
+                let directory = tempfile::Builder::new().prefix("pi-debug-go-").tempdir()?;
+                let output = directory.path().join(if cfg!(windows) { "debuggee.exe" } else { "debuggee" });
+                arguments["output"] = json!(output.to_str().ok_or_else(|| {
+                    tool_err("DAP_USAGE", "Go build output directory must be representable as UTF-8")
+                })?);
+                artifacts = Some(directory);
+            }
+        }
+        let go_mode = (adapter.id == "dlv" && program.is_some()).then(|| arguments["mode"].clone());
+        let transport = if adapter.id == "dlv" {
+            dap::DapTransport::spawn_delve(&command, &adapter.adapter_args, &[], &self.cwd).await?
+        } else {
+            dap::DapTransport::spawn(&command, &adapter.adapter_args, &[], &self.cwd)?
+        };
+        let session = DapSession::begin(transport).await?.with_launch_artifacts(artifacts);
+        let timeout_ms = input.startup_timeout_ms.unwrap_or(120_000);
+        session.start(&input.action, arguments, &initial, input.exception_filters.as_deref(),
+            Duration::from_millis(timeout_ms)).await?;
         if program.is_some() && input.stop_on_entry.unwrap_or(true) {
             session.wait_stopped(Duration::from_secs(10)).await;
         }
@@ -118,7 +149,9 @@ impl DebugTool {
         let state = session.state();
         let payload = json!({
             "action": input.action, "program": program.as_ref().map(|path| path.display().to_string()),
-            "pid": input.pid, "adapter": adapter.id,
+            "pid": input.pid, "adapter": adapter.id, "goMode": go_mode,
+            "transport": if adapter.id == "dlv" { "tcp" } else { "stdio" },
+            "startupTimeoutMs": timeout_ms,
             "state": match &state {
                 ExecState::Stopped { reason, .. } if reason == "entry" => "stopped_entry",
                 ExecState::Stopped { .. } => "stopped",
@@ -212,10 +245,15 @@ impl DebugTool {
                 json!({"command":command,"result":session.call(command,input.payload.clone().unwrap_or_else(||json!({}))).await?})
             }
             "output" => json!({"tail":session.output_tail()}),
-            "terminate" => {
-                session.terminate().await;
-                lock(&self.session).take();
-                json!({"state":"exited"})
+            "terminate" | "disconnect" => {
+                let terminate = input.action == "terminate";
+                let result = session.disconnect(terminate).await;
+                // A dead transport must not permanently block a future launch.
+                // A live adapter's rejection leaves the session available.
+                if result.is_ok() || !session.is_connected() { lock(&self.session).take(); }
+                result?;
+                json!({"state":"disconnected","adapterAcknowledged":true,
+                    "debuggeeTerminationRequested":terminate})
             }
             "sessions" => json!({"sessions":[{"id":0,"state":session.state(),"capabilities":session.capabilities()}]}),
             other => return Err(tool_err("DAP_USAGE", format!("unknown debug action {other:?}"))),
@@ -247,7 +285,6 @@ impl DebugTool {
                 (Group::Instruction, reference.map(|reference|json!({"instructionReference":reference,"offset":input.offset.unwrap_or(0)})), json!({"reference":reference,"offset":input.offset.unwrap_or(0)}))
             }
             "set_data_breakpoint" | "remove_data_breakpoint" => {
-                // dataId is opaque adapter output, not a source variable name.
                 let data_id = input.data_id.as_deref().or(input.name.as_deref());
                 let data_id = if setting { Some(input.required("dataId",data_id)?) } else { data_id };
                 (Group::Data, data_id.map(|id|json!({"dataId":id,"accessType":input.access_type.as_deref().unwrap_or("write")})), json!({"dataId":data_id}))
@@ -359,6 +396,8 @@ struct DebugInput {
     program: Option<String>,
     args: Option<Vec<String>>,
     adapter: Option<String>,
+    go_mode: Option<String>,
+    startup_timeout_ms: Option<u64>,
     pid: Option<u32>,
     file: Option<String>,
     line: Option<u64>,
@@ -402,6 +441,13 @@ impl DebugInput {
             || self.frame_id.is_some_and(|frame|frame > 2_147_483_647)
             || self.variables_reference.is_some_and(|reference|reference > 2_147_483_647)
         { return Err(tool_err("DAP_USAGE","invalid DAP identifier, offset or result limit")); }
+        if self.go_mode.as_deref().is_some_and(|mode| self.action != "launch" || !matches!(mode, "debug" | "test" | "exec")) {
+            return Err(tool_err("DAP_USAGE", "goMode is launch-only and must be debug, test or exec"));
+        }
+        if self.startup_timeout_ms.is_some_and(|timeout| !(1..=300_000).contains(&timeout)
+            || !matches!(self.action.as_str(), "launch" | "attach")) {
+            return Err(tool_err("DAP_USAGE", "startupTimeoutMs is launch/attach-only and must be in 1..=300000"));
+        }
         if self.filter.as_deref().is_some_and(|filter|!matches!(filter,"named"|"indexed")) {
             return Err(tool_err("DAP_USAGE","filter must be named or indexed"));
         }
@@ -421,7 +467,7 @@ impl Tool for DebugTool {
     fn name(&self) -> &str { "debug" }
     fn label(&self) -> &str { "debug" }
     fn description(&self) -> &str {
-        "Drive a real DAP debugger: launch/attach with initial breakpoints, retained source/function/instruction/data breakpoints, conditional breakpoints/logpoints, stepping, evaluation, stack/variables and memory. One active session. Removing a breakpoint with its key preserves the others; omit the key to clear that set. Stack operations require a stopped debuggee."
+        "Drive a real DAP debugger: native/Python stdio or Go/Delve TCP. Launch binaries, scripts, Go packages or tests with initial breakpoints; manage retained breakpoint sets, step and inspect expandable objects. One active session. Use disconnect to preserve an attached process, terminate to request target termination. Stack operations require a stopped debuggee."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -431,10 +477,12 @@ impl Tool for DebugTool {
                     "set_function_breakpoint","remove_function_breakpoint","set_instruction_breakpoint","remove_instruction_breakpoint",
                     "data_breakpoint_info","set_data_breakpoint","remove_data_breakpoint","list_breakpoints","set_exception_breakpoints",
                     "continue","step_over","step_in","step_out","pause","evaluate","stack_trace","threads","scopes","variables",
-                    "disassemble","read_memory","write_memory","modules","loaded_sources","custom_request","output","terminate","sessions"]},
-                "program":{"type":"string","description":"Binary/script to launch"},
+                    "disassemble","read_memory","write_memory","modules","loaded_sources","custom_request","output","terminate","disconnect","sessions"]},
+                "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
-                "adapter":{"type":"string","description":"Registered adapter ID, not an executable path"},
+                "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
+                "goMode":{"type":"string","enum":["debug","test","exec"],"description":"Go launch mode; inferred from source/test/binary target when omitted"},
+                "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300000,"default":120000,"description":"Launch/attach request and initial configuration budget, including Go compilation; excludes adapter process discovery and initialize handshake"},
                 "pid":{"type":"integer","minimum":1},
                 "file":{"type":"string","description":"Source path; required for source breakpoint set/remove"},
                 "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear all breakpoints in file"},
@@ -466,7 +514,7 @@ impl Tool for DebugTool {
             }
         })
     }
-    fn effects(&self) -> ToolEffects { ToolEffects::process() }
+    fn effects(&self) -> ToolEffects { ToolEffects::process().union(ToolEffects::network()) }
     async fn execute(&self, _tool_call_id: &str, input: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput>
     {
