@@ -554,6 +554,19 @@ impl MockHttpResponse {
     }
 }
 
+/// How long a single socket read waits before the loop looks at the clock.
+///
+/// Short on purpose: it is a polling interval, not a patience budget. The
+/// budget is [`REQUEST_READ_DEADLINE`], which covers the whole exchange.
+const READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the server waits for one complete request before giving up.
+///
+/// Generous on purpose. Every expiry of this is a real failure worth reporting,
+/// whereas the old 2s per-read timeout expired routinely on a loaded host and
+/// reported a slow client as a broken one (bd-eg6ng).
+const REQUEST_READ_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct MockHttpRequest {
     pub method: String,
@@ -762,8 +775,19 @@ fn handle_connection(
     logger: &TestLogger,
     scratch: &mut [u8],
 ) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    // A read timeout here means "the client has not been scheduled yet", not
+    // "the request failed" (bd-eg6ng). The socket timeout is therefore a short
+    // POLLING interval, and patience is bounded by a wall deadline for the
+    // whole exchange instead of by a single read. The old shape was a 2s read
+    // timeout whose expiry ended the request: on a loaded host the client can
+    // easily take longer than that between connect and headers, or between
+    // headers and body, and the connection was then dropped with no response.
+    // The client sees that as a transient network error, so a slow machine
+    // silently turned into extra retries, extra failovers and flaky exact-count
+    // assertions in every test that uses this server.
+    stream.set_read_timeout(Some(READ_POLL_INTERVAL))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+    let deadline = Instant::now() + REQUEST_READ_DEADLINE;
 
     let mut buf = Vec::with_capacity(8192);
     let header_end = loop {
@@ -778,9 +802,25 @@ fn handle_connection(
                 ));
             }
             Ok(n) => buf.extend_from_slice(&scratch[..n]),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                // Transient EAGAIN (macOS); retry after a short sleep.
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            // `WouldBlock` on Unix, `TimedOut` on some platforms and on
+            // Windows: std documents a read timeout as either one, and matching
+            // only the first is what made this fixture fail on a slow client.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "mock http server waited {}s for request headers and got {} bytes",
+                            REQUEST_READ_DEADLINE.as_secs(),
+                            buf.len()
+                        ),
+                    ));
+                }
                 continue;
             }
             Err(err) => return Err(err),
@@ -824,10 +864,37 @@ fn handle_connection(
         }
     }
 
+    // Same deadline, same reason: a gap between the headers and the body is the
+    // client being descheduled. Propagating the timeout with `?` here was the
+    // worse half of the bug, because the headers had already been read — the
+    // request was well formed and merely slow, and it was reported as a failed
+    // connection.
     while body_bytes.len() < content_length {
         let remaining = content_length - body_bytes.len();
         let to_read = remaining.min(scratch.len());
-        let n = stream.read(&mut scratch[..to_read])?;
+        let n = match stream.read(&mut scratch[..to_read]) {
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "mock http server waited {}s for a {content_length}-byte body and got \
+                             {} bytes",
+                            REQUEST_READ_DEADLINE.as_secs(),
+                            body_bytes.len()
+                        ),
+                    ));
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         if n == 0 {
             break;
         }

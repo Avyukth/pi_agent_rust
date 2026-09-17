@@ -1192,6 +1192,46 @@ fn e2e_cli_fetch_models_is_a_standalone_stdout_command() {
     );
 }
 
+/// Drain one HTTP request's headers off a catalog fixture socket, patiently.
+///
+/// The three catalog fixtures below each had their own copy of this loop with a
+/// 5s read timeout and `.expect()` on the read (bd-eg6ng). macOS reports an
+/// expired read timeout as EAGAIN/`WouldBlock`, so on a loaded host "the CLI
+/// has not been scheduled yet" failed the test — and because the fixture thread
+/// then died without answering, the CLI saw a connection error and the failure
+/// pointed at the catalog fetch rather than at the clock.
+///
+/// The socket timeout is now a polling interval; the patience budget is the
+/// wall deadline, which only fires when the request really never arrives.
+fn read_catalog_request_headers(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("bound catalog request poll");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) => panic!("catalog request ended before its headers"),
+            Ok(count) => request.extend_from_slice(&chunk[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "catalog fixture waited 30s for request headers and got {} bytes",
+                    request.len()
+                );
+            }
+            Err(error) => panic!("read catalog request: {error}"),
+        }
+    }
+    request
+}
+
 #[test]
 fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
     let harness =
@@ -1216,16 +1256,7 @@ fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound fixture request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before its headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"z/model"},{"id":"a/model"}]}"#;
         write!(
             stream,
@@ -1320,16 +1351,7 @@ fn e2e_cli_fetch_models_custom_authorization_skips_held_auth_lock() {
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound fixture request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before its headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"custom-auth-model"}]}"#;
         write!(
             stream,
@@ -1470,16 +1492,7 @@ fn e2e_cli_fetch_models_keyless_persist_updates_list_models_despite_held_auth_lo
                 Err(error) => panic!("accept catalog request: {error}"),
             }
         };
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("bound catalog request read");
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 1024];
-        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-            let count = stream.read(&mut chunk).expect("read catalog request");
-            assert!(count > 0, "catalog request ended before headers");
-            request.extend_from_slice(&chunk[..count]);
-        }
+        let _request = read_catalog_request_headers(&mut stream);
         let body = br#"{"data":[{"id":"issue-150-live-model"}]}"#;
         write!(
             stream,

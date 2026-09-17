@@ -26,6 +26,16 @@ needed it one at a time and nothing stopped a twelfth being written the old
 way. A unit test cannot cover that: it can prove the fixtures that exist, not
 the ones someone adds tomorrow.
 
+SCOPE, widened once: the first version scanned only `src/`, which missed the
+integration suites entirely even though they stand up more loopback fixtures
+than `src/` does. Adding `tests/` found five more real instances immediately —
+three in tests/e2e_cli.rs, two in tests/provider_bedrock_streaming.rs — plus
+both halves of the shared mock HTTP server in tests/common/harness.rs, which
+backs most of the e2e suite and had a 2s read timeout whose expiry dropped the
+connection without a response. On a loaded host that reads to the client as a
+transient network error, so a slow machine silently became extra retries, extra
+failovers and flaky exact-count assertions.
+
 RETIREMENT: delete this when the fixtures share one helper that makes the bad
 shape unexpressible. A gate that guards a copied idiom is a stand-in for the
 abstraction, not a substitute for it.
@@ -60,11 +70,49 @@ TRUNCATING_READ = re.compile(
     re.MULTILINE,
 )
 
-SEARCH_ROOTS = ("src/providers", "src/agent_cx", "src/media_tools", "src/browser")
+# `tests/` was outside this list when the gate shipped, which was a mistake: the
+# integration suites stand up more loopback fixtures than `src/` does, and the
+# shared one in tests/common/harness.rs backs most of the e2e suite. Adding it
+# found seven more instances of the same two shapes on the first run.
+SEARCH_ROOTS = (
+    "src/providers",
+    "src/agent_cx",
+    "src/media_tools",
+    "src/browser",
+    "tests",
+)
+
+# `socket.set_read_timeout(Some(Duration::from_secs(5)))` and friends.
+READ_TIMEOUT = re.compile(
+    r"set_read_timeout\(\s*Some\(\s*(?:std::time::)?Duration::from_(secs|millis)\(\s*(\d+)"
+)
+
+# The invariant this gate actually enforces is not "never panic on a read"; it
+# is THE PATIENCE BUDGET MUST BE LONG, however it is spent. A fixture that waits
+# 30s on a single blocking read has the same budget as one that polls every
+# 250ms against a 30s deadline — it just spends it differently, and flagging it
+# would teach people to reach for the allowlist instead of the fix.
+#
+# So a fatal read is reported only where the socket's own timeout is SHORT
+# enough that expiry means "not yet" rather than "never came".
+#
+# Out of scope by construction: a fixture that sets no read timeout at all. Its
+# reads block forever, so a timeout cannot make them panic; the failure mode
+# there is a hung suite, which is a different bead.
+MIN_PATIENCE_SECS = 30.0
 
 
 def offending_lines(text: str, pattern: re.Pattern[str]) -> list[int]:
     return [text.count("\n", 0, m.start()) + 1 for m in pattern.finditer(text)]
+
+
+def shortest_read_timeout_secs(text: str) -> float | None:
+    """The least patient read timeout the file sets, in seconds."""
+    timeouts = [
+        float(value) if unit == "secs" else float(value) / 1000.0
+        for unit, value in READ_TIMEOUT.findall(text)
+    ]
+    return min(timeouts) if timeouts else None
 
 
 def scan(repo: Path) -> list[tuple[str, int, str]]:
@@ -78,8 +126,20 @@ def scan(repo: Path) -> list[tuple[str, int, str]]:
             if rel in ALLOWLIST:
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
-            for line in offending_lines(text, FATAL_READ):
-                findings.append((rel, line, "fatal: a read timeout panics"))
+            timeout = shortest_read_timeout_secs(text)
+            if timeout is not None and timeout < MIN_PATIENCE_SECS:
+                for line in offending_lines(text, FATAL_READ):
+                    findings.append(
+                        (
+                            rel,
+                            line,
+                            f"fatal: a read timeout panics, and this file's "
+                            f"shortest read timeout is {timeout:g}s",
+                        )
+                    )
+            # Truncation is wrong at any timeout: however long the fixture
+            # waited, ending the request with a partial buffer reports a SLOW
+            # client as a MALFORMED one.
             for line in offending_lines(text, TRUNCATING_READ):
                 findings.append(
                     (rel, line, "truncating: a read timeout ends the request")
