@@ -123,7 +123,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let build = BuildBuilder::default().build_timestamp(true).build()?;
     let cargo = CargoBuilder::default().target_triple(true).build()?;
-    let gix = GixBuilder::default().sha(true).dirty(true).build()?;
+    // `GixBuilder::sha(short: bool)` -- the bool selects SHORT, it does not
+    // enable the variable (vergen-gix 9.1.0, src/gix/mod.rs:280). So `.sha(true)`
+    // baked a 9-character sha into VERGEN_GIT_SHA, and every perf evidence
+    // record that carries provenance was rejected by its own gate:
+    // `is_full_git_sha` wants 40 hex characters, so `source_identity_verified`
+    // was false, so `eligible_for_regression_gate` was false and `confidence`
+    // came out "medium" where the contract demands "high". An abbreviated sha is
+    // genuinely ambiguous provenance, so the gate is right and this was wrong.
+    // `pi --version` still shows the short form; it abbreviates for display.
+    let gix = GixBuilder::default().sha(false).dirty(true).build()?;
     let rustc = RustcBuilder::default().semver(true).build()?;
 
     let mut emitter = Emitter::default();

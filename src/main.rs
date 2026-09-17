@@ -7237,11 +7237,21 @@ fn handle_doctor(
     Ok(())
 }
 
+/// How much of the commit sha `--version` shows.
+///
+/// `VERGEN_GIT_SHA` is the full 40 characters because the perf evidence records
+/// that carry provenance are rejected by their own gate without it (build.rs).
+/// Nobody wants to read forty characters in a version banner, so the display
+/// abbreviates to git's own default width; every consumer that cares about
+/// provenance reads the environment variable, not this line.
+const VERSION_SHA_WIDTH: usize = 9;
+
 fn print_version() {
+    let sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     println!(
         "pi {} ({} {})",
         env!("CARGO_PKG_VERSION"),
-        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+        &sha[..sha.len().min(VERSION_SHA_WIDTH)],
         option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
     );
 }
