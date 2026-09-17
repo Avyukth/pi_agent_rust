@@ -1336,6 +1336,7 @@ impl PiFtuiModel {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
             displayed_session_id: None,
+            deferred_notes: Vec::new(),
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
@@ -3903,13 +3904,16 @@ async fn run_tan_command(
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) {
-    if !handle.session.agent.has_tool("subagent") {
+    if !handle.has_tool("subagent") {
         let _ = agent_tx.send(PiMsg::AgentError(String::from(
             "/tan unavailable: enable the opt-in subagent tool with --tools ...subagent",
         )));
         return;
     }
-    let owner_session_id = match handle.with_session(|session| session.header.id.clone()).await {
+    let owner_session_id = match handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
         Ok(id) => id,
         Err(err) => {
             let _ = agent_tx.send(PiMsg::AgentError(format!("/tan: {err}")));
@@ -3922,7 +3926,19 @@ async fn run_tan_command(
     let tx = agent_tx.clone();
     runtime_handle.spawn(async move {
         let message = match tool.run_background_tan(&work).await {
-            Ok(completion) => format!("(/tan done) {}", completion.answer),
+            // Two deliveries, exactly as the classic stack does it
+            // (`completed_tan_event`): the summary is queued through the
+            // background-jobs seam for the parent AGENT to pick up at its next
+            // idle turn boundary, and the card is what the USER sees. The
+            // agent half needs nothing from this stack — `Agent` drains
+            // completion notices itself, so it already worked here.
+            Ok(completion) => {
+                crate::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
+                    .map_or_else(
+                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                        |()| completion.card_text(),
+                    )
+            }
             Err(err) => format!("(/tan failed)\n{err}"),
         };
         let _ = tx.send(PiMsg::SessionSystemNote {
@@ -6863,6 +6879,105 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("compacting")),
             "compact note missing"
+        );
+    }
+
+    /// bd-ydz1t.2: `/tan` existed only on the classic stack, so on the default
+    /// stack it fell through to extension dispatch and reported "Unknown
+    /// command".
+    #[test]
+    fn slash_tan_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan summarise the changelog");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Tan("summarise the changelog".to_string())
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("(/tan started)")),
+            "the user must be told the background job started"
+        );
+        assert_eq!(
+            sim.model().state,
+            AgentUiState::Ready,
+            "/tan must NOT put the session in a working state — the point is \
+             that the user keeps working while the child runs"
+        );
+    }
+
+    /// `/tan` with no work is a usage error, and must not reach the driver:
+    /// launching a child agent with an empty task would burn a real provider
+    /// call on nothing.
+    #[test]
+    fn slash_tan_without_work_is_refused_before_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an empty /tan must never reach the driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("Usage: /tan")),
+            "the refusal must say how to use it"
+        );
+    }
+
+    /// The delivery half (bd-ydz1t.2): a background answer that arrives while a
+    /// turn is streaming is HELD until the turn ends. Splicing it in mid-stream
+    /// would show an answer to an earlier question inside the current one.
+    #[test]
+    fn a_background_note_arriving_mid_turn_waits_for_the_turn_boundary() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "s1".to_string(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("partial".to_string())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::SessionSystemNote {
+            owner_session_id: "s1".to_string(),
+            message: "(/tan completed)\nbackground answer".to_string(),
+        }));
+
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the note must not interleave with the streaming reply"
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: crate::model::StopReason::Stop,
+            error_message: None,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the turn ended, so the held note is owed to the user now"
         );
     }
 
