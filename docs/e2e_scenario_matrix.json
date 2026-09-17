@@ -780,7 +780,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_tui_features --suite e2e_tui_perf"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_tui_features --suite e2e_tui_perf --suite e2e_ftui"
     },
     {
       "workflow_id": "wf-soak-and-performance-regression-pack",
@@ -1006,7 +1006,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan --suite e2e_ftui"
     },
     {
       "workflow_id": "wf-url-read-reader-mode",
