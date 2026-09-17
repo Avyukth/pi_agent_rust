@@ -4,7 +4,11 @@
 //! writeback are separate gates. No isolated edit reaches the parent before
 //! all required gates pass. Dropping a pending run kills its process tree and
 //! settles the hub lease; rejected worktrees remain available for inspection.
+//! One request deadline covers launch, execution, validation and retries. It
+//! gates mutation dispatch, but cannot interrupt synchronous Git/filesystem
+//! calls or arbitrary host callbacks already running.
 
+use super::deadline::Deadline;
 use super::{
     AgentDefinition, SchemaMode, SubagentResult, SubagentStatus, SubagentTask, UpdateCallback,
     append_bounded_line, child_args, child_depth, compile_output_schema, corrective_retry_task,
@@ -32,6 +36,7 @@ pub(super) struct ChildRunner {
     child_binary: PathBuf,
     role_model_spec: Option<String>,
     hub_kind: ChildKind,
+    deadline: Deadline,
 }
 
 impl ChildRunner {
@@ -41,6 +46,7 @@ impl ChildRunner {
         child_binary: PathBuf,
         role_model_spec: Option<String>,
         hub_kind: ChildKind,
+        deadline: Deadline,
     ) -> Self {
         Self {
             cwd,
@@ -48,11 +54,14 @@ impl ChildRunner {
             child_binary,
             role_model_spec,
             hub_kind,
+            deadline,
         }
     }
 
     /// At most one fresh corrective run. The first attempt's isolated edits
-    /// are retained, never applied as input to that retry.
+    /// are retained, never applied as input to that retry. The original
+    /// deadline is retained too, including time spent waiting in the queue.
+    #[allow(clippy::too_many_lines)] // Keep acceptance, retry and disposition together.
     pub(super) async fn run_one(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
@@ -63,6 +72,9 @@ impl ChildRunner {
         let Some(agent) = agents.get(&task.agent) else {
             return SubagentResult::unknown(task, step);
         };
+        if let Err(error) = self.deadline.check() {
+            return SubagentResult::failed(agent, task, step, error.to_string());
+        }
         let schema = task
             .output_schema
             .clone()
@@ -101,7 +113,19 @@ impl ChildRunner {
 
         let errors = attempt.result.validation_errors.clone().unwrap_or_default();
         attempt.result.fail("Child output failed schema validation; preserving this attempt before one corrective retry.".to_string());
-        let previous = attempt.finish(&owner, false, update);
+        let mut previous = attempt.finish(&owner, false, update);
+        // Finishing an attempt can perform a snapshot or invoke a host callback.
+        // Never spend a new launch after either cancellation or budget expiry.
+        if owner.checkpoint().is_err() {
+            cancel(&mut previous, CANCELLED);
+            emit_progress(update, &previous);
+            return previous;
+        }
+        if let Err(error) = self.deadline.check() {
+            previous.fail(error.to_string());
+            emit_progress(update, &previous);
+            return previous;
+        }
         let corrective = SubagentTask {
             task: corrective_retry_task(&task.task, &errors),
             ..task.clone()
@@ -162,16 +186,11 @@ impl ChildRunner {
         );
         let args = child_args(agent, &task.task, self.role_model_spec.as_deref(), schema);
         let policy = isolation_policy(&task);
-        let mut attempt = Attempt::new(SubagentResult::starting(
-            agent,
-            task,
-            step,
-            &self.child_binary,
-            &cwd,
-            &args,
-        ));
-        if owner.checkpoint().is_err() {
-            cancel(&mut attempt.result, CANCELLED);
+        let mut attempt = Attempt::new(
+            SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args),
+            self.deadline,
+        );
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
         if !owner.capabilities().io || !owner.capabilities().time {
@@ -207,8 +226,7 @@ impl ChildRunner {
                 }
             }
         }
-        if owner.checkpoint().is_err() {
-            cancel(&mut attempt.result, CANCELLED);
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
         let hub_entry = crate::agent_hub::registry()
@@ -222,8 +240,15 @@ impl ChildRunner {
         attempt.result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
         attempt.hub.id.clone_from(&attempt.result.hub_id);
         emit_progress(update, &attempt.result);
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
+            return attempt;
+        }
 
         let mut command = Command::new(&self.child_binary);
+        if let Err(error) = self.deadline.configure_child(&mut command) {
+            attempt.result.fail(error.to_string());
+            return attempt;
+        }
         command
             .args(&args)
             .current_dir(&attempt.result.cwd)
@@ -245,10 +270,8 @@ impl ChildRunner {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        // A host progress callback may cancel the owner while handling
-        // Starting. Recheck after callbacks, immediately before dispatch.
-        if owner.checkpoint().is_err() {
-            cancel(&mut attempt.result, CANCELLED);
+        // Check after callbacks and setup, immediately before dispatch.
+        if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
         let child = match command.spawn() {
@@ -288,15 +311,14 @@ impl ChildRunner {
         let stderr = spawn_pipe_reader(stderr, PipeKind::Stderr, tx);
         let mut protocol = protocol::ChildProtocol::default();
         loop {
-            drain_child_frames(&rx, &mut protocol, &mut attempt.result, update);
-            if owner.checkpoint().is_err() {
-                cancel(&mut attempt.result, CANCELLED);
+            if !check_budget(owner, self.deadline, &mut attempt.result) {
                 child.terminate();
                 break;
             }
-            if attempt.result.is_error {
-                // A producer that keeps writing after an invalid frame must
-                // not keep an already-rejected task alive indefinitely.
+            drain_child_frames(&rx, &mut protocol, &mut attempt.result, update);
+            if !check_budget(owner, self.deadline, &mut attempt.result) {
+                // Invalid frames and expired budgets must stop the producer,
+                // including one that continues writing after agent_end.
                 child.terminate();
                 break;
             }
@@ -317,7 +339,7 @@ impl ChildRunner {
             poll_pause(owner).await;
         }
         // No descendant should keep writing or hold the pipes open after its
-        // root exits. The guard still owns cleanup if this drain is cancelled.
+        // root exits. Cleanup gets a separate bounded drain, not a new work budget.
         child.stop_descendants();
         drain_until_reader_exit(
             rx,
@@ -327,9 +349,10 @@ impl ChildRunner {
             stdout,
             stderr,
             owner,
+            self.deadline,
         )
         .await;
-        if !attempt.result.is_error {
+        if check_budget(owner, self.deadline, &mut attempt.result) {
             if attempt.result.exit_code != Some(0) {
                 attempt.result.fail(format!(
                     "Child exited with code {}.",
@@ -369,18 +392,33 @@ fn cancel(result: &mut SubagentResult, message: &str) {
     result.is_error = true;
 }
 
+/// Preserve an existing failure, and distinguish an execution timeout from a
+/// user's cancellation. Neither authorizes accepting or applying partial work.
+fn check_budget(owner: &AgentCx, deadline: Deadline, result: &mut SubagentResult) -> bool {
+    if owner.checkpoint().is_err() {
+        cancel(result, CANCELLED);
+    } else if !result.is_error
+        && let Err(error) = deadline.check()
+    {
+        result.fail(error.to_string());
+    }
+    !result.is_error
+}
+
 struct Attempt {
     result: SubagentResult,
     isolation: Option<(IsoHandle, IsoApplyMode)>,
     hub: HubLease,
+    deadline: Deadline,
 }
 
 impl Attempt {
-    const fn new(result: SubagentResult) -> Self {
+    const fn new(result: SubagentResult, deadline: Deadline) -> Self {
         Self {
             result,
             isolation: None,
             hub: HubLease { id: None },
+            deadline,
         }
     }
 
@@ -390,9 +428,7 @@ impl Attempt {
         accepted: bool,
         update: Option<&UpdateCallback>,
     ) -> SubagentResult {
-        if owner.checkpoint().is_err() {
-            cancel(&mut self.result, CANCELLED);
-        }
+        check_budget(owner, self.deadline, &mut self.result);
         if self.hub.was_killed() {
             cancel(&mut self.result, "Child was killed by the operator.");
         }
@@ -422,9 +458,13 @@ impl Attempt {
                     outcome.patch = patch;
                     outcome.diff_stat = stat;
                     // Recheck after snapshot collection, immediately before
-                    // the externally visible mutation. No await splits this.
-                    if owner.checkpoint().is_err() || self.hub.was_killed() {
+                    // mutation dispatch. Once apply begins it is not rolled
+                    // back or misreported merely because the clock advances.
+                    let in_budget = check_budget(owner, self.deadline, &mut self.result);
+                    if self.hub.was_killed() {
                         cancel(&mut self.result, CANCELLED);
+                        outcome.apply_mode = "keep".to_string();
+                    } else if !in_budget {
                         outcome.apply_mode = "keep".to_string();
                     } else if mode == IsoApplyMode::Apply {
                         match crate::worktree_iso::apply_to_parent(&handle, &outcome.patch) {
@@ -449,7 +489,7 @@ impl Attempt {
                 }
                 Err(error) => {
                     outcome.apply_mode = "keep".to_string();
-                    if !matches!(self.result.status, SubagentStatus::Cancelled) {
+                    if !self.result.is_error {
                         self.result.fail(format!(
                             "Failed to collect isolated diff; worktree preserved: {error}"
                         ));
@@ -662,9 +702,11 @@ async fn drain_until_reader_exit(
     stdout: JoinHandle<()>,
     stderr: JoinHandle<()>,
     owner: &AgentCx,
+    work_deadline: Deadline,
 ) {
     let deadline = Instant::now() + PIPE_DRAIN_TIMEOUT;
     loop {
+        check_budget(owner, work_deadline, result);
         drain_child_frames(&receiver, protocol, result, update);
         if stdout.is_finished() && stderr.is_finished() {
             // Neither thread can produce another frame after this barrier.

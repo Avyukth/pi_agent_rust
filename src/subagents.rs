@@ -20,12 +20,17 @@ use std::path::{Path, PathBuf};
 #[cfg(all(test, unix))]
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
+mod deadline;
+#[cfg(test)]
+mod deadline_tests;
 mod execution;
 #[cfg(test)]
 mod execution_tests;
 mod protocol;
 
+use deadline::Deadline;
 use execution::ChildRunner;
 
 const MAX_PARALLEL_TASKS: usize = 8;
@@ -115,6 +120,8 @@ pub struct SubagentTool {
     /// Model spec children run with when their agent definition does not pin
     /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
     role_model_spec: Option<String>,
+    /// Host ceiling for the entire request, not a fresh allowance per child.
+    timeout: Option<Duration>,
 }
 
 impl SubagentTool {
@@ -131,6 +138,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            timeout: None,
         }
     }
 
@@ -139,6 +147,17 @@ impl SubagentTool {
     #[must_use]
     pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
         self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self
+    }
+
+    /// Set the host's request-wide execution ceiling (1 ms through 24 hours).
+    /// Without this override, `PI_SUBAGENT_TIMEOUT_SECS` supplies the ceiling,
+    /// defaulting to 900 seconds. A model's `timeoutSeconds` can only shorten it.
+    /// Invalid limits are rejected before launch. Inherited parent deadlines
+    /// remain an upper bound even when this explicit SDK policy is supplied.
+    #[must_use]
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -172,6 +191,7 @@ impl SubagentTool {
             return Err(Error::validation("/tan requires non-empty work"));
         }
 
+        let deadline = Deadline::for_request(self.timeout, None)?;
         let definition = tan_agent_definition();
         let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
         let request = SubagentTask {
@@ -189,6 +209,7 @@ impl SubagentTool {
             self.child_binary.clone(),
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Tan,
+            deadline,
         )
         .run_one(&agents, request, None, None)
         .await;
@@ -209,6 +230,7 @@ impl SubagentTool {
             child_binary,
             structured_results: false,
             role_model_spec: None,
+            timeout: None,
         }
     }
 
@@ -221,6 +243,9 @@ impl SubagentTool {
         request: SubagentRequest,
         on_update: Option<UpdateCallback>,
     ) -> Result<Vec<SubagentResult>> {
+        // Capture once, before discovery and queueing. Every parallel task,
+        // sequential step and schema-correction retry consumes this budget.
+        let deadline = Deadline::for_request(self.timeout, request.timeout_seconds)?;
         let agents = self.discover(request.scope)?;
         let concurrency = request
             .concurrency
@@ -228,9 +253,9 @@ impl SubagentTool {
             .clamp(1, MAX_PARALLEL_TASKS);
 
         match request.mode()? {
-            RequestMode::Single(task) => {
-                Ok(vec![self.run_one(&agents, task, None, on_update).await])
-            }
+            RequestMode::Single(task) => Ok(vec![
+                self.run_one(&agents, task, None, on_update, deadline).await,
+            ]),
             RequestMode::Parallel(tasks) => {
                 let cwd = self.cwd.clone();
                 let global_dir = self.global_dir.clone();
@@ -252,6 +277,7 @@ impl SubagentTool {
                                 binary,
                                 role_spec,
                                 crate::agent_hub::ChildKind::Subagent,
+                                deadline,
                             );
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
@@ -269,7 +295,7 @@ impl SubagentTool {
                 for (step, task) in tasks.into_iter().enumerate() {
                     let task = task.with_rendered_previous_result(previous.as_ref());
                     let result = self
-                        .run_one(&agents, task, Some(step + 1), on_update.clone())
+                        .run_one(&agents, task, Some(step + 1), on_update.clone(), deadline)
                         .await;
                     let failed = result.is_error;
                     previous = Some(result.clone());
@@ -289,6 +315,7 @@ impl SubagentTool {
         task: SubagentTask,
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
+        deadline: Deadline,
     ) -> SubagentResult {
         ChildRunner::new(
             self.cwd.clone(),
@@ -296,6 +323,7 @@ impl SubagentTool {
             self.child_binary.clone(),
             self.role_model_spec.clone(),
             crate::agent_hub::ChildKind::Subagent,
+            deadline,
         )
         .run_one(agents, task, step, on_update)
         .await
@@ -313,7 +341,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. timeoutSeconds bounds the entire request, including queued tasks and retries, and cannot extend the host limit (900 seconds by default). Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {
@@ -327,6 +355,7 @@ impl Tool for SubagentTool {
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
                 "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
+                "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": deadline::MAX_TIMEOUT_SECS, "description": "Budget for this whole delegation request, including queueing, chained steps and corrective retries. May shorten, never extend, the host's limit."},
                 "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"}
             },
             "definitions": {
@@ -360,6 +389,17 @@ impl Tool for SubagentTool {
                 format!(
                     "Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}; child agents are isolated by default and do not receive the subagent tool."
                 ),
+            ));
+        }
+        // An explicit null/string must not silently remove a requested limit
+        // when an SDK caller bypasses schema validation.
+        if input
+            .get("timeoutSeconds")
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(Error::tool(
+                "subagent",
+                "PI_SUBAGENT_INVALID_TIMEOUT: timeoutSeconds must be an integer from 1 to 86400",
             ));
         }
         let request: SubagentRequest = serde_json::from_value(input)
@@ -408,6 +448,8 @@ struct SubagentRequest {
     chain: Option<Vec<SubagentTask>>,
     #[serde(default)]
     concurrency: Option<usize>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
     #[serde(default)]
     scope: AgentScope,
 }
