@@ -1682,3 +1682,196 @@ fn e2e_ftui_share_public_never_invokes_gh() {
     quit_and_assert_clean(&session);
     session.write_artifacts();
 }
+
+/// SSE body for a one-shot OpenAI-compatible completion.
+fn openai_sse(text: &str) -> common::harness::MockHttpResponse {
+    let delta = serde_json::json!({
+        "choices": [{"index": 0, "delta": {"content": text}}]
+    });
+    let done = serde_json::json!({
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    let body = format!("data: {delta}\n\ndata: {done}\n\ndata: [DONE]\n\n");
+    common::harness::MockHttpResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body: body.into_bytes(),
+    }
+}
+
+/// bd-ydz1t.2: `/tan` runs a child agent on the ftui stack and its summary
+/// reaches the PARENT AGENT at the next turn boundary.
+///
+/// The mirror of `e2e_tan_runs_in_background_and_delivers_at_next_turn_boundary`
+/// in tests/btw_tan.rs, which carried a comment claiming "FTUI is covered by
+/// tests/e2e_ftui.rs" while no such coverage existed. It does now.
+///
+/// The load-bearing assertions are the SERVER-SIDE ones. A pane can show
+/// "(/tan completed)" whether or not the agent ever learned anything; only the
+/// second parent request proves the summary was actually fed back into the
+/// conversation, which is the whole point of the command.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_ftui_tan_delivers_its_summary_to_the_parent_turn() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_tan_delivery") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let server = session.harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/tan-role/v1/chat/completions",
+        openai_sse("ftui tan child summary marker"),
+    );
+    server.add_route_queue(
+        "POST",
+        "/parent/v1/chat/completions",
+        vec![
+            openai_sse("ftui parent main turn marker"),
+            openai_sse("ftui parent processed tan follow-up marker"),
+        ],
+    );
+
+    let env_root = session.harness.temp_path("ftui-tan-env");
+    let coding_dir = env_root.join("agent");
+    let sessions_dir = env_root.join("sessions");
+    let packages_dir = env_root.join("packages");
+    for dir in [&coding_dir, &sessions_dir, &packages_dir] {
+        std::fs::create_dir_all(dir).expect("create env dir");
+    }
+
+    let models = serde_json::json!({
+        "providers": {
+            "parent": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/parent/v1", server.base_url()),
+                "apiKey": "test-key",
+                "models": [{"id": "parent-model", "contextWindow": 128_000}]
+            },
+            "tan-role": {
+                "api": "openai-completions",
+                "baseUrl": format!("{}/tan-role/v1", server.base_url()),
+                "apiKey": "test-key",
+                "models": [{"id": "task-model", "contextWindow": 128_000}]
+            }
+        }
+    });
+    std::fs::write(
+        coding_dir.join("models.json"),
+        serde_json::to_vec_pretty(&models).expect("serialize models"),
+    )
+    .expect("write models");
+    let settings_path = env_root.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        r#"{"modelRoles":{"task":"tan-role/task-model"},"checkForUpdates":false,"approval":{"mode":"yolo"}}"#,
+    )
+    .expect("write settings");
+
+    session.set_env("PI_CODING_AGENT_DIR", &coding_dir.display().to_string());
+    session.set_env("PI_CONFIG_PATH", &settings_path.display().to_string());
+    session.set_env("PI_SESSIONS_DIR", &sessions_dir.display().to_string());
+    session.set_env("PI_PACKAGE_DIR", &packages_dir.display().to_string());
+    session.set_env("PI_NO_AUTO_UPDATE_CHECK", "1");
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&[
+        "--ftui",
+        "--provider",
+        "parent",
+        "--model",
+        "parent-model",
+        "--tools",
+        "subagent",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "ftui tan e2e parent",
+    ]);
+    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+
+    let started = session.send_text_and_wait(
+        "start_tan",
+        "/tan update the changelog",
+        "(/tan started)",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        started.contains("update the changelog"),
+        "the started note must echo the work; pane:\n{started}"
+    );
+
+    let completed =
+        session.wait_and_capture("tan_completed", "(/tan completed)", Duration::from_secs(60));
+    assert!(
+        completed.contains("ftui tan child summary marker"),
+        "the child's answer must reach the user; pane:\n{completed}"
+    );
+
+    let main_turn = session.send_text_and_wait(
+        "main_turn",
+        "continue main work",
+        "ftui parent main turn marker",
+        Duration::from_secs(30),
+    );
+    assert!(main_turn.contains("ftui parent main turn marker"));
+
+    session.wait_and_capture(
+        "tan_follow_up_boundary",
+        "ftui parent processed tan follow-up marker",
+        Duration::from_secs(30),
+    );
+
+    // The assertions that actually prove the feature. The pane above could
+    // look right with the agent none the wiser.
+    let requests = server.requests();
+    let role_requests = requests
+        .iter()
+        .filter(|request| request.path == "/tan-role/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        role_requests.len(),
+        1,
+        "exactly one child agent request was expected"
+    );
+    let role_body = role_requests
+        .first()
+        .map(|request| String::from_utf8_lossy(&request.body))
+        .unwrap_or_default();
+    assert!(
+        role_body.contains("Task: update the changelog"),
+        "the child must receive the work; body:\n{role_body}"
+    );
+
+    let parent_requests = requests
+        .iter()
+        .filter(|request| request.path == "/parent/v1/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        parent_requests.len(),
+        2,
+        "expected the main turn plus the tan follow-up turn"
+    );
+    let follow_up_body = parent_requests
+        .get(1)
+        .map(|request| String::from_utf8_lossy(&request.body))
+        .unwrap_or_default();
+    assert!(
+        follow_up_body.contains("[background tan"),
+        "the follow-up seam must feed the summary back to the parent agent, \
+         not just to the screen; body:\n{follow_up_body}"
+    );
+    assert!(
+        follow_up_body.contains("ftui tan child summary marker"),
+        "the parent must receive the CHILD's answer; body:\n{follow_up_body}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}

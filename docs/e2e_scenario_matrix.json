@@ -987,10 +987,12 @@
         "core-runtime"
       ],
       "suite_ids": [
-        "btw_tan"
+        "btw_tan",
+        "e2e_ftui"
       ],
       "test_paths": [
-        "tests/btw_tan.rs"
+        "tests/btw_tan.rs",
+        "tests/e2e_ftui.rs"
       ],
       "sli_ids": [
         "sli_e2e_turn_latency_p95_ms"
