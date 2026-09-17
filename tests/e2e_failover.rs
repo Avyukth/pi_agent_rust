@@ -552,6 +552,193 @@ fn e2e_failover_json_mode_closes_lifecycle_after_backup_failure() {
     harness.record_artifact("e2e_failover_json_failure.jsonl", &path);
 }
 
+/// bd-2vmu6: the fallback runs a retry lifecycle of its own, and the primary's
+/// is already closed when it opens.
+///
+/// This is the collision the bead was opened for. A successful swap resets the
+/// retry budget to zero, so the fallback's first retry is `attempt: 1` — the
+/// same number the primary's lifecycle was using. If the primary's
+/// `auto_retry_end` is not emitted on the way into the swap, the stream reads
+/// `auto_retry_start(1) -> failover_start -> auto_retry_start(1)` and nothing
+/// in it distinguishes a second lifecycle from a continuation of the first.
+///
+/// The other two lifecycle tests let the fallback answer on its first request,
+/// so only one retry lifecycle ever exists in them and the ordering claim is
+/// vacuous. Here the fallback refuses once before answering, so both
+/// lifecycles are real and the event stream has to keep them apart.
+#[test]
+fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
+    let harness =
+        TestHarness::new("e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    // No static route behind the queue: a third request to the fallback is a
+    // regression in its own right and should fail loudly rather than be served.
+    server.add_route_queue(
+        "POST",
+        "/backup/v1/chat/completions",
+        vec![
+            error_response(
+                503,
+                r#"{"error":{"type":"overloaded_error","message":"backup warming up"}}"#,
+            ),
+            sse_response(text_sse_body("backup ok on the retry")),
+        ],
+    );
+
+    let (events, stdout, stderr) = run_print_json_failover(
+        &harness,
+        &server,
+        "spawning pi --print --mode json on a 429 primary and a fallback that needs one retry",
+    );
+    let kinds = event_kinds(&events);
+
+    // Two lifecycles, each opened and closed exactly once. An implementation
+    // whose only lifecycle state is `retry_count`, reset to 0 on the swap,
+    // emits two starts and one end here.
+    assert_eq!(
+        (
+            kinds.iter().filter(|k| *k == "auto_retry_start").count(),
+            kinds.iter().filter(|k| *k == "auto_retry_end").count(),
+        ),
+        (2, 2),
+        "the primary's retry lifecycle and the fallback's are each opened and closed: \
+         {kinds:?}\n{stdout}\n{stderr}"
+    );
+
+    // ...and they never overlap. Ordering is the whole claim, because both
+    // lifecycles report `attempt: 1` and are otherwise indistinguishable.
+    let retry_frames: Vec<&str> = kinds
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| matches!(*kind, "auto_retry_start" | "auto_retry_end"))
+        .collect();
+    assert_eq!(
+        retry_frames,
+        [
+            "auto_retry_start",
+            "auto_retry_end",
+            "auto_retry_start",
+            "auto_retry_end",
+        ],
+        "each retry lifecycle closes before the next one opens: {kinds:?}\n{stdout}\n{stderr}"
+    );
+
+    let failover_start = kinds
+        .iter()
+        .position(|k| k == "failover_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let failover_end = kinds
+        .iter()
+        .position(|k| k == "failover_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let primary_retry_end = kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let fallback_retry_start = kinds
+        .iter()
+        .rposition(|k| k == "auto_retry_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let fallback_retry_end = kinds
+        .iter()
+        .rposition(|k| k == "auto_retry_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_start").count(),
+        1,
+        "one swap, so one failover_start: {kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_end").count(),
+        1,
+        "exactly one failover_end per failover_start: {kinds:?}"
+    );
+    assert!(
+        primary_retry_end < failover_start,
+        "the primary's retry lifecycle closes on the way into the swap: {kinds:?}"
+    );
+    assert!(
+        failover_start < fallback_retry_start,
+        "the second retry lifecycle belongs to the fallback, so it opens after the swap: {kinds:?}"
+    );
+    assert!(
+        fallback_retry_end < failover_end,
+        "the fallback's retry lifecycle closes inside the failover lifecycle that contains it: \
+         {kinds:?}"
+    );
+
+    // The two ends disagree about success, which is what each one is reporting:
+    // the primary's retries really did fail, and the fallback's really did
+    // recover. A stream that reused one lifecycle for both could not say this.
+    let primary_end_event = &events[primary_retry_end]; // ubs:ignore index proven by position() above
+    assert_eq!(
+        primary_end_event["success"],
+        serde_json::Value::Bool(false),
+        "the primary exhausted its budget: {primary_end_event}"
+    );
+    assert_eq!(
+        primary_end_event["attempt"], 1,
+        "maxRetries is 1, so the primary's lifecycle ends on attempt 1: {primary_end_event}"
+    );
+    let fallback_end_event = &events[fallback_retry_end]; // ubs:ignore index proven by rposition() above
+    assert_eq!(
+        fallback_end_event["success"],
+        serde_json::Value::Bool(true),
+        "the fallback recovered on its retry: {fallback_end_event}"
+    );
+    assert_eq!(
+        fallback_end_event["attempt"], 1,
+        "the fallback's budget starts over, so its lifecycle is attempt 1 as well — ordering is \
+         the only thing that separates the two: {fallback_end_event}"
+    );
+
+    let end_event = &events[failover_end]; // ubs:ignore index proven by position() above
+    assert_eq!(end_event["success"], serde_json::Value::Bool(true));
+    assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["provider"], "e2ebackup");
+    assert_eq!(end_event["model"], "backup-model");
+
+    // The events above describe provider traffic that has to have happened:
+    // two requests to the primary (the attempt and its one retry) and two to
+    // the fallback (the refusal and the retry that answered). Without this the
+    // whole assertion set could pass on an event stream that was merely
+    // well-formed.
+    let paths: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("/primary/")).count(),
+        2,
+        "one primary attempt plus its single retry: {paths:?}"
+    );
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("/backup/")).count(),
+        2,
+        "the fallback was really retried, not merely reported as retried: {paths:?}"
+    );
+
+    let path = harness.temp_path("e2e_failover_json_fallback_retry.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_json_fallback_retry.jsonl", &path);
+}
+
 /// bd-gm481.1: with the cooldown elapsed, the primary comes back between
 /// prompts and the next prompt is attempted on it again.
 ///
