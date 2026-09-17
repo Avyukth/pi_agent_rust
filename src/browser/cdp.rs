@@ -1,7 +1,7 @@
 //! Native, bounded CDP transport. A connection belongs to one tool operation;
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
-use super::{BrowserTabInfo, interaction, output, policy, required};
+use super::{BrowserLaunchOptions, BrowserTabInfo, interaction, launch, output, policy, required};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent};
@@ -17,7 +17,6 @@ use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:9222";
 
 #[derive(Default)]
 pub(super) struct Session {
@@ -26,11 +25,22 @@ pub(super) struct Session {
     endpoint: Option<String>,
     references: BTreeMap<String, interaction::References>,
     next_ref: u64,
+    browser: Option<launch::ManagedBrowser>,
 }
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     let action = required(args, "action")?;
     match action {
+        "start" | "status" | "stop" => {
+            if args.as_object().is_some_and(|object| {
+                object.keys().any(|key| !matches!(key.as_str(), "action" | "timeout_ms"))
+            }) {
+                return Err(Error::tool(
+                    "browser",
+                    "lifecycle actions accept only action and timeout_ms; launch configuration belongs to the host",
+                ));
+            }
+        }
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
         "evaluate" => {
             required(args, "script")?;
@@ -93,16 +103,13 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
 pub(super) async fn execute(
     state: &std::sync::Arc<asupersync::sync::Mutex<Session>>,
     endpoint_override: Option<&str>,
+    launch_options: Option<&BrowserLaunchOptions>,
     cwd: &Path,
     allowlist: Option<&[String]>,
     args: &Value,
 ) -> Result<ToolOutput> {
     let timeout_ms = validate(args, allowlist)?;
-    let endpoint_text = endpoint_override
-        .map(str::to_owned)
-        .or_else(|| std::env::var("PI_BROWSER_CDP_URL").ok())
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
-    let endpoint = policy::endpoint(&endpoint_text, false)?;
+    let connection = launch::Connection::resolve(endpoint_override, launch_options)?;
     let owner = AgentCx::for_current_or_request();
     let caps = owner.capabilities();
     if !caps.io || !caps.time || !caps.entropy {
@@ -115,26 +122,32 @@ pub(super) async fn execute(
         .checkpoint()
         .map_err(|_| Error::tool("browser", "browser operation cancelled"))?;
     let operation = async {
-        // OwnedMutexGuard, not the borrowed one: this guard is held across the
-        // awaits below, inside a future that `Tool::execute` requires to be
-        // `Send`, and `asupersync::sync::MutexGuard` is not `Send` while
-        // `OwnedMutexGuard` is.
         let mut state =
             asupersync::sync::OwnedMutexGuard::lock(std::sync::Arc::clone(state), owner.cx())
                 .await
                 .map_err(|e| Error::tool("browser", format!("browser session lock: {e}")))?;
-        if state.endpoint.as_deref() != Some(endpoint.as_str()) {
-            state.tabs.clear();
-            state.references.clear();
-            state.active = None;
-            state.endpoint = Some(endpoint.to_string());
+        let action = required(args, "action")?;
+        let connected = state.connect(&owner, cwd, &connection, action).await?;
+        if matches!(action, "start" | "status" | "stop") {
+            let running = connected.is_some();
+            let mode = match connection {
+                launch::Connection::Attach(_) => "attached",
+                launch::Connection::Managed(_) => "managed",
+            };
+            return Ok(output(
+                format!("Browser {mode}: {}", if running { "running" } else { "stopped" }),
+                json!({
+                    "backend": "cdp", "mode": mode, "running": running,
+                    "owned": state.browser.is_some(),
+                    "process_id": state.browser.as_ref().map(launch::ManagedBrowser::id),
+                    "endpoint": state.endpoint,
+                }),
+            ));
         }
-        let mut cdp = Cdp::connect(&owner, &endpoint).await?;
+        let mut cdp = connected.ok_or_else(|| Error::tool("browser", "browser is not running"))?;
         cdp.timeout_ms = timeout_ms;
         state.execute(&owner, &mut cdp, cwd, allowlist, args).await
     };
-    // Register owner cancellation even while the peer is silent or the lock is
-    // occupied. No detached task, polling thread or unbounded receive is needed.
     let cancelled = async {
         let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
         let _ = receiver.recv(owner.cx()).await;
@@ -171,11 +184,15 @@ pub(super) struct Cdp {
 }
 
 impl Cdp {
-    async fn connect(owner: &AgentCx, endpoint: &url::Url) -> Result<Self> {
+    async fn connect(
+        owner: &AgentCx,
+        endpoint: &url::Url,
+        expected_debugger_path: Option<&str>,
+    ) -> Result<Self> {
         let client = owner.http().client();
         let response = client.get(&format!("{}json/version", endpoint.as_str()))
             .timeout(Duration::from_secs(5)).send().await
-            .map_err(|e| Error::tool("browser", format!("cannot attach to Chromium at {endpoint}: {e}. Start Chromium with --remote-debugging-port={} and a dedicated --user-data-dir, or set PI_BROWSER_CDP_URL", endpoint.port_or_known_default().unwrap_or(9222))))?;
+            .map_err(|e| Error::tool("browser", format!("cannot attach to Chromium at {endpoint}: {e}. Check the explicitly configured endpoint or the managed browser process")))?;
         if response.status() != 200 {
             return Err(Error::tool(
                 "browser",
@@ -190,6 +207,12 @@ impl Cdp {
             return Err(Error::tool(
                 "browser",
                 "CDP discovery changed the endpoint port",
+            ));
+        }
+        if expected_debugger_path.is_some_and(|path| path != websocket.path()) {
+            return Err(Error::tool(
+                "browser",
+                "CDP discovery does not match the owned browser's DevToolsActivePort identity",
             ));
         }
         websocket
@@ -371,7 +394,6 @@ impl Cdp {
                 "navigation did not reach DOMContentLoaded",
             ));
         }
-        // A same-document navigation has no new loader and no load event.
         Ok(())
     }
 }
@@ -403,6 +425,75 @@ pub(super) fn evaluation_value(response: &Value) -> Result<Value> {
 }
 
 impl Session {
+    fn clear_pages(&mut self) {
+        self.tabs.clear();
+        self.references.clear();
+        self.active = None;
+        self.endpoint = None;
+        // Never reuse element IDs across process lifetimes.
+    }
+
+    async fn connect(
+        &mut self,
+        owner: &AgentCx,
+        cwd: &Path,
+        connection: &launch::Connection,
+        action: &str,
+    ) -> Result<Option<Cdp>> {
+        if action == "stop" {
+            if matches!(connection, launch::Connection::Attach(_)) {
+                return Err(Error::tool("browser", "cannot stop an attached browser; Pi does not own its process"));
+            }
+            if let Some(browser) = self.browser.as_mut() {
+                browser.stop()?;
+            }
+            self.browser = None;
+            self.clear_pages();
+            return Ok(None);
+        }
+        let mut startup = None;
+        let (endpoint, expected_path) = match connection {
+            launch::Connection::Attach(endpoint) => {
+                if self.browser.is_some() {
+                    return Err(Error::tool("browser", "stop the owned browser before changing to an attached endpoint"));
+                }
+                (endpoint.clone(), None)
+            }
+            launch::Connection::Managed(options) => {
+                if let Some(browser) = self.browser.as_mut()
+                    && !browser.running()?
+                {
+                    self.browser = None;
+                    self.clear_pages();
+                    if action == "status" {
+                        return Ok(None);
+                    }
+                    return Err(Error::tool("browser", "the owned browser exited; its tabs are gone. Retry start or open to create a fresh isolated browser"));
+                }
+                if self.browser.is_none() {
+                    if action == "status" {
+                        return Ok(None);
+                    }
+                    startup = Some(launch::ManagedBrowser::launch(owner, cwd, options).await?);
+                }
+                let browser = self.browser.as_ref().or(startup.as_ref())
+                    .ok_or_else(|| Error::tool("browser", "managed browser was not created"))?;
+                (browser.address.http.clone(), Some(browser.address.debugger_path.clone()))
+            }
+        };
+        // Adopt startup only after discovery AND WebSocket identity/handshake
+        // succeed. Failure or cancellation before then drops the local process.
+        let cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
+        if self.endpoint.as_deref() != Some(endpoint.as_str()) {
+            self.clear_pages();
+        }
+        self.endpoint = Some(endpoint.to_string());
+        if let Some(browser) = startup {
+            self.browser = Some(browser);
+        }
+        Ok(Some(cdp))
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &mut self,
@@ -473,7 +564,6 @@ impl Session {
             .cloned()
             .or_else(|| pages.contains_key(&tab).then(|| tab.clone()));
         let target = if action == "open" && existing.is_none() {
-            // Create a blank target first: validate and attach before navigation.
             let created = cdp
                 .call(
                     owner,
@@ -640,25 +730,38 @@ mod tests {
 
     #[test]
     fn javascript_exceptions_and_unserializable_values_are_not_fake_successes() {
-        assert!(
-            evaluation_value(
-                &json!({"exceptionDetails": {"text": "Uncaught"}, "result": {"type": "object"}})
-            )
-            .is_err()
-        );
+        assert!(evaluation_value(&json!({"exceptionDetails": {"text": "Uncaught"}, "result": {"type": "object"}})).is_err());
         assert!(evaluation_value(&json!({})).is_err());
-        assert_eq!(
-            evaluation_value(&json!({"result": {"type": "number", "value": 42}})).unwrap(),
-            json!(42)
-        );
-        assert_eq!(
-            evaluation_value(&json!({"result": {"type": "number", "unserializableValue": "NaN"}}))
-                .unwrap()["unserializableValue"],
-            "NaN"
-        );
-        assert_eq!(
-            evaluation_value(&json!({"result": {"type": "undefined"}})).unwrap()["type"],
-            "undefined"
-        );
+        assert_eq!(evaluation_value(&json!({"result": {"type": "number", "value": 42}})).unwrap(), json!(42));
+        assert_eq!(evaluation_value(&json!({"result": {"type": "number", "unserializableValue": "NaN"}})).unwrap()["unserializableValue"], "NaN");
+        assert_eq!(evaluation_value(&json!({"result": {"type": "undefined"}})).unwrap()["type"], "undefined");
+    }
+
+    #[test]
+    fn lifecycle_never_accepts_model_selected_process_configuration() {
+        assert!(validate(&json!({"action":"start"}), None).is_ok());
+        for field in ["executable_path", "user_data_dir", "args", "headless", "endpoint", "tab"] {
+            let mut input = json!({"action":"start"});
+            input[field] = json!("untrusted");
+            assert!(validate(&input, None).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn idle_status_and_stop_do_not_launch_and_stop_does_not_own_attached_browsers() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let managed = launch::Connection::Managed(BrowserLaunchOptions {
+            executable_path: Some(PathBuf::from("/nonexistent/do-not-launch")),
+            ..Default::default()
+        });
+        let mut session = Session::default();
+        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &managed, "status")).unwrap().is_none());
+        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &managed, "stop")).unwrap().is_none());
+        let attached = launch::Connection::Attach(policy::endpoint("http://127.0.0.1:9", false).unwrap());
+        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &attached, "stop")).is_err());
+        session.next_ref = 42;
+        session.clear_pages();
+        assert_eq!(session.next_ref, 42);
     }
 }
