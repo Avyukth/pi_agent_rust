@@ -4,6 +4,7 @@
 //! uses Google authorization. It must never enter the first-party OAuth lane.
 
 use super::{AnthropicProvider, StreamState};
+use crate::agent_cx::{AgentCx, AgentHttpResponse};
 use crate::error::{Error, Result};
 use crate::http::client::Response;
 use crate::model::{AssistantMessage, ContentBlock, StreamEvent};
@@ -56,6 +57,9 @@ impl AnthropicProvider {
         options: &StreamOptions,
         authorization: &str,
     ) -> Result<EventStream> {
+        // Hooks and later stream consumers may run under other task contexts.
+        // They must not replace the authority or cancellation owner of this call.
+        let owner = AgentCx::for_current_or_request();
         let original = vertex_request(serde_json::to_value(self.build_request(context, options))?)
             .map_err(|message| Error::provider(self.name(), message))?;
         let rewritten = super::super::offer_before_provider_request(
@@ -92,7 +96,7 @@ impl AnthropicProvider {
         // Install the already resolved winner last, including when an empty
         // request header must not erase a non-empty compatibility override.
         let request = request.header("Authorization", authorization).json(body)?;
-        let response = Box::pin(request.send()).await?;
+        let response = Box::pin(owner.http().request(request).send()).await?;
         let status = response.status();
         if !(200..300).contains(&status) {
             let body = response
@@ -104,8 +108,8 @@ impl AnthropicProvider {
                 format!("Vertex AI Anthropic API error (HTTP {status}): {body}"),
             ));
         }
-        Ok(response_stream(
-            response,
+        Ok(wire_stream(
+            response.bytes_stream(),
             self.model.clone(),
             "google-vertex".to_string(),
             self.provider.clone(),
@@ -284,14 +288,16 @@ fn protocol_error(message: &str) -> Error {
     Error::api(format!("Anthropic stream protocol error: {message}"))
 }
 
-/// Both native Anthropic and Vertex use this exact stream driver. Owning the
-/// response keeps socket cleanup tied to the stream's lifetime (including drop).
+/// Bind the already-dispatched native Anthropic response to its current owner.
+/// This scopes body reads and cleanup, not the request dispatch that preceded it.
+/// Vertex uses the same driver with a response scoped before dispatch instead.
 pub(super) fn response_stream(
     response: Response,
     model: String,
     api: String,
     provider: String,
 ) -> EventStream {
+    let response = AgentHttpResponse::from_response(AgentCx::for_current_or_request(), response);
     wire_stream(response.bytes_stream(), model, api, provider)
 }
 
