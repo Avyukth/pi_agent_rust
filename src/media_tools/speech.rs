@@ -76,8 +76,12 @@ impl TtsTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for TtsTool {
-    fn name(&self) -> &str { NAME }
-    fn label(&self) -> &str { "Text to Speech" }
+    fn name(&self) -> &str {
+        NAME
+    }
+    fn label(&self) -> &str {
+        "Text to Speech"
+    }
     fn description(&self) -> &str {
         "Synthesize speech through OpenAI or xAI and save the actual audio to a new file. Audio is AI-generated; disclose this when sharing it. Requires the selected provider's API key."
     }
@@ -120,36 +124,59 @@ impl Tool for TtsTool {
         }
         let char_count = text.chars().count();
         if char_count > MAX_TTS_TEXT_CHARS {
-            return Err(Error::tool(NAME, format!(
-                "text length {char_count} exceeds max allowed {MAX_TTS_TEXT_CHARS} chars"
-            )));
+            return Err(Error::tool(
+                NAME,
+                format!("text length {char_count} exceeds max allowed {MAX_TTS_TEXT_CHARS} chars"),
+            ));
         }
         let env_provider = std::env::var("PI_TTS_PROVIDER").ok();
-        let provider = transport::provider(NAME, transport::optional(&args, NAME, "provider")?
-            .or(self.default_provider.as_deref()).or(env_provider.as_deref()).unwrap_or("openai"))?;
+        let provider = transport::provider(
+            NAME,
+            transport::optional(&args, NAME, "provider")?
+                .or(self.default_provider.as_deref())
+                .or(env_provider.as_deref())
+                .unwrap_or("openai"),
+        )?;
         if !matches!(provider, "openai" | "xai") {
             return Err(Error::tool(NAME, "speech provider must be openai or xai"));
         }
         let env_voice = std::env::var("PI_TTS_VOICE").ok();
         let voice = transport::optional(&args, NAME, "voice")?
-            .or(self.default_voice.as_deref()).or(env_voice.as_deref())
+            .or(self.default_voice.as_deref())
+            .or(env_voice.as_deref())
             .unwrap_or(if provider == "xai" { "eve" } else { "alloy" });
         if voice.trim().is_empty() || voice.len() > 128 {
-            return Err(Error::tool(NAME, "voice must be nonempty and at most 128 bytes"));
+            return Err(Error::tool(
+                NAME,
+                "voice must be nonempty and at most 128 bytes",
+            ));
         }
         let format = transport::optional(&args, NAME, "format")?.unwrap_or("wav");
         let requested = transport::optional(&args, NAME, "output_path")?;
         let duration = transport::timeout(&args, NAME, 120_000)?;
         let (endpoint, body) = request(provider, voice, text, format, &args)?;
-        let is_mock = self.mock_mode.unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
-        let api = if is_mock { None } else {
-            Some(self.transport.api(NAME, provider, self.api_key.as_deref(), duration)?)
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
+        let api = if is_mock {
+            None
+        } else {
+            Some(
+                self.transport
+                    .api(NAME, provider, self.api_key.as_deref(), duration)?,
+            )
         };
         artifact::preflight(&self.cwd, requested, NAME)?;
         if let Some(path) = requested {
-            let extension = Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            let extension = Path::new(path)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("");
             if !extension.eq_ignore_ascii_case(format) {
-                return Err(Error::tool(NAME, "output_path extension must match the requested audio format"));
+                return Err(Error::tool(
+                    NAME,
+                    "output_path extension must match the requested audio format",
+                ));
             }
         }
         let (bytes, mime) = match api.as_ref() {
@@ -160,19 +187,33 @@ impl Tool for TtsTool {
             }
             None => {
                 if format != "wav" {
-                    return Err(Error::tool(NAME, "deterministic speech fixtures support WAV only; native synthesis supports the advertised provider formats"));
+                    return Err(Error::tool(
+                        NAME,
+                        "deterministic speech fixtures support WAV only; native synthesis supports the advertised provider formats",
+                    ));
                 }
                 (super::MIN_VALID_WAV.to_vec(), "audio/wav")
             }
         };
-        let path = artifact::publish(&self.cwd, requested, "audio/speech", format,
-            &bytes, api.as_ref().map(|api| &api.owner), NAME)?;
+        let path = artifact::publish(
+            &self.cwd,
+            requested,
+            "audio/speech",
+            format,
+            &bytes,
+            api.as_ref().map(|api| &api.owner),
+            NAME,
+        )?;
         let message = if is_mock {
-            format!("Successfully synthesized speech fixture to {} (mock; no provider request)", path.display())
+            format!(
+                "Successfully synthesized speech fixture to {} (mock; no provider request)",
+                path.display()
+            )
         } else {
             format!(
                 "Synthesized AI-generated speech to {}\nProvider: {provider} | Voice: {voice} | Format: {format} | Bytes: {}\nDisclose that this audio is AI-generated when sharing it.",
-                path.display(), bytes.len()
+                path.display(),
+                bytes.len()
             )
         };
         Ok(ToolOutput {
@@ -188,7 +229,13 @@ impl Tool for TtsTool {
     }
 }
 
-fn request(provider: &str, voice: &str, text: &str, format: &str, args: &Value) -> Result<(&'static str, Value)> {
+fn request(
+    provider: &str,
+    voice: &str,
+    text: &str,
+    format: &str,
+    args: &Value,
+) -> Result<(&'static str, Value)> {
     if !matches!(format, "wav" | "mp3" | "opus" | "aac" | "flac") {
         return Err(Error::tool(NAME, "unsupported audio format"));
     }
@@ -197,19 +244,30 @@ fn request(provider: &str, voice: &str, text: &str, format: &str, args: &Value) 
     let language = transport::optional(args, NAME, "language")?;
     let speed = match args.get("speed") {
         None => None,
-        Some(value) => Some(value.as_f64().filter(|speed| speed.is_finite())
-            .ok_or_else(|| Error::tool(NAME, "speed must be a finite number"))?),
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|speed| speed.is_finite())
+                .ok_or_else(|| Error::tool(NAME, "speed must be a finite number"))?,
+        ),
     };
     match provider {
         "openai" => {
             if language.is_some() {
-                return Err(Error::tool(NAME, "language is an xAI option; OpenAI infers language from the input"));
+                return Err(Error::tool(
+                    NAME,
+                    "language is an xAI option; OpenAI infers language from the input",
+                ));
             }
             let model = transport::model_id(NAME, model.unwrap_or("gpt-4o-mini-tts"))?;
-            let mut body = json!({"model": model, "input": text, "voice": voice, "response_format": format});
+            let mut body =
+                json!({"model": model, "input": text, "voice": voice, "response_format": format});
             if let Some(instructions) = instructions {
                 if !model.starts_with("gpt-4o-mini-tts") || instructions.len() > 4096 {
-                    return Err(Error::tool(NAME, "instructions require gpt-4o-mini-tts and must be at most 4096 bytes"));
+                    return Err(Error::tool(
+                        NAME,
+                        "instructions require gpt-4o-mini-tts and must be at most 4096 bytes",
+                    ));
                 }
                 body["instructions"] = json!(instructions);
             }
@@ -223,16 +281,28 @@ fn request(provider: &str, voice: &str, text: &str, format: &str, args: &Value) 
         }
         "xai" => {
             if !matches!(format, "wav" | "mp3") {
-                return Err(Error::tool(NAME, "xAI synthesis supports wav or mp3; choose OpenAI for opus/aac/flac"));
+                return Err(Error::tool(
+                    NAME,
+                    "xAI synthesis supports wav or mp3; choose OpenAI for opus/aac/flac",
+                ));
             }
             if model.is_some() || instructions.is_some() {
-                return Err(Error::tool(NAME, "xAI /tts does not accept model or instructions; use inline speech tags in text"));
+                return Err(Error::tool(
+                    NAME,
+                    "xAI /tts does not accept model or instructions; use inline speech tags in text",
+                ));
             }
             let language = language.unwrap_or("auto");
-            if language.is_empty() || language.len() > 64
-                || !language.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+            if language.is_empty()
+                || language.len() > 64
+                || !language
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
             {
-                return Err(Error::tool(NAME, "language must be auto or a BCP-47 language code"));
+                return Err(Error::tool(
+                    NAME,
+                    "language must be auto or a BCP-47 language code",
+                ));
             }
             let mut body = json!({"text": text, "voice_id": voice, "language": language,
                 "output_format": {"codec": format, "sample_rate": 24000}});
@@ -257,22 +327,34 @@ fn validate_audio(bytes: &[u8], format: &str, content_type: &str) -> Result<&'st
         "flac" => ("audio/flac", &["audio/flac", "audio/x-flac"]),
         _ => return Err(Error::tool(NAME, "unsupported audio format")),
     };
-    if !content_type.is_empty() && content_type != "application/octet-stream"
+    if !content_type.is_empty()
+        && content_type != "application/octet-stream"
         && !aliases.contains(&content_type)
     {
-        return Err(Error::tool(NAME, "speech provider returned a content type that does not match the requested audio"));
+        return Err(Error::tool(
+            NAME,
+            "speech provider returned a content type that does not match the requested audio",
+        ));
     }
     let valid = match format {
         "wav" => wav_has_samples(bytes),
         "mp3" => mp3_has_frame(bytes),
-        "opus" => bytes.len() > 48 && bytes.starts_with(b"OggS")
-            && bytes[..bytes.len().min(128)].windows(8).any(|part| part == b"OpusHead"),
+        "opus" => {
+            bytes.len() > 48
+                && bytes.starts_with(b"OggS")
+                && bytes[..bytes.len().min(128)]
+                    .windows(8)
+                    .any(|part| part == b"OpusHead")
+        }
         "aac" => aac_has_frame(bytes),
         "flac" => bytes.len() > 42 && bytes.starts_with(b"fLaC"),
         _ => false,
     };
     if !valid {
-        return Err(Error::tool(NAME, "speech provider returned empty, truncated, or mismatched audio bytes"));
+        return Err(Error::tool(
+            NAME,
+            "speech provider returned empty, truncated, or mismatched audio bytes",
+        ));
     }
     Ok(mime)
 }
@@ -283,9 +365,18 @@ fn wav_has_samples(bytes: &[u8]) -> bool {
     }
     let declared = u32::from_le_bytes(bytes[4..8].try_into().expect("four bytes"));
     // Streaming WAV writers may use the all-ones sentinel until the body ends.
-    let end = if declared == u32::MAX { bytes.len() } else {
-        let Some(end) = usize::try_from(declared).ok().and_then(|n| n.checked_add(8)) else { return false; };
-        if end > bytes.len() { return false; }
+    let end = if declared == u32::MAX {
+        bytes.len()
+    } else {
+        let Some(end) = usize::try_from(declared)
+            .ok()
+            .and_then(|n| n.checked_add(8))
+        else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
         end
     };
     let mut offset = 12usize;
@@ -293,24 +384,46 @@ fn wav_has_samples(bytes: &[u8]) -> bool {
     let mut samples = false;
     while offset.checked_add(8).is_some_and(|next| next <= end) {
         let id = &bytes[offset..offset + 4];
-        let declared = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().expect("four bytes"));
+        let declared = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("four bytes"),
+        );
         let start = offset + 8;
-        let length = if declared == u32::MAX && id == b"data" { end - start } else {
-            let Ok(length) = usize::try_from(declared) else { return false; };
+        let length = if declared == u32::MAX && id == b"data" {
+            end - start
+        } else {
+            let Ok(length) = usize::try_from(declared) else {
+                return false;
+            };
             length
         };
-        let Some(next) = start.checked_add(length).filter(|next| *next <= end) else { return false; };
+        let Some(next) = start.checked_add(length).filter(|next| *next <= end) else {
+            return false;
+        };
         if id == b"fmt " {
-            if length < 16 { return false; }
-            let channels = u16::from_le_bytes(bytes[start + 2..start + 4].try_into().expect("two bytes"));
-            let sample_rate = u32::from_le_bytes(bytes[start + 4..start + 8].try_into().expect("four bytes"));
-            block_align = usize::from(u16::from_le_bytes(bytes[start + 12..start + 14].try_into().expect("two bytes")));
-            if channels == 0 || sample_rate == 0 || block_align == 0 { return false; }
+            if length < 16 {
+                return false;
+            }
+            let channels =
+                u16::from_le_bytes(bytes[start + 2..start + 4].try_into().expect("two bytes"));
+            let sample_rate =
+                u32::from_le_bytes(bytes[start + 4..start + 8].try_into().expect("four bytes"));
+            block_align = usize::from(u16::from_le_bytes(
+                bytes[start + 12..start + 14].try_into().expect("two bytes"),
+            ));
+            if channels == 0 || sample_rate == 0 || block_align == 0 {
+                return false;
+            }
         } else if id == b"data" {
-            if block_align == 0 || length == 0 || length % block_align != 0 { return false; }
+            if block_align == 0 || length == 0 || length % block_align != 0 {
+                return false;
+            }
             samples = true;
         }
-        let Some(next) = next.checked_add(length % 2) else { return false; };
+        let Some(next) = next.checked_add(length % 2) else {
+            return false;
+        };
         offset = next;
     }
     samples && offset == end
@@ -319,30 +432,46 @@ fn wav_has_samples(bytes: &[u8]) -> bool {
 fn mp3_has_frame(bytes: &[u8]) -> bool {
     let mut offset = 0usize;
     if bytes.starts_with(b"ID3") {
-        if bytes.len() < 10 || bytes[6..10].iter().any(|byte| byte & 0x80 != 0) { return false; }
-        let length = bytes[6..10].iter().fold(0usize, |value, byte| (value << 7) | usize::from(*byte));
-        let Some(end) = length.checked_add(10 + if bytes[5] & 0x10 != 0 { 10 } else { 0 }) else { return false; };
+        if bytes.len() < 10 || bytes[6..10].iter().any(|byte| byte & 0x80 != 0) {
+            return false;
+        }
+        let length = bytes[6..10]
+            .iter()
+            .fold(0usize, |value, byte| (value << 7) | usize::from(*byte));
+        let Some(end) = length.checked_add(10 + if bytes[5] & 0x10 != 0 { 10 } else { 0 }) else {
+            return false;
+        };
         offset = end;
     }
-    let Some(audio) = bytes.get(offset..) else { return false; };
-    if audio.len() <= 4 { return false; }
-    audio[0] == 0xff && audio[1] & 0xe0 == 0xe0
-        && audio[1] & 0x18 != 0x08 && audio[1] & 0x06 != 0
-        && !matches!(audio[2] >> 4, 0 | 15) && audio[2] & 0x0c != 0x0c
+    let Some(audio) = bytes.get(offset..) else {
+        return false;
+    };
+    if audio.len() <= 4 {
+        return false;
+    }
+    audio[0] == 0xff
+        && audio[1] & 0xe0 == 0xe0
+        && audio[1] & 0x18 != 0x08
+        && audio[1] & 0x06 != 0
+        && !matches!(audio[2] >> 4, 0 | 15)
+        && audio[2] & 0x0c != 0x0c
 }
 
 fn aac_has_frame(bytes: &[u8]) -> bool {
-    if bytes.len() < 7 || bytes[0] != 0xff || bytes[1] & 0xf6 != 0xf0 { return false; }
+    if bytes.len() < 7 || bytes[0] != 0xff || bytes[1] & 0xf6 != 0xf0 {
+        return false;
+    }
     let length = (usize::from(bytes[3] & 3) << 11)
-        | (usize::from(bytes[4]) << 3) | usize::from(bytes[5] >> 5);
+        | (usize::from(bytes[4]) << 3)
+        | usize::from(bytes[5] >> 5);
     let header = if bytes[1] & 1 == 0 { 9 } else { 7 };
     length > header && length <= bytes.len()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::transport::tests::peer;
+    use super::*;
 
     fn wav() -> Vec<u8> {
         let mut bytes = super::super::MIN_VALID_WAV.to_vec();
@@ -354,14 +483,26 @@ mod tests {
 
     #[test]
     fn native_synthesis_uses_provider_specific_requests_and_retains_audio_samples() {
-        for (provider, voice, endpoint_path) in [("openai", "alloy", "audio/speech"), ("xai", "eve", "tts")] {
+        for (provider, voice, endpoint_path) in
+            [("openai", "alloy", "audio/speech"), ("xai", "eve", "tts")]
+        {
             let audio = wav();
             let (endpoint, worker) = peer(200, "audio/wav", audio.clone());
             let dir = tempfile::tempdir().unwrap();
             let tool = TtsTool::with_defaults(dir.path(), Some(provider.into()), None)
-                .with_mock(false).with_api_key(Some("speech-test-key".into())).with_base_url(endpoint);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-            let output = runtime.block_on(tool.execute("speak", json!({"text":"Hello, world.","format":"wav","output_path":"hello.wav"}), None)).unwrap();
+                .with_mock(false)
+                .with_api_key(Some("speech-test-key".into()))
+                .with_base_url(endpoint);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let output = runtime
+                .block_on(tool.execute(
+                    "speak",
+                    json!({"text":"Hello, world.","format":"wav","output_path":"hello.wav"}),
+                    None,
+                ))
+                .unwrap();
             assert_eq!(std::fs::read(dir.path().join("hello.wav")).unwrap(), audio);
             let details = output.details.unwrap();
             assert_eq!(details["voice"], voice);
@@ -369,8 +510,17 @@ mod tests {
             assert_eq!(details["mock"], false);
             assert_eq!(details["ai_generated"], true);
             let request = worker.join().unwrap();
-            assert!(request.headers.starts_with(&format!("POST /v1/{endpoint_path} ")));
-            assert!(request.headers.to_ascii_lowercase().contains("authorization: bearer speech-test-key"));
+            assert!(
+                request
+                    .headers
+                    .starts_with(&format!("POST /v1/{endpoint_path} "))
+            );
+            assert!(
+                request
+                    .headers
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer speech-test-key")
+            );
             if provider == "openai" {
                 assert_eq!(request.body["input"], "Hello, world.");
                 assert_eq!(request.body["model"], "gpt-4o-mini-tts");
@@ -388,16 +538,31 @@ mod tests {
     #[test]
     fn malformed_or_json_audio_never_creates_an_artifact() {
         for (content_type, bytes) in [
-            ("application/json", br#"{"error":"synthesis unavailable"}"#.to_vec()),
+            (
+                "application/json",
+                br#"{"error":"synthesis unavailable"}"#.to_vec(),
+            ),
             ("audio/wav", super::super::MIN_VALID_WAV.to_vec()),
             ("audio/wav", b"RIFF truncated".to_vec()),
         ] {
             let (endpoint, worker) = peer(200, content_type, bytes);
             let dir = tempfile::tempdir().unwrap();
-            let tool = TtsTool::new(dir.path()).with_mock(false)
-                .with_api_key(Some("speech-test-key".into())).with_base_url(endpoint);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-            assert!(runtime.block_on(tool.execute("bad-speech", json!({"text":"Hello","output_path":"out.wav"}), None)).is_err());
+            let tool = TtsTool::new(dir.path())
+                .with_mock(false)
+                .with_api_key(Some("speech-test-key".into()))
+                .with_base_url(endpoint);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(tool.execute(
+                        "bad-speech",
+                        json!({"text":"Hello","output_path":"out.wav"}),
+                        None
+                    ))
+                    .is_err()
+            );
             assert!(!dir.path().join("out.wav").exists());
             worker.join().unwrap();
         }
@@ -409,7 +574,14 @@ mod tests {
         assert!(request("xai", "eve", "hello", "wav", &json!({"speed":2.0})).is_err());
         assert!(request("xai", "eve", "hello", "wav", &json!({"model":"tts-1"})).is_err());
         assert!(request("openai", "alloy", "hello", "wav", &json!({"language":"en"})).is_err());
-        let (_, body) = request("openai", "nova", "hello", "mp3", &json!({"instructions":"Speak calmly","speed":0.8})).unwrap();
+        let (_, body) = request(
+            "openai",
+            "nova",
+            "hello",
+            "mp3",
+            &json!({"instructions":"Speak calmly","speed":0.8}),
+        )
+        .unwrap();
         assert_eq!(body["instructions"], "Speak calmly");
         assert_eq!(body["speed"], 0.8);
     }

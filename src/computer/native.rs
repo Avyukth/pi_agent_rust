@@ -1,6 +1,8 @@
 //! Validated desktop requests and native X11 operations. Other backends fail
 //! explicitly; selecting a backend never selects canned results.
 
+#[cfg(unix)]
+use super::process::{self, strings, text};
 use super::{DisplayInfo, WindowInfo, error, output};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
@@ -13,15 +15,25 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-#[cfg(unix)]
-use super::process::{self, strings, text};
 
 #[cfg(unix)]
 mod input;
 
 pub(super) const HELPERS: &[&str] = &[
-    "xrandr", "wmctrl", "xprop", "scrot", "xdotool", "xclip",
-    "grim", "wl-copy", "wl-paste", "screencapture", "pbcopy", "pbpaste", "osascript", "python3",
+    "xrandr",
+    "wmctrl",
+    "xprop",
+    "scrot",
+    "xdotool",
+    "xclip",
+    "grim",
+    "wl-copy",
+    "wl-paste",
+    "screencapture",
+    "pbcopy",
+    "pbpaste",
+    "osascript",
+    "python3",
 ];
 pub(super) const IMAGE_LIMIT: usize = 20 * 1024 * 1024;
 
@@ -36,15 +48,21 @@ pub(super) struct State {
 pub(super) fn check_owner(owner: &AgentCx) -> Result<()> {
     let caps = owner.capabilities();
     if !caps.io || !caps.spawn || !caps.time {
-        return Err(error("native desktop operations require I/O, spawn and timer capabilities"));
+        return Err(error(
+            "native desktop operations require I/O, spawn and timer capabilities",
+        ));
     }
-    owner.checkpoint().map_err(|_| error("desktop operation cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| error("desktop operation cancelled"))
 }
 
 pub(super) fn string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
     match args.get(field) {
         None => Ok(None),
-        Some(value) => value.as_str().map(Some)
+        Some(value) => value
+            .as_str()
+            .map(Some)
             .ok_or_else(|| error(format!("{field} must be a string"))),
     }
 }
@@ -52,15 +70,20 @@ pub(super) fn string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>
 pub(super) fn number(args: &Value, field: &str, min: i64, max: i64) -> Result<Option<i64>> {
     match args.get(field) {
         None => Ok(None),
-        Some(value) => value.as_i64().filter(|n| (min..=max).contains(n)).map(Some)
+        Some(value) => value
+            .as_i64()
+            .filter(|n| (min..=max).contains(n))
+            .map(Some)
             .ok_or_else(|| error(format!("{field} must be an integer in {min}..={max}"))),
     }
 }
 
 pub(super) fn validate(args: &Value) -> Result<Duration> {
-    let object = args.as_object().ok_or_else(|| error("computer arguments must be an object"))?;
-    let action = string(args, "action")?
-        .ok_or_else(|| error("missing required action parameter"))?;
+    let object = args
+        .as_object()
+        .ok_or_else(|| error("computer arguments must be an object"))?;
+    let action =
+        string(args, "action")?.ok_or_else(|| error("missing required action parameter"))?;
     let fields: &[&str] = match action {
         "list_displays" | "list_windows" | "clipboard_read" => &[],
         "screenshot" => &["display_id", "window_id", "output_path"],
@@ -75,14 +98,16 @@ pub(super) fn validate(args: &Value) -> Result<Duration> {
     };
     for field in object.keys() {
         if field != "action" && field != "timeout_ms" && !fields.contains(&field.as_str()) {
-            return Err(error(format!("unsupported parameter for {action}: {}", clean(field, 64))));
+            return Err(error(format!(
+                "unsupported parameter for {action}: {}",
+                clean(field, 64)
+            )));
         }
     }
     let timeout = number(args, "timeout_ms", 1, 120_000)?.unwrap_or(30_000);
     let x = number(args, "x", -32768, 32767)?;
     let y = number(args, "y", -32768, 32767)?;
-    if x.is_some() != y.is_some()
-        || (matches!(action, "mouse_move" | "mouse_drag") && x.is_none())
+    if x.is_some() != y.is_some() || (matches!(action, "mouse_move" | "mouse_drag") && x.is_none())
     {
         return Err(error(format!("{action} requires both x and y coordinates")));
     }
@@ -109,12 +134,18 @@ pub(super) fn validate(args: &Value) -> Result<Duration> {
         let value = string(args, "text")?
             .ok_or_else(|| error(format!("{action} requires text parameter")))?;
         if value.chars().count() > 4096 || value.contains('\0') {
-            return Err(error("text must contain at most 4096 Unicode characters and no NUL"));
+            return Err(error(
+                "text must contain at most 4096 Unicode characters and no NUL",
+            ));
         }
         if action == "key_type"
-            && value.chars().any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+            && value
+                .chars()
+                .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
         {
-            return Err(error("typed text may contain newline/tab but no other control characters"));
+            return Err(error(
+                "typed text may contain newline/tab but no other control characters",
+            ));
         }
     }
     if action == "key_press" {
@@ -123,39 +154,67 @@ pub(super) fn validate(args: &Value) -> Result<Duration> {
     if let Some(path) = string(args, "output_path")?
         && (path.is_empty() || path.len() > 4096 || path.contains('\0'))
     {
-        return Err(error("output_path must be nonempty, NUL-free and at most 4096 bytes"));
+        return Err(error(
+            "output_path must be nonempty, NUL-free and at most 4096 bytes",
+        ));
     }
-    Ok(Duration::from_millis(u64::try_from(timeout).expect("validated positive timeout")))
+    Ok(Duration::from_millis(
+        u64::try_from(timeout).expect("validated positive timeout"),
+    ))
 }
 
 // xdotool supports command chaining. A free-form 'key' argument can therefore
 // be a command, not a keysym. Only one explicitly parsed key/chord is admitted.
 pub(super) fn key(value: &str) -> Result<String> {
-    if value.len() > 128 { return Err(error("key chord is too long")); }
+    if value.len() > 128 {
+        return Err(error("key chord is too long"));
+    }
     let parts: Vec<_> = value.split('+').collect();
-    if parts.is_empty() || parts.len() > 5 { return Err(error("invalid key chord")); }
+    if parts.is_empty() || parts.len() > 5 {
+        return Err(error("invalid key chord"));
+    }
     let mut result = Vec::new();
     for modifier in &parts[..parts.len() - 1] {
         let normalized = match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => "ctrl", "alt" => "alt", "shift" => "shift",
+            "ctrl" | "control" => "ctrl",
+            "alt" => "alt",
+            "shift" => "shift",
             "super" | "meta" | "cmd" | "command" => "super",
             _ => return Err(error("unknown key modifier")),
         };
-        if result.contains(&normalized.to_string()) { return Err(error("duplicate key modifier")); }
+        if result.contains(&normalized.to_string()) {
+            return Err(error("duplicate key modifier"));
+        }
         result.push(normalized.to_string());
     }
     let last = parts[parts.len() - 1];
     let normalized = match last.to_ascii_lowercase().as_str() {
-        "return" | "enter" => "Return", "escape" | "esc" => "Escape",
-        "tab" => "Tab", "space" => "space", "backspace" => "BackSpace",
-        "delete" => "Delete", "insert" => "Insert", "home" => "Home", "end" => "End",
-        "left" | "arrowleft" => "Left", "right" | "arrowright" => "Right",
-        "up" | "arrowup" => "Up", "down" | "arrowdown" => "Down",
-        "pageup" | "prior" => "Prior", "pagedown" | "next" => "Next",
+        "return" | "enter" => "Return",
+        "escape" | "esc" => "Escape",
+        "tab" => "Tab",
+        "space" => "space",
+        "backspace" => "BackSpace",
+        "delete" => "Delete",
+        "insert" => "Insert",
+        "home" => "Home",
+        "end" => "End",
+        "left" | "arrowleft" => "Left",
+        "right" | "arrowright" => "Right",
+        "up" | "arrowup" => "Up",
+        "down" | "arrowdown" => "Down",
+        "pageup" | "prior" => "Prior",
+        "pagedown" | "next" => "Next",
         _ if last.len() == 1 && last.as_bytes()[0].is_ascii_alphanumeric() => last,
         _ if last.starts_with('F')
-            && last[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) => last,
-        _ => return Err(error("unsupported key; use one alphanumeric key, F1..F24, or a named navigation key")),
+            && last[1..].parse::<u8>().is_ok_and(|n| (1..=24).contains(&n)) =>
+        {
+            last
+        }
+        _ => {
+            return Err(error(
+                "unsupported key; use one alphanumeric key, F1..F24, or a named navigation key",
+            ));
+        }
     };
     // Conventional Ctrl+C means ctrl+c, not ctrl+shift+c. An explicit Shift
     // modifier remains in result; bare uppercase letters still request case.
@@ -168,16 +227,22 @@ pub(super) fn key(value: &str) -> Result<String> {
 }
 
 fn clean(value: &str, limit: usize) -> String {
-    value.chars()
-        .filter(|ch| !ch.is_control()
-            && !matches!(*ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        .take(limit).collect()
+    value
+        .chars()
+        .filter(|ch| {
+            !ch.is_control() && !matches!(*ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .take(limit)
+        .collect()
 }
 
 #[cfg(unix)]
 pub(super) async fn execute(
-    owner: &AgentCx, cwd: &Path, helpers: &BTreeMap<String, PathBuf>,
-    state: &mut State, args: &Value,
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
+    state: &mut State,
+    args: &Value,
 ) -> Result<ToolOutput> {
     check_owner(owner)?;
     if let Some(clipboard) = state.clipboard.as_mut()
@@ -186,46 +251,79 @@ pub(super) async fn execute(
         state.clipboard = None;
     }
     if !cfg!(target_os = "linux") {
-        return Err(error("native computer backend is currently available for Linux X11 only"));
+        return Err(error(
+            "native computer backend is currently available for Linux X11 only",
+        ));
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
-        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || std::env::var("XDG_SESSION_TYPE")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
     {
-        return Err(error("Wayland desktop is not an X11 desktop; refusing a misleading XWayland fallback"));
+        return Err(error(
+            "Wayland desktop is not an X11 desktop; refusing a misleading XWayland fallback",
+        ));
     }
     if std::env::var_os("DISPLAY").is_none_or(|value| value.is_empty()) {
-        return Err(error("native computer operations need the authorized X11 DISPLAY and XAUTHORITY"));
+        return Err(error(
+            "native computer operations need the authorized X11 DISPLAY and XAUTHORITY",
+        ));
     }
     x11(owner, cwd, helpers, state, args).await
 }
 
 #[cfg(not(unix))]
 pub(super) async fn execute(
-    _owner: &AgentCx, _cwd: &Path, _helpers: &BTreeMap<String, PathBuf>,
-    _state: &mut State, _args: &Value,
+    _owner: &AgentCx,
+    _cwd: &Path,
+    _helpers: &BTreeMap<String, PathBuf>,
+    _state: &mut State,
+    _args: &Value,
 ) -> Result<ToolOutput> {
-    Err(error("native computer backend is not implemented for this operating system"))
+    Err(error(
+        "native computer backend is not implemented for this operating system",
+    ))
 }
 
 #[cfg(unix)]
 async fn query(
-    owner: &AgentCx, cwd: &Path, helpers: &BTreeMap<String, PathBuf>,
-    program: &str, args: &[&str],
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
+    program: &str,
+    args: &[&str],
 ) -> Result<String> {
-    text(process::run(owner, cwd, helpers, program, &strings(args), b"", process::TEXT_LIMIT).await?)
+    text(
+        process::run(
+            owner,
+            cwd,
+            helpers,
+            program,
+            &strings(args),
+            b"",
+            process::TEXT_LIMIT,
+        )
+        .await?,
+    )
 }
 
 #[cfg(unix)]
 async fn x11(
-    owner: &AgentCx, cwd: &Path, helpers: &BTreeMap<String, PathBuf>,
-    state: &mut State, args: &Value,
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
+    state: &mut State,
+    args: &Value,
 ) -> Result<ToolOutput> {
     match args["action"].as_str().expect("validated action") {
         "list_displays" => {
             let monitors = monitors(owner, cwd, helpers).await?;
-            Ok(output(format!("Found {} display(s)", monitors.len()), json!({
-                "displays":monitors,"backend":"x11","coordinate_space":"desktop_pixels"
-            }), false))
+            Ok(output(
+                format!("Found {} display(s)", monitors.len()),
+                json!({
+                    "displays":monitors,"backend":"x11","coordinate_space":"desktop_pixels"
+                }),
+                false,
+            ))
         }
         "list_windows" => {
             let active = active_window(owner, cwd, helpers).await?;
@@ -233,14 +331,25 @@ async fn x11(
             let mut windows = parse_windows(&raw, active)?;
             for window in &mut windows {
                 let id = format!("0x{:x}", window.info.id);
-                let window_state = query(owner, cwd, helpers, "xprop", &["-id", &id, "-notype", "_NET_WM_STATE"]).await?;
+                let window_state = query(
+                    owner,
+                    cwd,
+                    helpers,
+                    "xprop",
+                    &["-id", &id, "-notype", "_NET_WM_STATE"],
+                )
+                .await?;
                 window.info.is_minimized = window_state
                     .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
                     .any(|token| token == "_NET_WM_STATE_HIDDEN");
             }
-            Ok(output(format!("Found {} window(s)", windows.len()), json!({
-                "windows":windows,"active_window":active,"backend":"x11"
-            }), false))
+            Ok(output(
+                format!("Found {} window(s)", windows.len()),
+                json!({
+                    "windows":windows,"active_window":active,"backend":"x11"
+                }),
+                false,
+            ))
         }
         "screenshot" => {
             let target = destination(cwd, args)?;
@@ -249,44 +358,81 @@ async fn x11(
                 command.extend(["--window".into(), window.to_string()]);
             } else if let Some(display) = args.get("display_id").and_then(Value::as_u64) {
                 let monitors = monitors(owner, cwd, helpers).await?;
-                let monitor = monitors.iter().find(|m| u64::from(m.info.id) == display)
-                    .ok_or_else(|| error("display_id is not present in the current monitor list"))?;
-                command.extend(["--autoselect".into(), format!(
-                    "{},{},{},{}", monitor.x, monitor.y, monitor.info.width, monitor.info.height
-                )]);
+                let monitor = monitors
+                    .iter()
+                    .find(|m| u64::from(m.info.id) == display)
+                    .ok_or_else(|| {
+                        error("display_id is not present in the current monitor list")
+                    })?;
+                command.extend([
+                    "--autoselect".into(),
+                    format!(
+                        "{},{},{},{}",
+                        monitor.x, monitor.y, monitor.info.width, monitor.info.height
+                    ),
+                ]);
             }
             command.extend(strings(&["--file", "-"]));
-            let bytes = process::run(owner, cwd, helpers, "scrot", &command, b"", IMAGE_LIMIT).await?;
+            let bytes =
+                process::run(owner, cwd, helpers, "scrot", &command, b"", IMAGE_LIMIT).await?;
             check_owner(owner)?;
             publish(&target, args, &bytes, false)
         }
         "clipboard_read" => {
-            let bytes = process::run(owner, cwd, helpers, "xclip", &strings(&[
-                "-selection","clipboard","-out","-target","UTF8_STRING"
-            ]), b"", 64 * 1024).await?;
+            let bytes = process::run(
+                owner,
+                cwd,
+                helpers,
+                "xclip",
+                &strings(&["-selection", "clipboard", "-out", "-target", "UTF8_STRING"]),
+                b"",
+                64 * 1024,
+            )
+            .await?;
             let value = text(bytes)?;
-            Ok(output(format!("Clipboard content ({} chars):\n{value}", value.chars().count()), json!({
-                "text":value,"char_count":value.chars().count(),"backend":"x11"
-            }), false))
+            Ok(output(
+                format!(
+                    "Clipboard content ({} chars):\n{value}",
+                    value.chars().count()
+                ),
+                json!({
+                    "text":value,"char_count":value.chars().count(),"backend":"x11"
+                }),
+                false,
+            ))
         }
-        "ax_tree" => Err(error("AT-SPI accessibility inspection is not available in this backend yet")),
+        "ax_tree" => Err(error(
+            "AT-SPI accessibility inspection is not available in this backend yet",
+        )),
         _ => input::execute(owner, cwd, helpers, state, args).await,
     }
 }
 
 #[cfg(unix)]
 async fn active_window(
-    owner: &AgentCx, cwd: &Path, helpers: &BTreeMap<String, PathBuf>,
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
 ) -> Result<Option<u32>> {
-    let value = query(owner, cwd, helpers, "xprop", &["-root", "_NET_ACTIVE_WINDOW"]).await?;
+    let value = query(
+        owner,
+        cwd,
+        helpers,
+        "xprop",
+        &["-root", "_NET_ACTIVE_WINDOW"],
+    )
+    .await?;
     match value.split_once("0x") {
         Some((_, tail)) => {
             let digits: String = tail.chars().take_while(char::is_ascii_hexdigit).collect();
-            let id = u32::from_str_radix(&digits, 16).map_err(|_| error("invalid active window ID"))?;
+            let id =
+                u32::from_str_radix(&digits, 16).map_err(|_| error("invalid active window ID"))?;
             Ok((id != 0).then_some(id))
         }
         None if value.contains("not found") || value.contains("no such atom") => Ok(None),
-        None => Err(error("could not parse the desktop's active window property")),
+        None => Err(error(
+            "could not parse the desktop's active window property",
+        )),
     }
 }
 
@@ -300,39 +446,75 @@ struct Monitor {
 
 #[cfg(unix)]
 async fn monitors(
-    owner: &AgentCx, cwd: &Path, helpers: &BTreeMap<String, PathBuf>,
+    owner: &AgentCx,
+    cwd: &Path,
+    helpers: &BTreeMap<String, PathBuf>,
 ) -> Result<Vec<Monitor>> {
     parse_monitors(&query(owner, cwd, helpers, "xrandr", &["--listactivemonitors"]).await?)
 }
 
 fn parse_monitors(raw: &str) -> Result<Vec<Monitor>> {
     let mut lines = raw.lines();
-    let expected = lines.next().and_then(|line| line.strip_prefix("Monitors:"))
+    let expected = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Monitors:"))
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|count| *count <= 64).ok_or_else(|| error("invalid xrandr monitor header"))?;
+        .filter(|count| *count <= 64)
+        .ok_or_else(|| error("invalid xrandr monitor header"))?;
     let geometry = regex::Regex::new(r"^(\d+)(?:/\d+)?x(\d+)(?:/\d+)?([+-]\d+)([+-]\d+)$")
         .expect("constant monitor geometry expression");
     let mut monitors = Vec::new();
     for line in lines.filter(|line| !line.trim().is_empty()) {
         let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 3 || monitors.len() >= 64 { return Err(error("invalid xrandr monitor entry")); }
-        let index = fields[0].trim_end_matches(':').parse::<u32>().ok()
-            .filter(|index| *index < 64).ok_or_else(|| error("invalid monitor index"))?;
-        let caps = geometry.captures(fields[2]).ok_or_else(|| error("invalid monitor geometry"))?;
-        let width = caps[1].parse::<u32>().map_err(|_| error("invalid monitor width"))?;
-        let height = caps[2].parse::<u32>().map_err(|_| error("invalid monitor height"))?;
-        if width == 0 || height == 0 { return Err(error("empty monitor geometry")); }
-        let x = caps[3].parse::<i32>().map_err(|_| error("invalid monitor x"))?;
-        let y = caps[4].parse::<i32>().map_err(|_| error("invalid monitor y"))?;
-        if monitors.iter().any(|monitor: &Monitor| monitor.info.id == index + 1) {
+        if fields.len() < 3 || monitors.len() >= 64 {
+            return Err(error("invalid xrandr monitor entry"));
+        }
+        let index = fields[0]
+            .trim_end_matches(':')
+            .parse::<u32>()
+            .ok()
+            .filter(|index| *index < 64)
+            .ok_or_else(|| error("invalid monitor index"))?;
+        let caps = geometry
+            .captures(fields[2])
+            .ok_or_else(|| error("invalid monitor geometry"))?;
+        let width = caps[1]
+            .parse::<u32>()
+            .map_err(|_| error("invalid monitor width"))?;
+        let height = caps[2]
+            .parse::<u32>()
+            .map_err(|_| error("invalid monitor height"))?;
+        if width == 0 || height == 0 {
+            return Err(error("empty monitor geometry"));
+        }
+        let x = caps[3]
+            .parse::<i32>()
+            .map_err(|_| error("invalid monitor x"))?;
+        let y = caps[4]
+            .parse::<i32>()
+            .map_err(|_| error("invalid monitor y"))?;
+        if monitors
+            .iter()
+            .any(|monitor: &Monitor| monitor.info.id == index + 1)
+        {
             return Err(error("duplicate monitor index"));
         }
-        monitors.push(Monitor { info: DisplayInfo {
-            id: index + 1, name: clean(fields[1].trim_start_matches(['+', '*']), 256),
-            width, height, is_primary: fields[1].contains('*'), scale_factor: 1,
-        }, x, y });
+        monitors.push(Monitor {
+            info: DisplayInfo {
+                id: index + 1,
+                name: clean(fields[1].trim_start_matches(['+', '*']), 256),
+                width,
+                height,
+                is_primary: fields[1].contains('*'),
+                scale_factor: 1,
+            },
+            x,
+            y,
+        });
     }
-    if monitors.len() != expected { return Err(error("incomplete xrandr monitor list")); }
+    if monitors.len() != expected {
+        return Err(error("incomplete xrandr monitor list"));
+    }
     Ok(monitors)
 }
 
@@ -346,31 +528,56 @@ struct Window {
 fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
     let mut windows = Vec::new();
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        if windows.len() >= 256 { return Err(error("window list exceeds 256 entries")); }
+        if windows.len() >= 256 {
+            return Err(error("window list exceeds 256 entries"));
+        }
         // Nine fixed fields, followed by a title that may contain spaces.
         let mut rest = line;
         let mut fields = Vec::new();
         for _ in 0..9 {
             rest = rest.trim_start();
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            if end == 0 { return Err(error("malformed wmctrl window entry")); }
+            if end == 0 {
+                return Err(error("malformed wmctrl window entry"));
+            }
             fields.push(&rest[..end]);
             rest = &rest[end..];
         }
-        let id = fields[0].strip_prefix("0x")
+        let id = fields[0]
+            .strip_prefix("0x")
             .and_then(|id| u32::from_str_radix(id, 16).ok())
-            .filter(|id| *id != 0).ok_or_else(|| error("invalid window ID"))?;
-        let parse = |field: &str| field.parse::<i32>().map_err(|_| error("invalid window geometry"));
-        let width = fields[5].parse::<u32>().map_err(|_| error("invalid window width"))?;
-        let height = fields[6].parse::<u32>().map_err(|_| error("invalid window height"))?;
+            .filter(|id| *id != 0)
+            .ok_or_else(|| error("invalid window ID"))?;
+        let parse = |field: &str| {
+            field
+                .parse::<i32>()
+                .map_err(|_| error("invalid window geometry"))
+        };
+        let width = fields[5]
+            .parse::<u32>()
+            .map_err(|_| error("invalid window width"))?;
+        let height = fields[6]
+            .parse::<u32>()
+            .map_err(|_| error("invalid window height"))?;
         if windows.iter().any(|window: &Window| window.info.id == id) {
             return Err(error("duplicate window ID"));
         }
-        windows.push(Window { info: WindowInfo {
-            id, title: clean(rest.trim_start(), 2048), app_name: clean(fields[7], 256),
-            x: parse(fields[3])?, y: parse(fields[4])?, width, height,
-            is_minimized: false, is_focused: active == Some(id),
-        }, pid: fields[2].parse::<u32>().map_err(|_| error("invalid window process ID"))? });
+        windows.push(Window {
+            info: WindowInfo {
+                id,
+                title: clean(rest.trim_start(), 2048),
+                app_name: clean(fields[7], 256),
+                x: parse(fields[3])?,
+                y: parse(fields[4])?,
+                width,
+                height,
+                is_minimized: false,
+                is_focused: active == Some(id),
+            },
+            pid: fields[2]
+                .parse::<u32>()
+                .map_err(|_| error("invalid window process ID"))?,
+        });
     }
     windows.sort_by_key(|window| window.info.id);
     Ok(windows)
@@ -378,14 +585,26 @@ fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
 
 pub(super) fn destination(cwd: &Path, args: &Value) -> Result<PathBuf> {
     let path = string(args, "output_path")?.map_or_else(
-        || cwd.join(format!("screenshots/desktop_{}.png", uuid::Uuid::new_v4().simple())),
+        || {
+            cwd.join(format!(
+                "screenshots/desktop_{}.png",
+                uuid::Uuid::new_v4().simple()
+            ))
+        },
         |path| cwd.join(path),
     );
-    if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")) {
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+    {
         return Err(error("screenshot output_path must have a .png extension"));
     }
     match std::fs::symlink_metadata(&path) {
-        Ok(_) => return Err(error("screenshot destination already exists; refusing to overwrite it")),
+        Ok(_) => {
+            return Err(error(
+                "screenshot destination already exists; refusing to overwrite it",
+            ));
+        }
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
         Err(failure) => return Err(failure.into()),
     }
@@ -393,36 +612,58 @@ pub(super) fn destination(cwd: &Path, args: &Value) -> Result<PathBuf> {
 }
 
 pub(super) fn publish(path: &Path, args: &Value, bytes: &[u8], mock: bool) -> Result<ToolOutput> {
-    if bytes.len() < 45 || bytes.len() > IMAGE_LIMIT || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+    if bytes.len() < 45
+        || bytes.len() > IMAGE_LIMIT
+        || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         || bytes.get(12..16) != Some(b"IHDR".as_slice())
         || !bytes.ends_with(b"\0\0\0\0IEND\xaeB`\x82")
     {
-        return Err(error("screenshot helper did not return a complete bounded PNG container"));
+        return Err(error(
+            "screenshot helper did not return a complete bounded PNG container",
+        ));
     }
     let width = u32::from_be_bytes(bytes[16..20].try_into().expect("checked PNG length"));
     let height = u32::from_be_bytes(bytes[20..24].try_into().expect("checked PNG length"));
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 128 * 1024 * 1024 {
-        return Err(error("screenshot dimensions are empty or exceed 128 megapixels"));
+        return Err(error(
+            "screenshot dimensions are empty or exceed 128 megapixels",
+        ));
     }
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut stage = tempfile::NamedTempFile::new_in(parent)?;
     stage.write_all(bytes)?;
     stage.as_file().sync_all()?;
-    stage.persist_noclobber(path)
+    stage
+        .persist_noclobber(path)
         .map_err(|_| error("screenshot destination could not be published without overwriting"))?;
     let preview = bytes.len() <= crate::tools::IMAGE_MAX_BYTES;
-    let mut result = output(format!(
-        "Screenshot captured to {} ({}x{}, {} bytes){}", path.display(), width, height, bytes.len(),
-        if preview { "" } else { "; preview exceeds the inline image budget; inspect the saved file" }
-    ), json!({
-        "saved_path":path.display().to_string(),"size_bytes":bytes.len(),"width":width,"height":height,
-        "display_id":args.get("display_id"),"window_id":args.get("window_id"),"preview_included":preview
-    }), mock);
+    let mut result = output(
+        format!(
+            "Screenshot captured to {} ({}x{}, {} bytes){}",
+            path.display(),
+            width,
+            height,
+            bytes.len(),
+            if preview {
+                ""
+            } else {
+                "; preview exceeds the inline image budget; inspect the saved file"
+            }
+        ),
+        json!({
+            "saved_path":path.display().to_string(),"size_bytes":bytes.len(),"width":width,"height":height,
+            "display_id":args.get("display_id"),"window_id":args.get("window_id"),"preview_included":preview
+        }),
+        mock,
+    );
     if preview {
         result.content.push(ContentBlock::Image(ImageContent {
-            data: base64::engine::general_purpose::STANDARD.encode(bytes), mime_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: "image/png".into(),
         }));
     }
     Ok(result)
@@ -450,7 +691,15 @@ mod tests {
     }
     #[test]
     fn command_chains_and_wrong_typed_inputs_are_rejected() {
-        for value in ["exec", "key Return", "ctrl+exec", "--window", "a\nexec", "ctrl+ctrl+a", "F25"] {
+        for value in [
+            "exec",
+            "key Return",
+            "ctrl+exec",
+            "--window",
+            "a\nexec",
+            "ctrl+ctrl+a",
+            "F25",
+        ] {
             assert!(key(value).is_err(), "{value}");
         }
         assert_eq!(key("Ctrl+C").unwrap(), "ctrl+c");
@@ -468,7 +717,12 @@ mod tests {
         let bytes = super::super::mock::PNG;
         let result = publish(&path, &args, bytes, false).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert!(result.content.iter().any(|block| matches!(block, ContentBlock::Image(_))));
+        assert!(
+            result
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Image(_)))
+        );
         assert!(destination(dir.path(), &args).is_err());
         assert!(publish(&path, &args, bytes, false).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);

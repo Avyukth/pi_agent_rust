@@ -43,10 +43,15 @@ impl Transport {
         explicit_key: Option<&str>,
         timeout: Duration,
     ) -> Result<Api<'_>> {
-        let key = resolve_key(tool, provider, explicit_key, |name| std::env::var(name).ok())?;
+        let key = resolve_key(tool, provider, explicit_key, |name| {
+            std::env::var(name).ok()
+        })?;
         let (default_url, env_name) = match provider {
             "openai" => ("https://api.openai.com/v1/", "PI_MEDIA_OPENAI_BASE_URL"),
-            "anthropic" => ("https://api.anthropic.com/v1/", "PI_MEDIA_ANTHROPIC_BASE_URL"),
+            "anthropic" => (
+                "https://api.anthropic.com/v1/",
+                "PI_MEDIA_ANTHROPIC_BASE_URL",
+            ),
             "gemini" => (
                 "https://generativelanguage.googleapis.com/v1beta/",
                 "PI_MEDIA_GEMINI_BASE_URL",
@@ -57,11 +62,22 @@ impl Transport {
         let env_url = std::env::var(env_name).ok();
         let base = endpoint(
             tool,
-            self.base_url.as_deref().or(env_url.as_deref()).unwrap_or(default_url),
+            self.base_url
+                .as_deref()
+                .or(env_url.as_deref())
+                .unwrap_or(default_url),
         )?;
         let owner = AgentCx::for_current_or_request();
         check_owner(tool, &owner)?;
-        Ok(Api { transport: self, tool, provider, key, base, owner, timeout })
+        Ok(Api {
+            transport: self,
+            tool,
+            provider,
+            key,
+            base,
+            owner,
+            timeout,
+        })
     }
 }
 
@@ -103,47 +119,87 @@ impl Api<'_> {
 
     pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
         // Paths are built by adapters, never accepted as model-facing arguments.
-        let url = self.base.join(path)
+        let url = self
+            .base
+            .join(path)
             .map_err(|_| Error::tool(self.tool, "invalid media endpoint path"))?;
         if url.origin() != self.base.origin() || !url.path().starts_with(self.base.path()) {
-            return Err(Error::tool(self.tool, "media request escaped its configured API base"));
+            return Err(Error::tool(
+                self.tool,
+                "media request escaped its configured API base",
+            ));
         }
         let operation = async {
             check_owner(self.tool, &self.owner)?;
             let client = self.owner.http().bind(&self.transport.client);
-            let request = client.post(url.as_str()).timeout(self.timeout).json(payload)?;
+            let request = client
+                .post(url.as_str())
+                .timeout(self.timeout)
+                .json(payload)?;
             let request = match self.provider {
                 "gemini" => request.try_header("x-goog-api-key", &self.key),
                 "anthropic" => request
                     .try_header("x-api-key", &self.key)
                     .and_then(|request| request.try_header("anthropic-version", "2023-06-01")),
                 _ => request.try_header("Authorization", format!("Bearer {}", self.key)),
-            }.map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
+            }
+            .map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
             let response = request.send().await.map_err(|error| {
-                Error::tool(self.tool, format!("{} request failed: {}", self.provider,
-                    self.scrub(&error.to_string(), 2048)))
+                Error::tool(
+                    self.tool,
+                    format!(
+                        "{} request failed: {}",
+                        self.provider,
+                        self.scrub(&error.to_string(), 2048)
+                    ),
+                )
             })?;
             let status = response.status();
             if !(200..300).contains(&status) {
-                let detail = response.text_limited(16 * 1024).await
+                let detail = response
+                    .text_limited(16 * 1024)
+                    .await
                     .map(|body| self.scrub(&body, 2048))
                     .unwrap_or_else(|_| "error body unavailable or too large".to_string());
-                return Err(Error::tool(self.tool,
-                    format!("{} HTTP {status}: {detail}", self.provider)));
+                return Err(Error::tool(
+                    self.tool,
+                    format!("{} HTTP {status}: {detail}", self.provider),
+                ));
             }
-            let content_type = response.headers().iter()
+            let content_type = response
+                .headers()
+                .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                .map(|(_, value)| value.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+                .map(|(_, value)| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase()
+                })
                 .unwrap_or_default();
             let bytes = response.bytes_limited(limit).await.map_err(|error| {
-                Error::tool(self.tool, format!("{} response failed: {}", self.provider,
-                    self.scrub(&error.to_string(), 2048)))
+                Error::tool(
+                    self.tool,
+                    format!(
+                        "{} response failed: {}",
+                        self.provider,
+                        self.scrub(&error.to_string(), 2048)
+                    ),
+                )
             })?;
             check_owner(self.tool, &self.owner)?;
             if bytes.is_empty() {
-                return Err(Error::tool(self.tool, "provider returned an empty response"));
+                return Err(Error::tool(
+                    self.tool,
+                    "provider returned an empty response",
+                ));
             }
-            Ok(Response { bytes, content_type })
+            Ok(Response {
+                bytes,
+                content_type,
+            })
         };
         let cancelled = async {
             let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
@@ -154,9 +210,15 @@ impl Api<'_> {
             match select(
                 Box::pin(self.owner.time().sleep(self.timeout)),
                 Box::pin(cancelled),
-            ).await {
-                Either::Left(_) => "media request timed out; the provider may already have processed it",
-                Either::Right(_) => "media request cancelled; the provider may already have processed it",
+            )
+            .await
+            {
+                Either::Left(_) => {
+                    "media request timed out; the provider may already have processed it"
+                }
+                Either::Right(_) => {
+                    "media request cancelled; the provider may already have processed it"
+                }
             }
         };
         match select(Box::pin(operation), Box::pin(watchdog)).await {
@@ -171,14 +233,19 @@ impl Api<'_> {
 
 pub(super) fn check_owner(tool: &str, owner: &AgentCx) -> Result<()> {
     if !owner.capabilities().io || !owner.capabilities().time {
-        return Err(Error::tool(tool, "media operations require I/O and timer capabilities"));
+        return Err(Error::tool(
+            tool,
+            "media operations require I/O and timer capabilities",
+        ));
     }
-    owner.checkpoint().map_err(|_| Error::tool(tool, "media operation cancelled"))
+    owner
+        .checkpoint()
+        .map_err(|_| Error::tool(tool, "media operation cancelled"))
 }
 
 fn endpoint(tool: &str, value: &str) -> Result<Url> {
-    let mut url = Url::parse(value.trim())
-        .map_err(|_| Error::tool(tool, "invalid media API base URL"))?;
+    let mut url =
+        Url::parse(value.trim()).map_err(|_| Error::tool(tool, "invalid media API base URL"))?;
     let loopback = match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
@@ -187,11 +254,15 @@ fn endpoint(tool: &str, value: &str) -> Result<Url> {
     };
     if url.host().is_none()
         || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
-        || !url.username().is_empty() || url.password().is_some()
-        || url.query().is_some() || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err(Error::tool(tool,
-            "media API base must use HTTPS (HTTP only on loopback), without credentials, query or fragment"));
+        return Err(Error::tool(
+            tool,
+            "media API base must use HTTPS (HTTP only on loopback), without credentials, query or fragment",
+        ));
     }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
@@ -206,7 +277,10 @@ pub(super) fn provider(tool: &str, value: &str) -> Result<&'static str> {
         "anthropic" => Ok("anthropic"),
         "gemini" | "google" => Ok("gemini"),
         "xai" | "x-ai" => Ok("xai"),
-        _ => Err(Error::tool(tool, "unsupported media provider (use openai, anthropic, gemini or xai)")),
+        _ => Err(Error::tool(
+            tool,
+            "unsupported media provider (use openai, anthropic, gemini or xai)",
+        )),
     }
 }
 
@@ -226,22 +300,34 @@ fn resolve_key(
     // An explicit empty key is a deliberate denial, not permission to fall back.
     let key = match explicit {
         Some(key) => Some(key.to_string()),
-        None => vars.iter().find_map(|name| lookup(name).filter(|key| !key.trim().is_empty())),
+        None => vars
+            .iter()
+            .find_map(|name| lookup(name).filter(|key| !key.trim().is_empty())),
     };
-    key.map(|key| key.trim().to_string()).filter(|key| !key.is_empty()).ok_or_else(|| {
-        let purpose = match tool {
-            "inspect_image" => "vision provider",
-            "generate_image" => "image generation provider",
-            _ => "TTS synthesis provider",
-        };
-        Error::tool(tool, format!("missing API key for {purpose} {provider} (set {})", vars.join(" or ")))
-    })
+    key.map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| {
+            let purpose = match tool {
+                "inspect_image" => "vision provider",
+                "generate_image" => "image generation provider",
+                _ => "TTS synthesis provider",
+            };
+            Error::tool(
+                tool,
+                format!(
+                    "missing API key for {purpose} {provider} (set {})",
+                    vars.join(" or ")
+                ),
+            )
+        })
 }
 
 pub(super) fn optional<'a>(args: &'a Value, tool: &str, field: &str) -> Result<Option<&'a str>> {
     match args.get(field) {
         None => Ok(None),
-        Some(value) => value.as_str().map(Some)
+        Some(value) => value
+            .as_str()
+            .map(Some)
             .ok_or_else(|| Error::tool(tool, format!("{field} must be a string"))),
     }
 }
@@ -250,16 +336,25 @@ pub(super) fn required<'a>(args: &'a Value, tool: &str, field: &str) -> Result<&
     let value = optional(args, tool, field)?
         .ok_or_else(|| Error::tool(tool, format!("missing required {field} parameter")))?;
     if value.trim().is_empty() || value.len() > 128 * 1024 {
-        return Err(Error::tool(tool, format!("{field} must be nonempty and at most 128 KiB")));
+        return Err(Error::tool(
+            tool,
+            format!("{field} must be nonempty and at most 128 KiB"),
+        ));
     }
     Ok(value)
 }
 
 pub(super) fn model_id<'a>(tool: &str, value: &'a str) -> Result<&'a str> {
-    if value.is_empty() || value.len() > 256
-        || !value.bytes().all(|ch| ch.is_ascii_alphanumeric() || b"-._/".contains(&ch))
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || b"-._/".contains(&ch))
     {
-        return Err(Error::tool(tool, "model must be a nonempty identifier of at most 256 ASCII bytes"));
+        return Err(Error::tool(
+            tool,
+            "model must be a nonempty identifier of at most 256 ASCII bytes",
+        ));
     }
     Ok(value)
 }
@@ -268,7 +363,10 @@ pub(super) fn gemini_path(tool: &str, model: &str) -> Result<String> {
     let model = model.strip_prefix("models/").unwrap_or(model);
     model_id(tool, model)?;
     if model.contains('/') || matches!(model, "." | "..") {
-        return Err(Error::tool(tool, "Gemini model must be a model ID, not a path"));
+        return Err(Error::tool(
+            tool,
+            "Gemini model must be a model ID, not a path",
+        ));
     }
     Ok(format!("models/{model}:generateContent"))
 }
@@ -276,7 +374,9 @@ pub(super) fn gemini_path(tool: &str, model: &str) -> Result<String> {
 pub(super) fn timeout(args: &Value, tool: &str, default_ms: u64) -> Result<Duration> {
     let ms = match args.get("timeout_ms") {
         None => default_ms,
-        Some(value) => value.as_u64().filter(|ms| (1..=300_000).contains(ms))
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| (1..=300_000).contains(ms))
             .ok_or_else(|| Error::tool(tool, "timeout_ms must be an integer in 1..=300000"))?,
     };
     Ok(Duration::from_millis(ms))
@@ -286,46 +386,67 @@ pub(super) fn read_capped(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>
     let initial = std::fs::metadata(path)
         .map_err(|error| Error::tool(tool, format!("cannot stat media file: {error}")))?;
     if !initial.is_file() || initial.len() > limit {
-        return Err(Error::tool(tool, format!("media input must be a regular file of at most {limit} bytes")));
+        return Err(Error::tool(
+            tool,
+            format!("media input must be a regular file of at most {limit} bytes"),
+        ));
     }
     // A regular file can be replaced between metadata and open. NONBLOCK keeps
     // a concurrent FIFO swap from hanging before the descriptor can be checked.
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
     let file = {
         use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty())
-            .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
+        let fd = rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
         std::fs::File::from(fd)
     };
     #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
     let file = std::fs::File::open(path)
         .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
-    let metadata = file.metadata()
+    let metadata = file
+        .metadata()
         .map_err(|error| Error::tool(tool, format!("cannot stat media file: {error}")))?;
     if !metadata.is_file() || metadata.len() > limit {
-        return Err(Error::tool(tool, format!("media input must be a regular file of at most {limit} bytes")));
+        return Err(Error::tool(
+            tool,
+            format!("media input must be a regular file of at most {limit} bytes"),
+        ));
     }
     let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
     if bytes.is_empty() || bytes.len() as u64 > limit {
-        return Err(Error::tool(tool, "media input is empty or grew beyond its byte limit"));
+        return Err(Error::tool(
+            tool,
+            "media input is empty or grew beyond its byte limit",
+        ));
     }
     Ok(bytes)
 }
 
 /// Basic container checks, not a full image decoder or decompression-bomb guard.
 pub(super) fn image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 45 && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+    if bytes.len() >= 45
+        && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         && bytes.get(12..16) == Some(b"IHDR".as_slice())
         && bytes.ends_with(b"\0\0\0\0IEND\xaeB`\x82")
     {
         Some("image/png")
-    } else if bytes.len() > 4 && bytes.starts_with(b"\xff\xd8\xff") && bytes.ends_with(b"\xff\xd9") {
+    } else if bytes.len() > 4 && bytes.starts_with(b"\xff\xd8\xff") && bytes.ends_with(b"\xff\xd9")
+    {
         Some("image/jpeg")
-    } else if bytes.len() >= 20 && bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP".as_slice()) {
+    } else if bytes.len() >= 20
+        && bytes.starts_with(b"RIFF")
+        && bytes.get(8..12) == Some(b"WEBP".as_slice())
+    {
         Some("image/webp")
-    } else if bytes.len() >= 14 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
+    } else if bytes.len() >= 14
+        && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"))
         && bytes.last() == Some(&b';')
     {
         Some("image/gif")
@@ -349,7 +470,11 @@ pub(super) mod tests {
 
     // A real TCP peer with a canned protocol response, not a replacement client.
     // Both accept and I/O are bounded so a failed assertion cannot hang the suite.
-    pub(crate) fn peer(status: u16, content_type: &str, body: Vec<u8>) -> (String, JoinHandle<Captured>) {
+    pub(crate) fn peer(
+        status: u16,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (String, JoinHandle<Captured>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let endpoint = format!("http://{}/v1/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -366,8 +491,12 @@ pub(super) mod tests {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
-            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let header_end = loop {
                 let mut chunk = [0; 4096];
@@ -380,10 +509,14 @@ pub(super) mod tests {
                 }
             };
             let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
-            let length: usize = headers.lines().find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
-            }).expect("content-length");
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .expect("content-length");
             assert!(length < 2 * 1024 * 1024);
             while request.len() - header_end < length {
                 let mut chunk = [0; 4096];
@@ -404,25 +537,56 @@ pub(super) mod tests {
 
     #[test]
     fn credentials_are_provider_scoped_and_explicit_empty_never_falls_back() {
-        assert!(resolve_key("inspect_image", "openai", Some(" "), |_| Some("ambient".into())).is_err());
-        assert_eq!(resolve_key("inspect_image", "gemini", None, |name| {
-            (name == "GOOGLE_API_KEY").then(|| " google-token ".into())
-        }).unwrap(), "google-token");
-        assert!(resolve_key("inspect_image", "anthropic", None, |name| {
-            (name == "OPENAI_API_KEY").then(|| "wrong-provider".into())
-        }).is_err());
+        assert!(
+            resolve_key("inspect_image", "openai", Some(" "), |_| Some(
+                "ambient".into()
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            resolve_key("inspect_image", "gemini", None, |name| {
+                (name == "GOOGLE_API_KEY").then(|| " google-token ".into())
+            })
+            .unwrap(),
+            "google-token"
+        );
+        assert!(
+            resolve_key("inspect_image", "anthropic", None, |name| {
+                (name == "OPENAI_API_KEY").then(|| "wrong-provider".into())
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn endpoints_and_model_paths_cannot_redirect_credentials() {
-        for bad in ["http://example.com/v1", "https://user:secret@example.com/", "https://example.com/?key=x", "file:///tmp/api", "https://example.com/#x"] {
+        for bad in [
+            "http://example.com/v1",
+            "https://user:secret@example.com/",
+            "https://example.com/?key=x",
+            "file:///tmp/api",
+            "https://example.com/#x",
+        ] {
             assert!(endpoint("inspect_image", bad).is_err(), "{bad}");
         }
-        assert_eq!(endpoint("inspect_image", "http://127.0.0.1:1234/v1").unwrap().path(), "/v1/");
-        for bad in ["../../attack", "models/../attack", "x?key=secret", "https://evil"] {
+        assert_eq!(
+            endpoint("inspect_image", "http://127.0.0.1:1234/v1")
+                .unwrap()
+                .path(),
+            "/v1/"
+        );
+        for bad in [
+            "../../attack",
+            "models/../attack",
+            "x?key=secret",
+            "https://evil",
+        ] {
             assert!(gemini_path("inspect_image", bad).is_err());
         }
-        assert_eq!(gemini_path("inspect_image", "models/gemini-2.5-flash").unwrap(), "models/gemini-2.5-flash:generateContent");
+        assert_eq!(
+            gemini_path("inspect_image", "models/gemini-2.5-flash").unwrap(),
+            "models/gemini-2.5-flash:generateContent"
+        );
     }
 
     #[test]

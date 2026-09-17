@@ -81,8 +81,12 @@ impl GenerateImageTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GenerateImageTool {
-    fn name(&self) -> &str { NAME }
-    fn label(&self) -> &str { "Generate Image" }
+    fn name(&self) -> &str {
+        NAME
+    }
+    fn label(&self) -> &str {
+        "Generate Image"
+    }
     fn description(&self) -> &str {
         "Generate or edit an image through OpenAI, Gemini or xAI and save the actual provider bytes. Supply image_path or ordered image_paths for editing; OpenAI GPT image models also support mask_path. Existing files are never overwritten."
     }
@@ -109,7 +113,9 @@ impl Tool for GenerateImageTool {
     }
 
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read().union(ToolEffects::write()).union(ToolEffects::network())
+        ToolEffects::read()
+            .union(ToolEffects::write())
+            .union(ToolEffects::network())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -122,31 +128,61 @@ impl Tool for GenerateImageTool {
         let prompt = transport::required(&args, NAME, "prompt")?;
         let requested = transport::optional(&args, NAME, "output_path")?;
         let env_provider = std::env::var("PI_IMAGE_GEN_PROVIDER").ok();
-        let provider = transport::provider(NAME, transport::optional(&args, NAME, "provider")?
-            .or(self.default_provider.as_deref()).or(env_provider.as_deref()).unwrap_or("openai"))?;
+        let provider = transport::provider(
+            NAME,
+            transport::optional(&args, NAME, "provider")?
+                .or(self.default_provider.as_deref())
+                .or(env_provider.as_deref())
+                .unwrap_or("openai"),
+        )?;
         let fallback_model = match provider {
             "openai" => "gpt-image-1.5",
             "gemini" => "gemini-3.1-flash-image",
             "xai" => "grok-imagine-image-2.0",
-            _ => return Err(Error::tool(NAME, "image generation provider must be openai, gemini or xai")),
+            _ => {
+                return Err(Error::tool(
+                    NAME,
+                    "image generation provider must be openai, gemini or xai",
+                ));
+            }
         };
         let env_model = std::env::var("PI_IMAGE_GEN_MODEL").ok();
-        let model = transport::model_id(NAME, transport::optional(&args, NAME, "model")?
-            .or(self.default_model.as_deref()).or(env_model.as_deref()).unwrap_or(fallback_model))?;
+        let model = transport::model_id(
+            NAME,
+            transport::optional(&args, NAME, "model")?
+                .or(self.default_model.as_deref())
+                .or(env_model.as_deref())
+                .unwrap_or(fallback_model),
+        )?;
         let duration = transport::timeout(&args, NAME, 180_000)?;
         let (mut endpoint, mut payload) = request(provider, model, prompt, &args)?;
-        let is_mock = self.mock_mode.unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
-        let api = if is_mock { None } else {
-            Some(self.transport.api(NAME, provider, self.api_key.as_deref(), duration)?)
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
+        let api = if is_mock {
+            None
+        } else {
+            Some(
+                self.transport
+                    .api(NAME, provider, self.api_key.as_deref(), duration)?,
+            )
         };
         artifact::preflight(&self.cwd, requested, NAME)?;
         let reference_count = inputs::attach(
-            &self.cwd, provider, model, &args, &mut endpoint, &mut payload,
+            &self.cwd,
+            provider,
+            model,
+            &args,
+            &mut endpoint,
+            &mut payload,
         )?;
         let (bytes, mime) = match api.as_ref() {
             None => (super::MIN_VALID_PNG.to_vec(), "image/png"),
             Some(api) => {
-                let response = api.post(&endpoint, &payload, MAX_RESPONSE_BYTES).await?.json(NAME)?;
+                let response = api
+                    .post(&endpoint, &payload, MAX_RESPONSE_BYTES)
+                    .await?
+                    .json(NAME)?;
                 parse_image(provider, &response)?
             }
         };
@@ -155,14 +191,33 @@ impl Tool for GenerateImageTool {
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
             "image/gif" => "gif",
-            _ => return Err(Error::tool(NAME, "provider returned an unsupported image format")),
+            _ => {
+                return Err(Error::tool(
+                    NAME,
+                    "provider returned an unsupported image format",
+                ));
+            }
         };
-        let path = artifact::publish(&self.cwd, requested, "images/generated", extension,
-            &bytes, api.as_ref().map(|api| &api.owner), NAME)?;
+        let path = artifact::publish(
+            &self.cwd,
+            requested,
+            "images/generated",
+            extension,
+            &bytes,
+            api.as_ref().map(|api| &api.owner),
+            NAME,
+        )?;
         let message = if is_mock {
-            format!("Successfully generated image fixture and saved to {} (mock; no provider request)", path.display())
+            format!(
+                "Successfully generated image fixture and saved to {} (mock; no provider request)",
+                path.display()
+            )
         } else {
-            format!("Generated image and saved to {}\nProvider: {provider} | Model: {model} | Format: {mime} | Bytes: {}", path.display(), bytes.len())
+            format!(
+                "Generated image and saved to {}\nProvider: {provider} | Model: {model} | Format: {mime} | Bytes: {}",
+                path.display(),
+                bytes.len()
+            )
         };
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(message))],
@@ -185,12 +240,18 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
     let resolution = transport::optional(args, NAME, "resolution")?;
     let quality = transport::optional(args, NAME, "quality")?;
     if ratio.is_some_and(|ratio| !COMMON_RATIOS.contains(&ratio)) {
-        return Err(Error::tool(NAME, "unsupported aspect_ratio; use a ratio from the tool schema"));
+        return Err(Error::tool(
+            NAME,
+            "unsupported aspect_ratio; use a ratio from the tool schema",
+        ));
     }
     match provider {
         "openai" => {
             if ratio.is_some() || resolution.is_some() {
-                return Err(Error::tool(NAME, "OpenAI uses size, not aspect_ratio or resolution"));
+                return Err(Error::tool(
+                    NAME,
+                    "OpenAI uses size, not aspect_ratio or resolution",
+                ));
             }
             let size = size.unwrap_or("1024x1024");
             validate_size(size)?;
@@ -199,7 +260,10 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
                 body["output_format"] = json!("png");
                 if let Some(quality) = quality {
                     if !matches!(quality, "auto" | "low" | "medium" | "high") {
-                        return Err(Error::tool(NAME, "GPT image quality must be auto, low, medium or high"));
+                        return Err(Error::tool(
+                            NAME,
+                            "GPT image quality must be auto, low, medium or high",
+                        ));
                     }
                     body["quality"] = json!(quality);
                 }
@@ -207,21 +271,33 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
                 body["response_format"] = json!("b64_json");
                 if let Some(quality) = quality {
                     if quality != "standard" && !(model == "dall-e-3" && quality == "hd") {
-                        return Err(Error::tool(NAME, "DALL-E quality must be standard (or hd for dall-e-3)"));
+                        return Err(Error::tool(
+                            NAME,
+                            "DALL-E quality must be standard (or hd for dall-e-3)",
+                        ));
                     }
                     body["quality"] = json!(quality);
                 }
             } else {
-                return Err(Error::tool(NAME, "OpenAI image model must be gpt-image-* or dall-e-2/dall-e-3"));
+                return Err(Error::tool(
+                    NAME,
+                    "OpenAI image model must be gpt-image-* or dall-e-2/dall-e-3",
+                ));
             }
             Ok(("images/generations".into(), body))
         }
         "gemini" => {
             if size.is_some() || quality.is_some() {
-                return Err(Error::tool(NAME, "Gemini uses aspect_ratio and resolution, not size or quality"));
+                return Err(Error::tool(
+                    NAME,
+                    "Gemini uses aspect_ratio and resolution, not size or quality",
+                ));
             }
             if model.starts_with("imagen-") {
-                return Err(Error::tool(NAME, "use a Gemini image model with generateContent; this adapter does not support Imagen predict"));
+                return Err(Error::tool(
+                    NAME,
+                    "use a Gemini image model with generateContent; this adapter does not support Imagen predict",
+                ));
             }
             // REST responseFormat.image uses protobuf enum names, unlike the
             // older imageConfig string fields and the SDK's convenience values.
@@ -243,21 +319,32 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
                     "1K" => "IMAGE_SIZE_ONE_K",
                     "2K" => "IMAGE_SIZE_TWO_K",
                     "4K" => "IMAGE_SIZE_FOUR_K",
-                    _ => return Err(Error::tool(NAME, "Gemini resolution must be 512, 1K, 2K or 4K")),
+                    _ => {
+                        return Err(Error::tool(
+                            NAME,
+                            "Gemini resolution must be 512, 1K, 2K or 4K",
+                        ));
+                    }
                 };
                 image_config["imageSize"] = json!(image_size);
             }
-            Ok((transport::gemini_path(NAME, model)?, json!({
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseModalities": ["TEXT", "IMAGE"],
-                    "responseFormat": {"image": image_config}
-                }
-            })))
+            Ok((
+                transport::gemini_path(NAME, model)?,
+                json!({
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["TEXT", "IMAGE"],
+                        "responseFormat": {"image": image_config}
+                    }
+                }),
+            ))
         }
         "xai" => {
             if size.is_some() {
-                return Err(Error::tool(NAME, "xAI uses aspect_ratio and resolution, not pixel size"));
+                return Err(Error::tool(
+                    NAME,
+                    "xAI uses aspect_ratio and resolution, not pixel size",
+                ));
             }
             let mut body = json!({"model": model, "prompt": prompt, "n": 1,
                 "response_format": "b64_json", "aspect_ratio": ratio.unwrap_or("1:1")});
@@ -280,50 +367,84 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
 }
 
 fn validate_size(size: &str) -> Result<()> {
-    if size == "auto" { return Ok(()); }
+    if size == "auto" {
+        return Ok(());
+    }
     if let Some((width, height)) = size.split_once('x')
         && let (Ok(width), Ok(height)) = (width.parse::<u32>(), height.parse::<u32>())
-        && (64..=8192).contains(&width) && (64..=8192).contains(&height)
+        && (64..=8192).contains(&width)
+        && (64..=8192).contains(&height)
         && u64::from(width) * u64::from(height) <= 32 * 1024 * 1024
     {
         return Ok(());
     }
-    Err(Error::tool(NAME, "size must be auto or WIDTHxHEIGHT (64..8192 per side, at most 32 megapixels); model-specific limits also apply"))
+    Err(Error::tool(
+        NAME,
+        "size must be auto or WIDTHxHEIGHT (64..8192 per side, at most 32 megapixels); model-specific limits also apply",
+    ))
 }
 
 fn parse_image(provider: &str, response: &Value) -> Result<(Vec<u8>, &'static str)> {
     let (encoded, declared_mime) = if provider == "gemini" {
-        if response.pointer("/promptFeedback/blockReason").is_some_and(|value| !value.is_null()) {
-            return Err(Error::tool(NAME, "image request was blocked by the provider"));
+        if response
+            .pointer("/promptFeedback/blockReason")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(Error::tool(
+                NAME,
+                "image request was blocked by the provider",
+            ));
         }
-        let candidate = response.pointer("/candidates/0")
+        let candidate = response
+            .pointer("/candidates/0")
             .ok_or_else(|| Error::tool(NAME, "image provider returned no candidates"))?;
         if candidate["finishReason"] != "STOP" {
-            return Err(Error::tool(NAME, "image response was refused, incomplete, or lacked a completion marker"));
+            return Err(Error::tool(
+                NAME,
+                "image response was refused, incomplete, or lacked a completion marker",
+            ));
         }
-        let images: Vec<_> = candidate["content"]["parts"].as_array().into_iter().flatten()
+        let images: Vec<_> = candidate["content"]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .filter(|part| part["thought"] != true)
             .filter_map(|part| part.get("inlineData"))
             .collect();
         if images.len() != 1 {
-            return Err(Error::tool(NAME, "expected exactly one final image, not text-only or multiple image output"));
+            return Err(Error::tool(
+                NAME,
+                "expected exactly one final image, not text-only or multiple image output",
+            ));
         }
         (images[0]["data"].as_str(), images[0]["mimeType"].as_str())
     } else {
-        let data = response["data"].as_array()
+        let data = response["data"]
+            .as_array()
             .filter(|data| data.len() == 1)
             .ok_or_else(|| Error::tool(NAME, "image provider did not return exactly one image"))?;
         if data[0]["respect_moderation"] == false || response["respect_moderation"] == false {
-            return Err(Error::tool(NAME, "image response was filtered by provider moderation"));
+            return Err(Error::tool(
+                NAME,
+                "image response was filtered by provider moderation",
+            ));
         }
         (data[0]["b64_json"].as_str(), None)
     };
-    let encoded = encoded.ok_or_else(|| Error::tool(NAME,
-        "provider returned no inline image bytes; hosted URL downloads are not followed"))?;
+    let encoded = encoded.ok_or_else(|| {
+        Error::tool(
+            NAME,
+            "provider returned no inline image bytes; hosted URL downloads are not followed",
+        )
+    })?;
     if encoded.is_empty() || encoded.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-        return Err(Error::tool(NAME, "provider image is empty or exceeds 20 MiB"));
+        return Err(Error::tool(
+            NAME,
+            "provider image is empty or exceeds 20 MiB",
+        ));
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
         .map_err(|_| Error::tool(NAME, "provider image contains invalid base64"))?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(Error::tool(NAME, "provider image exceeds 20 MiB"));
@@ -331,44 +452,101 @@ fn parse_image(provider: &str, response: &Value) -> Result<(Vec<u8>, &'static st
     let mime = transport::image_mime(&bytes)
         .ok_or_else(|| Error::tool(NAME, "provider bytes are not a supported image container"))?;
     if declared_mime.is_some_and(|declared| declared != mime) {
-        return Err(Error::tool(NAME, "provider image MIME type does not match the received bytes"));
+        return Err(Error::tool(
+            NAME,
+            "provider image MIME type does not match the received bytes",
+        ));
     }
     Ok((bytes, mime))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::transport::tests::peer;
+    use super::*;
 
     const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==";
 
     #[test]
     fn generation_calls_each_native_api_and_publishes_the_received_pixels() {
         let cases = [
-            ("openai", "gpt-image-1.5", json!({"data":[{"b64_json":RED_PNG}]})),
-            ("xai", "grok-imagine-image-2.0", json!({"data":[{"b64_json":RED_PNG,"respect_moderation":true}]})),
-            ("gemini", "gemini-3.1-flash-image", json!({"candidates":[{"finishReason":"STOP","content":{"parts":[
-                {"thought":true,"inlineData":{"mimeType":"image/png","data":"not-the-final-image"}},
-                {"inlineData":{"mimeType":"image/png","data":RED_PNG}}
-            ]}}]})),
+            (
+                "openai",
+                "gpt-image-1.5",
+                json!({"data":[{"b64_json":RED_PNG}]}),
+            ),
+            (
+                "xai",
+                "grok-imagine-image-2.0",
+                json!({"data":[{"b64_json":RED_PNG,"respect_moderation":true}]}),
+            ),
+            (
+                "gemini",
+                "gemini-3.1-flash-image",
+                json!({"candidates":[{"finishReason":"STOP","content":{"parts":[
+                    {"thought":true,"inlineData":{"mimeType":"image/png","data":"not-the-final-image"}},
+                    {"inlineData":{"mimeType":"image/png","data":RED_PNG}}
+                ]}}]}),
+            ),
         ];
         for (provider, model, response) in cases {
-            let (endpoint, worker) = peer(200, "application/json", serde_json::to_vec(&response).unwrap());
+            let (endpoint, worker) = peer(
+                200,
+                "application/json",
+                serde_json::to_vec(&response).unwrap(),
+            );
             let dir = tempfile::tempdir().unwrap();
-            let tool = GenerateImageTool::with_defaults(dir.path(), Some(provider.into()), Some(model.into()))
-                .with_mock(false).with_api_key(Some("generation-test-key".into())).with_base_url(endpoint);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-            let output = runtime.block_on(tool.execute("generate", json!({"prompt":"Draw a red square","output_path":"out.png"}), None)).unwrap();
-            assert_eq!(std::fs::read(dir.path().join("out.png")).unwrap(), base64::engine::general_purpose::STANDARD.decode(RED_PNG).unwrap());
+            let tool = GenerateImageTool::with_defaults(
+                dir.path(),
+                Some(provider.into()),
+                Some(model.into()),
+            )
+            .with_mock(false)
+            .with_api_key(Some("generation-test-key".into()))
+            .with_base_url(endpoint);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            let output = runtime
+                .block_on(tool.execute(
+                    "generate",
+                    json!({"prompt":"Draw a red square","output_path":"out.png"}),
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("out.png")).unwrap(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(RED_PNG)
+                    .unwrap()
+            );
             assert_eq!(output.details.as_ref().unwrap()["mock"], false);
             assert_eq!(output.details.as_ref().unwrap()["model"], model);
             let request = worker.join().unwrap();
             if provider == "gemini" {
-                assert!(request.headers.starts_with(&format!("POST /v1/models/{model}:generateContent ")));
-                assert_eq!(request.body.pointer("/contents/0/parts/0/text").unwrap(), "Draw a red square");
-                assert_eq!(request.body.pointer("/generationConfig/responseFormat/image/aspectRatio").unwrap(), "ASPECT_RATIO_ONE_BY_ONE");
-                assert_eq!(request.body.pointer("/generationConfig/responseFormat/image/delivery").unwrap(), "INLINE");
+                assert!(
+                    request
+                        .headers
+                        .starts_with(&format!("POST /v1/models/{model}:generateContent "))
+                );
+                assert_eq!(
+                    request.body.pointer("/contents/0/parts/0/text").unwrap(),
+                    "Draw a red square"
+                );
+                assert_eq!(
+                    request
+                        .body
+                        .pointer("/generationConfig/responseFormat/image/aspectRatio")
+                        .unwrap(),
+                    "ASPECT_RATIO_ONE_BY_ONE"
+                );
+                assert_eq!(
+                    request
+                        .body
+                        .pointer("/generationConfig/responseFormat/image/delivery")
+                        .unwrap(),
+                    "INLINE"
+                );
             } else {
                 assert!(request.headers.starts_with("POST /v1/images/generations "));
                 assert_eq!(request.body["prompt"], "Draw a red square");
@@ -386,35 +564,84 @@ mod tests {
     #[test]
     fn image_editing_sends_gemini_the_real_input_image() {
         let response = json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"inlineData":{"mimeType":"image/png","data":RED_PNG}}]}}]});
-        let (endpoint, worker) = peer(200, "application/json", serde_json::to_vec(&response).unwrap());
+        let (endpoint, worker) = peer(
+            200,
+            "application/json",
+            serde_json::to_vec(&response).unwrap(),
+        );
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("source.png"), super::super::MIN_VALID_PNG).unwrap();
         let tool = GenerateImageTool::with_provider(dir.path(), Some("gemini".into()))
-            .with_mock(false).with_api_key(Some("editing-test-key".into())).with_base_url(endpoint);
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let output = runtime.block_on(tool.execute("edit", json!({"prompt":"Make it red","image_path":"source.png"}), None)).unwrap();
+            .with_mock(false)
+            .with_api_key(Some("editing-test-key".into()))
+            .with_base_url(endpoint);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(
+                "edit",
+                json!({"prompt":"Make it red","image_path":"source.png"}),
+                None,
+            ))
+            .unwrap();
         assert_eq!(output.details.as_ref().unwrap()["edited"], true);
         assert_eq!(output.details.as_ref().unwrap()["reference_count"], 1);
         let request = worker.join().unwrap();
-        let sent = request.body.pointer("/contents/0/parts/0/inlineData/data").unwrap().as_str().unwrap();
-        assert_eq!(base64::engine::general_purpose::STANDARD.decode(sent).unwrap(), super::super::MIN_VALID_PNG);
-        assert!(request.body.pointer("/generationConfig/responseFormat/image/aspectRatio").is_none());
-        assert_eq!(std::fs::read(dir.path().join("source.png")).unwrap(), super::super::MIN_VALID_PNG);
+        let sent = request
+            .body
+            .pointer("/contents/0/parts/0/inlineData/data")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(sent)
+                .unwrap(),
+            super::super::MIN_VALID_PNG
+        );
+        assert!(
+            request
+                .body
+                .pointer("/generationConfig/responseFormat/image/aspectRatio")
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("source.png")).unwrap(),
+            super::super::MIN_VALID_PNG
+        );
     }
 
     #[test]
     fn image_failures_never_create_a_success_artifact() {
-        for response in [json!({"data":[{"url":"http://127.0.0.1/private"}]}),
+        for response in [
+            json!({"data":[{"url":"http://127.0.0.1/private"}]}),
             json!({"data":[{"b64_json":"invalid"}]}),
             json!({"data":[{"b64_json":RED_PNG,"respect_moderation":false}]}),
-            json!({"data":[]})]
-        {
-            let (endpoint, worker) = peer(200, "application/json", serde_json::to_vec(&response).unwrap());
+            json!({"data":[]}),
+        ] {
+            let (endpoint, worker) = peer(
+                200,
+                "application/json",
+                serde_json::to_vec(&response).unwrap(),
+            );
             let dir = tempfile::tempdir().unwrap();
-            let tool = GenerateImageTool::new(dir.path()).with_mock(false)
-                .with_api_key(Some("generation-test-key".into())).with_base_url(endpoint);
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-            assert!(runtime.block_on(tool.execute("bad-image", json!({"prompt":"test","output_path":"out.png"}), None)).is_err());
+            let tool = GenerateImageTool::new(dir.path())
+                .with_mock(false)
+                .with_api_key(Some("generation-test-key".into()))
+                .with_base_url(endpoint);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(tool.execute(
+                        "bad-image",
+                        json!({"prompt":"test","output_path":"out.png"}),
+                        None
+                    ))
+                    .is_err()
+            );
             assert!(!dir.path().join("out.png").exists());
             worker.join().unwrap();
         }
@@ -422,14 +649,60 @@ mod tests {
 
     #[test]
     fn provider_options_are_not_silently_ignored() {
-        assert!(request("xai", "grok-imagine-image-2.0", "test", &json!({"size":"512x512"})).is_err());
-        assert!(request("gemini", "gemini-3.1-flash-image", "test", &json!({"quality":"high"})).is_err());
-        assert!(request("openai", "gpt-image-1.5", "test", &json!({"size":"../../wrong"})).is_err());
-        let (_, dalle) = request("openai", "dall-e-3", "test", &json!({"size":"1792x1024","quality":"hd"})).unwrap();
+        assert!(
+            request(
+                "xai",
+                "grok-imagine-image-2.0",
+                "test",
+                &json!({"size":"512x512"})
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                "gemini",
+                "gemini-3.1-flash-image",
+                "test",
+                &json!({"quality":"high"})
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                "openai",
+                "gpt-image-1.5",
+                "test",
+                &json!({"size":"../../wrong"})
+            )
+            .is_err()
+        );
+        let (_, dalle) = request(
+            "openai",
+            "dall-e-3",
+            "test",
+            &json!({"size":"1792x1024","quality":"hd"}),
+        )
+        .unwrap();
         assert_eq!(dalle["response_format"], "b64_json");
         assert!(dalle.get("output_format").is_none());
-        let (_, gemini) = request("gemini", "gemini-3.1-flash-image", "test", &json!({"aspect_ratio":"16:9","resolution":"2K"})).unwrap();
-        assert_eq!(gemini.pointer("/generationConfig/responseFormat/image/aspectRatio").unwrap(), "ASPECT_RATIO_SIXTEEN_BY_NINE");
-        assert_eq!(gemini.pointer("/generationConfig/responseFormat/image/imageSize").unwrap(), "IMAGE_SIZE_TWO_K");
+        let (_, gemini) = request(
+            "gemini",
+            "gemini-3.1-flash-image",
+            "test",
+            &json!({"aspect_ratio":"16:9","resolution":"2K"}),
+        )
+        .unwrap();
+        assert_eq!(
+            gemini
+                .pointer("/generationConfig/responseFormat/image/aspectRatio")
+                .unwrap(),
+            "ASPECT_RATIO_SIXTEEN_BY_NINE"
+        );
+        assert_eq!(
+            gemini
+                .pointer("/generationConfig/responseFormat/image/imageSize")
+                .unwrap(),
+            "IMAGE_SIZE_TWO_K"
+        );
     }
 }

@@ -128,7 +128,9 @@ impl ComputerTool {
     pub fn with_helper_path(mut self, name: &str, path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         if !native::HELPERS.contains(&name) || !path.is_absolute() {
-            return Err(error("helper override requires a known helper and an absolute path"));
+            return Err(error(
+                "helper override requires a known helper and an absolute path",
+            ));
         }
         self.helpers.insert(name.to_string(), path);
         Ok(self)
@@ -147,25 +149,36 @@ impl ComputerTool {
         // Never duplicate typed text, clipboard contents, window titles or
         // screenshots in a long-lived audit log. Retain only bounded metadata.
         let timestamp_ms = u64::try_from(
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-        ).unwrap_or(u64::MAX);
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         let details = json!({
             "outcome": outcome, "mock": mock,
             "window_id": args.get("window_id").and_then(Value::as_u64),
             "display_id": args.get("display_id").and_then(Value::as_u64),
             "text_bytes": args.get("text").and_then(Value::as_str).map(str::len)
         });
-        let mut log = self.audit_log.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut log = self
+            .audit_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if log.len() == 256 {
             log.pop_front();
         }
         log.push_back(ComputerAuditEntry {
-            timestamp_ms, action: action.chars().take(64).collect(), details, allowed,
+            timestamp_ms,
+            action: action.chars().take(64).collect(),
+            details,
+            allowed,
         });
     }
 
     fn is_mock(&self) -> bool {
-        self.mock_mode.unwrap_or_else(|| std::env::var("PI_COMPUTER_MOCK").as_deref() == Ok("1"))
+        self.mock_mode
+            .unwrap_or_else(|| std::env::var("PI_COMPUTER_MOCK").as_deref() == Ok("1"))
     }
 
     async fn authorize(&self, action: &str, args: &Value) -> Result<()> {
@@ -176,21 +189,35 @@ impl ComputerTool {
             "desktop input requires host approval; no approval handler is installed. The host may install with_approval_handler, or explicitly grant session-wide input with computer.requireApproval=false. Tool arguments cannot grant permission",
         ))?;
         let id = uuid::Uuid::new_v4().to_string();
-        let request = AskRequest { questions: vec![AskQuestion {
-            id: Some(id.clone()), header: Some("Desktop permission".into()),
-            question: format!("Allow this desktop action once? It can affect the active application.\n{}", args),
-            options: vec![
-                AskOption { label: "Deny".into(), description: None },
-                AskOption { label: "Allow once".into(), description: None },
-            ],
-            recommended: Some(0), multi: false,
-        }] };
+        let request = AskRequest {
+            questions: vec![AskQuestion {
+                id: Some(id.clone()),
+                header: Some("Desktop permission".into()),
+                question: format!(
+                    "Allow this desktop action once? It can affect the active application.\n{}",
+                    args
+                ),
+                options: vec![
+                    AskOption {
+                        label: "Deny".into(),
+                        description: None,
+                    },
+                    AskOption {
+                        label: "Allow once".into(),
+                        description: None,
+                    },
+                ],
+                recommended: Some(0),
+                multi: false,
+            }],
+        };
         let response = handler(request).await?;
         if response.dismissed || response.answers.len() != 1 {
             return Err(error("desktop action was not approved"));
         }
         let answer = &response.answers[0];
-        if answer.question_id != id || answer.other.is_some()
+        if answer.question_id != id
+            || answer.other.is_some()
             || answer.selected.as_slice() != ["Allow once"]
         {
             return Err(error("desktop action was not approved"));
@@ -202,8 +229,12 @@ impl ComputerTool {
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ComputerTool {
-    fn name(&self) -> &str { "computer" }
-    fn label(&self) -> &str { "Computer" }
+    fn name(&self) -> &str {
+        "computer"
+    }
+    fn label(&self) -> &str {
+        "Computer"
+    }
     fn description(&self) -> &str {
         "Inspect the authorized desktop, capture actual screenshots, and perform OS input/clipboard actions. Native capabilities depend on the desktop backend and installed helpers. Input requires trusted host approval; unavailable operations fail explicitly."
     }
@@ -227,14 +258,21 @@ impl Tool for ComputerTool {
         })
     }
     fn effects(&self) -> ToolEffects {
-        ToolEffects::read().union(ToolEffects::write()).union(ToolEffects::process())
+        ToolEffects::read()
+            .union(ToolEffects::write())
+            .union(ToolEffects::process())
     }
 
     async fn execute(
-        &self, _tool_call_id: &str, args: Value,
+        &self,
+        _tool_call_id: &str,
+        args: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("unknown");
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
         let mock = self.is_mock();
         let duration = match native::validate(&args) {
             Ok(duration) => duration,
@@ -245,7 +283,13 @@ impl Tool for ComputerTool {
         };
         if mock {
             let result = mock::execute(self, &args);
-            self.record_audit(action, &args, true, if result.is_ok() { "success" } else { "error" }, true);
+            self.record_audit(
+                action,
+                &args,
+                true,
+                if result.is_ok() { "success" } else { "error" },
+                true,
+            );
             return result;
         }
         let owner = AgentCx::for_current_or_request();
@@ -255,8 +299,10 @@ impl Tool for ComputerTool {
             self.authorize(action, &args).await?;
             allowed = true;
             // This owned guard is Send, unlike asupersync's borrowed guard.
-            let mut state = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.state), owner.cx())
-                .await.map_err(|_| error("desktop session lock cancelled"))?;
+            let mut state =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.state), owner.cx())
+                    .await
+                    .map_err(|_| error("desktop session lock cancelled"))?;
             native::execute(&owner, &self.cwd, &self.helpers, &mut state, &args).await
         };
         let cancelled = async {
@@ -266,26 +312,55 @@ impl Tool for ComputerTool {
         };
         let watchdog = async {
             match select(Box::pin(owner.time().sleep(duration)), Box::pin(cancelled)).await {
-                Either::Left(_) => "desktop action timed out; OS side effects may already have occurred",
-                Either::Right(_) => "desktop action cancelled; OS side effects may already have occurred",
+                Either::Left(_) => {
+                    "desktop action timed out; OS side effects may already have occurred"
+                }
+                Either::Right(_) => {
+                    "desktop action cancelled; OS side effects may already have occurred"
+                }
             }
         };
         let result = match select(Box::pin(operation), Box::pin(watchdog)).await {
             Either::Left((result, _)) => result,
-            Either::Right((message, pending)) => { drop(pending); Err(error(message)) }
+            Either::Right((message, pending)) => {
+                drop(pending);
+                Err(error(message))
+            }
         };
-        self.record_audit(action, &args, allowed, if result.is_ok() { "success" } else { "error" }, false);
+        self.record_audit(
+            action,
+            &args,
+            allowed,
+            if result.is_ok() { "success" } else { "error" },
+            false,
+        );
         result
     }
 }
 
 fn mutating(action: &str) -> bool {
-    matches!(action, "mouse_move" | "mouse_click" | "mouse_drag" | "key_type" | "key_press" | "clipboard_write" | "scroll" | "focus_window")
+    matches!(
+        action,
+        "mouse_move"
+            | "mouse_click"
+            | "mouse_drag"
+            | "key_type"
+            | "key_press"
+            | "clipboard_write"
+            | "scroll"
+            | "focus_window"
+    )
 }
-fn error(message: impl Into<String>) -> Error { Error::tool("computer", message) }
+fn error(message: impl Into<String>) -> Error {
+    Error::tool("computer", message)
+}
 fn output(text: String, mut details: Value, mock: bool) -> ToolOutput {
     details["mock"] = json!(mock);
-    ToolOutput { content: vec![ContentBlock::Text(TextContent::new(text))], details: Some(details), is_error: false }
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(text))],
+        details: Some(details),
+        is_error: false,
+    }
 }
 
 #[cfg(test)]
@@ -293,33 +368,58 @@ mod tests {
     use super::*;
     #[test]
     fn model_flags_cannot_authorize_input() {
-        assert!(native::validate(&json!({"action":"key_type","text":"test","confirmed":true})).is_err());
+        assert!(
+            native::validate(&json!({"action":"key_type","text":"test","confirmed":true})).is_err()
+        );
         let tool = ComputerTool::new(Path::new("."));
-        assert!(futures::executor::block_on(tool.authorize("key_type", &json!({"text":"test"}))).is_err());
+        assert!(
+            futures::executor::block_on(tool.authorize("key_type", &json!({"text":"test"})))
+                .is_err()
+        );
     }
     #[test]
     fn audit_is_bounded_and_excludes_private_payloads() {
         let tool = ComputerTool::new(Path::new("."));
         for _ in 0..300 {
-            tool.record_audit("key_type", &json!({"text":"private-secret"}), false, "denied", false);
+            tool.record_audit(
+                "key_type",
+                &json!({"text":"private-secret"}),
+                false,
+                "denied",
+                false,
+            );
         }
         let entries = tool.get_audit_log();
         assert_eq!(entries.len(), 256);
         assert!(!entries[0].allowed);
-        assert!(!serde_json::to_string(&entries).unwrap().contains("private-secret"));
+        assert!(
+            !serde_json::to_string(&entries)
+                .unwrap()
+                .contains("private-secret")
+        );
     }
     #[test]
     fn only_exact_host_selection_approves() {
         use crate::ask::{AskAnswer, AskResponse};
         for selected in ["Deny", "Allow once"] {
-            let handler: AskHandler = Arc::new(move |request| Box::pin(async move {
-                Ok(AskResponse { dismissed: false, answers: vec![AskAnswer {
-                    question_id: request.questions[0].id.clone().unwrap(),
-                    selected: vec![selected.into()], other: None,
-                }] })
-            }));
+            let handler: AskHandler = Arc::new(move |request| {
+                Box::pin(async move {
+                    Ok(AskResponse {
+                        dismissed: false,
+                        answers: vec![AskAnswer {
+                            question_id: request.questions[0].id.clone().unwrap(),
+                            selected: vec![selected.into()],
+                            other: None,
+                        }],
+                    })
+                })
+            });
             let tool = ComputerTool::new(Path::new(".")).with_approval_handler(handler);
-            assert_eq!(futures::executor::block_on(tool.authorize("key_press", &json!({"key":"Return"}))).is_ok(), selected == "Allow once");
+            assert_eq!(
+                futures::executor::block_on(tool.authorize("key_press", &json!({"key":"Return"})))
+                    .is_ok(),
+                selected == "Allow once"
+            );
         }
     }
 }
