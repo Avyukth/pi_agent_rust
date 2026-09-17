@@ -27,6 +27,16 @@ const RUN_ENV: &str = "PI_SUBAGENT_RUN_ID";
 const MAX_GRANT_BYTES: usize = 16 * 1024;
 const GRANT_VERSION: u32 = 1;
 const TOOL_NAMES: [&str; 3] = ["read_memory", "write_memory", "list_memory"];
+const ALL_TOOLS: u8 = 0b111;
+
+fn tool_bit(name: &str) -> u8 {
+    match name {
+        "read_memory" => 1,
+        "write_memory" => 2,
+        "list_memory" => 4,
+        _ => 0,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,12 +53,13 @@ pub struct SharedMemoryBinding {
     scope: JobSessionScope,
     access: Access,
     source_root: Option<PathBuf>,
+    allowed_tools: u8,
 }
 
 impl SharedMemoryBinding {
     #[must_use]
     pub const fn new(bank: Arc<MemoryStore>, scope: JobSessionScope) -> Self {
-        Self { bank, scope, access: Access::ReadWrite, source_root: None }
+        Self { bank, scope, access: Access::ReadWrite, source_root: None, allowed_tools: ALL_TOOLS }
     }
 
     /// Restrict this binding. No API upgrades an inherited read-only grant.
@@ -81,6 +92,7 @@ impl SharedMemoryBinding {
             store: SharedMemoryStore::new(Arc::clone(&self.bank), session_id)?,
             access: self.access,
             source_root: self.source_root.clone().unwrap_or_else(|| self.bank.project_root.clone()),
+            allowed_tools: self.allowed_tools,
         })
     }
 }
@@ -107,6 +119,7 @@ pub struct SharedMemoryGrant {
     store: SharedMemoryStore,
     access: Access,
     source_root: PathBuf,
+    allowed_tools: u8,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +134,7 @@ struct WireGrant {
     project_key: String,
     session_id: String,
     access: Access,
+    allowed_tools: u8,
 }
 
 fn valid_run_id(id: &str) -> bool {
@@ -138,16 +152,19 @@ impl SharedMemoryGrant {
             scope: JobSessionScope::fixed(self.store.session_id.clone()),
             access: self.access,
             source_root: Some(self.source_root.clone()),
+            allowed_tools: self.allowed_tools,
         }
     }
 
     /// Intersect an agent's explicit tool pin with this grant. No shared names
-    /// means no delegation. A read-only ceiling removes a requested writer.
-    /// An omitted pin selects all key tools permitted by the inherited ceiling.
+    /// means no delegation. A read-only ceiling still denies a selected writer.
+    /// An omitted pin retains the inherited selection, never all possible tools.
     pub fn for_tool_selection(&self, tools: Option<&[String]>) -> Option<Self> {
         let mut grant = self.clone();
         if let Some(tools) = tools {
-            if !tools.iter().any(|name| TOOL_NAMES.contains(&name.as_str())) {
+            let selected = tools.iter().fold(0, |bits, name| bits | tool_bit(name));
+            grant.allowed_tools &= selected;
+            if grant.allowed_tools == 0 {
                 return None;
             }
             if !tools.iter().any(|name| name == "write_memory") {
@@ -170,7 +187,8 @@ impl SharedMemoryGrant {
 
     /// Attach the captured grant to an explicitly chosen child. `cwd` is the
     /// final working directory, which may be a worktree of a checked source.
-    /// No I/O is dispatched; this does not spawn the process or enable tools.
+    /// This validates filesystem identities but does not spawn a process or
+    /// enable tools. The host retains responsibility for process ownership.
     pub fn configure_command(&self, command: &mut Command, cwd: &Path, run_id: &str) -> Result<()> {
         // A caller that mistakenly continues after an error must not inherit a
         // broader ambient grant. Parent/run markers are set only on success.
@@ -187,13 +205,15 @@ impl SharedMemoryGrant {
             project_key: self.store.bank.project_key.clone(),
             session_id: self.store.session_id.clone(),
             access: self.access,
+            allowed_tools: self.allowed_tools,
         };
         if !grant.database.is_absolute() || grant.project_key.is_empty() || grant.project_key.len() > 128 {
             return Err(invalid_grant());
         }
         let encoded = serde_json::to_string(&grant).map_err(|_| invalid_grant())?;
         if encoded.len() > MAX_GRANT_BYTES { return Err(invalid_grant()); }
-        command.env(GRANT_ENV, encoded)
+        command.current_dir(&grant.working_directory)
+            .env(GRANT_ENV, encoded)
             .env(PARENT_ENV, grant.parent_pid.to_string())
             .env(RUN_ENV, run_id);
         Ok(())
@@ -225,6 +245,7 @@ impl SharedMemoryGrant {
             || !grant.database.is_absolute() || !grant.project_root.is_absolute()
             || !grant.working_directory.is_absolute()
             || grant.project_key.is_empty() || grant.project_key.len() > 128
+            || grant.allowed_tools == 0 || grant.allowed_tools & !ALL_TOOLS != 0
             || cwd.canonicalize().map_err(|_| invalid_grant())? != grant.working_directory
         {
             return Err(invalid_grant());
@@ -239,6 +260,7 @@ impl SharedMemoryGrant {
             store: SharedMemoryStore::new(bank, grant.session_id).map_err(|_| invalid_grant())?,
             access: grant.access,
             source_root: grant.working_directory,
+            allowed_tools: grant.allowed_tools,
         })
     }
 
@@ -248,8 +270,14 @@ impl SharedMemoryGrant {
     /// A selected writer on a read-only grant is installed but rejects execution.
     pub fn install_tools(&self, registry: &mut ToolRegistry, enabled: &[&str]) -> Result<()> {
         let selected: Vec<_> = TOOL_NAMES.into_iter().filter(|name| enabled.contains(name)).collect();
-        for name in &selected {
-            if registry.get(name).is_some() || registry.inactive_tools().iter().any(|tool| tool.name() == *name) {
+        // The exact role pin travels with the grant. A nested host cannot gain
+        // list/read access merely by presenting a wider local enabled set.
+        if selected.iter().any(|name| self.allowed_tools & tool_bit(name) == 0) {
+            return Err(failure("PI_SHARED_MEMORY_TOOL_SCOPE", "A requested shared-memory tool is outside the inherited role selection"));
+        }
+        if selected.is_empty() { return Ok(()); }
+        for name in TOOL_NAMES {
+            if registry.get(name).is_some() || registry.inactive_tools().iter().any(|tool| tool.name() == name) {
                 return Err(failure("PI_SHARED_MEMORY_TOOL_COLLISION", "A delegated shared-memory tool name is already registered"));
             }
         }
@@ -277,7 +305,7 @@ struct DelegatedTool {
 impl Tool for DelegatedTool {
     fn name(&self) -> &str { self.inner.name() }
     fn label(&self) -> &str { self.inner.label() }
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         match self.name() {
             "read_memory" => "Read a key and revision from this task's parent-shared namespace, separate from its transcript and jobs.",
             "write_memory" => "Write exact text to the parent-shared namespace. Use expectedRevision (or absent for create-only). Read-only grants reject writes.",

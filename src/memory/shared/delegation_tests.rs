@@ -108,7 +108,7 @@ fn nested_read_only_grants_reject_writes_even_if_the_writer_is_selected() {
     let child = decode(&command(&selected, dir.path(), "readonly"), dir.path());
     let nested = run(child.binding().resolve(Duration::from_secs(5))).unwrap();
     let mut registry = ToolRegistry::from_tools(Vec::new());
-    nested.install_tools(&mut registry, &TOOL_NAMES).unwrap();
+    nested.install_tools(&mut registry, &["write_memory"]).unwrap();
     let error = run(registry.get("write_memory").unwrap().execute("write", json!({
         "key":"key", "content":"must not persist"
     }), None)).unwrap_err();
@@ -147,6 +147,26 @@ fn name_collision_leaves_the_registry_unchanged() {
 }
 
 #[test]
+fn a_nested_host_cannot_widen_the_exact_role_tool_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = grant(dir.path());
+    let selected = parent.for_tool_selection(Some(&["read_memory".to_string()])).unwrap();
+    let child = decode(&command(&selected, dir.path(), "read-role"), dir.path());
+    let nested = run(child.binding().resolve(Duration::from_secs(5))).unwrap();
+    assert!(nested.for_tool_selection(Some(&["list_memory".to_string()])).is_none());
+    let mut registry = ToolRegistry::from_tools(Vec::new());
+    let error = nested.install_tools(&mut registry, &TOOL_NAMES).unwrap_err();
+    assert!(error.to_string().contains("PI_SHARED_MEMORY_TOOL_SCOPE"));
+    assert!(registry.tools().is_empty(), "a rejected wider pin must not partially install");
+    nested.install_tools(&mut registry, &["read_memory"]).unwrap();
+    assert_eq!(registry.tools().len(), 1);
+    let mut mixed = ToolRegistry::from_tools(vec![Box::new(SharedMemoryTool::write(bank(dir.path())))]);
+    let error = nested.install_tools(&mut mixed, &["read_memory"]).unwrap_err();
+    assert!(error.to_string().contains("PI_SHARED_MEMORY_TOOL_COLLISION"));
+    assert!(mixed.get("read_memory").is_none(), "never mix two alias namespaces");
+}
+
+#[test]
 fn malformed_and_mismatched_grants_never_select_a_fallback_namespace() {
     let dir = tempfile::tempdir().unwrap();
     let parent = grant(dir.path());
@@ -160,6 +180,7 @@ fn malformed_and_mismatched_grants_never_select_a_fallback_namespace() {
         ("database", json!("relative.sqlite")), ("workingDirectory", json!(".")),
         ("parentPid", json!(0)), ("runId", json!("different")),
         ("access", json!("administrator")), ("unexpected", json!("secret-value")),
+        ("allowedTools", json!(0)), ("allowedTools", json!(8)),
     ] {
         let mut candidate = value.clone();
         candidate[field] = invalid;
@@ -183,6 +204,7 @@ fn command_setup_does_not_expose_values_and_clears_failed_or_unshared_grants() {
     parent.store.write("key", "private fixture content", Some("absent")).unwrap();
     let mut cmd = command(&parent, dir.path(), "child");
     assert!(cmd.get_args().next().is_none(), "grant must not enter argv");
+    assert_eq!(cmd.get_current_dir(), Some(dir.path().canonicalize().unwrap().as_path()));
     assert!(!env(&cmd, GRANT_ENV).to_string_lossy().contains("private fixture content"));
     assert!(parent.configure_command(&mut cmd, dir.path(), "bad/run").is_err());
     assert!(cmd.get_envs().any(|(key, value)| key == GRANT_ENV && value.is_none()));
