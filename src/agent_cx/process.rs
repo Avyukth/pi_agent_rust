@@ -27,6 +27,16 @@ fn check_spawn(owner: &AgentCx) -> io::Result<()> {
     owner.checkpoint().map_err(|_| cancelled())
 }
 
+fn check_wait(owner: &AgentCx) -> io::Result<()> {
+    if !owner.capabilities().time {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "waiting for an agent process requires timer capability",
+        ));
+    }
+    Ok(())
+}
+
 impl AgentProcess<'_> {
     /// Dispatch for internal runners that already own process-group cleanup,
     /// pipe draining and reaping. The returned child must enter that guard
@@ -38,8 +48,8 @@ impl AgentProcess<'_> {
     }
 }
 
-/// A command builder that cannot lose its captured owner through DerefMut.
-/// Read-only Command inspection remains available through Deref.
+/// A command builder that cannot lose its captured owner through `DerefMut`.
+/// Read-only `Command` inspection remains available through `Deref`.
 pub struct AgentCommand {
     owner: AgentCx,
     command: Command,
@@ -47,7 +57,10 @@ pub struct AgentCommand {
 
 impl AgentCommand {
     pub(super) fn new(owner: AgentCx, program: impl AsRef<OsStr>) -> Self {
-        Self { owner, command: Command::new(program) }
+        Self {
+            owner,
+            command: Command::new(program),
+        }
     }
 
     pub fn arg(&mut self, argument: impl AsRef<OsStr>) -> &mut Self {
@@ -128,14 +141,20 @@ impl AgentCommand {
     }
 
     /// Spawn and wait, retaining cancellation and cleanup ownership throughout.
+    /// Waiting requires timer capability; check that before starting a process.
     pub async fn status(&mut self) -> io::Result<ExitStatus> {
+        check_spawn(&self.owner)?;
+        check_wait(&self.owner)?;
         self.spawn()?.wait().await
     }
 }
 
 impl Deref for AgentCommand {
     type Target = Command;
-    fn deref(&self) -> &Self::Target { &self.command }
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
 }
 
 /// Owns a subprocess until reaped. Extracted pipe handles are ordinary OS
@@ -152,13 +171,19 @@ pub struct AgentChild {
 impl AgentChild {
     fn new(owner: AgentCx, child: Child) -> Self {
         Self {
-            owner, id: child.id(), child: Some(child), status: None,
-            descendants_stopped: false, cancelled: false,
+            owner,
+            id: child.id(),
+            child: Some(child),
+            status: None,
+            descendants_stopped: false,
+            cancelled: false,
         }
     }
 
     #[must_use]
-    pub const fn id(&self) -> u32 { self.id }
+    pub const fn id(&self) -> u32 {
+        self.id
+    }
 
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.as_mut().and_then(|child| child.stdin.take())
@@ -173,8 +198,12 @@ impl AgentChild {
     }
 
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        if self.cancelled { return Err(cancelled()); }
-        if let Some(status) = self.status { return Ok(Some(status)); }
+        if self.cancelled {
+            return Err(cancelled());
+        }
+        if let Some(status) = self.status {
+            return Ok(Some(status));
+        }
         if self.owner.checkpoint().is_err() {
             self.cancelled = true;
             self.terminate()?;
@@ -192,25 +221,31 @@ impl AgentChild {
         Ok(status)
     }
 
+    /// Wait for completion, closing stdin still owned by this handle first.
+    /// A caller that extracted stdin must close that separate handle itself.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(child) = self.child.as_mut() {
+            drop(child.stdin.take());
+        }
         loop {
-            if let Some(status) = self.try_wait()? { return Ok(status); }
-            if !self.owner.capabilities().time {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "waiting for an agent process requires timer capability",
-                ));
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
             }
+            check_wait(&self.owner)?;
             self.owner.time().sleep(Duration::from_millis(10)).await;
         }
     }
 
     /// Kill the owned process tree and reap its root, even when the owner has
     /// already been cancelled. Cleanup must not require renewed authority.
-    pub fn kill(&mut self) -> io::Result<()> { self.terminate() }
+    pub fn kill(&mut self) -> io::Result<()> {
+        self.terminate()
+    }
 
     fn stop_descendants(&mut self) {
-        if self.descendants_stopped { return; }
+        if self.descendants_stopped {
+            return;
+        }
         self.descendants_stopped = true;
         #[cfg(unix)]
         if let Ok(pid) = i32::try_from(self.id)
@@ -223,7 +258,9 @@ impl AgentChild {
     }
 
     fn terminate(&mut self) -> io::Result<()> {
-        if self.child.is_none() { return Ok(()); }
+        if self.child.is_none() {
+            return Ok(());
+        }
         self.stop_descendants();
         let child = self.child.as_mut().expect("owned child");
         let _ = child.kill();
@@ -235,13 +272,17 @@ impl AgentChild {
 }
 
 impl Drop for AgentChild {
-    fn drop(&mut self) { let _ = self.terminate(); }
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::{Budget, Cx};
+    use asupersync::Cx;
+    #[cfg(unix)]
+    use asupersync::Budget;
 
     fn restricted_owner() -> AgentCx {
         let restricted = Cx::for_request().restrict::<asupersync::cx::cap::None>();
@@ -312,5 +353,21 @@ mod tests {
         let status = Command::new("kill").args(["-0", &pid])
             .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
         assert!(!status.success(), "the owned root must already be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_closes_unclaimed_stdin_before_waiting_for_eof() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(Budget::new()));
+        let mut child = AgentCommand::new(owner, "sh")
+            .args(["-c", "read value; test $? -ne 0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.child.as_ref().unwrap().stdin.is_some());
+        assert!(runtime.block_on(child.wait()).unwrap().success());
+        assert!(child.child.is_none());
     }
 }
