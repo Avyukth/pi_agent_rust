@@ -56,7 +56,7 @@ pub struct AgentHttpClient {
 }
 
 impl AgentHttpClient {
-    pub(super) fn new(owner: AgentCx, client: Client) -> Self {
+    pub(super) const fn new(owner: AgentCx, client: Client) -> Self {
         Self { owner, client }
     }
 
@@ -134,7 +134,7 @@ impl<'a> AgentHttpRequest<'a> {
         // Cancellation may have raced the response headers. Drop the response
         // rather than handing an already-cancelled transport to another task.
         check_access(&owner)?;
-        Ok(AgentHttpResponse { owner, response })
+        Ok(AgentHttpResponse::from_response(owner, response))
     }
 }
 
@@ -145,14 +145,20 @@ pub struct AgentHttpResponse {
 }
 
 impl AgentHttpResponse {
+    /// Adopt a provider response at the stream boundary. This scopes body
+    /// consumption only, not the dispatch that already produced the response.
+    pub(crate) const fn from_response(owner: AgentCx, response: Response) -> Self {
+        Self { owner, response }
+    }
+
     #[must_use]
-    pub fn status(&self) -> u16 {
+    pub const fn status(&self) -> u16 {
         self.response.status()
     }
 
     #[must_use]
     pub fn headers(&self) -> &[(String, String)] {
-        self.response.headers()
+        &self.response.headers()
     }
 
     #[must_use]
