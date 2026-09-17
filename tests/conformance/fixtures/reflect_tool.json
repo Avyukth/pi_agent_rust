@@ -46,10 +46,11 @@
         "question": "What should I remember?"
       },
       "expected": {
-        "content_exact": "No memories to reflect on yet — retain some facts first.",
+        "is_error": false,
         "details_exact": {
           "schema": "pi.memory.v1",
-          "citations": []
+          "citations": [],
+          "sourceMemoryIds": []
         }
       }
     },

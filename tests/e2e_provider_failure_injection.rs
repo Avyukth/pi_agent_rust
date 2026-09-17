@@ -1503,7 +1503,7 @@ fn anthropic_tool_use_stop_reason() {
     let sse = concat!(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"x\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
         "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\",\"input\":{}}}\n\n",
-        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/tmp\\\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/tmp\\\"}\"}}\n\n",
         "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
         "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":10}}\n\n",
         "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -1511,10 +1511,12 @@ fn anthropic_tool_use_stop_reason() {
     let (provider, _server) = setup_anthropic(&harness, make_sse_response(sse));
     let r = collect_events(provider, simple_context(), default_options());
     let classified = classify_result("anthropic_tool_use_reason", "anthropic", &r);
-    // Should produce ToolCallStart/Delta/End events, then Done with ToolUse reason
+    // A complete tool_use block must terminate with Done and StopReason::ToolUse.
+    // The transport deliberately returns Err (not an Error event) for malformed
+    // argument JSON, so asserting on has_done_event alone would miss it.
     assert!(
-        classified.has_done_event || classified.has_error_event,
-        "Anthropic tool_use must produce terminal event"
+        classified.has_done_event && !classified.has_error_event,
+        "Anthropic tool_use must terminate with Done: {classified:?}"
     );
 
     let results = vec![classified];

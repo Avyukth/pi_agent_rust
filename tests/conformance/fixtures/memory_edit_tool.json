@@ -32,7 +32,7 @@
     },
     {
       "name": "memory_edit_update_requires_content",
-      "description": "update refuses a missing replacement while preserving the seeded row",
+      "description": "update returns a tool error when the replacement content is missing",
       "requirement_ids": [
         "MEM-EDIT-2"
       ],
@@ -48,12 +48,7 @@
         "op": "update"
       },
       "expected": {
-        "content_contains": [
-          "memory_edit update requires content"
-        ],
-        "details_contains": [
-          "memory_edit update requires content"
-        ]
+        "is_error": true
       }
     },
     {

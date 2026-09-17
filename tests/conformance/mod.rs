@@ -113,6 +113,9 @@ pub enum SetupStep {
 /// Expected results for a test case.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Expected {
+    /// Require the tool output's error flag, independently of Rust Result errors.
+    #[serde(default)]
+    pub is_error: Option<bool>,
     /// Content must contain these substrings
     #[serde(default)]
     pub content_contains: Vec<String>,

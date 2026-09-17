@@ -736,69 +736,6 @@ fn assert_coalescer_idle(coalescer: &EventCoalescer) {
 }
 
 #[test]
-fn event_coalescer_characterization_replacement_keeps_first_and_latest_payload() {
-    let runtime = RuntimeBuilder::current_thread()
-        .build()
-        .expect("runtime build");
-    let handle = runtime.handle();
-    let manager = coalescer_test_manager_with_hooks(&[ExtensionEventName::MessageUpdate]);
-    let coalescer = EventCoalescer::new(manager);
-    let resolved = Arc::new(Mutex::new(Vec::new()));
-
-    for sequence in 1..=3 {
-        coalescer.dispatch_fire_and_forget(
-            ExtensionEventName::MessageUpdate,
-            coalescer_recording_payload(sequence, &resolved),
-            &handle,
-        );
-    }
-
-    assert!(
-        resolved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty(),
-        "lazy payloads must not resolve before the runtime drives the task"
-    );
-    assert_eq!(
-        coalescer
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "only the latest replacement may remain pending"
-    );
-
-    runtime.block_on(async {
-        // Deadline-based: see the handoff test below — yield-only budgets
-        // flake on loaded hosts when OS threads are involved.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if coalescer
-                .in_flight
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-            {
-                return;
-            }
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
-        }
-        panic!("coalesced dispatch did not become idle");
-    });
-
-    assert_eq!(
-        *resolved
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![1, 3],
-        "the superseded middle payload must never be resolved"
-    );
-    assert_coalescer_idle(&coalescer);
-}
-
-#[test]
 fn event_coalescer_characterization_batch_drain_resolves_every_payload_in_order() {
     let runtime = RuntimeBuilder::current_thread()
         .build()

@@ -9542,17 +9542,12 @@ mod retry_tests {
     }
 
     #[test]
-    fn rpc_prompt_command_inherits_cancelled_context_from_run() {
-        // Watchdog (bd-yqo76 hang policy). This test hangs forever when the
-        // cancelled context does not reach the retry timeline: its internal
-        // `asupersync::time::timeout` guards cannot save it, because timeouts
-        // do not fire on a bare `RuntimeBuilder::current_thread()` runtime —
-        // the same trap documented on
-        // `auto_compaction_rejects_stale_session_snapshot_with_paired_end_event`.
-        // A hang here stalls the whole lib test binary and every test
-        // scheduled after it, which is how this one silently blocked the DSR
-        // test lane. Running the body on its own thread turns that into a
-        // loud failure after 120 s.
+    fn rpc_abort_retry_command_drives_retry_timeline_to_terminal_frames() {
+        // Watchdog (bd-yqo76 hang policy). A hang here stalls the whole lib
+        // test binary and every test scheduled after it, which is how the
+        // original context-cancellation variant silently blocked the DSR test
+        // lane. Running the body on its own thread turns that into a loud
+        // failure after 120 s.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let body = std::thread::spawn(move || {
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -9600,13 +9595,18 @@ mod retry_tests {
                 let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
                 let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
 
-                let ambient_cx = asupersync::Cx::for_testing();
-                let cancel_cx = ambient_cx.clone();
-                let _current = asupersync::Cx::set_current(Some(ambient_cx));
+                // Keep an ambient context (run() and tools resolve
+                // for_current_or_request against it) but never cancel it:
+                // asupersync 0.5.0 parks a cancel-requested task without
+                // dropping it, so a context-cancelled turn can never emit
+                // terminal frames (bd-todkd, upstream scheduler contract).
+                // Cancellation arrives through the abort_retry wire command.
+                let _current = asupersync::Cx::set_current(Some(asupersync::Cx::for_testing()));
 
                 let client_out_rx = Arc::clone(&out_rx);
                 let client = async move {
                     let send_cx = asupersync::Cx::for_testing();
+                    let abort_tx = in_tx.clone();
                     in_tx
                         .send(
                             &send_cx,
@@ -9660,7 +9660,7 @@ mod retry_tests {
 
                     let retry_abort_wait = async {
                         let mut timeline = Vec::new();
-                        let mut cancellation_requested = false;
+                        let mut abort_retry_sent = false;
                         loop {
                             let recv_result = {
                                 let rx = client_out_rx.lock().expect("lock rpc output receiver");
@@ -9676,9 +9676,20 @@ mod retry_tests {
                                         continue;
                                     };
                                     timeline.push(kind.to_string());
-                                    if kind == "auto_retry_start" && !cancellation_requested {
-                                        cancel_cx.set_cancel_requested(true);
-                                        cancellation_requested = true;
+                                    if kind == "auto_retry_start" && !abort_retry_sent {
+                                        // Cancel through the wire command path the
+                                        // production surface uses; context
+                                        // cancellation cannot reach this task
+                                        // (bd-todkd, asupersync 0.5.0 scheduler).
+                                        let abort_cx = asupersync::Cx::for_testing();
+                                        abort_tx
+                                            .send(
+                                                &abort_cx,
+                                                r#"{"id":"2","type":"abort_retry"}"#.to_string(),
+                                            )
+                                            .await
+                                            .expect("send abort_retry command");
+                                        abort_retry_sent = true;
                                     }
                                     if kind == "agent_end" {
                                         let agent_end_error = value

@@ -239,7 +239,7 @@ fn cloned_client_observes_owner_cancellation_before_any_socket_is_opened() {
     listener.set_nonblocking(true).unwrap();
     let runtime = runtime();
     let owner = owner(&runtime);
-    let client = owner.http().bind(&Client::new()).clone();
+    let client = owner.http().bind(&Client::new());
     owner.cancel_with(asupersync::types::CancelKind::User, Some("before dispatch"));
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let error = runtime
@@ -259,7 +259,7 @@ fn owner_cancellation_interrupts_silent_response_headers() {
     let server = Server::start(move |socket| {
         received
             .send(())
-            .map_err(|_| io::Error::other("missing cancellation observer"))?;
+            .map_err(|()| io::Error::other("missing cancellation observer"))?;
         peer_closed(socket)
     });
     let runtime = runtime();
@@ -397,7 +397,7 @@ fn vertex_claude_dispatch_keeps_owner_cancellation_before_headers_arrive() {
     let server = Server::start(move |socket| {
         received
             .send(())
-            .map_err(|_| io::Error::other("missing cancellation observer"))?;
+            .map_err(|()| io::Error::other("missing cancellation observer"))?;
         peer_closed(socket)
     });
     let runtime = runtime();
