@@ -2578,9 +2578,20 @@ async fn run(
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
+            // Same `disabledProviders` filter the classic stack applies when it
+            // builds its model list: without it the setting was silently
+            // ignored on this frontend and every catalog provider still
+            // appeared in the picker.
             let ftui_models = model_registry
                 .get_available()
                 .into_iter()
+                .filter(|entry| {
+                    !pi::failover::provider_is_disabled(
+                        &disabled_providers,
+                        scope_override,
+                        &entry.model.provider,
+                    )
+                })
                 .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
                 .collect::<Vec<_>>();
             // /resume picker entries: this cwd's saved sessions, newest first
