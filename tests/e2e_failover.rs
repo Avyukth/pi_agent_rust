@@ -244,6 +244,58 @@ fn e2e_failover_429_walks_chain_and_completes() {
     harness.record_artifact("e2e_failover_429.jsonl", &path);
 }
 
+/// Run `pi --rpc` with ONE piped prompt against the mock server and return the
+/// parsed event stream plus the raw stdout/stderr for diagnostics.
+///
+/// Closing stdin after the single request is the documented one-shot shape:
+/// `printf '{"type":"prompt",...}' | pi --mode rpc` drains the in-flight turn
+/// and still emits the full stream through `agent_end` before exiting (gh #137,
+/// src/rpc.rs). The RPC loop serialises the same `AgentEvent` values print mode
+/// does, so `event_kinds` reads both surfaces.
+fn run_rpc_failover(
+    harness: &TestHarness,
+    server: &common::harness::MockHttpServer,
+    label: &str,
+) -> (Vec<serde_json::Value>, String, String) {
+    let env = PiEnv::new(harness);
+    env.write_models(&server.base_url());
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command
+        .args([
+            "--rpc",
+            "--provider",
+            "e2eprimary",
+            "--model",
+            "primary-model",
+            "--no-extensions",
+        ])
+        .stdin(Stdio::piped());
+    harness.log().info("action", label);
+    let mut child = command.spawn().expect("spawn pi --rpc");
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("pi --rpc stdin was not piped");
+        writeln!(stdin, r#"{{"type":"prompt","id":"p1","message":"ping"}}"#)
+            .expect("write the prompt request");
+        stdin.flush().expect("flush the prompt request");
+    }
+    drop(child.stdin.take());
+    let (stdout, stderr) = run_and_collect(child, 90);
+    let events = stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    harness.log().info_ctx("verify", "process finished", |ctx| {
+        ctx.push(("event_count".to_string(), events.len().to_string()));
+        ctx.push((
+            "stderr_tail".to_string(),
+            stderr.chars().take(400).collect(),
+        ));
+    });
+    (events, stdout, stderr)
+}
+
 /// Run `pi --print --mode json` against the mock server and return the parsed
 /// event stream plus the raw stdout/stderr for diagnostics.
 fn run_print_json_failover(
@@ -737,6 +789,149 @@ fn e2e_failover_json_mode_gives_the_fallback_its_own_retry_lifecycle() {
     let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_failover_json_fallback_retry.jsonl", &path);
+}
+
+/// bd-2vmu6, RPC half: the same collision, over `pi --rpc`, which is the
+/// surface SDK clients actually drive.
+///
+/// The bead's acceptance asks for this scenario on BOTH surfaces. The RPC
+/// lifecycle test that exists installs a fallback pointing at an unreachable
+/// port, so its fallback turn can only fail immediately -- there is no way for
+/// it to run a retry lifecycle of its own, which is the thing being claimed.
+/// Running the real binary against the mock server is what makes the fallback
+/// able to fail once and then succeed.
+///
+/// The two surfaces close their lifecycles in a different ORDER, and that
+/// difference is asserted rather than papered over: print streams the agent
+/// loop's own `agent_end` per attempt and emits the closers after the last one,
+/// while RPC defers its terminal `agent_end` and closes the lifecycle first.
+#[test]
+fn e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle() {
+    let harness =
+        TestHarness::new("e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+    server.add_route_queue(
+        "POST",
+        "/backup/v1/chat/completions",
+        vec![
+            error_response(
+                503,
+                r#"{"error":{"type":"overloaded_error","message":"backup warming up"}}"#,
+            ),
+            sse_response(text_sse_body("backup ok on the retry")),
+        ],
+    );
+
+    let (events, stdout, stderr) = run_rpc_failover(
+        &harness,
+        &server,
+        "spawning pi --rpc on a 429 primary and a fallback that needs one retry",
+    );
+    let kinds = event_kinds(&events);
+
+    assert_eq!(
+        (
+            kinds.iter().filter(|k| *k == "auto_retry_start").count(),
+            kinds.iter().filter(|k| *k == "auto_retry_end").count(),
+        ),
+        (2, 2),
+        "the primary's retry lifecycle and the fallback's are each opened and closed: \
+         {kinds:?}\n{stdout}\n{stderr}"
+    );
+    let retry_frames: Vec<&str> = kinds
+        .iter()
+        .map(String::as_str)
+        .filter(|kind| matches!(*kind, "auto_retry_start" | "auto_retry_end"))
+        .collect();
+    assert_eq!(
+        retry_frames,
+        [
+            "auto_retry_start",
+            "auto_retry_end",
+            "auto_retry_start",
+            "auto_retry_end",
+        ],
+        "each retry lifecycle closes before the next one opens: {kinds:?}\n{stdout}\n{stderr}"
+    );
+
+    let failover_start = kinds
+        .iter()
+        .position(|k| k == "failover_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let failover_end = kinds
+        .iter()
+        .position(|k| k == "failover_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let primary_retry_end = kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let fallback_retry_start = kinds
+        .iter()
+        .rposition(|k| k == "auto_retry_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("auto_retry_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let terminal_agent_end = kinds
+        .iter()
+        .rposition(|k| k == "agent_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    assert_eq!(
+        kinds.iter().filter(|k| *k == "failover_end").count(),
+        1,
+        "exactly one failover_end per failover_start: {kinds:?}"
+    );
+    assert!(
+        primary_retry_end < failover_start,
+        "the primary's retry lifecycle closes on the way into the swap: {kinds:?}"
+    );
+    assert!(
+        failover_start < fallback_retry_start,
+        "the second retry lifecycle belongs to the fallback, so it opens after the swap: {kinds:?}"
+    );
+    assert!(
+        failover_end < terminal_agent_end,
+        "RPC closes the failover lifecycle BEFORE its terminal agent_end, unlike print: {kinds:?}"
+    );
+
+    let end_event = &events[failover_end]; // ubs:ignore index proven by position() above
+    assert_eq!(end_event["success"], serde_json::Value::Bool(true));
+    assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["provider"], "e2ebackup");
+    assert_eq!(end_event["model"], "backup-model");
+
+    let paths: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("/primary/")).count(),
+        2,
+        "one primary attempt plus its single retry: {paths:?}"
+    );
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("/backup/")).count(),
+        2,
+        "the fallback was really retried, not merely reported as retried: {paths:?}"
+    );
+
+    let path = harness.temp_path("e2e_failover_rpc_fallback_retry.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_rpc_fallback_retry.jsonl", &path);
 }
 
 /// bd-gm481.1: with the cooldown elapsed, the primary comes back between
