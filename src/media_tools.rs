@@ -1,6 +1,6 @@
 //! Opt-in media tools (bd-cv653.2.7).
-//! Native image inspection lives in `vision`; `read_media` attaches local media.
-//! Generation and synthesis retain their public tool interfaces here.
+//! Native vision and image generation use bounded provider requests; read_media
+//! attaches local video/audio. Public tool paths remain stable across modules.
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -12,16 +12,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+mod artifact;
+mod generation;
 mod transport;
 mod vision;
+pub use generation::GenerateImageTool;
 pub use vision::InspectImageTool;
 
-pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
+pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
 pub const MAX_TTS_TEXT_CHARS: usize = 4096;
 /// Default decoded-byte cap for an inline video/audio block (`media.maxBytes`).
 pub const DEFAULT_MEDIA_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
-// Deterministic fixture pixels; never used by native vision requests.
+// Deterministic fixture pixels. Native adapters never use these as a fallback.
 const MIN_VALID_PNG: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
@@ -90,17 +93,24 @@ pub struct ReadMediaTool {
 
 impl ReadMediaTool {
     pub fn new(cwd: &Path) -> Self {
-        Self { cwd: cwd.to_path_buf(), max_bytes: DEFAULT_MEDIA_MAX_BYTES }
+        Self {
+            cwd: cwd.to_path_buf(),
+            max_bytes: DEFAULT_MEDIA_MAX_BYTES,
+        }
     }
 
     #[must_use]
     pub const fn with_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
-        if let Some(max_bytes) = max_bytes { self.max_bytes = max_bytes; }
+        if let Some(max_bytes) = max_bytes {
+            self.max_bytes = max_bytes;
+        }
         self
     }
 
     #[must_use]
-    pub const fn max_bytes(&self) -> u64 { self.max_bytes }
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
 
     fn resolve_path(&self, rel_or_abs: &str) -> PathBuf {
         let p = Path::new(rel_or_abs);
@@ -157,85 +167,6 @@ impl Tool for ReadMediaTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(note)), ContentBlock::Media(crate::model::MediaContent { data, mime_type: mime_type.to_string(), name })],
             details: Some(json!({"path":target_path.display().to_string(), "mime_type":mime_type, "size_bytes":size, "max_bytes":self.max_bytes})),
-            is_error: false,
-        })
-    }
-}
-
-pub struct GenerateImageTool {
-    cwd: PathBuf,
-    default_provider: Option<String>,
-    mock_mode: Option<bool>,
-    api_key: Option<String>,
-}
-
-impl GenerateImageTool {
-    pub fn new(cwd: &Path) -> Self {
-        Self { cwd: cwd.to_path_buf(), default_provider: None, mock_mode: None, api_key: None }
-    }
-    pub fn with_provider(cwd: &Path, provider: Option<String>) -> Self {
-        Self { cwd: cwd.to_path_buf(), default_provider: provider, mock_mode: None, api_key: None }
-    }
-    #[must_use]
-    pub const fn with_mock(mut self, mock: bool) -> Self { self.mock_mode = Some(mock); self }
-    #[must_use]
-    pub fn with_api_key(mut self, key: Option<String>) -> Self { self.api_key = key; self }
-}
-
-#[async_trait]
-#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
-impl Tool for GenerateImageTool {
-    fn name(&self) -> &str { "generate_image" }
-    fn label(&self) -> &str { "Generate Image" }
-    fn description(&self) -> &str {
-        "Generate an image from a prompt or edit an image via OpenAI (DALL-E), Gemini (Imagen), or xAI. \
-         Saves generated image to disk artifact and returns local file path."
-    }
-    fn parameters(&self) -> Value {
-        json!({"type":"object", "required":["prompt"], "properties":{
-            "prompt":{"type":"string", "description":"Description of the image to generate"},
-            "provider":{"type":"string", "enum":["openai","gemini","xai"], "description":"Image generation provider (default: auto)"},
-            "model":{"type":"string", "description":"Model name (e.g. dall-e-3, imagen-3.0-generate-002)"},
-            "size":{"type":"string", "enum":["1024x1024","1024x1792","1792x1024","512x512"], "description":"Output dimensions (default: 1024x1024)"},
-            "output_path":{"type":"string", "description":"Target destination path for the saved image file"}
-        }})
-    }
-    fn effects(&self) -> ToolEffects { ToolEffects::write() }
-    async fn execute(&self, _tool_call_id: &str, args: Value,
-        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput>
-    {
-        let prompt = args.get("prompt").and_then(|v| v.as_str())
-            .ok_or_else(|| Error::tool("generate_image", "missing required prompt parameter"))?;
-        let provider = args.get("provider").and_then(|v| v.as_str())
-            .or(self.default_provider.as_deref()).unwrap_or("openai");
-        let size = args.get("size").and_then(|v| v.as_str()).unwrap_or("1024x1024");
-        let output_path_str = args.get("output_path").and_then(Value::as_str)
-            .map_or_else(|| format!("images/generated_{}.png", Uuid::new_v4().simple()), ToString::to_string);
-        let target_path = if Path::new(&output_path_str).is_absolute() {
-            PathBuf::from(&output_path_str)
-        } else { self.cwd.join(&output_path_str) };
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| Error::tool("generate_image", format!("cannot create output dir: {e}")))?;
-        }
-        let is_mock = self.mock_mode.unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
-        if is_mock {
-            fs::write(&target_path, MIN_VALID_PNG).map_err(|e| Error::tool("generate_image", format!("failed to write generated image: {e}")))?;
-        } else {
-            let key_env = match provider {
-                "openai" => "OPENAI_API_KEY", "gemini" => "GEMINI_API_KEY", "xai" => "XAI_API_KEY",
-                _ => return Err(Error::tool("generate_image", format!("unknown image generation provider: {provider}"))),
-            };
-            let has_key = self.api_key.as_deref().map_or_else(|| std::env::var(key_env).is_ok(), |k| !k.trim().is_empty());
-            if !has_key {
-                return Err(Error::tool("generate_image", format!("missing API key for image generation provider {provider} (set {key_env})")));
-            }
-            fs::write(&target_path, MIN_VALID_PNG).map_err(|e| Error::tool("generate_image", format!("failed to write generated image: {e}")))?;
-        }
-        let written_bytes = fs::metadata(&target_path).map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
-        let result_msg = format!("Successfully generated image and saved to {}\nPrompt: \"{}\"\nProvider: {} | Size: {} | Bytes: {}", target_path.display(), prompt, provider, size, written_bytes);
-        Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent { text: result_msg, text_signature: None })],
-            details: Some(json!({"saved_path":target_path.display().to_string(), "provider":provider, "size":size, "size_bytes":written_bytes})),
             is_error: false,
         })
     }
