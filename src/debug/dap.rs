@@ -1,8 +1,9 @@
-//! Content-Length-framed DAP over owned adapter stdio. Dedicated, bounded
-//! writer/reader lanes keep a blocked adapter pipe off the async reactor.
+//! Content-Length-framed DAP over owned adapter stdio or loopback TCP.
+//! Dedicated, bounded writer/reader lanes keep blocking I/O off the reactor.
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -16,6 +17,8 @@ use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::lsp::jsonrpc::{await_completion, encode_frame, read_frame_with_scratch};
 
+mod delve;
+
 const MAX_PENDING: usize = 32;
 const MAX_OUTBOUND: usize = 2 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
@@ -23,6 +26,8 @@ const QUEUED: u8 = 0;
 const WRITING: u8 = 1;
 const SENT: u8 = 2;
 const CANCELLED: u8 = 3;
+
+type OutputTail = Arc<Mutex<crate::lsp::jsonrpc::PublicTailBuffer>>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -85,6 +90,9 @@ type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, Da
 
 struct Lifetime {
     child: Mutex<crate::tools::ProcessGuard>,
+    // Shutting down a clone wakes both TCP I/O lanes, even if the peer never
+    // closes its end. Process teardown alone is insufficient for TCP streams.
+    socket: Option<TcpStream>,
     alive: AtomicBool,
     pending: Arc<PendingMap>,
 }
@@ -92,6 +100,9 @@ struct Lifetime {
 impl Lifetime {
     fn close(&self, reason: &str) {
         if self.alive.swap(false, Ordering::SeqCst) {
+            if let Some(socket) = &self.socket {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
             let waiting = std::mem::take(&mut *lock(&self.pending));
             for (_, sender) in waiting {
                 let _ = sender.try_send(Err(DapError::Transport(reason.to_string())));
@@ -106,9 +117,6 @@ struct Frame {
     phase: Arc<AtomicU8>,
 }
 
-// A request lease is also a dispatch revocation. Dropping a queued request
-// prevents the writer starting it. Dropping a partially written frame retires
-// the connection: continuing that stream would corrupt subsequent requests.
 struct PendingLease {
     seq: u64,
     life: Arc<Lifetime>,
@@ -122,14 +130,13 @@ impl Drop for PendingLease {
         if !self.answered
             && self.phase.compare_exchange(QUEUED, CANCELLED, Ordering::SeqCst, Ordering::SeqCst) == Err(WRITING)
         {
-            self.life.close("request cancelled during a pipe write; adapter connection retired");
+            self.life.close("request cancelled during a write; adapter connection retired");
         }
     }
 }
 
-// The reader never writes to the OS pipe. Reverse-request refusals go through
-// the same bounded lane, preventing an adapter from deadlocking response reads
-// by issuing a reverse request while it is not consuming stdin.
+// Reverse-request refusals share the bounded writer lane. The reader never
+// blocks attempting a synchronous write to an unresponsive adapter.
 struct ReplyWriter(StdSyncSender<Frame>);
 impl Write for ReplyWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -143,15 +150,24 @@ impl Write for ReplyWriter {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
+// Startup keeps these handles local until all required pipes/socket clones
+// exist. Dropping a failed or cancelled startup also drops its process guard.
+struct AdapterIo {
+    child: crate::tools::ProcessGuard,
+    input: Box<dyn Write + Send>,
+    output: Box<dyn Read + Send>,
+    socket: Option<TcpStream>,
+    tail: OutputTail,
+}
+
 /// The session owns the adapter; each request owns its pending wait and frame.
-/// OS pipe threads exit on owned process teardown/EOF. Their blocking I/O and
-/// process cleanup are not a hard real-time deadline guarantee.
+/// Blocking OS I/O and process cleanup are not hard real-time operations.
 pub struct DapTransport {
     life: Arc<Lifetime>,
     writer: StdSyncSender<Frame>,
     pending: Arc<PendingMap>,
     next_seq: Arc<AtomicU64>,
-    stderr_tail: Arc<Mutex<crate::lsp::jsonrpc::PublicTailBuffer>>,
+    stderr_tail: OutputTail,
     event_rx: Mutex<StdReceiver<DapEvent>>,
     frames_read: Arc<AtomicU64>,
 }
@@ -185,36 +201,38 @@ impl DapTransport {
             let _ = child.wait();
             return Err(tool_err("DAP_TRANSPORT", "adapter pipes unavailable"));
         };
+        let child = crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
+        owner.checkpoint().map_err(|_| tool_err("DAP_CANCELLED", "cancelled during adapter spawn"))?;
+        let tail = Arc::new(Mutex::new(crate::lsp::jsonrpc::PublicTailBuffer::new()));
+        spawn_output_pump(stderr, Arc::clone(&tail));
+        Ok(Self::from_io(AdapterIo {
+            child,
+            input: Box::new(stdin),
+            output: Box::new(stdout),
+            socket: None,
+            tail,
+        }))
+    }
+
+    fn from_io(io: AdapterIo) -> Self {
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         let life = Arc::new(Lifetime {
-            child: Mutex::new(crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree)),
-            alive: AtomicBool::new(true), pending: Arc::clone(&pending),
+            child: Mutex::new(io.child),
+            socket: io.socket,
+            alive: AtomicBool::new(true),
+            pending: Arc::clone(&pending),
         });
-        if owner.checkpoint().is_err() {
-            life.close("cancelled during adapter spawn");
-            return Err(tool_err("DAP_CANCELLED", "cancelled during adapter spawn"));
-        }
         let next_seq = Arc::new(AtomicU64::new(1));
-        let stderr_tail = Arc::new(Mutex::new(crate::lsp::jsonrpc::PublicTailBuffer::new()));
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel(512);
         let (writer, writes) = std::sync::mpsc::sync_channel::<Frame>(MAX_PENDING);
         let frames_read = Arc::new(AtomicU64::new(0));
-        spawn_writer(stdin, writes, Arc::clone(&life));
-        spawn_reader(stdout, Arc::clone(&life), Arc::clone(&stderr_tail), writer.clone(),
+        spawn_writer(io.input, writes, Arc::clone(&life));
+        spawn_reader(io.output, Arc::clone(&life), Arc::clone(&io.tail), writer.clone(),
             Arc::clone(&next_seq), Arc::clone(&frames_read), event_tx);
-        {
-            let tail = Arc::clone(&stderr_tail);
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-                let mut reader = std::io::BufReader::new(stderr);
-                let mut buf = [0_u8; 4096];
-                while let Ok(count) = reader.read(&mut buf) {
-                    if count == 0 { break; }
-                    lock(&tail).push(&String::from_utf8_lossy(&buf[..count]));
-                }
-            });
+        Self {
+            life, writer, pending, next_seq, stderr_tail: io.tail,
+            event_rx: Mutex::new(event_rx), frames_read,
         }
-        Ok(Self { life, writer, pending, next_seq, stderr_tail, event_rx: Mutex::new(event_rx), frames_read })
     }
 
     #[must_use]
@@ -258,9 +276,6 @@ impl DapTransport {
         let mut lease = PendingLease { seq, life: Arc::clone(&self.life), phase: Arc::clone(&phase), answered: false };
         self.writer.try_send(Frame { bytes, phase })
             .map_err(|_| DapError::Transport("DAP writer queue is full or closed".into()))?;
-        // No synchronous pipe writes from timeout/cancellation cleanup. After a
-        // complete frame is sent, remote effects may still occur; cancellation
-        // only retires this local wait, not the whole established session.
         let outcome = await_completion(receiver, timeout, || {}).await;
         lease.answered = outcome.is_ok();
         match outcome {
@@ -296,7 +311,17 @@ fn next_sequence(sequence: &AtomicU64) -> std::result::Result<u64, DapError> {
         .map_err(|_| DapError::Transport("DAP sequence numbers exhausted".into()))
 }
 
-fn spawn_writer(mut stdin: std::process::ChildStdin, writes: StdReceiver<Frame>, life: Arc<Lifetime>) {
+fn spawn_output_pump(mut reader: impl Read + Send + 'static, tail: OutputTail) {
+    std::thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        while let Ok(count) = reader.read(&mut buf) {
+            if count == 0 { break; }
+            lock(&tail).push(&String::from_utf8_lossy(&buf[..count]));
+        }
+    });
+}
+
+fn spawn_writer(mut writer: impl Write + Send + 'static, writes: StdReceiver<Frame>, life: Arc<Lifetime>) {
     std::thread::spawn(move || {
         while life.alive.load(Ordering::SeqCst) {
             let frame = match writes.recv_timeout(Duration::from_millis(100)) {
@@ -308,8 +333,8 @@ fn spawn_writer(mut stdin: std::process::ChildStdin, writes: StdReceiver<Frame>,
                 continue;
             }
             if !life.alive.load(Ordering::SeqCst) { break; }
-            if stdin.write_all(&frame.bytes).and_then(|()| stdin.flush()).is_err() {
-                life.close("adapter stdin write failed");
+            if writer.write_all(&frame.bytes).and_then(|()| writer.flush()).is_err() {
+                life.close("adapter write failed");
                 break;
             }
             frame.phase.store(SENT, Ordering::SeqCst);
@@ -318,12 +343,12 @@ fn spawn_writer(mut stdin: std::process::ChildStdin, writes: StdReceiver<Frame>,
 }
 
 fn spawn_reader(
-    stdout: std::process::ChildStdout, life: Arc<Lifetime>,
-    tail: Arc<Mutex<crate::lsp::jsonrpc::PublicTailBuffer>>, writer: StdSyncSender<Frame>,
+    output: impl Read + Send + 'static, life: Arc<Lifetime>,
+    tail: OutputTail, writer: StdSyncSender<Frame>,
     sequence: Arc<AtomicU64>, frames: Arc<AtomicU64>, events: StdSyncSender<DapEvent>,
 ) {
     std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
+        let mut reader = std::io::BufReader::new(output);
         let mut scratch = Vec::new();
         let writer = Mutex::new(ReplyWriter(writer));
         let reason = loop {
@@ -334,7 +359,7 @@ fn spawn_reader(
                         break "DAP event/reply buffer overflow or invalid control message";
                     }
                 }
-                Ok(None) => break "adapter closed stdout (EOF)",
+                Ok(None) => break "adapter closed DAP stream (EOF)",
                 Err(_) => break "invalid or truncated DAP frame",
             }
         };
@@ -342,9 +367,6 @@ fn spawn_reader(
     });
 }
 
-/// Output is already retained in its bounded tail and must not consume the
-/// state-event queue. Losing a stopped/initialized event would make the session
-/// lie about execution state; control overflow therefore closes the transport.
 fn dispatch<W: Write>(
     message: &Value, pending: &PendingMap, events: &StdSyncSender<DapEvent>,
     tail: &Mutex<crate::lsp::jsonrpc::PublicTailBuffer>, writer: &Mutex<W>, sequence: &AtomicU64,
