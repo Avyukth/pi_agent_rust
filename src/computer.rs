@@ -274,7 +274,7 @@ impl Tool for ComputerTool {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let mock = self.is_mock();
-        let duration = match native::validate(&args) {
+        let duration: Duration = match native::validate(&args) {
             Ok(duration) => duration,
             Err(failure) => {
                 self.record_audit(action, &args, false, "invalid", mock);
@@ -421,5 +421,47 @@ mod tests {
                 selected == "Allow once"
             );
         }
+    }
+
+    #[test]
+    fn native_failure_never_publishes_a_fixture_screenshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ComputerTool::new(dir.path())
+            .with_mock(false)
+            .with_helper_path("scrot", dir.path().join("missing-scrot"))
+            .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(tool.execute(
+            "missing-native",
+            json!({"action":"screenshot","output_path":"must-not-exist.png"}),
+            None,
+        ));
+        assert!(result.is_err());
+        assert!(!dir.path().join("must-not-exist.png").exists());
+        assert_eq!(tool.get_audit_log()[0].details["outcome"], "error");
+    }
+
+    #[test]
+    fn tool_boundary_enforces_approval_before_any_native_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ComputerTool::new(dir.path())
+            .with_mock(false)
+            .with_helper_path("xdotool", dir.path().join("must-not-run"))
+            .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(tool.execute(
+            "denied-input",
+            json!({"action":"key_type","text":"private-secret"}),
+            None,
+        ));
+        let failure = result.unwrap_err();
+        assert!(failure.to_string().contains("host approval"));
+        let log = tool.get_audit_log();
+        assert!(!log[0].allowed);
+        assert!(!serde_json::to_string(&log).unwrap().contains("private-secret"));
     }
 }
