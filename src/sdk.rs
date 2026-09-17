@@ -1824,24 +1824,30 @@ impl AgentSessionHandle {
     /// This is useful for retry/continuation flows where session history or
     /// injected messages should drive the next turn without synthesizing a new
     /// user message through [`Self::prompt`].
+    ///
+    /// The turn is persisted, and it will not issue against a provider the
+    /// admission gate has quarantined. Both come from routing through
+    /// [`AgentSession::run_continue_with_abort`] rather than the inner `Agent`
+    /// (bd-9o9i2); the raw loop does neither, so this used to run a full turn,
+    /// stream its events, return its assistant message, and write nothing.
     pub async fn continue_turn(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         let combined = self.make_combined_callback(on_event);
-        self.session
-            .sync_runtime_selection_from_session_header()
-            .await?;
-        self.session
-            .agent
-            .run_continue_with_abort(None, combined)
-            .await
+        self.session.run_continue_with_abort(None, combined).await
     }
 
     /// Continue the current agent loop with an explicit abort signal.
     ///
     /// Applies [`SessionOptions::retry`] when one is configured; with none, the
     /// first outcome is returned unchanged.
+    ///
+    /// The first attempt persists and respects the admission gate, like every
+    /// retry after it. It did neither until bd-9o9i2: the retry attempts went
+    /// through [`AgentSession`] while the attempt they were retrying went
+    /// through the inner `Agent`, so a turn that succeeded first time wrote
+    /// nothing while the same turn on its second try wrote correctly.
     pub async fn continue_turn_with_abort(
         &mut self,
         abort_signal: AbortSignal,
@@ -1850,12 +1856,8 @@ impl AgentSessionHandle {
         let shared: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(on_event);
         let first_attempt = Arc::clone(&shared);
         let combined = self.make_combined_callback(move |event| first_attempt(event));
-        self.session
-            .sync_runtime_selection_from_session_header()
-            .await?;
         let first = self
             .session
-            .agent
             .run_continue_with_abort(Some(abort_signal.clone()), combined)
             .await;
         self.apply_retry_policy(first, &abort_signal, &shared).await
@@ -2235,9 +2237,10 @@ impl AgentSessionHandle {
             // transcript from the session path the revert above just moved, so
             // the retry continues from the last COMPLETED state and the next
             // failure leaves a tail for the next revert. Print mode and RPC
-            // resume the same way. (The bare Agent call is what
-            // `continue_turn_with_abort` still uses for its first attempt,
-            // which is the session-persistence gap bd-9o9i2 tracks.)
+            // resume the same way, and since bd-9o9i2 so does the first
+            // attempt in `continue_turn_with_abort` — that asymmetry, where a
+            // turn persisted only if it had to be retried, is what the bead
+            // was about.
             current = self
                 .session
                 .run_continue_with_abort(Some(abort_signal.clone()), combined)
@@ -3360,6 +3363,33 @@ mod tests {
         flaky_handle_as(failures, "test-provider", "test-model")
     }
 
+    /// A handle over a SAVING, on-disk session, for tests that care what
+    /// reaches the file rather than what reaches memory. The other helpers here
+    /// build an in-memory session with saving off, which cannot distinguish a
+    /// turn that persisted from one that did not.
+    fn saving_handle(dir: &Path) -> AgentSessionHandle {
+        let provider = Arc::new(FlakyThenOkProvider {
+            failures: 0,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            name: "test-provider".to_string(),
+            model: "test-model".to_string(),
+        });
+        let agent = crate::agent::Agent::new(
+            provider,
+            crate::tools::ToolRegistry::new(&[], Path::new("."), None),
+            crate::agent::AgentConfig::default(),
+        );
+        let session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(crate::session::Session::create_with_dir(
+                Some(dir.to_path_buf()),
+            ))),
+            true,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
+    }
+
     fn flaky_handle_as(
         failures: usize,
         name: &str,
@@ -3613,6 +3643,48 @@ mod tests {
         assert!(
             calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
             "the failing provider was called at least once before the swap"
+        );
+    }
+
+    /// bd-9o9i2: `continue_turn_with_abort` drove the inner `Agent` directly,
+    /// and the raw loop persists nothing — everything that writes a turn to the
+    /// session lives on `AgentSession`. So a continuation ran a full turn,
+    /// streamed its events, returned its assistant message, and wrote nothing.
+    ///
+    /// The asymmetry was inside one type and, after the retry work, inside one
+    /// call: a turn that failed and was RETRIED persisted correctly, because
+    /// the retry went through `AgentSession`, while the same turn succeeding
+    /// first time did not.
+    ///
+    /// Asserted against the session REOPENED FROM DISK rather than the live
+    /// handle, because the live `Session` would show the entry even if it were
+    /// never flushed.
+    #[test]
+    fn a_continuation_persists_its_turn_to_the_reopened_session() {
+        let dir = tempdir().expect("tempdir");
+        let mut handle = saving_handle(dir.path());
+
+        let message = run_async(handle.continue_turn(|_| {})).expect("continuation completes");
+        assert_eq!(
+            message.stop_reason,
+            crate::model::StopReason::Stop,
+            "the provider double completes on the first attempt"
+        );
+
+        let path = run_async(async {
+            let store = handle.session_store();
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let inner = store.lock(cx.cx()).await.expect("session lock");
+            inner.path.clone()
+        })
+        .expect("a persisted continuation gives the session a path on disk");
+
+        let reopened = run_async(crate::session::Session::open(&path.display().to_string()))
+            .expect("reopen the session file");
+        assert!(
+            !reopened.to_messages_for_current_path().is_empty(),
+            "a continuation must write its turn to the session file; the raw \
+             Agent loop persists nothing (bd-9o9i2)"
         );
     }
 
