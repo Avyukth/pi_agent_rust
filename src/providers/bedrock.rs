@@ -1345,9 +1345,49 @@ mod tests {
     use futures::StreamExt as _;
     use serde_json::json;
     use std::io::{Read as _, Write as _};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// Polling interval for a fixture socket read. NOT the budget — see
+    /// [`read_with_deadline`].
+    const FIXTURE_POLL: Duration = Duration::from_millis(250);
+    /// Wall-clock budget for one fixture request.
+    const FIXTURE_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Read into `chunk`, treating a socket read timeout as "keep waiting"
+    /// until `deadline` rather than as a hard error.
+    ///
+    /// macOS surfaces a read timeout as EAGAIN/`WouldBlock` (errno 35), not
+    /// `TimedOut`, so `read().expect(..)` failed the test outright whenever a
+    /// client had merely not been scheduled in time. Two seconds is nothing
+    /// under a parallel lib suite; the same shape took seven tests out of the
+    /// Gemini and Vertex fixtures before it was fixed there (bd-eg6ng).
+    fn read_with_deadline(
+        socket: &mut TcpStream,
+        chunk: &mut [u8],
+        deadline: Instant,
+        what: &str,
+    ) -> usize {
+        loop {
+            match socket.read(chunk) {
+                Ok(count) => return count,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture timed out waiting for {what}"
+                    );
+                }
+                // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                Err(err) => panic!("{what}: {err}"),
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CapturedBedrockRequest {
@@ -1363,13 +1403,15 @@ mod tests {
         std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().expect("accept Bedrock request");
             socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(FIXTURE_POLL))
                 .expect("set Bedrock request read timeout");
+            let deadline = Instant::now() + FIXTURE_BUDGET;
 
             let mut request = Vec::new();
             let mut chunk = [0_u8; 4096];
             let header_end = loop {
-                let read = socket.read(&mut chunk).expect("read Bedrock request");
+                let read =
+                    read_with_deadline(&mut socket, &mut chunk, deadline, "read Bedrock request");
                 assert!(read > 0, "Bedrock request ended before its headers");
                 request.extend_from_slice(&chunk[..read]);
                 if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -1390,7 +1432,12 @@ mod tests {
                 .expect("Bedrock request content-length");
             let body_start = header_end + 4;
             while request.len().saturating_sub(body_start) < content_length {
-                let read = socket.read(&mut chunk).expect("read Bedrock request body");
+                let read = read_with_deadline(
+                    &mut socket,
+                    &mut chunk,
+                    deadline,
+                    "read Bedrock request body",
+                );
                 assert!(read > 0, "Bedrock request ended before its body");
                 request.extend_from_slice(&chunk[..read]);
             }
