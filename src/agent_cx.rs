@@ -10,10 +10,16 @@
 //! `asupersync::Cx`; it just centralizes how Pi threads context through async code.
 
 use asupersync::{Budget, Cx};
+use std::ffi::OsStr;
 use std::future::{Future, poll_fn};
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
+
+mod http;
+mod process;
+pub use http::{AgentHttpClient, AgentHttpRequest, AgentHttpResponse};
+pub use process::{AgentChild, AgentCommand};
 
 /// A capability-scoped context for agent operations.
 ///
@@ -110,16 +116,16 @@ impl AgentCx {
         AgentTime { cx: self }
     }
 
-    /// HTTP capability accessor.
+    /// HTTP capability accessor. Requests and response bodies retain this owner.
     #[must_use]
     pub const fn http(&self) -> AgentHttp<'_> {
-        AgentHttp { _cx: self }
+        AgentHttp { cx: self }
     }
 
-    /// Process capability accessor.
+    /// Process capability accessor. Owned commands check authority at spawn.
     #[must_use]
     pub const fn process(&self) -> AgentProcess<'_> {
-        AgentProcess { _cx: self }
+        AgentProcess { cx: self }
     }
 }
 
@@ -203,27 +209,43 @@ impl AgentTime<'_> {
     }
 }
 
-/// HTTP-related operations.
+/// HTTP operations scoped through dispatch and response-body consumption.
+/// A configured client can be bound without losing VCR or transport settings.
 pub struct AgentHttp<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentHttp<'_> {
     #[must_use]
-    pub fn client(&self) -> crate::http::client::Client {
-        crate::http::client::Client::new()
+    pub fn client(&self) -> AgentHttpClient {
+        AgentHttpClient::new(self.cx.clone(), crate::http::client::Client::new())
+    }
+
+    #[must_use]
+    pub fn bind(&self, client: &crate::http::client::Client) -> AgentHttpClient {
+        AgentHttpClient::new(self.cx.clone(), client.clone())
+    }
+
+    /// Attach this owner to an already-configured request. This preserves its
+    /// endpoint, credentials, headers, body, recorder and timeout settings.
+    #[must_use]
+    pub fn request<'a>(
+        &self,
+        request: crate::http::client::RequestBuilder<'a>,
+    ) -> AgentHttpRequest<'a> {
+        AgentHttpRequest::new(self.cx.clone(), request)
     }
 }
 
-/// Process-related operations.
+/// Process operations scoped through dispatch and owned child cleanup.
 pub struct AgentProcess<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentProcess<'_> {
     #[must_use]
-    pub fn command(&self, program: &str) -> std::process::Command {
-        std::process::Command::new(program)
+    pub fn command(&self, program: impl AsRef<OsStr>) -> AgentCommand {
+        AgentCommand::new(self.cx.clone(), program)
     }
 }
 
