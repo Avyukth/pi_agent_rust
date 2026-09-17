@@ -29,7 +29,7 @@ pub(super) struct Session {
 }
 
 pub(super) async fn execute(
-    state: &asupersync::sync::Mutex<Session>,
+    state: &std::sync::Arc<asupersync::sync::Mutex<Session>>,
     endpoint_override: Option<&str>,
     cwd: &Path,
     allowlist: Option<&[String]>,
@@ -110,10 +110,14 @@ pub(super) async fn execute(
         .checkpoint()
         .map_err(|_| Error::tool("browser", "browser operation cancelled"))?;
     let operation = async {
-        let mut state = state
-            .lock(owner.cx())
-            .await
-            .map_err(|e| Error::tool("browser", format!("browser session lock: {e}")))?;
+        // OwnedMutexGuard, not the borrowed one: this guard is held across the
+        // awaits below, inside a future that `Tool::execute` requires to be
+        // `Send`, and `asupersync::sync::MutexGuard` is not `Send` while
+        // `OwnedMutexGuard` is.
+        let mut state =
+            asupersync::sync::OwnedMutexGuard::lock(std::sync::Arc::clone(state), owner.cx())
+                .await
+                .map_err(|e| Error::tool("browser", format!("browser session lock: {e}")))?;
         if state.endpoint.as_deref() != Some(endpoint.as_str()) {
             state.tabs.clear();
             state.references.clear();

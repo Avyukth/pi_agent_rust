@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 mod cdp;
 mod interaction;
@@ -63,7 +63,10 @@ pub struct BrowserTool {
     cwd: PathBuf,
     mock_mode: Option<bool>,
     mock_state: Mutex<mock::State>,
-    live_state: asupersync::sync::Mutex<cdp::Session>,
+    /// Behind an `Arc` so the CDP path can take an `OwnedMutexGuard`.
+    /// `asupersync::sync::MutexGuard` is NOT `Send`, and this guard is held
+    /// across awaits inside a `Tool::execute` future, which must be.
+    live_state: Arc<asupersync::sync::Mutex<cdp::Session>>,
     cdp_endpoint: Option<String>,
     domain_allowlist: Option<Vec<String>>,
 }
@@ -74,7 +77,7 @@ impl BrowserTool {
             cwd: cwd.to_path_buf(),
             mock_mode: None,
             mock_state: Mutex::new(mock::State::default()),
-            live_state: asupersync::sync::Mutex::new(cdp::Session::default()),
+            live_state: Arc::new(asupersync::sync::Mutex::new(cdp::Session::default())),
             cdp_endpoint: None,
             domain_allowlist: None,
         }
