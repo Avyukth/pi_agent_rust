@@ -1536,10 +1536,10 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn thinking_block_drops_foreign_reasoning_signature() {
@@ -2935,6 +2935,78 @@ mod tests {
 
     fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
         run_stream_and_capture_headers_with_api_key(cache_retention, "sk-ant-test-key")
+    }
+
+    /// bd-n0hjg: the regression test for the whole fixture class (bd-eg6ng).
+    ///
+    /// Eleven provider fixtures used to treat a socket read timeout as fatal or
+    /// as end-of-request. That only breaks under contention — when the client
+    /// has not been scheduled before the fixture's first read — so on an idle
+    /// machine the timeout arm is never even reached and a mutation probe
+    /// cannot fail. I could not prove those conversions any other way: with the
+    /// deadline forced into the past AND a 1ms poll, all 68 tests still passed,
+    /// because the request was already buffered.
+    ///
+    /// This reproduces the condition deliberately instead of waiting for load:
+    /// the CLIENT connects and then says nothing for longer than the two
+    /// seconds the old code allowed. Against the old fixture the read returned
+    /// `WouldBlock` and the header scan then failed as
+    /// `expect("request header boundary")` — a SLOW request misreported as a
+    /// MALFORMED one. Against the current fixture the read waits and the
+    /// request parses.
+    ///
+    /// One provider is enough: the eleven conversions are textually identical,
+    /// so a second copy of this would be ceremony. It lives beside the fixture
+    /// it drives rather than in tests/common, because each provider owns its
+    /// own in-module fixture and there is no shared mock to put it next to.
+    #[test]
+    fn a_fixture_waits_out_a_client_slower_than_the_old_read_timeout() {
+        // Comfortably past the 2s the old code allowed, well inside the 30s
+        // budget the current code gives the whole exchange.
+        const CLIENT_SILENCE: Duration = Duration::from_millis(2_500);
+
+        let (url, rx) = spawn_test_server(200, "text/event-stream", "data: [DONE]\n\n");
+        let authority = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .expect("fixture URL has an authority")
+            .to_string();
+
+        let started = Instant::now();
+        let client = std::thread::spawn(move || {
+            let mut socket = TcpStream::connect(&authority).expect("connect to fixture");
+            // The point of the test: connected, then silent past the old window.
+            std::thread::sleep(CLIENT_SILENCE);
+            let body = r#"{"model":"claude-test"}"#;
+            let request = format!(
+                "POST /v1/messages HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(request.as_bytes())
+                .expect("write the delayed request");
+            socket.flush().expect("flush the delayed request");
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the fixture must still capture a request from a slow client");
+        client.join().expect("client thread");
+
+        assert!(
+            started.elapsed() >= CLIENT_SILENCE,
+            "the client did not actually stay silent, so this proves nothing"
+        );
+        assert_eq!(
+            captured.body, r#"{"model":"claude-test"}"#,
+            "the body must arrive whole, not truncated at the read timeout"
+        );
+        assert_eq!(
+            captured.headers.get("content-type").map(String::as_str),
+            Some("application/json"),
+            "headers must parse; truncation shows up here first"
+        );
     }
 
     fn run_stream_and_capture_headers_with_api_key(
