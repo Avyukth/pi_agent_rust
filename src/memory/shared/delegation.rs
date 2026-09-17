@@ -79,7 +79,7 @@ impl SharedMemoryBinding {
     /// The caller should pass its remaining request budget, not restart a budget
     /// per child. A failed resolution must not fall back to a different session.
     pub async fn resolve(&self, timeout: Duration) -> Result<SharedMemoryGrant> {
-        if timeout < Duration::from_millis(1) || timeout > Duration::from_secs(86_400) {
+        if timeout < Duration::from_millis(1) || timeout > Duration::from_hours(24) {
             return Err(failure(
                 "PI_SHARED_MEMORY_TIMEOUT",
                 "Resolution requires a budget from 1 ms to 24 hours",
@@ -142,9 +142,11 @@ fn read_only_error() -> crate::error::Error {
     )
 }
 
-/// Captured parent namespace. Safe to clone across concurrent children and
-/// retries; the live parent resolver is no longer consulted. Deliberately no
-/// Debug/Serialize implementation: storage and scope identifiers are private.
+/// Captured parent namespace: safe to clone across concurrent children and
+/// retries; the live parent resolver is no longer consulted.
+///
+/// Deliberately no Debug/Serialize implementation: storage and scope
+/// identifiers are private.
 #[derive(Clone)]
 pub struct SharedMemoryGrant {
     store: SharedMemoryStore,

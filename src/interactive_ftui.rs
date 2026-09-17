@@ -1091,6 +1091,11 @@ impl AgentUiState {
 /// Covers init/update/view/subscriptions end to end but holds only what its
 /// tests assert on; the real conversation state migrates here from
 /// `interactive::state` as the view port proceeds.
+// The four model flags are deliberately independent: quit intent, two
+// terminal-capture features with separate user toggles, and a transient
+// suspend marker. Collapsing them would invent state coupling that does not
+// exist, so the excessive-bools lint is declined here by design.
+#[allow(clippy::struct_excessive_bools)]
 pub struct PiFtuiModel {
     /// What the agent is doing right now (drives header + input routing).
     state: AgentUiState,
