@@ -14,9 +14,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_BODY_LIMIT: usize = 50 * 1024 * 1024;
 type ByteStream = Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
+type CancelWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 fn check_access(owner: &AgentCx) -> std::io::Result<()> {
     if !owner.capabilities().io || !owner.capabilities().time {
@@ -35,16 +35,14 @@ fn cancelled() -> std::io::Error {
     )
 }
 
-// Foreign transports do not necessarily register a cancellation waker with
-// asupersync. This timer wakes a silent operation without busy polling or
-// spawning a detached task. Each sleep registers under this exact owner.
+// The transport may not register with the explicit owner's cancellation lane.
+// A cancel-aware receive does so without a polling timer or detached task. The
+// sender stays local and alive across the receive, and never publishes: only
+// cancellation can complete this wait. Dropping it retires its registration.
 async fn cancellation(owner: AgentCx) {
-    loop {
-        if owner.checkpoint().is_err() {
-            return;
-        }
-        owner.time().sleep(CANCEL_POLL_INTERVAL).await;
-    }
+    let (sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+    let _ = receiver.recv(owner.cx()).await;
+    drop(sender);
 }
 
 /// A reusable HTTP client carrying an explicit request owner.
@@ -125,11 +123,17 @@ impl<'a> AgentHttpRequest<'a> {
     pub async fn send(self) -> Result<AgentHttpResponse> {
         let Self { owner, request } = self;
         check_access(&owner)?;
-        let operation = Box::pin(owner.with_current(request.send()));
-        let cancellation = Box::pin(cancellation(owner.clone()));
-        let response = match futures::future::select(operation, cancellation).await {
-            futures::future::Either::Left((response, _)) => response?,
-            futures::future::Either::Right(((), _)) => return Err(cancelled().into()),
+        let response = {
+            let operation = Box::pin(owner.with_current(request.send()));
+            let cancellation = Box::pin(cancellation(owner.clone()));
+            match futures::future::select(operation, cancellation).await {
+                futures::future::Either::Left((response, _)) => response?,
+                futures::future::Either::Right(((), pending)) => {
+                    let _guard = owner.cx().clone().set_current_restricted();
+                    drop(pending);
+                    return Err(cancelled().into());
+                }
+            }
         };
         // Cancellation may have raced the response headers. Drop the response
         // rather than handing an already-cancelled transport to another task.
@@ -158,7 +162,7 @@ impl AgentHttpResponse {
 
     #[must_use]
     pub fn headers(&self) -> &[(String, String)] {
-        &self.response.headers()
+        self.response.headers()
     }
 
     #[must_use]
@@ -192,13 +196,22 @@ impl AgentHttpResponse {
 struct OwnedBody {
     owner: AgentCx,
     stream: Option<ByteStream>,
-    cancellation: Pin<Box<dyn Future<Output = ()> + Send>>,
+    cancellation: Option<CancelWait>,
 }
 
 impl OwnedBody {
     fn new(owner: AgentCx, stream: ByteStream) -> Self {
         let cancellation = Box::pin(cancellation(owner.clone()));
-        Self { owner, stream: Some(stream), cancellation }
+        Self {
+            owner,
+            stream: Some(stream),
+            cancellation: Some(cancellation),
+        }
+    }
+
+    fn retire(&mut self) {
+        drop(self.stream.take());
+        drop(self.cancellation.take());
     }
 }
 
@@ -212,18 +225,30 @@ impl Stream for OwnedBody {
         }
         let _guard = this.owner.cx().clone().set_current_restricted();
         if let Err(error) = check_access(&this.owner) {
-            drop(this.stream.take());
+            this.retire();
             return Poll::Ready(Some(Err(error)));
         }
-        if this.cancellation.as_mut().poll(task).is_ready() {
-            drop(this.stream.take());
+        if this
+            .cancellation
+            .as_mut()
+            .expect("active cancellation wait")
+            .as_mut()
+            .poll(task)
+            .is_ready()
+        {
+            this.retire();
             return Poll::Ready(Some(Err(cancelled())));
         }
-        let result = this.stream.as_mut().expect("active stream").as_mut().poll_next(task);
+        let result = this
+            .stream
+            .as_mut()
+            .expect("active stream")
+            .as_mut()
+            .poll_next(task);
         if matches!(result, Poll::Ready(None | Some(Err(_)))) {
             // Fusing errors also closes the socket immediately; consumers that
             // poll after a timeout must not receive an infinite error sequence.
-            drop(this.stream.take());
+            this.retire();
         }
         result
     }
@@ -232,7 +257,7 @@ impl Stream for OwnedBody {
 impl Drop for OwnedBody {
     fn drop(&mut self) {
         let _guard = self.owner.cx().clone().set_current_restricted();
-        drop(self.stream.take());
+        self.retire();
     }
 }
 
@@ -242,11 +267,14 @@ mod tests {
     use asupersync::{Budget, Cx};
     use futures::StreamExt;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Wake, Waker};
 
     #[test]
     fn denied_owner_cannot_borrow_the_callers_http_authority() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let raw = runtime.request_cx_with_budget(Budget::new());
         let owner = {
             let _guard = raw.restrict::<asupersync::cx::cap::None>().set_current_restricted();
@@ -268,9 +296,13 @@ mod tests {
         let owner = AgentCx::for_request();
         owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancellation"));
         let client = AgentHttpClient::new(owner, Client::new());
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let error = runtime.block_on(client.get("not a URL").no_timeout().send())
-            .err().expect("cancelled request");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(client.get("not a URL").no_timeout().send())
+            .err()
+            .expect("cancelled request");
         assert!(error.to_string().contains("cancelled"));
         assert!(!error.to_string().contains("not a URL"));
     }
@@ -284,6 +316,7 @@ mod tests {
 
     impl Stream for ObservedStream {
         type Item = std::io::Result<Vec<u8>>;
+
         fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             assert_eq!(Cx::current().expect("owner installed").budget(), self.owner_budget);
             self.polled.store(true, Ordering::SeqCst);
@@ -303,46 +336,110 @@ mod tests {
 
     #[test]
     fn body_error_releases_transport_and_is_emitted_only_once() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let budget = Budget::new().with_poll_quota(123);
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(budget));
         let polled = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = OwnedBody::new(owner, Box::pin(ObservedStream {
-            owner_budget: budget, polled: Arc::clone(&polled),
-            dropped: Arc::clone(&dropped), fail: true,
+            owner_budget: budget,
+            polled: Arc::clone(&polled),
+            dropped: Arc::clone(&dropped),
+            fail: true,
         }));
         runtime.block_on(async {
             let caller = Cx::current().unwrap();
             assert!(body.next().await.unwrap().is_err());
             assert!(polled.load(Ordering::SeqCst));
             assert!(dropped.load(Ordering::SeqCst));
+            assert!(body.cancellation.is_none());
             assert!(body.next().await.is_none());
             assert_eq!(Cx::current().unwrap().budget(), caller.budget());
         });
     }
 
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     #[test]
-    fn cancellation_wakes_an_idle_body_without_incoming_bytes() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    fn cancellation_wakes_an_idle_body_without_incoming_bytes_or_timer_polls() {
         let budget = Budget::new().with_poll_quota(1000);
-        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(budget));
+        let owner = AgentCx::for_request_with_budget(budget);
+        let parent = Cx::for_request_with_budget(Budget::new().with_poll_quota(2000));
+        let _parent_guard = parent.clone().set_current_restricted();
         let polled = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let mut body = OwnedBody::new(owner.clone(), Box::pin(ObservedStream {
-            owner_budget: budget, polled: Arc::clone(&polled),
-            dropped: Arc::clone(&dropped), fail: false,
+            owner_budget: budget,
+            polled: Arc::clone(&polled),
+            dropped: Arc::clone(&dropped),
+            fail: false,
         }));
-        runtime.block_on(async {
-            let cancel_owner = async {
-                owner.time().sleep(Duration::from_millis(1)).await;
-                assert!(polled.load(Ordering::SeqCst));
-                owner.cancel_with(asupersync::types::CancelKind::User, Some("idle cancellation"));
-            };
-            let (item, ()) = futures::join!(body.next(), cancel_owner);
-            assert_eq!(item.unwrap().unwrap_err().kind(), std::io::ErrorKind::Interrupted);
-            assert!(dropped.load(Ordering::SeqCst));
-            assert!(body.next().await.is_none());
-        });
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        assert!(Pin::new(&mut body).poll_next(&mut task).is_pending());
+        assert!(polled.load(Ordering::SeqCst));
+        assert_eq!(Cx::current().unwrap().budget(), parent.budget());
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("idle cancellation"));
+        assert!(counter.0.load(Ordering::SeqCst) > 0, "owner cancellation must wake the consumer");
+        let Poll::Ready(Some(Err(error))) = Pin::new(&mut body).poll_next(&mut task) else {
+            panic!("expected terminal cancellation");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(body.cancellation.is_none());
+        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert_eq!(Cx::current().unwrap().budget(), parent.budget());
+        assert!(!parent.is_cancel_requested());
+    }
+
+    #[test]
+    fn successful_eof_retires_the_owner_waiter() {
+        let mut body = OwnedBody::new(
+            AgentCx::for_request(),
+            Box::pin(futures::stream::iter([Ok(vec![0, 255, 1])])),
+        );
+        let mut task = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Some(Ok(bytes))) = Pin::new(&mut body).poll_next(&mut task) else {
+            panic!("expected exact bytes");
+        };
+        assert_eq!(bytes, [0, 255, 1]);
+        assert!(matches!(Pin::new(&mut body).poll_next(&mut task), Poll::Ready(None)));
+        assert!(body.stream.is_none());
+        assert!(body.cancellation.is_none());
+    }
+
+    #[test]
+    fn dropping_an_idle_body_retires_its_cancellation_registration() {
+        let budget = Budget::new().with_poll_quota(1000);
+        let owner = AgentCx::for_request_with_budget(budget);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut body = OwnedBody::new(owner.clone(), Box::pin(ObservedStream {
+            owner_budget: budget,
+            polled: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::clone(&dropped),
+            fail: false,
+        }));
+        let counter = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut task = Context::from_waker(&waker);
+        assert!(Pin::new(&mut body).poll_next(&mut task).is_pending());
+        drop(body);
+        assert!(dropped.load(Ordering::SeqCst));
+        let before = counter.0.load(Ordering::SeqCst);
+        owner.cancel_with(asupersync::types::CancelKind::User, Some("after body drop"));
+        assert_eq!(counter.0.load(Ordering::SeqCst), before);
     }
 }
