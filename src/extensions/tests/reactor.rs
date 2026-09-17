@@ -2216,6 +2216,7 @@ fn dispatch_shared_allowed_fast_and_forced_compat_match_on_malformed_payload() {
 
 #[test]
 fn runtime_hostcall_telemetry_records_lane_reason_fallback_and_latency_share() {
+    let _guard = superinstruction_test_lock();
     let dir = tempdir().expect("tempdir");
     let file = dir.path().join("lane_telemetry.txt");
     std::fs::write(&file, "lane-telemetry").expect("write test file");
