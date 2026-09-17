@@ -12,6 +12,10 @@ pub(super) const PNG: &[u8] = &[
     0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep deterministic action fixtures together in one dispatch table"
+)]
 pub(super) fn execute(tool: &ComputerTool, args: &Value) -> Result<ToolOutput> {
     let action = args["action"].as_str().expect("validated action");
     match action {

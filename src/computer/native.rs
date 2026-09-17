@@ -1,14 +1,17 @@
-//! Validated desktop requests and native X11 operations. Other backends fail
-//! explicitly; selecting a backend never selects canned results.
+//! Validated desktop requests and native X11/AT-SPI operations. Other backends
+//! fail explicitly; selecting a backend never selects canned results.
 
 #[cfg(unix)]
 use super::process::{self, strings, text};
-use super::{DisplayInfo, WindowInfo, error, output};
+#[cfg(any(unix, test))]
+use super::{DisplayInfo, WindowInfo};
+use super::{error, output};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use crate::model::{ContentBlock, ImageContent};
 use crate::tools::ToolOutput;
 use base64::Engine as _;
+#[cfg(any(unix, test))]
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -17,23 +20,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
+mod accessibility;
+#[cfg(unix)]
 mod input;
 
 pub(super) const HELPERS: &[&str] = &[
-    "xrandr",
-    "wmctrl",
-    "xprop",
-    "scrot",
-    "xdotool",
-    "xclip",
-    "grim",
-    "wl-copy",
-    "wl-paste",
-    "screencapture",
-    "pbcopy",
-    "pbpaste",
-    "osascript",
-    "python3",
+    "xrandr", "wmctrl", "xprop", "scrot", "xdotool", "xclip", "python3",
 ];
 pub(super) const IMAGE_LIMIT: usize = 20 * 1024 * 1024;
 
@@ -58,24 +50,22 @@ pub(super) fn check_owner(owner: &AgentCx) -> Result<()> {
 }
 
 pub(super) fn string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(value) => value
+    args.get(field).map_or(Ok(None), |value| {
+        value
             .as_str()
             .map(Some)
-            .ok_or_else(|| error(format!("{field} must be a string"))),
-    }
+            .ok_or_else(|| error(format!("{field} must be a string")))
+    })
 }
 
 pub(super) fn number(args: &Value, field: &str, min: i64, max: i64) -> Result<Option<i64>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(value) => value
+    args.get(field).map_or(Ok(None), |value| {
+        value
             .as_i64()
             .filter(|n| (min..=max).contains(n))
             .map(Some)
-            .ok_or_else(|| error(format!("{field} must be an integer in {min}..={max}"))),
-    }
+            .ok_or_else(|| error(format!("{field} must be an integer in {min}..={max}")))
+    })
 }
 
 pub(super) fn validate(args: &Value) -> Result<Duration> {
@@ -401,9 +391,7 @@ async fn x11(
                 false,
             ))
         }
-        "ax_tree" => Err(error(
-            "AT-SPI accessibility inspection is not available in this backend yet",
-        )),
+        "ax_tree" => accessibility::execute(owner, cwd, helpers, args).await,
         _ => input::execute(owner, cwd, helpers, state, args).await,
     }
 }
@@ -436,6 +424,7 @@ async fn active_window(
     }
 }
 
+#[cfg(any(unix, test))]
 #[derive(Serialize)]
 struct Monitor {
     #[serde(flatten)]
@@ -453,6 +442,7 @@ async fn monitors(
     parse_monitors(&query(owner, cwd, helpers, "xrandr", &["--listactivemonitors"]).await?)
 }
 
+#[cfg(any(unix, test))]
 fn parse_monitors(raw: &str) -> Result<Vec<Monitor>> {
     let mut lines = raw.lines();
     let expected = lines
@@ -518,13 +508,19 @@ fn parse_monitors(raw: &str) -> Result<Vec<Monitor>> {
     Ok(monitors)
 }
 
+#[cfg(any(unix, test))]
 #[derive(Serialize)]
 struct Window {
     #[serde(flatten)]
     info: WindowInfo,
     pid: u32,
+    // Keep identity separate from display sanitization, and never serialize it
+    // into tool output or an audit record.
+    #[serde(skip)]
+    raw_title: String,
 }
 
+#[cfg(any(unix, test))]
 fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
     let mut windows = Vec::new();
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
@@ -562,10 +558,16 @@ fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
         if windows.iter().any(|window: &Window| window.info.id == id) {
             return Err(error("duplicate window ID"));
         }
+        // wmctrl emits one delimiter after the right-aligned hostname. Any
+        // further leading spaces belong to the title and affect identity.
+        let raw_title = rest
+            .strip_prefix(' ')
+            .ok_or_else(|| error("malformed wmctrl title delimiter"))?
+            .to_string();
         windows.push(Window {
             info: WindowInfo {
                 id,
-                title: clean(rest.trim_start(), 2048),
+                title: clean(&raw_title, 2048),
                 app_name: clean(fields[7], 256),
                 x: parse(fields[3])?,
                 y: parse(fields[4])?,
@@ -577,6 +579,7 @@ fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
             pid: fields[2]
                 .parse::<u32>()
                 .map_err(|_| error("invalid window process ID"))?,
+            raw_title,
         });
     }
     windows.sort_by_key(|window| window.info.id);
@@ -632,7 +635,7 @@ pub(super) fn publish(path: &Path, args: &Value, bytes: &[u8], mock: bool) -> Re
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut stage = tempfile::NamedTempFile::new_in(parent)?;
     stage.write_all(bytes)?;
@@ -674,12 +677,25 @@ mod tests {
     use super::*;
     #[test]
     fn parses_real_wmctrl_columns_and_preserves_spaced_titles() {
-        let windows = parse_windows("0x00200022  0 42 30 40 360 120 PiDesktopProbe.Xmessage localhost Pi desktop protocol fixture\n", Some(0x200022)).unwrap();
+        let windows = parse_windows("0x00200022  0 42 30 40 360 120 PiDesktopProbe.Xmessage localhost Pi desktop protocol fixture\n", Some(0x0020_0022)).unwrap();
         assert_eq!(windows[0].info.title, "Pi desktop protocol fixture");
         assert_eq!(windows[0].info.app_name, "PiDesktopProbe.Xmessage");
         assert!(windows[0].info.is_focused);
         assert_eq!(windows[0].pid, 42);
         assert!(parse_windows("bad window", None).is_err());
+    }
+    #[test]
+    fn display_sanitization_does_not_change_accessibility_target_identity() {
+        let windows = parse_windows(
+            "0x00200022 0 42 0 0 80 60 Test.App host  A\u{202e}B\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(windows[0].raw_title, " A\u{202e}B");
+        assert_eq!(windows[0].info.title, " AB");
+        let serialized = serde_json::to_string(&windows).unwrap();
+        assert!(!serialized.contains("raw_title"));
+        assert!(!serialized.contains('\u{202e}'));
     }
     #[test]
     fn monitor_ids_geometry_and_completeness_are_checked() {

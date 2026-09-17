@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod mock;
 mod native;
@@ -194,8 +194,7 @@ impl ComputerTool {
                 id: Some(id.clone()),
                 header: Some("Desktop permission".into()),
                 question: format!(
-                    "Allow this desktop action once? It can affect the active application.\n{}",
-                    args
+                    "Allow this desktop action once? It can affect the active application.\n{args}"
                 ),
                 options: vec![
                     AskOption {
@@ -253,7 +252,7 @@ impl Tool for ComputerTool {
                 "direction": {"type":"string", "enum":["up","down","left","right"]},
                 "amount": {"type":"integer", "minimum":1, "maximum":100},
                 "output_path": {"type":"string", "description":"New PNG destination; existing files are never overwritten"},
-                "timeout_ms": {"type":"integer", "minimum":1, "maximum":120000, "default":30000}
+                "timeout_ms": {"type":"integer", "minimum":1, "maximum":120_000, "default":30_000}
             }
         })
     }
@@ -274,7 +273,7 @@ impl Tool for ComputerTool {
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let mock = self.is_mock();
-        let duration = match native::validate(&args) {
+        let duration: Duration = match native::validate(&args) {
             Ok(duration) => duration,
             Err(failure) => {
                 self.record_audit(action, &args, false, "invalid", mock);
@@ -421,5 +420,47 @@ mod tests {
                 selected == "Allow once"
             );
         }
+    }
+
+    #[test]
+    fn native_failure_never_publishes_a_fixture_screenshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ComputerTool::new(dir.path())
+            .with_mock(false)
+            .with_helper_path("scrot", dir.path().join("missing-scrot"))
+            .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(tool.execute(
+            "missing-native",
+            json!({"action":"screenshot","output_path":"must-not-exist.png"}),
+            None,
+        ));
+        assert!(result.is_err());
+        assert!(!dir.path().join("must-not-exist.png").exists());
+        assert_eq!(tool.get_audit_log()[0].details["outcome"], "error");
+    }
+
+    #[test]
+    fn tool_boundary_enforces_approval_before_any_native_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ComputerTool::new(dir.path())
+            .with_mock(false)
+            .with_helper_path("xdotool", dir.path().join("must-not-run"))
+            .unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(tool.execute(
+            "denied-input",
+            json!({"action":"key_type","text":"private-secret"}),
+            None,
+        ));
+        let failure = result.unwrap_err();
+        assert!(failure.to_string().contains("host approval"));
+        let log = tool.get_audit_log();
+        assert!(!log[0].allowed);
+        assert!(!serde_json::to_string(&log).unwrap().contains("private-secret"));
     }
 }
