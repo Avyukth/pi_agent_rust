@@ -9,7 +9,7 @@
 use super::AgentCx;
 use crate::error::{Error, Result};
 use crate::http::client::{Client, RequestBuilder, Response};
-use futures::{Future, Stream, StreamExt, TryStreamExt};
+use futures::{Future, Stream, TryStreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -62,31 +62,31 @@ impl AgentHttpClient {
 
     #[must_use]
     pub fn get(&self, url: &str) -> AgentHttpRequest<'_> {
-        self.bind(self.client.get(url))
+        AgentHttpRequest::new(self.owner.clone(), self.client.get(url))
     }
 
     #[must_use]
     pub fn post(&self, url: &str) -> AgentHttpRequest<'_> {
-        self.bind(self.client.post(url))
+        AgentHttpRequest::new(self.owner.clone(), self.client.post(url))
     }
 
     #[must_use]
     pub fn delete(&self, url: &str) -> AgentHttpRequest<'_> {
-        self.bind(self.client.delete(url))
-    }
-
-    fn bind<'a>(&'a self, request: RequestBuilder<'a>) -> AgentHttpRequest<'a> {
-        AgentHttpRequest { owner: &self.owner, request }
+        AgentHttpRequest::new(self.owner.clone(), self.client.delete(url))
     }
 }
 
 /// A request builder with no escape hatch that discards its context.
 pub struct AgentHttpRequest<'a> {
-    owner: &'a AgentCx,
+    owner: AgentCx,
     request: RequestBuilder<'a>,
 }
 
-impl AgentHttpRequest<'_> {
+impl<'a> AgentHttpRequest<'a> {
+    pub(super) const fn new(owner: AgentCx, request: RequestBuilder<'a>) -> Self {
+        Self { owner, request }
+    }
+
     #[must_use]
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.request = self.request.header(key, value);
@@ -123,9 +123,9 @@ impl AgentHttpRequest<'_> {
     }
 
     pub async fn send(self) -> Result<AgentHttpResponse> {
-        check_access(self.owner)?;
-        let owner = self.owner.clone();
-        let operation = Box::pin(owner.with_current(self.request.send()));
+        let Self { owner, request } = self;
+        check_access(&owner)?;
+        let operation = Box::pin(owner.with_current(request.send()));
         let cancellation = Box::pin(cancellation(owner.clone()));
         let response = match futures::future::select(operation, cancellation).await {
             futures::future::Either::Left((response, _)) => response?,
@@ -206,20 +206,27 @@ impl Stream for OwnedBody {
         }
         let _guard = this.owner.cx().clone().set_current_restricted();
         if let Err(error) = check_access(&this.owner) {
-            this.stream.take();
+            drop(this.stream.take());
             return Poll::Ready(Some(Err(error)));
         }
         if this.cancellation.as_mut().poll(task).is_ready() {
-            this.stream.take();
+            drop(this.stream.take());
             return Poll::Ready(Some(Err(cancelled())));
         }
         let result = this.stream.as_mut().expect("active stream").as_mut().poll_next(task);
         if matches!(result, Poll::Ready(None | Some(Err(_)))) {
             // Fusing errors also closes the socket immediately; consumers that
             // poll after a timeout must not receive an infinite error sequence.
-            this.stream.take();
+            drop(this.stream.take());
         }
         result
+    }
+}
+
+impl Drop for OwnedBody {
+    fn drop(&mut self) {
+        let _guard = self.owner.cx().clone().set_current_restricted();
+        drop(self.stream.take());
     }
 }
 
@@ -227,17 +234,27 @@ impl Stream for OwnedBody {
 mod tests {
     use super::*;
     use asupersync::{Budget, Cx};
+    use futures::StreamExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn denied_owner_cannot_borrow_the_callers_http_authority() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
-        let owner = AgentCx::from_cx(
-            runtime.request_cx_with_budget(Budget::new())
-                .restrict::<asupersync::cx::cap::None>().set_current_restricted().previous()
-        );
-        drop(owner);
+        let raw = runtime.request_cx_with_budget(Budget::new());
+        let owner = {
+            let _guard = raw.restrict::<asupersync::cx::cap::None>().set_current_restricted();
+            AgentCx::for_current_or_request()
+        };
+        let client = AgentHttpClient::new(owner, Client::new());
+        runtime.block_on(async {
+            let caller = Cx::current().expect("caller installed");
+            assert!(caller.capabilities().io);
+            let error = client.get("not a URL").send().await.err().expect("denied request");
+            assert!(error.to_string().contains("capabilities"));
+            assert!(!error.to_string().contains("not a URL"));
+            assert_eq!(Cx::current().unwrap().capabilities(), caller.capabilities());
+        });
     }
 
     #[test]
@@ -245,7 +262,8 @@ mod tests {
         let owner = AgentCx::for_request();
         owner.cancel_with(asupersync::types::CancelKind::User, Some("test cancellation"));
         let client = AgentHttpClient::new(owner, Client::new());
-        let error = futures::executor::block_on(client.get("not a URL").no_timeout().send())
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let error = runtime.block_on(client.get("not a URL").no_timeout().send())
             .err().expect("cancelled request");
         assert!(error.to_string().contains("cancelled"));
         assert!(!error.to_string().contains("not a URL"));
