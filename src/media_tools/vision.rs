@@ -489,7 +489,20 @@ mod tests {
         let cwd = dir
             .path()
             .join(std::ffi::OsString::from_vec(vec![b'i', 0xff]));
-        std::fs::create_dir(&cwd).unwrap();
+        // APFS rejects a name that is not valid UTF-8 outright (EILSEQ), so the
+        // panic this test guards against is unreachable there: there is no such
+        // working directory to serialize. Skipping is the honest result on those
+        // filesystems; panicking would report a filesystem policy as a pi bug.
+        match std::fs::create_dir(&cwd) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(rustix::io::Errno::ILSEQ.raw_os_error()) => {
+                eprintln!("SKIP non-UTF-8 working directory {cwd:?}: filesystem returned {error}");
+                return;
+            }
+            // Any other errno is a real failure, not a filesystem policy.
+            // ubs:ignore-next-line test fixture — the arm EILSEQ does not take
+            Err(error) => panic!("create non-UTF-8 working directory {cwd:?}: {error}"),
+        }
         std::fs::write(cwd.join("input.png"), super::super::MIN_VALID_PNG).unwrap();
         let tool = InspectImageTool::new(&cwd).with_mock(true);
         let output = futures::executor::block_on(tool.execute(

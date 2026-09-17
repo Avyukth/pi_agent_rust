@@ -2961,13 +2961,35 @@ mod tests {
                     Err(error) => panic!("accept catalog request: {error}"),
                 }
             };
+            // 250ms is the POLLING interval; the deadline is the budget. A read
+            // timeout means "nothing yet", not "fail the test" — macOS reports
+            // it as EAGAIN/WouldBlock, so `read().expect(..)` failed outright
+            // whenever the client had merely not been scheduled (bd-eg6ng).
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("bound catalog request read");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut request = Vec::new();
             let mut chunk = [0_u8; 1024];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let count = stream.read(&mut chunk).expect("read catalog request");
+                let count = loop {
+                    match stream.read(&mut chunk) {
+                        Ok(count) => break count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for the catalog request"
+                            );
+                        }
+                        // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                        Err(error) => panic!("read catalog request: {error}"),
+                    }
+                };
                 assert!(count > 0, "catalog request ended before its headers");
                 request.extend_from_slice(&chunk[..count]);
             }
@@ -3305,13 +3327,35 @@ mod tests {
                     Err(error) => panic!("accept catalog request: {error}"),
                 }
             };
+            // 250ms is the POLLING interval; the deadline is the budget. A read
+            // timeout means "nothing yet", not "fail the test" — macOS reports
+            // it as EAGAIN/WouldBlock, so `read().expect(..)` failed outright
+            // whenever the client had merely not been scheduled (bd-eg6ng).
             stream
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .expect("bound catalog request read");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let mut request = Vec::new();
             let mut chunk = [0_u8; 1024];
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let count = stream.read(&mut chunk).expect("read catalog request");
+                let count = loop {
+                    match stream.read(&mut chunk) {
+                        Ok(count) => break count,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "fixture timed out waiting for the catalog request"
+                            );
+                        }
+                        // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                        Err(error) => panic!("read catalog request: {error}"),
+                    }
+                };
                 assert!(count > 0, "catalog request ended before its headers");
                 request.extend_from_slice(&chunk[..count]);
             }

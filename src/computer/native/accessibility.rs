@@ -39,9 +39,7 @@ pub(super) async fn execute(
         .and_then(Value::as_u64)
         .map(|id| u32::try_from(id).expect("validated window ID"))
         .or(active)
-        .ok_or_else(|| {
-            error("accessibility inspection needs a window_id or a focused window")
-        })?;
+        .ok_or_else(|| error("accessibility inspection needs a window_id or a focused window"))?;
     let windows = parse_windows(
         &query(owner, cwd, helpers, "wmctrl", &["-u", "-lpGx"]).await?,
         active,
@@ -88,14 +86,20 @@ pub(super) async fn execute(
 }
 
 fn parse_response(bytes: &[u8]) -> Result<Snapshot> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| error("AT-SPI helper returned invalid JSON"))?;
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| error("AT-SPI helper returned invalid JSON"))?;
     if let Some(failure) = value.get("error") {
         return Err(error(match failure.as_str() {
-            Some("atspi_bindings_unavailable") => "AT-SPI requires Python PyGObject and the Atspi 2.0 introspection package; install them for the selected python3 interpreter",
-            Some("target_not_unique_or_not_exposed") => "window is not uniquely exposed by AT-SPI for its PID and title; enable application accessibility or choose another window",
+            Some("atspi_bindings_unavailable") => {
+                "AT-SPI requires Python PyGObject and the Atspi 2.0 introspection package; install them for the selected python3 interpreter"
+            }
+            Some("target_not_unique_or_not_exposed") => {
+                "window is not uniquely exposed by AT-SPI for its PID and title; enable application accessibility or choose another window"
+            }
             Some("accessibility_bus_unavailable") => "the session accessibility bus is unavailable",
-            Some("desktop_registry_limit" | "application_window_limit") => "accessibility target search exceeded its bounded registry budget",
+            Some("desktop_registry_limit" | "application_window_limit") => {
+                "accessibility target search exceeded its bounded registry budget"
+            }
             _ => "accessibility target became unavailable or could not be inspected",
         }));
     }
@@ -114,7 +118,9 @@ fn parse_response(bytes: &[u8]) -> Result<Snapshot> {
 
 fn validate_node(node: &AxNode, depth: usize, count: &mut usize) -> Result<()> {
     if depth > MAX_DEPTH || *count >= MAX_NODES || node.children.len() > 64 {
-        return Err(error("AT-SPI tree exceeded its node, depth or child budget"));
+        return Err(error(
+            "AT-SPI tree exceeded its node, depth or child budget",
+        ));
     }
     *count += 1;
     if node.role.is_empty()

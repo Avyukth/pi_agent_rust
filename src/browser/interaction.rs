@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+pub(super) mod upload;
+
 const ELEMENT_FUNCTION: &str = include_str!("dom.js");
 const MAX_ELEMENTS: usize = 200;
 const MAX_AX_NODES: usize = 1000;

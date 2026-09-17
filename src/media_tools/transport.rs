@@ -480,16 +480,40 @@ pub(super) mod tests {
                     Err(error) => panic!("accept: {error}"),
                 }
             };
+            // 250ms is the POLLING interval; `deadline` is the budget for the
+            // whole exchange. A read timeout means "nothing yet", not "fail":
+            // macOS reports one as EAGAIN/WouldBlock, so panicking on it fails
+            // the test whenever the client has merely not been scheduled, which
+            // is common under a parallel suite (bd-eg6ng).
             socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_millis(250)))
                 .unwrap();
             socket
                 .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let read_patiently = |socket: &mut std::net::TcpStream, chunk: &mut [u8]| loop {
+                match socket.read(chunk) {
+                    Ok(n) => return n,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture timed out waiting for the request"
+                        );
+                    }
+                    // ubs:ignore an unexpected socket error in a fixture is an assertion failure
+                    Err(error) => panic!("fixture read failed: {error}"),
+                }
+            };
             let mut request = Vec::new();
             let header_end = loop {
                 let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).unwrap();
+                let n = read_patiently(&mut socket, &mut chunk);
                 assert!(n > 0, "request ended before headers");
                 request.extend_from_slice(&chunk[..n]);
                 assert!(request.len() < 2 * 1024 * 1024);
@@ -509,7 +533,7 @@ pub(super) mod tests {
             assert!(length < 2 * 1024 * 1024);
             while request.len() - header_end < length {
                 let mut chunk = [0; 4096];
-                let n = socket.read(&mut chunk).unwrap();
+                let n = read_patiently(&mut socket, &mut chunk);
                 assert!(n > 0, "request ended before body");
                 request.extend_from_slice(&chunk[..n]);
             }

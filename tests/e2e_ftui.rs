@@ -1587,13 +1587,13 @@ fn e2e_ftui_share_creates_secret_gist() {
     let mock_bin = session.harness.temp_path("mock_bin");
     std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
     let gist_url = "https://gist.github.com/testuser/e2e_ftui_share_id";
-    common::mocks::write_mock_gh_script(&mock_bin, gist_url);
+    let gh_path = common::mocks::write_mock_gh_script(&mock_bin, gist_url);
 
     let pi_dir = session.harness.temp_path(".pi");
     std::fs::create_dir_all(&pi_dir).expect("create .pi");
     std::fs::write(
         pi_dir.join("settings.json"),
-        format!("{{\"ghPath\": \"{}\"}}", mock_bin.join("gh").display()),
+        format!("{{\"ghPath\": \"{}\"}}", gh_path.display()),
     )
     .expect("write settings.json");
     session.set_env(
@@ -1646,13 +1646,14 @@ fn e2e_ftui_share_public_never_invokes_gh() {
 
     let mock_bin = session.harness.temp_path("mock_bin");
     std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
-    common::mocks::write_mock_gh_script(&mock_bin, "https://gist.github.com/testuser/never");
+    let gh_path =
+        common::mocks::write_mock_gh_script(&mock_bin, "https://gist.github.com/testuser/never");
 
     let pi_dir = session.harness.temp_path(".pi");
     std::fs::create_dir_all(&pi_dir).expect("create .pi");
     std::fs::write(
         pi_dir.join("settings.json"),
-        format!("{{\"ghPath\": \"{}\"}}", mock_bin.join("gh").display()),
+        format!("{{\"ghPath\": \"{}\"}}", gh_path.display()),
     )
     .expect("write settings.json");
     session.set_env(

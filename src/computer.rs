@@ -461,6 +461,10 @@ mod tests {
         assert!(failure.to_string().contains("host approval"));
         let log = tool.get_audit_log();
         assert!(!log[0].allowed);
-        assert!(!serde_json::to_string(&log).unwrap().contains("private-secret"));
+        assert!(
+            !serde_json::to_string(&log)
+                .unwrap()
+                .contains("private-secret")
+        );
     }
 }

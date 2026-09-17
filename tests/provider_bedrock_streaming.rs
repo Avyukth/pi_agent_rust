@@ -109,13 +109,53 @@ struct CapturedRequest {
     body: Value,
 }
 
+/// One socket read that treats a timeout as "nothing yet" rather than "failed".
+///
+/// Returns the byte count, or panics once `deadline` has passed — which is the
+/// only condition under which a fixture read is really a test failure.
+fn read_patiently(
+    socket: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    what: &str,
+) -> usize {
+    loop {
+        match socket.read(buffer) {
+            Ok(count) => return count,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture timed out reading {what}"
+                );
+            }
+            // A socket error that is not a timeout really is a failed test.
+            // ubs:ignore-next-line test fixture — the only arm that can reach one
+            Err(error) => panic!("read {what}: {error}"),
+        }
+    }
+}
+
+/// Read one HTTP request off the fixture socket, patiently (bd-eg6ng).
+///
+/// The read timeout is a POLLING interval, not a patience budget: macOS reports
+/// an expired read timeout as EAGAIN/`WouldBlock`, so the old 5s timeout plus
+/// `.expect()` turned "the client has not been scheduled yet" into a failed
+/// test. Five seconds sounds generous and is not, on a host running anything
+/// else. The budget is the wall deadline below, which covers the whole
+/// exchange and fires only when the client really never came.
 fn read_request(socket: &mut TcpStream) -> CapturedRequest {
     socket
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_millis(250)))
         .unwrap();
     socket
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(Duration::from_secs(30)))
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut data = Vec::new();
     let header_end = loop {
         if let Some(index) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -123,7 +163,7 @@ fn read_request(socket: &mut TcpStream) -> CapturedRequest {
         }
         assert!(data.len() < 64 * 1024, "bounded fixture headers");
         let mut buffer = [0; 4096];
-        let count = socket.read(&mut buffer).expect("request header bytes");
+        let count = read_patiently(socket, &mut buffer, deadline, "request header bytes");
         assert!(count > 0, "request closed before headers");
         data.extend_from_slice(&buffer[..count]);
     };
@@ -140,7 +180,7 @@ fn read_request(socket: &mut TcpStream) -> CapturedRequest {
     assert!(length <= 1024 * 1024, "bounded fixture request body");
     while data.len() - header_end < length {
         let mut buffer = [0; 4096];
-        let count = socket.read(&mut buffer).expect("request body bytes");
+        let count = read_patiently(socket, &mut buffer, deadline, "request body bytes");
         assert!(count > 0, "request closed before body");
         data.extend_from_slice(&buffer[..count]);
     }

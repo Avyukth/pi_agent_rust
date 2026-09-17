@@ -6,6 +6,30 @@ function piBrowserElement(action, options) {
         throw new Error("Element reference is detached or does not identify an element; take a new snapshot");
     }
     const element = this;
+    // File inputs are commonly hidden behind a styled upload button. Selecting
+    // one is explicit, not a synthetic click; visibility is not a precondition.
+    if (action === "file_input" || action === "clear_files") {
+        if (!(element instanceof HTMLInputElement) || element.type !== "file") {
+            throw new Error("Element is not a file input");
+        }
+        if (element.matches(":disabled") || element.closest("[inert]")) {
+            throw new Error("File input is disabled or inert");
+        }
+        if (action === "clear_files") {
+            // An empty DOM.setFileInputFiles list is a no-op on some Chromium
+            // versions. Clearing via the native setter has explicit semantics.
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(element, "");
+            element.dispatchEvent(new Event("input", { bubbles: true }));
+            element.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        return {
+            multiple: element.multiple,
+            directory: element.webkitdirectory,
+            files: Array.from(element.files).slice(0, 11).map(file => ({
+                name: file.name, size: file.size
+            }))
+        };
+    }
     const style = getComputedStyle(element);
     const rect = element.getBoundingClientRect();
     const visible = rect.width > 0 && rect.height > 0 &&

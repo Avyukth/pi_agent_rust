@@ -1,8 +1,9 @@
 //! Opt-in Chromium automation through the native Chrome DevTools Protocol.
 //!
-//! Production calls attach to a running browser (by default on loopback port
-//! 9222). They never fall back to simulated results. Deterministic fixtures must
-//! explicitly select `with_mock(true)` or `PI_BROWSER_MOCK=1`.
+//! By default, Pi launches an installed browser with an isolated temporary
+//! profile. An explicit CDP endpoint attaches without taking process ownership.
+//! Production never falls back to simulated results. Deterministic fixtures
+//! must select `with_mock(true)` or `PI_BROWSER_MOCK=1` explicitly.
 
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -14,9 +15,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod cdp;
+mod exports;
 mod interaction;
+mod launch;
 mod mock;
 mod policy;
+
+pub use launch::BrowserLaunchOptions;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserTabInfo {
@@ -63,11 +68,10 @@ pub struct BrowserTool {
     cwd: PathBuf,
     mock_mode: Option<bool>,
     mock_state: Mutex<mock::State>,
-    /// Behind an `Arc` so the CDP path can take an `OwnedMutexGuard`.
-    /// `asupersync::sync::MutexGuard` is NOT `Send`, and this guard is held
-    /// across awaits inside a `Tool::execute` future, which must be.
+    /// An owned guard keeps the serialized CDP/managed-process lifetime Send.
     live_state: Arc<asupersync::sync::Mutex<cdp::Session>>,
     cdp_endpoint: Option<String>,
+    launch_options: Option<BrowserLaunchOptions>,
     domain_allowlist: Option<Vec<String>>,
 }
 
@@ -79,6 +83,7 @@ impl BrowserTool {
             mock_state: Mutex::new(mock::State::default()),
             live_state: Arc::new(asupersync::sync::Mutex::new(cdp::Session::default())),
             cdp_endpoint: None,
+            launch_options: None,
             domain_allowlist: None,
         }
     }
@@ -90,10 +95,20 @@ impl BrowserTool {
     }
 
     /// Attach to an explicitly selected loopback CDP HTTP endpoint.
-    /// Takes precedence over `PI_BROWSER_CDP_URL` and the port-9222 default.
+    /// Takes precedence over environment configuration. Pi will not stop it.
     #[must_use]
     pub fn with_cdp_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.cdp_endpoint = Some(endpoint.into());
+        self.launch_options = None;
+        self
+    }
+
+    /// Select managed launch from trusted host code, overriding the environment.
+    /// Stop an already-running browser before changing connection configuration.
+    #[must_use]
+    pub fn with_launch_options(mut self, options: BrowserLaunchOptions) -> Self {
+        self.launch_options = Some(options);
+        self.cdp_endpoint = None;
         self
     }
 
@@ -138,10 +153,11 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Chromium automation over a loopback CDP endpoint (PI_BROWSER_CDP_URL, default \
-         http://127.0.0.1:9222). Supports named tabs, navigation, JavaScript, page snapshots, \
-         input actions and PNG screenshots. A running remote-debugging browser is required; \
-         connection failures are errors, never simulated successes."
+        "Chromium automation with an owned isolated browser, or explicit loopback attachment \
+         through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
+         workspace file uploads, screenshots and PDF export. start launches or attaches; \
+         status never launches; stop only stops a Pi-owned browser. Failures are errors, \
+         never simulated successes. Selecting upload files exposes them to page scripts."
     }
 
     fn parameters(&self) -> Value {
@@ -151,9 +167,10 @@ impl Tool for BrowserTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open", "goto", "close", "list_tabs", "snapshot", "ax_tree",
-                             "evaluate", "click", "type", "fill", "press", "scroll", "wait_for", "screenshot"],
-                    "description": "Browser automation action"
+                    "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
+                             "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
+                             "scroll", "wait_for", "upload", "screenshot", "print_pdf"],
+                    "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
@@ -161,17 +178,26 @@ impl Tool for BrowserTool {
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1"},
                 "text": {"type": "string", "description": "Text for type/fill"},
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
-                "output_path": {"type": "string", "description": "Destination path for a real PNG screenshot"},
+                "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
+                          "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
+                "output_path": {"type": "string", "description": "New .png or .pdf destination; existing files are never overwritten"},
+                "full_page": {"type": "boolean", "description": "screenshot: capture beyond the viewport (default false)"},
+                "landscape": {"type": "boolean", "description": "print_pdf: landscape paper orientation (default false)"},
+                "print_background": {"type": "boolean", "description": "print_pdf: include background graphics (default true)"},
+                "page_ranges": {"type": "string", "description": "print_pdf: page ranges such as 1-3,5; omit for all pages"},
                 "delta_x": {"type": "number", "description": "Horizontal scroll delta in CSS pixels"},
                 "delta_y": {"type": "number", "description": "Vertical scroll delta in CSS pixels; default 600"},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120_000,
-                               "description": "Whole-operation deadline, including connection and lock wait"}
+                               "description": "Whole-operation deadline, including launch, connection and lock wait"}
             }
         })
     }
 
     fn effects(&self) -> ToolEffects {
-        ToolEffects::write()
+        ToolEffects::read()
+            .union(ToolEffects::write())
+            .union(ToolEffects::network())
+            .union(ToolEffects::process())
     }
 
     async fn execute(
@@ -180,8 +206,16 @@ impl Tool for BrowserTool {
         args: Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
-        required(&args, "action")?;
+        let action = required(&args, "action")?;
         if self.is_mock() {
+            if matches!(action, "start" | "status" | "stop" | "upload" | "print_pdf")
+                || args.get("full_page").is_some()
+            {
+                return Err(Error::tool(
+                    "browser",
+                    "browser lifecycle, file uploads and page exports require the native backend",
+                ));
+            }
             return self
                 .mock_state
                 .lock()
@@ -191,6 +225,7 @@ impl Tool for BrowserTool {
         cdp::execute(
             &self.live_state,
             self.cdp_endpoint.as_deref(),
+            self.launch_options.as_ref(),
             &self.cwd,
             self.domain_allowlist.as_deref(),
             &args,
