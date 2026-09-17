@@ -1892,6 +1892,16 @@ impl AgentSessionHandle {
         Arc::clone(&self.session.session)
     }
 
+    /// Whether a tool of this name is installed on the live agent.
+    ///
+    /// `/tan` is the caller this exists for: the `subagent` tool is opt-in, so
+    /// a session without it has to say so plainly rather than fail somewhere
+    /// inside the child launch (bd-ydz1t.2).
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.session.agent.has_tool(name)
+    }
+
     /// Install (or clear) this handle's provider retry policy.
     ///
     /// [`create_agent_session`] takes it from [`SessionOptions::retry`]; this is

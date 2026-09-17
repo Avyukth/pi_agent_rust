@@ -1027,6 +1027,10 @@ pub enum UiCommand {
     /// bd-ydz1t.1). Takes no arguments: the UI rejects `/share public`
     /// before this is ever sent, and the gist is always `--public=false`.
     Share,
+    /// Run `work` in a background child agent and deliver its answer at the
+    /// next turn boundary (`/tan`, bd-ydz1t.2). The UI rejects an empty
+    /// argument; the driver enforces that the opt-in `subagent` tool is on.
+    Tan(String),
     /// Print a textual branch-tree summary (`/tree`). The interactive tree
     /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
     /// branches/entries instead of falling through to extension dispatch.
@@ -1091,11 +1095,6 @@ impl AgentUiState {
 /// Covers init/update/view/subscriptions end to end but holds only what its
 /// tests assert on; the real conversation state migrates here from
 /// `interactive::state` as the view port proceeds.
-// The four model flags are deliberately independent: quit intent, two
-// terminal-capture features with separate user toggles, and a transient
-// suspend marker. Collapsing them would invent state coupling that does not
-// exist, so the excessive-bools lint is declined here by design.
-#[allow(clippy::struct_excessive_bools)]
 pub struct PiFtuiModel {
     /// What the agent is doing right now (drives header + input routing).
     state: AgentUiState,
@@ -1153,6 +1152,14 @@ pub struct PiFtuiModel {
     /// `run_prompt_turn` installs a fresh handle per turn; Ctrl-C fires it so
     /// exit doesn't block on the provider stream and remaining tool calls.
     turn_abort: Option<TurnAbortSlot>,
+    /// Background answers that arrived mid-turn, rendered at the turn boundary.
+    ///
+    /// `/tan` runs a child agent while the user keeps working, so its answer
+    /// can land at any moment (bd-ydz1t.2). Splicing it into a streaming reply
+    /// would show an answer to an earlier question in the middle of the current
+    /// one, so it waits for `AgentDone`/`AgentError` and is drained in arrival
+    /// order.
+    deferred_notes: Vec<String>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
     /// Conversation scroll, measured in lines UP from the tail. 0 means
@@ -1329,6 +1336,7 @@ impl PiFtuiModel {
             state: AgentUiState::Ready,
             transcript: Vec::new(),
             displayed_session_id: None,
+            deferred_notes: Vec::new(),
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
@@ -1903,6 +1911,7 @@ impl PiFtuiModel {
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                self.drain_deferred_notes();
                 self.settle_pending_cards();
             }
             PiMsg::AgentError(err) => {
@@ -1918,6 +1927,10 @@ impl PiFtuiModel {
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                // A failed turn still ends the turn, so a held note is owed to
+                // the user either way — dropping it on error would lose a
+                // completed background answer to an unrelated failure.
+                self.drain_deferred_notes();
                 self.settle_pending_cards();
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
@@ -1930,7 +1943,19 @@ impl PiFtuiModel {
             } => {
                 if self.displayed_session_id.as_deref() == Some(owner_session_id.as_str()) {
                     let text = sanitize(&message).into_owned();
-                    self.push_entry(EntryRole::System, text);
+                    // Held until the turn ends rather than rendered now: a
+                    // background answer arriving mid-stream would interleave
+                    // with the assistant text still accumulating in
+                    // `self.streaming`, and the user would see a reply to a
+                    // question they asked minutes ago spliced into the middle
+                    // of the current one (bd-ydz1t.2). The classic stack gets
+                    // the same effect a different way, by treating a busy
+                    // session as a reason to retry delivery later.
+                    if self.state == AgentUiState::Working {
+                        self.deferred_notes.push(text);
+                    } else {
+                        self.push_entry(EntryRole::System, text);
+                    }
                 }
             }
             PiMsg::ConversationReset {
@@ -2354,6 +2379,19 @@ impl PiFtuiModel {
                 self.send_command(UiCommand::SessionInfo);
                 return true;
             }
+            "/tan" => {
+                let work = cmd_args.trim();
+                if work.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Usage: /tan <work>"));
+                    return true;
+                }
+                // Deliberately NOT `begin_busy`: the whole point is that the
+                // user keeps working while the child agent runs. The answer
+                // arrives as a system entry at the next turn boundary.
+                self.push_entry(EntryRole::System, format!("(/tan started) {work}"));
+                self.send_command(UiCommand::Tan(work.to_string()));
+                return true;
+            }
             "/share" => {
                 // Refused HERE, before `gh` is ever invoked: a user who typed
                 // `/share public` is asking for the opposite of what this does,
@@ -2509,6 +2547,16 @@ impl PiFtuiModel {
     /// `label` until the driver replies. Call right before/after sending
     /// the matching [`UiCommand`]; the key handler that routed the input
     /// turns the pending flag into the spinner tick chain.
+    /// Render every background answer held during the turn that just ended.
+    ///
+    /// Drained in arrival order, so two `/tan` jobs that finish during one turn
+    /// appear in the order they completed rather than reversed.
+    fn drain_deferred_notes(&mut self) {
+        for text in std::mem::take(&mut self.deferred_notes) {
+            self.push_entry(EntryRole::System, text);
+        }
+    }
+
     fn begin_busy(&mut self, label: impl Into<String>) {
         self.busy = Some(BusyOp {
             label: label.into(),
@@ -3836,6 +3884,70 @@ async fn run_share_command(
     });
 }
 
+/// Handle `/tan` in the driver: start a background child agent and deliver its
+/// answer as a session note when it finishes.
+///
+/// The runner is `pi::subagents::SubagentTool::run_background_tan`, shared with
+/// the classic stack (bd-ydz1t.2). What this contributes is the gating and the
+/// delivery: the `subagent` tool is opt-in, so a session without it must say so
+/// rather than fail obscurely, and the completion is addressed to the session
+/// that ASKED, so an answer cannot land in a different session the user
+/// switched to meanwhile.
+///
+/// It does not await the child: the point of `/tan` is that the user keeps
+/// working. The UI holds the answer until the next turn boundary.
+async fn run_tan_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    role_spec: Option<String>,
+    work: String,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
+    if !handle.has_tool("subagent") {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "/tan unavailable: enable the opt-in subagent tool with --tools ...subagent",
+        )));
+        return;
+    }
+    let owner_session_id = match handle
+        .with_session(|session| session.header.id.clone())
+        .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("/tan: {err}")));
+            return;
+        }
+    };
+
+    let tool = crate::subagents::SubagentTool::new(cwd).with_role_model_spec(role_spec);
+    // ubs:ignore Sender clone per background job — the task must own its sender
+    let tx = agent_tx.clone();
+    runtime_handle.spawn(async move {
+        let message = match tool.run_background_tan(&work).await {
+            // Two deliveries, exactly as the classic stack does it
+            // (`completed_tan_event`): the summary is queued through the
+            // background-jobs seam for the parent AGENT to pick up at its next
+            // idle turn boundary, and the card is what the USER sees. The
+            // agent half needs nothing from this stack — `Agent` drains
+            // completion notices itself, so it already worked here.
+            Ok(completion) => {
+                crate::jobs::push_completion_notice(&owner_session_id, completion.follow_up_text())
+                    .map_or_else(
+                        |err| format!("(/tan failed to queue follow-up)\n{err}"),
+                        |()| completion.card_text(),
+                    )
+            }
+            Err(err) => format!("(/tan failed)\n{err}"),
+        };
+        let _ = tx.send(PiMsg::SessionSystemNote {
+            owner_session_id,
+            message,
+        });
+    });
+}
+
 async fn run_prompt_turn(
     handle: &mut crate::sdk::AgentSessionHandle,
     prompt: String,
@@ -4717,6 +4829,10 @@ pub struct FtuiSettings {
     /// With capture on, the terminal routes mouse events to the app and
     /// native drag-to-select stops working (pi_agent_rust#78).
     pub disable_mouse_capture: bool,
+    /// Model spec a `/tan` child agent runs under, from the `task` role falling
+    /// back to `smol` (`app::subagent_role_spec`). `None` lets the child pick
+    /// its own default.
+    pub subagent_role_spec: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4734,6 +4850,7 @@ pub fn run(
         markdown_spacing,
         gh_path,
         disable_mouse_capture,
+        subagent_role_spec,
     } = settings;
     // Issue #208: the driver re-sends the catalog with extension commands
     // once its session exists; the model starts from the resource catalog.
@@ -4876,6 +4993,17 @@ pub fn run(
                         }
                         Ok(UiCommand::SessionInfo) => {
                             run_session_info_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Tan(work)) => {
+                            run_tan_command(
+                                &handle,
+                                &bash_cwd,
+                                subagent_role_spec.clone(),
+                                work,
+                                &agent_tx,
+                                &runtime_handle,
+                            )
+                            .await;
                         }
                         Ok(UiCommand::Share) => {
                             run_share_command(
@@ -6751,6 +6879,105 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("compacting")),
             "compact note missing"
+        );
+    }
+
+    /// bd-ydz1t.2: `/tan` existed only on the classic stack, so on the default
+    /// stack it fell through to extension dispatch and reported "Unknown
+    /// command".
+    #[test]
+    fn slash_tan_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan summarise the changelog");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Tan("summarise the changelog".to_string())
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("(/tan started)")),
+            "the user must be told the background job started"
+        );
+        assert_eq!(
+            sim.model().state,
+            AgentUiState::Ready,
+            "/tan must NOT put the session in a working state — the point is \
+             that the user keeps working while the child runs"
+        );
+    }
+
+    /// `/tan` with no work is a usage error, and must not reach the driver:
+    /// launching a child agent with an empty task would burn a real provider
+    /// call on nothing.
+    #[test]
+    fn slash_tan_without_work_is_refused_before_the_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tan");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "an empty /tan must never reach the driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("Usage: /tan")),
+            "the refusal must say how to use it"
+        );
+    }
+
+    /// The delivery half (bd-ydz1t.2): a background answer that arrives while a
+    /// turn is streaming is HELD until the turn ends. Splicing it in mid-stream
+    /// would show an answer to an earlier question inside the current one.
+    #[test]
+    fn a_background_note_arriving_mid_turn_waits_for_the_turn_boundary() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let mut sim = ProgramSimulator::new(PiFtuiModel::new(rx));
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            session_id: "s1".to_string(),
+            messages: Vec::new(),
+            usage: crate::model::Usage::default(),
+            status: None,
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("partial".to_string())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::SessionSystemNote {
+            owner_session_id: "s1".to_string(),
+            message: "(/tan completed)\nbackground answer".to_string(),
+        }));
+
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the note must not interleave with the streaming reply"
+        );
+
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: crate::model::StopReason::Stop,
+            error_message: None,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("background answer")),
+            "the turn ended, so the held note is owed to the user now"
         );
     }
 

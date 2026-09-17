@@ -1569,3 +1569,116 @@ fn e2e_ftui_wheel_scroll_inside_tmux() {
     quit_and_assert_clean(&session);
     session.write_artifacts();
 }
+
+/// bd-ydz1t.1: `/share` reaches `gh` on the ftui stack and reports the URL.
+///
+/// The classic stack has had this scenario since the command existed; this is
+/// the same scenario against the stack most people run, driving the same
+/// `run_share` implementation through a mock `gh`. Without it, the ftui port
+/// was covered only by unit tests of the ROUTING — that the driver then
+/// produces a gist was true by construction and unasserted.
+#[test]
+fn e2e_ftui_share_creates_secret_gist() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_share_creates_gist") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let mock_bin = session.harness.temp_path("mock_bin");
+    std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
+    let gist_url = "https://gist.github.com/testuser/e2e_ftui_share_id";
+    common::mocks::write_mock_gh_script(&mock_bin, gist_url);
+
+    let pi_dir = session.harness.temp_path(".pi");
+    std::fs::create_dir_all(&pi_dir).expect("create .pi");
+    std::fs::write(
+        pi_dir.join("settings.json"),
+        format!("{{\"ghPath\": \"{}\"}}", mock_bin.join("gh").display()),
+    )
+    .expect("write settings.json");
+    session.set_env(
+        "PI_CONFIG_PATH",
+        &pi_dir.join("settings.json").display().to_string(),
+    );
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&ftui_args());
+    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+
+    // The success message's LAST paragraph, so the capture cannot land between
+    // two frames of the same multi-paragraph message.
+    let pane = session.send_text_and_wait("share", "/share", "Gist:", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains(gist_url),
+        "the gist URL the mock printed must reach the transcript; pane:\n{pane}"
+    );
+    assert!(
+        pane.contains("Share URL:"),
+        "the viewer URL paragraph is missing; pane:\n{pane}"
+    );
+
+    // What `gh` was actually asked to do. `--public=false` is the whole
+    // security claim of this command and it is invisible in the transcript.
+    let args_log = std::fs::read_to_string(mock_bin.join("gh_args.log"))
+        .expect("the mock gh must have been invoked");
+    assert!(
+        args_log.contains("--public=false"),
+        "the gist must be created secret; gh saw:\n{args_log}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
+/// bd-ydz1t.1: `/share public` is refused WITHOUT invoking `gh`.
+///
+/// The unit test proves the command never reaches the driver. This proves the
+/// consequence that actually matters: no process was spawned, so there is no
+/// path by which a public gist could have been created. Asserted on the
+/// absence of the mock's argument log, because "the command errored" and "the
+/// command never ran" look identical in a transcript.
+#[test]
+fn e2e_ftui_share_public_never_invokes_gh() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_share_public_refused") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let mock_bin = session.harness.temp_path("mock_bin");
+    std::fs::create_dir_all(&mock_bin).expect("create mock_bin");
+    common::mocks::write_mock_gh_script(&mock_bin, "https://gist.github.com/testuser/never");
+
+    let pi_dir = session.harness.temp_path(".pi");
+    std::fs::create_dir_all(&pi_dir).expect("create .pi");
+    std::fs::write(
+        pi_dir.join("settings.json"),
+        format!("{{\"ghPath\": \"{}\"}}", mock_bin.join("gh").display()),
+    )
+    .expect("write settings.json");
+    session.set_env(
+        "PI_CONFIG_PATH",
+        &pi_dir.join("settings.json").display().to_string(),
+    );
+    session.set_env("PI_WORKSPACE_TRUST", "trusted");
+
+    session.launch(&ftui_args());
+    session.wait_and_capture("startup", "ftui preview stack", STARTUP_TIMEOUT);
+
+    let pane = session.send_text_and_wait(
+        "share_public",
+        "/share public",
+        "public sharing is disabled",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        !pane.contains("Sharing session"),
+        "a refused /share must not start the export; pane:\n{pane}"
+    );
+    assert!(
+        !mock_bin.join("gh_args.log").exists(),
+        "gh must never be invoked for `/share public`"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}

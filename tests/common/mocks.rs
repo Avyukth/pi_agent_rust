@@ -873,6 +873,64 @@ impl FsFixture {
     }
 }
 
+// ─── Mock `gh` (for `/share`) ──────────────────────────────────────────────
+
+/// Write an executable mock `gh` into `dir` and report its path.
+///
+/// It answers `gh auth status` successfully, copies the payload of
+/// `gh gist create` to `<dir>/uploaded.html`, prints `gist_url`, and records
+/// every invocation's arguments to `<dir>/gh_args.log` — which is what lets a
+/// test assert that `gh` was NOT invoked, not merely that the command failed.
+/// Anything else exits 2 with the arguments on stderr, so an unexpected call
+/// fails loudly rather than looking like a success.
+///
+/// Shared by the classic and ftui `/share` scenarios (bd-ydz1t.1); both drive
+/// the same `run_share` implementation, so they must drive the same mock or
+/// the comparison proves nothing.
+#[must_use]
+pub fn write_mock_gh_script(dir: &Path, gist_url: &str) -> PathBuf {
+    let gh_path = dir.join("gh");
+    let args_path = dir.join("gh_args.log");
+    let uploaded_path = dir.join("uploaded.html");
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+
+# Record all invocations
+echo "$@" >> "{args_log}"
+
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  exit 0
+fi
+
+if [ "$1" = "gist" ] && [ "$2" = "create" ]; then
+  upload_path=""
+  for arg in "$@"; do
+    upload_path="$arg"
+  done
+  cp "$upload_path" "{uploaded}"
+  echo "{gist_url}"
+  exit 0
+fi
+
+echo "unexpected gh args: $@" >&2
+exit 2
+"#,
+        args_log = args_path.display(),
+        uploaded = uploaded_path.display(),
+    );
+    std::fs::write(&gh_path, script).expect("write mock gh");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock gh");
+    }
+
+    gh_path
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

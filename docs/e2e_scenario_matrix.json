@@ -759,11 +759,13 @@
       ],
       "suite_ids": [
         "e2e_tui_features",
-        "e2e_tui_perf"
+        "e2e_tui_perf",
+        "e2e_ftui"
       ],
       "test_paths": [
         "tests/e2e_tui_features.rs",
-        "tests/e2e_tui_perf.rs"
+        "tests/e2e_tui_perf.rs",
+        "tests/e2e_ftui.rs"
       ],
       "sli_ids": [
         "sli.tui.input_to_render_ms",

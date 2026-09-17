@@ -2626,6 +2626,10 @@ async fn run(
                     // `/share` on this stack (bd-ydz1t.1) runs the same gh flow
                     // the classic stack does, so it reads the same setting.
                     gh_path: config.gh_path.clone(),
+                    // `/tan` (bd-ydz1t.2) resolves its child model exactly as
+                    // the classic stack does: the `task` role, falling back to
+                    // `smol`.
+                    subagent_role_spec: pi::app::subagent_role_spec(&config),
                 },
                 pi::interactive_ftui::AutocompleteLaunch {
                     catalog: pi::autocomplete::AutocompleteCatalog::from_resources(&resources),
