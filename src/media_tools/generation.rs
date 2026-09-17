@@ -1,4 +1,4 @@
-//! Native image generation. Provider bytes, never fixture pixels, reach live artifacts.
+//! Native image generation and editing. Live artifacts contain provider bytes.
 
 use super::{artifact, transport};
 use crate::error::{Error, Result};
@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+
+mod inputs;
 
 const NAME: &str = "generate_image";
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -82,7 +84,7 @@ impl Tool for GenerateImageTool {
     fn name(&self) -> &str { NAME }
     fn label(&self) -> &str { "Generate Image" }
     fn description(&self) -> &str {
-        "Generate an image through OpenAI, Gemini or xAI and save the actual provider bytes. Existing files are never overwritten. Gemini also accepts an image_path for image editing."
+        "Generate or edit an image through OpenAI, Gemini or xAI and save the actual provider bytes. Supply image_path or ordered image_paths for editing; OpenAI GPT image models also support mask_path. Existing files are never overwritten."
     }
 
     fn parameters(&self) -> Value {
@@ -92,11 +94,14 @@ impl Tool for GenerateImageTool {
                 "prompt": {"type": "string", "description": "Image description or editing instructions"},
                 "provider": {"type": "string", "enum": ["openai", "gemini", "xai"]},
                 "model": {"type": "string", "description": "Provider image model ID"},
-                "size": {"type": "string", "description": "OpenAI only: WIDTHxHEIGHT or auto (default 1024x1024). Other providers use aspect_ratio and resolution."},
-                "aspect_ratio": {"type": "string", "enum": COMMON_RATIOS, "description": "Gemini/xAI only; default 1:1"},
+                "size": {"type": "string", "description": "OpenAI only: WIDTHxHEIGHT or auto (default 1024x1024 for generation, auto for editing). Other providers use aspect_ratio and resolution."},
+                "aspect_ratio": {"type": "string", "enum": COMMON_RATIOS, "description": "Gemini/xAI only; default 1:1 for generation, omitted for editing to preserve input shape"},
                 "resolution": {"type": "string", "description": "Gemini: 512, 1K, 2K, 4K; xAI: 1k, 2k"},
                 "quality": {"type": "string", "description": "OpenAI model-specific quality or xAI auto/low/medium"},
-                "image_path": {"type": "string", "description": "Optional local PNG/JPEG/WebP/GIF to edit with Gemini (at most 20 MiB)"},
+                "image_path": {"type": "string", "description": "One local image to edit. Mutually exclusive with image_paths."},
+                "image_paths": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string"}, "description": "Ordered local reference images to edit/combine. Inputs and mask share a 20 MiB decoded-byte budget."},
+                "mask_path": {"type": "string", "description": "OpenAI editing only: local PNG alpha mask for the first input image. Provider validates mask dimensions and alpha semantics."},
+                "input_fidelity": {"type": "string", "enum": ["low", "high"], "description": "OpenAI editing only: fidelity to the source images"},
                 "output_path": {"type": "string", "description": "New destination file. Omit to choose an extension matching the received image."},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000, "default": 180000}
             }
@@ -129,31 +134,15 @@ impl Tool for GenerateImageTool {
         let model = transport::model_id(NAME, transport::optional(&args, NAME, "model")?
             .or(self.default_model.as_deref()).or(env_model.as_deref()).unwrap_or(fallback_model))?;
         let duration = transport::timeout(&args, NAME, 180_000)?;
-        let (endpoint, mut payload) = request(provider, model, prompt, &args)?;
-        let image_path = transport::optional(&args, NAME, "image_path")?;
-        if image_path.is_some() && provider != "gemini" {
-            return Err(Error::tool(NAME, "image_path editing currently requires provider gemini"));
-        }
+        let (mut endpoint, mut payload) = request(provider, model, prompt, &args)?;
         let is_mock = self.mock_mode.unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
         let api = if is_mock { None } else {
             Some(self.transport.api(NAME, provider, self.api_key.as_deref(), duration)?)
         };
         artifact::preflight(&self.cwd, requested, NAME)?;
-        if let Some(image_path) = image_path {
-            if image_path.trim().is_empty() {
-                return Err(Error::tool(NAME, "image_path cannot be empty"));
-            }
-            let input = transport::read_capped(&self.cwd.join(image_path), NAME, MAX_IMAGE_BYTES as u64)?;
-            let mime = transport::image_mime(&input)
-                .ok_or_else(|| Error::tool(NAME, "image_path must contain PNG, JPEG, WebP or GIF bytes"))?;
-            let parts = payload.pointer_mut("/contents/0/parts")
-                .and_then(Value::as_array_mut)
-                .ok_or_else(|| Error::tool(NAME, "invalid Gemini image request"))?;
-            parts.insert(0, json!({"inlineData": {
-                "mimeType": mime,
-                "data": base64::engine::general_purpose::STANDARD.encode(input)
-            }}));
-        }
+        let reference_count = inputs::attach(
+            &self.cwd, provider, model, &args, &mut endpoint, &mut payload,
+        )?;
         let (bytes, mime) = match api.as_ref() {
             None => (super::MIN_VALID_PNG.to_vec(), "image/png"),
             Some(api) => {
@@ -182,7 +171,8 @@ impl Tool for GenerateImageTool {
                 "mime_type": mime, "size_bytes": bytes.len(), "mock": is_mock,
                 "size": payload.get("size"),
                 "aspect_ratio": transport::optional(&args, NAME, "aspect_ratio")?,
-                "edited": image_path.is_some()
+                "edited": reference_count > 0,
+                "reference_count": reference_count
             })),
             is_error: false,
         })
@@ -233,12 +223,29 @@ fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(S
             if model.starts_with("imagen-") {
                 return Err(Error::tool(NAME, "use a Gemini image model with generateContent; this adapter does not support Imagen predict"));
             }
-            let mut image_config = json!({"aspectRatio": ratio.unwrap_or("1:1")});
+            // REST responseFormat.image uses protobuf enum names, unlike the
+            // older imageConfig string fields and the SDK's convenience values.
+            let aspect_ratio = match ratio.unwrap_or("1:1") {
+                "1:1" => "ASPECT_RATIO_ONE_BY_ONE",
+                "16:9" => "ASPECT_RATIO_SIXTEEN_BY_NINE",
+                "9:16" => "ASPECT_RATIO_NINE_BY_SIXTEEN",
+                "4:3" => "ASPECT_RATIO_FOUR_BY_THREE",
+                "3:4" => "ASPECT_RATIO_THREE_BY_FOUR",
+                "3:2" => "ASPECT_RATIO_THREE_BY_TWO",
+                "2:3" => "ASPECT_RATIO_TWO_BY_THREE",
+                "21:9" => "ASPECT_RATIO_TWENTY_ONE_BY_NINE",
+                _ => return Err(Error::tool(NAME, "unsupported Gemini aspect ratio")),
+            };
+            let mut image_config = json!({"aspectRatio": aspect_ratio, "delivery": "INLINE"});
             if let Some(resolution) = resolution {
-                if !matches!(resolution, "512" | "1K" | "2K" | "4K") {
-                    return Err(Error::tool(NAME, "Gemini resolution must be 512, 1K, 2K or 4K"));
-                }
-                image_config["imageSize"] = json!(resolution);
+                let image_size = match resolution {
+                    "512" => "IMAGE_SIZE_FIVE_TWELVE",
+                    "1K" => "IMAGE_SIZE_ONE_K",
+                    "2K" => "IMAGE_SIZE_TWO_K",
+                    "4K" => "IMAGE_SIZE_FOUR_K",
+                    _ => return Err(Error::tool(NAME, "Gemini resolution must be 512, 1K, 2K or 4K")),
+                };
+                image_config["imageSize"] = json!(image_size);
             }
             Ok((transport::gemini_path(NAME, model)?, json!({
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -322,7 +329,7 @@ fn parse_image(provider: &str, response: &Value) -> Result<(Vec<u8>, &'static st
         return Err(Error::tool(NAME, "provider image exceeds 20 MiB"));
     }
     let mime = transport::image_mime(&bytes)
-        .ok_or_else(|| Error::tool(NAME, "provider bytes are not a supported, complete image container"))?;
+        .ok_or_else(|| Error::tool(NAME, "provider bytes are not a supported image container"))?;
     if declared_mime.is_some_and(|declared| declared != mime) {
         return Err(Error::tool(NAME, "provider image MIME type does not match the received bytes"));
     }
@@ -360,7 +367,8 @@ mod tests {
             if provider == "gemini" {
                 assert!(request.headers.starts_with(&format!("POST /v1/models/{model}:generateContent ")));
                 assert_eq!(request.body.pointer("/contents/0/parts/0/text").unwrap(), "Draw a red square");
-                assert_eq!(request.body.pointer("/generationConfig/responseFormat/image/aspectRatio").unwrap(), "1:1");
+                assert_eq!(request.body.pointer("/generationConfig/responseFormat/image/aspectRatio").unwrap(), "ASPECT_RATIO_ONE_BY_ONE");
+                assert_eq!(request.body.pointer("/generationConfig/responseFormat/image/delivery").unwrap(), "INLINE");
             } else {
                 assert!(request.headers.starts_with("POST /v1/images/generations "));
                 assert_eq!(request.body["prompt"], "Draw a red square");
@@ -385,10 +393,12 @@ mod tests {
             .with_mock(false).with_api_key(Some("editing-test-key".into())).with_base_url(endpoint);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
         let output = runtime.block_on(tool.execute("edit", json!({"prompt":"Make it red","image_path":"source.png"}), None)).unwrap();
-        assert_eq!(output.details.unwrap()["edited"], true);
+        assert_eq!(output.details.as_ref().unwrap()["edited"], true);
+        assert_eq!(output.details.as_ref().unwrap()["reference_count"], 1);
         let request = worker.join().unwrap();
         let sent = request.body.pointer("/contents/0/parts/0/inlineData/data").unwrap().as_str().unwrap();
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(sent).unwrap(), super::super::MIN_VALID_PNG);
+        assert!(request.body.pointer("/generationConfig/responseFormat/image/aspectRatio").is_none());
         assert_eq!(std::fs::read(dir.path().join("source.png")).unwrap(), super::super::MIN_VALID_PNG);
     }
 
@@ -418,5 +428,8 @@ mod tests {
         let (_, dalle) = request("openai", "dall-e-3", "test", &json!({"size":"1792x1024","quality":"hd"})).unwrap();
         assert_eq!(dalle["response_format"], "b64_json");
         assert!(dalle.get("output_format").is_none());
+        let (_, gemini) = request("gemini", "gemini-3.1-flash-image", "test", &json!({"aspect_ratio":"16:9","resolution":"2K"})).unwrap();
+        assert_eq!(gemini.pointer("/generationConfig/responseFormat/image/aspectRatio").unwrap(), "ASPECT_RATIO_SIXTEEN_BY_NINE");
+        assert_eq!(gemini.pointer("/generationConfig/responseFormat/image/imageSize").unwrap(), "IMAGE_SIZE_TWO_K");
     }
 }

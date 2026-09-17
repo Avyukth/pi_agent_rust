@@ -1,12 +1,12 @@
 //! Shared transport for native media adapters. No retries, redirects, or mock fallback.
-//! An explicit owner covers connect, response-body consumption, and the whole deadline.
+//! An explicit owner covers connect, response-body consumption, and the request deadline.
 
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use futures::future::{Either, select};
 use serde_json::Value;
-use std::io::Read as _;
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 use url::Url;
@@ -111,14 +111,14 @@ impl Api<'_> {
         let operation = async {
             check_owner(self.tool, &self.owner)?;
             let client = self.owner.http().bind(&self.transport.client);
-            let mut request = client.post(url.as_str()).timeout(self.timeout).json(payload)?;
-            request = match self.provider {
-                "gemini" => request.try_header("x-goog-api-key", &self.key)?,
+            let request = client.post(url.as_str()).timeout(self.timeout).json(payload)?;
+            let request = match self.provider {
+                "gemini" => request.try_header("x-goog-api-key", &self.key),
                 "anthropic" => request
-                    .try_header("x-api-key", &self.key)?
-                    .try_header("anthropic-version", "2023-06-01")?,
-                _ => request.try_header("Authorization", format!("Bearer {}", self.key))?,
-            };
+                    .try_header("x-api-key", &self.key)
+                    .and_then(|request| request.try_header("anthropic-version", "2023-06-01")),
+                _ => request.try_header("Authorization", format!("Bearer {}", self.key)),
+            }.map_err(|_| Error::tool(self.tool, "invalid media authentication header"))?;
             let response = request.send().await.map_err(|error| {
                 Error::tool(self.tool, format!("{} request failed: {}", self.provider,
                     self.scrub(&error.to_string(), 2048)))
@@ -283,6 +283,21 @@ pub(super) fn timeout(args: &Value, tool: &str, default_ms: u64) -> Result<Durat
 }
 
 pub(super) fn read_capped(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>> {
+    let initial = std::fs::metadata(path)
+        .map_err(|error| Error::tool(tool, format!("cannot stat media file: {error}")))?;
+    if !initial.is_file() || initial.len() > limit {
+        return Err(Error::tool(tool, format!("media input must be a regular file of at most {limit} bytes")));
+    }
+    // A regular file can be replaced between metadata and open. NONBLOCK keeps
+    // a concurrent FIFO swap from hanging before the descriptor can be checked.
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty())
+            .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
     let file = std::fs::File::open(path)
         .map_err(|error| Error::tool(tool, format!("cannot read media file: {error}")))?;
     let metadata = file.metadata()
@@ -299,6 +314,7 @@ pub(super) fn read_capped(path: &Path, tool: &str, limit: u64) -> Result<Vec<u8>
     Ok(bytes)
 }
 
+/// Basic container checks, not a full image decoder or decompression-bomb guard.
 pub(super) fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.len() >= 45 && bytes.starts_with(b"\x89PNG\r\n\x1a\n")
         && bytes.get(12..16) == Some(b"IHDR".as_slice())
@@ -412,6 +428,7 @@ pub(super) mod tests {
     #[test]
     fn bounded_file_reader_rejects_empty_and_oversized_inputs() {
         let dir = tempfile::tempdir().unwrap();
+        assert!(read_capped(dir.path(), "inspect_image", 4).is_err());
         let path = dir.path().join("image.png");
         std::fs::write(&path, []).unwrap();
         assert!(read_capped(&path, "inspect_image", 4).is_err());

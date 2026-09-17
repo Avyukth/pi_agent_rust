@@ -132,7 +132,7 @@ impl Tool for InspectImageTool {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
                     "Image Analysis for {path_str} ({mime}, {} bytes):\nPrompt: {prompt}\nCanned test fixture inspection; no provider request was made.", metadata.len()
                 )))],
-                details: Some(json!({"path": path, "mime_type": mime, "size_bytes": metadata.len(),
+                details: Some(json!({"path": path.display().to_string(), "mime_type": mime, "size_bytes": metadata.len(),
                     "provider": self.default_provider, "model": self.default_model, "mock": true})),
                 is_error: false,
             });
@@ -186,7 +186,7 @@ impl Tool for InspectImageTool {
         let analysis = api.scrub(&analysis, MAX_ANALYSIS_BYTES);
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(analysis))],
-            details: Some(json!({"path": path, "mime_type": mime, "size_bytes": size,
+            details: Some(json!({"path": path.display().to_string(), "mime_type": mime, "size_bytes": size,
                 "provider": provider, "model": model, "mock": false})),
             is_error: false,
         })
@@ -300,5 +300,18 @@ mod tests {
         assert!(error.contains("HTTP 401"));
         assert!(!error.contains(key));
         worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_working_directory_does_not_panic_while_serializing_details() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join(std::ffi::OsString::from_vec(vec![b'i', 0xff]));
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::write(cwd.join("input.png"), super::super::MIN_VALID_PNG).unwrap();
+        let tool = InspectImageTool::new(&cwd).with_mock(true);
+        let output = futures::executor::block_on(tool.execute("non-utf8", json!({"path":"input.png"}), None)).unwrap();
+        assert!(output.details.as_ref().unwrap()["path"].as_str().unwrap().ends_with("input.png"));
     }
 }
