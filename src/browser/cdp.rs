@@ -1,18 +1,16 @@
 //! Native, bounded CDP transport. A connection belongs to one tool operation;
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
-use super::{BrowserLaunchOptions, BrowserTabInfo, interaction, launch, output, policy, required};
+use super::{BrowserLaunchOptions, BrowserTabInfo, exports, interaction, launch, output, policy, required};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
-use crate::model::{ContentBlock, ImageContent};
 use crate::tools::ToolOutput;
 use asupersync::net::TcpStream;
 use asupersync::net::websocket::{Message, WebSocket, WebSocketConfig};
-use base64::Engine as _;
 use futures::future::{Either, select};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -25,7 +23,9 @@ pub(super) struct Session {
     endpoint: Option<String>,
     references: BTreeMap<String, interaction::References>,
     next_ref: u64,
+    // Field order matters: stop the owned browser before dropping upload copies.
     browser: Option<launch::ManagedBrowser>,
+    uploads: interaction::upload::Store,
 }
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
@@ -41,11 +41,15 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
                 ));
             }
         }
+        "upload" => {
+            interaction::upload::validate(args)?;
+        }
+        "screenshot" | "print_pdf" => exports::validate(args)?,
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
         "evaluate" => {
             required(args, "script")?;
         }
-        "close" | "list_tabs" | "screenshot" | "snapshot" | "ax_tree" => {}
+        "close" | "list_tabs" | "snapshot" | "ax_tree" => {}
         "click" | "wait_for" => {
             required(args, "selector")?;
         }
@@ -430,7 +434,8 @@ impl Session {
         self.references.clear();
         self.active = None;
         self.endpoint = None;
-        // Never reuse element IDs across process lifetimes.
+        // Never reuse element IDs across process lifetimes. Upload copies are
+        // retained separately: pending File objects can outlive a tab/navigation.
     }
 
     async fn connect(
@@ -448,6 +453,7 @@ impl Session {
                 browser.stop()?;
             }
             self.browser = None;
+            self.uploads.clear();
             self.clear_pages();
             return Ok(None);
         }
@@ -464,6 +470,7 @@ impl Session {
                     && !browser.running()?
                 {
                     self.browser = None;
+                    self.uploads.clear();
                     self.clear_pages();
                     if action == "status" {
                         return Ok(None);
@@ -656,65 +663,16 @@ impl Session {
             "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
                 interaction::execute(owner, cdp, &tab, self.references.get(&target), args).await
             }
+            "upload" => {
+                self.uploads.execute(owner, cdp, cwd, self.references.get(&target), args, allowlist).await
+            }
+            "screenshot" | "print_pdf" => exports::execute(owner, cdp, cwd, &tab, args).await,
             "evaluate" => {
                 let value = cdp.evaluate(owner, required(args, "script")?).await?;
                 Ok(output(
                     format!("Evaluation result: {value}"),
                     json!({"result": value, "backend": "cdp"}),
                 ))
-            }
-            "screenshot" => {
-                let response = cdp
-                    .command(
-                        owner,
-                        "Page.captureScreenshot",
-                        json!({"format": "png", "fromSurface": true}),
-                    )
-                    .await?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(required(&response, "data")?)
-                    .map_err(|e| {
-                        Error::tool("browser", format!("invalid screenshot base64: {e}"))
-                    })?;
-                if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                    return Err(Error::tool(
-                        "browser",
-                        "Chromium did not return a PNG screenshot",
-                    ));
-                }
-                let path = match args.get("output_path") {
-                    None => PathBuf::from(format!(
-                        "screenshots/browser_{}.png",
-                        uuid::Uuid::new_v4().simple()
-                    )),
-                    Some(value) => {
-                        PathBuf::from(value.as_str().filter(|s| !s.is_empty()).ok_or_else(
-                            || Error::tool("browser", "output_path must be a nonempty string"),
-                        )?)
-                    }
-                };
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    cwd.join(path)
-                };
-                if let Some(parent) = path.parent() {
-                    owner.fs().create_dir_all(parent).await?;
-                }
-                owner.fs().write(&path, &bytes).await?;
-                let mut result = output(
-                    format!(
-                        "Captured tab {tab} screenshot to {}\nSize: {} bytes",
-                        path.display(),
-                        bytes.len()
-                    ),
-                    json!({"tab": tab, "saved_path": path.display().to_string(), "size_bytes": bytes.len(), "backend": "cdp"}),
-                );
-                result.content.push(ContentBlock::Image(ImageContent {
-                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    mime_type: "image/png".into(),
-                }));
-                Ok(result)
             }
             _ => Err(Error::tool(
                 "browser",
@@ -752,7 +710,7 @@ mod tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let managed = launch::Connection::Managed(BrowserLaunchOptions {
-            executable_path: Some(PathBuf::from("/nonexistent/do-not-launch")),
+            executable_path: Some(std::path::PathBuf::from("/nonexistent/do-not-launch")),
             ..Default::default()
         });
         let mut session = Session::default();
