@@ -95,20 +95,29 @@ pub struct IsoOutcome {
 
 fn git_command(repo: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(repo)
+    command
+        .arg("-C")
+        .arg(repo)
         .args(["-c", "core.quotePath=true", "-c", "core.fsmonitor=false"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for key in ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+    for key in [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+    ] {
         command.env_remove(key);
     }
     command
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
-    git_command(repo).args(args).output()
+    git_command(repo)
+        .args(args)
+        .output()
         .map_err(|e| Error::tool("subagent", format!("Failed to run git: {e}")))
 }
 
@@ -168,15 +177,24 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
         ));
     }
     let repo_root = snapshot::repository_root(repo_root)?;
-    let id = format!("{ISO_PREFIX}{}-{}", sanitize_id(task_id), uuid::Uuid::new_v4().simple());
+    let id = format!(
+        "{ISO_PREFIX}{}-{}",
+        sanitize_id(task_id),
+        uuid::Uuid::new_v4().simple()
+    );
     let path = std::env::temp_dir().join(&id);
     // Capture first: unsupported modes and read failures must not launch an
     // incomplete child or create a half-materialized worktree.
     let captured = snapshot::capture(&repo_root, &id)?;
-    captured.checkout(&repo_root, &path, &id).map_err(|error| Error::tool(
-        "subagent",
-        format!("{error}; inspect {} for any incomplete checkout before retrying", path.display()),
-    ))?;
+    captured.checkout(&repo_root, &path, &id).map_err(|error| {
+        Error::tool(
+            "subagent",
+            format!(
+                "{error}; inspect {} for any incomplete checkout before retrying",
+                path.display()
+            ),
+        )
+    })?;
     Ok(IsoHandle {
         branch: id.clone(),
         id,
@@ -197,16 +215,30 @@ pub fn collect_diff(handle: &IsoHandle) -> Result<(String, String)> {
     let patch = git_ok(
         &handle.path,
         &[
-            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--binary",
-            "--full-index", "--src-prefix=a/", "--dst-prefix=b/",
-            &handle.baseline, &current.baseline, "--",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--binary",
+            "--full-index",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            &handle.baseline,
+            &current.baseline,
+            "--",
         ],
     )?;
     let diff_stat = git_ok(
         &handle.path,
         &[
-            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--stat",
-            &handle.baseline, &current.baseline, "--",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+            &handle.baseline,
+            &current.baseline,
+            "--",
         ],
     )?;
     Ok((patch, diff_stat))
@@ -226,7 +258,8 @@ struct PatchFile {
 
 impl PatchFile {
     fn new(patch: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("pi-iso-patch-{}", uuid::Uuid::new_v4().simple()));
+        let path =
+            std::env::temp_dir().join(format!("pi-iso-patch-{}", uuid::Uuid::new_v4().simple()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -234,8 +267,12 @@ impl PatchFile {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file = options.open(&path)
-            .map_err(|error| Error::tool("subagent", format!("Cannot create private patch file: {error}")))?;
+        let mut file = options.open(&path).map_err(|error| {
+            Error::tool(
+                "subagent",
+                format!("Cannot create private patch file: {error}"),
+            )
+        })?;
         let staged = Self { path };
         let written = file.write_all(patch.as_bytes());
         drop(file);
@@ -246,8 +283,13 @@ impl PatchFile {
     fn apply(&self, repo: &Path, check: bool) -> Result<std::process::Output> {
         let mut command = git_command(repo);
         command.arg("apply");
-        if check { command.arg("--check"); }
-        command.arg("--").arg(&self.path).output()
+        if check {
+            command.arg("--check");
+        }
+        command
+            .arg("--")
+            .arg(&self.path)
+            .output()
             .map_err(|error| Error::tool("subagent", format!("Cannot run git apply: {error}")))
     }
 }
@@ -275,13 +317,18 @@ pub fn apply_to_parent(handle: &IsoHandle, patch: &str) -> Result<()> {
     for check in [true, false] {
         let output = staged.apply(&handle.repo_root, check)?;
         if !output.status.success() {
-            let diagnostic: String = String::from_utf8_lossy(&output.stderr).chars().take(4096).collect();
+            let diagnostic: String = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(4096)
+                .collect();
             return Err(Error::tool(
                 "subagent",
                 format!(
                     "PI_ISO_CONFLICT: patch from {} does not apply cleanly to the parent tree. \
                      The worktree is left at {} for manual resolution. Git apply: {}",
-                    handle.branch, handle.path.display(), diagnostic.trim()
+                    handle.branch,
+                    handle.path.display(),
+                    diagnostic.trim()
                 ),
             ));
         }
@@ -299,15 +346,24 @@ pub fn drop_worktree(handle: &IsoHandle) -> Result<()> {
         || handle.branch != handle.id
         || handle.path.file_name() != Some(std::ffi::OsStr::new(&handle.id))
     {
-        return Err(Error::tool("subagent", "PI_ISO_NOT_OWNED: refusing to remove a non-matching isolation worktree"));
+        return Err(Error::tool(
+            "subagent",
+            "PI_ISO_NOT_OWNED: refusing to remove a non-matching isolation worktree",
+        ));
     }
     let output = git_command(&handle.repo_root)
-        .args(["worktree", "remove", "--force", "--"]).arg(&handle.path).output()
+        .args(["worktree", "remove", "--force", "--"])
+        .arg(&handle.path)
+        .output()
         .map_err(|error| Error::tool("subagent", format!("Cannot remove worktree: {error}")))?;
     if !output.status.success() {
-        return Err(Error::tool("subagent", format!(
-            "Cannot remove isolation worktree: {}", String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(Error::tool(
+            "subagent",
+            format!(
+                "Cannot remove isolation worktree: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
     }
     let _ = git(&handle.repo_root, &["branch", "-D", &handle.branch]);
     Ok(())
