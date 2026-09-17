@@ -200,6 +200,7 @@ files = [
     "agent_loop_vcr",
     "auth_oauth_refresh_vcr",
     "bench_scenario_runner",
+    "browser_cdp",
     "cargo_headroom_admission",
     "capability_prompt",
     "ci_cross_platform_matrix",

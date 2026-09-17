@@ -83,7 +83,20 @@ fn peer(script: Script) -> (String, thread::JoinHandle<()>) {
             // An asynchronous event before the reply must not be mistaken for it.
             write_frame(&mut socket, &json!({"method": "Target.targetInfoChanged", "params": {}}));
             if method == "Runtime.evaluate" {
-                assert_eq!(request["params"]["expression"], "({answer: 6 * 7})");
+                let expression = request["params"]["expression"].as_str().unwrap();
+                assert!(matches!(expression,
+                    "({answer: 6 * 7})" | "({url: location.href, title: document.title})"));
+            }
+            // Chromium may publish DOMContentLoaded before the Page.navigate
+            // reply. The adapter must retain it and correlate the loader ID.
+            if method == "Page.navigate" && response["result"]["loaderId"].is_string() {
+                for loader in [json!("old-loader"), response["result"]["loaderId"].clone()] {
+                    write_frame(&mut socket, &json!({
+                        "sessionId": "session-1", "method": "Page.lifecycleEvent",
+                        "params": {"frameId": response["result"]["frameId"],
+                                   "loaderId": loader, "name": "DOMContentLoaded"}
+                    }));
+                }
             }
             let mut reply = response;
             reply["id"] = request["id"].clone();
@@ -147,7 +160,7 @@ fn native_browser_never_falls_back_to_mock_when_endpoint_is_invalid() {
 fn native_screenshot_preserves_peer_pixels_and_returns_an_image_block() {
     use base64::Engine as _;
     use pi::model::ContentBlock;
-    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIMDP///wMAH+4F+Yo3CNgAAAAASUVORK5CYII=";
+    let encoded = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGP4z8DAAMIM/4EAAB/uBfsL2WiLAAAAAElFTkSuQmCC";
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
     let mut script = attached_script();
     script.push(("Page.captureScreenshot", json!({"result": {"data": encoded}})));
@@ -161,5 +174,64 @@ fn native_screenshot_preserves_peer_pixels_and_returns_an_image_block() {
     assert_eq!(std::fs::read(dir.path().join("capture.png")).unwrap(), bytes);
     assert!(result.content.iter().any(|block| matches!(block,
         ContentBlock::Image(image) if image.mime_type == "image/png" && image.data == encoded)));
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_navigation_handles_load_events_that_arrive_before_the_command_reply() {
+    let mut script = attached_script();
+    script.extend([
+        ("Page.enable", json!({"result": {}})),
+        ("Page.setLifecycleEventsEnabled", json!({"result": {}})),
+        ("Page.navigate", json!({"result": {"frameId": "frame-1", "loaderId": "new-loader"}})),
+        ("Runtime.evaluate", json!({"result": {"result": {"type": "object", "value": {
+            "url": "about:blank", "title": "Loaded target"
+        }}}})),
+    ]);
+    let (endpoint, handle) = peer(script);
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let result = runtime.block_on(tool.execute("native-navigation", json!({
+        "action": "goto", "tab": "page-1", "url": "about:blank", "timeout_ms": 3000
+    }), None)).unwrap();
+    let details = result.details.as_ref().unwrap();
+    assert_eq!(details["loaded"], true);
+    assert_eq!(details["title"], "Loaded target");
+    assert_eq!(details["url"], "about:blank");
+    assert!(details.get("status").is_none(), "do not manufacture an HTTP status");
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_navigation_refusals_are_not_reported_as_loaded_pages() {
+    let mut script = attached_script();
+    script.extend([
+        ("Page.enable", json!({"result": {}})),
+        ("Page.setLifecycleEventsEnabled", json!({"result": {}})),
+        ("Page.navigate", json!({"result": {"errorText": "net::ERR_BLOCKED_BY_ADMINISTRATOR"}})),
+    ]);
+    let (endpoint, handle) = peer(script);
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let error = runtime.block_on(tool.execute("native-navigation-refused", json!({
+        "action": "goto", "tab": "page-1", "url": "about:blank"
+    }), None)).unwrap_err();
+    assert!(error.to_string().contains("ERR_BLOCKED_BY_ADMINISTRATOR"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn native_browser_does_not_invent_results_after_peer_disconnects() {
+    // The peer closes immediately after attachment, before evaluating anything.
+    let (endpoint, handle) = peer(attached_script());
+    let dir = tempfile::tempdir().unwrap();
+    let tool = BrowserTool::new(dir.path()).with_mock(false).with_cdp_endpoint(endpoint);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let error = runtime.block_on(tool.execute("native-disconnected", json!({
+        "action": "evaluate", "tab": "page-1", "script": "({answer: 6 * 7})"
+    }), None)).unwrap_err();
+    assert!(error.to_string().contains("CDP"));
     handle.join().unwrap();
 }
