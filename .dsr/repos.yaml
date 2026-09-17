@@ -85,3 +85,8 @@ tools:
       - RCH_REQUIRE_REMOTE=1 RCH_BUILD_TIMEOUT_SEC=3600 RCH_TEST_TIMEOUT_SEC=7200 CARGO_BUILD_JOBS=2 rch exec -- env TMPDIR=/tmp CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" cargo test --locked --all-targets --no-fail-fast
       - bash tests/installer_regression.sh
       - python3 scripts/check_module_reachability.py
+      # Eleven loopback fixtures treated a socket read timeout as an error and
+      # lost seven tests from a full darwin run before anyone looked; the
+      # pattern then reappeared in two modules written after they were fixed.
+      # Seconds to run, and it is the only thing that stops a twelfth.
+      - python3 scripts/check_fixture_read_patience.py
