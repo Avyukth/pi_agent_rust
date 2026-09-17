@@ -107,7 +107,7 @@ impl Tool for GenerateImageTool {
                 "mask_path": {"type": "string", "description": "OpenAI editing only: local PNG alpha mask for the first input image. Provider validates mask dimensions and alpha semantics."},
                 "input_fidelity": {"type": "string", "enum": ["low", "high"], "description": "OpenAI editing only: fidelity to the source images"},
                 "output_path": {"type": "string", "description": "New destination file. Omit to choose an extension matching the received image."},
-                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300000, "default": 180000}
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 300_000, "default": 180_000}
             }
         })
     }
@@ -234,6 +234,8 @@ impl Tool for GenerateImageTool {
     }
 }
 
+// Keep provider-specific validation beside the corresponding image request payload.
+#[allow(clippy::too_many_lines)]
 fn request(provider: &str, model: &str, prompt: &str, args: &Value) -> Result<(String, Value)> {
     let size = transport::optional(args, NAME, "size")?;
     let ratio = transport::optional(args, NAME, "aspect_ratio")?;

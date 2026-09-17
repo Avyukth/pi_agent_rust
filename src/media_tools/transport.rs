@@ -11,18 +11,10 @@ use std::path::Path;
 use std::time::Duration;
 use url::Url;
 
+#[derive(Default)]
 pub(super) struct Transport {
     client: Client,
     base_url: Option<String>,
-}
-
-impl Default for Transport {
-    fn default() -> Self {
-        Self {
-            client: Client::new(),
-            base_url: None,
-        }
-    }
 }
 
 impl Transport {
@@ -117,6 +109,8 @@ impl Api<'_> {
             .collect()
     }
 
+    // Keep the bounded HTTP exchange inside its shared cancellation/deadline race.
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn post(&self, path: &str, payload: &Value, limit: usize) -> Result<Response> {
         // Paths are built by adapters, never accepted as model-facing arguments.
         let url = self
@@ -156,11 +150,10 @@ impl Api<'_> {
             })?;
             let status = response.status();
             if !(200..300).contains(&status) {
-                let detail = response
-                    .text_limited(16 * 1024)
-                    .await
-                    .map(|body| self.scrub(&body, 2048))
-                    .unwrap_or_else(|_| "error body unavailable or too large".to_string());
+                let detail = response.text_limited(16 * 1024).await.map_or_else(
+                    |_| "error body unavailable or too large".to_string(),
+                    |body| self.scrub(&body, 2048),
+                );
                 return Err(Error::tool(
                     self.tool,
                     format!("{} HTTP {status}: {detail}", self.provider),
@@ -298,12 +291,13 @@ fn resolve_key(
         _ => &[],
     };
     // An explicit empty key is a deliberate denial, not permission to fall back.
-    let key = match explicit {
-        Some(key) => Some(key.to_string()),
-        None => vars
-            .iter()
-            .find_map(|name| lookup(name).filter(|key| !key.trim().is_empty())),
-    };
+    let key = explicit.map_or_else(
+        || {
+            vars.iter()
+                .find_map(|name| lookup(name).filter(|key| !key.trim().is_empty()))
+        },
+        |key| Some(key.to_string()),
+    );
     key.map(|key| key.trim().to_string())
         .filter(|key| !key.is_empty())
         .ok_or_else(|| {
@@ -323,13 +317,12 @@ fn resolve_key(
 }
 
 pub(super) fn optional<'a>(args: &'a Value, tool: &str, field: &str) -> Result<Option<&'a str>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(value) => value
+    args.get(field).map_or(Ok(None), |value| {
+        value
             .as_str()
             .map(Some)
-            .ok_or_else(|| Error::tool(tool, format!("{field} must be a string"))),
-    }
+            .ok_or_else(|| Error::tool(tool, format!("{field} must be a string")))
+    })
 }
 
 pub(super) fn required<'a>(args: &'a Value, tool: &str, field: &str) -> Result<&'a str> {
@@ -463,18 +456,14 @@ pub(super) mod tests {
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
-    pub(crate) struct Captured {
-        pub(crate) headers: String,
-        pub(crate) body: Value,
+    pub struct Captured {
+        pub headers: String,
+        pub body: Value,
     }
 
     // A real TCP peer with a canned protocol response, not a replacement client.
     // Both accept and I/O are bounded so a failed assertion cannot hang the suite.
-    pub(crate) fn peer(
-        status: u16,
-        content_type: &str,
-        body: Vec<u8>,
-    ) -> (String, JoinHandle<Captured>) {
+    pub fn peer(status: u16, content_type: &str, body: Vec<u8>) -> (String, JoinHandle<Captured>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
         let endpoint = format!("http://{}/v1/", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();

@@ -28,13 +28,7 @@ pub(super) struct Session {
     next_ref: u64,
 }
 
-pub(super) async fn execute(
-    state: &std::sync::Arc<asupersync::sync::Mutex<Session>>,
-    endpoint_override: Option<&str>,
-    cwd: &Path,
-    allowlist: Option<&[String]>,
-    args: &Value,
-) -> Result<ToolOutput> {
+fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     let action = required(args, "action")?;
     match action {
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
@@ -93,6 +87,17 @@ pub(super) async fn execute(
             ));
         }
     }
+    Ok(timeout_ms)
+}
+
+pub(super) async fn execute(
+    state: &std::sync::Arc<asupersync::sync::Mutex<Session>>,
+    endpoint_override: Option<&str>,
+    cwd: &Path,
+    allowlist: Option<&[String]>,
+    args: &Value,
+) -> Result<ToolOutput> {
+    let timeout_ms = validate(args, allowlist)?;
     let endpoint_text = endpoint_override
         .map(str::to_owned)
         .or_else(|| std::env::var("PI_BROWSER_CDP_URL").ok())

@@ -38,7 +38,7 @@ impl ReleaseGuard {
     ) -> Result<Self> {
         let executable = helpers
             .get("xdotool")
-            .map_or(Path::new("xdotool"), PathBuf::as_path);
+            .map_or_else(|| Path::new("xdotool"), PathBuf::as_path);
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", RELEASE_SCRIPT, "pi-desktop-release"])
@@ -175,6 +175,10 @@ struct InputCommand {
     release: Vec<String>,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keep each input action's command and cancellation-release operands together"
+)]
 fn input_command(args: &Value) -> Result<InputCommand> {
     let action = args["action"].as_str().expect("validated action");
     let mut command = InputCommand {

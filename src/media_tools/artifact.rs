@@ -58,13 +58,15 @@ pub(super) fn publish(
         ));
     }
     preflight(cwd, requested, tool)?;
-    let path = match requested {
-        Some(requested) => cwd.join(requested),
-        None => cwd.join(format!(
-            "{prefix}_{}.{extension}",
-            uuid::Uuid::new_v4().simple()
-        )),
-    };
+    let path = requested.map_or_else(
+        || {
+            cwd.join(format!(
+                "{prefix}_{}.{extension}",
+                uuid::Uuid::new_v4().simple()
+            ))
+        },
+        |requested| cwd.join(requested),
+    );
     let actual_extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let matches = actual_extension.eq_ignore_ascii_case(extension)
         || (extension == "jpg" && actual_extension.eq_ignore_ascii_case("jpeg"));

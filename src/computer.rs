@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod mock;
 mod native;
@@ -194,8 +194,7 @@ impl ComputerTool {
                 id: Some(id.clone()),
                 header: Some("Desktop permission".into()),
                 question: format!(
-                    "Allow this desktop action once? It can affect the active application.\n{}",
-                    args
+                    "Allow this desktop action once? It can affect the active application.\n{args}"
                 ),
                 options: vec![
                     AskOption {
@@ -253,7 +252,7 @@ impl Tool for ComputerTool {
                 "direction": {"type":"string", "enum":["up","down","left","right"]},
                 "amount": {"type":"integer", "minimum":1, "maximum":100},
                 "output_path": {"type":"string", "description":"New PNG destination; existing files are never overwritten"},
-                "timeout_ms": {"type":"integer", "minimum":1, "maximum":120000, "default":30000}
+                "timeout_ms": {"type":"integer", "minimum":1, "maximum":120_000, "default":30_000}
             }
         })
     }

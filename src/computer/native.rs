@@ -50,24 +50,22 @@ pub(super) fn check_owner(owner: &AgentCx) -> Result<()> {
 }
 
 pub(super) fn string<'a>(args: &'a Value, field: &str) -> Result<Option<&'a str>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(value) => value
+    args.get(field).map_or(Ok(None), |value| {
+        value
             .as_str()
             .map(Some)
-            .ok_or_else(|| error(format!("{field} must be a string"))),
-    }
+            .ok_or_else(|| error(format!("{field} must be a string")))
+    })
 }
 
 pub(super) fn number(args: &Value, field: &str, min: i64, max: i64) -> Result<Option<i64>> {
-    match args.get(field) {
-        None => Ok(None),
-        Some(value) => value
+    args.get(field).map_or(Ok(None), |value| {
+        value
             .as_i64()
             .filter(|n| (min..=max).contains(n))
             .map(Some)
-            .ok_or_else(|| error(format!("{field} must be an integer in {min}..={max}"))),
-    }
+            .ok_or_else(|| error(format!("{field} must be an integer in {min}..={max}")))
+    })
 }
 
 pub(super) fn validate(args: &Value) -> Result<Duration> {
@@ -637,7 +635,7 @@ pub(super) fn publish(path: &Path, args: &Value, bytes: &[u8], mock: bool) -> Re
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let mut stage = tempfile::NamedTempFile::new_in(parent)?;
     stage.write_all(bytes)?;
@@ -679,7 +677,7 @@ mod tests {
     use super::*;
     #[test]
     fn parses_real_wmctrl_columns_and_preserves_spaced_titles() {
-        let windows = parse_windows("0x00200022  0 42 30 40 360 120 PiDesktopProbe.Xmessage localhost Pi desktop protocol fixture\n", Some(0x200022)).unwrap();
+        let windows = parse_windows("0x00200022  0 42 30 40 360 120 PiDesktopProbe.Xmessage localhost Pi desktop protocol fixture\n", Some(0x0020_0022)).unwrap();
         assert_eq!(windows[0].info.title, "Pi desktop protocol fixture");
         assert_eq!(windows[0].info.app_name, "PiDesktopProbe.Xmessage");
         assert!(windows[0].info.is_focused);

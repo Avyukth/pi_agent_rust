@@ -12,6 +12,8 @@ const MAX_REFERENCES: usize = 5;
 const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_OPENAI_DATA_URL_BYTES: usize = 20 * 1024 * 1024;
 
+// Keep shared input budgets and provider-specific edit payload assembly in one flow.
+#[allow(clippy::too_many_lines)]
 pub(super) fn attach(
     cwd: &Path,
     provider: &str,

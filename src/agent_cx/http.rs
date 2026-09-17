@@ -165,7 +165,6 @@ impl AgentHttpResponse {
         self.response.headers()
     }
 
-    #[must_use]
     pub fn bytes_stream(self) -> ByteStream {
         Box::pin(OwnedBody::new(self.owner, self.response.bytes_stream()))
     }

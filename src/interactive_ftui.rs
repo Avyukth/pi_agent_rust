@@ -1095,6 +1095,10 @@ impl AgentUiState {
 /// Covers init/update/view/subscriptions end to end but holds only what its
 /// tests assert on; the real conversation state migrates here from
 /// `interactive::state` as the view port proceeds.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "quit, terminal capabilities, and suspension are independent state flags"
+)]
 pub struct PiFtuiModel {
     /// What the agent is doing right now (drives header + input routing).
     state: AgentUiState,
