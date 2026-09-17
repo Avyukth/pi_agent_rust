@@ -296,9 +296,9 @@ mod tests {
         feed(
             &mut state,
             &mut output,
-            json!({"type":"message_end","message":final_message}),
+            &json!({"type":"message_end","message":final_message}),
         )
-        .unwrap();
+        .unwrap(); // ubs:ignore test assertion
         assert_eq!(output, "first 日本語");
         assert!(
             state.finish().is_err(),
@@ -307,7 +307,7 @@ mod tests {
         feed(
             &mut state,
             &mut output,
-            json!({"type":"agent_end","messages":[final_message]}),
+            &json!({"type":"agent_end","messages":[final_message]}),
         )
         .unwrap();
         assert_eq!(output, "first 日本語");
@@ -321,13 +321,13 @@ mod tests {
         feed(
             &mut state,
             &mut output,
-            json!({"type":"message_end","message":message("planning", "toolUse")}),
+            &json!({"type":"message_end","message":message("planning", "toolUse")}),
         )
         .unwrap();
         feed(
             &mut state,
             &mut output,
-            json!({"type":"message_start","message":{"role":"assistant"}}),
+            &json!({"type":"message_start","message":{"role":"assistant"}}),
         )
         .unwrap();
         assert!(output.is_empty());
@@ -397,7 +397,7 @@ mod tests {
                 feed(
                     &mut state,
                     &mut String::new(),
-                    json!({"type":"agent_end","messages":[message("earlier", "stop"), last]})
+                    &json!({"type":"agent_end","messages":[message("earlier", "stop"), last]})
                 )
                 .is_err()
             );
@@ -412,7 +412,7 @@ mod tests {
         let error = feed(
             &mut state,
             &mut String::new(),
-            json!({"type":"agent_end","messages":[final_message]}),
+            &json!({"type":"agent_end","messages":[final_message]}),
         )
         .unwrap_err();
         assert!(!error.contains("secret diagnostic"));
@@ -451,7 +451,7 @@ mod tests {
         feed(
             &mut state,
             &mut output,
-            json!({"type":"future_telemetry","data":42}),
+            &json!({"type":"future_telemetry","data":42}),
         )
         .unwrap();
         feed(&mut state, &mut output, &end("done", "stop")).unwrap();
@@ -471,7 +471,7 @@ mod tests {
                 feed(
                     &mut state,
                     &mut output,
-                    json!({"type":"message_update","assistantMessageEvent":update})
+                    &json!({"type":"message_update","assistantMessageEvent":update})
                 )
                 .is_err()
             );

@@ -477,11 +477,12 @@ fn apply_conflict_marks_result_and_hub_failed() {
         .find(|entry| entry.pid.map(u64::from) == Some(pid))
         .unwrap();
     assert_eq!(entry.status, crate::agent_hub::ChildStatus::Failed);
-    {
-        let statuses = statuses.lock().unwrap();
-        assert_eq!(statuses.last().map(String::as_str), Some("failed"));
-        assert!(!statuses.iter().any(|status| status == "completed"));
-    }
+    let statuses = statuses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(statuses.last().map(String::as_str), Some("failed"));
+    assert!(!statuses.iter().any(|status| status == "completed"));
 }
 
 #[test]

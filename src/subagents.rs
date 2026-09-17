@@ -1821,11 +1821,12 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop",
             panic!("expected text output");
         };
         assert_eq!(text.text, "## scout\nfinal child result");
-        {
-            let updates = updates.lock().unwrap();
-            assert!(updates.contains("streamed:"));
-            assert!(updates.contains(global_dir.to_string_lossy().as_ref()));
-        }
+        let updates = updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(updates.contains("streamed:"));
+        assert!(updates.contains(global_dir.to_string_lossy().as_ref()));
         assert!(
             output.details.as_ref().is_some_and(|details| {
                 details["results"][0]["binary"] == Value::String(child.display().to_string())
