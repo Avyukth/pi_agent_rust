@@ -10,8 +10,9 @@ use pi::extensions::{
 };
 use serde::de::DeserializeOwned;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 struct LedgerCase {
@@ -267,20 +268,77 @@ fn seal_ledger(mut entries: Vec<RuntimeRiskLedgerArtifactEntry>) -> RuntimeRiskL
     }
 }
 
+/// Build `ext_runtime_risk_ledger` once for this whole test binary and report
+/// where cargo put it.
+///
+/// Every call site used to be its own `cargo run --example …`, five nested
+/// cargo processes inside a single test. Each one takes the cargo package lock
+/// and re-resolves the dependency graph before it can decide there is nothing
+/// to do, and on a cold worker the first also builds the example from scratch.
+///
+/// That made this the most expensive test in the repository by a wide margin:
+/// 964s of the DSR quality lane's 3745s of test execution — 26% of the total —
+/// in the 20260916T143624 run, where the lane then died at its 7200s deadline.
+/// The other six tests in the same binary finish in under a second combined.
+///
+/// The executable path comes from cargo's own JSON artifact message rather than
+/// being reconstructed from `current_exe()`: the RCH remote lane puts test
+/// binaries under `<target>/debug/build/<pkg>/<hash>/out/`, not the `deps/`
+/// layout a hand-rolled path would assume.
+fn ledger_binary() -> &'static Path {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY
+        .get_or_init(|| {
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+            let output = Command::new(cargo)
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .env("CARGO_TERM_COLOR", "never")
+                .args([
+                    "build",
+                    "--example",
+                    "ext_runtime_risk_ledger",
+                    "--message-format",
+                    "json-render-diagnostics",
+                ])
+                .output()
+                .expect("build ext_runtime_risk_ledger");
+            assert!(
+                output.status.success(),
+                "building ext_runtime_risk_ledger failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let field = |message: &serde_json::Value, key: &str| {
+                message
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(std::string::ToString::to_string)
+            };
+            let executable = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|message| field(message, "reason").as_deref() == Some("compiler-artifact"))
+                .filter(|message| {
+                    message
+                        .get("target")
+                        .and_then(|target| field(target, "name"))
+                        .as_deref()
+                        == Some("ext_runtime_risk_ledger")
+                })
+                .find_map(|message| field(&message, "executable").map(PathBuf::from))
+                .expect("cargo reported an executable for ext_runtime_risk_ledger");
+            assert!(
+                executable.is_file(),
+                "cargo reported {} but it is not a file",
+                executable.display()
+            );
+            executable
+        })
+        .as_path()
+}
+
 fn run_ledger_command() -> Command {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let mut command = Command::new(cargo);
-    command
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("CARGO_TERM_COLOR", "never")
-        .args([
-            "run",
-            "--quiet",
-            "--example",
-            "ext_runtime_risk_ledger",
-            "--",
-        ]);
-    command
+    Command::new(ledger_binary())
 }
 
 fn write_json(path: &Path, value: &impl serde::Serialize) {

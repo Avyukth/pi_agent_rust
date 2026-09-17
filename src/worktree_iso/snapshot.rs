@@ -13,6 +13,15 @@ use std::process::{Command, Stdio};
 
 const MAX_INDEX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 
+/// Git revision syntax that peels `HEAD` to a commit object, rejecting a tag or
+/// tree that happens to be there.
+///
+/// Named rather than repeated at the two call sites because `{commit}` reads as
+/// a format placeholder to `clippy::literal_string_with_formatting_args`, so
+/// each literal use needs its own allow; the const needs one.
+#[allow(clippy::literal_string_with_formatting_args)]
+const HEAD_COMMIT_REV: &str = "HEAD^{commit}";
+
 fn failure(code: &str, message: &str) -> Error {
     Error::tool("subagent", format!("{code}: {message}"))
 }
@@ -272,7 +281,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         return Err(failure("PI_ISO_SNAPSHOT", "Cannot inspect checkout mode"));
     }
     let head = object_id(&run(
-        command(repo).args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
         "resolve parent commit",
     )?)?;
     let scratch = Scratch::new(repo)?;
@@ -329,7 +338,7 @@ pub(super) fn capture(repo: &Path, id: &str) -> Result<Snapshot> {
         .env_remove("GIT_COMMITTER_DATE");
     let baseline = object_id(&run(&mut commit, "record snapshot baseline")?)?;
     let current_head = object_id(&run(
-        command(repo).args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        command(repo).args(["rev-parse", "--verify", HEAD_COMMIT_REV]),
         "verify parent commit",
     )?)?;
     if current_head != head || scratch.entries(command(repo), "verify")? != parent_entries {

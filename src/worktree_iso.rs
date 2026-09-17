@@ -200,7 +200,7 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
         id,
         path,
         repo_root,
-        baseline: captured.baseline.clone(),
+        baseline: captured.baseline,
     })
 }
 
@@ -301,8 +301,10 @@ impl Drop for PatchFile {
 }
 
 /// Apply a patch without overwriting temporary/control filenames in either
-/// workspace. The real apply rechecks its preconditions after --check, so an
-/// external edit during that gap is rejected rather than forced.
+/// workspace.
+///
+/// The real apply rechecks its preconditions after `--check`, so an external
+/// edit during that gap is rejected rather than forced.
 ///
 /// # Errors
 /// Named `PI_ISO_CONFLICT` on a rejected patch; the worktree remains inspectable.
