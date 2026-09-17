@@ -14,8 +14,10 @@ LOCK = threading.Lock()
 SEQUENCE = 0
 REQUESTS = []
 LAUNCH = None
+COUNTER = "42"
 INPUT = sys.stdin.buffer
 OUTPUT = sys.stdout.buffer
+PAIR = MODE.startswith("thread_pair") or MODE == "resume_rejected"
 
 
 def send(message):
@@ -62,7 +64,7 @@ def read():
 
 
 def main():
-    global LAUNCH
+    global LAUNCH, COUNTER
     while True:
         request = read()
         if request is None:
@@ -77,13 +79,19 @@ def main():
                 "supportsConditionalBreakpoints", "supportsHitConditionalBreakpoints",
                 "supportsLogPoints", "supportsDisassembleRequest", "supportsReadMemoryRequest",
                 "supportsWriteMemoryRequest", "supportsModulesRequest", "supportsLoadedSourcesRequest",
-                "supportTerminateDebuggee"
+                "supportTerminateDebuggee", "supportsSetVariable", "supportsSetExpression",
+                "supportsExceptionInfoRequest", "supportsSingleThreadExecutionRequests",
+                "supportsSteppingGranularity"
             ]}
             caps["exceptionBreakpointFilters"] = [{"filter": "raised", "label": "Raised"}]
             if MODE == "no_configuration_done":
                 caps.pop("supportsConfigurationDoneRequest")
             if MODE == "no_terminate_attached":
                 caps.pop("supportTerminateDebuggee")
+            if MODE == "no_inspection_capabilities":
+                for key in ["supportsSetVariable", "supportsSetExpression", "supportsExceptionInfoRequest",
+                            "supportsSingleThreadExecutionRequests", "supportsSteppingGranularity"]:
+                    caps.pop(key)
             reply(request, caps)
         elif command in ("launch", "attach"):
             LAUNCH = request
@@ -91,7 +99,7 @@ def main():
                 time.sleep(0.2)
             event("initialized")
             if MODE == "no_configuration_done":
-                event("stopped", {"threadId": 7, "reason": "entry"})
+                event("stopped", {"threadId": 7, "reason": "entry", "allThreadsStopped": PAIR})
                 reply(request)
         elif command == "configurationDone":
             if MODE == "configuration_error":
@@ -99,7 +107,7 @@ def main():
                 continue
             if MODE == "configuration_stall":
                 continue
-            event("stopped", {"threadId": 7, "reason": "entry"})
+            event("stopped", {"threadId": 7, "reason": "entry", "allThreadsStopped": PAIR})
             reply(request)
             reply(LAUNCH)
         elif command in ("setBreakpoints", "setFunctionBreakpoints", "setInstructionBreakpoints", "setDataBreakpoints"):
@@ -115,31 +123,71 @@ def main():
         elif command == "setExceptionBreakpoints":
             reply(request)
         elif command in ("next", "stepIn", "stepOut"):
-            if MODE == "stop_before_reply":
-                event("stopped", {"threadId": 8, "reason": "step"})
+            stopped = {"threadId": args["threadId"] if args.get("singleThread") else 8, "reason": "step"}
+            if MODE in ("stop_before_reply", "thread_pair_before_reply"):
+                event("stopped", stopped)
                 reply(request)
             else:
                 reply(request)
-                timer = threading.Timer(0.05, event, ("stopped", {"threadId": 8, "reason": "step"}))
+                timer = threading.Timer(0.05, event, ("stopped", stopped))
                 timer.daemon = True
                 timer.start()
         elif command == "continue":
-            reply(request, {"allThreadsContinued": True})
+            if MODE == "resume_rejected":
+                event("continued", {"threadId": 8, "allThreadsContinued": False})
+                reply(request, error="resume rejected")
+            else:
+                reply(request, {"allThreadsContinued": not args.get("singleThread", False)})
         elif command == "pause":
             event("stopped", {"threadId": args["threadId"], "reason": "pause"})
             reply(request)
         elif command == "threads":
             reply(request, {"threads": [{"id": 7, "name": "main"}, {"id": 8, "name": "worker"}]})
         elif command == "stackTrace":
-            reply(request, {"stackFrames": [{"id": 21, "name": "main", "line": 10, "column": 1}], "totalFrames": 1})
+            frame = 21 if args["threadId"] == 7 else 22
+            reply(request, {"stackFrames": [{"id": frame, "name": "main", "line": 10, "column": 1}], "totalFrames": 1})
         elif command == "scopes":
-            reply(request, {"scopes": [{"name": "Locals", "variablesReference": 41, "expensive": False}]})
+            assert "threadId" not in args
+            assert args["frameId"] in (21, 22)
+            reference = 41 if args["frameId"] == 21 else 42
+            reply(request, {"scopes": [{"name": "Locals", "variablesReference": reference, "expensive": False}]})
         elif command == "dataBreakpointInfo":
+            assert "threadId" not in args
+            if "frameId" in args:
+                assert args["frameId"] in (21, 22)
+            if "variablesReference" in args:
+                assert args["variablesReference"] in (41, 42, 66, 67)
             reply(request, {"dataId": "opaque-watch-id", "description": args["name"], "accessTypes": ["read", "write", "readWrite"]})
-        elif command == "evaluate":
-            reply(request, {"result": "object", "type": "Object", "variablesReference": 66, "namedVariables": 2, "memoryReference": "0x100"})
-        elif command == "variables":
-            reply(request, {"variables": [{"name": "answer", "value": "42", "variablesReference": 0}]})
+        elif command in ("evaluate", "setExpression"):
+            assert "threadId" not in args
+            assert args["frameId"] in (21, 22)
+            if command == "setExpression":
+                COUNTER = args["value"]
+                reply(request, {"value": COUNTER, "type": "number", "variablesReference": 0})
+            elif args["expression"] == "count":
+                reply(request, {"result": COUNTER, "type": "number", "variablesReference": 0})
+            else:
+                reference = 66 if args["frameId"] == 21 else 67
+                reply(request, {"result": "object", "type": "Object", "variablesReference": reference, "namedVariables": 2, "memoryReference": "0x100"})
+        elif command in ("variables", "setVariable"):
+            assert "threadId" not in args
+            assert args["variablesReference"] in (41, 42, 66, 67)
+            if command == "setVariable":
+                COUNTER = args["value"]
+                if MODE == "invalid_set_result":
+                    reply(request, {"variablesReference": 0})
+                else:
+                    reply(request, {"value": COUNTER, "type": "number", "variablesReference": 0})
+            else:
+                if MODE == "invalidate_during_variables":
+                    event("invalidated", {"areas": ["variables"], "threadId": 7})
+                if MODE == "resume_during_variables":
+                    event("continued", {"threadId": 7, "allThreadsContinued": False})
+                    event("stopped", {"threadId": 7, "reason": "step"})
+                reply(request, {"variables": [{"name": "answer", "value": COUNTER, "variablesReference": 0}]})
+        elif command == "exceptionInfo":
+            reply(request, {"exceptionId": "ValueError", "description": "test failure", "breakMode": "always",
+                            "details": {"message": "test failure", "stackTrace": "fixture stack", "innerException": [{"message": "root cause"}]}})
         elif command == "capture":
             reply(request, {"requests": REQUESTS})
         elif command == "flood":

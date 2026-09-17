@@ -1,6 +1,7 @@
 //! DAP session state, launch sequencing and retained breakpoint configuration.
 
 mod execution;
+mod inspection;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +18,7 @@ use crate::error::Result;
 use execution::Execution;
 
 pub const DEFAULT_DAP_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const MAX_INSPECTION_HANDLE: u64 = inspection::MAX_HANDLE;
 const INITIALIZED_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -39,14 +41,23 @@ struct State {
     capabilities: Value,
     origin: Option<Origin>,
     fault: Option<String>,
-    /// Resume/pause waits must observe a fresh stop, not an already stopped peer.
     stop_wait: Option<(u64, Option<u64>)>,
+    inspection_revision: u64,
 }
 
 impl State {
+    fn invalidate_inspection(&mut self) -> Result<()> {
+        self.inspection_revision = self.inspection_revision.checked_add(1)
+            .ok_or_else(|| tool_err("DAP_PROTOCOL", "inspection revision exhausted"))?;
+        Ok(())
+    }
+
     fn event(&mut self, event: DapEvent) -> Result<()> {
         match event.event.as_str() {
             "initialized" => self.initialized = true,
+            // Area/thread/frame IDs are advisory hints. Conservatively expire
+            // all model-facing handles rather than retaining a stale subset.
+            "invalidated" => self.invalidate_inspection()?,
             "capabilities" => {
                 if let (Some(current), Some(update)) = (
                     self.capabilities.as_object_mut(), event.body["capabilities"].as_object(),
@@ -72,6 +83,7 @@ pub struct DapSession {
     transport: DapTransport,
     state: Mutex<State>,
     pub(super) breakpoints: Arc<asupersync::sync::Mutex<Store>>,
+    inspection: Arc<asupersync::sync::Mutex<inspection::Handles>>,
     _launch_artifacts: Option<tempfile::TempDir>,
 }
 
@@ -81,6 +93,7 @@ impl DapSession {
             "clientID": "pi_agent_rust", "clientName": "pi_agent_rust", "adapterID": "pi-dap",
             "linesStartAt1": true, "columnsStartAt1": true, "pathFormat": "path",
             "supportsVariableType": true, "supportsVariablePaging": true,
+            "supportsInvalidatedEvent": true,
             "supportsRunInTerminalRequest": false, "supportsStartDebuggingRequest": false
         }), DEFAULT_DAP_TIMEOUT).await?;
         if !capabilities.is_object() {
@@ -90,9 +103,10 @@ impl DapSession {
             transport,
             state: Mutex::new(State {
                 execution: Execution::default(), initialized: false,
-                capabilities, origin: None, fault: None, stop_wait: None,
+                capabilities, origin: None, fault: None, stop_wait: None, inspection_revision: 0,
             }),
             breakpoints: Arc::new(asupersync::sync::Mutex::new(Store::default())),
+            inspection: Arc::new(asupersync::sync::Mutex::new(inspection::Handles::default())),
             _launch_artifacts: None,
         })
     }
@@ -126,15 +140,18 @@ impl DapSession {
         Self::lock(&self.state).execution.aggregate()
     }
 
-    /// Aggregate state is only a convenience. This view includes every known
-    /// thread's individual state and the actual stop reason/exception metadata.
     #[must_use]
     pub fn execution_snapshot(&self) -> Value {
         self.pump_events();
         let state = Self::lock(&self.state);
         let mut snapshot = state.execution.snapshot();
+        snapshot["inspectionRevision"] = json!(state.inspection_revision);
         if let Some(fault) = &state.fault { snapshot["fault"] = json!(fault); }
         snapshot
+    }
+
+    pub(super) fn invalidate_inspection(&self) -> Result<()> {
+        Self::lock(&self.state).invalidate_inspection()
     }
 
     #[must_use]
@@ -165,13 +182,10 @@ impl DapSession {
             if !self.transport.is_alive() { state.execution.exit(); }
             state.fault.is_some()
         };
-        // Retire malformed/overflowed control state; never continue with a
-        // guessed suspension map. Drop the state mutex before process cleanup.
         if failed { self.transport.kill(); }
     }
 
-    /// One startup budget covers compilation, initialization and all initial
-    /// breakpoint configuration, not a fresh timeout for each handshake step.
+    /// One startup budget covers compilation and initial configuration.
     pub(super) async fn start(
         &self, command: &str, arguments: Value,
         initial: &BTreeMap<String, Vec<Value>>, exception_filters: Option<&[String]>,
@@ -257,8 +271,6 @@ impl DapSession {
         }
     }
 
-    /// After resume/pause, only a newly observed stop satisfies this wait. In
-    /// single-thread mode it must belong to the requested thread, not a peer.
     pub async fn wait_stopped(&self, wait: Duration) -> Option<(u64, String)> {
         let owner = AgentCx::for_current_or_request();
         let start = owner.cx().timer_driver()
@@ -270,9 +282,7 @@ impl DapSession {
                 let state = Self::lock(&self.state);
                 if state.execution.aggregate() == ExecState::Exited { return None; }
                 if let Some((revision, thread)) = state.stop_wait {
-                    if let Some(stop) = state.execution.stopped_since(revision, thread) {
-                        return Some(stop);
-                    }
+                    if let Some(stop) = state.execution.stopped_since(revision, thread) { return Some(stop); }
                 } else if let ExecState::Stopped { thread_id, reason } = state.execution.aggregate() {
                     return Some((thread_id, reason));
                 }
@@ -338,12 +348,17 @@ impl DapSession {
                 }
             }
         }
-        // Timeout, cancellation and disconnected requests never restore an old
-        // stop: the adapter may already have accepted the execution command.
         result.map_err(crate::error::Error::from)
     }
 
+    /// Typed stack/object inspection translates opaque local handles to the
+    /// adapter's IDs. Do not mix these handles with raw `call` replies.
     pub async fn call_stopped(&self, command: &str, arguments: Value) -> Result<Value> {
+        if matches!(command, "stackTrace" | "scopes" | "variables" | "evaluate"
+            | "setVariable" | "setExpression" | "exceptionInfo" | "dataBreakpointInfo")
+        {
+            return inspection::call(self, command, arguments).await;
+        }
         self.require_thread(arguments.get("threadId").and_then(Value::as_u64))?;
         self.call(command, arguments).await
     }
@@ -385,7 +400,7 @@ mod tests {
     fn state() -> State {
         State {
             execution: Execution::default(), initialized: false, capabilities: json!({}),
-            origin: None, fault: None, stop_wait: None,
+            origin: None, fault: None, stop_wait: None, inspection_revision: 0,
         }
     }
 
@@ -417,6 +432,16 @@ mod tests {
         state.event(DapEvent { event: "exited".into(), body: json!({}) }).unwrap();
         state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":3}) }).unwrap();
         assert_eq!(state.execution.aggregate(), ExecState::Exited);
+    }
+
+    #[test]
+    fn invalidated_refreshes_handles_without_manufacturing_a_new_stop() {
+        let mut state = state();
+        state.event(DapEvent { event: "stopped".into(), body: json!({"threadId":7,"reason":"entry"}) }).unwrap();
+        let stop = state.execution.stamp(7);
+        state.event(DapEvent { event: "invalidated".into(), body: json!({"areas":["variables"],"threadId":7}) }).unwrap();
+        assert_eq!(state.execution.stamp(7), stop);
+        assert_eq!(state.inspection_revision, 1);
     }
 
     #[test]

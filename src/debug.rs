@@ -1,10 +1,10 @@
 //! Agent-facing DAP debugger: owned sessions, retained breakpoint sets,
-//! pre-execution configuration and state-gated inspection (bd-cv653.1.2).
+//! pre-execution configuration and suspension-scoped inspection (bd-cv653.1.2).
 
 pub mod adapters;
+mod breakpoints;
 pub mod dap;
 pub mod session;
-mod breakpoints;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -57,7 +57,6 @@ impl DebugTool {
         }
     }
 
-    /// Trusted SDK adapter definitions; executable selection is not a tool argument.
     #[must_use]
     pub fn with_adapters(mut self, adapters: Vec<AdapterSpec>) -> Self {
         self.adapters = adapters;
@@ -158,12 +157,14 @@ impl DebugTool {
                 ExecState::Running => "running",
                 ExecState::Exited => "exited"
             },
-            "execution": state, "capabilities": session.capabilities()
+            "execution": state, "threadState": session.execution_snapshot(),
+            "capabilities": session.capabilities()
         });
         *lock(&self.session) = Some(Arc::new(session));
         Ok(text_output(payload.to_string(), payload))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_simple(&self, input: &DebugInput) -> Result<ToolOutput> {
         let session = self.session()?;
         let mut payload = match input.action.as_str() {
@@ -178,12 +179,12 @@ impl DebugTool {
                 let name = input.required("name", input.name.as_deref())?;
                 let mut args = json!({"name": name});
                 if let Some(reference) = input.variables_reference { args["variablesReference"] = json!(reference); }
-                let frame = match input.frame_id {
-                    Some(frame) => frame,
-                    None => self.top_frame(&session, input.thread_id).await?,
-                };
-                args["frameId"] = json!(frame);
-                json!({"result": session.call_stopped("dataBreakpointInfo", args).await?})
+                if let Some(frame) = input.frame_id {
+                    args["frameId"] = json!(frame);
+                } else if input.variables_reference.is_none() {
+                    args["frameId"] = json!(self.top_frame(&session, input.thread_id).await?);
+                }
+                json!({"result": session.call_stopped("dataBreakpointInfo", input.inspection_arguments(args)).await?})
             }
             "set_exception_breakpoints" => {
                 let filters = input.exception_filters.as_deref()
@@ -201,7 +202,8 @@ impl DebugTool {
             "continue" | "step_over" | "step_in" | "step_out" | "pause" => {
                 self.run_execution(&session, input).await?
             }
-            "evaluate" | "stack_trace" | "threads" | "scopes" | "variables" => {
+            "evaluate" | "stack_trace" | "threads" | "scopes" | "variables"
+            | "exception_info" | "set_variable" | "set_expression" => {
                 self.run_inspection(&session, input).await?
             }
             "disassemble" => {
@@ -218,9 +220,8 @@ impl DebugTool {
                 session.require_capability(if writing { "supportsWriteMemoryRequest" } else { "supportsReadMemoryRequest" })?;
                 let address = input.required("address", input.address.as_deref())?;
                 let mut args = json!({"memoryReference":address, "offset":input.offset.unwrap_or(0)});
-                if writing {
-                    args["data"] = json!(input.required("data", input.data.as_deref())?);
-                } else { args["count"] = json!(input.limit.unwrap_or(64)); }
+                if writing { args["data"] = json!(input.required("data", input.data.as_deref())?); }
+                else { args["count"] = json!(input.limit.unwrap_or(64)); }
                 let body = session.call_stopped(if writing { "writeMemory" } else { "readMemory" }, args).await?;
                 json!({"address":address,"result":body})
             }
@@ -238,24 +239,28 @@ impl DebugTool {
                 let command = input.required("command", input.command.as_deref())?;
                 if matches!(command, "initialize" | "launch" | "attach" | "configurationDone"
                     | "setBreakpoints" | "setFunctionBreakpoints" | "setInstructionBreakpoints"
-                    | "setDataBreakpoints" | "terminate" | "disconnect")
+                    | "setDataBreakpoints" | "setExceptionBreakpoints" | "terminate" | "disconnect"
+                    | "stackTrace" | "scopes" | "variables" | "evaluate" | "setVariable"
+                    | "setExpression" | "exceptionInfo" | "dataBreakpointInfo" | "continue"
+                    | "next" | "stepIn" | "stepOut" | "pause" | "stepBack" | "reverseContinue" | "restartFrame")
                 {
-                    return Err(tool_err("DAP_USAGE", "use the typed action for session or breakpoint-set changes"));
+                    return Err(tool_err("DAP_USAGE", "stateful DAP commands require a supported typed action, not custom_request"));
                 }
+                // Vendor requests may change debug state. Expire frame/object
+                // handles before dispatch, including on cancellation or failure.
+                session.invalidate_inspection()?;
                 json!({"command":command,"result":session.call(command,input.payload.clone().unwrap_or_else(||json!({}))).await?})
             }
             "output" => json!({"tail":session.output_tail()}),
             "terminate" | "disconnect" => {
                 let terminate = input.action == "terminate";
                 let result = session.disconnect(terminate).await;
-                // A dead transport must not permanently block a future launch.
-                // A live adapter's rejection leaves the session available.
                 if result.is_ok() || !session.is_connected() { lock(&self.session).take(); }
                 result?;
-                json!({"state":"disconnected","adapterAcknowledged":true,
-                    "debuggeeTerminationRequested":terminate})
+                json!({"state":"disconnected","adapterAcknowledged":true,"debuggeeTerminationRequested":terminate})
             }
-            "sessions" => json!({"sessions":[{"id":0,"state":session.state(),"capabilities":session.capabilities()}]}),
+            "sessions" => json!({"sessions":[{"id":0,"state":session.state(),
+                "execution":session.execution_snapshot(),"capabilities":session.capabilities()}]}),
             other => return Err(tool_err("DAP_USAGE", format!("unknown debug action {other:?}"))),
         };
         payload["action"] = json!(input.action);
@@ -311,81 +316,128 @@ impl DebugTool {
 
     async fn run_execution(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
         let thread = if input.action == "pause" {
-            match input.thread_id { Some(thread) => thread, None => self.any_thread(session).await? }
-        } else { Self::current_thread(session,input.thread_id)? };
+            self.pause_thread(session, input.thread_id).await?
+        } else { Self::current_thread(session, input.thread_id)? };
+        if input.action == "pause" && session.require_thread(Some(thread)).is_ok() {
+            return Ok(json!({"threadId":thread,"alreadyStopped":true,"execution":session.execution_snapshot()}));
+        }
         let command = match input.action.as_str() {
             "continue" => "continue", "step_over" => "next", "step_in" => "stepIn",
             "step_out" => "stepOut", _ => "pause",
         };
-        let response = session.call(command,json!({"threadId":thread})).await?;
-        let stopped = if input.action == "continue" { None } else { session.wait_stopped(Duration::from_secs(5)).await };
+        let mut args = json!({"threadId":thread});
+        if let Some(single) = input.single_thread { args["singleThread"] = json!(single); }
+        if let Some(granularity) = &input.granularity {
+            session.require_capability("supportsSteppingGranularity")?;
+            args["granularity"] = json!(granularity);
+        }
+        let response = session.call(command, args).await?;
+        let stopped = if input.action == "continue" { None }
+            else { session.wait_stopped(Duration::from_secs(5)).await };
+        AgentCx::for_current_or_request().checkpoint()
+            .map_err(|_| tool_err("DAP_CANCELLED", "debug execution wait cancelled; execution may already have resumed"))?;
         Ok(json!({"threadId":thread,"response":response,"state":session.state(),
+            "execution":session.execution_snapshot(),
             "stopped":stopped.map(|(thread,reason)|json!({"threadId":thread,"reason":reason}))}))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_inspection(&self, session: &DapSession, input: &DebugInput) -> Result<Value> {
         match input.action.as_str() {
-            "evaluate" => {
-                let expression = input.required("expression",input.expression.as_deref())?;
-                let frame = match input.frame_id { Some(frame) => frame, None => self.top_frame(session,input.thread_id).await? };
-                let body = session.call_stopped("evaluate",json!({"expression":expression,"frameId":frame,
-                    "context":input.context.as_deref().unwrap_or("repl")})).await?;
-                Ok(json!({"expression":expression,"frameId":frame,"result":body.get("result"),"type":body.get("type"),
-                    "variablesReference":body.get("variablesReference"),"namedVariables":body.get("namedVariables"),
-                    "indexedVariables":body.get("indexedVariables"),"memoryReference":body.get("memoryReference"),
-                    "presentationHint":body.get("presentationHint")}))
+            "evaluate" | "set_expression" => {
+                let assigning = input.action == "set_expression";
+                if assigning { session.require_capability("supportsSetExpression")?; }
+                let expression = input.required("expression", input.expression.as_deref())?;
+                let frame = match input.frame_id { Some(frame) => frame, None => self.top_frame(session, input.thread_id).await? };
+                let mut args = json!({"expression":expression,"frameId":frame});
+                if assigning {
+                    args["value"] = json!(input.assignment_value()?);
+                } else {
+                    args["context"] = json!(input.context.as_deref().unwrap_or("repl"));
+                }
+                let mut body = session.call_stopped(if assigning { "setExpression" } else { "evaluate" },
+                    input.inspection_arguments(args)).await?;
+                body["expression"] = json!(expression);
+                body["frameId"] = json!(frame);
+                if assigning { body["refreshVariableReferences"] = json!(true); }
+                Ok(body)
+            }
+            "set_variable" => {
+                session.require_capability("supportsSetVariable")?;
+                let reference = input.variables_reference.filter(|reference| *reference > 0)
+                    .ok_or_else(|| tool_err("DAP_USAGE", "set_variable requires a positive variablesReference"))?;
+                let name = input.required("name", input.name.as_deref())?;
+                let args = json!({"variablesReference":reference,"name":name,"value":input.assignment_value()?});
+                let mut body = session.call_stopped("setVariable", input.inspection_arguments(args)).await?;
+                body["name"] = json!(name);
+                body["refreshVariableReferences"] = json!(true);
+                Ok(body)
+            }
+            "exception_info" => {
+                session.require_capability("supportsExceptionInfoRequest")?;
+                let thread = Self::current_thread(session, input.thread_id)?;
+                let mut body = session.call_stopped("exceptionInfo", json!({"threadId":thread})).await?;
+                body["threadId"] = json!(thread);
+                Ok(body)
             }
             "stack_trace" => {
-                let thread = Self::current_thread(session,input.thread_id)?;
-                let body = session.call_stopped("stackTrace",json!({"threadId":thread,
+                let thread = Self::current_thread(session, input.thread_id)?;
+                let body = session.call_stopped("stackTrace", json!({"threadId":thread,
                     "startFrame":input.start.unwrap_or(0),"levels":input.limit.unwrap_or(50)})).await?;
                 Ok(json!({"threadId":thread,"frames":body.get("stackFrames"),"totalFrames":body.get("totalFrames")}))
             }
             "threads" => {
-                let body = session.call("threads",json!({})).await?;
-                Ok(json!({"threads":body.get("threads")}))
+                let body = session.call("threads", json!({})).await?;
+                Ok(json!({"threads":body.get("threads"),"execution":session.execution_snapshot()}))
             }
             "scopes" => {
-                let frame = match input.frame_id { Some(frame) => frame, None => self.top_frame(session,input.thread_id).await? };
-                let body = session.call_stopped("scopes",json!({"frameId":frame})).await?;
+                let frame = match input.frame_id { Some(frame) => frame, None => self.top_frame(session, input.thread_id).await? };
+                let body = session.call_stopped("scopes", input.inspection_arguments(json!({"frameId":frame}))).await?;
                 Ok(json!({"frameId":frame,"scopes":body.get("scopes")}))
             }
             "variables" => {
                 let reference = input.variables_reference.filter(|reference| *reference > 0)
-                    .ok_or_else(||tool_err("DAP_USAGE","variables requires a positive variablesReference"))?;
+                    .ok_or_else(|| tool_err("DAP_USAGE", "variables requires a positive variablesReference"))?;
                 let mut args = json!({"variablesReference":reference});
                 if let Some(start) = input.start { args["start"] = json!(start); }
                 if let Some(count) = input.limit { args["count"] = json!(count); }
                 if let Some(filter) = &input.filter { args["filter"] = json!(filter); }
-                let body = session.call_stopped("variables",args).await?;
+                let body = session.call_stopped("variables", input.inspection_arguments(args)).await?;
                 Ok(json!({"variablesReference":reference,"variables":body.get("variables")}))
             }
-            _ => Err(tool_err("DAP_USAGE","unknown inspection action")),
+            _ => Err(tool_err("DAP_USAGE", "unknown inspection action")),
         }
     }
 
     fn current_thread(session: &DapSession, selected: Option<u64>) -> Result<u64> {
-        let stopped = session.require_stopped()?;
-        selected.or((stopped != 0).then_some(stopped)).ok_or_else(|| {
-            tool_err("DAP_NO_THREADS","stopped event omitted threadId; query threads and supply threadId")
+        let stopped = if selected.is_some() { session.require_thread(selected)? }
+            else { session.require_stopped()? };
+        (stopped != 0).then_some(stopped).ok_or_else(|| {
+            tool_err("DAP_NO_THREADS", "stopped event omitted threadId; query threads and supply threadId")
         })
     }
 
-    async fn any_thread(&self, session: &DapSession) -> Result<u64> {
-        if let ExecState::Stopped { thread_id, .. } = session.state()
-            && thread_id > 0 { return Ok(thread_id); }
-        let body = session.call("threads",json!({})).await?;
-        body["threads"].as_array().and_then(|threads|threads.first())
-            .and_then(|thread|thread["id"].as_u64()).filter(|thread|*thread > 0)
-            .ok_or_else(||tool_err("DAP_NO_THREADS","adapter reported no threads"))
+    async fn pause_thread(&self, session: &DapSession, selected: Option<u64>) -> Result<u64> {
+        let body = session.call("threads", json!({})).await?;
+        let threads = body["threads"].as_array()
+            .ok_or_else(|| tool_err("DAP_NO_THREADS", "adapter reported no threads"))?;
+        if let Some(selected) = selected {
+            return threads.iter().any(|thread| thread["id"].as_u64() == Some(selected))
+                .then_some(selected).ok_or_else(|| tool_err("DAP_THREAD_UNKNOWN", "pause thread is not in the current inventory"));
+        }
+        let execution = session.execution_snapshot();
+        execution["threads"].as_array().and_then(|threads| threads.iter().find(|thread| thread["state"] == "running"))
+            .and_then(|thread| thread["id"].as_u64())
+            .or_else(|| threads.first().and_then(|thread| thread["id"].as_u64()))
+            .ok_or_else(|| tool_err("DAP_NO_THREADS", "adapter reported no threads"))
     }
 
     async fn top_frame(&self, session: &DapSession, thread: Option<u64>) -> Result<u64> {
-        let thread = Self::current_thread(session,thread)?;
-        let body = session.call_stopped("stackTrace",json!({"threadId":thread,"startFrame":0,"levels":1})).await?;
-        body["stackFrames"].as_array().and_then(|frames|frames.first())
-            .and_then(|frame|frame["id"].as_u64())
-            .ok_or_else(||tool_err("DAP_NO_FRAMES","no stack frames"))
+        let thread = Self::current_thread(session, thread)?;
+        let body = session.call_stopped("stackTrace", json!({"threadId":thread,"startFrame":0,"levels":1})).await?;
+        body["stackFrames"].as_array().and_then(|frames| frames.first())
+            .and_then(|frame| frame["id"].as_u64())
+            .ok_or_else(|| tool_err("DAP_NO_FRAMES", "no stack frames"))
     }
 }
 
@@ -406,6 +458,7 @@ struct DebugInput {
     hit_condition: Option<String>,
     log_message: Option<String>,
     name: Option<String>,
+    value: Option<String>,
     data_id: Option<String>,
     access_type: Option<String>,
     reference: Option<String>,
@@ -414,6 +467,8 @@ struct DebugInput {
     expression: Option<String>,
     context: Option<String>,
     thread_id: Option<u64>,
+    single_thread: Option<bool>,
+    granularity: Option<String>,
     frame_id: Option<u64>,
     variables_reference: Option<u64>,
     offset: Option<i64>,
@@ -429,18 +484,37 @@ struct DebugInput {
 
 impl DebugInput {
     fn required<'a>(&self, field: &str, value: Option<&'a str>) -> Result<&'a str> {
-        value.filter(|value|!value.is_empty() && !value.contains('\0') && value.len() <= 1024 * 1024)
-            .ok_or_else(||tool_err("DAP_USAGE",format!("{} requires nonempty, NUL-free {field}",self.action)))
+        value.filter(|value| !value.is_empty() && !value.contains('\0') && value.len() <= 1024 * 1024)
+            .ok_or_else(|| tool_err("DAP_USAGE", format!("{} requires nonempty, NUL-free {field}", self.action)))
+    }
+
+    fn assignment_value(&self) -> Result<&str> {
+        self.value.as_deref().ok_or_else(|| tool_err("DAP_USAGE", "assignment requires value as a string"))
+    }
+
+    fn inspection_arguments(&self, mut args: Value) -> Value {
+        if let Some(thread) = self.thread_id { args["threadId"] = json!(thread); }
+        args
     }
 
     fn validate(&self) -> Result<()> {
-        if self.limit.is_some_and(|limit|limit == 0 || limit > 1_000_000)
-            || self.start.is_some_and(|start|start > 2_147_483_647)
-            || self.offset.is_some_and(|offset|!(-2_147_483_648..=2_147_483_647).contains(&offset))
-            || self.thread_id.is_some_and(|thread|thread == 0 || thread > 2_147_483_647)
-            || self.frame_id.is_some_and(|frame|frame > 2_147_483_647)
-            || self.variables_reference.is_some_and(|reference|reference > 2_147_483_647)
-        { return Err(tool_err("DAP_USAGE","invalid DAP identifier, offset or result limit")); }
+        if self.limit.is_some_and(|limit| limit == 0 || limit > 1_000_000)
+            || self.start.is_some_and(|start| start > 2_147_483_647)
+            || self.offset.is_some_and(|offset| !(-2_147_483_648..=2_147_483_647).contains(&offset))
+            || self.thread_id.is_some_and(|thread| thread == 0 || thread > 2_147_483_647)
+            || self.frame_id.is_some_and(|frame| frame == 0 || frame > session::MAX_INSPECTION_HANDLE)
+            || self.variables_reference.is_some_and(|reference| reference > session::MAX_INSPECTION_HANDLE)
+        { return Err(tool_err("DAP_USAGE", "invalid DAP identifier, handle, offset or result limit")); }
+        let stepping = matches!(self.action.as_str(), "step_over" | "step_in" | "step_out");
+        if self.single_thread.is_some() && !stepping && self.action != "continue" {
+            return Err(tool_err("DAP_USAGE", "singleThread applies to continue or step actions only"));
+        }
+        if self.granularity.as_deref().is_some_and(|value| !stepping || !matches!(value, "statement" | "line" | "instruction")) {
+            return Err(tool_err("DAP_USAGE", "granularity is step-only and must be statement, line or instruction"));
+        }
+        if self.value.as_ref().is_some_and(|value| value.len() > 64 * 1024 || value.contains('\0')
+            || !matches!(self.action.as_str(), "set_variable" | "set_expression"))
+        { return Err(tool_err("DAP_USAGE", "value is assignment-only, NUL-free and at most 64 KiB")); }
         if self.go_mode.as_deref().is_some_and(|mode| self.action != "launch" || !matches!(mode, "debug" | "test" | "exec")) {
             return Err(tool_err("DAP_USAGE", "goMode is launch-only and must be debug, test or exec"));
         }
@@ -448,14 +522,14 @@ impl DebugInput {
             || !matches!(self.action.as_str(), "launch" | "attach")) {
             return Err(tool_err("DAP_USAGE", "startupTimeoutMs is launch/attach-only and must be in 1..=300000"));
         }
-        if self.filter.as_deref().is_some_and(|filter|!matches!(filter,"named"|"indexed")) {
-            return Err(tool_err("DAP_USAGE","filter must be named or indexed"));
+        if self.filter.as_deref().is_some_and(|filter| !matches!(filter, "named" | "indexed")) {
+            return Err(tool_err("DAP_USAGE", "filter must be named or indexed"));
         }
-        if self.access_type.as_deref().is_some_and(|access|!matches!(access,"read"|"write"|"readWrite")) {
-            return Err(tool_err("DAP_USAGE","accessType must be read, write or readWrite"));
+        if self.access_type.as_deref().is_some_and(|access| !matches!(access, "read" | "write" | "readWrite")) {
+            return Err(tool_err("DAP_USAGE", "accessType must be read, write or readWrite"));
         }
-        if self.exception_filters.as_ref().is_some_and(|filters|filters.len() > 64 || filters.iter().any(|filter|filter.is_empty() || filter.len() > 256)) {
-            return Err(tool_err("DAP_USAGE","exceptionFilters must contain at most 64 nonempty filter IDs"));
+        if self.exception_filters.as_ref().is_some_and(|filters| filters.len() > 64 || filters.iter().any(|filter| filter.is_empty() || filter.len() > 256)) {
+            return Err(tool_err("DAP_USAGE", "exceptionFilters must contain at most 64 nonempty filter IDs"));
         }
         Ok(())
     }
@@ -467,7 +541,7 @@ impl Tool for DebugTool {
     fn name(&self) -> &str { "debug" }
     fn label(&self) -> &str { "debug" }
     fn description(&self) -> &str {
-        "Drive a real DAP debugger: native/Python stdio or Go/Delve TCP. Launch binaries, scripts, Go packages or tests with initial breakpoints; manage retained breakpoint sets, step and inspect expandable objects. One active session. Use disconnect to preserve an attached process, terminate to request target termination. Stack operations require a stopped debuggee."
+        "Drive a real native/Python/Go debugger: launch/attach, retained breakpoints, thread-aware stepping, exception diagnosis and expandable object inspection. set_variable/set_expression change live debuggee state when supported. Pass frameId/variablesReference returned by this tool, never raw adapter IDs; refresh them after resuming. singleThread requires adapter support. Use disconnect to preserve an attached target, terminate to request termination."
     }
     fn parameters(&self) -> Value {
         json!({
@@ -477,36 +551,40 @@ impl Tool for DebugTool {
                     "set_function_breakpoint","remove_function_breakpoint","set_instruction_breakpoint","remove_instruction_breakpoint",
                     "data_breakpoint_info","set_data_breakpoint","remove_data_breakpoint","list_breakpoints","set_exception_breakpoints",
                     "continue","step_over","step_in","step_out","pause","evaluate","stack_trace","threads","scopes","variables",
-                    "disassemble","read_memory","write_memory","modules","loaded_sources","custom_request","output","terminate","disconnect","sessions"]},
+                    "exception_info","set_variable","set_expression","disassemble","read_memory","write_memory","modules",
+                    "loaded_sources","custom_request","output","terminate","disconnect","sessions"]},
                 "program":{"type":"string","description":"Binary/script or local Go package directory to launch"},
                 "args":{"type":"array","items":{"type":"string"}},
                 "adapter":{"type":"string","description":"Registered adapter ID; use dlv for a precompiled Go binary or attach"},
-                "goMode":{"type":"string","enum":["debug","test","exec"],"description":"Go launch mode; inferred from source/test/binary target when omitted"},
-                "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300000,"default":120000,"description":"Launch/attach request and initial configuration budget, including Go compilation; excludes adapter process discovery and initialize handshake"},
+                "goMode":{"type":"string","enum":["debug","test","exec"]},
+                "startupTimeoutMs":{"type":"integer","minimum":1,"maximum":300000,"default":120000,"description":"Launch/attach and configuration budget, including Go compilation; excludes adapter discovery and initialize"},
                 "pid":{"type":"integer","minimum":1},
-                "file":{"type":"string","description":"Source path; required for source breakpoint set/remove"},
-                "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear all breakpoints in file"},
+                "file":{"type":"string","description":"Source path for breakpoint set/remove"},
+                "line":{"type":"integer","minimum":1,"description":"1-based line; omit on removal to clear the file's set"},
                 "column":{"type":"integer","minimum":1},
                 "condition":{"type":"string","maxLength":4096},
                 "hitCondition":{"type":"string","maxLength":4096},
-                "logMessage":{"type":"string","maxLength":4096,"description":"Source logpoint message; requires adapter support"},
-                "name":{"type":"string","description":"Function name or variable name for data_breakpoint_info"},
-                "dataId":{"type":"string","description":"Opaque ID returned by data_breakpoint_info, not a variable name"},
+                "logMessage":{"type":"string","maxLength":4096},
+                "name":{"type":"string","description":"Function, data symbol or variable name in its parent container"},
+                "value":{"type":"string","maxLength":65536,"description":"set_variable/set_expression value, parsed by the debuggee language; changes live state"},
+                "dataId":{"type":"string","description":"Opaque data breakpoint ID returned by data_breakpoint_info"},
                 "accessType":{"type":"string","enum":["read","write","readWrite"]},
-                "reference":{"type":"string","description":"Instruction reference; omit on removal to clear the instruction set"},
+                "reference":{"type":"string","description":"Instruction reference"},
                 "address":{"type":"string","description":"Memory reference"},
                 "data":{"type":"string","description":"Base64 for write_memory"},
                 "expression":{"type":"string"}, "context":{"type":"string"},
-                "threadId":{"type":"integer","minimum":1,"description":"Selected thread; defaults to the stopped thread"},
-                "frameId":{"type":"integer","minimum":0},
-                "variablesReference":{"type":"integer","minimum":0},
+                "threadId":{"type":"integer","minimum":1,"description":"Selected thread; when combined with a handle, must own it"},
+                "singleThread":{"type":"boolean","description":"Continue/step only this thread; requires supportsSingleThreadExecutionRequests"},
+                "granularity":{"type":"string","enum":["statement","line","instruction"],"description":"Step granularity; requires adapter support"},
+                "frameId":{"type":"integer","minimum":1,"description":"Opaque frame handle from stack_trace; expires when its thread resumes"},
+                "variablesReference":{"type":"integer","minimum":0,"description":"Opaque object/container handle from scopes/evaluate/variables; zero means no children"},
                 "offset":{"type":"integer"}, "start":{"type":"integer","minimum":0},
                 "limit":{"type":"integer","minimum":1,"maximum":1000000},
                 "filter":{"type":"string","enum":["named","indexed"]},
                 "command":{"type":"string"}, "payload":{"type":"object"},
                 "stopOnEntry":{"type":"boolean","default":true},
                 "exceptionFilters":{"type":"array","maxItems":64,"items":{"type":"string"}},
-                "initialBreakpoints":{"type":"array","maxItems":1024,"description":"Source breakpoints installed before configurationDone, for launch/attach",
+                "initialBreakpoints":{"type":"array","maxItems":1024,
                     "items":{"type":"object","required":["file","line"],"additionalProperties":false,
                         "properties":{"file":{"type":"string"},"line":{"type":"integer","minimum":1},
                             "column":{"type":"integer","minimum":1},"condition":{"type":"string"},
@@ -519,16 +597,16 @@ impl Tool for DebugTool {
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput>
     {
         let input: DebugInput = serde_json::from_value(input)
-            .map_err(|error|tool_err("DAP_USAGE",format!("invalid input: {error}")))?;
+            .map_err(|error| tool_err("DAP_USAGE", format!("invalid input: {error}")))?;
         input.validate()?;
         let owner = AgentCx::for_current_or_request();
-        let _operation = OwnedMutexGuard::lock(Arc::clone(&self.operations),owner.cx()).await
-            .map_err(|_|tool_err("DAP_CANCELLED","debug operation cancelled while queued"))?;
+        let _operation = OwnedMutexGuard::lock(Arc::clone(&self.operations), owner.cx()).await
+            .map_err(|_| tool_err("DAP_CANCELLED", "debug operation cancelled while queued"))?;
         match input.action.as_str() {
-            "launch"|"attach" => self.run_start(&input).await,
+            "launch" | "attach" => self.run_start(&input).await,
             "sessions" if lock(&self.session).is_none() => {
                 let payload = json!({"action":"sessions","sessions":[]});
-                Ok(text_output(payload.to_string(),payload))
+                Ok(text_output(payload.to_string(), payload))
             }
             _ => self.run_simple(&input).await,
         }

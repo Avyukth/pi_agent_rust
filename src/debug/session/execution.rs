@@ -72,6 +72,11 @@ impl Execution {
         self.revision
     }
 
+    /// Identity of this thread's current suspension, not a session-wide flag.
+    pub(super) fn stamp(&self, id: u64) -> Option<u64> {
+        self.stop(id).map(|stop| stop.revision)
+    }
+
     fn advance(&mut self) -> Result<u64> {
         self.revision = self.revision.checked_add(1)
             .ok_or_else(|| tool_err("DAP_PROTOCOL", "execution revision exhausted"))?;
@@ -226,7 +231,7 @@ impl Execution {
             }
         }
         if self.threads.is_empty() && matches!(self.baseline.status, Status::Stopped(_)) {
-            return Ok(0); // all-stop without an identified thread: query threads.
+            return Ok(0);
         }
         Err(tool_err("DAP_STATE_RUNNING", "no known thread is stopped"))
     }
@@ -286,13 +291,9 @@ impl Execution {
         Ok(ticket)
     }
 
-    /// Restore only cells still owned by this request's optimistic transition.
-    /// An event on one thread does not prevent restoring an unaffected peer.
     pub(super) fn restore(&mut self, ticket: &Resume, except_resumed: bool) {
         if self.exited { return; }
-        if self.baseline.revision == ticket.revision {
-            self.baseline = ticket.baseline.clone();
-        }
+        if self.baseline.revision == ticket.revision { self.baseline = ticket.baseline.clone(); }
         for (id, previous) in &ticket.threads {
             if except_resumed && *id == ticket.thread { continue; }
             if let Some(current) = self.threads.get_mut(id)
@@ -305,8 +306,6 @@ impl Execution {
         self.choose();
     }
 
-    /// A continue reply may report that more threads resumed than requested.
-    /// Do not overwrite a stop that arrived after dispatch but before the reply.
     pub(super) fn continued_all(&mut self, ticket: &Resume) {
         if self.exited { return; }
         let cell = Cell { status: Status::Running, revision: ticket.revision };
