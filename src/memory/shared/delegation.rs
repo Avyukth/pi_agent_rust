@@ -1,34 +1,32 @@
-//! Host-authorized shared keys for native child processes.
+//! Explicit shared-key delegation between native hosts.
 //!
-//! A child keeps its own ephemeral transcript and job session. Only these
-//! dedicated tools use the parent's frozen shared-key namespace. The grant
-//! is carried in the child environment, never in prompts or tool arguments.
-//! Run-id/parent/cwd checks prevent accidental reuse by unrelated launches;
-//! they are not an OS sandbox against a process with arbitrary shell access.
+//! The parent captures its bank and live owner once, then passes a bounded grant
+//! in the child's environment. The child installs only the selected key tools.
+//! Transcript/job ownership stays independent. These grants prevent accidental
+//! cross-session reuse; they are not an OS sandbox against arbitrary shell I/O.
+//!
+//! This module provides the SDK boundary. The ordinary CLI registry does not
+//! install or propagate grants automatically.
 
 use super::{MemoryStore, SharedMemoryStore, SharedMemoryTool, failure, validate_session};
 use crate::agent_cx::AgentCx;
 use crate::error::Result;
 use crate::jobs::JobSessionScope;
-use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
+use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::ffi::{OsStr, OsString};
+use serde_json::Value;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
-pub(crate) const GRANT_ENV: &str = "PI_SUBAGENT_SHARED_MEMORY";
+const GRANT_ENV: &str = "PI_SUBAGENT_SHARED_MEMORY";
+const PARENT_ENV: &str = "PI_SUBAGENT_PARENT_PID";
+const RUN_ENV: &str = "PI_SUBAGENT_RUN_ID";
 const MAX_GRANT_BYTES: usize = 16 * 1024;
 const GRANT_VERSION: u32 = 1;
 const TOOL_NAMES: [&str; 3] = ["read_memory", "write_memory", "list_memory"];
-
-/// Explicit tool pins opt in; the native default tool set accepts a grant.
-/// Check this before resolving a live owner, so an unshared task does not
-/// depend on an unrelated or unavailable memory-session resolver.
-pub(crate) fn accepts_tool_selection(tools: Option<&[String]>) -> bool {
-    tools.is_none_or(|names| names.iter().any(|name| TOOL_NAMES.contains(&name.as_str())))
-}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,10 +35,8 @@ enum Access {
     ReadWrite,
 }
 
-/// Host binding for a delegating tool. A registry supplies its live session
-/// resolver, and the subagent tool resolves it once per complete request.
-/// Parallel children, chain steps and corrective retries then share that
-/// immutable result, even if the parent switches session while they run.
+/// Host authority with a live owner resolver. Cloning a binding does not freeze
+/// the owner: call `resolve` once for an entire queue, chain and retry sequence.
 #[derive(Clone)]
 pub struct SharedMemoryBinding {
     bank: Arc<MemoryStore>,
@@ -55,22 +51,33 @@ impl SharedMemoryBinding {
         Self { bank, scope, access: Access::ReadWrite, source_root: None }
     }
 
-    /// Attenuate this binding. No method upgrades an inherited read-only grant.
+    /// Restrict this binding. No API upgrades an inherited read-only grant.
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.access = Access::ReadOnly;
         self
     }
 
-    pub(crate) async fn resolve(&self) -> Result<ResolvedMemory> {
-        let owner = AgentCx::for_current_or_request();
-        owner.checkpoint().map_err(|_| cancelled())?;
-        if !owner.capabilities().io {
-            return Err(failure("PI_SHARED_MEMORY_PERMISSION", "Shared memory requires I/O capability"));
+    /// Freeze the owner, with an explicit bound on a suspended host resolver.
+    /// The caller should pass its remaining request budget, not restart a budget
+    /// per child. A failed resolution must not fall back to a different session.
+    pub async fn resolve(&self, timeout: Duration) -> Result<SharedMemoryGrant> {
+        if timeout < Duration::from_millis(1) || timeout > Duration::from_secs(86_400) {
+            return Err(failure("PI_SHARED_MEMORY_TIMEOUT", "Resolution requires a budget from 1 ms to 24 hours"));
         }
-        let session_id = self.scope.session_id().await.map_err(|_| invalid_grant())?;
-        owner.checkpoint().map_err(|_| cancelled())?;
-        Ok(ResolvedMemory {
+        let owner = AgentCx::for_current_or_request();
+        checkpoint(&owner)?;
+        if !owner.capabilities().io || !owner.capabilities().time {
+            return Err(failure("PI_SHARED_MEMORY_PERMISSION", "Delegation requires I/O and timer capabilities"));
+        }
+        let now = owner.cx().timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let session_id = asupersync::time::timeout(now, timeout, self.scope.session_id())
+            .await
+            .map_err(|_| failure("PI_SHARED_MEMORY_TIMEOUT", "Shared-memory owner resolution timed out"))?
+            .map_err(|_| invalid_grant())?;
+        checkpoint(&owner)?;
+        Ok(SharedMemoryGrant {
             store: SharedMemoryStore::new(Arc::clone(&self.bank), session_id)?,
             access: self.access,
             source_root: self.source_root.clone().unwrap_or_else(|| self.bank.project_root.clone()),
@@ -78,24 +85,25 @@ impl SharedMemoryBinding {
     }
 }
 
-fn cancelled() -> crate::error::Error {
-    failure("PI_SHARED_MEMORY_CANCELLED", "Shared-memory delegation cancelled before launch")
+fn checkpoint(owner: &AgentCx) -> Result<()> {
+    owner.checkpoint().map_err(|_| {
+        failure("PI_SHARED_MEMORY_CANCELLED", "Shared-memory delegation cancelled before dispatch")
+    })
 }
 
 fn invalid_grant() -> crate::error::Error {
-    failure(
-        "PI_SHARED_MEMORY_DELEGATION",
-        "Shared-memory delegation is invalid or unavailable; no session fallback is used",
-    )
+    failure("PI_SHARED_MEMORY_DELEGATION", "Invalid or unavailable shared-memory grant; no fallback namespace is used")
 }
 
 fn read_only_error() -> crate::error::Error {
     failure("PI_SHARED_MEMORY_READ_ONLY", "This child may read shared keys but cannot modify them")
 }
 
-/// Never derive Debug: the grant contains host session and storage identities.
+/// Captured parent namespace. Safe to clone across concurrent children and
+/// retries; the live parent resolver is no longer consulted. Deliberately no
+/// Debug/Serialize implementation: storage and scope identifiers are private.
 #[derive(Clone)]
-pub(crate) struct ResolvedMemory {
+pub struct SharedMemoryGrant {
     store: SharedMemoryStore,
     access: Access,
     source_root: PathBuf,
@@ -103,7 +111,7 @@ pub(crate) struct ResolvedMemory {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Grant {
+struct WireGrant {
     version: u32,
     parent_pid: u32,
     run_id: String,
@@ -120,24 +128,11 @@ fn valid_run_id(id: &str) -> bool {
         && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-/// Command inherits ambient variables unless explicitly removed. Every native
-/// launch calls this, including launches that have no memory binding.
-pub(crate) fn configure_child_command(
-    command: &mut Command,
-    memory: Option<&ResolvedMemory>,
-    cwd: &Path,
-    parent_pid: u32,
-    run_id: &str,
-) -> Result<()> {
-    command.env_remove(GRANT_ENV);
-    if let Some(memory) = memory {
-        memory.configure_command(command, cwd, parent_pid, run_id)?;
-    }
-    Ok(())
-}
-
-impl ResolvedMemory {
-    fn binding(&self) -> SharedMemoryBinding {
+impl SharedMemoryGrant {
+    /// Authorize a nested launcher without changing the bank, frozen owner, or
+    /// inherited permission ceiling. The child's source root may be a worktree.
+    #[must_use]
+    pub fn binding(&self) -> SharedMemoryBinding {
         SharedMemoryBinding {
             bank: Arc::clone(&self.store.bank),
             scope: JobSessionScope::fixed(self.store.session_id.clone()),
@@ -146,71 +141,45 @@ impl ResolvedMemory {
         }
     }
 
-    /// An explicit agent tool pin remains an opt-in boundary. With a pin,
-    /// at least one shared alias must be named; write_memory must be named
-    /// to obtain writes. Omitting tools uses the native child's defaults.
-    /// All choices are intersected with the inherited permission ceiling.
-    pub(crate) fn for_tool_selection(&self, tools: Option<&[String]>) -> Option<Self> {
-        if !accepts_tool_selection(tools) {
-            return None;
-        }
-        let mut memory = self.clone();
+    /// Intersect an agent's explicit tool pin with this grant. No shared names
+    /// means no delegation. A read-only ceiling removes a requested writer.
+    /// An omitted pin selects all key tools permitted by the inherited ceiling.
+    pub fn for_tool_selection(&self, tools: Option<&[String]>) -> Option<Self> {
+        let mut grant = self.clone();
         if let Some(tools) = tools {
+            if !tools.iter().any(|name| TOOL_NAMES.contains(&name.as_str())) {
+                return None;
+            }
             if !tools.iter().any(|name| name == "write_memory") {
-                memory.access = Access::ReadOnly;
+                grant.access = Access::ReadOnly;
             }
         }
-        Some(memory)
+        Some(grant)
     }
 
-    /// The requested source cwd must belong to the authorized project. An
-    /// isolated worktree is created only after this check; its different path
-    /// does not create a new bank or change the owner session.
-    pub(crate) fn check_source_directory(&self, cwd: &Path) -> Result<()> {
+    /// Check the requested source before creating an isolated worktree. The
+    /// caller must not substitute an arbitrary external directory as a worktree.
+    pub fn check_source_directory(&self, cwd: &Path) -> Result<()> {
         let root = self.source_root.canonicalize().map_err(|_| invalid_grant())?;
         let cwd = cwd.canonicalize().map_err(|_| invalid_grant())?;
         if !cwd.starts_with(root) {
-            return Err(failure(
-                "PI_SHARED_MEMORY_DELEGATION_SCOPE",
-                "A delegated shared-memory task must start within its authorized project",
-            ));
+            return Err(failure("PI_SHARED_MEMORY_DELEGATION_SCOPE", "The source directory is outside the authorized project"));
         }
         Ok(())
     }
 
-    /// Ensure the dedicated tools are in the child's pinned schema. Existing
-    /// explicit tools remain unchanged, except a read-only grant cannot request
-    /// the reserved writer alias. No long-term memory or reflection tool is added.
-    pub(crate) fn add_tool_args(&self, args: &mut [OsString]) -> Result<()> {
-        let index = args.iter().position(|arg| arg == "--tools").ok_or_else(invalid_grant)?;
-        let value = args.get_mut(index + 1).ok_or_else(invalid_grant)?;
-        let original = value.to_str().ok_or_else(invalid_grant)?;
-        let explicitly_selected = original.split(',').any(|name| TOOL_NAMES.contains(&name));
-        let mut names: Vec<&str> = original.split(',')
-            .filter(|name| !name.is_empty()
-                && (*name != "write_memory" || self.access == Access::ReadWrite)).collect();
-        if !explicitly_selected {
-            names.push("read_memory");
-            if self.access == Access::ReadWrite { names.push("write_memory"); }
-            names.push("list_memory");
-        }
-        if names.is_empty() {
-            // An empty --tools value can be interpreted as a default set by
-            // a host. Never widen an exhausted explicit pin that way.
-            return Err(read_only_error());
-        }
-        *value = OsString::from(names.join(","));
-        Ok(())
-    }
-
-    pub(crate) fn configure_command(
-        &self, command: &mut Command, cwd: &Path, parent_pid: u32, run_id: &str,
-    ) -> Result<()> {
-        if parent_pid == 0 || !valid_run_id(run_id) { return Err(invalid_grant()); }
+    /// Attach the captured grant to an explicitly chosen child. `cwd` is the
+    /// final working directory, which may be a worktree of a checked source.
+    /// No I/O is dispatched; this does not spawn the process or enable tools.
+    pub fn configure_command(&self, command: &mut Command, cwd: &Path, run_id: &str) -> Result<()> {
+        // A caller that mistakenly continues after an error must not inherit a
+        // broader ambient grant. Parent/run markers are set only on success.
+        command.env_remove(GRANT_ENV);
+        if !valid_run_id(run_id) { return Err(invalid_grant()); }
         validate_session(&self.store.session_id).map_err(|_| invalid_grant())?;
-        let grant = Grant {
+        let grant = WireGrant {
             version: GRANT_VERSION,
-            parent_pid,
+            parent_pid: std::process::id(),
             run_id: run_id.to_string(),
             working_directory: cwd.canonicalize().map_err(|_| invalid_grant())?,
             database: self.store.bank.db_path.clone(),
@@ -224,13 +193,30 @@ impl ResolvedMemory {
         }
         let encoded = serde_json::to_string(&grant).map_err(|_| invalid_grant())?;
         if encoded.len() > MAX_GRANT_BYTES { return Err(invalid_grant()); }
-        command.env(GRANT_ENV, encoded);
+        command.env(GRANT_ENV, encoded)
+            .env(PARENT_ENV, grant.parent_pid.to_string())
+            .env(RUN_ENV, run_id);
         Ok(())
+    }
+
+    /// Clear ambient shared authority on an unrelated child launch.
+    pub fn clear_command(command: &mut Command) {
+        command.env_remove(GRANT_ENV);
+    }
+
+    /// Decode an explicitly inherited grant. Missing means no delegation;
+    /// malformed means an error, never a new local/global namespace. The host
+    /// should call this once during startup, before accepting tool requests.
+    pub fn from_environment(cwd: &Path) -> Result<Option<Self>> {
+        let Some(raw) = std::env::var_os(GRANT_ENV) else { return Ok(None); };
+        let parent_pid = std::env::var_os(PARENT_ENV);
+        let run_id = std::env::var_os(RUN_ENV);
+        Self::decode(&raw, cwd, parent_pid.as_deref(), run_id.as_deref()).map(Some)
     }
 
     fn decode(raw: &OsStr, cwd: &Path, parent_pid: Option<&OsStr>, run_id: Option<&OsStr>) -> Result<Self> {
         let raw = raw.to_str().filter(|value| value.len() <= MAX_GRANT_BYTES).ok_or_else(invalid_grant)?;
-        let grant: Grant = serde_json::from_str(raw).map_err(|_| invalid_grant())?;
+        let grant: WireGrant = serde_json::from_str(raw).map_err(|_| invalid_grant())?;
         let parent_pid = parent_pid.and_then(OsStr::to_str)
             .and_then(|value| value.parse::<u32>().ok()).ok_or_else(invalid_grant)?;
         let run_id = run_id.and_then(OsStr::to_str).ok_or_else(invalid_grant)?;
@@ -255,96 +241,55 @@ impl ResolvedMemory {
             source_root: grant.working_directory,
         })
     }
-}
 
-/// Install only task-key tools for an explicitly granted child. A malformed
-/// present grant installs rejecting tools, not tools targeting a fresh local
-/// session. ToolRegistry's later job-scope binding cannot retarget these tools.
-pub(crate) fn attach_child_tools(
-    cwd: &Path,
-    enabled: &[&str],
-    tools: &mut Vec<Box<dyn Tool>>,
-) {
-    let Some(raw) = std::env::var_os(GRANT_ENV) else { return; };
-    let parent_pid = std::env::var_os("PI_SUBAGENT_PARENT_PID");
-    let run_id = std::env::var_os("PI_SUBAGENT_RUN_ID");
-    let memory = ResolvedMemory::decode(&raw, cwd, parent_pid.as_deref(), run_id.as_deref());
-    install_tools(memory, enabled, tools);
-}
-
-fn install_tools(
-    memory: Result<ResolvedMemory>,
-    enabled: &[&str],
-    tools: &mut Vec<Box<dyn Tool>>,
-) {
-    let memory = memory.ok();
-    // Attenuate nested launchers before collision handling too. A pre-existing
-    // tool identity must not accidentally preserve a broader local-bank grant.
-    let binding = memory.as_ref().map(ResolvedMemory::binding);
-    for tool in &mut *tools { tool.bind_shared_memory(binding.clone()); }
-    if tools.iter().any(|tool| TOOL_NAMES.contains(&tool.name())) {
-        // Do not shadow or partially install over existing host tool identities.
-        // Normal native construction has no aliases until this point.
-        tracing::warn!("shared-memory child tool names collide; delegation was not installed");
-        return;
-    }
-    // Inherited authority wins over a separately configured local bank. Invalid
-    // inheritance explicitly clears delegation rather than using that bank.
-    // A read-only child cannot upgrade nested delegations to read-write.
-    if memory.is_none() {
-        tracing::warn!("shared-memory child grant rejected; task-key tools will deny access");
-    }
-    for name in TOOL_NAMES {
-        if !enabled.contains(&name) {
-            continue;
+    /// Install the requested dedicated tools atomically with respect to name
+    /// collisions. Their frozen parent scope ignores later job-session rebinding.
+    /// Existing tools, tier choices and host settings are not reconstructed.
+    /// A selected writer on a read-only grant is installed but rejects execution.
+    pub fn install_tools(&self, registry: &mut ToolRegistry, enabled: &[&str]) -> Result<()> {
+        let selected: Vec<_> = TOOL_NAMES.into_iter().filter(|name| enabled.contains(name)).collect();
+        for name in &selected {
+            if registry.get(name).is_some() || registry.inactive_tools().iter().any(|tool| tool.name() == *name) {
+                return Err(failure("PI_SHARED_MEMORY_TOOL_COLLISION", "A delegated shared-memory tool name is already registered"));
+            }
         }
-        let inner = memory.as_ref().map(|memory| {
-            let bank = Arc::clone(&memory.store.bank);
-            let mut tool = match name {
+        let tools: Vec<Box<dyn Tool>> = selected.into_iter().map(|name| {
+            let bank = Arc::clone(&self.store.bank);
+            let mut inner = match name {
                 "read_memory" => SharedMemoryTool::read(bank),
                 "write_memory" => SharedMemoryTool::write(bank),
                 _ => SharedMemoryTool::list(bank),
             };
-            tool.bind_job_session_scope(JobSessionScope::fixed(memory.store.session_id.clone()));
-            tool
-        });
-        tools.push(Box::new(DelegatedTool {
-            name,
-            writable: memory.as_ref().is_some_and(|memory| memory.access == Access::ReadWrite),
-            inner,
-        }));
+            inner.bind_job_session_scope(JobSessionScope::fixed(self.store.session_id.clone()));
+            Box::new(DelegatedTool { inner, writable: self.access == Access::ReadWrite }) as Box<dyn Tool>
+        }).collect();
+        registry.extend(tools);
+        Ok(())
     }
 }
 
 struct DelegatedTool {
-    name: &'static str,
+    inner: SharedMemoryTool,
     writable: bool,
-    inner: Option<SharedMemoryTool>,
 }
 
 #[async_trait::async_trait]
 impl Tool for DelegatedTool {
-    fn name(&self) -> &'static str { self.name }
-    fn label(&self) -> &'static str { self.name }
-    fn description(&self) -> &'static str {
-        match self.name {
-            "read_memory" => "Read a key and revision from this task's parent-shared namespace. It is separate from your transcript and cannot be selected in arguments.",
-            "write_memory" => "Write exact text to this task's parent-shared namespace. Use expectedRevision from read_memory (or 'absent' for create-only) to avoid overwriting another agent. A read-only grant denies all writes.",
-            _ => "List this task's parent-shared keys, bounded previews and revisions, with literal prefix filtering and key cursors.",
+    fn name(&self) -> &str { self.inner.name() }
+    fn label(&self) -> &str { self.inner.label() }
+    fn description(&self) -> &str {
+        match self.name() {
+            "read_memory" => "Read a key and revision from this task's parent-shared namespace, separate from its transcript and jobs.",
+            "write_memory" => "Write exact text to the parent-shared namespace. Use expectedRevision (or absent for create-only). Read-only grants reject writes.",
+            _ => "List parent-shared keys, revisions and bounded previews with literal prefix filtering and key cursors.",
         }
     }
-    fn parameters(&self) -> Value {
-        self.inner.as_ref().map_or_else(|| json!({"type":"object"}), Tool::parameters)
-    }
-    fn effects(&self) -> ToolEffects {
-        if self.name == "write_memory" { ToolEffects::write() } else { ToolEffects::read() }
-    }
-    // Intentionally do not implement bind_job_session_scope: the child's job
-    // owner is not the parent namespace. The captured inner binding is immutable.
+    fn parameters(&self) -> Value { self.inner.parameters() }
+    fn effects(&self) -> ToolEffects { self.inner.effects() }
+    // Do not forward bind_job_session_scope: the child's jobs do not own these keys.
     async fn execute(&self, id: &str, input: Value, update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput> {
-        let inner = self.inner.as_ref().ok_or_else(invalid_grant)?;
-        if self.name == "write_memory" && !self.writable { return Err(read_only_error()); }
-        inner.execute(id, input, update).await
+        if self.name() == "write_memory" && !self.writable { return Err(read_only_error()); }
+        self.inner.execute(id, input, update).await
     }
 }
 
