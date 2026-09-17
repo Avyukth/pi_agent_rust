@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(900);
+pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_mins(15);
 pub(super) const MAX_TIMEOUT_SECS: u64 = 86_400;
 const TIMEOUT_ENV: &str = "PI_SUBAGENT_TIMEOUT_SECS";
 const DEADLINE_ENV: &str = "PI_SUBAGENT_DEADLINE_UNIX_MS";
