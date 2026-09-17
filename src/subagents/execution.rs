@@ -193,9 +193,10 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        if !owner.capabilities().io || !owner.capabilities().time {
+        let capabilities = owner.capabilities();
+        if !capabilities.io || !capabilities.spawn || !capabilities.time {
             attempt.result.fail(
-                "PI_SUBAGENT_PERMISSION: child execution requires I/O and timer capabilities"
+                "PI_SUBAGENT_PERMISSION: child execution requires I/O, spawn and timer capabilities"
                     .to_string(),
             );
             return attempt;
@@ -274,7 +275,7 @@ impl ChildRunner {
         if !check_budget(owner, self.deadline, &mut attempt.result) {
             return attempt;
         }
-        let child = match command.spawn() {
+        let child = match owner.process().spawn_checked(&mut command) {
             Ok(child) => child,
             Err(error) => {
                 attempt.result.fail(format!(
@@ -284,8 +285,10 @@ impl ChildRunner {
                 return attempt;
             }
         };
-        crate::tools::attach_child_job_discipline(&child);
+        // Guard ownership precedes platform attachment, which may itself fail
+        // or unwind. Every successfully spawned child already has a reaper.
         let mut child = ChildProcessGuard::new(child);
+        crate::tools::attach_child_job_discipline(child.child.as_ref().expect("owned child"));
         attempt.result.pid = Some(child.id());
         attempt.result.status = SubagentStatus::Running;
         if let Some(id) = &attempt.result.hub_id
@@ -686,11 +689,7 @@ fn drain_child_frames(
 }
 
 async fn poll_pause(owner: &AgentCx) {
-    let now = owner
-        .cx()
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    asupersync::time::sleep(now, Duration::from_millis(10)).await;
+    owner.time().sleep(Duration::from_millis(10)).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,7 +709,11 @@ async fn drain_until_reader_exit(
         drain_child_frames(&receiver, protocol, result, update);
         if stdout.is_finished() && stderr.is_finished() {
             // Neither thread can produce another frame after this barrier.
-            drain_child_frames(&receiver, protocol, result, update);
+            // There can still be a full queue, not merely one drain batch.
+            for _ in 0..protocol::PIPE_QUEUE_CAPACITY.div_ceil(DRAIN_BATCH) {
+                check_budget(owner, work_deadline, result);
+                drain_child_frames(&receiver, protocol, result, update);
+            }
             let stdout_ok = stdout.join().is_ok();
             let stderr_ok = stderr.join().is_ok();
             if (!stdout_ok || !stderr_ok) && !result.is_error {
@@ -731,5 +734,63 @@ async fn drain_until_reader_exit(
             return;
         }
         poll_pause(owner).await;
+    }
+}
+
+#[cfg(test)]
+mod settled_queue_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn drain_fixture(trailing_failure: bool) -> (SubagentResult, protocol::ChildProtocol) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
+        let deadline = Deadline::for_request(Some(Duration::from_secs(10)), None).unwrap();
+        let agent = super::super::tan_agent_definition();
+        let task: SubagentTask = serde_json::from_value(json!({"agent":"tan","task":"fixture"})).unwrap();
+        let mut result = SubagentResult::starting(&agent, task, None, Path::new("pi"), Path::new("."), &[]);
+        let mut protocol = protocol::ChildProtocol::default();
+        let (sender, receiver) = mpsc::sync_channel(protocol::PIPE_QUEUE_CAPACITY);
+        let completion = json!({"type":"agent_end","messages":[{
+            "role":"assistant","stopReason":"stop","content":[{"type":"text","text":"final answer"}]
+        }]}).to_string();
+        for index in 0..protocol::PIPE_QUEUE_CAPACITY {
+            let line = if index == 0 && trailing_failure {
+                completion.clone()
+            } else if index + 1 == protocol::PIPE_QUEUE_CAPACITY {
+                if trailing_failure { "not-json".to_string() } else { completion.clone() }
+            } else {
+                json!({"type":"usage","tokens":index}).to_string()
+            };
+            sender.send(PipeFrame::Data(PipeKind::Stdout, line)).unwrap();
+        }
+        drop(sender);
+        let stdout = thread::spawn(|| {});
+        let stderr = thread::spawn(|| {});
+        let wait_until = Instant::now() + Duration::from_secs(2);
+        while !stdout.is_finished() || !stderr.is_finished() {
+            assert!(Instant::now() < wait_until, "fixture readers did not settle");
+            thread::yield_now();
+        }
+        runtime.block_on(drain_until_reader_exit(
+            receiver, &mut protocol, &mut result, None, stdout, stderr, &owner, deadline,
+        ));
+        (result, protocol)
+    }
+
+    #[test]
+    fn settled_readers_do_not_drop_a_completion_behind_multiple_batches() {
+        let (result, protocol) = drain_fixture(false);
+        assert!(!result.is_error, "{:?}", result.error);
+        assert_eq!(result.output, "final answer");
+        assert!(protocol.finish().is_ok());
+    }
+
+    #[test]
+    fn settled_readers_do_not_hide_a_failure_after_an_earlier_completion() {
+        let (result, protocol) = drain_fixture(true);
+        assert!(result.is_error);
+        assert!(protocol.finish().is_err());
     }
 }
