@@ -430,6 +430,7 @@ impl HostState {
                 )
             }
             CapabilityPromptOutcome::Cancelled => (PolicyDecision::Deny, "prompt_cancelled"),
+            CapabilityPromptOutcome::AutoDenied => (PolicyDecision::Deny, "prompt_auto_deny"),
             CapabilityPromptOutcome::InvalidResponse => {
                 (PolicyDecision::Deny, "prompt_invalid_response")
             }
