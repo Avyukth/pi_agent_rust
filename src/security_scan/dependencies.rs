@@ -117,7 +117,7 @@ impl Builder {
     }
 }
 
-fn valid_name(ecosystem: &str, name: &str) -> bool {
+pub(super) fn valid_name(ecosystem: &str, name: &str) -> bool {
     let component = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
     if name.is_empty() || name.len() > 256 { return false; }
     if ecosystem == "crates.io" {
