@@ -1716,11 +1716,10 @@ pub struct PrimaryRestoreRequest<'a> {
     pub strict_invariants: bool,
     /// Whether to discard an in-flight background compaction.
     ///
-    /// RPC does; print never has. The restoration changes the context window
-    /// in the same transition, so a compaction computed against the fallback's
-    /// window is stale by construction and print's omission looks like a bug —
-    /// but fixing it is a behaviour change on a working surface, so it is a
-    /// flag here and a separate bead, not a silent edit.
+    /// RPC, the SDK, and print mode discard an in-flight background compaction across
+    /// primary restoration (bd-uyqkk). The restoration changes the model and the context
+    /// window in the same transition, so a compaction computed against the fallback's
+    /// window is stale by construction.
     pub invalidate_background_compaction: bool,
 }
 
@@ -12801,6 +12800,24 @@ impl AgentSession {
         self.compaction_worker.invalidate_for_context_switch();
         self.extensions_is_compacting
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a background compaction task is currently pending.
+    #[must_use]
+    pub fn has_pending_background_compaction(&self) -> bool {
+        self.compaction_worker.has_pending()
+    }
+
+    /// Inject a parked background compaction task for testing context-switch invalidation.
+    pub fn park_pending_compaction_for_test(
+        &mut self,
+        runtime_handle: &RuntimeHandle,
+        aborted: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        self.compaction_worker
+            .park_pending_for_test(runtime_handle, aborted);
+        self.extensions_is_compacting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Strip the failed request's incomplete output so a retry RESUMES the turn

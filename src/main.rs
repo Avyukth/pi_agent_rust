@@ -9198,9 +9198,9 @@ async fn maybe_restore_print_primary(
         auth: ctx.auth,
         cli_api_key: ctx.cli_api_key,
         strict_invariants: false,
-        // Print has never discarded an in-flight background compaction here.
-        // See `PrimaryRestoreRequest::invalidate_background_compaction`.
-        invalidate_background_compaction: false,
+        // Print discards an in-flight background compaction across primary restoration,
+        // matching RPC and the SDK (bd-uyqkk).
+        invalidate_background_compaction: true,
     };
     let cx = pi::agent_cx::AgentCx::for_request();
     let Ok(Some(restored)) = session.restore_primary(&cx, &request).await else {
@@ -12348,6 +12348,7 @@ mod tests {
             .blocking_threads(1, 8)
             .build()
             .expect("runtime build");
+        let handle = runtime.handle();
         runtime.block_on(async move {
             let model_entry =
                 |provider: &str, model_id: &str, api: &str, key: Option<&str>| ModelEntry {
@@ -12562,6 +12563,12 @@ mod tests {
                 .expect("swap for the cooldown case")
                 .is_some()
             );
+            let holding_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            swapped.park_pending_compaction_for_test(&handle, Some(Arc::clone(&holding_aborted)));
+            assert!(
+                swapped.has_pending_background_compaction(),
+                "compaction must be in flight before refused restoration"
+            );
             assert!(
                 !maybe_restore_print_primary(&mut swapped, &mut holding, failover_ctx, false).await,
                 "the cooldown must hold the primary back"
@@ -12570,6 +12577,14 @@ mod tests {
             assert!(
                 holding.active().is_some(),
                 "a refused restoration keeps the recorded fallback"
+            );
+            assert!(
+                swapped.has_pending_background_compaction(),
+                "a refused restoration must keep the in-flight background compaction active"
+            );
+            assert!(
+                !holding_aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "compaction task must not be aborted when restoration is refused"
             );
 
             // The live model is no longer the fallback we recorded: something
@@ -12628,6 +12643,16 @@ mod tests {
                 .is_some()
             );
             assert_eq!(restorable.agent.provider().model_id(), "fallback-model");
+
+            // bd-uyqkk: Park an in-flight background compaction while running on the fallback.
+            let compaction_aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            restorable
+                .park_pending_compaction_for_test(&handle, Some(Arc::clone(&compaction_aborted)));
+            assert!(
+                restorable.has_pending_background_compaction(),
+                "compaction must be in flight before restoration"
+            );
+
             assert!(
                 maybe_restore_print_primary(&mut restorable, &mut ready, failover_ctx, false).await,
                 "an elapsed cooldown with consistent state restores"
@@ -12643,6 +12668,19 @@ mod tests {
                 ready.chain_position(),
                 0,
                 "back on the primary, the chain starts over"
+            );
+            assert!(
+                !restorable.has_pending_background_compaction(),
+                "bd-uyqkk: primary restoration must invalidate the in-flight background compaction"
+            );
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                compaction_aborted.load(std::sync::atomic::Ordering::SeqCst),
+                "the in-flight compaction task must be aborted on restoration"
             );
         });
     }

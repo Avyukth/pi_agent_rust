@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub(crate) const COMPACTION_ADMISSION_SCHEMA_V1: &str = "pi.compaction.admission.v1";
@@ -449,6 +450,34 @@ impl CompactionWorkerState {
     #[cfg(test)]
     pub(crate) const fn set_attempt_count_for_test(&mut self, attempt_count: u32) {
         self.attempt_count = attempt_count;
+    }
+
+    /// Whether a background compaction is currently in flight.
+    #[must_use]
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Test helper: inject a parked background compaction task that signals `aborted` if aborted.
+    pub fn park_pending_for_test(
+        &mut self,
+        runtime_handle: &RuntimeHandle,
+        aborted: Option<Arc<AtomicBool>>,
+    ) {
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let join = runtime_handle.spawn(async move {
+            let _ = abort_rx.await;
+            if let Some(flag) = aborted {
+                flag.store(true, Ordering::SeqCst);
+            }
+            Err(Error::session("Background compaction aborted".to_string()))
+        });
+        self.pending = Some(PendingCompaction {
+            join,
+            abort_tx: Some(abort_tx),
+            started_at: Instant::now(),
+            origin: None,
+        });
     }
 
     pub(crate) fn invalidate_for_context_switch(&mut self) {
