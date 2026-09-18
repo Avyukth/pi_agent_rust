@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::agent::{
@@ -889,9 +889,56 @@ const RPC_MAX_PRE_ACK_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct RpcTransportClient {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     stdout: BufReader<ChildStdout>,
-    next_request_id: u64,
+    next_request_id: Arc<AtomicU64>,
+}
+
+/// Write-only control lane for a running RPC prompt.
+///
+/// The prompt task remains the sole stdout reader. A cloned control handle may
+/// be used from another thread or from a live event callback to dispatch steer,
+/// follow-up, or abort requests while that prompt is still active. Dispatch
+/// success means the command was written and flushed, not that the subprocess
+/// acknowledged or completed it.
+#[derive(Clone)]
+pub struct RpcControlHandle {
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for RpcControlHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcControlHandle").finish_non_exhaustive()
+    }
+}
+
+impl RpcControlHandle {
+    fn send(&self, command: &str, payload: Map<String, Value>) -> Result<String> {
+        let request_id = next_rpc_request_id(&self.next_request_id)?;
+        let mut frame = Map::new();
+        frame.insert("type".to_string(), Value::String(command.to_string()));
+        frame.insert("id".to_string(), Value::String(request_id.clone()));
+        frame.extend(payload);
+        write_rpc_json_line(&self.stdin, &Value::Object(frame))?;
+        Ok(request_id)
+    }
+
+    pub fn steer(&self, message: impl Into<String>) -> Result<String> {
+        let mut payload = Map::new();
+        payload.insert("message".to_string(), Value::String(message.into()));
+        self.send("steer", payload)
+    }
+
+    pub fn follow_up(&self, message: impl Into<String>) -> Result<String> {
+        let mut payload = Map::new();
+        payload.insert("message".to_string(), Value::String(message.into()));
+        self.send("follow_up", payload)
+    }
+
+    pub fn abort(&self) -> Result<String> {
+        self.send("abort", Map::new())
+    }
 }
 
 /// Unified adapter over in-process and subprocess-backed session control.
@@ -1022,10 +1069,20 @@ impl RpcTransportClient {
 
         Ok(Self {
             child,
-            stdin: BufWriter::new(stdin),
+            stdin: Arc::new(Mutex::new(BufWriter::new(stdin))),
             stdout: BufReader::new(stdout),
-            next_request_id: 1,
+            next_request_id: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    /// Clone a write-only lane that remains usable while `prompt*` borrows
+    /// this client for its single stdout reader.
+    #[must_use]
+    pub fn control_handle(&self) -> RpcControlHandle {
+        RpcControlHandle {
+            stdin: Arc::clone(&self.stdin),
+            next_request_id: Arc::clone(&self.next_request_id),
+        }
     }
 
     #[allow(
@@ -1038,7 +1095,7 @@ impl RpcTransportClient {
                 "RPC request payload cannot override reserved type/id fields",
             ));
         }
-        let request_id = self.next_request_id();
+        let request_id = self.next_request_id()?;
         let mut command_payload = Map::new();
         command_payload.insert("type".to_string(), Value::String(command.to_string()));
         command_payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -1332,7 +1389,7 @@ impl RpcTransportClient {
         streaming_behavior: Option<&str>,
         mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
-        let request_id = self.next_request_id();
+        let request_id = self.next_request_id()?;
         let mut payload = Map::new();
         payload.insert("type".to_string(), Value::String("prompt".to_string()));
         payload.insert("id".to_string(), Value::String(request_id.clone()));
@@ -1428,22 +1485,12 @@ impl RpcTransportClient {
         Ok(())
     }
 
-    fn next_request_id(&mut self) -> String {
-        let id = format!("rpc-{}", self.next_request_id);
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        id
+    fn next_request_id(&self) -> Result<String> {
+        next_rpc_request_id(&self.next_request_id)
     }
 
-    fn write_json_line(&mut self, payload: &Value) -> Result<()> {
-        let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
-        self.stdin
-            .write_all(encoded.as_bytes())
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        self.stdin
-            .write_all(b"\n")
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        self.stdin.flush().map_err(|err| Error::Io(Box::new(err)))?;
-        Ok(())
+    fn write_json_line(&self, payload: &Value) -> Result<()> {
+        write_rpc_json_line(&self.stdin, payload)
     }
 
     fn read_json_line(&mut self) -> Result<Value> {
@@ -1510,6 +1557,30 @@ impl RpcTransportClient {
             return Err(rpc_error_from_response(&item, command));
         }
     }
+}
+
+fn next_rpc_request_id(counter: &AtomicU64) -> Result<String> {
+    let id = counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        .map_err(|_| Error::api("RPC request id space exhausted"))?;
+    Ok(format!("rpc-{id}"))
+}
+
+fn write_rpc_json_line(
+    stdin: &Mutex<BufWriter<ChildStdin>>,
+    payload: &Value,
+) -> Result<()> {
+    let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| Error::api("RPC subprocess stdin writer lock poisoned"))?;
+    stdin
+        .write_all(encoded.as_bytes())
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    stdin.flush().map_err(|err| Error::Io(Box::new(err)))
 }
 
 impl Drop for RpcTransportClient {

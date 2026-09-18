@@ -338,3 +338,24 @@ cannot override the SDK-generated `type` or `id` fields.
 The returned `RpcEvents` vector still contains the delivered events for callers
 that need the completed transcript. Live callbacks are therefore additive, not a
 change to the completion payload.
+
+
+### Mid-turn RPC control
+
+Call `RpcTransportClient::control_handle()` before starting a subprocess prompt
+when another thread, event loop, or the prompt's live callback may need to steer
+or abort it. The cloned `RpcControlHandle` shares only the serialized stdin
+writer and request-id allocator. The prompt remains the **only stdout reader**,
+so concurrent control never races a second parser over the RPC event stream.
+
+`RpcControlHandle::steer`, `follow_up`, and `abort` synchronously write and
+flush a command and return its SDK-owned request id. A successful return means
+the command was dispatched to the subprocess pipe; it does not claim the RPC
+server accepted or completed the operation. Its acknowledgement is consumed by
+the prompt's single reader. Use the ordinary `RpcTransportClient` methods when
+you need an acknowledgement and no prompt currently owns the read lane.
+
+The control lane and ordinary requests use one atomic id sequence and one mutexed
+writer, preventing duplicate IDs or interleaved JSON lines. Holding a control
+handle does not keep the child process alive after the owning client shuts down;
+subsequent writes then fail.

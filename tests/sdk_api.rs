@@ -262,3 +262,61 @@ done
         .expect_err("reserved id must be rejected before write");
     assert!(error.to_string().contains("reserved type/id"), "{error}");
 }
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_control_handle_can_abort_during_a_live_prompt() {
+    let script = r#"
+IFS= read -r prompt
+prompt_id=$(printf '%s\n' "$prompt" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$prompt_id"
+printf '{"type":"agent_start","sessionId":"sess-control"}\n'
+IFS= read -r control
+control_id=$(printf '%s\n' "$control" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+control_type=$(printf '%s\n' "$control" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+printf '{"type":"response","id":"%s","command":"%s","success":true}\n' "$control_id" "$control_type"
+printf '{"type":"agent_end","sessionId":"sess-control","control":"%s","messages":[]}\n' "$control_type"
+"#;
+    let options = sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+    };
+    let mut client = sdk::RpcTransportClient::connect(options).expect("connect");
+    let control = client.control_handle();
+    let control_id = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let stored = std::sync::Arc::clone(&control_id);
+    let events = futures::executor::block_on(client.prompt_with_options_streaming(
+        "hello",
+        None,
+        None,
+        move |event| {
+            if event["type"] == "agent_start" {
+                let id = control.abort().expect("dispatch abort while prompt owns stdout");
+                *stored.lock().unwrap() = Some(id);
+            }
+        },
+    ))
+    .expect("prompt completes after abort acknowledgement");
+    assert_eq!(events.last().unwrap()["control"], "abort");
+    assert!(
+        control_id.lock().unwrap().as_deref().is_some_and(|id| id.starts_with("rpc-")),
+        "control command must receive an SDK-owned unique request id"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_control_handle_ids_share_the_client_sequence() {
+    let options = sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), "cat >/dev/null".into()],
+        cwd: None,
+    };
+    let client = sdk::RpcTransportClient::connect(options).expect("connect");
+    let control = client.control_handle();
+    let first = control.steer("one").expect("steer dispatch");
+    let second = control.follow_up("two").expect("follow-up dispatch");
+    let third = control.abort().expect("abort dispatch");
+    assert_eq!([first.as_str(), second.as_str(), third.as_str()], ["rpc-1", "rpc-2", "rpc-3"]);
+}
