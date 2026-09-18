@@ -26484,6 +26484,102 @@ mod tests {
         });
     }
 
+    /// gh #223 / bd-fpaso: pin that an extension importing `DefaultPackageManager`
+    /// from `@mariozechner/pi-coding-agent` loads without export errors, read methods
+    /// are inert, and mutating methods (install/remove/update) throw named errors.
+    #[test]
+    fn default_package_manager_shim_exports_and_behavior() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.pmProbe = { done: false };
+                    (async () => {
+                        const mod = await import('@mariozechner/pi-coding-agent');
+                        if (typeof mod.DefaultPackageManager !== 'function') {
+                            throw new Error('DefaultPackageManager is not exported');
+                        }
+                        const pm = new mod.DefaultPackageManager({ cwd: '/test/cwd', agentDir: '/test/agent' });
+                        if (pm.cwd !== '/test/cwd' || pm.agentDir !== '/test/agent') {
+                            throw new Error('Constructor options not retained');
+                        }
+                        if (pm.getInstalledPath('foo', 'user') !== undefined) {
+                            throw new Error('getInstalledPath should return undefined');
+                        }
+                        const resolved = await pm.resolve();
+                        if (!Array.isArray(resolved.extensions) || !Array.isArray(resolved.skills)) {
+                            throw new Error('resolve should return empty arrays');
+                        }
+                        const resolvedExt = await pm.resolveExtensionSources(['foo']);
+                        if (!Array.isArray(resolvedExt.extensions) || !Array.isArray(resolvedExt.skills)) {
+                            throw new Error('resolveExtensionSources should return empty arrays');
+                        }
+                        let installThrew = false;
+                        try {
+                            await pm.install('test-pkg');
+                        } catch (err) {
+                            installThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.install()')) {
+                                throw new Error('Unexpected install error message: ' + err.message);
+                            }
+                        }
+                        if (!installThrew) {
+                            throw new Error('install did not throw');
+                        }
+                        let removeThrew = false;
+                        try {
+                            await pm.remove('test-pkg');
+                        } catch (err) {
+                            removeThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.remove()')) {
+                                throw new Error('Unexpected remove error message: ' + err.message);
+                            }
+                        }
+                        if (!removeThrew) {
+                            throw new Error('remove did not throw');
+                        }
+                        let updateThrew = false;
+                        try {
+                            await pm.update('test-pkg');
+                        } catch (err) {
+                            updateThrew = true;
+                            if (!err.message.includes('DefaultPackageManager.update()')) {
+                                throw new Error('Unexpected update error message: ' + err.message);
+                            }
+                        }
+                        if (!updateThrew) {
+                            throw new Error('update did not throw');
+                        }
+                        globalThis.pmProbe.ok = true;
+                    })()
+                    .catch((error) => {
+                        globalThis.pmProbe.error = String((error && error.stack) || error);
+                    })
+                    .finally(() => {
+                        globalThis.pmProbe.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval DefaultPackageManager probe");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "pmProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(
+                probe["error"],
+                serde_json::Value::Null,
+                "probe error: {probe}"
+            );
+            assert_eq!(probe["ok"], json!(true));
+        });
+    }
+
     #[allow(clippy::future_not_send)]
     async fn reject_pi_ai_hostcalls_until_done(
         runtime: &PiJsRuntime<Arc<DeterministicClock>>,

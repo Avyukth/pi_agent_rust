@@ -116,6 +116,29 @@ impl std::fmt::Display for ApprovalSurfaceUnavailable {
 }
 
 impl std::error::Error for ApprovalSurfaceUnavailable {}
+
+/// Startup failure due to configured skills/prompts/themes/extensions being
+/// unreadable, invalid, or referencing unreachable packages (gh #223).
+/// Distinct from general runtime failure so callers can identify configuration
+/// and resource loading issues without parsing stderr.
+const EXIT_CODE_RESOURCE_LOAD_FAILED: i32 = 4;
+
+/// Raised when configured skills, prompts, themes, or extensions fail to load (gh #223).
+#[derive(Debug)]
+struct ConfiguredResourceLoadFailed(String);
+
+impl std::fmt::Display for ConfiguredResourceLoadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to load configured skills/prompts/themes/extensions: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ConfiguredResourceLoadFailed {}
+
 const USAGE_ERROR_PATTERNS: &[&str] = &[
     "@file arguments are not supported in rpc mode",
     "--api-key requires a model to be specified via --provider/--model or --models",
@@ -265,6 +288,13 @@ fn machine_output_mode_from_args(args: &[String]) -> Option<&'static str> {
 /// error) in the chain classifies it; a clap error is `usage`; anything else
 /// is `internal`.
 fn fatal_error_code(err: &anyhow::Error) -> &'static str {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConfiguredResourceLoadFailed>()
+            .is_some()
+    }) {
+        return "resource.load_failed";
+    }
     if let Some(pi_error) = err
         .chain()
         .find_map(|cause| cause.downcast_ref::<pi::error::Error>())
@@ -1027,6 +1057,13 @@ fn exit_code_for_error(err: &anyhow::Error) -> i32 {
     {
         return EXIT_CODE_APPROVAL_UNAVAILABLE;
     }
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<ConfiguredResourceLoadFailed>()
+            .is_some()
+    }) {
+        return EXIT_CODE_RESOURCE_LOAD_FAILED;
+    }
     if is_usage_error(err) {
         EXIT_CODE_USAGE
     } else {
@@ -1488,11 +1525,13 @@ async fn run(
     let mut resources = match resources_result {
         Ok(resources) => resources,
         Err(err) => {
+            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
             if resource_cli.has_explicit_paths() {
                 return Err(anyhow::Error::new(err));
             }
-            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
-            ResourceLoader::empty(config.enable_skill_commands())
+            return Err(anyhow::Error::new(ConfiguredResourceLoadFailed(
+                err.to_string(),
+            )));
         }
     };
     let _ = write_resource_diagnostics_since(
@@ -10071,6 +10110,34 @@ mod tests {
         assert_eq!(exit_code_for_error(&other), EXIT_CODE_FAILURE);
     }
 
+    /// gh #223: a failure loading configured skills/prompts/themes/extensions carries its own
+    /// exit code (4) and distinct fatal error code "resource.load_failed".
+    #[test]
+    fn configured_resource_load_failed_has_its_own_exit_code() {
+        let err = anyhow::Error::new(ConfiguredResourceLoadFailed(
+            "failed to resolve package".into(),
+        ));
+        assert_eq!(exit_code_for_error(&err), EXIT_CODE_RESOURCE_LOAD_FAILED);
+        assert_ne!(EXIT_CODE_RESOURCE_LOAD_FAILED, EXIT_CODE_FAILURE);
+        assert_ne!(EXIT_CODE_RESOURCE_LOAD_FAILED, EXIT_CODE_USAGE);
+        assert_ne!(
+            EXIT_CODE_RESOURCE_LOAD_FAILED,
+            EXIT_CODE_APPROVAL_UNAVAILABLE
+        );
+
+        let wrapped = anyhow::Error::new(ConfiguredResourceLoadFailed(
+            "failed to resolve package".into(),
+        ))
+        .context("startup");
+        assert_eq!(
+            exit_code_for_error(&wrapped),
+            EXIT_CODE_RESOURCE_LOAD_FAILED
+        );
+
+        assert_eq!(fatal_error_code(&err), "resource.load_failed");
+        assert_eq!(fatal_error_code(&wrapped), "resource.load_failed");
+    }
+
     /// gh #217: the stdout record's `code` comes from the typed error in the
     /// chain, clap/usage failures are `usage`, and untyped errors are
     /// `internal`.
@@ -10105,6 +10172,10 @@ mod tests {
         // a provider failure without parsing prose.
         let approval = anyhow::Error::new(ApprovalSurfaceUnavailable).context("print mode");
         assert_eq!(fatal_error_code(&approval), "approval.surface_unavailable");
+        // gh #223: configured resource load failure classified distinctly.
+        let resource_err =
+            anyhow::Error::new(ConfiguredResourceLoadFailed("broken package".into()));
+        assert_eq!(fatal_error_code(&resource_err), "resource.load_failed");
         let clap_err = anyhow::Error::new(clap::Error::raw(
             clap::error::ErrorKind::UnknownArgument,
             "unknown --bogus",

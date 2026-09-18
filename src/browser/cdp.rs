@@ -46,10 +46,9 @@ fn downloads_since_in(
 ///
 /// Free function rather than a `Cdp` method because it touches nothing else:
 /// no socket, no session, no page state. `Cdp::record_download_event` is a
-/// one-line delegation to it, and the test below drives a bare `BTreeMap` —
-/// which is what it was already trying to do, via a
-/// `panic_socket_for_type_only()` helper that was never written, so
-/// `cargo check --all-targets` did not compile.
+/// one-line delegation to it, and the test below drives a bare `BTreeMap`,
+/// which is what it was already trying to do — it just needed a
+/// `WebSocket<TcpStream>` for the struct field it never reads.
 fn record_download_event_into(
     downloads: &mut BTreeMap<String, DownloadRecord>,
     value: &Value,
@@ -945,6 +944,7 @@ mod tests {
         session.clear_pages();
         assert_eq!(session.next_ref, 42);
     }
+
     #[test]
     fn download_events_are_correlated_and_bounded() {
         let mut downloads = BTreeMap::new();

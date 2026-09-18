@@ -25,23 +25,52 @@ pub enum FailoverClass {
     Transient,
 }
 
-/// Classify an error text for failover. `None` = never fail over (auth and
-/// other loud errors). Ordering matters: auth patterns are checked FIRST so
-/// a "401 ... quota" message never fails over.
-pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
+/// Refusal shared by same-provider retry and failover. The input is lowercase.
+/// Authentication wins even when the provider also mentions a transient status.
+fn is_auth_failure(lower: &str) -> bool {
     const AUTH_PATTERNS: &[&str] = &[
-        "401",
-        "403",
         "unauthorized",
+        "unauthenticated",
         "forbidden",
         "invalid api key",
         "invalid_api_key",
         "incorrect api key",
         "authentication failed",
+        "authentication error",
+        "authentication_error",
         "permission denied",
+        "permission_denied",
         "expired token",
+        "invalid token",
+        "invalid_token",
+        "invalid credentials",
+        "invalid_credentials",
         "missing api key",
     ];
+    if AUTH_PATTERNS.iter().any(|pattern| lower.contains(pattern)) {
+        return true;
+    }
+
+    // Prefer an explicit response status to unrelated numbers inside the body.
+    // Reuse the existing parser rather than making recovery and diagnostics
+    // disagree about HTTP/status markers. Credential wording above still wins.
+    if let Some(status) =
+        crate::error::ProviderErrorSummary::from_error_text(None, lower).http_status
+    {
+        return matches!(status, 401 | 403);
+    }
+
+    // Some providers emit a bare status instead. Match a complete token, never
+    // the middle of a request id, a token count, or a duration such as 1403ms.
+    lower
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .any(|token| matches!(token, "401" | "403"))
+}
+
+/// Classify an error text for failover. `None` = never fail over (auth and
+/// other loud errors). Terminal markers and auth are checked before transient
+/// patterns so a "401 ... quota" message never fails over.
+pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     const QUOTA_PATTERNS: &[&str] = &[
         "429",
         "rate limit",
@@ -66,10 +95,17 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         "internal error",
     ];
 
+    // Durability failures may follow completed side effects. Context overflow
+    // needs compaction, not a replay against another provider.
+    if marks_session_persistence(error_text)
+        || crate::error::is_context_overflow(error_text, None, None)
+    {
+        return None;
+    }
     let text = error_text.to_ascii_lowercase();
 
     // Auth: loud, user-actionable, never a failover trigger.
-    if AUTH_PATTERNS.iter().any(|p| text.contains(p)) {
+    if is_auth_failure(&text) {
         return None;
     }
 
@@ -81,7 +117,7 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         return Some(FailoverClass::Overload);
     }
 
-    if crate::error::is_retryable_error(&text.to_ascii_lowercase(), None, None) {
+    if crate::error::is_retryable_error(&text, None, None) {
         return Some(FailoverClass::Transient);
     }
     None
@@ -96,6 +132,9 @@ pub struct FailoverChain {
 
 /// Resolve the chain for a role name or an exact `provider/model` spec from
 /// `retry.fallbackChains`. Role keys take precedence over exact model specs.
+/// Provider aliases and surrounding spec whitespace follow model resolution.
+/// An exact key wins over equivalent spellings; otherwise the lexicographically
+/// first matching key wins, independent of `HashMap` iteration order.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
@@ -110,14 +149,38 @@ pub fn chain_for<S: std::hash::BuildHasher>(
         });
     }
     let full = format!("{provider}/{model_id}");
-    for (key, entries) in chains {
-        if key.eq_ignore_ascii_case(&full) && !entries.is_empty() {
-            return Some(FailoverChain {
-                entries: entries.clone(),
-            });
-        }
+    if let Some(entries) = chains.get(&full)
+        && !entries.is_empty()
+    {
+        return Some(FailoverChain {
+            entries: entries.clone(),
+        });
     }
-    None
+    chains
+        .iter()
+        .filter(|(key, entries)| !entries.is_empty() && model_spec_matches(key, provider, model_id))
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, entries)| FailoverChain {
+            entries: entries.clone(),
+        })
+}
+
+/// Use the same identity relation as `resolve_chain_spec`, including provider
+/// aliases and nested model ids. Raw string equality is not model identity.
+fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
+    crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+        |(candidate_provider, candidate_model)| {
+            crate::provider_metadata::provider_ids_match(provider, candidate_provider)
+                && model_id.eq_ignore_ascii_case(candidate_model)
+        },
+    )
+}
+
+fn model_specs_match(left: &str, right: &str) -> bool {
+    crate::provider_metadata::split_provider_model_spec(right).map_or_else(
+        || left.eq_ignore_ascii_case(right),
+        |(provider, model_id)| model_spec_matches(left, provider, model_id),
+    )
 }
 
 /// Cooldown FSM for the primary after a failover.
@@ -510,15 +573,10 @@ impl<'a> FailoverWalk<'a> {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
-                |(provider, model_id)| {
-                    crate::provider_metadata::provider_ids_match(self.current_provider, provider)
-                        && self.current_model.eq_ignore_ascii_case(model_id)
-                },
-            );
+            let is_current = model_spec_matches(spec, self.current_provider, self.current_model);
             let is_duplicate = self.entries[..index]
                 .iter()
-                .any(|earlier| earlier.eq_ignore_ascii_case(spec));
+                .any(|earlier| model_specs_match(earlier, spec));
             if is_current || is_duplicate {
                 continue;
             }
@@ -619,31 +677,43 @@ pub fn error_result_is_retryable(
         return false;
     }
     let error_text = message.error_message.as_deref().unwrap_or("Request error");
-    // Session-persistence failures are never retryable, even when the wrapped
-    // message contains transient-looking prose ("connection reset", "500"):
-    // flattening loses the typed boundary, so the stable prefix is checked
-    // before any text classification.
-    if marks_session_persistence(error_text) {
+    // Terminal markers and authentication outrank transient-looking prose.
+    // In particular, a mixed 401/429 response must not spend the retry budget.
+    if marks_session_persistence(error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
         return false;
     }
     crate::error::is_retryable_error(error_text, Some(message.usage.input), context_window)
 }
 
+/// Only provider/transport failures can justify another provider call. A local
+/// tool, configuration, extension or session failure cannot be repaired by
+/// re-entering the provider, even when its diagnostic quotes a transient error.
+fn is_provider_call_error(error: &crate::error::Error) -> bool {
+    matches!(
+        error,
+        crate::error::Error::Api(_)
+            | crate::error::Error::Provider { .. }
+            | crate::error::Error::Io(_)
+    )
+}
+
 /// Whether a failed provider call reported through [`crate::error::Error`]
 /// should be retried against the same provider.
 ///
-/// Classifies from the TYPED error first — [`crate::error::Error::is_transient`]
-/// walks the source chain for a transient `io::ErrorKind` (connection
-/// reset/abort/EOF/broken pipe/timeout) without depending on flattened message
-/// text — then falls back to text matching for prose-only errors
-/// (pi_agent_rust#118). No usage or context window is available on this path
-/// because no response was received.
+/// Local errors and terminal markers are refused before classification.
+/// For provider/transport errors, [`crate::error::Error::is_transient`] walks
+/// the typed source chain without depending on flattened message text, then
+/// prose-only failures use text matching (pi_agent_rust#118).
 #[must_use]
 pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
-    if error.is_session_persistence() {
+    if !is_provider_call_error(error) {
         return false;
     }
-    error.is_transient() || crate::error::is_retryable_error(&error.to_string(), None, None)
+    let error_text = error.to_string();
+    if marks_session_persistence(&error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
+        return false;
+    }
+    error.is_transient() || crate::error::is_retryable_error(&error_text, None, None)
 }
 
 /// The outcome of one provider attempt, borrowed for classification.
@@ -790,11 +860,23 @@ pub fn decide(
             if marks_session_persistence(error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
             }
+            if is_auth_failure(&error_text.to_ascii_lowercase()) {
+                return TurnDecision::Finish { success: false };
+            }
             error_result_is_retryable(message, context_window)
         }
         TurnOutcome::Failed(error) => {
-            if error.is_session_persistence() {
+            if matches!(error, crate::error::Error::Aborted) {
+                return TurnDecision::Terminal(TerminalReason::Aborted);
+            }
+            // A persistence marker remains terminal after a boundary flattens
+            // and rewraps it as Api, Provider, Io, or another Session error.
+            let error_text = error.to_string();
+            if marks_session_persistence(&error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
+            }
+            if !is_provider_call_error(error) || is_auth_failure(&error_text.to_ascii_lowercase()) {
+                return TurnDecision::Finish { success: false };
             }
             call_error_is_retryable(error)
         }
@@ -872,6 +954,87 @@ mod tests {
         // The "default" role key matches any model by design; an UNCONFIGURED
         // role + unconfigured exact model yields no chain.
         assert!(chain_for(&chains, "task", "openai", "gpt-5.5").is_none());
+    }
+
+    #[test]
+    fn chain_lookup_resolves_provider_aliases_and_spec_whitespace() {
+        let chains = HashMap::from([(
+            " gemini / GEMINI-Z ".to_string(),
+            vec!["openai/gpt-y".to_string()],
+        )]);
+        for provider in ["google", "gemini", "GOOGLE"] {
+            let resolved = chain_for(&chains, "task", provider, "gemini-z")
+                .expect("configured aliases must resolve like model selection");
+            assert_eq!(resolved.entries, vec!["openai/gpt-y".to_string()]);
+        }
+    }
+
+    #[test]
+    fn chain_lookup_keeps_role_then_exact_key_precedence() {
+        let chains = HashMap::from([
+            ("task".to_string(), vec!["role/winner".to_string()]),
+            (
+                "google/gemini-z".to_string(),
+                vec!["exact/winner".to_string()],
+            ),
+            (
+                "GOOGLE/GEMINI-Z".to_string(),
+                vec!["case/alternative".to_string()],
+            ),
+            (
+                "gemini/gemini-z".to_string(),
+                vec!["alias/alternative".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            chain_for(&chains, "task", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["role/winner".to_string()]
+        );
+        assert_eq!(
+            chain_for(&chains, "unconfigured", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["exact/winner".to_string()]
+        );
+    }
+
+    #[test]
+    fn equivalent_chain_keys_have_a_stable_tie_break() {
+        for keys in [
+            ["gemini/gemini-z", "GEMINI/GEMINI-Z"],
+            ["GEMINI/GEMINI-Z", "gemini/gemini-z"],
+        ] {
+            let chains: HashMap<_, _> = keys
+                .into_iter()
+                .map(|key| (key.to_string(), vec![key.to_string()]))
+                .collect();
+            assert_eq!(
+                chain_for(&chains, "task", "google", "gemini-z")
+                    .unwrap()
+                    .entries,
+                vec!["GEMINI/GEMINI-Z".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_role_and_exact_chains_do_not_hide_a_nonempty_alias_chain() {
+        let chains = HashMap::from([
+            ("task".to_string(), Vec::new()),
+            ("google/gemini-z".to_string(), Vec::new()),
+            (
+                "gemini/gemini-z".to_string(),
+                vec!["openai/gpt-y".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            chain_for(&chains, "task", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["openai/gpt-y".to_string()]
+        );
     }
 
     #[test]
@@ -1078,6 +1241,53 @@ mod tests {
         assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
         assert_eq!(walk.next_spec(), None);
         assert_eq!(walk.position(), 4);
+    }
+
+    #[test]
+    fn the_walk_skips_alias_duplicates_after_intervening_models() {
+        let chain = chain(&[
+            "google/gemini-z",
+            "openai/gpt-y",
+            " GEMINI / GEMINI-Z ",
+            "google/gemini-next",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
+        assert_eq!(walk.next_spec(), Some((0, "google/gemini-z")));
+        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(), Some((3, "google/gemini-next")));
+        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.position(), 4);
+    }
+
+    #[test]
+    fn a_resumed_walk_does_not_revisit_an_earlier_provider_alias() {
+        let chain = chain(&[
+            "gemini/gemini-z",
+            "openai/gpt-y",
+            "google/gemini-z",
+            "anthropic/claude-x",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 2, "openai", "gpt-y");
+        assert_eq!(walk.next_spec(), Some((3, "anthropic/claude-x")));
+        assert_eq!(walk.position(), 4);
+        assert_eq!(walk.next_spec(), None);
+    }
+
+    #[test]
+    fn identity_matching_keeps_distinct_provider_routes_and_nested_models() {
+        let chain = chain(&[
+            "google/gemini-z",
+            "google-gemini-cli/gemini-z",
+            "openrouter/anthropic/claude-x",
+            "anthropic/claude-x",
+            " OPENROUTER / anthropic/CLAUDE-X ",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "openai", "gpt-y");
+        for (index, spec) in chain.entries[..4].iter().enumerate() {
+            assert_eq!(walk.next_spec(), Some((index, spec.as_str())));
+        }
+        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.position(), 5);
     }
 
     #[test]
@@ -1369,10 +1579,8 @@ mod tests {
 
     #[test]
     fn a_loud_auth_error_finishes_rather_than_failing_over_into_another_one() {
-        // classify_failover refuses auth, and the chain walk would only find
-        // another provider to reject the same credentials. The decision still
-        // offers FailOver; the caller's walk is what declines. Pinned so a
-        // future change to that division is deliberate.
+        // Refusal belongs to the shared decision, not only the caller's walk:
+        // no surface may retry or open a failover lifecycle for bad credentials.
         let error = crate::error::Error::Api("401 unauthorized: invalid api key".to_string());
         assert_eq!(
             decide(
@@ -1381,13 +1589,266 @@ mod tests {
                 &policy(),
                 None
             ),
-            TurnDecision::FailOver
+            TurnDecision::Finish { success: false }
         );
+        assert_eq!(classify_failover(&error.to_string()), None);
+    }
+
+    #[test]
+    fn a_failed_abort_is_terminal_with_any_remaining_budget() {
+        let error = crate::error::Error::Aborted;
+        assert!(!call_error_is_retryable(&error));
+        for state in [progress(0, 0), progress(2, 0), progress(2, 1)] {
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &state, &policy(), None),
+                TurnDecision::Terminal(TerminalReason::Aborted)
+            );
+        }
+    }
+
+    #[test]
+    fn local_errors_cannot_reenter_the_provider_due_to_their_prose() {
+        use crate::error::Error;
+
+        let errors = [
+            Error::auth("429 quota exceeded"),
+            Error::config("503 service unavailable"),
+            Error::validation("connection reset by peer"),
+            Error::tool("bash", "500 internal server error"),
+            Error::extension("fetch failed"),
+            Error::session("500 session write failed"),
+            Error::SessionNotFound {
+                path: "/sessions/500.jsonl".to_string(),
+            },
+            Error::Json(Box::new(serde_json::from_str::<bool>("503").unwrap_err())),
+            Error::Sqlite(Box::new(fsqlite::FrankenError::Busy)),
+        ];
+        for error in &errors {
+            assert!(!call_error_is_retryable(error), "{error}");
+            for state in [progress(0, 0), progress(2, 0)] {
+                assert_eq!(
+                    decide(TurnOutcome::Failed(error), &state, &policy(), None),
+                    TurnDecision::Finish { success: false },
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_statuses_do_not_match_inside_request_ids_or_durations() {
+        for detail in [
+            "request=req401abcdef",
+            "request=4037",
+            "elapsed=1403ms",
+            "trace=x_401_y",
+        ] {
+            let text = format!("503 service unavailable: {detail}");
+            assert_eq!(classify_failover(&text), Some(FailoverClass::Overload));
+            let message = errored_message(Some(&text), 0);
+            let error = crate::error::Error::api(text);
+            assert!(error_result_is_retryable(&message, None));
+            assert!(call_error_is_retryable(&error));
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::Retry {
+                        attempt: 1,
+                        delay_ms: 500
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_response_status_outweighs_unlabelled_diagnostic_numbers() {
+        for text in [
+            "HTTP 503: service unavailable; request_id=401",
+            "API error (status code: 503): upstream overloaded; attempt=403",
+        ] {
+            assert_eq!(classify_failover(text), Some(FailoverClass::Overload));
+            let error = crate::error::Error::api(text);
+            let message = errored_message(Some(text), 0);
+            assert!(call_error_is_retryable(&error));
+            assert!(error_result_is_retryable(&message, None));
+        }
+        // Explicit credential wording still wins over an outer 503 wrapper.
         assert_eq!(
-            classify_failover("401 unauthorized: invalid api key"),
-            None,
-            "the walk is what refuses an auth failure"
+            classify_failover("HTTP 503: invalid_api_key; retry delay"),
+            None
         );
+    }
+
+    #[test]
+    fn authentication_status_codes_support_provider_wire_spellings() {
+        for status in [
+            "401",
+            "403",
+            "HTTP401",
+            "http: 403",
+            "status code = 401",
+            "{\"status\":403}",
+        ] {
+            let text = format!("{status}: 429 retry delay");
+            assert_eq!(classify_failover(&text), None, "{text}");
+            let error = crate::error::Error::api(text.clone());
+            let message = errored_message(Some(&text), 0);
+            assert!(!call_error_is_retryable(&error), "{text}");
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Finish { success: false },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_refusal_wins_over_transient_words_on_both_outcome_shapes() {
+        for text in [
+            "401 unauthorized: 429 rate limit exceeded",
+            "403 forbidden: service unavailable",
+            "authentication_error: 503 overloaded",
+            "invalid_api_key: connection reset by peer",
+            "expired token: 500 server error",
+            "invalid_token: upstream connect error",
+            "permission_denied: 429 quota exceeded",
+        ] {
+            // Without the refusal guard, each message would spend the budget.
+            assert!(crate::error::is_retryable_error(text, None, None), "{text}");
+            assert_eq!(classify_failover(text), None, "{text}");
+            let message = errored_message(Some(text), 0);
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            let error = crate::error::Error::api(text);
+            assert!(!call_error_is_retryable(&error), "{text}");
+            for outcome in [
+                TurnOutcome::Completed(&message),
+                TurnOutcome::Failed(&error),
+            ] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::Finish { success: false },
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repackaged_persistence_markers_remain_terminal_everywhere() {
+        use crate::error::Error;
+
+        for detail in [
+            "503 connection reset by peer",
+            "401 unauthorized: 429 quota",
+        ] {
+            let flattened = Error::session_persistence(detail).to_string();
+            let errors = [
+                Error::api(flattened.clone()),
+                Error::provider("test", flattened.clone()),
+                Error::session(format!("while committing turn: {flattened}")),
+                Error::Io(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    flattened.clone(),
+                ))),
+            ];
+            assert_eq!(classify_failover(&flattened), None);
+            for error in &errors {
+                // None retains the original typed Session(prefix...) shape.
+                assert!(!error.is_session_persistence());
+                assert!(!call_error_is_retryable(error), "{error}");
+                assert_eq!(classify_failover(&error.to_string()), None);
+                assert_eq!(
+                    decide(TurnOutcome::Failed(error), &progress(0, 0), &policy(), None),
+                    TurnDecision::Terminal(TerminalReason::SessionPersistence),
+                    "{error}"
+                );
+            }
+            let message = errored_message(Some(&flattened), 0);
+            assert!(!error_result_is_retryable(&message, None));
+            assert_eq!(
+                decide(
+                    TurnOutcome::Completed(&message),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Terminal(TerminalReason::SessionPersistence)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_context_overflow_is_not_failover_even_with_transient_statuses() {
+        for text in [
+            "503 service unavailable: prompt is too long",
+            "429 rate limit: context_length_exceeded",
+            "500 server error: too many tokens",
+        ] {
+            assert_eq!(classify_failover(text), None, "{text}");
+            assert!(!error_result_is_retryable(
+                &errored_message(Some(text), 0),
+                None
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_transport_drops_still_retry_and_respect_both_budgets() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            // Deliberately no transient substring: the typed kind must decide.
+            let error = crate::error::Error::Io(Box::new(std::io::Error::new(kind, "wire")));
+            assert!(call_error_is_retryable(&error), "{kind:?}");
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Retry {
+                    attempt: 1,
+                    delay_ms: 500
+                },
+                "{kind:?}"
+            );
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(2, 0),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::FailOver,
+                "{kind:?}"
+            );
+            assert_eq!(
+                decide(
+                    TurnOutcome::Failed(&error),
+                    &progress(2, 1),
+                    &policy(),
+                    None
+                ),
+                TurnDecision::Finish { success: false },
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
