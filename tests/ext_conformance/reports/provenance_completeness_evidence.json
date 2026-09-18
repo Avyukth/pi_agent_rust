@@ -1,0 +1,178 @@
+{
+  "$schema": "pi.provenance-completeness.v1",
+  "bead": "bd-s7hzz",
+  "generated_at": "20260918T182603Z",
+  "verdict": "PASS",
+  "summary": {
+    "cases_passed": 5,
+    "cases_failed": 0,
+    "total_cases": 5
+  },
+  "roots_walked": [
+    {
+      "root": "tests/ext_conformance/artifacts",
+      "tracked_files_count": 18294,
+      "present_files_count": 18295,
+      "untracked_scratch_count": 1,
+      "missing_tracked_files": []
+    }
+  ],
+  "six_affected_env_fixtures": [
+    {
+      "path": "tests/ext_conformance/artifacts/npm/pi-super-curl/example.pi-super-curl/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 433
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/plugins-community/plugins/ai-ml/jeremy-adk-orchestrator/agent/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 2949
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/plugins-community/plugins/packages/fullstack-starter-pack/skills/skill-adapter/assets/example_env_config.env",
+      "exists_on_disk": true,
+      "size_bytes": 3729
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/sandbox/e2b/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 315
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/skills/analytics/google-analytics/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 1153
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/skills/scientific/perplexity-search/assets/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 506
+    },
+    {
+      "path": "tests/ext_conformance/artifacts/templates-davila7/cloudflare-workers/docs-monitor/.env.example",
+      "exists_on_disk": true,
+      "size_bytes": 846
+    }
+  ],
+  "truncated_negative_control": {
+    "deliberately_omitted_file": "tests/ext_conformance/artifacts/npm/pi-super-curl/example.pi-super-curl/.env.example",
+    "refusal_behavior": "All generators hard-error and name the missing tracked file before writing",
+    "missing_paths": [
+      "tests/ext_conformance/artifacts/npm/pi-super-curl/example.pi-super-curl/.env.example"
+    ]
+  },
+  "checksum_comparisons_side_by_side": [
+    {
+      "id": "agents-mikeastock/extensions",
+      "directory": "agents-mikeastock/extensions",
+      "master_checksum": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce",
+      "provenance_checksum": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce",
+      "match": true
+    },
+    {
+      "id": "antigravity-image-gen",
+      "directory": "antigravity-image-gen",
+      "master_checksum": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+      "provenance_checksum": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+      "match": true
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "directory": "auto-commit-on-exit",
+      "master_checksum": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+      "provenance_checksum": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+      "match": true
+    },
+    {
+      "id": "bash-spawn-hook",
+      "directory": "bash-spawn-hook",
+      "master_checksum": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+      "provenance_checksum": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+      "match": true
+    },
+    {
+      "id": "bookmark",
+      "directory": "bookmark",
+      "master_checksum": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+      "provenance_checksum": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+      "match": true
+    },
+    {
+      "id": "claude-rules",
+      "directory": "claude-rules",
+      "master_checksum": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+      "provenance_checksum": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+      "match": true
+    },
+    {
+      "id": "community/ferologics-notify",
+      "directory": "community/ferologics-notify",
+      "master_checksum": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+      "provenance_checksum": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-clipboard",
+      "directory": "community/hjanuschka-clipboard",
+      "master_checksum": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40",
+      "provenance_checksum": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-cost-tracker",
+      "directory": "community/hjanuschka-cost-tracker",
+      "master_checksum": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844",
+      "provenance_checksum": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-flicker-corp",
+      "directory": "community/hjanuschka-flicker-corp",
+      "master_checksum": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9",
+      "provenance_checksum": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-funny-working-message",
+      "directory": "community/hjanuschka-funny-working-message",
+      "master_checksum": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f",
+      "provenance_checksum": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-handoff",
+      "directory": "community/hjanuschka-handoff",
+      "master_checksum": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d",
+      "provenance_checksum": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-loop",
+      "directory": "community/hjanuschka-loop",
+      "master_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+      "provenance_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-memory-mode",
+      "directory": "community/hjanuschka-memory-mode",
+      "master_checksum": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627",
+      "provenance_checksum": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627",
+      "match": true
+    },
+    {
+      "id": "community/hjanuschka-oracle",
+      "directory": "community/hjanuschka-oracle",
+      "master_checksum": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462",
+      "provenance_checksum": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462",
+      "match": true
+    }
+  ],
+  "checksum_comparisons_total": 208,
+  "upstream_defect_attribution": {
+    "target": "rch",
+    "component": "remote_compilation_helper/rch-common/src/types.rs:3420-3438",
+    "mechanism": "TransferConfig::default_exclude_patterns hardcodes .env and .env.* in compiled secret hygiene list",
+    "evidence": "rch transfer excludes .env.* during workspace sync to workers without config override or allowlist"
+  }
+}

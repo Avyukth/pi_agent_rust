@@ -1055,6 +1055,7 @@ pub mod snapshot {
     use std::fmt::Write as _;
     use std::io;
     use std::path::{Path, PathBuf};
+    use thiserror::Error;
 
     // === Layout constants ===
 
@@ -1372,6 +1373,196 @@ pub mod snapshot {
         EXCLUDED_DIRS.contains(&name)
             || FIXTURE_DIRS.contains(&name)
             || TIER_SCOPED_DIRS.contains(&name)
+    }
+
+    // === Tree Completeness Verification (bd-s7hzz) ===
+
+    /// Report of tracked vs present files under a verified corpus root.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct TreeCompletenessReport {
+        /// The root path checked (e.g. "tests/ext_conformance/artifacts").
+        pub root: String,
+        /// Total number of git-tracked files under this root.
+        pub tracked_files_count: usize,
+        /// Total regular files physically present on disk under this root.
+        pub present_files_count: usize,
+        /// List of tracked relative paths that are missing from disk.
+        pub missing_files: Vec<String>,
+    }
+
+    impl TreeCompletenessReport {
+        /// Returns true if all tracked files exist on disk.
+        #[must_use]
+        pub fn is_complete(&self) -> bool {
+            self.missing_files.is_empty()
+        }
+    }
+
+    /// Error returned when tree completeness verification fails.
+    #[derive(Debug, Error)]
+    pub enum CompletenessError {
+        /// Git command execution failed.
+        #[error("Git execution failed: {0}")]
+        GitCommand(String),
+
+        /// Tracked files are missing from disk.
+        #[error(
+            "Corpus tree is incomplete under root '{root}'. {missing_count} tracked file(s) are missing from disk:\n\
+             {missing_list}\n\n\
+             Likely cause: build context transfer or worker synchronization dropped tracked files matching secret/hygiene patterns (e.g. rch excluding .env.* or secrets patterns). Refusing to generate or verify evidence records against a truncated tree."
+        )]
+        IncompleteTree {
+            /// Root directory where missing files were detected.
+            root: String,
+            /// Number of missing tracked files.
+            missing_count: usize,
+            /// Formatted bulleted list of missing files.
+            missing_list: String,
+            /// List of missing relative file paths.
+            missing_files: Vec<String>,
+        },
+
+        /// Underlying I/O error.
+        #[error("IO error: {0}")]
+        Io(#[from] io::Error),
+    }
+
+    /// Compare a list of git-tracked relative paths against files present on disk under `base_dir`.
+    ///
+    /// Any tracked path that does not exist as a regular file on disk is recorded in `missing_files`.
+    /// Untracked files present on disk are included in `present_files_count` but do NOT cause
+    /// the comparison to report drift or failure, ensuring untracked build scratch does not trigger false alarms.
+    pub fn compare_tracked_vs_present<S: AsRef<str>>(
+        base_dir: &Path,
+        root_label: &str,
+        tracked_relative_paths: &[S],
+    ) -> io::Result<TreeCompletenessReport> {
+        let mut missing_files = Vec::new();
+
+        for tracked in tracked_relative_paths {
+            let rel_str = tracked.as_ref();
+            let target = base_dir.join(rel_str);
+            if !target.is_file() {
+                missing_files.push(rel_str.to_string());
+            }
+        }
+
+        let mut present = Vec::new();
+        if base_dir.is_dir() {
+            collect_files_recursive(base_dir, &mut present)?;
+        }
+
+        Ok(TreeCompletenessReport {
+            root: root_label.to_string(),
+            tracked_files_count: tracked_relative_paths.len(),
+            present_files_count: present.len(),
+            missing_files,
+        })
+    }
+
+    /// Query git for tracked files under `subpath` relative to `repo_root`, and verify that
+    /// all tracked files exist on disk.
+    ///
+    /// Supports `PI_TEST_ARTIFACTS_ROOT` environment override when verifying test copies:
+    /// if `subpath == "tests/ext_conformance/artifacts"` (or matches `ARTIFACT_ROOT`), and
+    /// `PI_TEST_ARTIFACTS_ROOT` is set, tracked files are checked within the overridden directory.
+    ///
+    /// If git is unavailable or fails, returns `CompletenessError::GitCommand`.
+    /// If any tracked files are missing, returns `CompletenessError::IncompleteTree`.
+    pub fn verify_tree_completeness(
+        repo_root: &Path,
+        subpath: &str,
+    ) -> Result<TreeCompletenessReport, CompletenessError> {
+        let tracked_lines: Vec<String> = if let Ok(override_list) =
+            std::env::var("PI_CONFORMANCE_TRACKED_FILES_OVERRIDE")
+        {
+            override_list
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            let output = std::process::Command::new("git")
+                .current_dir(repo_root)
+                .args(["ls-files", "--", subpath])
+                .output()
+                .map_err(|e| {
+                    CompletenessError::GitCommand(format!("failed to execute git ls-files: {e}"))
+                })?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(CompletenessError::GitCommand(format!(
+                    "git ls-files exited with {}: {stderr}",
+                    output.status
+                )));
+            }
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        };
+
+        // Determine target directory on disk. Check for PI_TEST_ARTIFACTS_ROOT override.
+        let (target_dir, rel_prefix) = if (subpath == ARTIFACT_ROOT
+            || subpath.ends_with(ARTIFACT_ROOT))
+            && std::env::var_os("PI_TEST_ARTIFACTS_ROOT").is_some()
+        {
+            let env_dir = PathBuf::from(std::env::var_os("PI_TEST_ARTIFACTS_ROOT").unwrap());
+            (env_dir, Some(subpath))
+        } else {
+            (repo_root.join(subpath), None)
+        };
+
+        let mut missing_files = Vec::new();
+        for rel_path in &tracked_lines {
+            let full_path = if let Some(prefix) = rel_prefix {
+                let stripped = rel_path
+                    .strip_prefix(prefix)
+                    .unwrap_or(rel_path)
+                    .trim_start_matches('/');
+                target_dir.join(stripped)
+            } else {
+                repo_root.join(rel_path)
+            };
+
+            if !full_path.is_file() {
+                missing_files.push(rel_path.clone());
+            }
+        }
+
+        let mut present = Vec::new();
+        if target_dir.is_dir() {
+            collect_files_recursive(&target_dir, &mut present).map_err(CompletenessError::Io)?;
+        }
+
+        let report = TreeCompletenessReport {
+            root: subpath.to_string(),
+            tracked_files_count: tracked_lines.len(),
+            present_files_count: present.len(),
+            missing_files: missing_files.clone(),
+        };
+
+        if !report.is_complete() {
+            let missing_list = missing_files
+                .iter()
+                .map(|f| format!("  - {f}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(CompletenessError::IncompleteTree {
+                root: subpath.to_string(),
+                missing_count: missing_files.len(),
+                missing_list,
+                missing_files,
+            });
+        }
+
+        Ok(report)
     }
 }
 
@@ -3411,6 +3602,132 @@ mod tests {
         let parsed: ArtifactSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, "test-ext");
         assert_eq!(parsed.source_tier, SourceTier::Community);
+    }
+
+    #[test]
+    fn completeness_fires_when_tracked_file_is_missing_naming_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("present.ts"), b"export default 1;").unwrap();
+
+        let tracked = ["present.ts", "npm/pi-super-curl/example/.env.example"];
+        let report =
+            snapshot::compare_tracked_vs_present(tmp.path(), "test_root", &tracked).unwrap();
+
+        assert!(!report.is_complete());
+        assert_eq!(report.tracked_files_count, 2);
+        assert_eq!(report.present_files_count, 1);
+        assert_eq!(
+            report.missing_files,
+            vec!["npm/pi-super-curl/example/.env.example"]
+        );
+
+        let err = snapshot::CompletenessError::IncompleteTree {
+            root: report.root.clone(),
+            missing_count: report.missing_files.len(),
+            missing_list: report
+                .missing_files
+                .iter()
+                .map(|f| format!("  - {f}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            missing_files: report.missing_files,
+        };
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("npm/pi-super-curl/example/.env.example"));
+        assert!(err_msg.contains("Corpus tree is incomplete"));
+        assert!(err_msg.contains("rch excluding .env.*"));
+    }
+
+    #[test]
+    fn completeness_passes_on_complete_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("file1.ts"), b"export const a = 1;").unwrap();
+        std::fs::create_dir_all(tmp.path().join("nested")).unwrap();
+        std::fs::write(tmp.path().join("nested/file2.ts"), b"export const b = 2;").unwrap();
+
+        let tracked = ["file1.ts", "nested/file2.ts"];
+        let report =
+            snapshot::compare_tracked_vs_present(tmp.path(), "test_root", &tracked).unwrap();
+
+        assert!(report.is_complete());
+        assert_eq!(report.tracked_files_count, 2);
+        assert_eq!(report.present_files_count, 2);
+        assert!(report.missing_files.is_empty());
+    }
+
+    #[test]
+    fn completeness_not_fooled_by_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("tracked.ts"), b"export const a = 1;").unwrap();
+        // Create untracked build scratch / ephemeral files
+        std::fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        std::fs::write(tmp.path().join("scratch/untracked.tmp"), b"junk").unwrap();
+        std::fs::write(tmp.path().join(".untracked_cache"), b"cache").unwrap();
+
+        let tracked = ["tracked.ts"];
+        let report =
+            snapshot::compare_tracked_vs_present(tmp.path(), "test_root", &tracked).unwrap();
+
+        // Untracked files are counted in present_files_count, but missing_files remains empty
+        // and is_complete() remains true (not treated as drift).
+        assert!(report.is_complete());
+        assert_eq!(report.tracked_files_count, 1);
+        assert_eq!(report.present_files_count, 3);
+        assert!(report.missing_files.is_empty());
+    }
+
+    #[test]
+    fn completeness_rejects_genuinely_tampered_artifact_negative_control() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("index.ts");
+        std::fs::write(&file_path, b"export default function run() { return 42; }").unwrap();
+
+        let original_digest = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+        assert!(
+            snapshot::verify_integrity(tmp.path(), &original_digest)
+                .unwrap()
+                .is_ok()
+        );
+
+        // Mutate one single byte in the file
+        std::fs::write(&file_path, b"export default function run() { return 43; }").unwrap();
+
+        let tampered_digest = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+        assert_ne!(
+            original_digest, tampered_digest,
+            "1-byte tamper must change directory digest"
+        );
+
+        let verification_result = snapshot::verify_integrity(tmp.path(), &original_digest).unwrap();
+        assert!(verification_result.is_err());
+        let err = verification_result.unwrap_err();
+        assert!(
+            err.contains("checksum mismatch"),
+            "expected checksum mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn completeness_all_six_env_fixtures_are_tracked_and_present() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let env_fixtures = [
+            "tests/ext_conformance/artifacts/npm/pi-super-curl/example.pi-super-curl/.env.example",
+            "tests/ext_conformance/artifacts/plugins-community/plugins/ai-ml/jeremy-adk-orchestrator/agent/.env.example",
+            "tests/ext_conformance/artifacts/plugins-community/plugins/packages/fullstack-starter-pack/skills/skill-adapter/assets/example_env_config.env",
+            "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/sandbox/e2b/.env.example",
+            "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/skills/analytics/google-analytics/.env.example",
+            "tests/ext_conformance/artifacts/templates-davila7/cli-tool/components/skills/scientific/perplexity-search/assets/.env.example",
+            "tests/ext_conformance/artifacts/templates-davila7/cloudflare-workers/docs-monitor/.env.example",
+        ];
+
+        for fixture in env_fixtures {
+            let path = repo_root.join(fixture);
+            assert!(
+                path.is_file(),
+                "tracked env fixture must exist on disk: {}",
+                path.display()
+            );
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════

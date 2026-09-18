@@ -37,6 +37,7 @@ tests/ext_conformance/reports/*
 !tests/ext_conformance/reports/conformance_baseline.json
 !tests/ext_conformance/reports/conformance_summary.json
 !tests/ext_conformance/reports/COMPATIBILITY_SUMMARY.md
+!tests/ext_conformance/reports/provenance_completeness_evidence.json
 !tests/ext_conformance/reports/gate/
 !tests/ext_conformance/reports/gate/must_pass_gate_verdict.json
 !tests/ext_conformance/reports/gate/must_pass_events.jsonl
