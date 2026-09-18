@@ -214,9 +214,10 @@ impl ScopedRuleMatcher {
     #[must_use]
     pub fn matching_rules(&self, path: &Path, workspace_root: &Path) -> Vec<usize> {
         let relative = path.strip_prefix(workspace_root).unwrap_or(path);
+        let normalized = relative.to_string_lossy().replace('\\', "/");
         self.entries
             .iter()
-            .filter(|(_, set)| set.is_match(relative))
+            .filter(|(_, set)| set.is_match(&normalized) || set.is_match(relative))
             .map(|(index, _)| *index)
             .collect()
     }
@@ -365,10 +366,8 @@ fn normalized_body(content: &str) -> String {
 }
 
 fn relative_display(path: &Path, workspace_root: &Path) -> String {
-    path.strip_prefix(workspace_root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let rel = path.strip_prefix(workspace_root).unwrap_or(path);
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 fn read_rule_file(path: &Path) -> Option<String> {

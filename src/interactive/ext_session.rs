@@ -1700,7 +1700,7 @@ mod tests {
             let dir = tempfile::Builder::new()
                 .prefix("pi-ext-session-")
                 .tempdir_in("/tmp")
-                .expect("tempdir");
+                .unwrap_or_else(|_| tempfile::tempdir().expect("tempdir"));
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 dir.path().to_path_buf(),
             ))));

@@ -752,6 +752,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn reclaims_stale_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -775,6 +776,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
+    #[cfg(unix)]
     #[test]
     fn heals_stale_leftover_regular_file() {
         // Simulates the poisoning artifact left by older flock-based pi_agent_rust.
@@ -931,6 +933,7 @@ mod tests {
     }
 
     // Minimal mtime setter (avoids adding a dev-dep); uses std `File::set_times`.
+    #[cfg(unix)]
     fn filetime_set(path: &Path, when: SystemTime) {
         let f = fs::File::open(path).expect("open for set_times");
         let times = fs::FileTimes::new().set_modified(when).set_accessed(when);

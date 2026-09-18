@@ -852,7 +852,7 @@ mod tests {
         let temp = tempfile::Builder::new()
             .prefix("pi-tree-nav-")
             .tempdir_in("/tmp")
-            .expect("tempdir in /tmp");
+            .unwrap_or_else(|_| TempDir::new().expect("tempdir"));
         let (mut raw_session, current_leaf_id, target_leaf_id) =
             branched_session(Some(temp.path().to_path_buf()));
         raw_session.path = Some(temp.path().join("session.jsonl"));

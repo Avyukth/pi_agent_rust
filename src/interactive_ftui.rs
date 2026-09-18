@@ -2695,9 +2695,9 @@ impl PiFtuiModel {
                         // hand the terminal dance to a task: it restores
                         // cooked mode, stops on SIGTSTP, re-acquires the
                         // terminal after SIGCONT, and reports back.
-                        self.suspending = true;
                         #[cfg(unix)]
                         {
+                            self.suspending = true;
                             #[cfg(test)]
                             let task = self.suspend_task_override.take().unwrap_or_else(|| {
                                 Box::new(suspend_task(self.alt_screen, self.mouse))
@@ -5308,6 +5308,7 @@ mod tests {
         assert!(sim.model().streaming.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ctrl_z_dispatches_suspend_task_and_fake_resumes() {
         let (_tx, model) = new_model();
