@@ -70,7 +70,9 @@ impl Connection {
         };
         let user_agent = lookup("PI_BROWSER_USER_AGENT")
             .map(|value| {
-                value.into_string().map_err(|_| error("PI_BROWSER_USER_AGENT must be UTF-8"))
+                value
+                    .into_string()
+                    .map_err(|_| error("PI_BROWSER_USER_AGENT must be UTF-8"))
             })
             .transpose()?;
         let options = BrowserLaunchOptions {
@@ -84,13 +86,19 @@ impl Connection {
 }
 
 fn validate_options(options: &BrowserLaunchOptions) -> Result<()> {
-    if options.executable_path.as_ref().is_some_and(|path| path.as_os_str().is_empty()) {
+    if options
+        .executable_path
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
+    {
         return Err(error("browser executable path cannot be empty"));
     }
     if options.user_agent.as_ref().is_some_and(|value| {
         value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control)
     }) {
-        return Err(error("browser user agent must be nonempty, control-free and at most 1024 bytes"));
+        return Err(error(
+            "browser user agent must be nonempty, control-free and at most 1024 bytes",
+        ));
     }
     Ok(())
 }
@@ -124,13 +132,16 @@ impl ManagedBrowser {
     }
 
     pub(super) fn running(&mut self) -> Result<bool> {
-        self.process.child.try_wait()
+        self.process
+            .child
+            .try_wait()
             .map(|status| status.is_none())
             .map_err(|failure| error(format!("could not inspect the owned browser: {failure}")))
     }
 
     pub(super) fn stop(&mut self) -> Result<()> {
-        self.process.stop()
+        self.process
+            .stop()
             .map_err(|failure| error(format!("could not stop the owned browser: {failure}")))
     }
 }
@@ -147,14 +158,19 @@ impl Process {
     fn spawn(owner: &AgentCx, cwd: &Path, options: &BrowserLaunchOptions) -> Result<Self> {
         let caps = owner.capabilities();
         if !caps.io || !caps.spawn || !caps.time || !caps.entropy {
-            return Err(error("managed browser launch requires I/O, spawn, timer and entropy capabilities"));
+            return Err(error(
+                "managed browser launch requires I/O, spawn, timer and entropy capabilities",
+            ));
         }
-        owner.checkpoint().map_err(|_| error("browser launch cancelled before dispatch"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| error("browser launch cancelled before dispatch"))?;
         validate_options(options)?;
         let executable = executable(options.executable_path.as_deref(), cwd)?;
         let profile = tempfile::Builder::new().prefix("pi-browser-").tempdir()?;
         let mut command = Command::new(&executable);
-        command.current_dir(cwd)
+        command
+            .current_dir(cwd)
             .args(arguments(profile.path(), options))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -164,13 +180,24 @@ impl Process {
             use std::os::unix::process::CommandExt as _;
             command.process_group(0);
         }
-        let child = owner.process().spawn_checked(&mut command).map_err(|failure| {
-            error(format!("could not launch the configured browser: {failure}"))
-        })?;
-        let process = Self { child, stopped: false, profile };
+        let child = owner
+            .process()
+            .spawn_checked(&mut command)
+            .map_err(|failure| {
+                error(format!(
+                    "could not launch the configured browser: {failure}"
+                ))
+            })?;
+        let process = Self {
+            child,
+            stopped: false,
+            profile,
+        };
         crate::tools::attach_child_job_discipline(&process.child);
         // The guard already exists if cancellation races with spawn.
-        owner.checkpoint().map_err(|_| error("browser launch cancelled after dispatch"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| error("browser launch cancelled after dispatch"))?;
         Ok(process)
     }
 
@@ -178,7 +205,9 @@ impl Process {
         let started = Instant::now();
         let port_file = self.profile.path().join("DevToolsActivePort");
         loop {
-            owner.checkpoint().map_err(|_| error("browser launch cancelled"))?;
+            owner
+                .checkpoint()
+                .map_err(|_| error("browser launch cancelled"))?;
             if let Some(status) = self.child.try_wait()? {
                 return Err(error(format!(
                     "Chromium exited before remote debugging became ready ({status}); check the executable, display and OS sandbox support. Pi does not disable the browser sandbox"
@@ -188,7 +217,9 @@ impl Process {
                 return Ok(address);
             }
             if started.elapsed() >= Duration::from_secs(30) {
-                return Err(error("Chromium did not publish DevToolsActivePort within 30 seconds"));
+                return Err(error(
+                    "Chromium did not publish DevToolsActivePort within 30 seconds",
+                ));
             }
             owner.time().sleep(Duration::from_millis(25)).await;
         }
@@ -254,20 +285,31 @@ fn executable(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
         } else if explicit.components().count() > 1 {
             Some(cwd.join(explicit))
         } else {
-            directories.iter()
+            directories
+                .iter()
                 .map(|directory| directory.join(explicit))
                 .find(|path| is_executable(path))
         };
-        return candidate.filter(|path| is_executable(path))
-            .ok_or_else(|| error("configured browser executable was not found or is not executable"));
+        return candidate.filter(|path| is_executable(path)).ok_or_else(|| {
+            error("configured browser executable was not found or is not executable")
+        });
     }
     let names: &[&str] = if cfg!(windows) {
         &["chrome.exe", "chromium.exe", "msedge.exe"]
     } else {
-        &["chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"]
+        &[
+            "chromium",
+            "chromium-browser",
+            "google-chrome",
+            "google-chrome-stable",
+            "chrome",
+        ]
     };
-    let candidates = names.iter()
-        .flat_map(|name| directories.iter().map(move |directory| directory.join(name)));
+    let candidates = names.iter().flat_map(|name| {
+        directories
+            .iter()
+            .map(move |directory| directory.join(name))
+    });
     if let Some(path) = candidates.into_iter().find(|path| is_executable(path)) {
         return Ok(path);
     }
@@ -283,7 +325,10 @@ fn executable(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
     #[cfg(windows)]
     for root in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
         if let Some(root) = std::env::var_os(root) {
-            for suffix in ["Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe"] {
+            for suffix in [
+                "Google/Chrome/Application/chrome.exe",
+                "Microsoft/Edge/Application/msedge.exe",
+            ] {
                 let path = PathBuf::from(&root).join(suffix);
                 if path.is_absolute() && is_executable(&path) {
                     return Ok(path);
@@ -291,19 +336,27 @@ fn executable(explicit: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
             }
         }
     }
-    Err(error("no installed Chromium/Chrome executable found; set PI_BROWSER_EXECUTABLE or attach explicitly with PI_BROWSER_CDP_URL"))
+    Err(error(
+        "no installed Chromium/Chrome executable found; set PI_BROWSER_EXECUTABLE or attach explicitly with PI_BROWSER_CDP_URL",
+    ))
 }
 
 fn is_executable(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else { return false; };
-    if !metadata.is_file() { return false; }
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
-    { true }
+    {
+        true
+    }
 }
 
 fn read_address(path: &Path) -> Result<Option<Address>> {
@@ -316,12 +369,17 @@ fn read_address(path: &Path) -> Result<Option<Address>> {
         return Err(error("invalid browser readiness file"));
     }
     #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
-    let file = std::fs::File::from(rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC
-            | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    ).map_err(std::io::Error::from)?);
+    let file = std::fs::File::from(
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?,
+    );
     #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
     let file = std::fs::File::open(path)?;
     if !file.metadata()?.is_file() {
@@ -336,17 +394,32 @@ fn parse_address(bytes: &[u8]) -> Result<Option<Address>> {
     if bytes.len() > 4096 {
         return Err(error("browser readiness file exceeds its byte limit"));
     }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| error("browser readiness file is not UTF-8"))?;
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| error("browser readiness file is not UTF-8"))?;
     let mut lines = text.lines();
-    let Some(port) = lines.next() else { return Ok(None); };
-    let Some(debugger_path) = lines.next() else { return Ok(None); };
-    if debugger_path.is_empty() { return Ok(None); }
-    let port = port.parse::<u16>().ok().filter(|port| *port != 0)
+    let Some(port) = lines.next() else {
+        return Ok(None);
+    };
+    let Some(debugger_path) = lines.next() else {
+        return Ok(None);
+    };
+    if debugger_path.is_empty() {
+        return Ok(None);
+    }
+    let port = port
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
         .ok_or_else(|| error("invalid browser debugging port"))?;
-    let id = debugger_path.strip_prefix("/devtools/browser/")
-        .filter(|id| !id.is_empty() && id.len() <= 128
-            && id.bytes().all(|ch| ch.is_ascii_alphanumeric() || ch == b'-'))
+    let id = debugger_path
+        .strip_prefix("/devtools/browser/")
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+        })
         .ok_or_else(|| error("invalid browser debugging path"))?;
     if lines.any(|line| !line.is_empty()) {
         return Err(error("unexpected data in browser readiness file"));
@@ -371,10 +444,19 @@ mod tests {
         let forbidden = |_: &str| -> Option<OsString> {
             panic!("explicit settings must not read the environment")
         };
-        assert!(matches!(Connection::with_environment(Some("http://127.0.0.1:9222"), None, forbidden).unwrap(), Connection::Attach(_)));
+        assert!(matches!(
+            Connection::with_environment(Some("http://127.0.0.1:9222"), None, forbidden).unwrap(),
+            Connection::Attach(_)
+        ));
         let launch = BrowserLaunchOptions::default();
-        assert!(matches!(Connection::with_environment(None, Some(&launch), forbidden).unwrap(), Connection::Managed(_)));
-        assert!(matches!(Connection::with_environment(None, None, |_| None).unwrap(), Connection::Managed(_)));
+        assert!(matches!(
+            Connection::with_environment(None, Some(&launch), forbidden).unwrap(),
+            Connection::Managed(_)
+        ));
+        assert!(matches!(
+            Connection::with_environment(None, None, |_| None).unwrap(),
+            Connection::Managed(_)
+        ));
     }
 
     #[test]
@@ -384,27 +466,42 @@ mod tests {
             ..Default::default()
         };
         let args = arguments(Path::new("/tmp/profile with spaces"), &options);
-        assert_eq!(args[0], OsStr::new("--user-data-dir=/tmp/profile with spaces"));
+        assert_eq!(
+            args[0],
+            OsStr::new("--user-data-dir=/tmp/profile with spaces")
+        );
         assert!(args.contains(&OsString::from("--remote-debugging-port=0")));
         assert!(args.contains(&OsString::from("--user-agent=Pi test --no-sandbox")));
-        for forbidden in ["--no-sandbox", "--disable-web-security", "--remote-allow-origins=*"] {
+        for forbidden in [
+            "--no-sandbox",
+            "--disable-web-security",
+            "--remote-allow-origins=*",
+        ] {
             assert!(!args.contains(&OsString::from(forbidden)));
         }
-        assert!(validate_options(&BrowserLaunchOptions {
-            user_agent: Some("bad\nagent".into()),
-            ..Default::default()
-        }).is_err());
+        assert!(
+            validate_options(&BrowserLaunchOptions {
+                user_agent: Some("bad\nagent".into()),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn readiness_is_bounded_and_cannot_choose_a_remote_host_or_path() {
-        let address = parse_address(b"43123\n/devtools/browser/abc-123").unwrap().unwrap();
+        let address = parse_address(b"43123\n/devtools/browser/abc-123")
+            .unwrap()
+            .unwrap();
         assert_eq!(address.http.as_str(), "http://127.0.0.1:43123/");
         assert_eq!(address.debugger_path, "/devtools/browser/abc-123");
         assert!(parse_address(b"43123\n").unwrap().is_none());
         for value in [
-            "0\n/devtools/browser/id", "65536\n/devtools/browser/id", "42\nws://remote/id",
-            "42\n/devtools/browser/../id", "42\n/devtools/browser/id?secret",
+            "0\n/devtools/browser/id",
+            "65536\n/devtools/browser/id",
+            "42\nws://remote/id",
+            "42\n/devtools/browser/../id",
+            "42\n/devtools/browser/id?secret",
             "42\n/devtools/browser/id\nextra",
         ] {
             assert!(parse_address(value.as_bytes()).is_err(), "{value}");
@@ -425,18 +522,34 @@ mod tests {
     #[test]
     fn real_process_readiness_and_owned_profile_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let executable = fixture(dir.path(), "for arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${arg#--user-data-dir=};; esac; done\nprintf '43123\\n/devtools/browser/fixture-id' > \"$profile/DevToolsActivePort\"\nexec sleep 30");
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let executable = fixture(
+            dir.path(),
+            "for arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${arg#--user-data-dir=};; esac; done\nprintf '43123\\n/devtools/browser/fixture-id' > \"$profile/DevToolsActivePort\"\nexec sleep 30",
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
-        let options = BrowserLaunchOptions { executable_path: Some(executable), ..Default::default() };
-        let mut browser = runtime.block_on(ManagedBrowser::launch(&owner, dir.path(), &options)).unwrap();
+        let options = BrowserLaunchOptions {
+            executable_path: Some(executable),
+            ..Default::default()
+        };
+        let mut browser = runtime
+            .block_on(ManagedBrowser::launch(&owner, dir.path(), &options))
+            .unwrap();
         let profile = browser.process.profile.path().to_path_buf();
         assert!(profile.is_dir());
         assert!(browser.running().unwrap());
-        assert_eq!(browser.address.debugger_path, "/devtools/browser/fixture-id");
+        assert_eq!(
+            browser.address.debugger_path,
+            "/devtools/browser/fixture-id"
+        );
         // Completing/cancelling the launching call must not lend that old Cx to
         // the next call. The session owns the established process until stop/drop.
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("launching call finished"));
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("launching call finished"),
+        );
         assert!(browser.running().unwrap());
         browser.stop().unwrap();
         assert!(!browser.running().unwrap());
@@ -449,11 +562,23 @@ mod tests {
     fn cancellation_and_early_exit_do_not_become_a_ready_browser() {
         let dir = tempfile::tempdir().unwrap();
         let executable = fixture(dir.path(), "exit 7");
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
-        let options = BrowserLaunchOptions { executable_path: Some(executable), ..Default::default() };
-        assert!(runtime.block_on(ManagedBrowser::launch(&owner, dir.path(), &options)).is_err());
-        owner.cancel_with(asupersync::types::CancelKind::User, Some("cancel before launch"));
+        let options = BrowserLaunchOptions {
+            executable_path: Some(executable),
+            ..Default::default()
+        };
+        assert!(
+            runtime
+                .block_on(ManagedBrowser::launch(&owner, dir.path(), &options))
+                .is_err()
+        );
+        owner.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("cancel before launch"),
+        );
         assert!(Process::spawn(&owner, dir.path(), &options).is_err());
     }
 }

@@ -23,13 +23,15 @@ impl AdapterSpec {
     pub fn resolve_command(&self) -> Option<String> {
         self.command_candidates.iter().find_map(|candidate| {
             let path = Path::new(candidate);
-            if path.is_absolute() || candidate.contains('/') || (cfg!(windows) && candidate.contains('\\')) {
+            if path.is_absolute()
+                || candidate.contains('/')
+                || (cfg!(windows) && candidate.contains('\\'))
+            {
                 return resolved_executable(path);
             }
             std::env::var_os("PATH").and_then(|paths| {
-                std::env::split_paths(&paths).find_map(|directory| {
-                    resolved_executable(&directory.join(candidate))
-                })
+                std::env::split_paths(&paths)
+                    .find_map(|directory| resolved_executable(&directory.join(candidate)))
             })
         })
     }
@@ -38,11 +40,15 @@ impl AdapterSpec {
 fn resolved_executable(path: &Path) -> Option<String> {
     let path = std::fs::canonicalize(path).ok()?;
     let metadata = path.metadata().ok()?;
-    if !metadata.is_file() { return None; }
+    if !metadata.is_file() {
+        return None;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o111 == 0 { return None; }
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
     }
     // Command uses the actual path, never a lossy replacement spelling.
     path.to_str().map(str::to_owned)
@@ -85,7 +91,8 @@ pub fn default_adapters() -> Vec<AdapterSpec> {
             command_candidates: vec!["dlv".to_string(), "dlv.exe".to_string()],
             adapter_args: vec!["dap".to_string()],
             languages: vec!["go"],
-            install_hint: "install with: go install github.com/go-delve/delve/cmd/dlv@latest".to_string(),
+            install_hint: "install with: go install github.com/go-delve/delve/cmd/dlv@latest"
+                .to_string(),
         },
     ]
 }
@@ -105,10 +112,16 @@ pub fn classify_target(target: &Path) -> TargetKind {
     if target.is_dir()
         && (target.join("go.mod").is_file()
             || std::fs::read_dir(target).is_ok_and(|entries| {
-                entries.take(4096).filter_map(std::result::Result::ok).any(|entry| {
-                    entry.path().extension().is_some_and(|extension| extension == "go")
-                        && entry.path().is_file()
-                })
+                entries
+                    .take(4096)
+                    .filter_map(std::result::Result::ok)
+                    .any(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension == "go")
+                            && entry.path().is_file()
+                    })
             }))
     {
         return TargetKind::Go;
@@ -130,10 +143,15 @@ pub fn select_adapter(
         default_adapters()
     } else {
         let mut merged = overrides.to_vec();
-        let overridden: Vec<_> = overrides.iter().map(|adapter| adapter.id.as_str()).collect();
-        merged.extend(default_adapters().into_iter().filter(|adapter| {
-            !overridden.contains(&adapter.id.as_str())
-        }));
+        let overridden: Vec<_> = overrides
+            .iter()
+            .map(|adapter| adapter.id.as_str())
+            .collect();
+        merged.extend(
+            default_adapters()
+                .into_iter()
+                .filter(|adapter| !overridden.contains(&adapter.id.as_str())),
+        );
         merged
     };
     if let Some(id) = requested {
@@ -144,16 +162,25 @@ pub fn select_adapter(
         TargetKind::Go => "go",
         TargetKind::NativeBinary => "binary",
     };
-    available.into_iter()
+    available
+        .into_iter()
         .filter(|adapter| adapter.languages.contains(&language))
         .find(|adapter| adapter.resolve_command().is_some())
 }
 
 #[must_use]
 pub fn go_launch_mode(program: &Path) -> &'static str {
-    if program.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with("_test.go")) {
+    if program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_test.go"))
+    {
         "test"
-    } else if program.is_dir() || program.extension().is_some_and(|extension| extension == "go") {
+    } else if program.is_dir()
+        || program
+            .extension()
+            .is_some_and(|extension| extension == "go")
+    {
         "debug"
     } else {
         "exec"
@@ -161,7 +188,12 @@ pub fn go_launch_mode(program: &Path) -> &'static str {
 }
 
 #[must_use]
-pub fn launch_arguments(adapter: &AdapterSpec, program: &Path, args: &[String], cwd: &Path) -> Value {
+pub fn launch_arguments(
+    adapter: &AdapterSpec,
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> Value {
     match adapter.id.as_str() {
         "dlv" => serde_json::json!({
             "program": program.display().to_string(),
@@ -197,7 +229,10 @@ mod tests {
     fn classify_by_extension() {
         assert_eq!(classify_target(Path::new("app.py")), TargetKind::Python);
         assert_eq!(classify_target(Path::new("main.go")), TargetKind::Go);
-        assert_eq!(classify_target(Path::new("/bin/true")), TargetKind::NativeBinary);
+        assert_eq!(
+            classify_target(Path::new("/bin/true")),
+            TargetKind::NativeBinary
+        );
     }
 
     #[test]
@@ -216,14 +251,28 @@ mod tests {
     #[test]
     fn launch_args_shape_per_adapter() {
         let adapters = default_adapters();
-        let lldb = adapters.iter().find(|adapter| adapter.id == "lldb-dap").unwrap();
-        let args = launch_arguments(lldb, Path::new("/tmp/app"), &["--flag".to_string()], Path::new("/tmp"));
+        let lldb = adapters
+            .iter()
+            .find(|adapter| adapter.id == "lldb-dap")
+            .unwrap();
+        let args = launch_arguments(
+            lldb,
+            Path::new("/tmp/app"),
+            &["--flag".to_string()],
+            Path::new("/tmp"),
+        );
         assert_eq!(args["program"], "/tmp/app");
         assert_eq!(args["args"][0], "--flag");
         let dlv = adapters.iter().find(|adapter| adapter.id == "dlv").unwrap();
-        assert_eq!(launch_arguments(dlv, Path::new("/tmp/app"), &[], Path::new("/tmp"))["mode"], "exec");
+        assert_eq!(
+            launch_arguments(dlv, Path::new("/tmp/app"), &[], Path::new("/tmp"))["mode"],
+            "exec"
+        );
         assert_eq!(attach_arguments(lldb, 4242)["pid"], 4242);
-        assert_eq!(attach_arguments(dlv, 4242), serde_json::json!({"processId":4242,"mode":"local"}));
+        assert_eq!(
+            attach_arguments(dlv, 4242),
+            serde_json::json!({"processId":4242,"mode":"local"})
+        );
     }
 
     #[test]
@@ -250,7 +299,10 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link = directory.path().join("link");
         symlink(&program, &link).unwrap();
-        assert_eq!(resolved_executable(&link).unwrap(), std::fs::canonicalize(&program).unwrap().to_str().unwrap());
+        assert_eq!(
+            resolved_executable(&link).unwrap(),
+            std::fs::canonicalize(&program).unwrap().to_str().unwrap()
+        );
         assert!(resolved_executable(directory.path()).is_none());
     }
 }

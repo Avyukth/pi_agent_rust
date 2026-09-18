@@ -1,7 +1,9 @@
 //! Native, bounded CDP transport. A connection belongs to one tool operation;
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
-use super::{BrowserLaunchOptions, BrowserTabInfo, exports, interaction, launch, output, policy, required};
+use super::{
+    BrowserLaunchOptions, BrowserTabInfo, exports, interaction, launch, output, policy, required,
+};
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
 use crate::tools::ToolOutput;
@@ -33,7 +35,9 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
     match action {
         "start" | "status" | "stop" => {
             if args.as_object().is_some_and(|object| {
-                object.keys().any(|key| !matches!(key.as_str(), "action" | "timeout_ms"))
+                object
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "action" | "timeout_ms"))
             }) {
                 return Err(Error::tool(
                     "browser",
@@ -139,7 +143,10 @@ pub(super) async fn execute(
                 launch::Connection::Managed(_) => "managed",
             };
             return Ok(output(
-                format!("Browser {mode}: {}", if running { "running" } else { "stopped" }),
+                format!(
+                    "Browser {mode}: {}",
+                    if running { "running" } else { "stopped" }
+                ),
                 json!({
                     "backend": "cdp", "mode": mode, "running": running,
                     "owned": state.browser.is_some(),
@@ -447,7 +454,10 @@ impl Session {
     ) -> Result<Option<Cdp>> {
         if action == "stop" {
             if matches!(connection, launch::Connection::Attach(_)) {
-                return Err(Error::tool("browser", "cannot stop an attached browser; Pi does not own its process"));
+                return Err(Error::tool(
+                    "browser",
+                    "cannot stop an attached browser; Pi does not own its process",
+                ));
             }
             if let Some(browser) = self.browser.as_mut() {
                 browser.stop()?;
@@ -461,7 +471,10 @@ impl Session {
         let (endpoint, expected_path) = match connection {
             launch::Connection::Attach(endpoint) => {
                 if self.browser.is_some() {
-                    return Err(Error::tool("browser", "stop the owned browser before changing to an attached endpoint"));
+                    return Err(Error::tool(
+                        "browser",
+                        "stop the owned browser before changing to an attached endpoint",
+                    ));
                 }
                 (endpoint.clone(), None)
             }
@@ -475,7 +488,10 @@ impl Session {
                     if action == "status" {
                         return Ok(None);
                     }
-                    return Err(Error::tool("browser", "the owned browser exited; its tabs are gone. Retry start or open to create a fresh isolated browser"));
+                    return Err(Error::tool(
+                        "browser",
+                        "the owned browser exited; its tabs are gone. Retry start or open to create a fresh isolated browser",
+                    ));
                 }
                 if self.browser.is_none() {
                     if action == "status" {
@@ -483,9 +499,15 @@ impl Session {
                     }
                     startup = Some(launch::ManagedBrowser::launch(owner, cwd, options).await?);
                 }
-                let browser = self.browser.as_ref().or(startup.as_ref())
+                let browser = self
+                    .browser
+                    .as_ref()
+                    .or(startup.as_ref())
                     .ok_or_else(|| Error::tool("browser", "managed browser was not created"))?;
-                (browser.address.http.clone(), Some(browser.address.debugger_path.clone()))
+                (
+                    browser.address.http.clone(),
+                    Some(browser.address.debugger_path.clone()),
+                )
             }
         };
         // Adopt startup only after discovery AND WebSocket identity/handshake
@@ -664,7 +686,16 @@ impl Session {
                 interaction::execute(owner, cdp, &tab, self.references.get(&target), args).await
             }
             "upload" => {
-                self.uploads.execute(owner, cdp, cwd, self.references.get(&target), args, allowlist).await
+                self.uploads
+                    .execute(
+                        owner,
+                        cdp,
+                        cwd,
+                        self.references.get(&target),
+                        args,
+                        allowlist,
+                    )
+                    .await
             }
             "screenshot" | "print_pdf" => exports::execute(owner, cdp, cwd, &tab, args).await,
             "evaluate" => {
@@ -688,17 +719,39 @@ mod tests {
 
     #[test]
     fn javascript_exceptions_and_unserializable_values_are_not_fake_successes() {
-        assert!(evaluation_value(&json!({"exceptionDetails": {"text": "Uncaught"}, "result": {"type": "object"}})).is_err());
+        assert!(
+            evaluation_value(
+                &json!({"exceptionDetails": {"text": "Uncaught"}, "result": {"type": "object"}})
+            )
+            .is_err()
+        );
         assert!(evaluation_value(&json!({})).is_err());
-        assert_eq!(evaluation_value(&json!({"result": {"type": "number", "value": 42}})).unwrap(), json!(42));
-        assert_eq!(evaluation_value(&json!({"result": {"type": "number", "unserializableValue": "NaN"}})).unwrap()["unserializableValue"], "NaN");
-        assert_eq!(evaluation_value(&json!({"result": {"type": "undefined"}})).unwrap()["type"], "undefined");
+        assert_eq!(
+            evaluation_value(&json!({"result": {"type": "number", "value": 42}})).unwrap(),
+            json!(42)
+        );
+        assert_eq!(
+            evaluation_value(&json!({"result": {"type": "number", "unserializableValue": "NaN"}}))
+                .unwrap()["unserializableValue"],
+            "NaN"
+        );
+        assert_eq!(
+            evaluation_value(&json!({"result": {"type": "undefined"}})).unwrap()["type"],
+            "undefined"
+        );
     }
 
     #[test]
     fn lifecycle_never_accepts_model_selected_process_configuration() {
         assert!(validate(&json!({"action":"start"}), None).is_ok());
-        for field in ["executable_path", "user_data_dir", "args", "headless", "endpoint", "tab"] {
+        for field in [
+            "executable_path",
+            "user_data_dir",
+            "args",
+            "headless",
+            "endpoint",
+            "tab",
+        ] {
             let mut input = json!({"action":"start"});
             input[field] = json!("untrusted");
             assert!(validate(&input, None).is_err(), "{field}");
@@ -707,17 +760,34 @@ mod tests {
 
     #[test]
     fn idle_status_and_stop_do_not_launch_and_stop_does_not_own_attached_browsers() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
         let owner = AgentCx::from_cx(runtime.request_cx_with_budget(asupersync::Budget::new()));
         let managed = launch::Connection::Managed(BrowserLaunchOptions {
             executable_path: Some(std::path::PathBuf::from("/nonexistent/do-not-launch")),
             ..Default::default()
         });
         let mut session = Session::default();
-        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &managed, "status")).unwrap().is_none());
-        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &managed, "stop")).unwrap().is_none());
-        let attached = launch::Connection::Attach(policy::endpoint("http://127.0.0.1:9", false).unwrap());
-        assert!(runtime.block_on(session.connect(&owner, Path::new("."), &attached, "stop")).is_err());
+        assert!(
+            runtime
+                .block_on(session.connect(&owner, Path::new("."), &managed, "status"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .block_on(session.connect(&owner, Path::new("."), &managed, "stop"))
+                .unwrap()
+                .is_none()
+        );
+        let attached =
+            launch::Connection::Attach(policy::endpoint("http://127.0.0.1:9", false).unwrap());
+        assert!(
+            runtime
+                .block_on(session.connect(&owner, Path::new("."), &attached, "stop"))
+                .is_err()
+        );
         session.next_ref = 42;
         session.clear_pages();
         assert_eq!(session.next_ref, 42);

@@ -371,7 +371,7 @@ impl LspClient {
     }
 
     fn open_document(&self, uri: &str, content: &str, disk_hash: u64, language_id: &str) -> Result<String> {
-        let version = self.next_document_version.fetch_update(Ordering::SeqCst, Ordering::SeqCst,
+        let version = self.next_document_version.try_update(Ordering::SeqCst, Ordering::SeqCst,
             |value| (value < 2_147_483_647).then_some(value + 1))
             .map_err(|_| Error::tool("lsp", "[LSP_VERSION_EXHAUSTED] reload the language server before reopening more documents"))?;
         self.rpc.notify("textDocument/didOpen", serde_json::json!({"textDocument":{
