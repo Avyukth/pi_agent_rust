@@ -115,7 +115,9 @@ closes the real target. Active means the tool's selected tab, not desktop focus.
 
 Navigation waits for the matching document's DOMContentLoaded/load lifecycle
 event. Downloads and navigation errors are not reported as successfully loaded
-pages. Arbitrary link-download capture is not implemented by this adapter.
+pages. Browser downloads are denied by default for each established tool
+session so an ordinary click/evaluate/keypress cannot silently write an unmanaged
+file. Use the explicit `download` action below to capture one transfer.
 
 `snapshot` produces up to 200 accessibility-backed element references.
 `ax_tree` also returns up to 1,000 actual accessibility nodes with truncation
@@ -174,6 +176,36 @@ that may still be in use. Finish pending transfers before stopping the managed
 browser or dropping the tool to release copies. Attached-browser users must
 finish such transfers before ending the Pi tool session as well.
 
+
+## Capture a browser download
+
+```json
+{"action":"download","selector":"a.export","output_path":"downloads/report.csv"}
+{"action":"download","selector":"@e8"}
+```
+
+`download` temporarily enables Chromium's `allowAndName` behavior in a private
+directory, performs one native click through the same selector/reference path as
+`click`, correlates the resulting `Browser.downloadWillBegin` and
+`Browser.downloadProgress` events, and waits for completion. Multiple transfers
+from one click fail rather than choosing one silently. The final download URL is
+checked against `domainAllowlist` before publication.
+
+Captured transfers are limited to 100 MiB using both Chromium progress and the
+actual completed file size. A canceled, missing, symbolic, oversized, or
+byte-count-mismatched file is rejected. With no `output_path`, the suggested
+filename is sanitized and published under `downloads/`; supplied paths must be
+workspace-relative and use the same descriptor-pinned create-only publisher as
+screenshots/media artifacts. Existing files and symlinked ancestors are never
+overwritten or followed.
+
+After a normal download attempt Pi restores browser download behavior to
+`deny` before publishing the artifact. If cancellation interrupts that cleanup,
+the session records the policy as uninitialized and the next operation reapplies
+`deny` before proceeding. This prevents cancellation from leaving a persistent
+unmanaged download directory. Download capture does not inspect file contents or
+assert they are safe to execute/open.
+
 ## Screenshots and PDF exports
 
 ```json
@@ -190,9 +222,11 @@ An unsupported browser or invalid page range returns the actual command error.
 
 Both formats are capped at 20 MiB decoded bytes. Basic container/completion
 checks reject missing or malformed output; these are not full PDF/PNG decoders
-or a general artifact sanitizer. Files are staged beside their destination,
-synced and published without clobbering an existing file or symlink, including
-concurrent creations. A failed request does not publish a partial artifact.
+or a general artifact sanitizer. Files are staged inside a descriptor-pinned workspace directory, synced and
+published create-only without following ancestor symlinks or clobbering an
+existing destination, including concurrent creations. Absolute paths, parent
+traversal and platform separator escapes are rejected. A failed request does not
+publish a partial artifact.
 
 `output_path` must end in `.png` or `.pdf` as appropriate. Omitting it creates a
 unique file under `screenshots/` or `exports/`. Small PNGs also return an image

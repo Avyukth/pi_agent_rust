@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod cdp;
+mod download;
 mod exports;
 mod interaction;
 mod launch;
@@ -169,7 +170,7 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
                              "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
-                             "scroll", "wait_for", "upload", "screenshot", "print_pdf"],
+                             "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf"],
                     "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
@@ -180,7 +181,7 @@ impl Tool for BrowserTool {
                 "key": {"type": "string", "description": "Key for press, e.g. Enter, Tab, ArrowDown"},
                 "files": {"type": "array", "maxItems": 10, "items": {"type": "string"},
                           "description": "upload: workspace-relative regular files, no symlinks or parent traversal; [] clears selection. At most 20 MiB per call."},
-                "output_path": {"type": "string", "description": "New .png or .pdf destination; existing files are never overwritten"},
+                "output_path": {"type": "string", "description": "New workspace-relative artifact destination; screenshot requires .png, print_pdf requires .pdf, download keeps any extension; existing files are never overwritten"},
                 "full_page": {"type": "boolean", "description": "screenshot: capture beyond the viewport (default false)"},
                 "landscape": {"type": "boolean", "description": "print_pdf: landscape paper orientation (default false)"},
                 "print_background": {"type": "boolean", "description": "print_pdf: include background graphics (default true)"},
@@ -208,7 +209,7 @@ impl Tool for BrowserTool {
     ) -> Result<ToolOutput> {
         let action = required(&args, "action")?;
         if self.is_mock() {
-            if matches!(action, "start" | "status" | "stop" | "upload" | "print_pdf")
+            if matches!(action, "start" | "status" | "stop" | "upload" | "download" | "print_pdf")
                 || args.get("full_page").is_some()
             {
                 return Err(Error::tool(

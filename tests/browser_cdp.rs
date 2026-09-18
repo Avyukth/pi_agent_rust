@@ -190,6 +190,10 @@ fn peer(script: Script) -> (String, thread::JoinHandle<()>) {
 fn attached_script() -> Script {
     vec![
         (
+            "Browser.setDownloadBehavior",
+            json!({"result": {}, "_params":{"behavior":"deny","eventsEnabled":true}}),
+        ),
+        (
             "Target.getTargets",
             json!({"result": {"targetInfos": [
                 {"targetId": "page-1", "type": "page", "url": "https://example.com/", "title": "Real peer"}

@@ -2,7 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, exports, interaction, launch, output, policy, required,
+    BrowserLaunchOptions, BrowserTabInfo, download, exports, interaction, launch, output, policy,
+    required,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -17,6 +18,17 @@ use std::time::Duration;
 
 const MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
+const MAX_DOWNLOAD_RECORDS: usize = 128;
+
+#[derive(Debug, Clone)]
+pub(super) struct DownloadRecord {
+    pub(super) guid: String,
+    pub(super) url: String,
+    pub(super) suggested_filename: String,
+    pub(super) state: String,
+    pub(super) received_bytes: f64,
+    pub(super) total_bytes: f64,
+}
 
 #[derive(Default)]
 pub(super) struct Session {
@@ -28,6 +40,7 @@ pub(super) struct Session {
     // Field order matters: stop the owned browser before dropping upload copies.
     browser: Option<launch::ManagedBrowser>,
     uploads: interaction::upload::Store,
+    downloads_denied: bool,
 }
 
 fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
@@ -48,6 +61,7 @@ fn validate(args: &Value, allowlist: Option<&[String]>) -> Result<u64> {
         "upload" => {
             interaction::upload::validate(args)?;
         }
+        "download" => download::validate(args)?,
         "screenshot" | "print_pdf" => exports::validate(args)?,
         "open" | "goto" => policy::check_navigation(required(args, "url")?, allowlist)?,
         "evaluate" => {
@@ -191,6 +205,7 @@ pub(super) struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     loaded: BTreeSet<(String, String)>,
+    downloads: BTreeMap<String, DownloadRecord>,
     timeout_ms: u64,
 }
 
@@ -241,6 +256,7 @@ impl Cdp {
             next_id: 0,
             session_id: None,
             loaded: BTreeSet::new(),
+            downloads: BTreeMap::new(),
             timeout_ms: 30_000,
         })
     }
@@ -274,6 +290,7 @@ impl Cdp {
                         }
                         self.loaded.insert((frame.into(), loader.into()));
                     }
+                    self.record_download_event(&value)?;
                     if value["method"] == "Inspector.targetCrashed" {
                         return Err(Error::tool("browser", "browser target crashed"));
                     }
@@ -348,6 +365,86 @@ impl Cdp {
         params: Value,
     ) -> Result<Value> {
         self.call(owner, method, params, true).await
+    }
+
+    pub(super) async fn browser_command(
+        &mut self,
+        owner: &AgentCx,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.call(owner, method, params, false).await
+    }
+
+    pub(super) async fn pump_event(&mut self, owner: &AgentCx) -> Result<()> {
+        self.receive(owner).await.map(|_| ())
+    }
+
+    pub(super) fn download_ids(&self) -> BTreeSet<String> {
+        self.downloads.keys().cloned().collect()
+    }
+
+    pub(super) fn downloads_since(&self, before: &BTreeSet<String>) -> Vec<DownloadRecord> {
+        self.downloads
+            .iter()
+            .filter(|(guid, _)| !before.contains(*guid))
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+
+    pub(super) fn download_record(&self, guid: &str) -> Option<DownloadRecord> {
+        self.downloads.get(guid).cloned()
+    }
+
+    fn record_download_event(&mut self, value: &Value) -> Result<()> {
+        let method = value["method"].as_str().unwrap_or_default();
+        if method == "Browser.downloadWillBegin" {
+            let params = &value["params"];
+            let guid = required(params, "guid")?;
+            let url = required(params, "url")?;
+            let suggested = required(params, "suggestedFilename")?;
+            if guid.len() > 128
+                || guid.chars().any(char::is_control)
+                || url.len() > 64 * 1024
+                || suggested.len() > 4096
+                || suggested.chars().any(char::is_control)
+            {
+                return Err(Error::tool("browser", "invalid bounded download metadata"));
+            }
+            if !self.downloads.contains_key(guid) && self.downloads.len() >= MAX_DOWNLOAD_RECORDS {
+                return Err(Error::tool("browser", "too many browser downloads are being tracked"));
+            }
+            self.downloads.insert(
+                guid.to_owned(),
+                DownloadRecord {
+                    guid: guid.to_owned(),
+                    url: url.to_owned(),
+                    suggested_filename: suggested.to_owned(),
+                    state: "inProgress".into(),
+                    received_bytes: 0.0,
+                    total_bytes: 0.0,
+                },
+            );
+        } else if method == "Browser.downloadProgress" {
+            let params = &value["params"];
+            let guid = required(params, "guid")?;
+            if let Some(record) = self.downloads.get_mut(guid) {
+                let state = required(params, "state")?;
+                if !matches!(state, "inProgress" | "completed" | "canceled") {
+                    return Err(Error::tool("browser", "invalid browser download state"));
+                }
+                let number = |name: &str| {
+                    params[name]
+                        .as_f64()
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
+                };
+                record.state = state.to_owned();
+                record.received_bytes = number("receivedBytes")?;
+                record.total_bytes = number("totalBytes")?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
@@ -441,6 +538,7 @@ impl Session {
         self.references.clear();
         self.active = None;
         self.endpoint = None;
+        self.downloads_denied = false;
         // Never reuse element IDs across process lifetimes. Upload copies are
         // retained separately: pending File objects can outlive a tab/navigation.
     }
@@ -512,7 +610,16 @@ impl Session {
         };
         // Adopt startup only after discovery AND WebSocket identity/handshake
         // succeed. Failure or cancellation before then drops the local process.
-        let cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
+        let mut cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
+        if !self.downloads_denied {
+            cdp.browser_command(
+                owner,
+                "Browser.setDownloadBehavior",
+                json!({"behavior":"deny","eventsEnabled":true}),
+            )
+            .await?;
+            self.downloads_denied = true;
+        }
         if self.endpoint.as_deref() != Some(endpoint.as_str()) {
             self.clear_pages();
         }
@@ -697,6 +804,26 @@ impl Session {
                     )
                     .await
             }
+            "download" => {
+                // Mark false before allowing a transfer. If cancellation drops
+                // the future before deny is restored, the next call re-applies
+                // deny in connect() before any new browser action.
+                self.downloads_denied = false;
+                let result = download::execute(
+                    owner,
+                    cdp,
+                    cwd,
+                    &tab,
+                    self.references.get(&target),
+                    args,
+                    allowlist,
+                )
+                .await;
+                if result.is_ok() {
+                    self.downloads_denied = true;
+                }
+                result
+            }
             "screenshot" | "print_pdf" => exports::execute(owner, cdp, cwd, &tab, args).await,
             "evaluate" => {
                 let value = cdp.evaluate(owner, required(args, "script")?).await?;
@@ -792,4 +919,36 @@ mod tests {
         session.clear_pages();
         assert_eq!(session.next_ref, 42);
     }
+    #[test]
+    fn download_events_are_correlated_and_bounded() {
+        let mut downloads = BTreeMap::new();
+        downloads.insert(
+            "old".to_string(),
+            DownloadRecord {
+                guid:"old".into(), url:"https://example.com/old".into(),
+                suggested_filename:"old.bin".into(), state:"completed".into(),
+                received_bytes:1.0, total_bytes:1.0,
+            },
+        );
+        let before: BTreeSet<String> = downloads.keys().cloned().collect();
+        let mut cdp = Cdp {
+            socket: panic_socket_for_type_only(),
+            next_id:0,
+            session_id:None,
+            loaded:BTreeSet::new(),
+            downloads,
+            timeout_ms:1000,
+        };
+        cdp.record_download_event(&json!({"method":"Browser.downloadWillBegin","params":{
+            "guid":"new","url":"https://example.com/file","suggestedFilename":"file.bin"
+        }})).unwrap();
+        cdp.record_download_event(&json!({"method":"Browser.downloadProgress","params":{
+            "guid":"new","state":"completed","receivedBytes":7,"totalBytes":7
+        }})).unwrap();
+        let fresh = cdp.downloads_since(&before);
+        assert_eq!(fresh.len(),1);
+        assert_eq!(fresh[0].state,"completed");
+        assert_eq!(fresh[0].received_bytes,7.0);
+    }
+
 }
