@@ -1440,7 +1440,10 @@ impl RpcTransportClient {
                     return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
                 }
                 saw_ack = true;
-                for event in pre_ack.drain(..) {
+                // `mem::take` rather than `drain(..)`: same result (the buffer
+                // is left empty and refilled by later iterations) and it is
+                // what `clippy::iter_with_drain` asks for.
+                for event in std::mem::take(&mut pre_ack) {
                     let reached_end =
                         event.get("type").and_then(Value::as_str) == Some("agent_end");
                     on_event(event.clone());

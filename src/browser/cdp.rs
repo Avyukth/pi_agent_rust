@@ -98,7 +98,7 @@ fn record_download_event_into(
                     .filter(|value| value.is_finite() && *value >= 0.0)
                     .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
             };
-            record.state = state.to_owned();
+            state.clone_into(&mut record.state);
             record.received_bytes = number("receivedBytes")?;
             record.total_bytes = number("totalBytes")?;
         }
