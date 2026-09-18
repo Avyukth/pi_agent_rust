@@ -224,8 +224,8 @@ pub(super) async fn execute(
             .checkpoint()
             .map_err(|_| error("download cancelled before reading completed bytes"))?;
         let bytes = read_completed(&directory.path().join(&start.guid), &final_record)?;
-        let target = match explicit {
-            Some(target) => target,
+        let target = match explicit.as_ref() {
+            Some(target) => target.clone(),
             None => {
                 let filename = safe_filename(&start.suggested_filename);
                 crate::artifact_output::resolve_new(

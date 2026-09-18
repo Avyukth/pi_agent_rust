@@ -611,6 +611,9 @@ impl Session {
         // Adopt startup only after discovery AND WebSocket identity/handshake
         // succeed. Failure or cancellation before then drops the local process.
         let mut cdp = Cdp::connect(owner, &endpoint, expected_path.as_deref()).await?;
+        if self.endpoint.as_deref() != Some(endpoint.as_str()) {
+            self.clear_pages();
+        }
         if !self.downloads_denied {
             cdp.browser_command(
                 owner,
@@ -619,9 +622,6 @@ impl Session {
             )
             .await?;
             self.downloads_denied = true;
-        }
-        if self.endpoint.as_deref() != Some(endpoint.as_str()) {
-            self.clear_pages();
         }
         self.endpoint = Some(endpoint.to_string());
         if let Some(browser) = startup {
