@@ -186,6 +186,14 @@
           "justification": "Streaming provider behavior and event-shape stability across runtimes."
         },
         {
+          "path": "tests/provider_bedrock_streaming.rs",
+          "justification": "Bedrock streaming against a loopback fixture: signed reasoning and tool calls surviving stream/session/replay, credential redaction in errors, and truncated or corrupt streams never emitting done."
+        },
+        {
+          "path": "tests/agent_cx_io.rs",
+          "justification": "Scoped-I/O regressions driven through real loopback sockets and providers, with no remote credentials or external network."
+        },
+        {
           "path": "tests/resource_loader.rs",
           "justification": "Resource loading and path-resolution correctness for runtime dependency inputs."
         },
@@ -2329,6 +2337,10 @@
         {
           "path": "tests/browser.rs",
           "justification": "Browser tool schema/metadata, navigation, and tab lifecycle behaviour."
+        },
+        {
+          "path": "tests/browser_cdp.rs",
+          "justification": "Chromium session ownership over CDP: launch and teardown, DOM interaction, staged file uploads, and native page exports (bd-cv653.2.4)."
         },
         {
           "path": "tests/computer.rs",

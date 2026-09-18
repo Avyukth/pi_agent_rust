@@ -196,6 +196,7 @@ files = [
 [suite.vcr]
 files = [
     "agent_context_filtering",
+    "agent_cx_io",
     "agent_loop_reliability",
     "agent_loop_vcr",
     "auth_oauth_refresh_vcr",
@@ -288,6 +289,7 @@ files = [
     "perf_baseline_variance",
     "perf_bench_harness",
     "pi_connector_shims",
+    "provider_bedrock_streaming",
     "provider_contract",
     "provider_error_paths",
     "provider_factory",
