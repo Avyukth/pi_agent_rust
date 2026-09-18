@@ -9,18 +9,68 @@
     "failed": 0,
     "pass_rate_pct": 100.0,
     "by_tier": {
-      "1": { "pass": 38, "fail": 0, "total": 38, "rate_pct": 100.0 },
-      "2": { "pass": 87, "fail": 0, "total": 87, "rate_pct": 100.0 },
-      "3": { "pass": 90, "fail": 0, "total": 90, "rate_pct": 100.0 },
-      "4": { "pass": 3, "fail": 0, "total": 3, "rate_pct": 100.0 },
-      "5": { "pass": 5, "fail": 0, "total": 5, "rate_pct": 100.0 }
+      "1": {
+        "pass": 38,
+        "fail": 0,
+        "total": 38,
+        "rate_pct": 100.0
+      },
+      "2": {
+        "pass": 87,
+        "fail": 0,
+        "total": 87,
+        "rate_pct": 100.0
+      },
+      "3": {
+        "pass": 90,
+        "fail": 0,
+        "total": 90,
+        "rate_pct": 100.0
+      },
+      "4": {
+        "pass": 3,
+        "fail": 0,
+        "total": 3,
+        "rate_pct": 100.0
+      },
+      "5": {
+        "pass": 5,
+        "fail": 0,
+        "total": 5,
+        "rate_pct": 100.0
+      }
     },
     "by_source": {
-      "official-pi-mono": { "pass": 66, "fail": 0, "total": 66, "rate_pct": 100.0 },
-      "community": { "pass": 58, "fail": 0, "total": 58, "rate_pct": 100.0 },
-      "npm-registry": { "pass": 75, "fail": 0, "total": 75, "rate_pct": 100.0 },
-      "third-party-github": { "pass": 23, "fail": 0, "total": 23, "rate_pct": 100.0 },
-      "agents": { "pass": 1, "fail": 0, "total": 1, "rate_pct": 100.0 }
+      "official-pi-mono": {
+        "pass": 66,
+        "fail": 0,
+        "total": 66,
+        "rate_pct": 100.0
+      },
+      "community": {
+        "pass": 58,
+        "fail": 0,
+        "total": 58,
+        "rate_pct": 100.0
+      },
+      "npm-registry": {
+        "pass": 75,
+        "fail": 0,
+        "total": 75,
+        "rate_pct": 100.0
+      },
+      "third-party-github": {
+        "pass": 23,
+        "fail": 0,
+        "total": 23,
+        "rate_pct": 100.0
+      },
+      "agents": {
+        "pass": 1,
+        "fail": 0,
+        "total": 1,
+        "rate_pct": 100.0
+      }
     }
   },
   "scenario_conformance": {
@@ -142,6 +192,909 @@
       "review_by",
       "tracking_issue"
     ],
-    "entries": []
+    "entries": [
+      {
+        "id": "agents-mikeastock/extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'agents-mikeastock/extensions': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "base_fixtures",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'base_fixtures': manifest flags capability=true, but runtime registered 0 flags: {}).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "bash-spawn-hook",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'bash-spawn-hook': runtime tools identities differ from the manifest).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/hjanuschka-plan-mode",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'community/hjanuschka-plan-mode': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/jyaunches-canvas",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'community/jyaunches-canvas': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/mitsuhiko-control",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'community/mitsuhiko-control': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/mitsuhiko-uv",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'community/mitsuhiko-uv': runtime tools identities differ from the manifest).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/nicobailon-interactive-shell",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/nicobailon-interactive-shell': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/nicobailon-interview-tool",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'community/nicobailon-interview-tool': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/nicobailon-mcp-adapter",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/nicobailon-mcp-adapter': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/nicobailon-powerline-footer",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/nicobailon-powerline-footer': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/nicobailon-subagents",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'community/nicobailon-subagents': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/prateekmedia-checkpoint",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'community/prateekmedia-checkpoint': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/prateekmedia-lsp",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'community/prateekmedia-lsp': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/prateekmedia-ralph-loop",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/prateekmedia-ralph-loop': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/qualisero-background-notify",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/qualisero-background-notify': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'community/qualisero-pi-agent-scip': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/qualisero-safe-git",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/qualisero-safe-git': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/qualisero-session-color",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'community/qualisero-session-color': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/tmustier-files-widget",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'community/tmustier-files-widget': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "community/tmustier-tab-status",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'community/tmustier-tab-status': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/agentsbox",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/agentsbox': manifest commands capability=false, but runtime registered 3 commands: {\"agentsbox-help\", \"agentsbox-search\", \"agentsbox-status\"}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/aliou-pi-extension-dev",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/aliou-pi-extension-dev': manifest tools capability=false, but runtime registered 4 tools: {\"detect_package_manager\", \"pi_changelog\", \"pi_docs\", \"pi_version\"}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/aliou-pi-linkup",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/aliou-pi-linkup': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/aliou-pi-processes",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/aliou-pi-processes': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/aliou-pi-toolchain",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/aliou-pi-toolchain': runtime tools identities differ from the manifest).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/benvargas-pi-ancestor-discovery",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/benvargas-pi-ancestor-discovery': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/checkpoint-pi",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/checkpoint-pi': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/juanibiapina-pi-extension-settings",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/juanibiapina-pi-extension-settings': manifest commands capability=false, but runtime registered 1 commands: {\"extension-settings\"}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/juanibiapina-pi-files",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/juanibiapina-pi-files': manifest commands capability=false, but runtime registered 1 commands: {\"files\"}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/juanibiapina-pi-gob",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/juanibiapina-pi-gob': manifest commands capability=false, but runtime registered 1 commands: {\"gob\"}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/lsp-pi",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/lsp-pi': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/marckrenn-pi-sub-core",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/marckrenn-pi-sub-core': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/mitsupi",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'npm/mitsupi': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/ogulcancelik-pi-sketch",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/ogulcancelik-pi-sketch': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/oh-my-pi-basics",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/oh-my-pi-basics': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-annotate",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/pi-annotate': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-bash-confirm",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-bash-confirm': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/pi-extensions': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-interactive-shell",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-interactive-shell': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-interview",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/pi-interview': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-mcp-adapter",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-mcp-adapter': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-messenger",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-messenger': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-powerline-footer",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-powerline-footer': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-prompt-template-model",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-prompt-template-model': runtime commands identities differ from the manifest).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-repoprompt-mcp",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-repoprompt-mcp': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-review-loop",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-review-loop': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-search-agent",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/pi-search-agent': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-shadow-git",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/pi-shadow-git': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-shell-completions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/pi-shell-completions': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-telemetry-otel",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-telemetry-otel': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-watch",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'npm/pi-watch': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/pi-web-access",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/pi-web-access': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/qualisero-pi-agent-scip': manifest tools capability=false, but runtime registered 6 tools: {\"scip_find_definition\", \"scip_find_references\", \"scip_list_symbols\", \"scip_project_tree\", \"scip_reindex\", \"scip_search_symbols\"}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/ralph-loop-pi",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'npm/ralph-loop-pi': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/shitty-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'npm/shitty-extensions': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/vaayne-agent-kit",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/vaayne-agent-kit': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/vaayne-pi-subagent",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/vaayne-pi-subagent': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/vaayne-pi-web-tools",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'npm/vaayne-pi-web-tools': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "npm/vpellegrino-pi-skills",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'npm/vpellegrino-pi-skills': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "overlay-qa-tests",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'overlay-qa-tests': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "plan-mode",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'plan-mode': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "preset",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'preset': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "sandbox",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'sandbox': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "ssh",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'ssh': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "subagent",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Tool registration or capability in manifest differs from runtime registrations (Extension 'subagent': manifest tools capability=true, but runtime registered 0 tools: {}).",
+        "mitigation": "Reconcile tool declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/aliou-pi-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/aliou-pi-extensions': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/ben-vargas-pi-packages",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/ben-vargas-pi-packages': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/charles-cooper-pi-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/charles-cooper-pi-extensions': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/cv-pi-ssh-remote",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'third-party/cv-pi-ssh-remote': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/kcosr-pi-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/kcosr-pi-extensions': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/limouren-agent-things",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Flag registration syntax mismatch between static manifest scanner and runtime (Extension 'third-party/limouren-agent-things': runtime flags identities differ from the manifest).",
+        "mitigation": "Update static flag scanner to recognize all registerFlag argument patterns.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/lsj5031-pi-notification-extension",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/lsj5031-pi-notification-extension': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/marckrenn-pi-sub",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/marckrenn-pi-sub': runtime commands identities differ from the manifest).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/michalvavra-agents",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/michalvavra-agents': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/ogulcancelik-pi-sketch",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/ogulcancelik-pi-sketch': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/openclaw-openclaw",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/openclaw-openclaw': runtime commands identities differ from the manifest).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/pasky-pi-amplike",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/pasky-pi-amplike': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/qualisero-pi-agent-scip': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/rytswd-direnv",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/rytswd-direnv': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/vtemian-pi-config",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Static AST scanner detected Node.js EventEmitter calls recorded in manifest, but extension only registers pi events at runtime (Extension 'third-party/vtemian-pi-config': event-handler identities differ from the manifest).",
+        "mitigation": "Refine static manifest extractor to distinguish ExtensionAPI subscriptions from generic stream/process EventEmitter calls.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      },
+      {
+        "id": "third-party/w-winter-dot314",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "manifest_mismatch",
+        "rationale": "Command registration in manifest differs from runtime registrations (Extension 'third-party/w-winter-dot314': manifest commands capability=true, but runtime registered 0 commands: {}).",
+        "mitigation": "Reconcile command declarations in manifest with extension runtime behavior.",
+        "owner": "ext-conformance",
+        "review_by": "2027-01-01",
+        "tracking_issue": "bd-n4ov9.3"
+      }
+    ]
   }
 }
