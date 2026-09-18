@@ -187,3 +187,78 @@ done
         assert!(resolved);
     });
 }
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_prompt_streams_live_and_preserves_pre_ack_events() {
+    let script = r#"
+IFS= read -r line
+id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+printf '{"type":"agent_start","sessionId":"early"}\n'
+printf '{"type":"response","id":"%s","command":"prompt","success":true}\n' "$id"
+printf '{"type":"message_update","delta":"first"}\n'
+sleep 1
+printf '{"type":"agent_end","sessionId":"early","messages":[]}\n'
+"#;
+    let options = sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+    };
+    let mut client = sdk::RpcTransportClient::connect(options).expect("connect");
+    let started = std::time::Instant::now();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let times = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_cb = std::sync::Arc::clone(&seen);
+    let times_cb = std::sync::Arc::clone(&times);
+    let events = futures::executor::block_on(client.prompt_with_options_streaming(
+        "hello",
+        None,
+        None,
+        move |event| {
+            seen_cb.lock().unwrap().push(event["type"].as_str().unwrap().to_string());
+            times_cb.lock().unwrap().push(started.elapsed());
+        },
+    ))
+    .expect("streaming prompt");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["agent_start", "message_update", "agent_end"]
+    );
+    assert_eq!(events.len(), 3);
+    assert!(
+        times.lock().unwrap()[1] < std::time::Duration::from_millis(700),
+        "message_update must be delivered before the delayed agent_end"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sdk_rpc_prompt_rejects_wrong_ack_and_reserved_request_fields() {
+    let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  printf '{"type":"response","id":"%s","command":"wrong","success":true}\n' "$id"
+done
+"#;
+    let options = sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), script.into()],
+        cwd: None,
+    };
+    let mut client = sdk::RpcTransportClient::connect(options).expect("connect");
+    let error = futures::executor::block_on(client.prompt("hello")).expect_err("wrong command");
+    assert!(error.to_string().contains("wrong command"), "{error}");
+
+    let options = sdk::RpcTransportOptions {
+        binary_path: PathBuf::from("/bin/sh"),
+        args: vec!["-c".into(), "sleep 5".into()],
+        cwd: None,
+    };
+    let mut client = sdk::RpcTransportClient::connect(options).expect("connect");
+    let mut payload = serde_json::Map::new();
+    payload.insert("id".into(), json!("caller-controlled"));
+    let error = futures::executor::block_on(client.request("get_state", payload))
+        .expect_err("reserved id must be rejected before write");
+    assert!(error.to_string().contains("reserved type/id"), "{error}");
+}

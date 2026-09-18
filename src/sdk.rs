@@ -883,6 +883,10 @@ impl Default for RpcTransportOptions {
 }
 
 /// Subprocess-backed SDK transport for `pi --mode rpc`.
+const RPC_MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+const RPC_MAX_PRE_ACK_EVENTS: usize = 256;
+const RPC_MAX_PRE_ACK_BYTES: usize = 4 * 1024 * 1024;
+
 pub struct RpcTransportClient {
     child: Child,
     stdin: BufWriter<ChildStdin>,
@@ -946,10 +950,12 @@ impl SessionTransport {
                 Ok(SessionPromptResult::InProcess(Box::new(assistant)))
             }
             Self::RpcSubprocess(client) => {
-                let events = client.prompt(input).await?;
-                for event in events.iter().cloned() {
-                    (on_event)(SessionTransportEvent::Rpc(event));
-                }
+                let callback = Arc::clone(&on_event);
+                let events = client
+                    .prompt_with_options_streaming(input, None, None, move |event| {
+                        (callback)(SessionTransportEvent::Rpc(event));
+                    })
+                    .await?;
                 Ok(SessionPromptResult::RpcEvents(events))
             }
         }
@@ -1027,6 +1033,11 @@ impl RpcTransportClient {
         reason = "SDK RPC transport keeps an async public API"
     )]
     pub async fn request(&mut self, command: &str, payload: Map<String, Value>) -> Result<Value> {
+        if payload.contains_key("type") || payload.contains_key("id") {
+            return Err(Error::validation(
+                "RPC request payload cannot override reserved type/id fields",
+            ));
+        }
         let request_id = self.next_request_id();
         let mut command_payload = Map::new();
         command_payload.insert("type".to_string(), Value::String(command.to_string()));
@@ -1294,15 +1305,32 @@ impl RpcTransportClient {
         self.prompt_with_options(message, None, None).await
     }
 
-    #[allow(
-        clippy::unused_async,
-        reason = "SDK RPC transport keeps an async public API"
-    )]
     pub async fn prompt_with_options(
         &mut self,
         message: impl Into<String>,
         images: Option<Vec<ImageContent>>,
         streaming_behavior: Option<&str>,
+    ) -> Result<Vec<Value>> {
+        self.prompt_with_options_streaming(message, images, streaming_behavior, |_| {})
+            .await
+    }
+
+    /// Run one RPC prompt while delivering raw events as soon as they are read.
+    ///
+    /// Some servers can emit lifecycle events before the prompt response is
+    /// flushed. Those events are retained under explicit count/byte bounds and
+    /// released in order once the matching success acknowledgement arrives.
+    /// A failed acknowledgement never leaks speculative events to the caller.
+    #[allow(
+        clippy::unused_async,
+        reason = "SDK RPC transport keeps an async public API"
+    )]
+    pub async fn prompt_with_options_streaming(
+        &mut self,
+        message: impl Into<String>,
+        images: Option<Vec<ImageContent>>,
+        streaming_behavior: Option<&str>,
+        mut on_event: impl FnMut(Value),
     ) -> Result<Vec<Value>> {
         let request_id = self.next_request_id();
         let mut payload = Map::new();
@@ -1321,17 +1349,23 @@ impl RpcTransportClient {
                 Value::String(streaming_behavior.to_string()),
             );
         }
-        let payload = Value::Object(payload);
-        self.write_json_line(&payload)?;
+        self.write_json_line(&Value::Object(payload))?;
 
         let mut saw_ack = false;
         let mut events = Vec::new();
+        let mut pre_ack = Vec::new();
+        let mut pre_ack_bytes = 0usize;
         loop {
             let item = self.read_json_line()?;
             let item_type = item.get("type").and_then(Value::as_str);
             if item_type == Some("response") {
                 if item.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
                     continue;
+                }
+                if item.get("command").and_then(Value::as_str) != Some("prompt") {
+                    return Err(Error::api(
+                        "RPC prompt acknowledgement used the matching id with the wrong command",
+                    ));
                 }
                 let success = item
                     .get("success")
@@ -1340,16 +1374,43 @@ impl RpcTransportClient {
                 if !success {
                     return Err(rpc_error_from_response(&item, "prompt"));
                 }
+                if saw_ack {
+                    return Err(Error::api("RPC prompt sent a duplicate acknowledgement"));
+                }
                 saw_ack = true;
+                for event in pre_ack.drain(..) {
+                    let reached_end =
+                        event.get("type").and_then(Value::as_str) == Some("agent_end");
+                    on_event(event.clone());
+                    events.push(event);
+                    if reached_end {
+                        return Ok(events);
+                    }
+                }
                 continue;
             }
 
-            if saw_ack {
-                let reached_end = item_type == Some("agent_end");
-                events.push(item);
-                if reached_end {
-                    return Ok(events);
+            if !saw_ack {
+                let encoded_len = serde_json::to_vec(&item)
+                    .map_err(|err| Error::Json(Box::new(err)))?
+                    .len();
+                if pre_ack.len() >= RPC_MAX_PRE_ACK_EVENTS
+                    || encoded_len > RPC_MAX_PRE_ACK_BYTES.saturating_sub(pre_ack_bytes)
+                {
+                    return Err(Error::api(
+                        "RPC prompt emitted too many events before its acknowledgement",
+                    ));
                 }
+                pre_ack_bytes += encoded_len;
+                pre_ack.push(item);
+                continue;
+            }
+
+            let reached_end = item_type == Some("agent_end");
+            on_event(item.clone());
+            events.push(item);
+            if reached_end {
+                return Ok(events);
             }
         }
     }
@@ -1386,17 +1447,41 @@ impl RpcTransportClient {
     }
 
     fn read_json_line(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|err| Error::Io(Box::new(err)))?;
-        if read == 0 {
-            return Err(Error::api(
-                "RPC subprocess exited before sending a response",
-            ));
+        let mut line = Vec::new();
+        loop {
+            let available = self
+                .stdout
+                .fill_buf()
+                .map_err(|err| Error::Io(Box::new(err)))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(Error::api(
+                        "RPC subprocess exited before sending a response",
+                    ));
+                }
+                return Err(Error::api("RPC subprocess ended in the middle of a JSON line"));
+            }
+            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                    let _ = self.shutdown();
+                    return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+                }
+                line.extend_from_slice(&available[..newline]);
+                self.stdout.consume(newline + 1);
+                break;
+            }
+            if available.len() > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
+                let _ = self.shutdown();
+                return Err(Error::api("RPC subprocess JSON line exceeded 8 MiB"));
+            }
+            let available_len = available.len();
+            line.extend_from_slice(available);
+            self.stdout.consume(available_len);
         }
-        serde_json::from_str(line.trim_end()).map_err(|err| Error::Json(Box::new(err)))
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        serde_json::from_slice(&line).map_err(|err| Error::Json(Box::new(err)))
     }
 
     fn wait_for_response(&mut self, request_id: &str, command: &str) -> Result<Value> {

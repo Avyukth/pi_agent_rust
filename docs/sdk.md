@@ -318,3 +318,23 @@ fn main() -> pi::sdk::Result<()> {
 - `tests/sdk_api.rs`
 - `tests/sdk_unit.rs`
 - `tests/sdk_integration.rs`
+
+
+### RPC subprocess streaming
+
+`RpcTransportClient::prompt_with_options_streaming` delivers each raw RPC event
+as it is read instead of buffering the complete turn first. `SessionTransport::prompt`
+uses that path, so its callback has the same live-delivery contract in subprocess
+mode as in-process mode.
+
+A server event that races ahead of the matching prompt acknowledgement is retained
+under explicit count and byte bounds, then delivered in order after a successful
+acknowledgement. A failed acknowledgement does not expose those speculative events.
+Prompt acknowledgements must match both request id and command. Individual
+line-delimited JSON frames are capped at 8 MiB; oversized or truncated frames fail
+the transport rather than allocating without bound. Public generic RPC requests
+cannot override the SDK-generated `type` or `id` fields.
+
+The returned `RpcEvents` vector still contains the delivered events for callers
+that need the completed transcript. Live callbacks are therefore additive, not a
+change to the completion payload.
