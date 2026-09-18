@@ -74,6 +74,10 @@
           "justification": "Validates preflight workflow expectations before end-to-end runtime execution."
         },
         {
+          "path": "tests/e2e_resource_load_failure.rs",
+          "justification": "A configured package that fails to install or resolve exits 4 with a machine-readable resource.load_failed record, exits 1 when an explicit -e path is supplied, and stays silent on a healthy run (gh #223 / bd-fpaso)."
+        },
+        {
           "path": "tests/e2e_swarm_flight_recorder.rs",
           "justification": "Exercises deterministic multi-agent flight-recorder replay with real sessions, tools, extension hooks, and redacted JSONL/report artifacts."
         },

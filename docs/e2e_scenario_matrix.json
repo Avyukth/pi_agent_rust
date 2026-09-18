@@ -335,11 +335,13 @@
       ],
       "suite_ids": [
         "e2e_workflow_preflight",
-        "e2e_auto_repair"
+        "e2e_auto_repair",
+        "e2e_resource_load_failure"
       ],
       "test_paths": [
         "tests/e2e_workflow_preflight.rs",
-        "tests/e2e_auto_repair.rs"
+        "tests/e2e_auto_repair.rs",
+        "tests/e2e_resource_load_failure.rs"
       ],
       "sli_ids": [
         "sli.policy.preflight_decision_ms",
@@ -354,7 +356,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_workflow_preflight --suite e2e_auto_repair"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_workflow_preflight --suite e2e_auto_repair --suite e2e_resource_load_failure"
     },
     {
       "workflow_id": "wf-live-provider-parity-and-auth",
