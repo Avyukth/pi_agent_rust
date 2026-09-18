@@ -5497,19 +5497,19 @@ impl ToolRegistry {
                     ));
                 }
                 "generate_image" => {
-                    let provider = config
-                        .and_then(|c| c.media.as_ref())
-                        .and_then(|m| m.image_gen_provider.clone());
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.image_gen_provider.clone());
+                    let model = media.and_then(|m| m.image_gen_model.clone());
                     tools.push(Box::new(
-                        crate::media_tools::GenerateImageTool::with_provider(cwd, provider),
+                        crate::media_tools::GenerateImageTool::with_defaults(cwd, provider, model),
                     ));
                 }
                 "tts" => {
-                    let voice = config
-                        .and_then(|c| c.media.as_ref())
-                        .and_then(|m| m.tts_voice.clone());
-                    tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
-                        cwd, voice,
+                    let media = config.and_then(|c| c.media.as_ref());
+                    let provider = media.and_then(|m| m.tts_provider.clone());
+                    let voice = media.and_then(|m| m.tts_voice.clone());
+                    tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
+                        cwd, provider, voice,
                     )));
                 }
                 "computer" => {
@@ -5600,15 +5600,17 @@ impl ToolRegistry {
                 && !tools.iter().any(|t| t.name() == "generate_image")
             {
                 tools.push(Box::new(
-                    crate::media_tools::GenerateImageTool::with_provider(
+                    crate::media_tools::GenerateImageTool::with_defaults(
                         cwd,
                         media_cfg.image_gen_provider.clone(),
+                        media_cfg.image_gen_model.clone(),
                     ),
                 ));
             }
             if media_cfg.enable_tts.unwrap_or(false) && !tools.iter().any(|t| t.name() == "tts") {
-                tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
+                tools.push(Box::new(crate::media_tools::TtsTool::with_defaults(
                     cwd,
+                    media_cfg.tts_provider.clone(),
                     media_cfg.tts_voice.clone(),
                 )));
             }

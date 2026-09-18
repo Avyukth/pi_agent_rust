@@ -408,6 +408,56 @@ fn test_media_tools_opt_in_activation() {
     finish_case(&harness, "media_tools_opt_in");
 }
 
+
+#[test]
+fn test_registry_forwards_image_model_and_tts_provider_defaults() {
+    let harness = TestHarness::new("media_registry_defaults");
+    let config = Config {
+        media: Some(MediaSettings {
+            enable_generate_image: Some(true),
+            enable_tts: Some(true),
+            image_gen_provider: Some("openai".to_string()),
+            // Invalid as an adapter model id on purpose: if the registry drops
+            // this setting, execution reaches credential resolution instead.
+            image_gen_model: Some("invalid?configured-model".to_string()),
+            tts_provider: Some("unsupported-provider".to_string()),
+            ..MediaSettings::default()
+        }),
+        ..Default::default()
+    };
+    let registry = ToolRegistry::new(
+        &["generate_image", "tts"],
+        harness.temp_dir(),
+        Some(&config),
+    );
+
+    asupersync::test_utils::run_test(|| async {
+        let image_error = registry
+            .get("generate_image")
+            .unwrap()
+            .execute("configured-image", json!({"prompt":"fixture"}), None)
+            .await
+            .expect_err("configured invalid image model must reach adapter validation");
+        assert!(
+            image_error.to_string().contains("model must be a nonempty identifier"),
+            "{image_error}"
+        );
+
+        let speech_error = registry
+            .get("tts")
+            .unwrap()
+            .execute("configured-tts", json!({"text":"fixture"}), None)
+            .await
+            .expect_err("configured invalid TTS provider must reach adapter validation");
+        assert!(
+            speech_error.to_string().contains("speech provider must be openai or xai"),
+            "{speech_error}"
+        );
+    });
+
+    finish_case(&harness, "media_registry_defaults");
+}
+
 // ============================================================================
 // read_media (gh #212)
 // ============================================================================

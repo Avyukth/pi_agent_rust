@@ -57,12 +57,13 @@ over the environment. Operation defaults can be selected through
 `PI_IMAGE_GEN_PROVIDER` / `PI_IMAGE_GEN_MODEL`, and
 `PI_TTS_PROVIDER` / `PI_TTS_VOICE`.
 
-**Remaining settings integration:** this increment does not change the existing
-registry's forwarding of `media.image_gen_model` or `media.tts_provider`.
-Use the explicit tool arguments below, the corresponding environment variables,
-or the SDK `with_defaults` constructors for those selections. The existing
-activation flags, vision defaults, image-provider default, and speech-voice
-default retain their constructor interfaces.
+The default registry forwards all provider/model/voice defaults from `media`:
+`vision_provider`, `vision_model`, `image_gen_provider`,
+`image_gen_model`, `tts_provider`, and `tts_voice`. Model-facing tool
+arguments still take precedence, followed by these configured defaults and then
+the environment variables documented above. Invalid configured selections fail
+through the same adapter validation as explicit arguments instead of being
+silently ignored.
 
 ## Image inspection
 
