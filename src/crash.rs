@@ -620,6 +620,7 @@ mod tests {
         assert_eq!(PANIC_SUPPRESSION_DEPTH.with(std::cell::Cell::get), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn suppressed_panics_do_not_write_bundles() {
         // bd-ajg8l #3: recovered-internal panics (catch_unwind sites such as

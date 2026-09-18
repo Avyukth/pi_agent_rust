@@ -4962,6 +4962,7 @@ mod tests {
             .remove(&id);
     }
 
+    #[cfg(unix)]
     #[test]
     fn cancel_kills_running_job() {
         let _guard = process_test_guard();
@@ -5048,6 +5049,7 @@ mod tests {
         assert_eq!(registry().lock().expect("registry").starting_jobs, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_remains_running_until_term_ignoring_process_is_reaped() {
         let _guard = process_test_guard();

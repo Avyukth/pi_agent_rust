@@ -305,6 +305,7 @@ fn fake_adapter_full_handshake() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn wire_bytes_capture() {
     let temp = tempfile::tempdir().unwrap();

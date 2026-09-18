@@ -11862,7 +11862,7 @@ mod tests {
             let temp = tempfile::Builder::new()
                 .prefix("pi-print-persist-")
                 .tempdir_in("/tmp")
-                .expect("tempdir in /tmp");
+                .unwrap_or_else(|_| tempfile::tempdir().expect("tempdir"));
             let cwd = temp.path().to_path_buf();
             let poison = cwd.join("connection reset while saving");
             std::fs::create_dir(&poison).expect("poison directory");

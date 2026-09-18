@@ -35736,6 +35736,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {
@@ -35967,6 +35968,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn pijs_exec_file_sync_throws_when_stdout_exceeds_max_buffer() {
         futures::executor::block_on(async {

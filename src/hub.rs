@@ -956,6 +956,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn readiness_requires_observed_port() {
         let _guard = crate::hub::test_lock();
@@ -977,6 +978,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn duplicate_live_name_rejected() {
         let _guard = crate::hub::test_lock();
@@ -992,6 +994,7 @@ mod tests {
         let _ = stop(name);
     }
 
+    #[cfg(unix)]
     #[test]
     fn send_text_drives_repl() {
         let _guard = crate::hub::test_lock();
@@ -1018,6 +1021,7 @@ mod tests {
         let _ = stop(name);
     }
 
+    #[cfg(unix)]
     #[test]
     fn restart_after_completion_works() {
         let _guard = crate::hub::test_lock();
@@ -1043,6 +1047,7 @@ mod tests {
         let _ = stop(name).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn status_stays_running_for_live_repl() {
         let _guard = crate::hub::test_lock();
@@ -1075,6 +1080,7 @@ mod tests {
         let _ = stop(name);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_leaves_no_survivors() {
         let _guard = crate::hub::test_lock();
@@ -1095,6 +1101,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn logs_cursor_advances_incrementally() {
         let _guard = crate::hub::test_lock();
