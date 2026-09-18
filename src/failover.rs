@@ -25,23 +25,37 @@ pub enum FailoverClass {
     Transient,
 }
 
-/// Classify an error text for failover. `None` = never fail over (auth and
-/// other loud errors). Ordering matters: auth patterns are checked FIRST so
-/// a "401 ... quota" message never fails over.
-pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
+/// Refusal shared by same-provider retry and failover. The input is lowercase.
+/// Authentication wins even when the provider also mentions a transient status.
+fn is_auth_failure(lower: &str) -> bool {
     const AUTH_PATTERNS: &[&str] = &[
         "401",
         "403",
         "unauthorized",
+        "unauthenticated",
         "forbidden",
         "invalid api key",
         "invalid_api_key",
         "incorrect api key",
         "authentication failed",
+        "authentication error",
+        "authentication_error",
         "permission denied",
+        "permission_denied",
         "expired token",
+        "invalid token",
+        "invalid_token",
+        "invalid credentials",
+        "invalid_credentials",
         "missing api key",
     ];
+    AUTH_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+}
+
+/// Classify an error text for failover. `None` = never fail over (auth and
+/// other loud errors). Terminal markers and auth are checked before transient
+/// patterns so a "401 ... quota" message never fails over.
+pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
     const QUOTA_PATTERNS: &[&str] = &[
         "429",
         "rate limit",
@@ -66,10 +80,17 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         "internal error",
     ];
 
+    // Durability failures may follow completed side effects. Context overflow
+    // needs compaction, not a replay against another provider.
+    if marks_session_persistence(error_text)
+        || crate::error::is_context_overflow(error_text, None, None)
+    {
+        return None;
+    }
     let text = error_text.to_ascii_lowercase();
 
     // Auth: loud, user-actionable, never a failover trigger.
-    if AUTH_PATTERNS.iter().any(|p| text.contains(p)) {
+    if is_auth_failure(&text) {
         return None;
     }
 
@@ -81,7 +102,7 @@ pub fn classify_failover(error_text: &str) -> Option<FailoverClass> {
         return Some(FailoverClass::Overload);
     }
 
-    if crate::error::is_retryable_error(&text.to_ascii_lowercase(), None, None) {
+    if crate::error::is_retryable_error(&text, None, None) {
         return Some(FailoverClass::Transient);
     }
     None
@@ -641,31 +662,43 @@ pub fn error_result_is_retryable(
         return false;
     }
     let error_text = message.error_message.as_deref().unwrap_or("Request error");
-    // Session-persistence failures are never retryable, even when the wrapped
-    // message contains transient-looking prose ("connection reset", "500"):
-    // flattening loses the typed boundary, so the stable prefix is checked
-    // before any text classification.
-    if marks_session_persistence(error_text) {
+    // Terminal markers and authentication outrank transient-looking prose.
+    // In particular, a mixed 401/429 response must not spend the retry budget.
+    if marks_session_persistence(error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
         return false;
     }
     crate::error::is_retryable_error(error_text, Some(message.usage.input), context_window)
 }
 
+/// Only provider/transport failures can justify another provider call. A local
+/// tool, configuration, extension or session failure cannot be repaired by
+/// re-entering the provider, even when its diagnostic quotes a transient error.
+fn is_provider_call_error(error: &crate::error::Error) -> bool {
+    matches!(
+        error,
+        crate::error::Error::Api(_)
+            | crate::error::Error::Provider { .. }
+            | crate::error::Error::Io(_)
+    )
+}
+
 /// Whether a failed provider call reported through [`crate::error::Error`]
 /// should be retried against the same provider.
 ///
-/// Classifies from the TYPED error first — [`crate::error::Error::is_transient`]
-/// walks the source chain for a transient `io::ErrorKind` (connection
-/// reset/abort/EOF/broken pipe/timeout) without depending on flattened message
-/// text — then falls back to text matching for prose-only errors
-/// (pi_agent_rust#118). No usage or context window is available on this path
-/// because no response was received.
+/// Local errors and terminal markers are refused before classification.
+/// For provider/transport errors, [`crate::error::Error::is_transient`] walks
+/// the typed source chain without depending on flattened message text, then
+/// prose-only failures use text matching (pi_agent_rust#118).
 #[must_use]
 pub fn call_error_is_retryable(error: &crate::error::Error) -> bool {
-    if error.is_session_persistence() {
+    if !is_provider_call_error(error) {
         return false;
     }
-    error.is_transient() || crate::error::is_retryable_error(&error.to_string(), None, None)
+    let error_text = error.to_string();
+    if marks_session_persistence(&error_text) || is_auth_failure(&error_text.to_ascii_lowercase()) {
+        return false;
+    }
+    error.is_transient() || crate::error::is_retryable_error(&error_text, None, None)
 }
 
 /// The outcome of one provider attempt, borrowed for classification.
@@ -812,11 +845,25 @@ pub fn decide(
             if marks_session_persistence(error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
             }
+            if is_auth_failure(&error_text.to_ascii_lowercase()) {
+                return TurnDecision::Finish { success: false };
+            }
             error_result_is_retryable(message, context_window)
         }
         TurnOutcome::Failed(error) => {
-            if error.is_session_persistence() {
+            if matches!(error, crate::error::Error::Aborted) {
+                return TurnDecision::Terminal(TerminalReason::Aborted);
+            }
+            // A persistence marker remains terminal after a boundary flattens
+            // and rewraps it as Api, Provider, Io, or another Session error.
+            let error_text = error.to_string();
+            if marks_session_persistence(&error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
+            }
+            if !is_provider_call_error(error)
+                || is_auth_failure(&error_text.to_ascii_lowercase())
+            {
+                return TurnDecision::Finish { success: false };
             }
             call_error_is_retryable(error)
         }
@@ -1519,10 +1566,8 @@ mod tests {
 
     #[test]
     fn a_loud_auth_error_finishes_rather_than_failing_over_into_another_one() {
-        // classify_failover refuses auth, and the chain walk would only find
-        // another provider to reject the same credentials. The decision still
-        // offers FailOver; the caller's walk is what declines. Pinned so a
-        // future change to that division is deliberate.
+        // Refusal belongs to the shared decision, not only the caller's walk:
+        // no surface may retry or open a failover lifecycle for bad credentials.
         let error = crate::error::Error::Api("401 unauthorized: invalid api key".to_string());
         assert_eq!(
             decide(
@@ -1531,13 +1576,157 @@ mod tests {
                 &policy(),
                 None
             ),
-            TurnDecision::FailOver
+            TurnDecision::Finish { success: false }
         );
-        assert_eq!(
-            classify_failover("401 unauthorized: invalid api key"),
-            None,
-            "the walk is what refuses an auth failure"
-        );
+        assert_eq!(classify_failover(&error.to_string()), None);
+    }
+
+    #[test]
+    fn a_failed_abort_is_terminal_with_any_remaining_budget() {
+        let error = crate::error::Error::Aborted;
+        assert!(!call_error_is_retryable(&error));
+        for state in [progress(0, 0), progress(2, 0), progress(2, 1)] {
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &state, &policy(), None),
+                TurnDecision::Terminal(TerminalReason::Aborted)
+            );
+        }
+    }
+
+    #[test]
+    fn local_errors_cannot_reenter_the_provider_due_to_their_prose() {
+        use crate::error::Error;
+
+        let errors = [
+            Error::auth("429 quota exceeded"),
+            Error::config("503 service unavailable"),
+            Error::validation("connection reset by peer"),
+            Error::tool("bash", "500 internal server error"),
+            Error::extension("fetch failed"),
+            Error::session("500 session write failed"),
+            Error::SessionNotFound {
+                path: "/sessions/500.jsonl".to_string(),
+            },
+            Error::Json(Box::new(serde_json::from_str::<bool>("503").unwrap_err())),
+            Error::Sqlite(Box::new(fsqlite::FrankenError::Busy)),
+        ];
+        for error in &errors {
+            assert!(!call_error_is_retryable(error), "{error}");
+            for state in [progress(0, 0), progress(2, 0)] {
+                assert_eq!(
+                    decide(TurnOutcome::Failed(error), &state, &policy(), None),
+                    TurnDecision::Finish { success: false },
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn auth_refusal_wins_over_transient_words_on_both_outcome_shapes() {
+        for text in [
+            "401 unauthorized: 429 rate limit exceeded",
+            "403 forbidden: service unavailable",
+            "authentication_error: 503 overloaded",
+            "invalid_api_key: connection reset by peer",
+            "expired token: 500 server error",
+            "invalid_token: upstream connect error",
+            "permission_denied: 429 quota exceeded",
+        ] {
+            // Without the refusal guard, each message would spend the budget.
+            assert!(crate::error::is_retryable_error(text, None, None), "{text}");
+            assert_eq!(classify_failover(text), None, "{text}");
+            let message = errored_message(Some(text), 0);
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            let error = crate::error::Error::api(text);
+            assert!(!call_error_is_retryable(&error), "{text}");
+            for outcome in [TurnOutcome::Completed(&message), TurnOutcome::Failed(&error)] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::Finish { success: false },
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repackaged_persistence_markers_remain_terminal_everywhere() {
+        use crate::error::Error;
+
+        for detail in ["503 connection reset by peer", "401 unauthorized: 429 quota"] {
+            let flattened = Error::session_persistence(detail).to_string();
+            let errors = [
+                Error::api(flattened.clone()),
+                Error::provider("test", flattened.clone()),
+                Error::session(format!("while committing turn: {flattened}")),
+                Error::Io(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    flattened.clone(),
+                ))),
+            ];
+            assert_eq!(classify_failover(&flattened), None);
+            for error in &errors {
+                // None retains the original typed Session(prefix...) shape.
+                assert!(!error.is_session_persistence());
+                assert!(!call_error_is_retryable(error), "{error}");
+                assert_eq!(classify_failover(&error.to_string()), None);
+                assert_eq!(
+                    decide(TurnOutcome::Failed(error), &progress(0, 0), &policy(), None),
+                    TurnDecision::Terminal(TerminalReason::SessionPersistence),
+                    "{error}"
+                );
+            }
+            let message = errored_message(Some(&flattened), 0);
+            assert!(!error_result_is_retryable(&message, None));
+            assert_eq!(
+                decide(TurnOutcome::Completed(&message), &progress(0, 0), &policy(), None),
+                TurnDecision::Terminal(TerminalReason::SessionPersistence)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_context_overflow_is_not_failover_even_with_transient_statuses() {
+        for text in [
+            "503 service unavailable: prompt is too long",
+            "429 rate limit: context_length_exceeded",
+            "500 server error: too many tokens",
+        ] {
+            assert_eq!(classify_failover(text), None, "{text}");
+            assert!(!error_result_is_retryable(&errored_message(Some(text), 0), None));
+        }
+    }
+
+    #[test]
+    fn typed_transport_drops_still_retry_and_respect_both_budgets() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::NotConnected,
+            std::io::ErrorKind::TimedOut,
+        ] {
+            // Deliberately no transient substring: the typed kind must decide.
+            let error = crate::error::Error::Io(Box::new(std::io::Error::new(kind, "wire")));
+            assert!(call_error_is_retryable(&error), "{kind:?}");
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &progress(0, 0), &policy(), None),
+                TurnDecision::Retry { attempt: 1, delay_ms: 500 },
+                "{kind:?}"
+            );
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &progress(2, 0), &policy(), None),
+                TurnDecision::FailOver,
+                "{kind:?}"
+            );
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &progress(2, 1), &policy(), None),
+                TurnDecision::Finish { success: false },
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
