@@ -764,6 +764,100 @@ fn resolve_route(
         .unwrap_or_else(|| MockHttpResponse::text(404, "not found"))
 }
 
+/// Is this read error the socket's poll interval expiring rather than a failure?
+///
+/// std documents a read timeout as `WouldBlock` OR `TimedOut`, and matching only
+/// the first is what made this fixture fail on a slow client (bd-eg6ng).
+fn is_read_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// Read until the request headers are complete; returns the offset of the
+/// CRLFCRLF that ends them. Patience is bounded by `deadline`, not by any one
+/// read.
+fn read_request_headers(
+    stream: &mut TcpStream,
+    scratch: &mut [u8],
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    loop {
+        if let Some(pos) = find_double_crlf(buf) {
+            return Ok(pos);
+        }
+        match stream.read(scratch) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before request headers",
+                ));
+            }
+            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            Err(err) if is_read_timeout(&err) => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "mock http server waited {}s for request headers and got {} bytes",
+                            REQUEST_READ_DEADLINE.as_secs(),
+                            buf.len()
+                        ),
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        if buf.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
+        }
+    }
+}
+
+/// Fill `body` up to `content_length`, on the same deadline.
+///
+/// A gap between the headers and the body is the client being descheduled.
+/// Propagating that timeout with `?` was the worse half of bd-eg6ng: the
+/// headers had already been read, so the request was well formed and merely
+/// slow, and it was reported as a failed connection.
+fn read_request_body(
+    stream: &mut TcpStream,
+    scratch: &mut [u8],
+    body: &mut Vec<u8>,
+    content_length: usize,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        let to_read = remaining.min(scratch.len());
+        // ubs:ignore-next-line to_read is min(_, scratch.len()) on the line above
+        match stream.read(&mut scratch[..to_read]) {
+            Ok(0) => return Ok(()),
+            Ok(n) => body.extend_from_slice(&scratch[..n]),
+            Err(err) if is_read_timeout(&err) => {
+                if Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "mock http server waited {}s for a {content_length}-byte body and got \
+                             {} bytes",
+                            REQUEST_READ_DEADLINE.as_secs(),
+                            body.len()
+                        ),
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn handle_connection(
     stream: &mut TcpStream,
     peer: SocketAddr,
@@ -790,48 +884,7 @@ fn handle_connection(
     let deadline = Instant::now() + REQUEST_READ_DEADLINE;
 
     let mut buf = Vec::with_capacity(8192);
-    let header_end = loop {
-        if let Some(pos) = find_double_crlf(&buf) {
-            break pos;
-        }
-        match stream.read(scratch) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed before request headers",
-                ));
-            }
-            Ok(n) => buf.extend_from_slice(&scratch[..n]),
-            // `WouldBlock` on Unix, `TimedOut` on some platforms and on
-            // Windows: std documents a read timeout as either one, and matching
-            // only the first is what made this fixture fail on a slow client.
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "mock http server waited {}s for request headers and got {} bytes",
-                            REQUEST_READ_DEADLINE.as_secs(),
-                            buf.len()
-                        ),
-                    ));
-                }
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request headers too large",
-            ));
-        }
-    };
+    let header_end = read_request_headers(stream, scratch, &mut buf, deadline)?;
 
     let header_bytes = &buf[..header_end];
     let mut body_bytes = buf[(header_end + 4)..].to_vec();
@@ -864,42 +917,7 @@ fn handle_connection(
         }
     }
 
-    // Same deadline, same reason: a gap between the headers and the body is the
-    // client being descheduled. Propagating the timeout with `?` here was the
-    // worse half of the bug, because the headers had already been read — the
-    // request was well formed and merely slow, and it was reported as a failed
-    // connection.
-    while body_bytes.len() < content_length {
-        let remaining = content_length - body_bytes.len();
-        let to_read = remaining.min(scratch.len());
-        let n = match stream.read(&mut scratch[..to_read]) {
-            Ok(n) => n,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "mock http server waited {}s for a {content_length}-byte body and got \
-                             {} bytes",
-                            REQUEST_READ_DEADLINE.as_secs(),
-                            body_bytes.len()
-                        ),
-                    ));
-                }
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        if n == 0 {
-            break;
-        }
-        body_bytes.extend_from_slice(&scratch[..n]);
-    }
+    read_request_body(stream, scratch, &mut body_bytes, content_length, deadline)?;
 
     let request = MockHttpRequest {
         method: method.clone(),
