@@ -919,6 +919,17 @@ mod tests {
         session.clear_pages();
         assert_eq!(session.next_ref, 42);
     }
+
+    fn panic_socket_for_type_only() -> WebSocket<TcpStream> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let stream = runtime.block_on(TcpStream::connect(addr)).unwrap();
+        WebSocket::from_upgraded(stream, WebSocketConfig::default())
+    }
+
     #[test]
     fn download_events_are_correlated_and_bounded() {
         let mut downloads = BTreeMap::new();

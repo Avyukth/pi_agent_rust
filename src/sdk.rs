@@ -1410,7 +1410,7 @@ impl RpcTransportClient {
 
         let mut saw_ack = false;
         let mut events = Vec::new();
-        let mut pre_ack = Vec::new();
+        let mut pre_ack: Vec<Value> = Vec::new();
         let mut pre_ack_bytes = 0usize;
         loop {
             let item = self.read_json_line()?;

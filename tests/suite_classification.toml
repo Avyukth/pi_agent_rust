@@ -351,6 +351,7 @@ files = [
     "e2e_auto_repair",
     "e2e_cli",
     "e2e_cross_provider_parity",
+    "e2e_resource_load_failure",
     "doctor_swarm_temp_dir_json",
     "dropin_extension_ui_differential",
     "dropin_rpc_differential",
