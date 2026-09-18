@@ -1,17 +1,17 @@
 # Extension Conformance Report
 
-> Generated: 2026-08-04T07:06:49Z
+> Generated: 2026-09-18T18:41:24Z
 
 ## Summary
 
 | Metric | Value |
 |----|----|
-| Total extensions | 226 |
+| Total extensions | 227 |
 | PASS | 60 |
 | FAIL | 0 |
-| N/A (not yet tested) | 166 |
+| N/A (not yet tested) | 167 |
 | Pass rate (tested only) | 100.0% |
-| Coverage (tested/total) | 26.5% |
+| Coverage (tested/total) | 26.4% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
 
@@ -248,7 +248,7 @@
 
 ## third-party-github
 
-23 extensions (0 pass, 0 fail, 23 untested)
+24 extensions (0 pass, 0 fail, 24 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
@@ -261,6 +261,7 @@
 | [`third-party/jyaunches-pi-canvas`](tests/ext_conformance/artifacts/third-party/jyaunches-pi-canvas/index.ts) | `0.2.0` | T2 (multi-registration) | N/A | - | - | - |  |
 | [`third-party/kcosr-pi-extensions`](tests/ext_conformance/artifacts/third-party/kcosr-pi-extensions/apply-patch-tool/index.ts) | - | T5 (exec/network) | N/A | - | - | - |  |
 | [`third-party/limouren-agent-things`](tests/ext_conformance/artifacts/third-party/limouren-agent-things/sandbox/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
+| [`third-party/lll9p-pi-better-compaction`](tests/ext_conformance/artifacts/third-party/lll9p-pi-better-compaction/pi-better-compaction/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`third-party/lsj5031-pi-notification-extension`](tests/ext_conformance/artifacts/third-party/lsj5031-pi-notification-extension/notification.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`third-party/marckrenn-pi-sub`](tests/ext_conformance/artifacts/third-party/marckrenn-pi-sub/sub-bar/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`third-party/michalvavra-agents`](tests/ext_conformance/artifacts/third-party/michalvavra-agents/bell.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
@@ -288,9 +289,9 @@
 
 ## Coverage Gaps
 
-166 extensions have not been tested yet.
+167 extensions have not been tested yet.
 
-**Multi-file extension (T3)** (85 extensions):
+**Multi-file extension (T3)** (86 extensions):
 - `base_fixtures`
 - `community/jyaunches-canvas`
 - `community/nicobailon-interactive-shell`
@@ -368,6 +369,7 @@
 - `third-party/charles-cooper-pi-extensions`
 - `third-party/cv-pi-ssh-remote`
 - `third-party/limouren-agent-things`
+- `third-party/lll9p-pi-better-compaction`
 - `third-party/marckrenn-pi-sub`
 - `third-party/michalvavra-agents`
 - `third-party/openclaw-openclaw`
@@ -475,7 +477,7 @@ cargo test --test ext_conformance_scenarios --features ext-conformance
 cargo test --test extensions_policy_negative
 
 # 2. Generate this consolidated report
-cargo test --test conformance_report generate_conformance_report -- --nocapture
+PI_GENERATE_CONFORMANCE_REPORT=1 cargo test --locked --test conformance_report generate_conformance_report -- --exact --nocapture
 ```
 
 Report files:

@@ -1,20 +1,21 @@
 {
-  "correlation_id": "conformance-summary-local-20260804T070649446Z",
+  "correlation_id": "conformance-summary-local-20260918T184124350Z",
   "counts": {
     "fail": 0,
-    "na": 166,
+    "na": 167,
     "pass": 60,
     "tested": 60,
-    "total": 226
+    "total": 227
   },
-  "coverage_rate_pct": 26.548672566371685,
+  "coverage_rate_pct": 26.431718061674008,
   "evidence": {
     "golden_fixtures": 62,
     "load_time_benchmarks": 60,
     "parity_logs": 16,
     "smoke_logs": 16
   },
-  "generated_at": "2026-08-04T07:06:49Z",
+  "generated_at": "2026-09-18T18:41:24Z",
+  "git_commit": "5cf01d971297c122daf3b0307da3168f50e1c48f",
   "negative": {
     "fail": 0,
     "pass": 30
@@ -47,11 +48,12 @@
     },
     "third-party-github": {
       "fail": 0,
-      "na": 23,
+      "na": 24,
       "pass": 0,
-      "total": 23
+      "total": 24
     }
   },
-  "run_id": "local-20260804T070649446Z",
-  "schema": "pi.ext.conformance_summary.v2"
+  "run_id": "local-20260918T184124350Z",
+  "schema": "pi.ext.conformance_summary.v2",
+  "source_tree_sha256": "c1ad831715a18eb1acfe0648aa22f4cbb00d247da1d7522d903c5a5ceb08412e"
 }
