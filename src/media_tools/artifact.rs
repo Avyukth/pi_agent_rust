@@ -128,8 +128,16 @@ mod tests {
     #[test]
     fn requested_paths_cannot_escape_workspace_or_use_linked_parents() {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.png", "a\\escape.png"] {
-            assert!(preflight(dir.path(), Some(path), "generate_image").is_err(), "{path}");
+        for path in [
+            "../escape.png",
+            "/tmp/escape.png",
+            "a/../../escape.png",
+            "a\\escape.png",
+        ] {
+            assert!(
+                preflight(dir.path(), Some(path), "generate_image").is_err(),
+                "{path}"
+            );
         }
         #[cfg(unix)]
         {

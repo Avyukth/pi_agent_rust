@@ -585,7 +585,10 @@ fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
     Ok(windows)
 }
 
-pub(super) fn destination(cwd: &Path, args: &Value) -> Result<crate::artifact_output::OutputTarget> {
+pub(super) fn destination(
+    cwd: &Path,
+    args: &Value,
+) -> Result<crate::artifact_output::OutputTarget> {
     let requested = string(args, "output_path")?.map_or_else(
         || format!("screenshots/desktop_{}.png", uuid::Uuid::new_v4().simple()),
         ToString::to_string,
@@ -709,15 +712,33 @@ mod tests {
     #[test]
     fn screenshot_paths_cannot_escape_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.png", "a\\escape.png"] {
-            assert!(destination(dir.path(), &json!({"action":"screenshot","output_path":path})).is_err(), "{path}");
+        for path in [
+            "../escape.png",
+            "/tmp/escape.png",
+            "a/../../escape.png",
+            "a\\escape.png",
+        ] {
+            assert!(
+                destination(
+                    dir.path(),
+                    &json!({"action":"screenshot","output_path":path})
+                )
+                .is_err(),
+                "{path}"
+            );
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             let outside = tempfile::tempdir().unwrap();
             symlink(outside.path(), dir.path().join("linked")).unwrap();
-            assert!(destination(dir.path(), &json!({"action":"screenshot","output_path":"linked/capture.png"})).is_err());
+            assert!(
+                destination(
+                    dir.path(),
+                    &json!({"action":"screenshot","output_path":"linked/capture.png"})
+                )
+                .is_err()
+            );
         }
     }
 

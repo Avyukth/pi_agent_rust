@@ -1521,30 +1521,42 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             use crate::agent::ToolApprovalDecision;
             let tool = AskTool::new(AskPolicy::Error);
-            tool.set_handler(Arc::new(|_request: AskRequest| Box::pin(async {
-                Ok(AskResponse {
-                    answers: vec![AskAnswer {
-                        question_id: "approval:stale".into(),
-                        selected: vec![APPROVAL_ALLOW_LABEL.into()],
-                        other: None,
-                    }],
-                    dismissed: false,
+            tool.set_handler(Arc::new(|_request: AskRequest| {
+                Box::pin(async {
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id: "approval:stale".into(),
+                            selected: vec![APPROVAL_ALLOW_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
                 })
-            })));
-            let decision = approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default())(approval_request("bash")).await;
+            }));
+            let decision = approval_handler_via_ask(
+                tool.clone(),
+                crate::approval::ApprovalState::default(),
+            )(approval_request("bash"))
+            .await;
             assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
 
-            tool.set_handler(Arc::new(|request: AskRequest| Box::pin(async move {
-                Ok(AskResponse {
-                    answers: vec![AskAnswer {
-                        question_id: effective_question_id(&request.questions[0], 0),
-                        selected: vec![APPROVAL_ALLOW_LABEL.into(), APPROVAL_DENY_LABEL.into()],
-                        other: None,
-                    }],
-                    dismissed: false,
+            tool.set_handler(Arc::new(|request: AskRequest| {
+                Box::pin(async move {
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id: effective_question_id(&request.questions[0], 0),
+                            selected: vec![APPROVAL_ALLOW_LABEL.into(), APPROVAL_DENY_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
                 })
-            })));
-            let decision = approval_handler_via_ask(tool, crate::approval::ApprovalState::default())(approval_request("bash")).await;
+            }));
+            let decision = approval_handler_via_ask(
+                tool,
+                crate::approval::ApprovalState::default(),
+            )(approval_request("bash"))
+            .await;
             assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
         });
     }
@@ -1560,7 +1572,9 @@ mod tests {
                 let seen = Arc::clone(&seen);
                 Box::pin(async move {
                     let question_id = effective_question_id(&request.questions[0], 0);
-                    seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(question_id.clone());
+                    seen.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(question_id.clone());
                     Ok(AskResponse {
                         answers: vec![AskAnswer {
                             question_id,
@@ -1572,12 +1586,19 @@ mod tests {
                 })
             }));
             let handler = approval_handler_via_ask(tool, crate::approval::ApprovalState::default());
-            assert_eq!(handler(approval_request("bash")).await, ToolApprovalDecision::Allow);
-            assert_eq!(handler(approval_request("bash")).await, ToolApprovalDecision::Allow);
-            let ids = ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Allow
+            );
+            assert_eq!(
+                handler(approval_request("bash")).await,
+                ToolApprovalDecision::Allow
+            );
+            let ids = ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(ids.len(), 2);
             assert_ne!(ids[0], ids[1]);
         });
     }
-
 }

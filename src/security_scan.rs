@@ -30,7 +30,11 @@ pub struct SecurityScanTool {
 impl SecurityScanTool {
     #[must_use]
     pub fn new(cwd: &Path) -> Self {
-        Self { cwd: cwd.to_path_buf(), source: source::SecurityScanTool::new(cwd), osv:osv::Client::default() }
+        Self {
+            cwd: cwd.to_path_buf(),
+            source: source::SecurityScanTool::new(cwd),
+            osv: osv::Client::default(),
+        }
     }
 
     /// Trusted host override for an OSV-compatible service or loopback fixture.
@@ -50,15 +54,24 @@ impl SecurityScanTool {
 
 #[async_trait::async_trait]
 impl Tool for SecurityScanTool {
-    fn name(&self) -> &'static str { "security_scan" }
-    fn label(&self) -> &'static str { "security scan" }
+    fn name(&self) -> &'static str {
+        "security_scan"
+    }
+    fn label(&self) -> &'static str {
+        "security scan"
+    }
     fn description(&self) -> &'static str {
         "Review local source with plan/run/disposition/compare. dependency_plan inventories Cargo/npm lockfiles offline. audit_dependencies sends eligible public-registry package names, ecosystems and exact versions to OSV, returning known advisory matches and explicit completeness/exclusions. Source code, lockfile paths and private-registry entries are not uploaded. An optional new root-level .sarif report is never overwritten. This is not exploitability or installed-code analysis."
     }
     fn parameters(&self) -> Value {
         let mut schema = self.source.parameters();
         schema["properties"]["op"]["enum"] = json!([
-            "plan", "run", "disposition", "compare", "dependency_plan", "audit_dependencies"
+            "plan",
+            "run",
+            "disposition",
+            "compare",
+            "dependency_plan",
+            "audit_dependencies"
         ]);
         schema["properties"]["op"]["description"] = json!(
             "Source review: plan/run/disposition/compare. dependency_plan: offline lockfile inventory. audit_dependencies: native OSV known-vulnerability lookup."
@@ -73,35 +86,58 @@ impl Tool for SecurityScanTool {
         );
         schema
     }
-    fn effects(&self) -> ToolEffects { self.source.effects().union(ToolEffects::network()) }
+    fn effects(&self) -> ToolEffects {
+        self.source.effects().union(ToolEffects::network())
+    }
 
-    async fn execute(&self, call_id: &str, input: Value,
-        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>) -> Result<ToolOutput>
-    {
-        let op = input.get("op").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
-        if op == "audit_dependencies" { return self.osv.execute(&self.cwd, input).await; }
+    async fn execute(
+        &self,
+        call_id: &str,
+        input: Value,
+        on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let op = input
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if op == "audit_dependencies" {
+            return self.osv.execute(&self.cwd, input).await;
+        }
         if op != "dependency_plan" {
             return self.source.execute(call_id, input, on_update).await;
         }
         let owner = AgentCx::for_current_or_request();
         if !owner.capabilities().io {
-            return Err(Error::tool("security_scan", "dependency inventory requires I/O capability"));
+            return Err(Error::tool(
+                "security_scan",
+                "dependency inventory requires I/O capability",
+            ));
         }
-        owner.checkpoint().map_err(|_| Error::tool("security_scan", "dependency inventory cancelled"))?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("security_scan", "dependency inventory cancelled"))?;
         let input: dependencies::Input = serde_json::from_value(input)
             .map_err(|_| Error::tool("security_scan", "invalid dependency_plan arguments"))?;
         let cwd = self.cwd.clone();
         let inventory = asupersync::runtime::spawn_blocking(move || {
             dependencies::inventory(&cwd, &input.paths)
-        }).await?;
-        owner.checkpoint().map_err(|_| Error::tool("security_scan", "dependency inventory cancelled"))?;
+        })
+        .await?;
+        owner
+            .checkpoint()
+            .map_err(|_| Error::tool("security_scan", "dependency inventory cancelled"))?;
         let text = format!(
             "Dependency inventory: {} exact public-registry package/version pairs in {} lockfile(s); {} excluded entries. No vulnerability service was queried. Scope is selected lockfiles, not every workspace dependency.",
-            inventory.packages.len(), inventory.lockfiles.len(), inventory.excluded.len()
+            inventory.packages.len(),
+            inventory.lockfiles.len(),
+            inventory.excluded.len()
         );
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(text))],
-            details: Some(inventory_preview(&inventory)), is_error: false,
+            details: Some(inventory_preview(&inventory)),
+            is_error: false,
         })
     }
 }
@@ -127,8 +163,20 @@ mod tests {
     fn dependency_inventory_preserves_the_source_tool_schema() {
         let tool = SecurityScanTool::new(Path::new("."));
         let schema = tool.parameters();
-        for op in ["plan", "run", "disposition", "compare", "dependency_plan", "audit_dependencies"] {
-            assert!(schema["properties"]["op"]["enum"].as_array().unwrap().contains(&json!(op)));
+        for op in [
+            "plan",
+            "run",
+            "disposition",
+            "compare",
+            "dependency_plan",
+            "audit_dependencies",
+        ] {
+            assert!(
+                schema["properties"]["op"]["enum"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(op))
+            );
         }
         assert!(schema["properties"]["baseline"].is_object());
         assert!(schema["properties"]["fingerprint"].is_object());
@@ -139,21 +187,35 @@ mod tests {
     #[test]
     fn offline_preview_limits_packages_and_locations_without_hiding_total_counts() {
         let package = dependencies::Package {
-            ecosystem:"npm".into(), name:"example".into(), version:"1.0.0".into(),
-            locations:(0..100).map(|index|dependencies::Location {
-                lockfile:"package-lock.json".into(), package_path:Some(format!("node_modules/parent-{index}/node_modules/example")),
-            }).collect(),
+            ecosystem: "npm".into(),
+            name: "example".into(),
+            version: "1.0.0".into(),
+            locations: (0..100)
+                .map(|index| dependencies::Location {
+                    lockfile: "package-lock.json".into(),
+                    package_path: Some(format!("node_modules/parent-{index}/node_modules/example")),
+                })
+                .collect(),
         };
         let inventory = dependencies::Inventory {
-            schema:dependencies::INVENTORY_SCHEMA.into(), scope:"fixture".into(),
-            lockfiles:vec![], packages:vec![package;100], excluded:vec![],
+            schema: dependencies::INVENTORY_SCHEMA.into(),
+            scope: "fixture".into(),
+            lockfiles: vec![],
+            packages: vec![package; 100],
+            excluded: vec![],
         };
         let preview = inventory_preview(&inventory);
-        assert_eq!(preview["eligiblePackages"],100);
-        assert_eq!(preview["packages"].as_array().unwrap().len(),50);
-        assert_eq!(preview["packagesTruncated"],true);
-        assert_eq!(preview["packages"][0]["locations"].as_array().unwrap().len(),2);
-        assert_eq!(preview["packages"][0]["locationCount"],100);
-        assert_eq!(preview["packages"][0]["locationsTruncated"],true);
+        assert_eq!(preview["eligiblePackages"], 100);
+        assert_eq!(preview["packages"].as_array().unwrap().len(), 50);
+        assert_eq!(preview["packagesTruncated"], true);
+        assert_eq!(
+            preview["packages"][0]["locations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(preview["packages"][0]["locationCount"], 100);
+        assert_eq!(preview["packages"][0]["locationsTruncated"], true);
     }
 }

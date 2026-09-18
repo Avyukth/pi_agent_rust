@@ -122,9 +122,7 @@ fn read_completed(path: &Path, progress: &DownloadRecord) -> Result<Vec<u8>> {
     if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
         return Err(error("download grew beyond the 100 MiB capture budget"));
     }
-    if progress.received_bytes > 0.0
-        && (progress.received_bytes - bytes.len() as f64).abs() > 0.5
-    {
+    if progress.received_bytes > 0.0 && (progress.received_bytes - bytes.len() as f64).abs() > 0.5 {
         return Err(error(
             "completed download byte count did not match Chromium progress",
         ));
@@ -182,11 +180,7 @@ pub(super) async fn execute(
         let start = start.ok_or_else(|| error("click produced no download event"))?;
         if let Err(failure) = policy::check_navigation(&start.url, allowlist) {
             let _ = cdp
-                .browser_command(
-                    owner,
-                    "Browser.cancelDownload",
-                    json!({"guid":start.guid}),
-                )
+                .browser_command(owner, "Browser.cancelDownload", json!({"guid":start.guid}))
                 .await;
             return Err(failure);
         }
@@ -200,11 +194,7 @@ pub(super) async fn execute(
                 || record.total_bytes > MAX_DOWNLOAD_BYTES as f64
             {
                 let _ = cdp
-                    .browser_command(
-                        owner,
-                        "Browser.cancelDownload",
-                        json!({"guid":start.guid}),
-                    )
+                    .browser_command(owner, "Browser.cancelDownload", json!({"guid":start.guid}))
                     .await;
                 return Err(error("download exceeded the 100 MiB capture budget"));
             }
@@ -218,8 +208,8 @@ pub(super) async fn execute(
                 _ => return Err(error("Chromium reported an unknown download state")),
             }
         }
-        let final_record =
-            final_record.ok_or_else(|| error("download did not complete within the CDP event budget"))?;
+        let final_record = final_record
+            .ok_or_else(|| error("download did not complete within the CDP event budget"))?;
         owner
             .checkpoint()
             .map_err(|_| error("download cancelled before reading completed bytes"))?;
@@ -306,9 +296,12 @@ mod tests {
         let path = dir.path().join("guid");
         std::fs::write(&path, b"payload").unwrap();
         let record = DownloadRecord {
-            guid:"guid".into(), url:"https://example.com/file".into(),
-            suggested_filename:"file".into(), state:"completed".into(),
-            received_bytes:7.0, total_bytes:7.0,
+            guid: "guid".into(),
+            url: "https://example.com/file".into(),
+            suggested_filename: "file".into(),
+            state: "completed".into(),
+            received_bytes: 7.0,
+            total_bytes: 7.0,
         };
         assert_eq!(read_completed(&path, &record).unwrap(), b"payload");
         let mut wrong = record.clone();

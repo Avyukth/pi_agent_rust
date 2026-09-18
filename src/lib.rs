@@ -92,9 +92,9 @@ pub mod agent_cx;
 pub mod agent_hub;
 #[doc(hidden)]
 pub mod app;
+pub mod approval;
 #[doc(hidden)]
 pub(crate) mod artifact_output;
-pub mod approval;
 pub mod ask;
 #[doc(hidden)]
 pub mod ast_tools;

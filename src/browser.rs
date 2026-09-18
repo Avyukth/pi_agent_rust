@@ -209,8 +209,10 @@ impl Tool for BrowserTool {
     ) -> Result<ToolOutput> {
         let action = required(&args, "action")?;
         if self.is_mock() {
-            if matches!(action, "start" | "status" | "stop" | "upload" | "download" | "print_pdf")
-                || args.get("full_page").is_some()
+            if matches!(
+                action,
+                "start" | "status" | "stop" | "upload" | "download" | "print_pdf"
+            ) || args.get("full_page").is_some()
             {
                 return Err(Error::tool(
                     "browser",

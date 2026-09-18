@@ -90,13 +90,15 @@ pub(super) async fn execute(
     let pdf = required(args, "action")? == "print_pdf";
     let extension = if pdf { "pdf" } else { "png" };
     let folder = if pdf { "exports" } else { "screenshots" };
-    let requested = args
-        .get("output_path")
-        .and_then(Value::as_str)
-        .map_or_else(
-            || format!("{folder}/browser_{}.{extension}", uuid::Uuid::new_v4().simple()),
-            ToString::to_string,
-        );
+    let requested = args.get("output_path").and_then(Value::as_str).map_or_else(
+        || {
+            format!(
+                "{folder}/browser_{}.{extension}",
+                uuid::Uuid::new_v4().simple()
+            )
+        },
+        ToString::to_string,
+    );
     // Resolve before asking Chromium to render. The shared publisher repeats
     // destination checks under a pinned workspace directory at commit time.
     let target = crate::artifact_output::resolve_new(cwd, &requested, "browser")?;
@@ -252,10 +254,22 @@ mod tests {
     #[test]
     fn export_paths_cannot_escape_or_cross_symlinked_ancestors() {
         let dir = tempfile::tempdir().unwrap();
-        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.pdf", "a\\escape.png"] {
-            let action = if path.ends_with(".pdf") { "print_pdf" } else { "screenshot" };
+        for path in [
+            "../escape.png",
+            "/tmp/escape.png",
+            "a/../../escape.pdf",
+            "a\\escape.png",
+        ] {
+            let action = if path.ends_with(".pdf") {
+                "print_pdf"
+            } else {
+                "screenshot"
+            };
             let args = json!({"action":action,"output_path":path});
-            assert!(validate(&args).is_ok(), "schema validation stays format-focused");
+            assert!(
+                validate(&args).is_ok(),
+                "schema validation stays format-focused"
+            );
             assert!(crate::artifact_output::resolve_new(dir.path(), path, "browser").is_err());
         }
         #[cfg(unix)]
@@ -263,7 +277,10 @@ mod tests {
             use std::os::unix::fs::symlink;
             let outside = tempfile::tempdir().unwrap();
             symlink(outside.path(), dir.path().join("linked")).unwrap();
-            assert!(crate::artifact_output::resolve_new(dir.path(), "linked/capture.png", "browser").is_err());
+            assert!(
+                crate::artifact_output::resolve_new(dir.path(), "linked/capture.png", "browser")
+                    .is_err()
+            );
         }
     }
 
@@ -289,7 +306,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing.pdf");
         std::fs::write(&path, b"do not replace").unwrap();
-        assert!(crate::artifact_output::resolve_new(dir.path(), "existing.pdf", "browser").is_err());
+        assert!(
+            crate::artifact_output::resolve_new(dir.path(), "existing.pdf", "browser").is_err()
+        );
         assert_eq!(std::fs::read(path).unwrap(), b"do not replace");
     }
 }

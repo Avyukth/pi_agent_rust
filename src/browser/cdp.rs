@@ -30,6 +30,83 @@ pub(super) struct DownloadRecord {
     pub(super) total_bytes: f64,
 }
 
+/// The download records whose guid was not already present in `before`.
+fn downloads_since_in(
+    downloads: &BTreeMap<String, DownloadRecord>,
+    before: &BTreeSet<String>,
+) -> Vec<DownloadRecord> {
+    downloads
+        .iter()
+        .filter(|(guid, _)| !before.contains(*guid))
+        .map(|(_, record)| record.clone())
+        .collect()
+}
+
+/// Apply one `Browser.download*` CDP event to a download table.
+///
+/// Free function rather than a `Cdp` method because it touches nothing else:
+/// no socket, no session, no page state. `Cdp::record_download_event` is a
+/// one-line delegation to it, and the test below drives a bare `BTreeMap` —
+/// which is what it was already trying to do, via a
+/// `panic_socket_for_type_only()` helper that was never written, so
+/// `cargo check --all-targets` did not compile.
+fn record_download_event_into(
+    downloads: &mut BTreeMap<String, DownloadRecord>,
+    value: &Value,
+) -> Result<()> {
+    let method = value["method"].as_str().unwrap_or_default();
+    if method == "Browser.downloadWillBegin" {
+        let params = &value["params"];
+        let guid = required(params, "guid")?;
+        let url = required(params, "url")?;
+        let suggested = required(params, "suggestedFilename")?;
+        if guid.len() > 128
+            || guid.chars().any(char::is_control)
+            || url.len() > 64 * 1024
+            || suggested.len() > 4096
+            || suggested.chars().any(char::is_control)
+        {
+            return Err(Error::tool("browser", "invalid bounded download metadata"));
+        }
+        if !downloads.contains_key(guid) && downloads.len() >= MAX_DOWNLOAD_RECORDS {
+            return Err(Error::tool(
+                "browser",
+                "too many browser downloads are being tracked",
+            ));
+        }
+        downloads.insert(
+            guid.to_owned(),
+            DownloadRecord {
+                guid: guid.to_owned(),
+                url: url.to_owned(),
+                suggested_filename: suggested.to_owned(),
+                state: "inProgress".into(),
+                received_bytes: 0.0,
+                total_bytes: 0.0,
+            },
+        );
+    } else if method == "Browser.downloadProgress" {
+        let params = &value["params"];
+        let guid = required(params, "guid")?;
+        if let Some(record) = downloads.get_mut(guid) {
+            let state = required(params, "state")?;
+            if !matches!(state, "inProgress" | "completed" | "canceled") {
+                return Err(Error::tool("browser", "invalid browser download state"));
+            }
+            let number = |name: &str| {
+                params[name]
+                    .as_f64()
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
+            };
+            record.state = state.to_owned();
+            record.received_bytes = number("receivedBytes")?;
+            record.total_bytes = number("totalBytes")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 pub(super) struct Session {
     tabs: BTreeMap<String, String>,
@@ -385,11 +462,7 @@ impl Cdp {
     }
 
     pub(super) fn downloads_since(&self, before: &BTreeSet<String>) -> Vec<DownloadRecord> {
-        self.downloads
-            .iter()
-            .filter(|(guid, _)| !before.contains(*guid))
-            .map(|(_, record)| record.clone())
-            .collect()
+        downloads_since_in(&self.downloads, before)
     }
 
     pub(super) fn download_record(&self, guid: &str) -> Option<DownloadRecord> {
@@ -397,54 +470,7 @@ impl Cdp {
     }
 
     fn record_download_event(&mut self, value: &Value) -> Result<()> {
-        let method = value["method"].as_str().unwrap_or_default();
-        if method == "Browser.downloadWillBegin" {
-            let params = &value["params"];
-            let guid = required(params, "guid")?;
-            let url = required(params, "url")?;
-            let suggested = required(params, "suggestedFilename")?;
-            if guid.len() > 128
-                || guid.chars().any(char::is_control)
-                || url.len() > 64 * 1024
-                || suggested.len() > 4096
-                || suggested.chars().any(char::is_control)
-            {
-                return Err(Error::tool("browser", "invalid bounded download metadata"));
-            }
-            if !self.downloads.contains_key(guid) && self.downloads.len() >= MAX_DOWNLOAD_RECORDS {
-                return Err(Error::tool("browser", "too many browser downloads are being tracked"));
-            }
-            self.downloads.insert(
-                guid.to_owned(),
-                DownloadRecord {
-                    guid: guid.to_owned(),
-                    url: url.to_owned(),
-                    suggested_filename: suggested.to_owned(),
-                    state: "inProgress".into(),
-                    received_bytes: 0.0,
-                    total_bytes: 0.0,
-                },
-            );
-        } else if method == "Browser.downloadProgress" {
-            let params = &value["params"];
-            let guid = required(params, "guid")?;
-            if let Some(record) = self.downloads.get_mut(guid) {
-                let state = required(params, "state")?;
-                if !matches!(state, "inProgress" | "completed" | "canceled") {
-                    return Err(Error::tool("browser", "invalid browser download state"));
-                }
-                let number = |name: &str| {
-                    params[name]
-                        .as_f64()
-                        .filter(|value| value.is_finite() && *value >= 0.0)
-                        .ok_or_else(|| Error::tool("browser", format!("invalid download {name}")))
-                };
-                record.state = state.to_owned();
-                record.received_bytes = number("receivedBytes")?;
-                record.total_bytes = number("totalBytes")?;
-            }
-        }
-        Ok(())
+        record_download_event_into(&mut self.downloads, value)
     }
 
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
@@ -925,30 +951,34 @@ mod tests {
         downloads.insert(
             "old".to_string(),
             DownloadRecord {
-                guid:"old".into(), url:"https://example.com/old".into(),
-                suggested_filename:"old.bin".into(), state:"completed".into(),
-                received_bytes:1.0, total_bytes:1.0,
+                guid: "old".into(),
+                url: "https://example.com/old".into(),
+                suggested_filename: "old.bin".into(),
+                state: "completed".into(),
+                received_bytes: 1.0,
+                total_bytes: 1.0,
             },
         );
         let before: BTreeSet<String> = downloads.keys().cloned().collect();
-        let mut cdp = Cdp {
-            socket: panic_socket_for_type_only(),
-            next_id:0,
-            session_id:None,
-            loaded:BTreeSet::new(),
-            downloads,
-            timeout_ms:1000,
-        };
-        cdp.record_download_event(&json!({"method":"Browser.downloadWillBegin","params":{
-            "guid":"new","url":"https://example.com/file","suggestedFilename":"file.bin"
-        }})).unwrap();
-        cdp.record_download_event(&json!({"method":"Browser.downloadProgress","params":{
-            "guid":"new","state":"completed","receivedBytes":7,"totalBytes":7
-        }})).unwrap();
-        let fresh = cdp.downloads_since(&before);
-        assert_eq!(fresh.len(),1);
-        assert_eq!(fresh[0].state,"completed");
-        assert_eq!(fresh[0].received_bytes,7.0);
+        // Driven through the free functions the `Cdp` methods delegate to: this
+        // exercise needs a download table, not a live CDP websocket.
+        record_download_event_into(
+            &mut downloads,
+            &json!({"method":"Browser.downloadWillBegin","params":{
+                "guid":"new","url":"https://example.com/file","suggestedFilename":"file.bin"
+            }}),
+        )
+        .unwrap();
+        record_download_event_into(
+            &mut downloads,
+            &json!({"method":"Browser.downloadProgress","params":{
+                "guid":"new","state":"completed","receivedBytes":7,"totalBytes":7
+            }}),
+        )
+        .unwrap();
+        let fresh = downloads_since_in(&downloads, &before);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].state, "completed");
+        assert_eq!(fresh[0].received_bytes, 7.0);
     }
-
 }

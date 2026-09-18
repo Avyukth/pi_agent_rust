@@ -26,11 +26,7 @@ fn error(tool: &str, message: impl Into<String>) -> Error {
     Error::tool(tool, message)
 }
 
-pub(crate) fn resolve_new(
-    cwd: &Path,
-    requested: &str,
-    tool: &str,
-) -> Result<OutputTarget> {
+pub(crate) fn resolve_new(cwd: &Path, requested: &str, tool: &str) -> Result<OutputTarget> {
     if requested.is_empty()
         || requested.len() > 4096
         || requested.contains('\0')
@@ -44,11 +40,15 @@ pub(crate) fn resolve_new(
     }
     let relative = PathBuf::from(requested);
     if relative.is_absolute() || relative.file_name().is_none() {
-        return Err(error(tool, "output_path must name a relative file inside the workspace"));
+        return Err(error(
+            tool,
+            "output_path must name a relative file inside the workspace",
+        ));
     }
-    if relative.components().any(|component| {
-        !matches!(component, Component::Normal(_) | Component::CurDir)
-    }) {
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
         return Err(error(
             tool,
             "output_path may not contain parent traversal, a root, or a platform path prefix",
@@ -85,7 +85,9 @@ pub(crate) fn resolve_new(
     let mut cursor = root.clone();
     if let Some(parent) = relative.parent() {
         for component in parent.components() {
-            let Component::Normal(name) = component else { continue };
+            let Component::Normal(name) = component else {
+                continue;
+            };
             cursor.push(name);
             match std::fs::symlink_metadata(&cursor) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -105,7 +107,11 @@ pub(crate) fn resolve_new(
             }
         }
     }
-    Ok(OutputTarget { root, relative, absolute })
+    Ok(OutputTarget {
+        root,
+        relative,
+        absolute,
+    })
 }
 
 #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
@@ -116,13 +122,19 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
     if bytes.is_empty() {
         return Err(error(tool, "refusing to publish an empty artifact"));
     }
-    let directory_flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let mut directory = rustix::fs::open(&target.root, directory_flags, Mode::empty())
-        .map_err(|_| error(tool, "workspace root could not be pinned without following links"))?;
+    let directory_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let mut directory =
+        rustix::fs::open(&target.root, directory_flags, Mode::empty()).map_err(|_| {
+            error(
+                tool,
+                "workspace root could not be pinned without following links",
+            )
+        })?;
     if let Some(parent) = target.relative.parent() {
         for component in parent.components() {
-            let Component::Normal(name) = component else { continue };
+            let Component::Normal(name) = component else {
+                continue;
+            };
             let next = match rustix::fs::openat(&directory, name, directory_flags, Mode::empty()) {
                 Ok(next) => next,
                 Err(rustix::io::Errno::NOENT) => {
@@ -137,7 +149,12 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
                     rustix::fs::openat(&directory, name, directory_flags, Mode::empty())
                         .map_err(|_| error(tool, "artifact directory is missing or symbolic"))?
                 }
-                Err(_) => return Err(error(tool, "artifact path passes through a symbolic link or non-directory")),
+                Err(_) => {
+                    return Err(error(
+                        tool,
+                        "artifact path passes through a symbolic link or non-directory",
+                    ));
+                }
             };
             directory = next;
         }
@@ -154,7 +171,12 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     ) {
-        Ok(_) => return Err(error(tool, "output_path already exists; refusing to overwrite")),
+        Ok(_) => {
+            return Err(error(
+                tool,
+                "output_path already exists; refusing to overwrite",
+            ));
+        }
         Err(rustix::io::Errno::NOENT) => {}
         Err(_) => return Err(error(tool, "cannot safely inspect output_path")),
     }
@@ -175,7 +197,10 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
             let _ = rustix::fs::unlinkat(self.directory, self.name.as_str(), AtFlags::empty());
         }
     }
-    let _stage = Stage { directory: &directory, name: stage_name.clone() };
+    let _stage = Stage {
+        directory: &directory,
+        name: stage_name.clone(),
+    };
     let mut file = std::fs::File::from(stage_fd);
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
@@ -187,7 +212,12 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
         name,
         AtFlags::empty(),
     )
-    .map_err(|_| error(tool, "artifact destination exists or cannot be published without overwrite"))?;
+    .map_err(|_| {
+        error(
+            tool,
+            "artifact destination exists or cannot be published without overwrite",
+        )
+    })?;
     Ok(())
 }
 
@@ -197,13 +227,23 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
     if bytes.is_empty() {
         return Err(error(tool, "refusing to publish an empty artifact"));
     }
-    let parent = target.absolute.parent().ok_or_else(|| error(tool, "output_path has no parent"))?;
+    let parent = target
+        .absolute
+        .parent()
+        .ok_or_else(|| error(tool, "output_path has no parent"))?;
     std::fs::create_dir_all(parent)
         .map_err(|failure| error(tool, format!("cannot create artifact directory: {failure}")))?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .map_err(|failure| error(tool, format!("cannot resolve artifact directory: {failure}")))?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|failure| {
+        error(
+            tool,
+            format!("cannot resolve artifact directory: {failure}"),
+        )
+    })?;
     if !canonical_parent.starts_with(&target.root) {
-        return Err(error(tool, "output_path escaped the workspace through a linked directory"));
+        return Err(error(
+            tool,
+            "output_path escaped the workspace through a linked directory",
+        ));
     }
     let mut staged = tempfile::NamedTempFile::new_in(&canonical_parent)
         .map_err(|failure| error(tool, format!("cannot stage artifact: {failure}")))?;
@@ -211,13 +251,23 @@ pub(crate) fn publish(target: &OutputTarget, bytes: &[u8], tool: &str) -> Result
         .write_all(bytes)
         .and_then(|()| staged.as_file().sync_all())
         .map_err(|failure| error(tool, format!("cannot write artifact: {failure}")))?;
-    let canonical_parent_after = std::fs::canonicalize(parent)
-        .map_err(|failure| error(tool, format!("cannot revalidate artifact directory: {failure}")))?;
-    if canonical_parent_after != canonical_parent || !canonical_parent_after.starts_with(&target.root) {
+    let canonical_parent_after = std::fs::canonicalize(parent).map_err(|failure| {
+        error(
+            tool,
+            format!("cannot revalidate artifact directory: {failure}"),
+        )
+    })?;
+    if canonical_parent_after != canonical_parent
+        || !canonical_parent_after.starts_with(&target.root)
+    {
         return Err(error(tool, "artifact directory changed before publication"));
     }
-    staged.persist_noclobber(&target.absolute)
-        .map_err(|_| error(tool, "artifact destination exists or cannot be published without overwrite"))?;
+    staged.persist_noclobber(&target.absolute).map_err(|_| {
+        error(
+            tool,
+            "artifact destination exists or cannot be published without overwrite",
+        )
+    })?;
     Ok(())
 }
 

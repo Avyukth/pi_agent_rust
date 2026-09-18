@@ -408,7 +408,6 @@ fn test_media_tools_opt_in_activation() {
     finish_case(&harness, "media_tools_opt_in");
 }
 
-
 #[test]
 fn test_registry_forwards_image_model_and_tts_provider_defaults() {
     let harness = TestHarness::new("media_registry_defaults");
@@ -439,7 +438,9 @@ fn test_registry_forwards_image_model_and_tts_provider_defaults() {
             .await
             .expect_err("configured invalid image model must reach adapter validation");
         assert!(
-            image_error.to_string().contains("model must be a nonempty identifier"),
+            image_error
+                .to_string()
+                .contains("model must be a nonempty identifier"),
             "{image_error}"
         );
 
@@ -450,7 +451,9 @@ fn test_registry_forwards_image_model_and_tts_provider_defaults() {
             .await
             .expect_err("configured invalid TTS provider must reach adapter validation");
         assert!(
-            speech_error.to_string().contains("speech provider must be openai or xai"),
+            speech_error
+                .to_string()
+                .contains("speech provider must be openai or xai"),
             "{speech_error}"
         );
     });

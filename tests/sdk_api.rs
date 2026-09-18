@@ -216,7 +216,10 @@ printf '{"type":"agent_end","sessionId":"early","messages":[]}\n'
         None,
         None,
         move |event| {
-            seen_cb.lock().unwrap().push(event["type"].as_str().unwrap().to_string());
+            seen_cb
+                .lock()
+                .unwrap()
+                .push(event["type"].as_str().unwrap().to_string());
             times_cb.lock().unwrap().push(started.elapsed());
         },
     ))
@@ -292,7 +295,9 @@ printf '{"type":"agent_end","sessionId":"sess-control","control":"%s","messages"
         None,
         move |event| {
             if event["type"] == "agent_start" {
-                let id = control.abort().expect("dispatch abort while prompt owns stdout");
+                let id = control
+                    .abort()
+                    .expect("dispatch abort while prompt owns stdout");
                 *stored.lock().unwrap() = Some(id);
             }
         },
@@ -300,7 +305,11 @@ printf '{"type":"agent_end","sessionId":"sess-control","control":"%s","messages"
     .expect("prompt completes after abort acknowledgement");
     assert_eq!(events.last().unwrap()["control"], "abort");
     assert!(
-        control_id.lock().unwrap().as_deref().is_some_and(|id| id.starts_with("rpc-")),
+        control_id
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|id| id.starts_with("rpc-")),
         "control command must receive an SDK-owned unique request id"
     );
 }
@@ -318,5 +327,8 @@ fn sdk_rpc_control_handle_ids_share_the_client_sequence() {
     let first = control.steer("one").expect("steer dispatch");
     let second = control.follow_up("two").expect("follow-up dispatch");
     let third = control.abort().expect("abort dispatch");
-    assert_eq!([first.as_str(), second.as_str(), third.as_str()], ["rpc-1", "rpc-2", "rpc-3"]);
+    assert_eq!(
+        [first.as_str(), second.as_str(), third.as_str()],
+        ["rpc-1", "rpc-2", "rpc-3"]
+    );
 }

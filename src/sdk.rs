@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
@@ -1410,7 +1410,12 @@ impl RpcTransportClient {
 
         let mut saw_ack = false;
         let mut events = Vec::new();
-        let mut pre_ack = Vec::new();
+        // Annotated, not inferred: the first USE of the element type is
+        // `event.get("type")` in the drain loop below, and the only thing that
+        // would constrain it is the `pre_ack.push(item)` further down. Method
+        // resolution does not wait, so without this the crate does not compile
+        // (E0282).
+        let mut pre_ack: Vec<Value> = Vec::new();
         let mut pre_ack_bytes = 0usize;
         loop {
             let item = self.read_json_line()?;
@@ -1506,7 +1511,9 @@ impl RpcTransportClient {
                         "RPC subprocess exited before sending a response",
                     ));
                 }
-                return Err(Error::api("RPC subprocess ended in the middle of a JSON line"));
+                return Err(Error::api(
+                    "RPC subprocess ended in the middle of a JSON line",
+                ));
             }
             if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
                 if newline > RPC_MAX_LINE_BYTES.saturating_sub(line.len()) {
@@ -1561,15 +1568,14 @@ impl RpcTransportClient {
 
 fn next_rpc_request_id(counter: &AtomicU64) -> Result<String> {
     let id = counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
         .map_err(|_| Error::api("RPC request id space exhausted"))?;
     Ok(format!("rpc-{id}"))
 }
 
-fn write_rpc_json_line(
-    stdin: &Mutex<BufWriter<ChildStdin>>,
-    payload: &Value,
-) -> Result<()> {
+fn write_rpc_json_line(stdin: &Mutex<BufWriter<ChildStdin>>, payload: &Value) -> Result<()> {
     let encoded = serde_json::to_string(payload).map_err(|err| Error::Json(Box::new(err)))?;
     let mut stdin = stdin
         .lock()
@@ -3252,9 +3258,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
     // schema; disabling it does not remove the host's authorization surface.
     let ask_tool_handle = Some(host_ask.clone());
     if enabled_tools.contains(&"ask") {
-        agent_session
-            .agent
-            .extend_tools(vec![Box::new(host_ask.clone()) as Box<dyn crate::tools::Tool>]);
+        agent_session.agent.extend_tools(vec![
+            Box::new(host_ask.clone()) as Box<dyn crate::tools::Tool>
+        ]);
     }
     // Approval prompts bridge through the host picker whether or not the
     // model-facing ask tool is enabled.
@@ -5359,5 +5365,4 @@ export default function init(pi) {
         assert!(!handle.has_tool("ask"));
         assert!(handle.ask_tool().is_some());
     }
-
 }

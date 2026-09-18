@@ -17,10 +17,14 @@ const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
 const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(60);
 
 fn is_warmup_empty_retryable(method: &str) -> bool {
-    matches!(method,
-        "textDocument/definition" | "textDocument/typeDefinition"
-        | "textDocument/implementation" | "textDocument/references"
-        | "textDocument/hover" | "textDocument/rename"
+    matches!(
+        method,
+        "textDocument/definition"
+            | "textDocument/typeDefinition"
+            | "textDocument/implementation"
+            | "textDocument/references"
+            | "textDocument/hover"
+            | "textDocument/rename"
     )
 }
 
@@ -33,8 +37,14 @@ fn is_empty_result(value: &Value) -> bool {
         Value::Object(map) => {
             map.is_empty()
                 || ((map.contains_key("changes") || map.contains_key("documentChanges"))
-                    && map.get("changes").and_then(Value::as_object).is_none_or(serde_json::Map::is_empty)
-                    && map.get("documentChanges").and_then(Value::as_array).is_none_or(Vec::is_empty))
+                    && map
+                        .get("changes")
+                        .and_then(Value::as_object)
+                        .is_none_or(serde_json::Map::is_empty)
+                    && map
+                        .get("documentChanges")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty))
         }
         _ => false,
     }
@@ -85,7 +95,9 @@ pub fn path_to_uri(path: &Path) -> String {
     out.push_str("file://");
     for byte in raw.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
             _ => {
                 use std::fmt::Write as _;
                 out.push('%');
@@ -157,14 +169,21 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    pub async fn connect(command: &str, args: &[String], env: &[(String, String)], root: &Path,
-        initialization_options: Option<&Value>, timeout: Duration) -> Result<Self>
-    {
+    pub async fn connect(
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        root: &Path,
+        initialization_options: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let rpc = JsonRpcClient::spawn(command, args, env, root)?;
         let root = root.to_path_buf();
         let root_uri = path_to_uri(&root);
         let client = Self {
-            rpc, root, root_uri: root_uri.clone(),
+            rpc,
+            root,
+            root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
             request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
@@ -208,25 +227,45 @@ impl LspClient {
         if let Some(options) = initialization_options {
             params["initializationOptions"] = options.clone();
         }
-        let result = client.call("initialize", params, timeout).await.map_err(|err| {
-            client.rpc.kill();
-            Error::from(err)
-        })?;
+        let result = client
+            .call("initialize", params, timeout)
+            .await
+            .map_err(|err| {
+                client.rpc.kill();
+                Error::from(err)
+            })?;
         let caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
-        let will_rename_files = caps.pointer("/workspace/fileOperations/willRenameFiles").is_some();
+        let will_rename_files = caps
+            .pointer("/workspace/fileOperations/willRenameFiles")
+            .is_some();
         let sync_kind = caps.get("textDocumentSync").map_or(1, |sync| {
-            sync.get("change").and_then(Value::as_u64).or_else(|| sync.as_u64()).unwrap_or(1)
+            sync.get("change")
+                .and_then(Value::as_u64)
+                .or_else(|| sync.as_u64())
+                .unwrap_or(1)
         });
-        let server_name = result.get("serverInfo").and_then(|info| info.get("name"))
-            .and_then(Value::as_str).map(str::to_string);
-        *Self::lock(&client.capabilities) = ServerCapabilities { raw:caps, will_rename_files, sync_kind, server_name };
-        client.rpc.notify("initialized", serde_json::json!({}))
+        let server_name = result
+            .get("serverInfo")
+            .and_then(|info| info.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        *Self::lock(&client.capabilities) = ServerCapabilities {
+            raw: caps,
+            will_rename_files,
+            sync_kind,
+            server_name,
+        };
+        client
+            .rpc
+            .notify("initialized", serde_json::json!({}))
             .map_err(|err| Error::tool("lsp", format!("[LSP_TRANSPORT_IO] {}", err.message())))?;
         Ok(client)
     }
 
     fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[must_use]
@@ -235,16 +274,24 @@ impl LspClient {
     }
 
     #[must_use]
-    pub fn root(&self) -> &Path { &self.root }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     #[must_use]
-    pub fn is_alive(&self) -> bool { self.rpc.is_alive() && !self.rpc.child_exited() }
+    pub fn is_alive(&self) -> bool {
+        self.rpc.is_alive() && !self.rpc.child_exited()
+    }
 
     #[must_use]
-    pub fn stderr_tail(&self) -> String { self.rpc.stderr_tail() }
+    pub fn stderr_tail(&self) -> String {
+        self.rpc.stderr_tail()
+    }
 
     #[must_use]
-    pub fn dropped_notifications(&self) -> u64 { self.rpc.dropped_notifications() }
+    pub fn dropped_notifications(&self) -> u64 {
+        self.rpc.dropped_notifications()
+    }
 
     #[must_use]
     pub fn diagnostics_snapshot(&self) -> HashMap<String, Vec<Value>> {
@@ -253,13 +300,26 @@ impl LspClient {
     }
 
     #[must_use]
-    pub fn open_document_count(&self) -> usize { Self::lock(&self.open_docs).len() }
+    pub fn open_document_count(&self) -> usize {
+        Self::lock(&self.open_docs).len()
+    }
 
     #[must_use]
     pub fn document_snapshots(&self) -> HashMap<PathBuf, DocumentSnapshot> {
-        Self::lock(&self.open_docs).iter().filter_map(|(uri, doc)| {
-            uri_to_path(uri).map(|path| (path, DocumentSnapshot { version:doc.version, hash:doc.disk_hash }))
-        }).collect()
+        Self::lock(&self.open_docs)
+            .iter()
+            .filter_map(|(uri, doc)| {
+                uri_to_path(uri).map(|path| {
+                    (
+                        path,
+                        DocumentSnapshot {
+                            version: doc.version,
+                            hash: doc.disk_hash,
+                        },
+                    )
+                })
+            })
+            .collect()
     }
 
     pub fn poll_notifications(&self) {
@@ -267,12 +327,18 @@ impl LspClient {
             if notification.method == "textDocument/publishDiagnostics"
                 && let (Some(uri), Some(diags)) = (
                     notification.params.get("uri").and_then(Value::as_str),
-                    notification.params.get("diagnostics").and_then(Value::as_array),
+                    notification
+                        .params
+                        .get("diagnostics")
+                        .and_then(Value::as_array),
                 )
             {
                 Self::lock(&self.diagnostics).insert(uri.to_string(), diags.clone());
             } else if notification.method == "experimental/serverStatus"
-                && let Some(quiescent) = notification.params.get("quiescent").and_then(Value::as_bool)
+                && let Some(quiescent) = notification
+                    .params
+                    .get("quiescent")
+                    .and_then(Value::as_bool)
             {
                 self.quiescent.store(quiescent, Ordering::SeqCst);
             }
@@ -281,18 +347,27 @@ impl LspClient {
 
     pub async fn wait_for_diagnostics(&self, uri: &str, wait: Duration) -> bool {
         let cx = AgentCx::for_current_or_request();
-        let start = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         loop {
             self.poll_notifications();
             {
                 let cache = Self::lock(&self.diagnostics);
                 if let Some(diags) = cache.get(uri) {
-                    let settled = !diags.is_empty() || self.quiescent.load(Ordering::SeqCst)
+                    let settled = !diags.is_empty()
+                        || self.quiescent.load(Ordering::SeqCst)
                         || self.connected_at.elapsed() >= WARMUP_EMPTY_RESULT_WINDOW;
-                    if settled { return true; }
+                    if settled {
+                        return true;
+                    }
                 }
             }
-            let now = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             if Duration::from_nanos(now.duration_since(start)) >= wait {
                 return Self::lock(&self.diagnostics).contains_key(uri);
             }
@@ -300,47 +375,95 @@ impl LspClient {
         }
     }
 
-    pub async fn call(&self, method: &str, params: Value, timeout: Duration) -> std::result::Result<Value, LspCallError> {
+    pub async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> std::result::Result<Value, LspCallError> {
         let cx = AgentCx::for_current_or_request();
-        let start = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         let mut attempt = self.call_once(method, params.clone(), timeout).await;
         loop {
             // Never retry commands: a server error does not prove that its
             // command or workspace/applyEdit side effects were rolled back.
-            let retryable = is_warmup_empty_retryable(method) && matches!(
-                &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
-                    if (err.code == -32602 && err.message.contains("No references found")) || err.code == -32801
-            );
+            let retryable = is_warmup_empty_retryable(method)
+                && matches!(
+                    &attempt, Err(LspCallError::Transport(TransportError::Server(err)))
+                        if (err.code == -32602 && err.message.contains("No references found")) || err.code == -32801
+                );
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
                 && is_warmup_empty_retryable(method)
                 && self.connected_at.elapsed() < WARMUP_EMPTY_RESULT_WINDOW;
-            if !retryable && !empty_during_warmup { return attempt; }
-            let now = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            if !retryable && !empty_during_warmup {
+                return attempt;
+            }
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             let remaining = timeout.saturating_sub(Duration::from_nanos(now.duration_since(start)));
-            if remaining < WARMUP_RETRY_CADENCE * 2 { return attempt; }
+            if remaining < WARMUP_RETRY_CADENCE * 2 {
+                return attempt;
+            }
             asupersync::time::sleep(now, WARMUP_RETRY_CADENCE).await;
-            if cx.checkpoint().is_err() { return Err(LspCallError::Cancelled); }
-            attempt = self.call_once(method, params.clone(), remaining.saturating_sub(WARMUP_RETRY_CADENCE)).await;
+            if cx.checkpoint().is_err() {
+                return Err(LspCallError::Cancelled);
+            }
+            attempt = self
+                .call_once(
+                    method,
+                    params.clone(),
+                    remaining.saturating_sub(WARMUP_RETRY_CADENCE),
+                )
+                .await;
         }
     }
 
-    async fn call_once(&self, method: &str, params: Value, timeout: Duration) -> std::result::Result<Value, LspCallError> {
+    async fn call_once(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> std::result::Result<Value, LspCallError> {
         let cx = AgentCx::for_current_or_request();
-        let _lane = asupersync::sync::OwnedMutexGuard::lock(std::sync::Arc::clone(&self.request_lane), cx.cx())
-            .await.map_err(|_| LspCallError::Cancelled)?;
-        let (id, rx) = self.rpc.request(method, params).map_err(LspCallError::Transport)?;
-        let start = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let _lane = asupersync::sync::OwnedMutexGuard::lock(
+            std::sync::Arc::clone(&self.request_lane),
+            cx.cx(),
+        )
+        .await
+        .map_err(|_| LspCallError::Cancelled)?;
+        let (id, rx) = self
+            .rpc
+            .request(method, params)
+            .map_err(LspCallError::Transport)?;
+        let start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         loop {
             match rx.try_recv() {
                 Ok(Ok(value)) => return Ok(value),
                 Ok(Err(err)) => return Err(LspCallError::Transport(err)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Err(LspCallError::Transport(TransportError::Closed("completion channel dropped".to_string()))),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(LspCallError::Transport(TransportError::Closed(
+                        "completion channel dropped".to_string(),
+                    )));
+                }
             }
-            let now = cx.cx().timer_driver().map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             if Duration::from_nanos(now.duration_since(start)) >= timeout {
                 self.rpc.cancel_request(id);
-                return Err(LspCallError::Timeout { timeout_ms:u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX) });
+                return Err(LspCallError::Timeout {
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                });
             }
             if cx.checkpoint().is_err() {
                 self.rpc.cancel_request(id);
@@ -355,13 +478,24 @@ impl LspClient {
     pub fn ensure_synced(&self, path: &Path, language_id: &str) -> Result<String> {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         let uri = path_to_uri(&canonical);
-        let content = std::fs::read_to_string(&canonical).map_err(|err| Error::tool("lsp", format!("[LSP_FILE_UNREADABLE] cannot read {}: {err}", canonical.display())))?;
+        let content = std::fs::read_to_string(&canonical).map_err(|err| {
+            Error::tool(
+                "lsp",
+                format!(
+                    "[LSP_FILE_UNREADABLE] cannot read {}: {err}",
+                    canonical.display()
+                ),
+            )
+        })?;
         let disk_hash = content_hash(&content);
         let prior = Self::lock(&self.open_docs).get(&uri).cloned();
         match prior {
             Some(doc) if doc.disk_hash == disk_hash => Ok(uri),
             Some(_) => {
-                let _ = self.rpc.notify("textDocument/didClose", serde_json::json!({"textDocument":{"uri":uri}}));
+                let _ = self.rpc.notify(
+                    "textDocument/didClose",
+                    serde_json::json!({"textDocument":{"uri":uri}}),
+                );
                 Self::lock(&self.open_docs).remove(&uri);
                 Self::lock(&self.diagnostics).remove(&uri);
                 self.open_document(&uri, &content, disk_hash, language_id)
@@ -370,27 +504,50 @@ impl LspClient {
         }
     }
 
-    fn open_document(&self, uri: &str, content: &str, disk_hash: u64, language_id: &str) -> Result<String> {
+    fn open_document(
+        &self,
+        uri: &str,
+        content: &str,
+        disk_hash: u64,
+        language_id: &str,
+    ) -> Result<String> {
         let version = self.next_document_version.try_update(Ordering::SeqCst, Ordering::SeqCst,
             |value| (value < 2_147_483_647).then_some(value + 1))
             .map_err(|_| Error::tool("lsp", "[LSP_VERSION_EXHAUSTED] reload the language server before reopening more documents"))?;
-        self.rpc.notify("textDocument/didOpen", serde_json::json!({"textDocument":{
-            "uri":uri,"languageId":language_id,"version":version,"text":content
-        }})).map_err(|err| Error::tool("lsp", format!("[{}] {}", err.code(), err.message())))?;
-        Self::lock(&self.open_docs).insert(uri.to_string(), OpenDoc { version, disk_hash, language_id:language_id.to_string() });
+        self.rpc
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({"textDocument":{
+                    "uri":uri,"languageId":language_id,"version":version,"text":content
+                }}),
+            )
+            .map_err(|err| Error::tool("lsp", format!("[{}] {}", err.code(), err.message())))?;
+        Self::lock(&self.open_docs).insert(
+            uri.to_string(),
+            OpenDoc {
+                version,
+                disk_hash,
+                language_id: language_id.to_string(),
+            },
+        );
         Ok(uri.to_string())
     }
 
     pub fn invalidate(&self, uri: &str) {
         if Self::lock(&self.open_docs).remove(uri).is_some() {
-            let _ = self.rpc.notify("textDocument/didClose", serde_json::json!({"textDocument":{"uri":uri}}));
+            let _ = self.rpc.notify(
+                "textDocument/didClose",
+                serde_json::json!({"textDocument":{"uri":uri}}),
+            );
         }
         Self::lock(&self.diagnostics).remove(uri);
     }
 
     pub fn invalidate_all(&self) {
         let uris: Vec<_> = Self::lock(&self.open_docs).keys().cloned().collect();
-        for uri in uris { self.invalidate(&uri); }
+        for uri in uris {
+            self.invalidate(&uri);
+        }
     }
 
     pub async fn stop(&self) {
@@ -398,13 +555,19 @@ impl LspClient {
         self.rpc.shutdown();
     }
 
-    pub fn kill(&self) { self.rpc.kill(); }
+    pub fn kill(&self) {
+        self.rpc.kill();
+    }
 
     pub fn set_server_request_handler(&self, handler: super::jsonrpc::ServerRequestHandler) {
         self.rpc.set_server_request_handler(handler);
     }
 
-    pub fn call_no_wait_notify(&self, method: &str, params: Value) -> std::result::Result<(), TransportError> {
+    pub fn call_no_wait_notify(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<(), TransportError> {
         self.rpc.notify(method, params)
     }
 }
@@ -419,9 +582,15 @@ pub fn parse_locations(result: &Value) -> Vec<(String, super::text::Range)> {
     };
     for item in items {
         let (uri, range) = if let Some(uri) = item.get("targetUri").and_then(Value::as_str) {
-            (uri, item.get("targetSelectionRange").or_else(|| item.get("targetRange")))
+            (
+                uri,
+                item.get("targetSelectionRange")
+                    .or_else(|| item.get("targetRange")),
+            )
         } else {
-            let Some(uri) = item.get("uri").and_then(Value::as_str) else { continue; };
+            let Some(uri) = item.get("uri").and_then(Value::as_str) else {
+                continue;
+            };
             (uri, item.get("range"))
         };
         if let Some(range) = range.and_then(|r| serde_json::from_value(r.clone()).ok()) {
@@ -445,7 +614,11 @@ pub fn hover_to_text(result: &Value) -> Option<String> {
     match contents {
         Value::Array(items) => {
             let parts: Vec<_> = items.iter().filter_map(marked_string_text).collect();
-            if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
         }
         single => marked_string_text(single),
     }
@@ -459,45 +632,55 @@ mod tests {
     fn uri_roundtrip_plain() {
         let path = PathBuf::from("/tmp/workspace/src/main.rs");
         let uri = path_to_uri(&path);
-        assert_eq!(uri,"file:///tmp/workspace/src/main.rs");
-        assert_eq!(uri_to_path(&uri),Some(path));
+        assert_eq!(uri, "file:///tmp/workspace/src/main.rs");
+        assert_eq!(uri_to_path(&uri), Some(path));
     }
 
     #[test]
     fn uri_encodes_specials() {
         let path = PathBuf::from("/tmp/my project/fi#1?.rs");
         let uri = path_to_uri(&path);
-        assert_eq!(uri,"file:///tmp/my%20project/fi%231%3F.rs");
-        assert_eq!(uri_to_path(&uri),Some(path));
+        assert_eq!(uri, "file:///tmp/my%20project/fi%231%3F.rs");
+        assert_eq!(uri_to_path(&uri), Some(path));
     }
 
     #[test]
-    fn uri_rejects_non_file() { assert_eq!(uri_to_path("https://example.com/x"),None); }
+    fn uri_rejects_non_file() {
+        assert_eq!(uri_to_path("https://example.com/x"), None);
+    }
 
     #[test]
     fn parse_locations_handles_all_shapes() {
         let single = serde_json::json!({"uri":"file:///a.rs","range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}}});
         let got = parse_locations(&single);
-        assert_eq!(got.len(),1);
-        assert_eq!(got[0].0,"file:///a.rs");
-        assert_eq!(got[0].1.start.line,1);
-        assert_eq!(parse_locations(&serde_json::json!([single])).len(),1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "file:///a.rs");
+        assert_eq!(got[0].1.start.line, 1);
+        assert_eq!(parse_locations(&serde_json::json!([single])).len(), 1);
         let link = serde_json::json!({"targetUri":"file:///b.rs","targetRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"targetSelectionRange":{"start":{"line":0,"character":1},"end":{"line":0,"character":2}}});
         let got = parse_locations(&link);
-        assert_eq!(got.len(),1);
-        assert_eq!(got[0].0,"file:///b.rs");
-        assert_eq!(got[0].1.start.character,1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "file:///b.rs");
+        assert_eq!(got[0].1.start.character, 1);
         assert!(parse_locations(&Value::Null).is_empty());
         assert!(parse_locations(&serde_json::json!(42)).is_empty());
     }
 
     #[test]
     fn hover_text_handles_markup_and_marked() {
-        let markup = serde_json::json!({"contents":{"kind":"markdown","value":"```rust\nfn x()\n```"}});
-        assert_eq!(hover_to_text(&markup),Some("```rust\nfn x()\n```".to_string()));
-        let marked = serde_json::json!({"contents":[{"language":"rust","value":"fn x()"},"docs here"]});
-        assert_eq!(hover_to_text(&marked),Some("fn x()\n\ndocs here".to_string()));
-        assert_eq!(hover_to_text(&serde_json::json!({})),None);
+        let markup =
+            serde_json::json!({"contents":{"kind":"markdown","value":"```rust\nfn x()\n```"}});
+        assert_eq!(
+            hover_to_text(&markup),
+            Some("```rust\nfn x()\n```".to_string())
+        );
+        let marked =
+            serde_json::json!({"contents":[{"language":"rust","value":"fn x()"},"docs here"]});
+        assert_eq!(
+            hover_to_text(&marked),
+            Some("fn x()\n\ndocs here".to_string())
+        );
+        assert_eq!(hover_to_text(&serde_json::json!({})), None);
     }
 
     #[test]

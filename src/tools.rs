@@ -21529,30 +21529,44 @@ mod host_picker_registry_tests {
             let registry = ToolRegistry::new(&["read"], dir.path(), None);
             assert!(registry.get("ask").is_none());
             let picker = registry.host_ask_tool();
-            picker.set_handler(std::sync::Arc::new(|request| Box::pin(async move {
-                Ok(crate::ask::AskResponse {
-                    answers: vec![crate::ask::AskAnswer {
-                        question_id: request.questions[0].id.clone().unwrap_or_else(|| "q".into()),
-                        selected: vec!["Allow once".into()],
-                        other: None,
-                    }],
-                    dismissed: false,
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0]
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "q".into()),
+                            selected: vec!["Allow once".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
                 })
-            })));
+            }));
             let clone = registry.clone_shallow().host_ask_tool();
-            let response = clone.prompt_installed(crate::ask::AskRequest {
-                questions: vec![crate::ask::AskQuestion {
-                    id: Some("q".into()),
-                    header: None,
-                    question: "Host decision?".into(),
-                    options: vec![
-                        crate::ask::AskOption { label: "Deny".into(), description: None },
-                        crate::ask::AskOption { label: "Allow once".into(), description: None },
-                    ],
-                    recommended: None,
-                    multi: false,
-                }],
-            }).await.unwrap();
+            let response = clone
+                .prompt_installed(crate::ask::AskRequest {
+                    questions: vec![crate::ask::AskQuestion {
+                        id: Some("q".into()),
+                        header: None,
+                        question: "Host decision?".into(),
+                        options: vec![
+                            crate::ask::AskOption {
+                                label: "Deny".into(),
+                                description: None,
+                            },
+                            crate::ask::AskOption {
+                                label: "Allow once".into(),
+                                description: None,
+                            },
+                        ],
+                        recommended: None,
+                        multi: false,
+                    }],
+                })
+                .await
+                .unwrap();
             assert_eq!(response.answers[0].selected, ["Allow once"]);
         });
     }
@@ -21563,22 +21577,32 @@ mod host_picker_registry_tests {
             let dir = tempfile::tempdir().unwrap();
             let config: Config = serde_json::from_value(serde_json::json!({
                 "computer": { "enableComputer": true, "requireApproval": true }
-            })).unwrap();
+            }))
+            .unwrap();
             let registry = ToolRegistry::new(&["computer"], dir.path(), Some(&config));
             let picker = registry.host_ask_tool();
-            picker.set_handler(std::sync::Arc::new(|request| Box::pin(async move {
-                Ok(crate::ask::AskResponse {
-                    answers: vec![crate::ask::AskAnswer {
-                        question_id: request.questions[0].id.clone().unwrap(),
-                        selected: vec!["Deny".into()],
-                        other: None,
-                    }],
-                    dismissed: false,
+            picker.set_handler(std::sync::Arc::new(|request| {
+                Box::pin(async move {
+                    Ok(crate::ask::AskResponse {
+                        answers: vec![crate::ask::AskAnswer {
+                            question_id: request.questions[0].id.clone().unwrap(),
+                            selected: vec!["Deny".into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
                 })
-            })));
-            let error = registry.get("computer").unwrap()
-                .execute("host-picker", serde_json::json!({"action":"key_type","text":"must-not-reach-native"}), None)
-                .await.expect_err("host denial must stop before native input");
+            }));
+            let error = registry
+                .get("computer")
+                .unwrap()
+                .execute(
+                    "host-picker",
+                    serde_json::json!({"action":"key_type","text":"must-not-reach-native"}),
+                    None,
+                )
+                .await
+                .expect_err("host denial must stop before native input");
             let message = error.to_string();
             assert!(message.contains("not approved"), "{message}");
             assert!(!message.contains("no approval handler"), "{message}");
