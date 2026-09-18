@@ -380,7 +380,16 @@ fn test_ext_conformance_artifacts_match_manifest_checksums() {
 #[test]
 fn test_ext_conformance_artifact_provenance_matches_master_catalog_checksums() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+
+    // Verify tree completeness first (bd-s7hzz)
+    pi::conformance::snapshot::verify_tree_completeness(
+        repo_root,
+        "tests/ext_conformance/artifacts",
+    )
+    .expect("Tree completeness check failed");
 
     let master_path = repo_root.join("docs/extension-master-catalog.json");
     let master_bytes = fs::read(&master_path).expect("read docs/extension-master-catalog.json");
@@ -1859,7 +1868,9 @@ fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
 #[test]
 fn test_generate_validated_manifest() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_dir = repo_root.join("tests/ext_conformance/artifacts");
+    let artifacts_dir = std::env::var("PI_TEST_ARTIFACTS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
 
     let ext_dirs = discover_extension_dirs(&artifacts_dir);
     assert!(
@@ -1941,13 +1952,21 @@ fn test_generate_validated_manifest() {
         extensions: entries,
     };
 
-    let manifest_path = repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json");
+    let manifest_path = std::env::var("PI_TEST_MANIFEST_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json"));
     let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
     let generate = matches!(
         std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
         Ok("1")
     );
     if generate {
+        // Enforce tree completeness before writing the manifest (bd-s7hzz)
+        pi::conformance::snapshot::verify_tree_completeness(
+            repo_root,
+            "tests/ext_conformance/artifacts",
+        )
+        .expect("tree completeness verification failed: refusing to generate manifest against truncated tree");
         fs::write(&manifest_path, format!("{json}\n")).expect("write VALIDATED_MANIFEST.json");
     } else {
         let committed_json =
@@ -2151,7 +2170,16 @@ fn test_snapshot_protocol_provenance_entries_valid() {
     };
 
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+    let artifacts_root = std::env::var("PI_TEST_ARTIFACTS_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("tests/ext_conformance/artifacts"));
+
+    // Verify tree completeness first (bd-s7hzz)
+    pi::conformance::snapshot::verify_tree_completeness(
+        repo_root,
+        "tests/ext_conformance/artifacts",
+    )
+    .expect("Tree completeness check failed");
 
     let provenance_path = repo_root.join("docs/extension-artifact-provenance.json");
     let provenance_bytes =

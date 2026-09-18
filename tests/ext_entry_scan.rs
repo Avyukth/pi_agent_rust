@@ -59,10 +59,14 @@ struct ScanOutput {
 }
 
 fn artifacts_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("ext_conformance")
-        .join("artifacts")
+    if let Ok(path) = std::env::var("PI_TEST_ARTIFACTS_ROOT") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("ext_conformance")
+            .join("artifacts")
+    }
 }
 
 fn normalize_platform_line_endings(input: &str) -> String {
@@ -424,15 +428,25 @@ fn scan_extension_entry_points() {
     };
 
     // Validate the committed output, or regenerate it only when explicitly requested.
-    let output_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("docs")
-        .join("extension-entry-scan.json");
+    let output_path = std::env::var("PI_TEST_ENTRY_SCAN_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("docs")
+                .join("extension-entry-scan.json")
+        });
     let json = serde_json::to_string_pretty(&output).expect("serialize scan output");
     let generate = matches!(
         std::env::var("PI_GENERATE_EXT_ENTRY_SCAN").as_deref(),
         Ok("1")
     );
     if generate {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        pi::conformance::snapshot::verify_tree_completeness(
+            repo_root,
+            "tests/ext_conformance/artifacts",
+        )
+        .expect("tree completeness verification failed: refusing to generate entry scan against truncated tree");
         std::fs::write(&output_path, &json).expect("write scan output");
     } else {
         let committed = std::fs::read_to_string(&output_path)
