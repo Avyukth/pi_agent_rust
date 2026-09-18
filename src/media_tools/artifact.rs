@@ -3,7 +3,6 @@
 use super::transport;
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Check the requested destination before making a billable provider call.
@@ -16,25 +15,7 @@ pub(super) fn preflight(cwd: &Path, requested: Option<&str>, tool: &str) -> Resu
                 "output_path must be nonempty and at most 4096 bytes",
             ));
         }
-        let path = cwd.join(requested);
-        if path.file_name().is_none() {
-            return Err(Error::tool(tool, "output_path must name a file"));
-        }
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {
-                return Err(Error::tool(
-                    tool,
-                    "output_path already exists; choose a new file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(Error::tool(
-                    tool,
-                    format!("cannot inspect output_path: {error}"),
-                ));
-            }
-        }
+        crate::artifact_output::resolve_new(cwd, requested, tool)?;
     }
     Ok(())
 }
@@ -58,15 +39,12 @@ pub(super) fn publish(
         ));
     }
     preflight(cwd, requested, tool)?;
-    let path = requested.map_or_else(
-        || {
-            cwd.join(format!(
-                "{prefix}_{}.{extension}",
-                uuid::Uuid::new_v4().simple()
-            ))
-        },
-        |requested| cwd.join(requested),
+    let requested = requested.map_or_else(
+        || format!("{prefix}_{}.{extension}", uuid::Uuid::new_v4().simple()),
+        ToString::to_string,
     );
+    let target = crate::artifact_output::resolve_new(cwd, &requested, tool)?;
+    let path = target.path();
     let actual_extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let matches = actual_extension.eq_ignore_ascii_case(extension)
         || (extension == "jpg" && actual_extension.eq_ignore_ascii_case("jpeg"));
@@ -78,33 +56,11 @@ pub(super) fn publish(
             ),
         ));
     }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)
-        .map_err(|error| Error::tool(tool, format!("cannot create artifact directory: {error}")))?;
-    let mut staged = tempfile::Builder::new()
-        .prefix(".pi-media-")
-        .tempfile_in(parent)
-        .map_err(|error| Error::tool(tool, format!("cannot stage media artifact: {error}")))?;
-    staged
-        .write_all(bytes)
-        .and_then(|()| staged.as_file().sync_all())
-        .map_err(|error| Error::tool(tool, format!("cannot write media artifact: {error}")))?;
     if let Some(owner) = owner {
         transport::check_owner(tool, owner)?;
     }
-    staged.persist_noclobber(&path).map_err(|error| {
-        Error::tool(
-            tool,
-            format!(
-                "cannot publish media artifact without overwriting: {}",
-                error.error
-            ),
-        )
-    })?;
-    Ok(path)
+    crate::artifact_output::publish(&target, bytes, tool)?;
+    Ok(target.path().to_path_buf())
 }
 
 #[cfg(test)]
@@ -167,6 +123,21 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn requested_paths_cannot_escape_workspace_or_use_linked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.png", "a\\escape.png"] {
+            assert!(preflight(dir.path(), Some(path), "generate_image").is_err(), "{path}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), dir.path().join("linked")).unwrap();
+            assert!(preflight(dir.path(), Some("linked/result.png"), "generate_image").is_err());
+        }
     }
 
     #[test]

@@ -15,7 +15,6 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -586,35 +585,26 @@ fn parse_windows(raw: &str, active: Option<u32>) -> Result<Vec<Window>> {
     Ok(windows)
 }
 
-pub(super) fn destination(cwd: &Path, args: &Value) -> Result<PathBuf> {
-    let path = string(args, "output_path")?.map_or_else(
-        || {
-            cwd.join(format!(
-                "screenshots/desktop_{}.png",
-                uuid::Uuid::new_v4().simple()
-            ))
-        },
-        |path| cwd.join(path),
+pub(super) fn destination(cwd: &Path, args: &Value) -> Result<crate::artifact_output::OutputTarget> {
+    let requested = string(args, "output_path")?.map_or_else(
+        || format!("screenshots/desktop_{}.png", uuid::Uuid::new_v4().simple()),
+        ToString::to_string,
     );
-    if !path
+    if !Path::new(&requested)
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
     {
         return Err(error("screenshot output_path must have a .png extension"));
     }
-    match std::fs::symlink_metadata(&path) {
-        Ok(_) => {
-            return Err(error(
-                "screenshot destination already exists; refusing to overwrite it",
-            ));
-        }
-        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {}
-        Err(failure) => return Err(failure.into()),
-    }
-    Ok(path)
+    crate::artifact_output::resolve_new(cwd, &requested, "computer")
 }
 
-pub(super) fn publish(path: &Path, args: &Value, bytes: &[u8], mock: bool) -> Result<ToolOutput> {
+pub(super) fn publish(
+    target: &crate::artifact_output::OutputTarget,
+    args: &Value,
+    bytes: &[u8],
+    mock: bool,
+) -> Result<ToolOutput> {
     if bytes.len() < 45
         || bytes.len() > IMAGE_LIMIT
         || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
@@ -632,17 +622,8 @@ pub(super) fn publish(path: &Path, args: &Value, bytes: &[u8], mock: bool) -> Re
             "screenshot dimensions are empty or exceed 128 megapixels",
         ));
     }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut stage = tempfile::NamedTempFile::new_in(parent)?;
-    stage.write_all(bytes)?;
-    stage.as_file().sync_all()?;
-    stage
-        .persist_noclobber(path)
-        .map_err(|_| error("screenshot destination could not be published without overwriting"))?;
+    crate::artifact_output::publish(target, bytes, "computer")?;
+    let path = target.path();
     let preview = bytes.len() <= crate::tools::IMAGE_MAX_BYTES;
     let mut result = output(
         format!(
@@ -726,13 +707,28 @@ mod tests {
         assert!(validate(&json!({"action":"screenshot","timeout_ms":0})).is_err());
     }
     #[test]
+    fn screenshot_paths_cannot_escape_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.png", "a\\escape.png"] {
+            assert!(destination(dir.path(), &json!({"action":"screenshot","output_path":path})).is_err(), "{path}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), dir.path().join("linked")).unwrap();
+            assert!(destination(dir.path(), &json!({"action":"screenshot","output_path":"linked/capture.png"})).is_err());
+        }
+    }
+
+    #[test]
     fn screenshots_are_no_clobber_and_contain_the_actual_payload() {
         let dir = tempfile::tempdir().unwrap();
         let args = json!({"action":"screenshot","output_path":"capture.png"});
-        let path = destination(dir.path(), &args).unwrap();
+        let target = destination(dir.path(), &args).unwrap();
         let bytes = super::super::mock::PNG;
-        let result = publish(&path, &args, bytes, false).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let result = publish(&target, &args, bytes, false).unwrap();
+        assert_eq!(std::fs::read(target.path()).unwrap(), bytes);
         assert!(
             result
                 .content
@@ -740,7 +736,7 @@ mod tests {
                 .any(|block| matches!(block, ContentBlock::Image(_)))
         );
         assert!(destination(dir.path(), &args).is_err());
-        assert!(publish(&path, &args, bytes, false).is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(publish(&target, &args, bytes, false).is_err());
+        assert_eq!(std::fs::read(target.path()).unwrap(), bytes);
     }
 }

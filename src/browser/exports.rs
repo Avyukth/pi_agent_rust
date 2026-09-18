@@ -8,8 +8,7 @@ use crate::model::{ContentBlock, ImageContent};
 use crate::tools::ToolOutput;
 use base64::Engine as _;
 use serde_json::{Value, json};
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const MAX_EXPORT_BYTES: usize = 20 * 1024 * 1024;
 const MAX_CAPTURE_PIXELS: f64 = 128.0 * 1024.0 * 1024.0;
@@ -91,24 +90,16 @@ pub(super) async fn execute(
     let pdf = required(args, "action")? == "print_pdf";
     let extension = if pdf { "pdf" } else { "png" };
     let folder = if pdf { "exports" } else { "screenshots" };
-    let path: PathBuf = args.get("output_path").and_then(Value::as_str).map_or_else(
-        || {
-            cwd.join(format!(
-                "{folder}/browser_{}.{extension}",
-                uuid::Uuid::new_v4().simple()
-            ))
-        },
-        |path| cwd.join(path),
-    );
-    // Fail before asking Chromium to render, and stage beside the destination.
-    // The final no-clobber publish checks again against concurrent creations.
-    preflight(&path)?;
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    owner.fs().create_dir_all(parent).await?;
-    let mut stage = tempfile::NamedTempFile::new_in(parent)?;
+    let requested = args
+        .get("output_path")
+        .and_then(Value::as_str)
+        .map_or_else(
+            || format!("{folder}/browser_{}.{extension}", uuid::Uuid::new_v4().simple()),
+            ToString::to_string,
+        );
+    // Resolve before asking Chromium to render. The shared publisher repeats
+    // destination checks under a pinned workspace directory at commit time.
+    let target = crate::artifact_output::resolve_new(cwd, &requested, "browser")?;
     let response = if pdf {
         let mut parameters = json!({
             "transferMode": "ReturnAsBase64",
@@ -136,20 +127,16 @@ pub(super) async fn execute(
     owner
         .checkpoint()
         .map_err(|_| error("page export cancelled before publication"))?;
-    stage.write_all(&bytes)?;
-    stage.as_file().sync_all()?;
     owner
         .checkpoint()
         .map_err(|_| error("page export cancelled before publication"))?;
-    stage.persist_noclobber(&path).map_err(|_| {
-        error("page export could not be published without overwriting its destination")
-    })?;
+    crate::artifact_output::publish(&target, &bytes, "browser")?;
     let preview = !pdf && bytes.len() <= crate::tools::IMAGE_MAX_BYTES;
     let mime = if pdf { "application/pdf" } else { "image/png" };
     let mut result = output(
         format!(
             "Exported tab {tab} to {} ({mime}, {} bytes){}",
-            path.display(),
+            target.path().display(),
             bytes.len(),
             if !pdf && !preview {
                 "; capture exceeds the inline image budget; inspect the saved file"
@@ -158,7 +145,7 @@ pub(super) async fn execute(
             }
         ),
         json!({
-            "tab": tab, "saved_path": path.display().to_string(), "size_bytes": bytes.len(),
+            "tab": tab, "saved_path": target.path().display().to_string(), "size_bytes": bytes.len(),
             "mime_type": mime, "preview_included": preview, "backend": "cdp",
             "full_page": !pdf && flag(args, "full_page", false)?
         }),
@@ -170,16 +157,6 @@ pub(super) async fn execute(
         }));
     }
     Ok(result)
-}
-
-fn preflight(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Err(error(
-            "page export destination already exists; choose a new output_path",
-        )),
-        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(failure) => Err(failure.into()),
-    }
 }
 
 fn clip(metrics: &Value) -> Result<Value> {
@@ -273,6 +250,24 @@ mod tests {
     }
 
     #[test]
+    fn export_paths_cannot_escape_or_cross_symlinked_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in ["../escape.png", "/tmp/escape.png", "a/../../escape.pdf", "a\\escape.png"] {
+            let action = if path.ends_with(".pdf") { "print_pdf" } else { "screenshot" };
+            let args = json!({"action":action,"output_path":path});
+            assert!(validate(&args).is_ok(), "schema validation stays format-focused");
+            assert!(crate::artifact_output::resolve_new(dir.path(), path, "browser").is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), dir.path().join("linked")).unwrap();
+            assert!(crate::artifact_output::resolve_new(dir.path(), "linked/capture.png", "browser").is_err());
+        }
+    }
+
+    #[test]
     fn full_page_geometry_uses_css_metrics_and_is_bounded() {
         let metrics = json!({"cssContentSize":{"x":0,"y":0,"width":800,"height":3000}});
         assert_eq!(clip(&metrics).unwrap()["height"], 3000.0);
@@ -294,7 +289,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("existing.pdf");
         std::fs::write(&path, b"do not replace").unwrap();
-        assert!(preflight(&path).is_err());
+        assert!(crate::artifact_output::resolve_new(dir.path(), "existing.pdf", "browser").is_err());
         assert_eq!(std::fs::read(path).unwrap(), b"do not replace");
     }
 }
