@@ -29,8 +29,6 @@ pub enum FailoverClass {
 /// Authentication wins even when the provider also mentions a transient status.
 fn is_auth_failure(lower: &str) -> bool {
     const AUTH_PATTERNS: &[&str] = &[
-        "401",
-        "403",
         "unauthorized",
         "unauthenticated",
         "forbidden",
@@ -49,7 +47,23 @@ fn is_auth_failure(lower: &str) -> bool {
         "invalid_credentials",
         "missing api key",
     ];
-    AUTH_PATTERNS.iter().any(|pattern| lower.contains(pattern))
+    if AUTH_PATTERNS.iter().any(|pattern| lower.contains(pattern)) {
+        return true;
+    }
+
+    // Prefer an explicit response status to unrelated numbers inside the body.
+    // Reuse the existing parser rather than making recovery and diagnostics
+    // disagree about HTTP/status markers. Credential wording above still wins.
+    if let Some(status) = crate::error::ProviderErrorSummary::from_error_text(None, lower).http_status
+    {
+        return matches!(status, 401 | 403);
+    }
+
+    // Some providers emit a bare status instead. Match a complete token, never
+    // the middle of a request id, a token count, or a duration such as 1403ms.
+    lower
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .any(|token| matches!(token, "401" | "403"))
 }
 
 /// Classify an error text for failover. `None` = never fail over (auth and
@@ -860,9 +874,7 @@ pub fn decide(
             if marks_session_persistence(&error_text) {
                 return TurnDecision::Terminal(TerminalReason::SessionPersistence);
             }
-            if !is_provider_call_error(error)
-                || is_auth_failure(&error_text.to_ascii_lowercase())
-            {
+            if !is_provider_call_error(error) || is_auth_failure(&error_text.to_ascii_lowercase()) {
                 return TurnDecision::Finish { success: false };
             }
             call_error_is_retryable(error)
@@ -960,10 +972,7 @@ mod tests {
     fn chain_lookup_keeps_role_then_exact_key_precedence() {
         let chains = HashMap::from([
             ("task".to_string(), vec!["role/winner".to_string()]),
-            (
-                "google/gemini-z".to_string(),
-                vec!["exact/winner".to_string()],
-            ),
+            ("google/gemini-z".to_string(), vec!["exact/winner".to_string()]),
             (
                 "GOOGLE/GEMINI-Z".to_string(),
                 vec!["case/alternative".to_string()],
@@ -1011,10 +1020,7 @@ mod tests {
         let chains = HashMap::from([
             ("task".to_string(), Vec::new()),
             ("google/gemini-z".to_string(), Vec::new()),
-            (
-                "gemini/gemini-z".to_string(),
-                vec!["openai/gpt-y".to_string()],
-            ),
+            ("gemini/gemini-z".to_string(), vec!["openai/gpt-y".to_string()]),
         ]);
         assert_eq!(
             chain_for(&chains, "task", "google", "gemini-z")
@@ -1623,6 +1629,67 @@ mod tests {
     }
 
     #[test]
+    fn auth_statuses_do_not_match_inside_request_ids_or_durations() {
+        for detail in ["request=req401abcdef", "request=4037", "elapsed=1403ms", "trace=x_401_y"] {
+            let text = format!("503 service unavailable: {detail}");
+            assert_eq!(classify_failover(&text), Some(FailoverClass::Overload));
+            let message = errored_message(Some(&text), 0);
+            let error = crate::error::Error::api(text);
+            assert!(error_result_is_retryable(&message, None));
+            assert!(call_error_is_retryable(&error));
+            for outcome in [TurnOutcome::Completed(&message), TurnOutcome::Failed(&error)] {
+                assert_eq!(
+                    decide(outcome, &progress(0, 0), &policy(), None),
+                    TurnDecision::Retry {
+                        attempt: 1,
+                        delay_ms: 500
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_response_status_outweighs_unlabelled_diagnostic_numbers() {
+        for text in [
+            "HTTP 503: service unavailable; request_id=401",
+            "API error (status code: 503): upstream overloaded; attempt=403",
+        ] {
+            assert_eq!(classify_failover(text), Some(FailoverClass::Overload));
+            let error = crate::error::Error::api(text);
+            let message = errored_message(Some(text), 0);
+            assert!(call_error_is_retryable(&error));
+            assert!(error_result_is_retryable(&message, None));
+        }
+        // Explicit credential wording still wins over an outer 503 wrapper.
+        assert_eq!(classify_failover("HTTP 503: invalid_api_key; retry delay"), None);
+    }
+
+    #[test]
+    fn authentication_status_codes_support_provider_wire_spellings() {
+        for status in [
+            "401",
+            "403",
+            "HTTP401",
+            "http: 403",
+            "status code = 401",
+            "{\"status\":403}",
+        ] {
+            let text = format!("{status}: 429 retry delay");
+            assert_eq!(classify_failover(&text), None, "{text}");
+            let error = crate::error::Error::api(text.clone());
+            let message = errored_message(Some(&text), 0);
+            assert!(!call_error_is_retryable(&error), "{text}");
+            assert!(!error_result_is_retryable(&message, None), "{text}");
+            assert_eq!(
+                decide(TurnOutcome::Failed(&error), &progress(0, 0), &policy(), None),
+                TurnDecision::Finish { success: false },
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn auth_refusal_wins_over_transient_words_on_both_outcome_shapes() {
         for text in [
             "401 unauthorized: 429 rate limit exceeded",
@@ -1680,7 +1747,12 @@ mod tests {
             let message = errored_message(Some(&flattened), 0);
             assert!(!error_result_is_retryable(&message, None));
             assert_eq!(
-                decide(TurnOutcome::Completed(&message), &progress(0, 0), &policy(), None),
+                decide(
+                    TurnOutcome::Completed(&message),
+                    &progress(0, 0),
+                    &policy(),
+                    None
+                ),
                 TurnDecision::Terminal(TerminalReason::SessionPersistence)
             );
         }
@@ -1713,7 +1785,10 @@ mod tests {
             assert!(call_error_is_retryable(&error), "{kind:?}");
             assert_eq!(
                 decide(TurnOutcome::Failed(&error), &progress(0, 0), &policy(), None),
-                TurnDecision::Retry { attempt: 1, delay_ms: 500 },
+                TurnDecision::Retry {
+                    attempt: 1,
+                    delay_ms: 500
+                },
                 "{kind:?}"
             );
             assert_eq!(
