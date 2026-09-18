@@ -96,6 +96,9 @@ pub struct FailoverChain {
 
 /// Resolve the chain for a role name or an exact `provider/model` spec from
 /// `retry.fallbackChains`. Role keys take precedence over exact model specs.
+/// Provider aliases and surrounding spec whitespace follow model resolution.
+/// An exact key wins over equivalent spellings; otherwise the lexicographically
+/// first matching key wins, independent of `HashMap` iteration order.
 pub fn chain_for<S: std::hash::BuildHasher>(
     chains: &HashMap<String, Vec<String>, S>,
     role: &str,
@@ -110,14 +113,38 @@ pub fn chain_for<S: std::hash::BuildHasher>(
         });
     }
     let full = format!("{provider}/{model_id}");
-    for (key, entries) in chains {
-        if key.eq_ignore_ascii_case(&full) && !entries.is_empty() {
-            return Some(FailoverChain {
-                entries: entries.clone(),
-            });
-        }
+    if let Some(entries) = chains.get(&full)
+        && !entries.is_empty()
+    {
+        return Some(FailoverChain {
+            entries: entries.clone(),
+        });
     }
-    None
+    chains
+        .iter()
+        .filter(|(key, entries)| !entries.is_empty() && model_spec_matches(key, provider, model_id))
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, entries)| FailoverChain {
+            entries: entries.clone(),
+        })
+}
+
+/// Use the same identity relation as `resolve_chain_spec`, including provider
+/// aliases and nested model ids. Raw string equality is not model identity.
+fn model_spec_matches(spec: &str, provider: &str, model_id: &str) -> bool {
+    crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
+        |(candidate_provider, candidate_model)| {
+            crate::provider_metadata::provider_ids_match(provider, candidate_provider)
+                && model_id.eq_ignore_ascii_case(candidate_model)
+        },
+    )
+}
+
+fn model_specs_match(left: &str, right: &str) -> bool {
+    crate::provider_metadata::split_provider_model_spec(right).map_or_else(
+        || left.eq_ignore_ascii_case(right),
+        |(provider, model_id)| model_spec_matches(left, provider, model_id),
+    )
 }
 
 /// Cooldown FSM for the primary after a failover.
@@ -510,15 +537,10 @@ impl<'a> FailoverWalk<'a> {
             let index = self.position;
             let spec = self.entries[index].as_str();
             self.position += 1;
-            let is_current = crate::provider_metadata::split_provider_model_spec(spec).is_some_and(
-                |(provider, model_id)| {
-                    crate::provider_metadata::provider_ids_match(self.current_provider, provider)
-                        && self.current_model.eq_ignore_ascii_case(model_id)
-                },
-            );
+            let is_current = model_spec_matches(spec, self.current_provider, self.current_model);
             let is_duplicate = self.entries[..index]
                 .iter()
-                .any(|earlier| earlier.eq_ignore_ascii_case(spec));
+                .any(|earlier| model_specs_match(earlier, spec));
             if is_current || is_duplicate {
                 continue;
             }
@@ -875,6 +897,87 @@ mod tests {
     }
 
     #[test]
+    fn chain_lookup_resolves_provider_aliases_and_spec_whitespace() {
+        let chains = HashMap::from([(
+            " gemini / GEMINI-Z ".to_string(),
+            vec!["openai/gpt-y".to_string()],
+        )]);
+        for provider in ["google", "gemini", "GOOGLE"] {
+            let resolved = chain_for(&chains, "task", provider, "gemini-z")
+                .expect("configured aliases must resolve like model selection");
+            assert_eq!(resolved.entries, vec!["openai/gpt-y".to_string()]);
+        }
+    }
+
+    #[test]
+    fn chain_lookup_keeps_role_then_exact_key_precedence() {
+        let chains = HashMap::from([
+            ("task".to_string(), vec!["role/winner".to_string()]),
+            (
+                "google/gemini-z".to_string(),
+                vec!["exact/winner".to_string()],
+            ),
+            (
+                "GOOGLE/GEMINI-Z".to_string(),
+                vec!["case/alternative".to_string()],
+            ),
+            (
+                "gemini/gemini-z".to_string(),
+                vec!["alias/alternative".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            chain_for(&chains, "task", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["role/winner".to_string()]
+        );
+        assert_eq!(
+            chain_for(&chains, "unconfigured", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["exact/winner".to_string()]
+        );
+    }
+
+    #[test]
+    fn equivalent_chain_keys_have_a_stable_tie_break() {
+        for keys in [
+            ["gemini/gemini-z", "GEMINI/GEMINI-Z"],
+            ["GEMINI/GEMINI-Z", "gemini/gemini-z"],
+        ] {
+            let chains: HashMap<_, _> = keys
+                .into_iter()
+                .map(|key| (key.to_string(), vec![key.to_string()]))
+                .collect();
+            assert_eq!(
+                chain_for(&chains, "task", "google", "gemini-z")
+                    .unwrap()
+                    .entries,
+                vec!["GEMINI/GEMINI-Z".to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_role_and_exact_chains_do_not_hide_a_nonempty_alias_chain() {
+        let chains = HashMap::from([
+            ("task".to_string(), Vec::new()),
+            ("google/gemini-z".to_string(), Vec::new()),
+            (
+                "gemini/gemini-z".to_string(),
+                vec!["openai/gpt-y".to_string()],
+            ),
+        ]);
+        assert_eq!(
+            chain_for(&chains, "task", "google", "gemini-z")
+                .unwrap()
+                .entries,
+            vec!["openai/gpt-y".to_string()]
+        );
+    }
+
+    #[test]
     fn cooldown_blocks_primary_until_elapsed() {
         let start = Instant::now();
         let mut tracker = CooldownTracker::new(60);
@@ -1078,6 +1181,53 @@ mod tests {
         assert_eq!(walk.next_spec(), Some((3, "google/gemini-z")));
         assert_eq!(walk.next_spec(), None);
         assert_eq!(walk.position(), 4);
+    }
+
+    #[test]
+    fn the_walk_skips_alias_duplicates_after_intervening_models() {
+        let chain = chain(&[
+            "google/gemini-z",
+            "openai/gpt-y",
+            " GEMINI / GEMINI-Z ",
+            "google/gemini-next",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "anthropic", "claude-x");
+        assert_eq!(walk.next_spec(), Some((0, "google/gemini-z")));
+        assert_eq!(walk.next_spec(), Some((1, "openai/gpt-y")));
+        assert_eq!(walk.next_spec(), Some((3, "google/gemini-next")));
+        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.position(), 4);
+    }
+
+    #[test]
+    fn a_resumed_walk_does_not_revisit_an_earlier_provider_alias() {
+        let chain = chain(&[
+            "gemini/gemini-z",
+            "openai/gpt-y",
+            "google/gemini-z",
+            "anthropic/claude-x",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 2, "openai", "gpt-y");
+        assert_eq!(walk.next_spec(), Some((3, "anthropic/claude-x")));
+        assert_eq!(walk.position(), 4);
+        assert_eq!(walk.next_spec(), None);
+    }
+
+    #[test]
+    fn identity_matching_keeps_distinct_provider_routes_and_nested_models() {
+        let chain = chain(&[
+            "google/gemini-z",
+            "google-gemini-cli/gemini-z",
+            "openrouter/anthropic/claude-x",
+            "anthropic/claude-x",
+            " OPENROUTER / anthropic/CLAUDE-X ",
+        ]);
+        let mut walk = FailoverWalk::new(&chain, 0, "openai", "gpt-y");
+        for (index, spec) in chain.entries[..4].iter().enumerate() {
+            assert_eq!(walk.next_spec(), Some((index, spec.as_str())));
+        }
+        assert_eq!(walk.next_spec(), None);
+        assert_eq!(walk.position(), 5);
     }
 
     #[test]
