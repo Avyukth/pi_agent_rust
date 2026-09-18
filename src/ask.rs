@@ -691,8 +691,11 @@ pub fn approval_handler_via_ask(
                 ));
             }
 
+            // Fresh identity prevents a delayed reply for an earlier invocation
+            // from authorizing a later call that reuses the same tool-call id.
+            let question_id = format!("approval:{}", uuid::Uuid::new_v4());
             let question = AskQuestion {
-                id: Some(format!("approval:{}", request.tool_call_id)),
+                id: Some(question_id.clone()),
                 question: format!(
                     "Allow the `{}` tool to run?\n{}",
                     request.tool_name,
@@ -725,13 +728,13 @@ pub fn approval_handler_via_ask(
                             request.tool_name
                         ));
                     }
-                    let allowed = response.answers.first().is_some_and(|answer| {
-                        answer.other.is_none()
-                            && answer
-                                .selected
-                                .iter()
-                                .any(|label| label.eq_ignore_ascii_case(APPROVAL_ALLOW_LABEL))
-                    });
+                    let allowed = response.answers.len() == 1
+                        && response.answers.first().is_some_and(|answer| {
+                            answer.question_id == question_id
+                                && answer.other.is_none()
+                                && answer.selected.len() == 1
+                                && answer.selected[0].eq_ignore_ascii_case(APPROVAL_ALLOW_LABEL)
+                        });
                     if allowed {
                         ToolApprovalDecision::Allow
                     } else {
@@ -1513,4 +1516,68 @@ mod tests {
         assert!(bounded.chars().count() < 800);
         assert!(bounded.contains("truncated"));
     }
+    #[test]
+    fn approval_bridge_rejects_mismatched_or_ambiguous_replies() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+            let tool = AskTool::new(AskPolicy::Error);
+            tool.set_handler(Arc::new(|_request: AskRequest| Box::pin(async {
+                Ok(AskResponse {
+                    answers: vec![AskAnswer {
+                        question_id: "approval:stale".into(),
+                        selected: vec![APPROVAL_ALLOW_LABEL.into()],
+                        other: None,
+                    }],
+                    dismissed: false,
+                })
+            })));
+            let decision = approval_handler_via_ask(tool.clone(), crate::approval::ApprovalState::default())(approval_request("bash")).await;
+            assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
+
+            tool.set_handler(Arc::new(|request: AskRequest| Box::pin(async move {
+                Ok(AskResponse {
+                    answers: vec![AskAnswer {
+                        question_id: effective_question_id(&request.questions[0], 0),
+                        selected: vec![APPROVAL_ALLOW_LABEL.into(), APPROVAL_DENY_LABEL.into()],
+                        other: None,
+                    }],
+                    dismissed: false,
+                })
+            })));
+            let decision = approval_handler_via_ask(tool, crate::approval::ApprovalState::default())(approval_request("bash")).await;
+            assert!(matches!(decision, ToolApprovalDecision::Deny { .. }));
+        });
+    }
+
+    #[test]
+    fn approval_bridge_uses_a_fresh_question_id_for_each_invocation() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::agent::ToolApprovalDecision;
+            let ids = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&ids);
+            let tool = AskTool::new(AskPolicy::Error);
+            tool.set_handler(Arc::new(move |request: AskRequest| {
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    let question_id = effective_question_id(&request.questions[0], 0);
+                    seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(question_id.clone());
+                    Ok(AskResponse {
+                        answers: vec![AskAnswer {
+                            question_id,
+                            selected: vec![APPROVAL_ALLOW_LABEL.into()],
+                            other: None,
+                        }],
+                        dismissed: false,
+                    })
+                })
+            }));
+            let handler = approval_handler_via_ask(tool, crate::approval::ApprovalState::default());
+            assert_eq!(handler(approval_request("bash")).await, ToolApprovalDecision::Allow);
+            assert_eq!(handler(approval_request("bash")).await, ToolApprovalDecision::Allow);
+            let ids = ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(ids.len(), 2);
+            assert_ne!(ids[0], ids[1]);
+        });
+    }
+
 }

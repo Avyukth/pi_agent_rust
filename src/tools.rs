@@ -5363,6 +5363,11 @@ pub struct ToolRegistry {
     /// Session undo recorder shared with write/edit/hashline_edit
     /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    /// Host-owned picker surface shared by permission-gated built-ins and the
+    /// optional model-facing ask tool. This exists even when `ask` is not in
+    /// the model schema: host authorization must not disappear merely because
+    /// the model cannot ask arbitrary questions.
+    host_ask: crate::ask::AskTool,
     /// Back-pointer to the [`SharedToolRegistry`] this snapshot belongs to,
     /// so a hostcall holding only a snapshot can publish an update.
     shared: Option<std::sync::Weak<SharedToolRegistryInner>>,
@@ -5393,6 +5398,9 @@ impl ToolRegistry {
     ) -> Self {
         let legacy_workspace = WorkspaceHandle::default();
         let workspace = workspace.unwrap_or(&legacy_workspace);
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.and_then(|config| config.ask_policy.as_deref()),
+        ));
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let job_session_scope = crate::jobs::JobSessionScope::default();
         let shell_path = config.and_then(|c| c.shell_path.clone());
@@ -5511,7 +5519,14 @@ impl ToolRegistry {
                         .unwrap_or(true);
                     tools.push(Box::new(
                         crate::computer::ComputerTool::new(cwd)
-                            .with_require_approval(require_approval),
+                            .with_require_approval(require_approval)
+                            .with_approval_handler({
+                                let ask = host_ask.clone();
+                                std::sync::Arc::new(move |request| {
+                                    let ask = ask.clone();
+                                    Box::pin(async move { ask.prompt_installed(request).await })
+                                })
+                            }),
                     ));
                 }
                 "browser" => {
@@ -5606,7 +5621,15 @@ impl ToolRegistry {
         {
             let require_approval = comp_cfg.require_approval.unwrap_or(true);
             tools.push(Box::new(
-                crate::computer::ComputerTool::new(cwd).with_require_approval(require_approval),
+                crate::computer::ComputerTool::new(cwd)
+                    .with_require_approval(require_approval)
+                    .with_approval_handler({
+                        let ask = host_ask.clone();
+                        std::sync::Arc::new(move |request| {
+                            let ask = ask.clone();
+                            Box::pin(async move { ask.prompt_installed(request).await })
+                        })
+                    }),
             ));
         }
 
@@ -5661,13 +5684,25 @@ impl ToolRegistry {
             job_session_scope,
             discoverable: discoverable_names,
             mutation_recorder,
+            host_ask,
             shared: None,
         }
+    }
+
+    /// Host-owned interactive picker shared with permission-gated built-ins.
+    ///
+    /// This is deliberately independent of whether the model-facing `ask`
+    /// tool is enabled. Installing a UI here gives the host somewhere to make
+    /// authorization decisions without granting the model a new tool.
+    #[must_use]
+    pub fn host_ask_tool(&self) -> crate::ask::AskTool {
+        self.host_ask.clone()
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(mut tools: Vec<Box<dyn Tool>>) -> Self {
         let job_session_scope = crate::jobs::JobSessionScope::default();
+        let host_ask = crate::ask::AskTool::new(crate::ask::AskPolicy::Error);
         for tool in &mut tools {
             tool.bind_job_session_scope(job_session_scope.clone());
         }
@@ -5677,6 +5712,7 @@ impl ToolRegistry {
             job_session_scope,
             discoverable: std::collections::HashSet::new(),
             mutation_recorder: None,
+            host_ask,
             shared: None,
         }
     }
@@ -5692,6 +5728,7 @@ impl ToolRegistry {
             job_session_scope: self.job_session_scope.clone(),
             discoverable: self.discoverable.clone(),
             mutation_recorder: self.mutation_recorder.clone(),
+            host_ask: self.host_ask.clone(),
             shared: self.shared.clone(),
         }
     }
@@ -21476,5 +21513,73 @@ mod tests {
             !registry.is_discoverable("current_time"),
             "current_time must be essential-tier (directly callable)"
         );
+    }
+}
+
+#[cfg(test)]
+mod host_picker_registry_tests {
+    use super::*;
+
+    #[test]
+    fn host_picker_survives_shallow_registry_clones_without_model_ask() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = ToolRegistry::new(&["read"], dir.path(), None);
+            assert!(registry.get("ask").is_none());
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| Box::pin(async move {
+                Ok(crate::ask::AskResponse {
+                    answers: vec![crate::ask::AskAnswer {
+                        question_id: request.questions[0].id.clone().unwrap_or_else(|| "q".into()),
+                        selected: vec!["Allow once".into()],
+                        other: None,
+                    }],
+                    dismissed: false,
+                })
+            })));
+            let clone = registry.clone_shallow().host_ask_tool();
+            let response = clone.prompt_installed(crate::ask::AskRequest {
+                questions: vec![crate::ask::AskQuestion {
+                    id: Some("q".into()),
+                    header: None,
+                    question: "Host decision?".into(),
+                    options: vec![
+                        crate::ask::AskOption { label: "Deny".into(), description: None },
+                        crate::ask::AskOption { label: "Allow once".into(), description: None },
+                    ],
+                    recommended: None,
+                    multi: false,
+                }],
+            }).await.unwrap();
+            assert_eq!(response.answers[0].selected, ["Allow once"]);
+        });
+    }
+
+    #[test]
+    fn default_registry_computer_uses_host_picker_before_native_input() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "computer": { "enableComputer": true, "requireApproval": true }
+            })).unwrap();
+            let registry = ToolRegistry::new(&["computer"], dir.path(), Some(&config));
+            let picker = registry.host_ask_tool();
+            picker.set_handler(std::sync::Arc::new(|request| Box::pin(async move {
+                Ok(crate::ask::AskResponse {
+                    answers: vec![crate::ask::AskAnswer {
+                        question_id: request.questions[0].id.clone().unwrap(),
+                        selected: vec!["Deny".into()],
+                        other: None,
+                    }],
+                    dismissed: false,
+                })
+            })));
+            let error = registry.get("computer").unwrap()
+                .execute("host-picker", serde_json::json!({"action":"key_type","text":"must-not-reach-native"}), None)
+                .await.expect_err("host denial must stop before native input");
+            let message = error.to_string();
+            assert!(message.contains("not approved"), "{message}");
+            assert!(!message.contains("no approval handler"), "{message}");
+        });
     }
 }

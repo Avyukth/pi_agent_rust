@@ -1529,9 +1529,9 @@ impl AgentSessionHandle {
         }
     }
 
-    /// Ask tool handle, when this session enabled the ask tool. Cloning is
-    /// cheap (shared state); hosts use it to install a picker surface via
-    /// `install_channel_ui` and resolve cards via `respond_ui`.
+    /// Host picker handle for sessions built through [`create_agent_session`].
+    /// Cloning is cheap shared state. It exists even when the model-facing
+    /// `ask` tool is disabled, so permission prompts remain reachable.
     #[must_use]
     pub fn ask_tool(&self) -> Option<crate::ask::AskTool> {
         self.ask_tool.clone()
@@ -3047,6 +3047,9 @@ pub(crate) async fn create_agent_session_deferred_mcp(
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
+    // Permission prompts belong to the host, not to the model-facing ask
+    // capability. Every registry owns one picker even when "ask" is disabled.
+    let host_ask = tools.host_ask_tool();
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
@@ -3088,33 +3091,24 @@ pub(crate) async fn create_agent_session_deferred_mcp(
             Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
         ]);
     }
-    // Ask tool (opt-in): without a host-installed picker surface it resolves
-    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8). A
-    // clone is kept on the returned handle so embedders (e.g. the ftui launch
-    // path) can install a channel UI and pair respond_ui replies.
-    let mut ask_tool_handle = None;
+    // The host picker always exists. Enabling "ask" grants the model the
+    // structured-question tool by exposing this same shared handle in the
+    // schema; disabling it does not remove the host's authorization surface.
+    let ask_tool_handle = Some(host_ask.clone());
     if enabled_tools.contains(&"ask") {
-        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
-            config.ask_policy.as_deref(),
-        ));
-        ask_tool_handle = Some(ask.clone());
         agent_session
             .agent
-            .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
+            .extend_tools(vec![Box::new(host_ask.clone()) as Box<dyn crate::tools::Tool>]);
     }
-    // Approval prompts (issue #196): when this session gates tool calls and
-    // the embedder supplied no explicit handler, bridge approval requests
-    // through the ask surface the host installs (`install_channel_ui`). The
-    // bridge never auto-answers — with no surface installed it denies with an
-    // explicit reason instead of prompting nobody and denying silently.
+    // Approval prompts bridge through the host picker whether or not the
+    // model-facing ask tool is enabled.
     if let Some(approval_state) = &options.approval_state
         && options.tool_approval.is_none()
-        && let Some(ask) = &ask_tool_handle
     {
         agent_session
             .agent
             .set_tool_approval(Some(crate::ask::approval_handler_via_ask(
-                ask.clone(),
+                host_ask,
                 approval_state.clone(),
             )));
     }
@@ -5200,4 +5194,14 @@ export default function init(pi) {
         handle.set_max_tokens(None);
         assert_eq!(handle.max_tokens(), None);
     }
+    #[test]
+    fn session_without_model_ask_still_exposes_host_picker() {
+        let tmp = tempdir().expect("tempdir");
+        let mut options = hermetic_session_options(tmp.path());
+        options.enabled_tools = Some(vec!["read".to_string()]);
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        assert!(!handle.has_tool("ask"));
+        assert!(handle.ask_tool().is_some());
+    }
+
 }

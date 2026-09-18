@@ -2078,15 +2078,17 @@ async fn run(
             );
         }
     }
-    let ask_tool = enabled_tools.contains(&"ask").then(|| {
-        let tool = pi::ask::AskTool::new(pi::ask::AskPolicy::from_config(
-            config.ask_policy.as_deref(),
-        ));
+    // Host authorization must not depend on granting the model the ask tool.
+    // The registry picker is always handed to interactive/RPC hosts; only this
+    // conditional extend adds ask to the provider-visible schema.
+    let ask_tool = Some(shared_tools.snapshot().host_ask_tool());
+    if enabled_tools.contains(&"ask")
+        && let Some(ask) = &ask_tool
+    {
         agent_session
             .agent
-            .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
-        tool
-    });
+            .extend_tools(vec![Box::new(ask.clone()) as Box<dyn pi::tools::Tool>]);
+    }
     // Approval prompts (issue #196): route calls the approval mode gates
     // through the ask surface the interactive/RPC hosts install, instead of
     // silently denying because no `tool_approval` handler existed. Surfaces

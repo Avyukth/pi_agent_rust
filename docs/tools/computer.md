@@ -53,13 +53,17 @@ and accepts only the matching question's explicit **Allow once** choice.
 Dismissals, absent handlers, malformed replies and errors deny the action.
 There is no recommended-answer or model-supplied `confirmed` fallback.
 
-**The CLI does not yet install this per-call picker callback.** With the
-default `requireApproval: true`, its native input calls therefore fail with a
-named approval error. A host/operator can explicitly grant session-wide input
-using `computer.requireApproval: false`, which the existing registry forwards,
-or use an SDK host that installs the real picker. This is a permission grant,
-not a setting that tool arguments can change. Other host approval layers still
-apply independently.
+The default registry routes this callback through the session's host picker.
+Interactive CLI/RPC/FTUI hosts install that picker even when the model-facing
+`ask` tool is not enabled, so narrowing the model tool list does not silently
+disable desktop consent. Headless/print hosts install no interactive picker and
+therefore continue to fail closed. SDK sessions created through
+`create_agent_session` expose the same picker from `AgentSessionHandle::ask_tool`;
+a custom prebuilt `ComputerTool` can still install its own trusted callback.
+A host/operator may explicitly grant session-wide input with
+`computer.requireApproval: false`. This is a permission grant, not a setting
+that tool arguments can change. Other host approval layers still apply
+independently.
 
 Enabling this tool grants desktop observation: screenshots, window labels,
 accessibility names and clipboard reads can expose private data to the model.
