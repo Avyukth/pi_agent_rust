@@ -92,17 +92,30 @@ impl PiEnv {
     }
 
     fn write_models(&self, base_url: &str) {
+        self.write_models_split(
+            &format!("{base_url}/primary/v1"),
+            &format!("{base_url}/backup/v1"),
+        );
+    }
+
+    /// Same models.json with the two providers pointed at INDEPENDENT bases.
+    ///
+    /// The abort test needs a fallback that accepts a request and never answers
+    /// it, which no route on the mock server can do — the server writes its
+    /// response as soon as it has read the request. A bare listener that is
+    /// never accepted from does exactly that, and it needs its own base URL.
+    fn write_models_split(&self, primary_base: &str, backup_base: &str) {
         let models_json = format!(
             r#"{{"providers": {{
                 "e2eprimary": {{
                     "api": "openai-completions",
-                    "baseUrl": "{base_url}/primary/v1",
+                    "baseUrl": "{primary_base}",
                     "apiKey": "primary-key",
                     "models": [{{"id": "primary-model", "contextWindow": 128000}}]
                 }},
                 "e2ebackup": {{
                     "api": "openai-completions",
-                    "baseUrl": "{base_url}/backup/v1",
+                    "baseUrl": "{backup_base}",
                     "apiKey": "backup-key",
                     "models": [{{"id": "backup-model", "contextWindow": 128000}}]
                 }}
@@ -294,6 +307,147 @@ fn run_rpc_failover(
         ));
     });
     (events, stdout, stderr)
+}
+
+/// Drive `pi --rpc` to a failover and then abort the fallback turn mid-flight.
+///
+/// The abort has to land INSIDE the fallback turn or the test proves nothing,
+/// so nothing here sleeps and hopes. The fallback base URL points at a listener
+/// that is bound and never accepted from: the connection completes in the
+/// kernel's backlog, pi's request is written, and no response ever comes, so
+/// the fallback turn stays open until something aborts it. The abort is then
+/// sent the moment `failover_start` appears on stdout, which is the boundary
+/// this is testing.
+fn run_rpc_failover_then_abort(
+    harness: &TestHarness,
+    server: &common::harness::MockHttpServer,
+    stalled_backup_base: &str,
+    label: &str,
+) -> (Vec<serde_json::Value>, String, String) {
+    let env = PiEnv::new(harness);
+    env.write_models_split(
+        &format!("{}/primary/v1", server.base_url()),
+        stalled_backup_base,
+    );
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command
+        .args([
+            "--rpc",
+            "--provider",
+            "e2eprimary",
+            "--model",
+            "primary-model",
+            "--no-extensions",
+        ])
+        .stdin(Stdio::piped());
+    harness.log().info("action", label);
+    let mut child = command.spawn().expect("spawn pi --rpc");
+
+    let stdout = child.stdout.take().expect("pi --rpc stdout was not piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let pump = std::thread::spawn(move || {
+        use std::io::BufRead as _;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    {
+        use std::io::Write as _;
+        let stdin = child.stdin.as_mut().expect("pi --rpc stdin was not piped");
+        writeln!(stdin, r#"{{"type":"prompt","id":"p1","message":"ping"}}"#)
+            .expect("write the prompt request");
+        stdin.flush().expect("flush the prompt request");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut lines: Vec<String> = Vec::new();
+    let mut aborted = false;
+    loop {
+        let Ok(line) = rx.recv_timeout(Duration::from_millis(250)) else {
+            assert!(
+                Instant::now() < deadline,
+                "pi --rpc never reached the failover boundary: {lines:?}"
+            );
+            continue;
+        };
+        let kind = serde_json::from_str::<serde_json::Value>(&line)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            });
+        lines.push(line);
+        match kind.as_deref() {
+            Some("failover_start") if !aborted => {
+                use std::io::Write as _;
+                let stdin = child.stdin.as_mut().expect("pi --rpc stdin was not piped");
+                writeln!(stdin, r#"{{"type":"abort","id":"a1"}}"#).expect("write the abort");
+                stdin.flush().expect("flush the abort");
+                aborted = true;
+            }
+            Some("agent_end") if aborted => break,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pi --rpc never produced a terminal agent_end after the abort: {lines:?}"
+        );
+    }
+
+    drop(child.stdin.take());
+    let status = run_to_exit(&mut child, 60);
+    drop(rx);
+    let _ = pump.join();
+    let mut stderr = String::new();
+    if let Some(mut handle) = child.stderr.take() {
+        use std::io::Read as _;
+        let _ = handle.read_to_string(&mut stderr);
+    }
+    let stdout = lines.join("\n");
+    let events = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    harness.log().info_ctx("verify", "process finished", |ctx| {
+        ctx.push(("event_count".to_string(), events.len().to_string()));
+        ctx.push(("exit".to_string(), format!("{status:?}")));
+        ctx.push((
+            "stderr_tail".to_string(),
+            stderr.chars().take(400).collect(),
+        ));
+    });
+    (events, stdout, stderr)
+}
+
+/// Wait for a child that has already had its stdout drained elsewhere.
+fn run_to_exit(child: &mut std::process::Child, deadline_secs: u64) -> Option<i32> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.code(),
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(deadline_secs) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // Mirrors run_and_collect above: a wait() that errors is a broken
+            // harness, not a test outcome.
+            // ubs:ignore-next-line test harness — waitpid failure is unrecoverable
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    }
 }
 
 /// Run `pi --print --mode json` against the mock server and return the parsed
@@ -932,6 +1086,138 @@ fn e2e_failover_rpc_mode_gives_the_fallback_its_own_retry_lifecycle() {
     let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_failover_rpc_fallback_retry.jsonl", &path);
+}
+
+/// bd-2vmu6, abort at the boundary: a turn aborted while it is running on the
+/// fallback still closes both lifecycles, and closes them truthfully.
+///
+/// This is the fourth of the bead's five named scenarios and the one with no
+/// coverage on either surface. It is the hardest to make deterministic, because
+/// "abort at the boundary" is a race by description: abort too early and the
+/// swap has not happened, too late and the turn is already over. Two things
+/// remove the race entirely. The fallback points at a listener that is bound
+/// and NEVER ACCEPTED FROM, so the fallback turn cannot finish on its own — the
+/// connection completes in the kernel backlog and no response ever arrives. And
+/// the abort is sent on observing `failover_start` rather than after a sleep,
+/// so it is sent exactly once the swap has been announced.
+///
+/// What is being protected: `failovers_this_turn > 0` is what drives the
+/// terminal `failover_end` in `run_prompt_with_retry`, and an abort takes a
+/// different path out of the turn than success or provider error do. If that
+/// path skipped the closers, a client would see `auto_retry_start` and
+/// `failover_start` with nothing terminating either, on the one exit that is
+/// most likely to be hit by a user pressing Ctrl+C.
+#[test]
+fn e2e_failover_rpc_abort_at_the_boundary_still_closes_both_lifecycles() {
+    let harness =
+        TestHarness::new("e2e_failover_rpc_abort_at_the_boundary_still_closes_both_lifecycles");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/primary/v1/chat/completions",
+        error_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        ),
+    );
+
+    // Bound, never accepted from. Held in scope for the whole test so the port
+    // stays claimed; dropping it would let the connection be refused instead of
+    // hanging, which is a different scenario.
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stalled fallback");
+    let stalled_base = format!(
+        "http://{}/v1",
+        stalled.local_addr().expect("stalled fallback address")
+    );
+
+    let (events, stdout, stderr) = run_rpc_failover_then_abort(
+        &harness,
+        &server,
+        &stalled_base,
+        "spawning pi --rpc on a 429 primary and a fallback that never answers",
+    );
+    let kinds = event_kinds(&events);
+
+    let failover_start = kinds
+        .iter()
+        .position(|k| k == "failover_start")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("failover_start missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let failover_end = kinds
+        .iter()
+        .position(|k| k == "failover_end")
+        // ubs:ignore-next-line test assertion — the open lifecycle IS the bug
+        .unwrap_or_else(|| {
+            panic!("failover_end missing after abort: {kinds:?}\n{stdout}\n{stderr}")
+        });
+    let retry_end = kinds
+        .iter()
+        .position(|k| k == "auto_retry_end")
+        // ubs:ignore-next-line test assertion — the open lifecycle IS the bug
+        .unwrap_or_else(|| panic!("auto_retry_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+    let terminal_agent_end = kinds
+        .iter()
+        .rposition(|k| k == "agent_end")
+        // ubs:ignore-next-line test assertion — a missing lifecycle event is the failure
+        .unwrap_or_else(|| panic!("agent_end missing: {kinds:?}\n{stdout}\n{stderr}"));
+
+    assert_eq!(
+        (
+            kinds.iter().filter(|k| *k == "auto_retry_start").count(),
+            kinds.iter().filter(|k| *k == "auto_retry_end").count(),
+        ),
+        (1, 1),
+        "the primary's retry lifecycle opens and closes exactly once, even though the turn was \
+         aborted on the fallback: {kinds:?}\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        (
+            kinds.iter().filter(|k| *k == "failover_start").count(),
+            kinds.iter().filter(|k| *k == "failover_end").count(),
+        ),
+        (1, 1),
+        "one swap, one close, on the abort path too: {kinds:?}\n{stdout}\n{stderr}"
+    );
+    assert!(
+        retry_end < failover_start && failover_start < failover_end,
+        "the retry lifecycle closes into the swap and the failover lifecycle closes after it, \
+         the same order an unaborted turn uses: {kinds:?}"
+    );
+    assert!(
+        failover_end < terminal_agent_end,
+        "RPC closes the lifecycle before its terminal agent_end on this path as well: {kinds:?}"
+    );
+
+    // Truthfully, not merely present: an aborted fallback turn did not succeed.
+    let end_event = &events[failover_end]; // ubs:ignore index proven by position() above
+    assert_eq!(
+        end_event["success"],
+        serde_json::Value::Bool(false),
+        "an aborted fallback turn is not a successful one: {end_event}"
+    );
+    assert_eq!(end_event["restoredPrimary"], serde_json::Value::Bool(false));
+    assert_eq!(end_event["provider"], "e2ebackup");
+    assert_eq!(end_event["model"], "backup-model");
+
+    // The fallback really was reached and really did hang: the mock server saw
+    // the primary's attempt and its one retry, and nothing after, because the
+    // fallback's traffic went to the stalled listener instead.
+    let paths: Vec<String> = server
+        .requests()
+        .into_iter()
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(
+        paths.iter().filter(|p| p.starts_with("/primary/")).count(),
+        2,
+        "one primary attempt plus its single retry: {paths:?}"
+    );
+
+    let path = harness.temp_path("e2e_failover_rpc_abort_boundary.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_failover_rpc_abort_boundary.jsonl", &path);
 }
 
 /// bd-gm481.1: with the cooldown elapsed, the primary comes back between
