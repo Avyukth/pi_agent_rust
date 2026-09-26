@@ -32,6 +32,7 @@ pub mod bedrock;
 pub mod cohere;
 pub mod copilot;
 pub mod cursor;
+mod extension_stream;
 pub mod gemini;
 pub mod gitlab;
 pub mod model_fetch;
@@ -190,14 +191,8 @@ struct ExtensionStreamSimpleProvider {
 struct ExtensionStreamSimpleState {
     runtime: ExtensionRuntimeHandle,
     stream_id: Option<String>,
-    model_id: String,
-    provider: String,
-    api: String,
-    accumulated_text: String,
-    last_message: Option<AssistantMessage>,
-    /// Whether `StreamEvent::Start` + `TextStart` have been emitted for string-chunk mode.
-    string_chunk_started: bool,
-    /// Buffered events to drain before polling the next JS chunk.
+    decoder: extension_stream::Decoder,
+    /// Buffered events to drain before polling the next extension chunk.
     pending_events: std::collections::VecDeque<StreamEvent>,
 }
 
@@ -864,178 +859,53 @@ impl Provider for ExtensionStreamSimpleProvider {
         let state = ExtensionStreamSimpleState {
             runtime: self.runtime.clone(),
             stream_id: Some(stream_id),
-            model_id: self.model.id.clone(),
-            provider: self.model.provider.clone(),
-            api: self.model.api.clone(),
-            accumulated_text: String::new(),
-            last_message: None,
-            string_chunk_started: false,
+            decoder: extension_stream::Decoder::new(
+                self.model.id.clone(),
+                self.model.provider.clone(),
+                self.model.api.clone(),
+            ),
             pending_events: std::collections::VecDeque::new(),
         };
 
         let stream = stream::unfold(state, |mut state| async move {
-            // Drain any buffered events before polling JS.
+            // Drain terminal text-mode events even after retiring the iterator.
             if let Some(event) = state.pending_events.pop_front() {
                 return Some((Ok(event), state));
             }
 
             let stream_id = state.stream_id.clone()?;
-            let stream_id_for_cancel = stream_id.clone();
-
-            match state
+            let decoded = match state
                 .runtime
                 .provider_stream_simple_next(stream_id, Self::NEXT_TIMEOUT_MS)
                 .await
             {
-                Ok(Some(value)) => {
-                    if let Some(chunk) = value.as_str() {
-                        let chunk = chunk.to_string();
-                        state.accumulated_text.push_str(&chunk);
-                        // Update last_message in-place: mutate existing text
-                        // content instead of rebuilding the entire
-                        // AssistantMessage (avoids 3 String + Vec allocs per
-                        // chunk).
-                        match &mut state.last_message {
-                            Some(msg) => {
-                                if let Some(ContentBlock::Text(t)) = msg.content.first_mut() {
-                                    t.text.clone_from(&state.accumulated_text);
-                                }
-                            }
-                            None => {
-                                state.last_message = Some(Self::make_partial(
-                                    &state.model_id,
-                                    &state.provider,
-                                    &state.api,
-                                    &state.accumulated_text,
-                                ));
-                            }
-                        }
-
-                        // Emit Start + TextStart before first string-chunk TextDelta.
-                        if !state.string_chunk_started {
-                            state.string_chunk_started = true;
-                            state
-                                .pending_events
-                                .push_back(StreamEvent::TextStart { content_index: 0 });
-                            state.pending_events.push_back(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            });
-                            // Raw string mode still streams deltas chunk-by-chunk, so the
-                            // synthetic Start event must begin empty. Otherwise the agent
-                            // seeds the partial with the first chunk and then appends that
-                            // same first delta again.
-                            return Some((
-                                Ok(StreamEvent::Start {
-                                    partial: Self::make_partial(
-                                        &state.model_id,
-                                        &state.provider,
-                                        &state.api,
-                                        "",
-                                    ),
-                                }),
-                                state,
-                            ));
-                        }
-                        return Some((
-                            Ok(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            }),
-                            state,
-                        ));
+                Ok(Some(value)) => state.decoder.push(value),
+                Ok(None) => state.decoder.finish(),
+                Err(error) => Err(error),
+            };
+            match decoded {
+                Ok(events) => {
+                    // A structured terminal is authoritative now; never wait
+                    // for or pull more extension work after it. Text-only
+                    // iterators finish through their separate EOF contract.
+                    if state.decoder.finished()
+                        && let Some(id) = state.stream_id.take()
+                    {
+                        state.runtime.provider_stream_simple_cancel_best_effort(id);
                     }
-
-                    let event: AssistantMessageEvent = match serde_json::from_value(value) {
-                        Ok(event) => event,
-                        Err(err) => {
-                            state
-                                .runtime
-                                .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                            state.stream_id = None;
-                            return Some((
-                                Err(Error::extension(format!(
-                                    "streamSimple yielded invalid event: {err}"
-                                ))),
-                                state,
-                            ));
-                        }
-                    };
-
-                    match &event {
-                        AssistantMessageEvent::Start { partial }
-                        | AssistantMessageEvent::TextStart { partial, .. }
-                        | AssistantMessageEvent::TextDelta { partial, .. }
-                        | AssistantMessageEvent::TextEnd { partial, .. }
-                        | AssistantMessageEvent::ThinkingStart { partial, .. }
-                        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                        | AssistantMessageEvent::ToolCallStart { partial, .. }
-                        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-                        | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                            state.last_message = Some(partial.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Done { message, .. } => {
-                            state.last_message = Some(message.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Error { error, .. } => {
-                            state.last_message = Some(error.as_ref().clone());
-                        }
-                    }
-
-                    let stream_event = Self::assistant_event_to_stream_event(event);
-                    if matches!(
-                        stream_event,
-                        StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                    ) {
-                        state
-                            .runtime
-                            .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                        state.stream_id = None;
-                    }
-                    Some((Ok(stream_event), state))
+                    state.pending_events.extend(events);
+                    let event = state.pending_events.pop_front()?;
+                    Some((Ok(event), state))
                 }
-                Ok(None) => {
-                    // Stream ended — emit TextEnd (if string chunks were used) then Done.
-                    state.stream_id = None;
-                    let message = state.last_message.clone().unwrap_or_else(|| {
-                        Self::make_partial(
-                            &state.model_id,
-                            &state.provider,
-                            &state.api,
-                            &state.accumulated_text,
-                        )
-                    });
-
-                    if state.string_chunk_started {
-                        // Emit TextEnd before Done.
-                        state.pending_events.push_back(StreamEvent::Done {
-                            reason: StopReason::Stop,
-                            message,
-                        });
-                        Some((
-                            Ok(StreamEvent::TextEnd {
-                                content_index: 0,
-                                content: state.accumulated_text.clone(),
-                            }),
-                            state,
-                        ))
-                    } else {
-                        Some((
-                            Ok(StreamEvent::Done {
-                                reason: StopReason::Stop,
-                                message,
-                            }),
-                            state,
-                        ))
+                Err(error) => {
+                    state.pending_events.clear();
+                    if let Some(id) = state.stream_id.take() {
+                        state.runtime.provider_stream_simple_cancel_best_effort(id);
                     }
-                }
-                Err(err) => {
-                    state
-                        .runtime
-                        .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                    state.stream_id = None;
-                    Some((Err(err), state))
+                    // Emit exactly one error, then EOF. In particular, the
+                    // agent must not receive a synthetic Done for a partial
+                    // tool call after a structured iterator ends early.
+                    Some((Err(error), state))
                 }
             }
         });
