@@ -1771,6 +1771,11 @@ pub struct Agent {
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<MessageFetcher>,
 
+    /// Whether queue sources may be polled and dispatched automatically.
+    /// Hosts can pause either lane and explicitly take already staged batches.
+    automatic_steering_dispatch: bool,
+    automatic_follow_up_dispatch: bool,
+
     /// Live owner resolver for background completions. Notices retain the
     /// resolved owner across the registry-to-Agent handoff and are checked
     /// again immediately before provider delivery.
@@ -1907,6 +1912,8 @@ impl Agent {
             steering_fetchers: Vec::new(),
             initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
+            automatic_steering_dispatch: true,
+            automatic_follow_up_dispatch: true,
             job_session_scope,
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
@@ -2278,6 +2285,39 @@ impl Agent {
             self.message_queue.steering_mode,
             self.message_queue.follow_up_mode,
         )
+    }
+
+    /// Enable or pause automatic queue dispatch independently of batch mode.
+    ///
+    /// Pausing a lane prevents the agent from polling that lane's external
+    /// fetchers and from consuming already staged messages automatically.
+    /// Direct tool-call continuations are unaffected. Pausing follow-ups also
+    /// suppresses synthetic turn-recovery nudges, so an idle/truncated turn
+    /// cannot trigger an unexpected provider request.
+    pub const fn set_automatic_queue_dispatch(&mut self, steering: bool, follow_up: bool) {
+        self.automatic_steering_dispatch = steering;
+        self.automatic_follow_up_dispatch = follow_up;
+    }
+
+    #[must_use]
+    pub const fn automatic_queue_dispatch(&self) -> (bool, bool) {
+        (
+            self.automatic_steering_dispatch,
+            self.automatic_follow_up_dispatch,
+        )
+    }
+
+    /// Explicitly take one configured steering batch without polling fetchers.
+    pub fn take_queued_steering_batch(&mut self) -> Vec<QueuedAgentMessage> {
+        self.message_queue.pop_steering()
+    }
+
+    /// Explicitly take one configured follow-up batch without polling fetchers.
+    ///
+    /// Background-job notices are still owner-validated before they leave the
+    /// queue; stale notices are restored to their owning session registry.
+    pub async fn take_queued_follow_up_batch(&mut self) -> Vec<QueuedAgentMessage> {
+        self.pop_follow_up_for_current_session().await
     }
 
     /// Count queued messages (steering + follow-up).
@@ -3714,7 +3754,10 @@ impl Agent {
                 // synthetic continue nudge (hard-capped) instead of a silent
                 // end. The nudge flows through pending_messages so it is
                 // evented and persisted like any user message.
-                if pending_messages.is_empty() && !has_more_tool_calls {
+                if self.automatic_follow_up_dispatch
+                    && pending_messages.is_empty()
+                    && !has_more_tool_calls
+                {
                     let text = assistant_text_content(&assistant_arc.content);
                     if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
                         pending_messages =
@@ -3902,6 +3945,9 @@ impl Agent {
     }
 
     async fn drain_steering_messages(&mut self) -> Vec<QueuedAgentMessage> {
+        if !self.automatic_steering_dispatch {
+            return Vec::new();
+        }
         for fetcher in &self.steering_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
@@ -3916,6 +3962,9 @@ impl Agent {
     }
 
     async fn stage_follow_up_messages(&mut self) -> bool {
+        if !self.automatic_follow_up_dispatch {
+            return false;
+        }
         let mut owning_surface_ready = self.message_queue.follow_up_batch_len() > 0;
         if !owning_surface_ready {
             let owning_surface = self
