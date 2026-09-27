@@ -12,6 +12,8 @@ use std::fs;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+mod streams;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct NativeRustExtensionDescriptor {
@@ -61,12 +63,6 @@ struct NativeRustLoadedExtension {
     provider_streams: HashMap<String, Arc<[Value]>>,
 }
 
-#[derive(Debug, Clone)]
-struct NativeRustProviderStreamCursor {
-    chunks: Arc<[Value]>,
-    next_index: usize,
-}
-
 #[derive(Debug, Default)]
 struct NativeRustRuntimeState {
     extensions: Vec<NativeRustLoadedExtension>,
@@ -76,8 +72,7 @@ struct NativeRustRuntimeState {
     provider_stream_extension_index: HashMap<String, usize>,
     event_hook_extension_indexes: HashMap<String, Vec<usize>>,
     registered_tools: Vec<ExtensionToolDef>,
-    streams: HashMap<String, NativeRustProviderStreamCursor>,
-    next_stream_id: u64,
+    streams: streams::StreamRegistry,
     flags: HashMap<(String, String), Value>,
     repair_events: Vec<ExtensionRepairEvent>,
 }
@@ -93,7 +88,6 @@ impl NativeRustRuntimeState {
             .collect::<Vec<_>>();
         self.extensions = loaded;
         self.streams.clear();
-        self.next_stream_id = 0;
         self.rebuild_indexes();
         snapshots
     }
@@ -489,15 +483,7 @@ impl NativeRustExtensionRuntimeHandle {
                 ))
             })?;
             let chunk_count = stream_chunks.len();
-            state.next_stream_id = state.next_stream_id.saturating_add(1);
-            let stream_id = format!("native-stream-{}", state.next_stream_id);
-            state.streams.insert(
-                stream_id.clone(),
-                NativeRustProviderStreamCursor {
-                    chunks: stream_chunks,
-                    next_index: 0,
-                },
-            );
+            let stream_id = state.streams.start(stream_chunks)?;
             drop(state);
             (stream_id, chunk_count)
         };
@@ -516,27 +502,14 @@ impl NativeRustExtensionRuntimeHandle {
         stream_id: String,
         _timeout_ms: u64,
     ) -> Result<Option<Value>> {
-        let next_value = {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
-            let Some(cursor) = state.streams.get_mut(&stream_id) else {
-                return Ok(None);
-            };
-            let next = cursor.chunks.get(cursor.next_index).cloned();
-            let exhausted = if next.is_some() {
-                cursor.next_index = cursor.next_index.saturating_add(1);
-                cursor.next_index >= cursor.chunks.len()
-            } else {
-                true
-            };
-            if exhausted {
-                state.streams.remove(&stream_id);
-            }
-            next
-        };
-        Ok(next_value)
+        // Unknown/retired handles are errors, never ordinary EOF. The provider
+        // adapter may complete a raw-text response at EOF, so conflating reset
+        // or cancellation with exhaustion would publish truncated text.
+        self.state
+            .write()
+            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
+            .streams
+            .next(&stream_id)
     }
 
     pub async fn provider_stream_simple_cancel(
@@ -548,14 +521,14 @@ impl NativeRustExtensionRuntimeHandle {
             .write()
             .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
             .streams
-            .remove(&stream_id);
+            .cancel(&stream_id);
         Ok(())
     }
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
         if let Ok(mut state) = self.state.write() {
-            state.streams.remove(&stream_id);
+            state.streams.cancel(&stream_id);
         }
     }
 }
