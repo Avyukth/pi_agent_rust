@@ -688,3 +688,150 @@ fn quoted_generic_credentials_obey_block_and_off_modes_at_provider_entry() {
     }
     finish_case(&harness, case);
 }
+
+
+#[test]
+fn structured_custom_and_tool_arguments_are_screened_request_wide() {
+    const OPAQUE: &str = "opaqueCredentialValue1234567890";
+    let harness = TestHarness::new("structured_custom_and_tool_arguments_are_screened_request_wide");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    let custom = pi::model::Message::Custom(pi::model::CustomMessage {
+        content: format!("earlier bare echo: {OPAQUE}"),
+        custom_type: "fixture".to_string(),
+        display: true,
+        details: Some(json!({"api_key": OPAQUE, "ordinary": true})),
+        timestamp: 0,
+    });
+    let assistant = pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
+        content: vec![pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
+            id: "history-call".to_string(),
+            name: "fixture".to_string(),
+            arguments: json!({
+                "echo": OPAQUE,
+                "nested": {"api_key": OPAQUE},
+            }),
+            thought_signature: None,
+        })],
+        stop_reason: pi::model::StopReason::Stop,
+        timestamp: 0,
+        ..pi::model::AssistantMessage::default()
+    }));
+
+    block_on_local(agent.run_with_messages_with_abort(
+        vec![custom, assistant],
+        None,
+        |_| {},
+    ))
+    .expect("screened request should reach provider");
+
+    let joined = capture.lock().expect("capture").payloads.join("\n");
+    assert!(!joined.contains(OPAQUE), "opaque credential leaked: {joined}");
+    assert!(
+        joined.matches("<pi-secret:").count() >= 4,
+        "content, details and structured arguments should all be protected: {joined}"
+    );
+
+    let restored = agent.restore_secrets_inbound(pi::model::ToolCall {
+        id: "restore".to_string(),
+        name: "fixture".to_string(),
+        arguments: json!({"value": "<pi-secret:000001>"}),
+        thought_signature: None,
+    });
+    assert_eq!(restored.arguments["value"], OPAQUE);
+}
+
+#[test]
+fn late_signed_content_refusal_rolls_back_the_entire_request_vault() {
+    const EARLY: &str = "sk-aaaaaaaaaaaaaaaaaaaaaaaa";
+    const SIGNED: &str = "sk-bbbbbbbbbbbbbbbbbbbbbbbb";
+    let harness = TestHarness::new("late_signed_content_refusal_rolls_back_the_entire_request_vault");
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    let early = pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Text(format!("remember {EARLY}")),
+        timestamp: 0,
+    });
+    let signed = pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
+        content: vec![pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
+            id: "signed-call".to_string(),
+            name: "fixture".to_string(),
+            arguments: json!({"token": SIGNED}),
+            thought_signature: Some("provider-signature".to_string()),
+        })],
+        stop_reason: pi::model::StopReason::ToolUse,
+        timestamp: 0,
+        ..pi::model::AssistantMessage::default()
+    }));
+
+    let error = block_on_local(agent.run_with_messages_with_abort(
+        vec![early, signed],
+        None,
+        |_| {},
+    ))
+    .expect_err("signed content must never be rewritten");
+    assert!(
+        error.to_string().contains("PI_SECRET_SIGNED_CONTENT"),
+        "{error}"
+    );
+    assert!(
+        capture.lock().expect("capture").payloads.is_empty(),
+        "provider must not be invoked after a screening refusal"
+    );
+
+    // The refused request discovered both values in its staged vault. Neither
+    // may survive into the live session or consume placeholder identities.
+    assert_eq!(
+        agent
+            .secrets_transform_outbound_text(SIGNED)
+            .expect("screen signed credential after rollback"),
+        "<pi-secret:000001>"
+    );
+    assert_eq!(
+        agent
+            .secrets_transform_outbound_text(EARLY)
+            .expect("screen early credential after rollback"),
+        "<pi-secret:000002>"
+    );
+}
+
+#[test]
+fn signed_text_and_paused_turns_fail_closed_instead_of_breaking_replay_bytes() {
+    const SECRET_IN_SIGNED_TEXT: &str = "sk-cccccccccccccccccccccccc";
+    let harness = TestHarness::new("signed_text_and_paused_turns_fail_closed_instead_of_breaking_replay_bytes");
+    let root = harness.temp_path(".");
+
+    for message in [
+        pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
+            content: vec![pi::model::ContentBlock::Text(pi::model::TextContent {
+                text: SECRET_IN_SIGNED_TEXT.to_string(),
+                text_signature: Some("text-signature".to_string()),
+            })],
+            stop_reason: pi::model::StopReason::Stop,
+            timestamp: 0,
+            ..pi::model::AssistantMessage::default()
+        })),
+        pi::model::Message::Assistant(Arc::new(pi::model::AssistantMessage {
+            content: vec![pi::model::ContentBlock::ToolCall(pi::model::ToolCall {
+                id: "server-tool".to_string(),
+                name: "server_tool".to_string(),
+                arguments: json!({"api_key": SECRET_IN_SIGNED_TEXT}),
+                thought_signature: Some("server-signature".to_string()),
+            })],
+            stop_reason: pi::model::StopReason::PauseTurn,
+            timestamp: 0,
+            ..pi::model::AssistantMessage::default()
+        })),
+    ] {
+        let (mut agent, capture) = build_agent(&root, None);
+        let error = block_on_local(agent.run_with_message_with_abort(message, None, |_| {}))
+            .expect_err("signed/verbatim payload must fail closed");
+        assert!(
+            error.to_string().contains("PI_SECRET_SIGNED_CONTENT"),
+            "{error}"
+        );
+        assert!(capture.lock().expect("capture").payloads.is_empty());
+    }
+}
