@@ -10,9 +10,12 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod streams;
+#[cfg(test)]
+mod shutdown_tests;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -87,7 +90,7 @@ impl NativeRustRuntimeState {
             .map(|extension| extension.snapshot.clone())
             .collect::<Vec<_>>();
         self.extensions = loaded;
-        self.streams.clear();
+        self.reset_transient_state();
         self.rebuild_indexes();
         snapshots
     }
@@ -209,6 +212,7 @@ impl NativeRustRuntimeState {
 #[derive(Clone)]
 pub struct NativeRustExtensionRuntimeHandle {
     state: Arc<RwLock<NativeRustRuntimeState>>,
+    closed: Arc<AtomicBool>,
 }
 
 // The native runtime handle mirrors the async JS runtime handle so
@@ -224,34 +228,77 @@ impl NativeRustExtensionRuntimeHandle {
         );
         Ok(Self {
             state: Arc::new(RwLock::new(NativeRustRuntimeState::default())),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
+    /// Permanently close admission through every clone and try to retire state.
+    /// Native descriptors have no worker to join. Never park the executor on a
+    /// contended synchronous lock: return false, remaining closed, so the owner
+    /// can retry. Even a zero budget attempts an immediate drain. Destruction
+    /// is synchronous; this is not a hard real-time deallocation guarantee.
     pub async fn shutdown(&self, _budget: Duration) -> bool {
+        self.closed.store(true, Ordering::Release);
+        let mut state = match self.state.try_write() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        let retired = std::mem::take(&mut *state);
+        drop(state);
+        drop(retired);
         true
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::extension(
+                "PI_NATIVE_RUNTIME_CLOSED: native extension runtime is shut down; start a new runtime",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_running(&self) -> Result<std::sync::RwLockReadGuard<'_, NativeRustRuntimeState>> {
+        self.ensure_running()?;
+        let state = self
+            .state
+            .read()
+            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+        // Admission may have closed while this caller waited for the lock.
+        self.ensure_running()?;
+        Ok(state)
+    }
+
+    fn write_running(&self) -> Result<std::sync::RwLockWriteGuard<'_, NativeRustRuntimeState>> {
+        self.ensure_running()?;
+        let state = self
+            .state
+            .write()
+            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+        self.ensure_running()?;
+        Ok(state)
     }
 
     async fn load_extensions_snapshots(
         &self,
         specs: Vec<NativeRustExtensionLoadSpec>,
     ) -> Result<Vec<JsExtensionSnapshot>> {
+        // Check both before filesystem work and at installation. A descriptor
+        // read already in flight may finish, but cannot reopen a closed runtime.
+        self.ensure_running()?;
         let loaded = load_native_extensions_from_specs(&specs)?;
-        let mut state = self
-            .state
-            .write()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+        let mut state = self.write_running()?;
         Ok(state.load_extensions(loaded))
     }
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+        let state = self.read_running()?;
         Ok(state.registered_tools.clone())
     }
 
     pub async fn pump_once(&self) -> Result<bool> {
+        self.ensure_running()?;
         Ok(false)
     }
 
@@ -262,10 +309,7 @@ impl NativeRustExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         _timeout_ms: u64,
     ) -> Result<Value> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+        let state = self.read_running()?;
         Ok(state.dispatch_event(&event_name, &event_payload, ctx_payload.as_ref()))
     }
 
@@ -276,10 +320,7 @@ impl NativeRustExtensionRuntimeHandle {
         _timeout_ms: u64,
     ) -> Result<Vec<Result<Value>>> {
         let out = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let state = self.read_running()?;
             let mut out = Vec::with_capacity(events.len());
             for (event_name, payload) in events {
                 out.push(Ok(state.dispatch_event(
@@ -320,10 +361,7 @@ impl NativeRustExtensionRuntimeHandle {
         }
 
         let lookup = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let state = self.read_running()?;
             if let Some(extension) = state.find_tool_extension(tool_name) {
                 extension
                     .tool_outputs
@@ -370,10 +408,7 @@ impl NativeRustExtensionRuntimeHandle {
         }
 
         let lookup = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let state = self.read_running()?;
             state
                 .find_command_extension(&command_name)
                 .map_or(Lookup::Missing, |extension| {
@@ -406,10 +441,7 @@ impl NativeRustExtensionRuntimeHandle {
         }
 
         let lookup = {
-            let state = self
-                .state
-                .read()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let state = self.read_running()?;
             state
                 .find_shortcut_extension(&key_id)
                 .map_or(Lookup::Missing, |extension| {
@@ -439,9 +471,7 @@ impl NativeRustExtensionRuntimeHandle {
         flag_name: String,
         value: Value,
     ) -> Result<()> {
-        self.state
-            .write()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
+        self.write_running()?
             .flags
             .insert((extension_id, flag_name), value);
         Ok(())
@@ -457,10 +487,7 @@ impl NativeRustExtensionRuntimeHandle {
     }
 
     pub async fn reset_transient_state(&self) -> Result<()> {
-        self.state
-            .write()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
-            .reset_transient_state();
+        self.write_running()?.reset_transient_state();
         Ok(())
     }
 
@@ -473,10 +500,7 @@ impl NativeRustExtensionRuntimeHandle {
         _timeout_ms: u64,
     ) -> Result<String> {
         let (stream_id, chunk_count) = {
-            let mut state = self
-                .state
-                .write()
-                .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?;
+            let mut state = self.write_running()?;
             let stream_chunks = state.provider_stream_chunks(&provider_id).ok_or_else(|| {
                 Error::extension(format!(
                     "native-rust provider `{provider_id}` has no streamSimple handler"
@@ -505,11 +529,7 @@ impl NativeRustExtensionRuntimeHandle {
         // Unknown/retired handles are errors, never ordinary EOF. The provider
         // adapter may complete a raw-text response at EOF, so conflating reset
         // or cancellation with exhaustion would publish truncated text.
-        self.state
-            .write()
-            .map_err(|_| Error::extension("native-rust runtime state lock poisoned"))?
-            .streams
-            .next(&stream_id)
+        self.write_running()?.streams.next(&stream_id)
     }
 
     pub async fn provider_stream_simple_cancel(
