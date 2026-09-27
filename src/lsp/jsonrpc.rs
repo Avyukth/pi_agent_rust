@@ -1,17 +1,15 @@
 //! JSON-RPC 2.0 transport for language-server child processes.
 //!
-//! One `JsonRpcClient` owns one child process: a dedicated reader thread
-//! parses `Content-Length` frames from stdout (blocking I/O on a dedicated
-//! OS thread, the same isolation choice as the bash tool's pump threads —
-//! see bd-xdcrh.4.3), a mutex-guarded stdin writer serializes frames, and a
-//! pending map correlates responses to request ids. The async consumer polls
-//! completion receivers with a tick loop so timeouts and ambient
-//! cancellation stay responsive without blocking the runtime (bd-cv653.1.1).
+//! One `JsonRpcClient` owns one child process. Dedicated stdout/stdin pump
+//! threads isolate blocking pipes from runtime workers. Outbound frames have
+//! count and byte admission limits; a pending map correlates responses. The
+//! shared async completion wait retains its request owner and retires pending
+//! work on timeout, cancellation, disconnection, or future drop.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver as StdReceiver, SyncSender as StdSyncSender, TrySendError};
 use std::sync::{Mutex, MutexGuard};
@@ -21,14 +19,20 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 use crate::tools::{ProcessCleanupMode, ProcessGuard};
 
+mod completion;
+mod outbound;
+pub use completion::{CompletionWaitError, await_completion};
+
 /// Hard cap on a single JSON-RPC frame body (64 MiB); larger frames are
 /// treated as transport corruption and kill the connection.
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Bound on the notification queue; overflow drops oldest-first by count and
-/// is recorded in `dropped_notifications`.
+/// Bound on the notification queue; overflow drops the incoming notification
+/// and is recorded in `dropped_notifications`.
 const NOTIFICATION_QUEUE_CAP: usize = 1024;
 /// Bound on retained server stderr (diagnostics surface), bytes.
 const STDERR_TAIL_CAP: usize = 32 * 1024;
+/// A server that never answers cannot accumulate unbounded completion slots.
+const MAX_PENDING_REQUESTS: usize = 1024;
 
 /// A JSON-RPC error object returned by the server.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -123,8 +127,8 @@ pub const MCP_ENV_ALLOWLIST: &[&str] = &[
     "COMSPEC",
 ];
 
-/// Shared writer: frames are written atomically under one mutex.
-type SharedWriter = Mutex<ChildStdin>;
+/// Shared frame-admission writer. The mutex never guards a blocking pipe.
+type SharedWriter = Mutex<outbound::QueuedWriter>;
 
 /// Pending request completions: reader thread sends exactly one result.
 type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, TransportError>>>>;
@@ -340,59 +344,6 @@ impl PublicTailBuffer {
     }
 }
 
-/// Poll a request-completion receiver until it resolves, the deadline
-/// passes, or the ambient context cancels.
-///
-/// On timeout/cancel the caller-provided `on_abandon` runs (used to send
-/// `$/cancelRequest`). The receiver is taken by value: `Receiver<T>` is
-/// `Send` but not `Sync`, so a by-reference wait would make the caller's
-/// future non-`Send`. Shared by the LSP client and the MCP stdio transport
-/// (bd-cv653.1.1 / bd-cv653.6.1).
-pub async fn await_completion<T>(
-    rx: StdReceiver<T>,
-    timeout: std::time::Duration,
-    on_abandon: impl FnOnce(),
-) -> std::result::Result<T, CompletionWaitError> {
-    let cx = crate::agent_cx::AgentCx::for_current_or_request();
-    let start = cx
-        .cx()
-        .timer_driver()
-        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    loop {
-        match rx.try_recv() {
-            Ok(value) => return Ok(value),
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(CompletionWaitError::Closed);
-            }
-        }
-        let now = cx
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        if std::time::Duration::from_nanos(now.duration_since(start)) >= timeout {
-            on_abandon();
-            return Err(CompletionWaitError::Timeout);
-        }
-        if cx.checkpoint().is_err() {
-            on_abandon();
-            return Err(CompletionWaitError::Cancelled);
-        }
-        asupersync::time::sleep(now, std::time::Duration::from_millis(10)).await;
-    }
-}
-
-/// Why a completion wait ended without a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionWaitError {
-    /// Deadline exceeded.
-    Timeout,
-    /// Ambient cancellation fired.
-    Cancelled,
-    /// The sender dropped without sending.
-    Closed,
-}
-
 /// Apply the environment policy and the caller's env entries to a command.
 fn apply_env_policy(cmd: &mut Command, policy: &EnvPolicy, env: &[(String, String)]) {
     match policy {
@@ -454,12 +405,7 @@ fn reader_loop(
                 Err(err) => break format!("frame read error: {err}"),
             }
         };
-        alive.store(false, Ordering::SeqCst);
-        // Fail every outstanding request so waiters wake immediately.
-        let mut pending = lock(&pending);
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(TransportError::Closed(close_reason.clone())));
-        }
+        outbound::close_pending(&pending, &alive, TransportError::Closed(close_reason));
     }
 }
 
@@ -478,7 +424,7 @@ pub struct JsonRpcClient {
 
 impl JsonRpcClient {
     /// Spawn `command` with `args`/`env` rooted at `cwd` and start the
-    /// reader/stderr pump threads.
+    /// reader, writer, and stderr pump threads.
     ///
     /// # Errors
     ///
@@ -542,10 +488,17 @@ impl JsonRpcClient {
             .stderr
             .take()
             .ok_or_else(|| Error::tool("lsp", "missing child stderr".to_string()))?;
-
-        let writer = std::sync::Arc::new(Mutex::new(stdin));
+        // Own cleanup before starting any fallible pump construction.
+        let child = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
         let pending: std::sync::Arc<PendingMap> = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let queued_writer = outbound::QueuedWriter::start(
+            stdin,
+            std::sync::Arc::clone(&pending),
+            std::sync::Arc::clone(&alive),
+        )
+        .map_err(|err| Error::tool(flavor, format!("failed to start server writer: {err}")))?;
+        let writer = std::sync::Arc::new(Mutex::new(queued_writer));
         let stderr_tail = std::sync::Arc::new(Mutex::new(TailBuffer {
             data: String::new(),
             cap: STDERR_TAIL_CAP,
@@ -594,7 +547,7 @@ impl JsonRpcClient {
         }
 
         Ok(Self {
-            child: Mutex::new(ProcessGuard::new(child, ProcessCleanupMode::ChildOnly)),
+            child: Mutex::new(child),
             writer,
             pending,
             next_id: AtomicU64::new(1),
@@ -619,12 +572,15 @@ impl JsonRpcClient {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Send a request and return the completion receiver plus the request id
-    /// (needed to send `$/cancelRequest` on timeout/cancellation).
+    /// Queue a request and return its completion receiver and request id.
+    /// Only the dedicated pump writes the blocking pipe. An abandoned request
+    /// is skipped if it is still queued; an in-flight write may already have
+    /// reached the server and is never retried here.
     ///
     /// # Errors
-    ///
-    /// Returns an error when the transport is dead or the write fails.
+    /// Returns an error for a dead transport, exhausted request slots/ids, or
+    /// outbound admission failure. Admission failure retires the transport so
+    /// later requests cannot use a connection with incomplete traffic.
     pub fn request(
         &self,
         method: &str,
@@ -633,14 +589,23 @@ impl JsonRpcClient {
         (u64, StdReceiver<std::result::Result<Value, TransportError>>),
         TransportError,
     > {
-        if !self.is_alive() {
-            return Err(TransportError::Closed(
-                "server transport is not alive".to_string(),
-            ));
-        }
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let id = self
+            .next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| TransportError::Io("request id space exhausted".to_string()))?;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        lock(&self.pending).insert(id, tx);
+        {
+            // Closure marks the transport dead before taking this same lock.
+            // No request can appear after the terminal pending-map drain.
+            let mut pending = lock(&self.pending);
+            if !self.is_alive() {
+                return Err(TransportError::Closed("server transport is not alive".to_string()));
+            }
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err(TransportError::Io("pending request limit exceeded".to_string()));
+            }
+            pending.insert(id, tx);
+        }
         let mut frame_value = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -650,20 +615,21 @@ impl JsonRpcClient {
         let frame = encode_frame(&frame_value);
         let write_result = {
             let mut guard = lock(&self.writer);
-            guard.write_all(&frame).and_then(|()| guard.flush())
+            guard.write_request(&frame, id).and_then(|()| guard.flush())
         };
         if let Err(err) = write_result {
             lock(&self.pending).remove(&id);
-            return Err(TransportError::Io(format!("request write failed: {err}")));
+            self.kill();
+            return Err(TransportError::Io(format!("request queue failed: {err}")));
         }
         Ok((id, rx))
     }
 
-    /// Send a notification (no response expected).
+    /// Queue a notification (no response expected), without blocking on stdin.
+    /// Success means accepted by the bounded queue, not remote acknowledgement.
     ///
     /// # Errors
-    ///
-    /// Returns an error when the write fails.
+    /// Returns an error and retires the transport when admission fails.
     pub fn notify(&self, method: &str, params: Value) -> std::result::Result<(), TransportError> {
         let mut frame_value = serde_json::json!({
             "jsonrpc": "2.0",
@@ -671,18 +637,25 @@ impl JsonRpcClient {
         });
         frame_value["params"] = params;
         let frame = encode_frame(&frame_value);
-        let mut guard = lock(&self.writer);
-        guard
-            .write_all(&frame)
-            .and_then(|()| guard.flush())
-            .map_err(|err| TransportError::Io(format!("notification write failed: {err}")))
+        let write_result = {
+            let mut guard = lock(&self.writer);
+            guard.write_all(&frame).and_then(|()| guard.flush())
+        };
+        if let Err(err) = write_result {
+            self.kill();
+            return Err(TransportError::Io(format!("notification queue failed: {err}")));
+        }
+        Ok(())
     }
 
-    /// Cancel an in-flight request: drop the pending entry and notify the
-    /// server via `$/cancelRequest`.
+    /// Retire a request exactly once, then queue `$/cancelRequest`. Safe from
+    /// completion-future drop: no synchronous pipe write occurs here. A queued
+    /// request not yet taken by the pump is skipped when its pending slot is gone.
     pub fn cancel_request(&self, id: u64) {
-        lock(&self.pending).remove(&id);
-        let _ = self.notify("$/cancelRequest", serde_json::json!({ "id": id }));
+        let removed = lock(&self.pending).remove(&id).is_some();
+        if removed {
+            let _ = self.notify("$/cancelRequest", serde_json::json!({ "id": id }));
+        }
     }
 
     /// Drain queued server notifications (non-blocking).
@@ -714,18 +687,22 @@ impl JsonRpcClient {
         matches!(status, Ok(Some(_)))
     }
 
-    /// Graceful stop: best-effort `shutdown` + `exit`, then kill.
+    /// Best-effort exit notification, then a hard stop. The client layer owns
+    /// the timed shutdown handshake; this method never waits for pipe drainage.
     pub fn shutdown(&self) {
-        // Do not wait for the response here; the client layer performs the
-        // timed shutdown handshake when it has an async context.
         let _ = self.notify("exit", Value::Null);
         self.kill();
     }
 
-    /// Kill the child process immediately.
+    /// Retire every pending request and kill the owned child immediately.
+    /// This does not depend on the stdout reader observing EOF first.
     pub fn kill(&self) {
+        outbound::close_pending(
+            &self.pending,
+            &self.alive,
+            TransportError::Closed("server transport stopped".to_string()),
+        );
         let _ = lock(&self.child).kill();
-        self.alive.store(false, Ordering::SeqCst);
     }
 }
 
@@ -987,5 +964,18 @@ mod tests {
         assert!(notification_rx.try_recv().is_ok());
         assert!(notification_rx.try_recv().is_ok());
         assert!(notification_rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_completes_pending_without_waiting_for_stdout_eof() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let client = JsonRpcClient::spawn("cat", &[], &[], temp.path()).expect("cat");
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        lock(&client.pending).insert(99, sender);
+        client.kill();
+        assert!(matches!(receiver.try_recv(), Ok(Err(TransportError::Closed(_)))));
+        assert!(lock(&client.pending).is_empty());
+        assert!(matches!(client.request("later", Value::Null), Err(TransportError::Closed(_))));
     }
 }

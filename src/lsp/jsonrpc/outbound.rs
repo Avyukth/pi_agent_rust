@@ -1,0 +1,286 @@
+//! Bounded, non-blocking admission to a single child-stdin pump.
+//!
+//! Runtime and reader threads enqueue complete frames; only this dedicated
+//! pump touches the blocking pipe. Queue acceptance is not delivery. The
+//! response wait owns the request deadline, and failures retire the transport
+//! rather than retrying a frame whose delivery is uncertain.
+
+use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+
+use super::{MAX_FRAME_BYTES, PendingMap, TransportError, lock};
+
+const MAX_QUEUED_FRAMES: usize = 64;
+// Includes the frame being written, not just frames still in the channel.
+const MAX_OUTBOUND_BYTES: usize = MAX_FRAME_BYTES + 64 * 1024;
+
+struct ByteBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+struct Reservation {
+    budget: Arc<ByteBudget>,
+    bytes: usize,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct Frame {
+    bytes: Vec<u8>,
+    request_id: Option<u64>,
+    _reservation: Reservation,
+}
+
+/// A frame-admission writer. `flush` checks transport health; it does not wait
+/// for pipe drainage. Waiting for the protocol response establishes delivery.
+pub(super) struct QueuedWriter {
+    sender: SyncSender<Frame>,
+    budget: Arc<ByteBudget>,
+    alive: Arc<AtomicBool>,
+}
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "server writer is closed")
+}
+
+/// Publish terminal state before draining, sharing the pending-map lock with
+/// request admission. Completions are sent outside the lock and never block.
+pub(super) fn close_pending(
+    pending: &PendingMap,
+    alive: &AtomicBool,
+    error: TransportError,
+) {
+    alive.store(false, Ordering::Release);
+    let abandoned = std::mem::take(&mut *lock(pending));
+    for (_, sender) in abandoned {
+        let _ = sender.try_send(Err(error.clone()));
+    }
+}
+
+impl QueuedWriter {
+    fn channel(
+        alive: Arc<AtomicBool>,
+        capacity: usize,
+        byte_limit: usize,
+    ) -> (Self, Receiver<Frame>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(capacity);
+        (
+            Self {
+                sender,
+                budget: Arc::new(ByteBudget {
+                    used: AtomicUsize::new(0),
+                    limit: byte_limit,
+                }),
+                alive,
+            },
+            receiver,
+        )
+    }
+
+    pub(super) fn start(
+        mut pipe: impl Write + Send + 'static,
+        pending: Arc<PendingMap>,
+        alive: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
+        let (writer, receiver) =
+            Self::channel(Arc::clone(&alive), MAX_QUEUED_FRAMES, MAX_OUTBOUND_BYTES);
+        // Intentional detach, just like the stdout/stderr pumps. Killing the
+        // owned child breaks a blocked write; dropping all senders ends recv.
+        let _writer_thread = std::thread::Builder::new()
+            .name("pi-lsp-stdin".to_string())
+            .spawn(move || {
+                let error = loop {
+                    let Ok(frame) = receiver.recv() else {
+                        break TransportError::Closed("server writer queue closed".to_string());
+                    };
+                    if !alive.load(Ordering::Acquire) {
+                        break TransportError::Closed("server transport retired".to_string());
+                    }
+                    // Do not start an abandoned request that was still queued.
+                    // Cancellation racing an already started write cannot undo
+                    // delivery; the cancel notification remains best effort.
+                    if frame
+                        .request_id
+                        .is_some_and(|id| !lock(&pending).contains_key(&id))
+                    {
+                        continue;
+                    }
+                    if let Err(error) = pipe.write_all(&frame.bytes).and_then(|()| pipe.flush()) {
+                        break TransportError::Io(format!("server pipe write failed: {error}"));
+                    }
+                    // Drop releases the byte reservation only after the entire
+                    // frame was written. There is no replay on a partial write.
+                };
+                close_pending(&pending, &alive, error);
+                // Dropping the receiver also releases every queued reservation.
+            })?;
+        Ok(writer)
+    }
+
+    pub(super) fn write_request(&mut self, bytes: &[u8], id: u64) -> io::Result<()> {
+        self.enqueue(bytes, Some(id)).map(|_| ())
+    }
+
+    fn enqueue(&mut self, bytes: &[u8], request_id: Option<u64>) -> io::Result<usize> {
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        self.budget
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes.len())
+                    .filter(|total| *total <= self.budget.limit)
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "server writer byte budget exhausted")
+            })?;
+        let reservation = Reservation {
+            budget: Arc::clone(&self.budget),
+            bytes: bytes.len(),
+        };
+        let frame = Frame {
+            bytes: bytes.to_vec(),
+            request_id,
+            _reservation: reservation,
+        };
+        self.sender.try_send(frame).map_err(|error| match error {
+            TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "server writer frame queue full")
+            }
+            TrySendError::Disconnected(_) => closed(),
+        })?;
+        Ok(bytes.len())
+    }
+}
+
+impl Write for QueuedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.enqueue(bytes, None)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.alive.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(closed())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::io::BufReader;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn admission_is_bounded_without_any_receiver_progress() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let (mut writer, receiver) = QueuedWriter::channel(alive, 2, 8);
+        writer.write_all(b"abc").expect("first frame");
+        writer.write_all(b"def").expect("second frame");
+        assert_eq!(writer.write(b"g").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 6);
+        let first = receiver.try_recv().expect("first frame");
+        assert_eq!(first.bytes, b"abc");
+        // Moving a frame out of the queue does not free its in-flight budget.
+        assert_eq!(writer.write(b"ghi").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 6);
+        drop(first);
+        writer.write_all(b"ghi").expect("released budget reused");
+        assert_eq!(receiver.try_recv().expect("second frame").bytes, b"def");
+        assert_eq!(receiver.try_recv().expect("third frame").bytes, b"ghi");
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rejected_and_disconnected_frames_release_their_reservations() {
+        let (mut writer, receiver) =
+            QueuedWriter::channel(Arc::new(AtomicBool::new(true)), 1, 4);
+        assert_eq!(writer.write(b"12345").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+        writer.write_all(b"1234").expect("exact limit");
+        drop(receiver);
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+        assert_eq!(writer.write(b"x").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn real_pipe_preserves_complete_frames_in_order() {
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
+        let first = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize"});
+        let second = serde_json::json!({"jsonrpc":"2.0", "method":"initialized"});
+        writer.write_all(&super::super::encode_frame(&first)).expect("first");
+        writer.write_all(&super::super::encode_frame(&second)).expect("second");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        assert_eq!(super::super::read_frame(&mut reader).expect("read first"), Some(first));
+        assert_eq!(super::super::read_frame(&mut reader).expect("read second"), Some(second));
+        assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
+    }
+
+    #[test]
+    fn queued_abandoned_requests_do_not_reach_the_pipe() {
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
+        // The wait owner has already removed request 7's pending slot.
+        let abandoned = serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"workspace/executeCommand"});
+        writer.write_request(&super::super::encode_frame(&abandoned), 7).expect("queue");
+        let notification = serde_json::json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":7}});
+        writer.write_all(&super::super::encode_frame(&notification)).expect("cancel");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        assert_eq!(super::super::read_frame(&mut reader).expect("notification"), Some(notification));
+        assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
+    }
+
+    #[test]
+    fn broken_real_pipe_fails_pending_requests_and_retires_transport() {
+        let (reader, pipe) = std::io::pipe().expect("pipe");
+        drop(reader);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        lock(&pending).insert(7, sender);
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = QueuedWriter::start(pipe, Arc::clone(&pending), Arc::clone(&alive))
+            .expect("pump");
+        writer.write_all(b"frame").expect("queue admission");
+        let result = receiver.recv_timeout(Duration::from_secs(5)).expect("failure delivered");
+        assert!(matches!(result, Err(TransportError::Io(_))));
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(lock(&pending).is_empty());
+        assert_eq!(writer.write(b"later").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn closure_does_not_block_on_an_already_completed_receiver() {
+        let pending = Mutex::new(HashMap::new());
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        sender.send(Ok(Value::Null)).expect("completed");
+        lock(&pending).insert(1, sender);
+        let alive = AtomicBool::new(true);
+        close_pending(&pending, &alive, TransportError::Closed("stop".to_string()));
+        assert_eq!(receiver.try_recv().expect("original result").unwrap(), Value::Null);
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(lock(&pending).is_empty());
+    }
+}
