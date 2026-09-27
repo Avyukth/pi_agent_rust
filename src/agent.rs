@@ -2558,9 +2558,12 @@ impl Agent {
         .await
     }
 
-    /// Outbound secrets transform (bd-cv653.7.9): obfuscate credential
-    /// shapes in the context before the provider sees it (or refuse the
-    /// send in block mode). Off mode is byte-identical.
+    /// Outbound secret screening at the primary provider boundary.
+    ///
+    /// The whole request is transactional: all mutations happen against a
+    /// cloned vault and owned context, and the live vault is installed only
+    /// after every field succeeds. This prevents a late refusal from learning
+    /// credentials or consuming placeholder identities.
     fn apply_secrets_outbound(
         &mut self,
         mut context: Context<'static>,
@@ -2578,87 +2581,216 @@ impl Agent {
                 .and_then(|s| s.extra_patterns.as_deref())
                 .unwrap_or(&[]),
         );
+        let mut staged_vault = self.secrets_vault.clone();
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
 
         if let Some(prompt) = context.system_prompt.as_deref() {
-            let out = Self::secrets_transform_text(
+            context.system_prompt = Some(Cow::Owned(Self::secrets_transform_text(
                 prompt,
-                &mut self.secrets_vault,
+                &mut staged_vault,
                 mode,
                 &extra,
                 &mut total,
                 &mut labels,
-            )?;
-            context.system_prompt = Some(std::borrow::Cow::Owned(out));
+            )?));
         }
+
         for message in context.messages.to_mut().iter_mut() {
             match message {
-                Message::User(user) => {
-                    Self::secrets_transform_user_content(
-                        &mut user.content,
-                        &mut self.secrets_vault,
-                        mode,
-                        &extra,
-                        &mut total,
-                        &mut labels,
-                    )?;
-                }
+                Message::User(user) => Self::secrets_transform_user_content(
+                    &mut user.content,
+                    &mut staged_vault,
+                    mode,
+                    &extra,
+                    &mut total,
+                    &mut labels,
+                )?,
                 Message::Assistant(assistant) => {
+                    // Paused server-tool responses and signed blocks must remain
+                    // byte/structure stable for provider replay. Screen them to
+                    // detect leakage, but refuse rather than invalidate a
+                    // signature or alter a verbatim continuation.
+                    if assistant.stop_reason == StopReason::PauseTurn {
+                        let original = serde_json::to_value(assistant.as_ref()).map_err(|_| {
+                            Error::validation(
+                                "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
+                                    .to_string(),
+                            )
+                        })?;
+                        let protected = Self::secrets_transform_json(
+                            &original,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                        if protected != original {
+                            return Err(Self::secret_signed_content_error());
+                        }
+                        continue;
+                    }
+
                     let assistant_mut = Arc::make_mut(assistant);
                     for block in &mut assistant_mut.content {
-                        match block {
-                            ContentBlock::Text(t) => {
-                                t.text = Self::secrets_transform_text(
-                                    &t.text,
-                                    &mut self.secrets_vault,
-                                    mode,
-                                    &extra,
-                                    &mut total,
-                                    &mut labels,
-                                )?;
-                            }
-                            ContentBlock::Thinking(t) => {
-                                t.thinking = Self::secrets_transform_text(
-                                    &t.thinking,
-                                    &mut self.secrets_vault,
-                                    mode,
-                                    &extra,
-                                    &mut total,
-                                    &mut labels,
-                                )?;
-                            }
-                            _ => {}
-                        }
+                        Self::secrets_transform_content_block(
+                            block,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(error_message) = assistant_mut.error_message.as_mut() {
+                        *error_message = Self::secrets_transform_text(
+                            error_message,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(details) = assistant_mut.stop_details.as_mut()
+                        && let Some(explanation) = details.explanation.as_mut()
+                    {
+                        *explanation = Self::secrets_transform_text(
+                            explanation,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
                     }
                 }
                 Message::ToolResult(result) => {
                     let result_mut = Arc::make_mut(result);
                     for block in &mut result_mut.content {
-                        if let ContentBlock::Text(t) = block {
-                            t.text = Self::secrets_transform_text(
-                                &t.text,
-                                &mut self.secrets_vault,
-                                mode,
-                                &extra,
-                                &mut total,
-                                &mut labels,
-                            )?;
-                        }
+                        Self::secrets_transform_content_block(
+                            block,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                    if let Some(details) = result_mut.details.as_mut() {
+                        *details = Self::secrets_transform_json(
+                            details,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
                     }
                 }
-                Message::Custom(_) => {}
+                Message::Custom(custom) => {
+                    custom.content = Self::secrets_transform_text(
+                        &custom.content,
+                        &mut staged_vault,
+                        mode,
+                        &extra,
+                        &mut total,
+                        &mut labels,
+                    )?;
+                    if let Some(details) = custom.details.as_mut() {
+                        *details = Self::secrets_transform_json(
+                            details,
+                            &mut staged_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                }
             }
         }
+
+        for tool in context.tools.to_mut().iter_mut() {
+            // Tool names are routing identifiers. A replacement here would
+            // advertise a name the local registry cannot execute.
+            let screened_name = Self::secrets_transform_text(
+                &tool.name,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+            if screened_name != tool.name {
+                return Err(Error::validation(
+                    "PI_SECRET_IDENTIFIER: tool name contains secret material and cannot be rewritten safely"
+                        .to_string(),
+                ));
+            }
+            tool.description = Self::secrets_transform_text(
+                &tool.description,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+            tool.parameters = Self::secrets_transform_json(
+                &tool.parameters,
+                &mut staged_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+        }
+
+        self.secrets_vault = staged_vault;
         if total > 0 {
             tracing::info!(
                 event = "pi.secrets.outbound",
                 detections = total,
                 rules = ?labels,
-                "secrets obfuscated in outbound context (redacted)"
+                "secrets screened in outbound provider context (redacted)"
             );
         }
         Ok(context)
+    }
+
+    fn secret_signed_content_error() -> Error {
+        Error::validation(
+            "PI_SECRET_SIGNED_CONTENT: secret replacement would alter signed or verbatim provider content; refusing to send"
+                .to_string(),
+        )
+    }
+
+    fn secrets_add_audit(
+        audit: crate::secrets::TransformAudit,
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) {
+        *total = total.saturating_add(audit.detections);
+        for rule in audit.rules {
+            if !labels.contains(&rule) {
+                labels.push(rule);
+            }
+        }
+    }
+
+    fn secrets_transform_json(
+        value: &Value,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<Value> {
+        let (output, audit) =
+            crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
+        Self::secrets_add_audit(audit, total, labels);
+        Ok(output)
     }
 
     fn secrets_transform_text(
@@ -2669,23 +2801,61 @@ impl Agent {
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<String> {
-        if mode == crate::secrets::SecretsMode::Block {
-            crate::secrets::gate_outbound(text, mode, extra)?;
-        }
-        let (out, audit) = crate::secrets::obfuscate(text, vault, extra);
-        *total += audit.detections;
-        for rule in audit.rules {
-            if !labels.contains(&rule) {
-                labels.push(rule);
-            }
-        }
-        Ok(out)
+        let value = Value::String(text.to_string());
+        let output =
+            Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
+        output.as_str().map(ToString::to_string).ok_or_else(|| {
+            Error::validation(
+                "PI_SECRET_JSON_PRIMITIVE: text screening changed the JSON value type".to_string(),
+            )
+        })
     }
 
-    /// Outbound secret hygiene for a user message. Attachment-carrying
-    /// messages (`Blocks`: text + images) must get the same treatment as
-    /// plain text — that is the shape the interactive app sends whenever an
-    /// attachment exists.
+    fn secrets_transform_content_block(
+        block: &mut ContentBlock,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<()> {
+        match block {
+            ContentBlock::Text(text) => {
+                let screened = Self::secrets_transform_text(
+                    &text.text, vault, mode, extra, total, labels,
+                )?;
+                if text.text_signature.is_some() && screened != text.text {
+                    return Err(Self::secret_signed_content_error());
+                }
+                text.text = screened;
+            }
+            ContentBlock::Thinking(thinking) => {
+                let screened = Self::secrets_transform_text(
+                    &thinking.thinking, vault, mode, extra, total, labels,
+                )?;
+                if thinking.thinking_signature.is_some() && screened != thinking.thinking {
+                    return Err(Self::secret_signed_content_error());
+                }
+                thinking.thinking = screened;
+            }
+            ContentBlock::ToolCall(call) => {
+                let screened = Self::secrets_transform_json(
+                    &call.arguments, vault, mode, extra, total, labels,
+                )?;
+                if call.thought_signature.is_some() && screened != call.arguments {
+                    return Err(Self::secret_signed_content_error());
+                }
+                call.arguments = screened;
+            }
+            ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
+                // Opaque signed/provider bytes and binary payloads are not
+                // interpreted as text by the secret detector.
+            }
+        }
+        Ok(())
+    }
+
+    /// Outbound secret hygiene for user content, including structured blocks.
     fn secrets_transform_user_content(
         content: &mut UserContent,
         vault: &mut crate::secrets::SecretVault,
@@ -2699,12 +2869,10 @@ impl Agent {
                 *text = Self::secrets_transform_text(text, vault, mode, extra, total, labels)?;
             }
             UserContent::Blocks(blocks) => {
-                for block in blocks.iter_mut() {
-                    if let ContentBlock::Text(t) = block {
-                        t.text = Self::secrets_transform_text(
-                            &t.text, vault, mode, extra, total, labels,
-                        )?;
-                    }
+                for block in blocks {
+                    Self::secrets_transform_content_block(
+                        block, vault, mode, extra, total, labels,
+                    )?;
                 }
             }
         }
