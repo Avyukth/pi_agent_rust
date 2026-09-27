@@ -2582,6 +2582,20 @@ impl Agent {
                 .unwrap_or(&[]),
         );
         let mut staged_vault = self.secrets_vault.clone();
+
+        // Discover across the complete screenable request before rewriting any
+        // one field. A later assignment such as {"api_key": "..."} can
+        // therefore identify an earlier bare echo of the same opaque value.
+        // Binary image/media bytes and provider-opaque redacted reasoning are
+        // deliberately absent from this projection.
+        let discovery = Self::secrets_discovery_projection(&context);
+        let _ = crate::secrets::transform_outbound_json(
+            &discovery,
+            &mut staged_vault,
+            mode,
+            &extra,
+        )?;
+
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
 
@@ -2757,6 +2771,69 @@ impl Agent {
             );
         }
         Ok(context)
+    }
+
+    fn secrets_discovery_projection(context: &Context<'_>) -> Value {
+        let mut fields = Vec::new();
+        if let Some(prompt) = context.system_prompt.as_deref() {
+            fields.push(Value::String(prompt.to_string()));
+        }
+        for message in context.messages.iter() {
+            match message {
+                Message::User(user) => match &user.content {
+                    UserContent::Text(text) => fields.push(Value::String(text.clone())),
+                    UserContent::Blocks(blocks) => {
+                        Self::secrets_discovery_blocks(blocks, &mut fields);
+                    }
+                },
+                Message::Assistant(assistant) => {
+                    Self::secrets_discovery_blocks(&assistant.content, &mut fields);
+                    if let Some(error) = &assistant.error_message {
+                        fields.push(Value::String(error.clone()));
+                    }
+                    if let Some(explanation) = assistant
+                        .stop_details
+                        .as_ref()
+                        .and_then(|details| details.explanation.as_ref())
+                    {
+                        fields.push(Value::String(explanation.clone()));
+                    }
+                }
+                Message::ToolResult(result) => {
+                    Self::secrets_discovery_blocks(&result.content, &mut fields);
+                    if let Some(details) = &result.details {
+                        fields.push(details.clone());
+                    }
+                }
+                Message::Custom(custom) => {
+                    fields.push(Value::String(custom.content.clone()));
+                    if let Some(details) = &custom.details {
+                        fields.push(details.clone());
+                    }
+                }
+            }
+        }
+        for tool in context.tools.iter() {
+            fields.push(Value::String(tool.name.clone()));
+            fields.push(Value::String(tool.description.clone()));
+            fields.push(tool.parameters.clone());
+        }
+        Value::Array(fields)
+    }
+
+    fn secrets_discovery_blocks(blocks: &[ContentBlock], fields: &mut Vec<Value>) {
+        for block in blocks {
+            match block {
+                ContentBlock::Text(text) => fields.push(Value::String(text.text.clone())),
+                ContentBlock::Thinking(thinking) => {
+                    fields.push(Value::String(thinking.thinking.clone()));
+                }
+                ContentBlock::ToolCall(call) => fields.push(call.arguments.clone()),
+                ContentBlock::RedactedThinking(_)
+                | ContentBlock::Image(_)
+                | ContentBlock::Media(_) => {}
+            }
+        }
     }
 
     fn secret_signed_content_error() -> Error {
