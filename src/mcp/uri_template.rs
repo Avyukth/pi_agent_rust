@@ -1,13 +1,13 @@
-//! Bounded RFC 6570 string-valued URI templates for MCP resource reads.
+//! Bounded RFC 6570 URI templates for MCP resource reads.
 //!
 //! This is expansion, not URI resolution: never normalize paths, open files,
 //! follow links, or fetch a URI locally. All I/O stays on the original MCP
 //! manager's trust-, owner-, and transport-generation-checked read path.
 //!
-//! All RFC operators and scalar prefix/explode modifiers are supported.
-//! Variables are strings or explicit nulls. Unlike a generic template engine,
-//! an absent variable is an error: accidentally omitting a selector must not
-//! silently read a different resource. Use null to deliberately omit it.
+//! All RFC operators, scalar prefixes, and list/map explode modifiers are
+//! supported. Values are strings, lists, maps, or explicit nulls; composite
+//! members must be strings or nulls. Missing variables remain an error rather
+//! than silently selecting a different resource. Use null to omit a value.
 
 use serde_json::{Map, Value};
 
@@ -17,6 +17,7 @@ const MAX_TEMPLATE_BYTES: usize = 16 * 1024;
 const MAX_URI_BYTES: usize = 16 * 1024;
 const MAX_VARIABLES: usize = 128;
 const MAX_VARIABLE_BYTES: usize = 64 * 1024;
+const MAX_VARIABLE_MEMBERS: usize = 1024;
 const MAX_EXPANSIONS: usize = 1024;
 
 fn invalid(reason: &str) -> Error {
@@ -30,44 +31,76 @@ fn limit() -> Error {
     invalid("resource template exceeds its input, expansion, or URI limit")
 }
 
-/// Expand a string-valued resource URI template without performing any I/O.
+fn charge(total: &mut usize, amount: usize, maximum: usize) -> Result<()> {
+    *total = total
+        .checked_add(amount)
+        .filter(|value| *value <= maximum)
+        .ok_or_else(limit)?;
+    Ok(())
+}
+
+fn validate_member(value: &Value, bytes: &mut usize) -> Result<()> {
+    match value {
+        Value::String(text) => charge(bytes, text.len(), MAX_VARIABLE_BYTES),
+        Value::Null => Ok(()),
+        _ => Err(invalid(
+            "template values must be strings, nulls, or flat lists/maps of strings or nulls",
+        )),
+    }
+}
+
+fn validate_variables(variables: &Map<String, Value>) -> Result<()> {
+    let mut bytes = 0usize;
+    let mut members = 0usize;
+    for (name, value) in variables {
+        if !valid_name(name) {
+            return Err(invalid("variable names must use RFC 6570 variable syntax"));
+        }
+        charge(&mut bytes, name.len(), MAX_VARIABLE_BYTES)?;
+        match value {
+            Value::Array(values) => {
+                charge(&mut members, values.len(), MAX_VARIABLE_MEMBERS)?;
+                for value in values {
+                    validate_member(value, &mut bytes)?;
+                }
+            }
+            Value::Object(values) => {
+                charge(&mut members, values.len(), MAX_VARIABLE_MEMBERS)?;
+                for (key, value) in values {
+                    // Map keys are data, not RFC variable identifiers. Count
+                    // even keys whose values are deliberately omitted.
+                    charge(&mut bytes, key.len(), MAX_VARIABLE_BYTES)?;
+                    validate_member(value, &mut bytes)?;
+                }
+            }
+            _ => validate_member(value, &mut bytes)?,
+        }
+    }
+    Ok(())
+}
+
+/// Expand a resource URI template without performing any I/O.
 ///
-/// Values must be strings or null; null explicitly omits an optional variable.
-/// Names are case-sensitive and percent-encoded names are not decoded. `+` and
+/// Values may be strings, flat lists/maps of strings or nulls, or null. Nulls
+/// and empty composites are omitted; missing variables are errors. Lists
+/// preserve order and duplicates; maps expand in lexical key order. Names are
+/// case-sensitive and percent-encoded variable names are not decoded. `+` and
 /// `#` retain reserved characters and valid percent triplets; other operators
-/// encode values as components. Prefix lengths count Unicode characters.
-/// The result must have an absolute URI scheme, but is otherwise opaque.
+/// encode values and map keys as components. Prefixes count Unicode characters
+/// and are only valid on strings. The URI must have an absolute scheme.
 ///
 /// # Errors
-/// Rejects invalid syntax, missing variables, composite/non-string values, and
+/// Rejects invalid syntax, missing variables, nested/non-string members, and
 /// bounded-input/output violations. Diagnostics never echo URIs or values.
-/// Limits: 16 KiB template and expanded URI, 128 variables, 64 KiB combined
-/// variable names/values, and 1,024 variable occurrences across expressions.
+/// Limits: 16 KiB template and URI, 128 variables, 64 KiB combined variable
+/// names/keys/values, 1,024 composite members, and 1,024 variable/member visits
+/// during expansion. Input limits also apply to unused and null-valued data.
 pub fn expand_resource_uri(template: &str, variables: &Map<String, Value>) -> Result<String> {
     if template.is_empty() || template.len() > MAX_TEMPLATE_BYTES || variables.len() > MAX_VARIABLES
     {
         return Err(limit());
     }
-    let mut bytes = 0usize;
-    for (name, value) in variables {
-        if !valid_name(name) {
-            return Err(invalid("variable names must use RFC 6570 variable syntax"));
-        }
-        let value_bytes = match value {
-            Value::String(text) => text.len(),
-            Value::Null => 0,
-            _ => {
-                return Err(invalid(
-                    "template variables must be strings or explicit nulls",
-                ));
-            }
-        };
-        bytes = bytes
-            .checked_add(name.len())
-            .and_then(|bytes| bytes.checked_add(value_bytes))
-            .filter(|bytes| *bytes <= MAX_VARIABLE_BYTES)
-            .ok_or_else(limit)?;
-    }
+    validate_variables(variables)?;
 
     let mut output = Output(String::new());
     let mut remaining = template;
@@ -175,42 +208,144 @@ fn expand_expression(
     expansions: &mut usize,
 ) -> Result<()> {
     let (operator, expression) = Operator::parse(expression);
-    let mut emitted = false;
+    let mut writer = Expression {
+        operator,
+        output,
+        emitted: false,
+    };
     for specification in expression.split(',') {
-        *expansions += 1;
-        if *expansions > MAX_EXPANSIONS {
-            return Err(limit());
-        }
-        let (name, prefix) = variable_spec(specification)?;
-        let value = variables.get(name).ok_or_else(|| {
-            invalid("a referenced variable is missing; supply a string or explicit null")
+        charge(expansions, 1, MAX_EXPANSIONS)?;
+        let spec = variable_spec(specification)?;
+        let value = variables.get(spec.name).ok_or_else(|| {
+            invalid("a referenced variable is missing; supply a value or explicit null")
         })?;
-        let Value::String(value) = value else {
-            // Values were validated before parsing. Null is deliberate omission.
-            continue;
+        let members = match value {
+            Value::Array(values) => values.len(),
+            Value::Object(values) => values.len(),
+            _ => 0,
         };
-        let value = prefix.map_or(value.as_str(), |length| &value[..prefix_end(value, length)]);
-        output.push(if emitted {
-            operator.separator
-        } else {
-            operator.first
-        })?;
-        emitted = true;
-        if operator.named {
-            // Variable spelling is literal, including its percent triplets.
-            output.push(name)?;
-            if !value.is_empty() || operator.empty_equals {
-                output.push("=")?;
-            }
+        // Empty and null members still cost work on every occurrence, even
+        // when they produce no bytes. Bound that work before iterating/sorting.
+        charge(expansions, members, MAX_EXPANSIONS)?;
+        if spec.prefix.is_some() && matches!(value, Value::Array(_) | Value::Object(_)) {
+            return Err(invalid("prefix modifiers are only valid on string values"));
         }
-        output.encoded(value, operator.reserved)?;
+        match value {
+            Value::String(value) => {
+                let value = spec
+                    .prefix
+                    .map_or(value.as_str(), |length| &value[..prefix_end(value, length)]);
+                writer.scalar(spec.name, value)?;
+            }
+            Value::Array(values) => writer.list(&spec, values)?,
+            Value::Object(values) => writer.map(&spec, values)?,
+            // All values were validated before expansion. Null is omission.
+            _ => {}
+        }
     }
     Ok(())
 }
 
-fn variable_spec(specification: &str) -> Result<(&str, Option<usize>)> {
-    // Explode is a no-op for a string, per RFC 6570. Composite values are not
-    // accepted by this API, and explode+prefix is not a legal combination.
+struct Expression<'a> {
+    operator: Operator,
+    output: &'a mut Output,
+    emitted: bool,
+}
+
+impl Expression<'_> {
+    fn start(&mut self) -> Result<()> {
+        self.output.push(if self.emitted {
+            self.operator.separator
+        } else {
+            self.operator.first
+        })?;
+        self.emitted = true;
+        Ok(())
+    }
+
+    fn variable_name(&mut self, name: &str, empty: bool) -> Result<()> {
+        if self.operator.named {
+            // Variable spelling is literal, including its percent triplets.
+            self.output.push(name)?;
+            if !empty || self.operator.empty_equals {
+                self.output.push("=")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scalar(&mut self, name: &str, value: &str) -> Result<()> {
+        self.start()?;
+        self.variable_name(name, value.is_empty())?;
+        self.output.encoded(value, self.operator.reserved)
+    }
+
+    fn list(&mut self, spec: &VariableSpec<'_>, values: &[Value]) -> Result<()> {
+        let mut values = values.iter().filter_map(Value::as_str).peekable();
+        if values.peek().is_none() {
+            return Ok(());
+        }
+        if spec.explode {
+            for value in values {
+                self.scalar(spec.name, value)?;
+            }
+        } else {
+            self.start()?;
+            self.variable_name(spec.name, false)?;
+            for (index, value) in values.enumerate() {
+                if index != 0 {
+                    self.output.push(",")?;
+                }
+                self.output.encoded(value, self.operator.reserved)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn map(&mut self, spec: &VariableSpec<'_>, values: &Map<String, Value>) -> Result<()> {
+        let mut pairs: Vec<_> = values
+            .iter()
+            .filter_map(|(key, value)| value.as_str().map(|value| (key.as_str(), value)))
+            .collect();
+        if pairs.is_empty() {
+            return Ok(());
+        }
+        // Stable regardless of serde_json's preserve_order feature. Input
+        // validation and the work budget bound this allocation and sort.
+        pairs.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        if !spec.explode {
+            self.start()?;
+            self.variable_name(spec.name, false)?;
+        }
+        for (index, (key, value)) in pairs.into_iter().enumerate() {
+            if spec.explode {
+                self.start()?;
+            } else if index != 0 {
+                self.output.push(",")?;
+            }
+            self.output.encoded(key, self.operator.reserved)?;
+            if !spec.explode {
+                self.output.push(",")?;
+            } else if !value.is_empty() || self.operator.empty_equals {
+                // RFC 6570 section 3.2.1: an exploded empty map value emits
+                // only its key, except that form-style operators retain '='.
+                self.output.push("=")?;
+            }
+            self.output.encoded(value, self.operator.reserved)?;
+        }
+        Ok(())
+    }
+}
+
+struct VariableSpec<'a> {
+    name: &'a str,
+    prefix: Option<usize>,
+    explode: bool,
+}
+
+fn variable_spec(specification: &str) -> Result<VariableSpec<'_>> {
+    // Explode is a no-op for a string. Explode+prefix is never legal.
+    let explode = specification.ends_with('*');
     let (name, prefix) = if let Some(name) = specification.strip_suffix('*') {
         (name, None)
     } else if let Some((name, prefix)) = specification.split_once(':') {
@@ -239,7 +374,11 @@ fn variable_spec(specification: &str) -> Result<(&str, Option<usize>)> {
             "invalid variable expression or unsupported template operator",
         ));
     }
-    Ok((name, prefix))
+    Ok(VariableSpec {
+        name,
+        prefix,
+        explode,
+    })
 }
 
 fn valid_name(name: &str) -> bool {
@@ -520,12 +659,7 @@ mod tests {
             assert!(error.contains("MCP_TEMPLATE_INVALID"));
             assert!(!error.contains("private-sentinel"));
         }
-        for value in [
-            json!(1),
-            json!(true),
-            json!(["one"]),
-            json!({"key":"value"}),
-        ] {
+        for value in [json!(1), json!(true), json!([1]), json!({"key":false})] {
             assert!(expand_resource_uri("docs:{v}", &vars(json!({"v":value}))).is_err());
         }
     }
@@ -557,5 +691,226 @@ mod tests {
             .map(|index| (format!("v{index}"), Value::Null))
             .collect();
         assert!(expand_resource_uri("docs:static", &variables).is_err());
+    }
+
+    #[test]
+    fn lists_support_every_operator_with_and_without_explode() {
+        let variables = vars(json!({"list":["red","green","blue"]}));
+        for (template, expected) in [
+            ("{list}", "red,green,blue"),
+            ("{list*}", "red,green,blue"),
+            ("{+list}", "red,green,blue"),
+            ("{+list*}", "red,green,blue"),
+            ("{#list}", "#red,green,blue"),
+            ("{#list*}", "#red,green,blue"),
+            ("{.list}", ".red,green,blue"),
+            ("{.list*}", ".red.green.blue"),
+            ("{/list}", "/red,green,blue"),
+            ("{/list*}", "/red/green/blue"),
+            ("{;list}", ";list=red,green,blue"),
+            ("{;list*}", ";list=red;list=green;list=blue"),
+            ("{?list}", "?list=red,green,blue"),
+            ("{?list*}", "?list=red&list=green&list=blue"),
+            ("{&list}", "&list=red,green,blue"),
+            ("{&list*}", "&list=red&list=green&list=blue"),
+        ] {
+            assert_eq!(
+                expand_resource_uri(&format!("docs:{template}"), &variables).unwrap(),
+                format!("docs:{expected}"),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_support_every_operator_in_stable_key_order() {
+        let variables = vars(json!({"keys":{"b":"/", "a":"x y"}}));
+        for (template, expected) in [
+            ("{keys}", "a,x%20y,b,%2F"),
+            ("{keys*}", "a=x%20y,b=%2F"),
+            ("{+keys}", "a,x%20y,b,/"),
+            ("{+keys*}", "a=x%20y,b=/"),
+            ("{#keys}", "#a,x%20y,b,/"),
+            ("{#keys*}", "#a=x%20y,b=/"),
+            ("{.keys}", ".a,x%20y,b,%2F"),
+            ("{.keys*}", ".a=x%20y.b=%2F"),
+            ("{/keys}", "/a,x%20y,b,%2F"),
+            ("{/keys*}", "/a=x%20y/b=%2F"),
+            ("{;keys}", ";keys=a,x%20y,b,%2F"),
+            ("{;keys*}", ";a=x%20y;b=%2F"),
+            ("{?keys}", "?keys=a,x%20y,b,%2F"),
+            ("{?keys*}", "?a=x%20y&b=%2F"),
+            ("{&keys}", "&keys=a,x%20y,b,%2F"),
+            ("{&keys*}", "&a=x%20y&b=%2F"),
+        ] {
+            assert_eq!(
+                expand_resource_uri(&format!("docs:{template}"), &variables).unwrap(),
+                format!("docs:{expected}"),
+                "{template}"
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_composites_do_not_emit_prefixes_or_separators() {
+        let variables = vars(json!({
+            "list":[], "map":{}, "nulls":[null,null], "none":{"key":null},
+            "x":"tail", "mixed":[null,"one",null,"one"],
+            "pairs":{"a":null,"b":"two"}
+        }));
+        for operator in ["", "+", "#", ".", "/", ";", "?", "&"] {
+            assert_eq!(
+                expand_resource_uri(
+                    &format!("docs:{{{operator}list*,map*,nulls*,none*}}"),
+                    &variables
+                )
+                .unwrap(),
+                "docs:"
+            );
+        }
+        assert_eq!(
+            expand_resource_uri("docs:{?list*,mixed*,map*,pairs*,x}", &variables).unwrap(),
+            "docs:?mixed=one&mixed=one&b=two&x=tail"
+        );
+        assert_eq!(
+            expand_resource_uri("docs:{/list,nulls,mixed,map,pairs,none}", &variables).unwrap(),
+            "docs:/one,one/b,two"
+        );
+    }
+
+    #[test]
+    fn empty_composite_members_are_distinct_from_omission() {
+        let variables = vars(json!({"list":["","x",""], "keys":{"k":""}}));
+        assert_eq!(
+            expand_resource_uri("docs:{?list*}", &variables).unwrap(),
+            "docs:?list=&list=x&list="
+        );
+        assert_eq!(
+            expand_resource_uri("docs:{;list*}", &variables).unwrap(),
+            "docs:;list;list=x;list"
+        );
+        assert_eq!(
+            expand_resource_uri("docs:{/list*}", &variables).unwrap(),
+            "docs://x/"
+        );
+        for (operator, expected) in [
+            ("", "k"),
+            ("+", "k"),
+            ("#", "#k"),
+            (".", ".k"),
+            ("/", "/k"),
+            (";", ";k"),
+            ("?", "?k="),
+            ("&", "&k="),
+        ] {
+            assert_eq!(
+                expand_resource_uri(&format!("docs:{{{operator}keys*}}"), &variables).unwrap(),
+                format!("docs:{expected}")
+            );
+        }
+        let variables = vars(json!({"list":[""]}));
+        assert_eq!(
+            expand_resource_uri("docs:{;list}", &variables).unwrap(),
+            "docs:;list="
+        );
+    }
+
+    #[test]
+    fn composite_prefixes_and_nested_or_typed_members_are_rejected_without_echo() {
+        for value in [
+            json!([]),
+            json!({}),
+            json!(["secret"]),
+            json!({"secret":"value"}),
+        ] {
+            let error = expand_resource_uri("docs:{v:1}", &vars(json!({"v":value})))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("prefix"));
+            assert!(!error.contains("secret"));
+        }
+        for value in [
+            json!([["private-sentinel"]]),
+            json!([{"private-sentinel":"value"}]),
+            json!({"private-sentinel":[]}),
+            json!({"private-sentinel":{}}),
+            json!([true]),
+            json!({"private-sentinel":1}),
+        ] {
+            // Validation covers unused input too; nested data cannot be hidden
+            // behind an expression that happens not to reference it.
+            let error = expand_resource_uri("docs:static", &vars(json!({"v":value})))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("MCP_TEMPLATE_INVALID"));
+            assert!(!error.contains("private-sentinel"));
+        }
+    }
+
+    #[test]
+    fn composite_keys_and_values_cannot_inject_query_fields() {
+        let variables = vars(json!({
+            "keys":{"a&admin=1":"x/y#z"},
+            "list":["?q=1&admin=true","日本","%2f"]
+        }));
+        assert_eq!(
+            expand_resource_uri("docs:{?keys*,list*}", &variables).unwrap(),
+            "docs:?a%26admin%3D1=x%2Fy%23z&list=%3Fq%3D1%26admin%3Dtrue&list=%E6%97%A5%E6%9C%AC&list=%252f"
+        );
+        let variables = vars(json!({"list":["%2f","%GG","🌍"]}));
+        assert_eq!(
+            expand_resource_uri("docs:{+list*}", &variables).unwrap(),
+            "docs:%2f,%25GG,%F0%9F%8C%8D"
+        );
+    }
+
+    #[test]
+    fn composite_input_budgets_include_empty_members_and_map_keys() {
+        let variables = vars(json!({"v":vec![Value::Null; MAX_VARIABLE_MEMBERS + 1]}));
+        assert!(expand_resource_uri("docs:static", &variables).is_err());
+        let variables = vars(json!({
+            "left":vec![""; MAX_VARIABLE_MEMBERS / 2],
+            "right":vec![Value::Null; MAX_VARIABLE_MEMBERS / 2 + 1]
+        }));
+        assert!(expand_resource_uri("docs:static", &variables).is_err());
+        let mut values = Map::new();
+        values.insert("x".repeat(MAX_VARIABLE_BYTES), Value::Null);
+        let variables = vars(json!({"v":values}));
+        assert!(expand_resource_uri("docs:static", &variables).is_err());
+        let values: Map<String, Value> = (0..=MAX_VARIABLE_MEMBERS)
+            .map(|index| (index.to_string(), Value::Null))
+            .collect();
+        assert!(expand_resource_uri("docs:static", &vars(json!({"v":values}))).is_err());
+    }
+
+    #[test]
+    fn repeated_composite_expansion_has_a_work_budget_even_without_output() {
+        let variables = vars(json!({"v":vec![Value::Null; 16]}));
+        let allowed = MAX_EXPANSIONS / 17;
+        assert_eq!(
+            expand_resource_uri(&format!("docs:{}", "{v*}".repeat(allowed)), &variables).unwrap(),
+            "docs:"
+        );
+        assert!(
+            expand_resource_uri(
+                &format!("docs:{}", "{v*}".repeat(allowed + 1)),
+                &variables
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn composite_output_limits_apply_to_keys_and_encoded_members() {
+        let variables = vars(json!({"v":[" ".repeat(MAX_URI_BYTES / 3)]}));
+        assert!(expand_resource_uri("docs:{?v*}", &variables).is_err());
+        let mut values = Map::new();
+        values.insert(
+            " ".repeat(MAX_URI_BYTES / 3),
+            Value::String(String::new()),
+        );
+        assert!(expand_resource_uri("docs:{?v*}", &vars(json!({"v":values}))).is_err());
+        let variables = vars(json!({"v":["x".repeat(MAX_URI_BYTES / 2)]}));
+        assert!(expand_resource_uri("docs:{v}{v}", &variables).is_err());
     }
 }
