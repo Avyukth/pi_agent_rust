@@ -9900,6 +9900,139 @@ mod extensions_integration_tests {
     }
 
     #[test]
+    fn manual_follow_up_dispatch_keeps_staged_work_without_an_extra_provider_call() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(0));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_automatic_queue_dispatch(true, false);
+            agent.queue_follow_up(Message::User(UserMessage {
+                content: UserContent::Text("manual follow-up".to_string()),
+                timestamp: 0,
+            }));
+
+            let final_message = agent.run("initial", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(agent.queued_message_count(), 1);
+
+            let batch = agent.take_queued_follow_up_batch().await;
+            assert_eq!(batch.len(), 1);
+            assert_eq!(agent.queued_message_count(), 0);
+        });
+    }
+
+    #[test]
+    fn manual_follow_up_dispatch_suppresses_turn_recovery_continuations() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(10));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_automatic_queue_dispatch(true, false);
+
+            let final_message = agent.run("write main", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Length);
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                1,
+                "manual follow-up control must suppress synthetic recovery requests"
+            );
+            assert!(!agent.messages().iter().any(|message| {
+                matches!(message, Message::User(user)
+                    if matches!(&user.content, UserContent::Text(text)
+                        if text.contains("auto-continue")))
+            }));
+        });
+    }
+
+    #[test]
+    fn manual_steering_dispatch_never_polls_external_fetchers() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(0));
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(
+                provider_dyn,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            let polls = Arc::new(AtomicUsize::new(0));
+            let polls_for_fetcher = Arc::clone(&polls);
+            agent.register_message_fetchers(
+                Some(Arc::new(move || {
+                    let polls = Arc::clone(&polls_for_fetcher);
+                    Box::pin(async move {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        vec![QueuedAgentMessage::generated(Message::User(UserMessage {
+                            content: UserContent::Text("should not be fetched".to_string()),
+                            timestamp: 0,
+                        }))]
+                    })
+                })),
+                None,
+            );
+            agent.set_automatic_queue_dispatch(false, true);
+
+            let final_message = agent.run("initial", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+            assert_eq!(polls.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn explicit_manual_batch_take_respects_queue_modes_without_enabling_dispatch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider: Arc<dyn Provider> = Arc::new(TruncatingProvider::new(0));
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::from_tools(vec![]),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            agent.set_automatic_queue_dispatch(false, false);
+            assert_eq!(agent.automatic_queue_dispatch(), (false, false));
+
+            for text in ["s1", "s2"] {
+                agent.queue_steering(Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: 0,
+                }));
+            }
+            for text in ["f1", "f2"] {
+                agent.queue_follow_up(Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: 0,
+                }));
+            }
+            assert_eq!(agent.queued_message_count(), 4);
+            assert_eq!(agent.take_queued_steering_batch().len(), 2);
+            assert_eq!(agent.take_queued_follow_up_batch().await.len(), 2);
+            assert_eq!(agent.queued_message_count(), 0);
+            assert_eq!(agent.automatic_queue_dispatch(), (false, false));
+        });
+    }
+
+    #[test]
     fn send_user_message_follow_up_does_not_skip_tools() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
