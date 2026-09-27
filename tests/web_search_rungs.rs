@@ -183,3 +183,104 @@ fn rung_429_maps_to_rate_limited() {
     let err = result.expect_err("429 must map to rate limited");
     assert!(err.to_string().contains("rate limited"), "error: {err}");
 }
+
+#[test]
+fn youcom_adapter_parses_web_section_only() {
+    let harness = TestHarness::new("youcom_adapter_parses_web_section_only");
+    let results = run_rung(
+        "youcom",
+        Some("ydc-key"),
+        "/v1/search",
+        "POST",
+        json_response(
+            200,
+            r#"{"results":{"web":[
+                {"url":"https://tokio.rs","title":"Tokio","description":"An async runtime","snippets":["ignored"]},
+                {"url":"https://smol.rs","title":"smol","description":"","snippets":["a small async runtime"]},
+                {"url":"","title":"no url"}
+              ],"news":[{"url":"https://news.example/x","title":"News","description":"not a web hit"}]},
+              "metadata":{"search_uuid":"u","query":"rust async runtime","latency":0.1}}"#,
+        ),
+        &harness,
+    )
+    .expect("youcom parses");
+    assert_eq!(results.len(), 2, "news and url-less hits are skipped");
+    assert_eq!(results[0].url, "https://tokio.rs");
+    assert_eq!(results[0].title, "Tokio");
+    assert_eq!(results[0].snippet, "An async runtime");
+    assert_eq!(results[0].source, "youcom");
+    assert_eq!(
+        results[1].snippet, "a small async runtime",
+        "empty description falls back to the first snippet"
+    );
+}
+
+#[test]
+fn youcom_adapter_sends_key_header_and_json_body() {
+    let harness = TestHarness::new("youcom_adapter_sends_key_header_and_json_body");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/v1/search",
+        json_response(
+            200,
+            r#"{"results":{"web":[{"url":"https://tokio.rs","title":"Tokio","description":"d"}]}}"#,
+        ),
+    );
+    let _guard = env_lock().lock().expect("env lock");
+    pi::web_search::set_base_url_override("youcom", &server.base_url());
+    let rungs = all_rungs();
+    let rung = &rungs["youcom"];
+    let site_filters = SearchFilters {
+        site: Some("docs.rs".to_string()),
+        after: None,
+        limit: 50,
+    };
+    let mut result = None;
+    asupersync::test_utils::run_test(|| async {
+        result = Some(
+            (rung.run)(
+                &pi::http::client::Client::new(),
+                "tokio",
+                &site_filters,
+                Some("ydc-key"),
+            )
+            .await,
+        );
+    });
+    pi::web_search::clear_base_url_overrides();
+    result
+        .expect("rung future ran to completion")
+        .expect("youcom parses");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-api-key") && value == "ydc-key"),
+        "headers: {:?}",
+        request.headers
+    );
+    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("json body");
+    assert_eq!(body["query"], "site:docs.rs tokio");
+    assert_eq!(body["count"], 20, "count is capped at 20");
+}
+
+#[test]
+fn youcom_adapter_without_web_hits_is_parse_error() {
+    let harness = TestHarness::new("youcom_adapter_without_web_hits_is_parse_error");
+    let result = run_rung(
+        "youcom",
+        Some("ydc-key"),
+        "/v1/search",
+        "POST",
+        json_response(200, r#"{"results":{"web":[]},"metadata":{}}"#),
+        &harness,
+    );
+    assert!(
+        matches!(result, Err(RungError::Parse(_))),
+        "empty web section must fall through the chain: {result:?}"
+    );
+}
