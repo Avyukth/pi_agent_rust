@@ -98,6 +98,10 @@ impl PiEnv {
     }
 
     fn spawn(&self, binary: &std::path::Path, extra_env: &[(&str, String)]) -> std::process::Child {
+        self.command(binary, extra_env).spawn().expect("spawn pi")
+    }
+
+    fn command(&self, binary: &std::path::Path, extra_env: &[(&str, String)]) -> Command {
         let mut command = Command::new(binary);
         command
             .args([
@@ -127,20 +131,50 @@ impl PiEnv {
             "XAI_API_KEY",
             "OPENROUTER_API_KEY",
             "DEEPSEEK_API_KEY",
-            "PERPLEXITY_API_KEY",
-            "TAVILY_API_KEY",
-            "BRAVE_API_KEY",
-            "BRAVE_SEARCH_API_KEY",
-            "EXA_API_KEY",
-            "JINA_API_KEY",
-            "KAGI_API_KEY",
         ] {
+            command.env_remove(key);
+        }
+        // Strip every search rung's key, derived from the registry so a new
+        // keyed rung (e.g. youcom/YDC_API_KEY) can never make these cases
+        // reach a real provider with an ambient developer/CI key.
+        for key in search_rung_env_keys() {
             command.env_remove(key);
         }
         for (key, value) in extra_env {
             command.env(key, value);
         }
-        command.spawn().expect("spawn pi")
+        command
+    }
+}
+
+fn search_rung_env_keys() -> Vec<&'static str> {
+    let mut keys: Vec<&'static str> = pi::web_search::all_rungs()
+        .values()
+        .flat_map(|rung| rung.env_keys.iter().copied())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+#[test]
+fn e2e_spawn_scrubs_every_search_rung_key() {
+    let harness = TestHarness::new("e2e_spawn_scrubs_every_search_rung_key");
+    let env = PiEnv::new(&harness, "scrub");
+    let command = env.command(std::path::Path::new(env!("CARGO_BIN_EXE_pi")), &[]);
+    let removed: Vec<String> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key.to_string_lossy().into_owned())
+        .collect();
+    for rung in pi::web_search::all_rungs().values() {
+        for key in rung.env_keys {
+            assert!(
+                removed.iter().any(|r| r == key),
+                "{} key {key} leaks into the e2e child env: removed={removed:?}",
+                rung.name
+            );
+        }
     }
 }
 
