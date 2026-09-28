@@ -76,11 +76,15 @@ impl Drop for Guard {
 }
 
 /// Acquire native input ownership before FTUI performs its first output write.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 pub(crate) fn enter(mouse: bool) -> io::Result<Guard> {
     #[cfg(windows)]
     {
         native::begin(mouse)?;
-        let guard = Guard { active: true, _thread_bound: PhantomData };
+        let guard = Guard {
+            active: true,
+            _thread_bound: PhantomData,
+        };
         // Failure unwinds the guard and restores the original mode.
         resume()?;
         Ok(guard)
@@ -88,31 +92,49 @@ pub(crate) fn enter(mouse: bool) -> io::Result<Guard> {
     #[cfg(not(windows))]
     {
         let _ = mouse;
-        Ok(Guard { active: false, _thread_bound: PhantomData })
+        Ok(Guard {
+            active: false,
+            _thread_bound: PhantomData,
+        })
     }
 }
 
 /// Restore the shell mode while a synchronous external editor owns the console.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 pub(crate) fn suspend() -> io::Result<()> {
     #[cfg(windows)]
-    return native::suspend();
+    {
+        native::suspend()
+    }
     #[cfg(not(windows))]
-    Ok(())
+    {
+        Ok(())
+    }
 }
 
 /// Reapply native input flags after raw mode is re-enabled, before rendering.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 pub(crate) fn resume() -> io::Result<()> {
     #[cfg(windows)]
-    return native::resume();
+    {
+        native::resume()
+    }
     #[cfg(not(windows))]
-    Ok(())
+    {
+        Ok(())
+    }
 }
 
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 fn restore() -> io::Result<()> {
     #[cfg(windows)]
-    return native::restore();
+    {
+        native::restore()
+    }
     #[cfg(not(windows))]
-    Ok(())
+    {
+        Ok(())
+    }
 }
 
 #[cfg(windows)]

@@ -14,7 +14,7 @@ mod enabled {
     use std::fs::{File, OpenOptions};
     use std::io::{self, Write};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -27,16 +27,22 @@ mod enabled {
         keys: AtomicU64,
         resizes: AtomicU64,
         views: AtomicU64,
+        observer_failed: AtomicBool,
         error: Mutex<Option<String>>,
     }
 
     impl Progress {
         fn new() -> Self {
             Self {
-                start: Instant::now(), phase: AtomicU8::new(0),
-                completed_ms: AtomicU64::new(0), ticks: AtomicU64::new(0),
-                keys: AtomicU64::new(0), resizes: AtomicU64::new(0),
-                views: AtomicU64::new(0), error: Mutex::new(None),
+                start: Instant::now(),
+                phase: AtomicU8::new(0),
+                completed_ms: AtomicU64::new(0),
+                ticks: AtomicU64::new(0),
+                keys: AtomicU64::new(0),
+                resizes: AtomicU64::new(0),
+                views: AtomicU64::new(0),
+                observer_failed: AtomicBool::new(false),
+                error: Mutex::new(None),
             }
         }
 
@@ -81,6 +87,7 @@ mod enabled {
         }
     }
 
+    #[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
     fn input_mode() -> io::Result<Option<u32>> {
         #[cfg(windows)]
         {
@@ -89,7 +96,9 @@ mod enabled {
             winapi_util::console::mode(&handle).map(Some)
         }
         #[cfg(not(windows))]
-        Ok(None)
+        {
+            Ok(None)
+        }
     }
 
     struct Observer {
@@ -100,22 +109,33 @@ mod enabled {
     impl Observer {
         fn start(mut log: File, state: Arc<Progress>, native_fix: bool) -> io::Result<Self> {
             let (stop, stopped) = mpsc::channel();
-            let worker = thread::Builder::new().name("conhost-observer".into()).spawn(move || {
-                loop {
-                    // Only GetConsoleMode and file writes: never poll/read
-                    // terminal events, and never contend for stdout/stderr.
-                    writeln!(log, "{}", state.record(input_mode(), native_fix))?;
-                    log.flush()?;
-                    match stopped.recv_timeout(Duration::from_millis(500)) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        _ => {
+            let worker = thread::Builder::new()
+                .name("conhost-observer".into())
+                .spawn(move || {
+                    let result = (|| {
+                        loop {
+                            // Only GetConsoleMode and file writes: never poll/read
+                            // terminal events, and never contend for stdout/stderr.
                             writeln!(log, "{}", state.record(input_mode(), native_fix))?;
-                            return log.flush();
+                            log.flush()?;
+                            match stopped.recv_timeout(Duration::from_millis(500)) {
+                                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                                _ => {
+                                    writeln!(log, "{}", state.record(input_mode(), native_fix))?;
+                                    return log.flush();
+                                }
+                            }
                         }
+                    })();
+                    if result.is_err() {
+                        state.observer_failed.store(true, Ordering::Release);
                     }
-                }
-            })?;
-            Ok(Self { stop, worker: Some(worker) })
+                    result
+                })?;
+            Ok(Self {
+                stop,
+                worker: Some(worker),
+            })
         }
 
         fn finish(mut self) -> io::Result<()> {
@@ -152,7 +172,11 @@ mod enabled {
             let command = match msg {
                 Event::Tick => {
                     self.state.ticks.fetch_add(1, Ordering::Relaxed);
-                    Cmd::tick(Duration::from_millis(250))
+                    if self.state.observer_failed.load(Ordering::Acquire) {
+                        Cmd::quit()
+                    } else {
+                        Cmd::tick(Duration::from_millis(250))
+                    }
                 }
                 Event::Key(key) => {
                     self.state.keys.fetch_add(1, Ordering::Relaxed);
@@ -188,7 +212,6 @@ mod enabled {
 
         fn view(&self, frame: &mut Frame) {
             self.state.phase.store(2, Ordering::Relaxed);
-            self.state.views.fetch_add(1, Ordering::Relaxed);
             let text = format!(
                 "FTUI ConHost probe: ticks={} key-events={} resizes={}\n\
                  Type, resize and click/drag to reproduce. q quits; s cycles input modes.\n\
@@ -198,6 +221,7 @@ mod enabled {
                 self.state.resizes.load(Ordering::Relaxed)
             );
             Paragraph::new(text).render(Rect::new(0, 0, frame.width(), frame.height()), frame);
+            self.state.views.fetch_add(1, Ordering::Relaxed);
             self.state.completed();
         }
     }
@@ -220,6 +244,11 @@ mod enabled {
         }
         let path = path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
             "a new trace file path is required"))?;
+        #[cfg(not(windows))]
+        if native_fix {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "--native-input requires a real Windows console"));
+        }
         // Never truncate an existing trace. No provider, credentials, Pi
         // session, typed characters, or terminal input bytes are collected.
         let mut log = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -234,7 +263,8 @@ mod enabled {
         } else {
             App::inline_auto(model, 3_u16..=8)
         };
-        let result = app.with_mouse_capture(true).with_mouse_motion(false).run();
+        // Use the same FTUI 0.7 builder surface as pi's production run path.
+        let result = app.with_mouse().run();
         let restored = guard.map_or(Ok(()), console_input::Guard::finish);
         state.phase.store(4, Ordering::Relaxed);
         let observed = observer.finish();

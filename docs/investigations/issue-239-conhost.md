@@ -31,8 +31,8 @@ point toward a failed terminal reacquisition rather than a normal keybinding.
 Relevant primary sources:
 
 - [Windows SetConsoleMode](https://learn.microsoft.com/en-us/windows/console/setconsolemode)
-- [Crossterm 0.29 Windows terminal modes](https://github.com/crossterm-rs/crossterm/blob/0.29.0/src/terminal/sys/windows.rs)
-- [Crossterm 0.29 native mouse capture](https://github.com/crossterm-rs/crossterm/blob/0.29.0/src/event/sys/windows.rs)
+- [Crossterm upstream Windows terminal modes](https://github.com/crossterm-rs/crossterm/blob/master/src/terminal/sys/windows.rs)
+- [Crossterm upstream native mouse capture](https://github.com/crossterm-rs/crossterm/blob/master/src/event/sys/windows.rs)
 - [FTUI 0.7.0 terminal lifecycle](https://github.com/Dicklesworthstone/frankentui/blob/v0.7.0/crates/ftui-core/src/terminal_session.rs)
 
 The current Pi handler already filters releases, gates SIGTSTP suspension to
@@ -64,7 +64,9 @@ FTUI timer ticks every 250 ms. The observer never calls poll/read on terminal
 input and never writes to stdout/stderr. Records contain counters, mode bits,
 callback age and phase, not key values, typed text, prompts or credentials.
 Existing trace files are never overwritten. The native-input flag applies the
-candidate scoped mode lease in the probe only.
+candidate scoped mode lease in the probe only and is rejected on non-Windows
+hosts. A trace-write failure asks the model to quit on its next timer tick;
+the observer's I/O error is then returned instead of silently losing evidence.
 
 Interpretation requires the accompanying reproduction observations:
 
@@ -77,7 +79,8 @@ Interpretation requires the accompanying reproduction observations:
   selection. The probe does not query console selection state.
 - `processed_input`, `line_input` or `echo_input` during the active loop help
   identify a lost raw-mode transition. The initial/final records are expected
-  to show shell modes, so interpret them together with `phase`.
+  to show shell modes. Sampling can straddle startup/shutdown transitions;
+  a single cooked-mode record near either boundary is not proof of a stall.
 - View counts mean model rendering completed, not that terminal output was
   flushed. A stopped observer or a mode-query error is not a passing result.
 
