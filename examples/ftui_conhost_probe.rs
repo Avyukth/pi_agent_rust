@@ -9,6 +9,7 @@ mod console_input;
 #[cfg(feature = "ftui")]
 mod enabled {
     use super::console_input;
+    use ftui::core::event::KeyEventKind;
     use ftui::prelude::*;
     use ftui::widgets::paragraph::Paragraph;
     use std::fs::{File, OpenOptions};
@@ -180,7 +181,11 @@ mod enabled {
                 }
                 Event::Key(key) => {
                     self.state.keys.fetch_add(1, Ordering::Relaxed);
-                    if key.is_char('q') {
+                    // Keep releases visible in the event count, but do not
+                    // cycle terminal modes twice for one Windows keystroke.
+                    if key.kind == KeyEventKind::Release {
+                        Cmd::none()
+                    } else if key.is_char('q') {
                         Cmd::quit()
                     } else if key.is_char('s') {
                         // Exercise the native-input portion of an editor
@@ -261,7 +266,7 @@ mod enabled {
         let app = if fullscreen {
             App::fullscreen(model)
         } else {
-            App::inline_auto(model, 3_u16..=8)
+            App::inline_auto(model, 3, 8)
         };
         // Use the same FTUI 0.7 builder surface as pi's production run path.
         let result = app.with_mouse().run();
