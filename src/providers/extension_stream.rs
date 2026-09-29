@@ -14,6 +14,8 @@ use super::ExtensionStreamSimpleProvider;
 use crate::error::{Error, Result};
 use crate::model::{AssistantMessageEvent, ContentBlock, StopReason, StreamEvent};
 
+mod blocks;
+
 const MAX_EVENTS: usize = 262_144;
 const MAX_EVENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EVENT_NODES: usize = 262_144;
@@ -40,6 +42,7 @@ pub(super) struct Decoder {
     text: String,
     events: usize,
     delta_bytes: usize,
+    blocks: blocks::Ledger,
 }
 
 fn protocol(message: &'static str) -> Error {
@@ -96,6 +99,7 @@ impl Decoder {
             text: String::new(),
             events: 0,
             delta_bytes: 0,
+            blocks: blocks::Ledger::new(),
         }
     }
 
@@ -168,6 +172,7 @@ impl Decoder {
         }
         self.mode = Mode::Events;
         validate_event(&event)?;
+        self.blocks.admit(&event)?;
         match &event {
             AssistantMessageEvent::TextDelta { delta, .. }
             | AssistantMessageEvent::ThinkingDelta { delta, .. }
