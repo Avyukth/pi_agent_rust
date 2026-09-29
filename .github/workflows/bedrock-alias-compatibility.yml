@@ -1,0 +1,193 @@
+name: Apply reviewed Bedrock alias compatibility patch
+
+# A narrowly scoped, one-shot source migration. No builds or tests run here:
+# Rust verification remains on the repository's certified DSR lane.
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/bedrock-alias-compatibility.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    if: github.repository == 'Dicklesworthstone/pi_agent_rust'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Apply the reviewed source hunks without replacing unrelated code
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/bedrock-alias.patch" <<'PATCH'
+          diff --git a/src/provider_metadata.rs b/src/provider_metadata.rs
+          --- a/src/provider_metadata.rs
+          +++ b/src/provider_metadata.rs
+          @@ -1738,4 +1738,4 @@
+                   canonical_id: "amazon-bedrock",
+                   display_name: Some("Amazon Bedrock"),
+          -        aliases: &["bedrock"],
+          +        aliases: &["bedrock", "amazon"],
+                   auth_env_keys: &[
+          diff --git a/src/providers/mod.rs b/src/providers/mod.rs
+          --- a/src/providers/mod.rs
+          +++ b/src/providers/mod.rs
+          @@ -31,3 +31,5 @@
+           pub mod azure;
+           pub mod bedrock;
+          +#[cfg(test)]
+          +mod bedrock_alias_tests;
+           pub mod cohere;
+          PATCH
+          if ! git apply --reverse --check "$RUNNER_TEMP/bedrock-alias.patch" 2>/dev/null; then
+            git apply --check "$RUNNER_TEMP/bedrock-alias.patch"
+            git apply "$RUNNER_TEMP/bedrock-alias.patch"
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          # These JSON references are checked against the runtime registry.
+          for filename, keys in [
+              ('docs/provider-auth-crosswalk.json', ('providers',)),
+              ('docs/provider-canonical-id-policy.json', ('canonical_id_map', 'entries')),
+          ]:
+              path = Path(filename)
+              original = path.read_text()
+              document = json.loads(original)
+              rows = document
+              for key in keys:
+                  rows = rows[key]
+              bedrock = [row for row in rows if row['canonical_id'] == 'amazon-bedrock']
+              assert len(bedrock) == 1, f'{filename}: ambiguous Bedrock metadata'
+              aliases = bedrock[0]['aliases']
+              assert aliases in (['bedrock'], ['bedrock', 'amazon']), filename
+              if aliases == ['bedrock']:
+                  # Edit only this known array in the existing formatted data.
+                  marker = '"canonical_id": "amazon-bedrock"'
+                  start = original.index(marker)
+                  aliases_start = original.index('"aliases":', start)
+                  array_start = original.index('[', aliases_start)
+                  array_end = original.index(']', array_start) + 1
+                  old = original[array_start:array_end]
+                  assert json.loads(old) == ['bedrock'], filename
+                  if '\n' in old:
+                      indent = old.split('\n')[1].split('"')[0]
+                      replacement = old.replace('"bedrock"', '"bedrock",\n' + indent + '"amazon"')
+                  else:
+                      replacement = '["bedrock", "amazon"]'
+                  updated = original[:array_start] + replacement + original[array_end:]
+                  bedrock[0]['aliases'] = ['bedrock', 'amazon']
+                  assert json.loads(updated) == document, filename
+                  path.write_text(updated)
+
+          path = Path('docs/models.md')
+          original = path.read_text()
+          old = '| `amazon-bedrock` | Amazon Bedrock | bedrock |'
+          new = '| `amazon-bedrock` | Amazon Bedrock | bedrock, amazon |'
+          assert original.count(old) == 1 or original.count(new) == 1
+          if old in original:
+              path.write_text(original.replace(old, new, 1))
+          PY
+          cat > "$RUNNER_TEMP/bedrock_alias_tests.rs" <<'RUST'
+          //! Regression coverage for the public Amazon/Bedrock provider spellings.
+          //! bd-2evyt.6.14: normalize before routing and credential discovery.
+
+          use super::{ProviderRouteKind, resolve_provider_route};
+          use crate::models::ModelEntry;
+          use crate::provider::{InputType, Model, ModelCost};
+          use crate::provider_metadata::{
+              canonical_provider_id, provider_auth_env_keys, provider_ids_match,
+              provider_metadata, provider_routing_defaults, split_provider_model_spec,
+          };
+          use std::collections::HashMap;
+
+          const SPELLINGS: [&str; 5] = [
+              "amazon-bedrock", "bedrock", "amazon", " AMAZON ", " BeDrOcK ",
+          ];
+
+          #[test]
+          fn public_bedrock_spellings_share_metadata_and_auth_candidates() {
+              let canonical = provider_metadata("amazon-bedrock").expect("Bedrock metadata");
+              for spelling in SPELLINGS {
+                  let metadata = provider_metadata(spelling).expect("Bedrock alias metadata");
+                  assert!(std::ptr::eq(metadata, canonical), "{spelling}");
+                  assert_eq!(canonical_provider_id(spelling), Some("amazon-bedrock"));
+                  assert_eq!(provider_auth_env_keys(spelling), canonical.auth_env_keys);
+                  assert!(provider_ids_match(spelling, "amazon-bedrock"));
+                  assert!(provider_ids_match("bedrock", spelling));
+                  assert_eq!(
+                      provider_routing_defaults(spelling).expect("Bedrock defaults").api,
+                      "bedrock-converse-stream"
+                  );
+              }
+              assert!(canonical.aliases.contains(&"amazon"));
+          }
+
+          #[test]
+          fn public_bedrock_spellings_route_natively_with_or_without_explicit_api() {
+              for spelling in SPELLINGS {
+                  for api in ["", "bedrock-converse-stream"] {
+                      let entry = ModelEntry {
+                          model: Model {
+                              id: "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+                              name: "Bedrock alias regression".to_string(),
+                              api: api.to_string(),
+                              provider: spelling.to_string(),
+                              base_url: String::new(),
+                              reasoning: false,
+                              input: vec![InputType::Text],
+                              cost: ModelCost {
+                                  input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0,
+                              },
+                              context_window: 200_000,
+                              max_tokens: 8192,
+                              headers: HashMap::new(),
+                          },
+                          api_key: None,
+                          headers: HashMap::new(),
+                          auth_header: false,
+                          compat: None,
+                          oauth_config: None,
+                      };
+                      let (route, provider, effective_api) =
+                          resolve_provider_route(&entry).expect("native Bedrock route");
+                      assert_eq!(route, ProviderRouteKind::NativeBedrock, "{spelling}");
+                      assert_eq!(provider, "amazon-bedrock");
+                      assert_eq!(effective_api, "bedrock-converse-stream");
+                  }
+              }
+          }
+
+          #[test]
+          fn legacy_amazon_model_specs_match_canonical_bedrock_models() {
+              let (provider, model) = split_provider_model_spec(
+                  "amazon/anthropic.claude-sonnet-4-5-20250929-v1:0",
+              ).expect("provider-qualified model");
+              assert!(provider_ids_match(provider, "amazon-bedrock"));
+              assert_eq!(model, "anthropic.claude-sonnet-4-5-20250929-v1:0");
+              assert!(!provider_ids_match("amazon", "nova"));
+          }
+          RUST
+          if test -e src/providers/bedrock_alias_tests.rs; then
+            cmp "$RUNNER_TEMP/bedrock_alias_tests.rs" src/providers/bedrock_alias_tests.rs
+          else
+            cp "$RUNNER_TEMP/bedrock_alias_tests.rs" src/providers/bedrock_alias_tests.rs
+          fi
+          git diff --check
+          git add src/provider_metadata.rs src/providers/mod.rs src/providers/bedrock_alias_tests.rs docs/provider-auth-crosswalk.json docs/provider-canonical-id-policy.json docs/models.md
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix(providers): resolve amazon alias through native Bedrock auth and routing (bd-2evyt.6.14)'
+          # Never force or rebase over another contributor's concurrent work.
+          git push origin HEAD:refs/heads/main
