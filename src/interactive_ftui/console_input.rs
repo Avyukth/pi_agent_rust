@@ -28,11 +28,12 @@ struct ModeLease {
 #[cfg(any(windows, test))]
 impl ModeLease {
     fn capture(self, current: u32) -> u32 {
-        let current = current | WINDOW_INPUT;
+        let current = (current | WINDOW_INPUT) & !MOUSE_INPUT;
         if self.mouse {
             (current | MOUSE_INPUT | EXTENDED_FLAGS) & !QUICK_EDIT
         } else {
-            // Preserve native selection when mouse capture was opted out of.
+            // Preserve native selection, but do not deliver native mouse
+            // records to an app whose user explicitly opted out of capture.
             current
         }
     }
@@ -72,6 +73,55 @@ impl Drop for Guard {
             }
             self.active = false;
         }
+    }
+}
+
+/// Run an app under the native-input lease, including failed startup paths.
+/// The app owns channels the driver waits on, so it must be dropped before
+/// returning an acquisition error to a caller that will join that driver.
+pub(crate) fn run<A>(
+    app: A,
+    mouse: bool,
+    run_app: impl FnOnce(A) -> io::Result<()>,
+) -> io::Result<()> {
+    run_with_lease(app, || enter(mouse), run_app, Guard::finish)
+}
+
+/// This is also the fault-injection seam for the lifecycle regressions. The
+/// public entry point above and tests execute exactly the same ordering.
+fn run_with_lease<A, G>(
+    app: A,
+    acquire: impl FnOnce() -> io::Result<G>,
+    run_app: impl FnOnce(A) -> io::Result<()>,
+    finish: impl FnOnce(G) -> io::Result<()>,
+) -> io::Result<()> {
+    let guard = match acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            drop(app);
+            return Err(error);
+        }
+    };
+    let result = run_app(app);
+    // Deliberately not `result?`: even a failed App::run must restore the
+    // original mode, and a cleanup failure must not erase the primary cause.
+    let restored = finish(guard);
+    combine_results(result, restored)
+}
+
+/// Preserve the primary error kind and both diagnostics when cleanup fails
+/// too. Used after App::run and after a fatal model-side terminal failure.
+pub(super) fn combine_results(
+    primary: io::Result<()>,
+    cleanup: io::Result<()>,
+) -> io::Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(io::Error::new(
+            primary.kind(),
+            format!("{primary}; additional terminal error: {cleanup}"),
+        )),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -307,8 +357,122 @@ mod tests {
     fn mouse_opt_out_preserves_native_selection_policy() {
         for original in 0..=0x03ff {
             let lease = ModeLease { original, mouse: false };
-            assert_eq!(lease.capture(original), original | WINDOW_INPUT);
+            assert_eq!(
+                lease.capture(original),
+                (original | WINDOW_INPUT) & !MOUSE_INPUT
+            );
         }
+    }
+
+    #[test]
+    fn failed_acquisition_disconnects_the_driver_without_running_the_app() {
+        let (submit_tx, submit_rx) = std::sync::mpsc::channel::<()>();
+        let result = run_with_lease(
+            submit_tx,
+            || Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied)),
+            |_| panic!("an app with no console lease must not run"),
+            |()| panic!("failed acquisition did not produce a lease"),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            submit_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected),
+            "the caller must be able to join the driver immediately after return"
+        );
+    }
+
+    #[test]
+    fn cleanup_runs_after_the_app_releases_its_channels_even_on_error() {
+        for fail_run in [false, true] {
+            let (submit_tx, submit_rx) = std::sync::mpsc::channel::<()>();
+            let restored = std::cell::Cell::new(false);
+            let result = run_with_lease(
+                submit_tx,
+                || Ok(()),
+                |app| {
+                    drop(app);
+                    if fail_run {
+                        Err(io::Error::from(io::ErrorKind::BrokenPipe))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |()| {
+                    assert_eq!(
+                        submit_rx.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected)
+                    );
+                    restored.set(true);
+                    Ok(())
+                },
+            );
+            assert!(restored.get(), "cleanup cannot be skipped by an app error");
+            assert_eq!(result.is_err(), fail_run);
+        }
+    }
+
+    #[test]
+    fn app_and_restore_failures_keep_both_diagnostics() {
+        let error = run_with_lease(
+            (),
+            || Ok(()),
+            |()| Err(io::Error::new(io::ErrorKind::BrokenPipe, "frame write failed")),
+            |()| Err(io::Error::other("shell mode restore failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("frame write failed"));
+        assert!(error.to_string().contains("shell mode restore failed"));
+    }
+
+    #[test]
+    fn a_restore_failure_cannot_be_reported_as_a_successful_exit() {
+        let error = run_with_lease(
+            (),
+            || Ok(()),
+            |()| Ok(()),
+            |()| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn the_outer_lease_is_dropped_if_the_app_unwinds() {
+        struct Lease<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let restored = std::cell::Cell::new(false);
+        let (submit_tx, submit_rx) = std::sync::mpsc::channel::<()>();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with_lease(
+                submit_tx,
+                || Ok(Lease(&restored)),
+                |_app| panic!("simulated runtime unwind"),
+                |_| panic!("normal finish must not run while unwinding"),
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(restored.get());
+        assert_eq!(
+            submit_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_run_wrapper_is_headless_off_windows() {
+        let ran = std::cell::Cell::new(false);
+        run((), true, |()| {
+            ran.set(true);
+            Ok(())
+        })
+        .expect("non-Windows wrapper must not open a terminal");
+        assert!(ran.get());
     }
 
     #[cfg(not(windows))]
