@@ -29,11 +29,10 @@ pub(super) struct References {
 }
 
 async fn document(owner: &AgentCx, cdp: &mut Cdp) -> Result<Document> {
-    let tree = cdp.command(owner, "Page.getFrameTree", json!({})).await?;
-    let frame = &tree["frameTree"]["frame"];
+    let frame = cdp.frame_document(owner).await?;
     Ok(Document {
-        frame: required(frame, "id")?.into(),
-        loader: required(frame, "loaderId")?.into(),
+        frame: required(&frame, "id")?.into(),
+        loader: required(&frame, "loaderId")?.into(),
     })
 }
 
@@ -182,7 +181,15 @@ pub(super) async fn snapshot(
         elements,
         summary: summary.clone(),
     };
-    let mut details = json!({"snapshot": snapshot, "truncated": truncated, "backend": "cdp", "reference_scope": "main-frame document"});
+    let reference_scope = if cdp.frame_selected() {
+        "selected-frame document"
+    } else {
+        "main-frame document"
+    };
+    let mut details = json!({
+        "snapshot": snapshot, "truncated": truncated, "backend": "cdp",
+        "reference_scope": reference_scope, "frame_id": doc.frame,
+    });
     if include_tree {
         // Return the actual accessibility tree, bounded independently of the
         // compact element inventory. Values are omitted for the same reason above.

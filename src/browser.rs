@@ -18,6 +18,7 @@ mod cdp;
 mod dialog;
 mod download;
 mod exports;
+mod frames;
 mod interaction;
 mod launch;
 mod mock;
@@ -157,9 +158,10 @@ impl Tool for BrowserTool {
     fn description(&self) -> &str {
         "Chromium automation with an owned isolated browser, or explicit loopback attachment \
          through PI_BROWSER_CDP_URL. Supports tabs, navigation, JavaScript, snapshots, input, \
-         workspace file uploads, JavaScript dialogs, screenshots and PDF export. start launches or attaches; \
-         status never launches; stop only stops a Pi-owned browser. Failures are errors, \
-         never simulated successes. Selecting upload files exposes them to page scripts."
+         frame discovery and frame-scoped inspection, workspace file uploads, JavaScript dialogs, \
+         screenshots and PDF export. start launches or attaches; status never launches; stop only \
+         stops a Pi-owned browser. Failures are errors, never simulated successes. Selecting \
+         upload files exposes them to page scripts."
     }
 
     fn parameters(&self) -> Value {
@@ -170,12 +172,14 @@ impl Tool for BrowserTool {
                 "action": {
                     "type": "string",
                     "enum": ["start", "status", "stop", "open", "goto", "close", "list_tabs",
-                             "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
+                             "list_frames", "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press",
                              "scroll", "wait_for", "upload", "download", "screenshot", "print_pdf",
                              "handle_dialog"],
                     "description": "Browser action; ordinary actions lazily start the managed browser"
                 },
                 "tab": {"type": "string", "description": "Tab name or target ID; default: active tab"},
+                "frame": {"type": "string", "maxLength": 256,
+                          "description": "Frame ID from list_frames; requires an explicit tab. Scopes snapshot, ax_tree or evaluate to that frame for this call only. Omit for the main document. Frames and all ancestors must pass domainAllowlist; detached or navigated documents fail, never fall back to the main frame. Out-of-process frame inspection is not yet supported."},
                 "url": {"type": "string", "description": "HTTP(S) URL or about:blank for open/goto"},
                 "script": {"type": "string", "description": "JavaScript expression for evaluate"},
                 "selector": {"type": "string", "description": "CSS selector or snapshot element ref, e.g. @e1"},
@@ -227,13 +231,14 @@ impl Tool for BrowserTool {
         if self.is_mock() {
             if matches!(
                 action,
-                "start" | "status" | "stop" | "upload" | "download" | "print_pdf" | "handle_dialog"
-            ) || args.get("full_page").is_some()
+                "start" | "status" | "stop" | "list_frames" | "upload" | "download" | "print_pdf" | "handle_dialog"
+            ) || args.get("frame").is_some()
+                || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()
             {
                 return Err(Error::tool(
                     "browser",
-                    "browser lifecycle, file uploads, dialogs and page exports require the native backend",
+                    "browser lifecycle, frames, file uploads, dialogs and page exports require the native backend",
                 ));
             }
             return self
