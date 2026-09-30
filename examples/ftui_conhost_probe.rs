@@ -261,20 +261,23 @@ mod enabled {
         writeln!(log, "{}", state.record(input_mode(), native_fix))?;
         log.flush()?;
         let observer = Observer::start(log, Arc::clone(&state), native_fix)?;
-        let guard = if native_fix { Some(console_input::enter(true)?) } else { None };
         let model = Probe { state: Arc::clone(&state) };
         let app = if fullscreen {
             App::fullscreen(model)
         } else {
             App::inline_auto(model, 3, 8)
         };
-        // Use the same FTUI 0.7 builder surface as pi's production run path.
-        let result = app.with_mouse().run();
-        let restored = guard.map_or(Ok(()), console_input::Guard::finish);
+        // Exercise the same lease runner as the pending production integration:
+        // drop an unrun app on acquisition failure, and restore after App::run
+        // even when it fails. Baseline runs intentionally leave native modes alone.
+        let result = if native_fix {
+            console_input::run(app, true, |app| app.with_mouse().run())
+        } else {
+            app.with_mouse().run()
+        };
         state.phase.store(4, Ordering::Relaxed);
         let observed = observer.finish();
         result?;
-        restored?;
         observed?;
         let failure = state.error.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(error) = failure {
