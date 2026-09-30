@@ -180,8 +180,8 @@ impl Scope {
     }
 }
 
-/// Validate before connecting or launching, never silently ignore a frame on
-/// a tab-level action. Inspection is the first supported frame-scoped surface.
+/// Validate before connecting or launching. Tab-level actions must not silently
+/// ignore a frame, and native key/wheel events need an explicit target element.
 pub(super) fn validate(args: &Value) -> Result<()> {
     let Some(frame) = args.get("frame") else {
         return Ok(());
@@ -194,8 +194,14 @@ pub(super) fn validate(args: &Value) -> Result<()> {
     if args.get("tab").and_then(Value::as_str).is_none_or(str::is_empty) {
         return Err(error("frame selection requires an explicit tab"));
     }
-    if !matches!(required(args, "action")?, "snapshot" | "ax_tree" | "evaluate") {
-        return Err(error("frame selection is supported by snapshot, ax_tree and evaluate"));
+    let action = required(args, "action")?;
+    if !matches!(action, "snapshot" | "ax_tree" | "evaluate" | "click" | "type" | "fill" | "press" | "scroll" | "wait_for") {
+        return Err(error("frame selection is supported by inspection, evaluation and input actions only"));
+    }
+    if matches!(action, "press" | "scroll")
+        && args.get("selector").and_then(Value::as_str).is_none_or(str::is_empty)
+    {
+        return Err(error("frame-scoped press and scroll require an explicit selector"));
     }
     if args.get("dialog_response").is_some() {
         return Err(error("frame-scoped dialog responses are not supported"));
@@ -374,15 +380,28 @@ mod tests {
 
     #[test]
     fn frame_selection_is_explicit_and_never_ignored_by_unsupported_actions() {
-        for action in ["snapshot", "ax_tree", "evaluate"] {
-            assert!(validate(&json!({"action":action,"tab":"work","frame":"child"})).is_ok());
+        for action in ["snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press", "scroll", "wait_for"] {
+            assert!(validate(&json!({"action":action,"tab":"work","frame":"child","selector":"#control"})).is_ok());
         }
-        for action in ["open", "goto", "close", "list_tabs", "list_frames", "click", "upload", "stop"] {
+        for action in ["open", "goto", "close", "list_tabs", "list_frames", "upload", "download", "screenshot", "print_pdf", "stop"] {
             assert!(validate(&json!({"action":action,"tab":"work","frame":"child"})).is_err());
         }
         assert!(validate(&json!({"action":"snapshot","frame":"child"})).is_err());
         assert!(validate(&json!({"action":"snapshot","tab":"work","frame":null})).is_err());
         assert!(validate(&json!({"action":"evaluate","tab":"work","frame":"child","dialog_response":{}})).is_err());
         assert!(validate(&json!({"action":"snapshot"})).is_ok());
+    }
+
+    #[test]
+    fn frame_key_and_wheel_actions_cannot_target_ambient_focus_or_the_main_viewport() {
+        for action in ["press", "scroll"] {
+            let mut args = json!({"action":action,"tab":"work","frame":"child"});
+            assert!(validate(&args).is_err());
+            args["selector"] = json!("");
+            assert!(validate(&args).is_err());
+            args["selector"] = json!("@e42");
+            assert!(validate(&args).is_ok());
+        }
+        assert!(validate(&json!({"action":"press","key":"Tab"})).is_ok());
     }
 }
