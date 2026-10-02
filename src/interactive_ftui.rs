@@ -648,19 +648,33 @@ fn resolve_model_selector(
     selector: &str,
 ) -> Result<(String, String, Option<crate::model::ThinkingLevel>), String> {
     let selector = selector.trim();
-    let (spec, level) = match selector.rsplit_once(':') {
-        Some((spec, level)) if !spec.is_empty() => match level.parse() {
-            Ok(level) => (spec, Some(level)),
-            Err(_) => (selector, None),
-        },
-        _ => (selector, None),
-    };
-    let lower = spec.to_ascii_lowercase();
     let id_of = |full: &str| {
         full.split_once('/')
             .map_or(full, |(_, id)| id)
             .to_ascii_lowercase()
     };
+    let names_available_model = |candidate: &str| {
+        let lower = candidate.to_ascii_lowercase();
+        available
+            .iter()
+            .any(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
+    };
+    // `spec:level` selects a thinking level by name only. Model ids can end in
+    // `:<digit>` (Bedrock's `...-v1:0`), and a selector that names an available
+    // model exactly is never split.
+    let (spec, level) = match selector.rsplit_once(':') {
+        Some((spec, level))
+            if !spec.is_empty()
+                && !level.bytes().all(|byte| byte.is_ascii_digit())
+                && !names_available_model(selector) =>
+        {
+            level
+                .parse::<crate::model::ThinkingLevel>()
+                .map_or((selector, None), |level| (spec, Some(level)))
+        }
+        _ => (selector, None),
+    };
+    let lower = spec.to_ascii_lowercase();
     let mut matches: Vec<&String> = available
         .iter()
         .filter(|full| full.to_ascii_lowercase() == lower || id_of(full) == lower)
@@ -3885,8 +3899,8 @@ impl PiFtuiModel {
                     self.push_entry(
                         EntryRole::System,
                         String::from(
-                            "This permanently deletes this session's file and starts a new \
-                             session. Type /delete yes to confirm.",
+                            "This deletes this session's file (to the trash when one is \
+                             available) and starts a new session. Type /delete yes to confirm.",
                         ),
                     );
                 }
@@ -6322,6 +6336,8 @@ fn prepare_prompt(
         return Ok((expand(prompt), Vec::new()));
     }
     let single;
+    #[allow(clippy::option_if_let_else)]
+    // deferred init: a closure cannot capture the unassigned `single`
     let workspace = if let Some(workspace) = workspace {
         workspace
     } else {
@@ -8507,11 +8523,34 @@ pub fn run(
                                 replacement_failure = Some(err);
                                 break;
                             }
-                            let _ = agent_tx.send(match std::fs::remove_file(&doomed) {
-                                Ok(()) => PiMsg::System(format!(
-                                    "Deleted {}; this is a new session.",
+                            // A refused or failed switch is reported in the UI
+                            // and keeps the current session: never delete the
+                            // file that is still live (or that cannot be checked).
+                            let still_live = handle
+                                .with_session(|session| session.path.clone())
+                                .await
+                                .map_or(true, |path| path.as_deref() == Some(doomed.as_path()));
+                            if still_live {
+                                let _ = agent_tx.send(PiMsg::AgentError(format!(
+                                    "Kept {}: no new session started, so it is still the live session.",
                                     doomed.display()
-                                )),
+                                )));
+                                continue;
+                            }
+                            // The shared helper takes the session persistence
+                            // lock, prefers the trash, and removes the SQLite
+                            // and v2 sidecars that a bare remove_file leaves.
+                            // Then drop the index row, as the session picker
+                            // does, or /resume keeps listing the deleted file.
+                            let _ = agent_tx.send(match crate::session_picker::delete_session_file(&doomed) {
+                                Ok(()) => {
+                                    let _ = crate::session_index::SessionIndex::new()
+                                        .delete_session_path(&doomed);
+                                    PiMsg::System(format!(
+                                        "Deleted {}; this is a new session.",
+                                        doomed.display()
+                                    ))
+                                }
                                 Err(err) => PiMsg::AgentError(format!(
                                     "Could not delete {}: {err}",
                                     doomed.display()
@@ -8795,10 +8834,11 @@ pub fn run(
                 };
                 if driver_restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
                     let cx = crate::agent_cx::AgentCx::for_request();
-                    let saved = match session_store.lock(cx.cx()).await {
-                        Ok(session) => session.path.clone().filter(|path| path.is_file()),
-                        Err(_) => None,
-                    };
+                    let saved = session_store
+                        .lock(cx.cx())
+                        .await
+                        .ok()
+                        .and_then(|session| session.path.clone().filter(|path| path.is_file()));
                     if let Ok(mut slot) = driver_restart_session.lock() {
                         *slot = saved;
                     }
@@ -10876,6 +10916,27 @@ mod tests {
             Ok((
                 String::from("ollama"),
                 String::from("llama3.2:latest"),
+                None
+            ))
+        );
+        // Bedrock ids end in `:0`; that suffix is part of the id, never a
+        // thinking level, whether or not the model is listed.
+        let bedrock = vec![String::from(
+            "amazon-bedrock/anthropic.claude-sonnet-4-20250514-v1:0",
+        )];
+        assert_eq!(
+            resolve_model_selector(&bedrock, "anthropic.claude-sonnet-4-20250514-v1:0"),
+            Ok((
+                String::from("amazon-bedrock"),
+                String::from("anthropic.claude-sonnet-4-20250514-v1:0"),
+                None
+            ))
+        );
+        assert_eq!(
+            resolve("amazon-bedrock/anthropic.claude-opus-4-1-20250805-v1:0"),
+            Ok((
+                String::from("amazon-bedrock"),
+                String::from("anthropic.claude-opus-4-1-20250805-v1:0"),
                 None
             ))
         );
