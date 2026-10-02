@@ -14,6 +14,124 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.7.0] — 2026-10-01 — Release
+
+A minor release because two library structs that `docs/sdk.md` marks Stable
+gained public fields (see **Changed**). The CLI's flags and settings stay
+compatible, and session files are compatible in both directions.
+
+### Changed
+
+- **Breaking (library API): new public fields.** `pi::sdk::SessionOptions`
+  gained `skills_prompt`, `no_context_files` and `advisor`, and
+  `pi::sdk::StreamOptions` gained `service_tier`. Code that builds either
+  struct by listing every field must add them; code that ends the literal
+  with `..Default::default()` (as every example in `docs/sdk.md` does) is
+  unaffected.
+- **SDK retry and failover.** `prompt()` and `continue_turn()` now apply the
+  configured retry policy, and `FailoverStart.attempt` counts from 1. After a
+  save that cannot be confirmed durable, later prompts on that SDK handle
+  return an error until a new or resumed session replaces it. A prompt or
+  continuation started with an already-aborted signal
+  (`prompt_with_abort`, `continue_turn_with_abort`) now returns
+  `Err(Error::Aborted)` before any provider or session work, instead of an
+  `Ok` message whose `stop_reason` is `Aborted`.
+- **Extension provider streams must finish explicitly.** A `streamSimple`
+  iterator that yields nothing, or a structured event stream that ends without
+  a `done` or `error` terminal, now fails with `PI_EXTENSION_STREAM_INCOMPLETE`
+  instead of completing as an empty or partial reply, and an `error` terminal
+  must carry `reason: "error"` (or `"aborted"`) matching its message.
+- **Secret screening covers the whole provider request.** In the default
+  `obfuscate` mode, tool-call arguments, tool schemas, structured tool-result
+  details and custom messages are screened alongside text, in one
+  transaction: a refused request leaves the session's vault untouched.
+  Assistant content that a provider signed (Anthropic thinking signatures,
+  Gemini thought signatures, and the `fc_`/`msg_` item ids OpenAI Responses
+  replays by) is still screened but sent exactly as the provider produced it,
+  so a replay can never be invalidated. `secrets.mode=block` still refuses
+  any detection anywhere, including signed content and tool names. Tool
+  names are never rewritten.
+- **Detector ruleset v5.** OpenAI and Anthropic `sk-` keys are no longer
+  matched directly after a letter, so identifiers such as
+  `task-management-service` or an MCP tool `mcp__task-master-ai__get_tasks`
+  are not treated as credentials. Keys after `=`, `:`, quotes, spaces, `_`,
+  digits or percent-encoding are still found.
+- **Background-job logs.** The oldest unlocked job logs are now pruned by
+  default. `PI_JOBS_ARTIFACT_RETENTION=preserve` keeps the previous behavior.
+- **ACP editor sessions** get pi's default tool set, real system prompt,
+  skills and context files. Every tool call still asks the editor for
+  permission, so expect more permission prompts than before.
+- **Dependencies.** `dirs` 7, `similar` 3, `jsonschema` 0.58, `ast-grep` 0.45,
+  `vergen-gix` 10 and `enable-ansi-support` 0.3, plus a refresh of every
+  semver-compatible dependency. `rquickjs` stays on 0.12: 0.13 made its
+  typed-array byte accessors `unsafe`, and this crate forbids unsafe code.
+
+### Added
+
+- **Default (FTUI) stack commands, following OMP:** `/pin` keeps a session at
+  the top of `/resume`; `/delete` removes this session (to the trash when one
+  is available, with its SQLite and v2 sidecars) and starts a new one;
+  `/branch` and Esc Esc rewind to an earlier message; `/restart` relaunches
+  pi into the same session; `/dump` copies the session as text and writes the
+  request JSON; `/copy` picks a reply or code block (`/copy code|cmd|link`);
+  `/fast` toggles priority processing; `/model` and `/switch` take selectors
+  with an optional `:level` (by name, such as `opus:high`); `/queue` queues a
+  follow-up; `/template`, `/templates`, `/ssh`, `/security`, `/plugins`,
+  `/open`, `/reload-plugins` and `/scoped-models`; `@file` attachments and
+  image paste; typing filters the `/model`, `/resume` and `/theme` pickers
+  (#244).
+- **SOCKS5 and SOCKS5h proxies** for provider traffic, with optional
+  username/password authentication. There is no automatic loopback bypass:
+  list `localhost` and `127.0.0.1` in `NO_PROXY` to keep local model servers
+  direct.
+- **MCP:** bounded list and map resource URI templates, and composite
+  resource arguments in the agent's context tools.
+- **web_search:** an optional You.com rung, enabled by `YDC_API_KEY` (#246).
+- **Browser tool:** frame discovery, inspection scoped to an embedded
+  document, and native form input inside iframes.
+- **LSP:** bounded numeric snippet transforms in semantic completions.
+- **Agent:** explicit manual queue dispatch control.
+
+### Fixed
+
+- **Windows and WSL** (#182, #242): the bash tool finds a bash when
+  `shell_path` is unset, skipping empty and relative `PATH` entries, and says
+  once when it falls back to WSL's `bash.exe`; `!command` on the default stack
+  honors `shell_path` and `shell_command_prefix`; `pi doctor` reports the
+  shell the bash tool will actually run; under WSL, `/copy` and `/share` copy
+  through `clip.exe` (UTF-16LE), and ctrl+v pastes clipboard images through
+  PowerShell.
+- **Default stack:** `--no-context-files` (#216), `--plan-mode`, and `-e`
+  extensions under `--no-extensions` are honored; the model is told which
+  skills exist; `steeringMode`, `followUpMode` and `hideThinkingBlock` are
+  honored and thinking streams live; `/model` shows display names (#214);
+  `/resume` re-reads the session list each time; `@file` references in
+  messages sent while the agent works are read.
+- **ACP:** `session/list` and model/thinking `configOptions` follow the spec
+  (#245); editor sessions get the real system prompt and skills list.
+- **Providers and streams:** a truncated extension stream can no longer
+  authorize a tool call; streamed block completions are validated; SSE
+  metadata is bounded and coalesced streams decode on demand; auxiliary
+  requests (advisor, `/btw`) are bound to the owner's cancellation and
+  deadline.
+- **Privacy of auxiliary requests:** the advisor and `/btw` screen their
+  complete inputs before truncation, and only accept complete, bounded
+  responses.
+- **Extensions:** the native runtime shuts down irreversibly and isolates
+  its streams across reload, reset and cancellation.
+- **LSP:** request cancellation and writes to the server's pipe no longer
+  block.
+
+### Known issues
+
+Tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
+without credentials (`curl`/`git` then fail to authenticate); extension
+providers that end a turn with `stop` while returning tool calls are
+rejected; on the default stack a built-in command such as `/plan` or
+`/status` takes precedence over an extension command of the same name; a
+full LSP request queue restarts the language server; a bare `/advisor` on
+the classic stack toggles instead of showing status.
+
 ## [v0.6.1] — 2026-09-24 — Release
 
 ### Fixed

@@ -1030,9 +1030,15 @@ Resolution order for a request, first match wins:
 Ambient proxy variables are honored by default, the same as `git` and `curl`.
 Where they are set for some other tool — a capture proxy, a stale VPN helper —
 turn the inheritance off with `"http": { "ignore_env_proxy": true }` or
-`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. An
-unusable ambient value (e.g. a `socks5://` `ALL_PROXY` — SOCKS is not
-supported) is skipped with a warning rather than failing requests.
+`PI_HTTP_PROXY=off`; explicit settings and `PI_*_PROXY` still apply. Proxy
+endpoints may be `http://`, `socks5://` (local DNS) or `socks5h://` (DNS on the
+proxy), with optional username/password authentication; SOCKS credentials are
+not encrypted on the hop to the proxy. There is no automatic loopback bypass:
+requests to local model servers (Ollama, LM Studio) go through the proxy too
+unless `localhost` and `127.0.0.1` are in `NO_PROXY` or `http.noProxy`. An
+unusable ambient value
+(e.g. an `https://` or `socks4://` endpoint) is skipped with a warning rather
+than failing requests.
 
 The resolved proxy is also injected into every process the `bash` tool spawns
 (as `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and their lowercase spellings), so
