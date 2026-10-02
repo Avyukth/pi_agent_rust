@@ -261,6 +261,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/lsp/hierarchy.rs` | LSP call hierarchy navigation | Unit; `src/lsp/hierarchy/tests.rs`, `tests/lsp.rs`. |
 | `src/lsp/hierarchy/tests.rs` | LSP call hierarchy test suite | Test module; hierarchy tests. |
 | `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
+| `src/lsp/jsonrpc/completion.rs` | LSP request waits that retain their owner and retire abandoned requests on drop | Unit (6 in-module tests). |
+| `src/lsp/jsonrpc/outbound.rs` | Bounded, non-blocking admission to the single child-stdin pump | Unit (6 in-module tests). |
 | `src/lsp/refactor_preview.rs` | LSP refactor preview and approval staging | Unit; `src/lsp/refactor_preview/tests.rs`, `src/lsp/refactor_preview/tests/protocol.rs`. |
 | `src/lsp/refactor_preview/tests.rs` | LSP refactor preview test suite | Test module; refactor preview tests. |
 | `src/lsp/refactor_preview/tests/protocol.rs` | LSP refactor preview protocol test cases | Test support module; refactor protocol scenarios. |
@@ -340,6 +342,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/cohere/streaming.rs` | Bounded Cohere v2 indexed content/tool lifecycle and terminal stream handling | Unit (16 tests), including interleaved calls, malformed arguments, sparse indices, byte/block limits, native completion and one-error-then-EOF behavior. Added, not executed: DSR unavailable. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
+| `src/providers/extension_stream.rs` | Admission and terminal semantics for extension-authored provider streams | Unit; `src/providers/extension_stream/tests.rs`, `tests/extension_stream_terminal.rs`, `tests/extensions_provider_streaming.rs`. |
+| `src/providers/extension_stream/blocks.rs` | Per-block admission for structured extension streams | Unit (8 in-module tests). |
+| `src/providers/extension_stream/tests.rs` | Extension stream decoder test suite | Test module; extension stream terminal and admission tests. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gemini/files.rs` | Credential-scoped Gemini Files API staging for large inline media | Unit (in-module, loopback HTTP fixtures); two concurrency cases are timing-flaky, see bd-eg6ng. |
 | `src/providers/gemini/reasoning.rs` | Gemini reasoning and thinking trace handling | Unit; `tests/provider_streaming/gemini.rs`. |
@@ -362,7 +367,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
 | `src/sdk/extension_bootstrap.rs` | SDK session extension model resolution and runtime bootstrap | Unit; `tests/sdk_integration.rs`. |
 | `src/sdk/extension_bootstrap_tests.rs` | SDK extension bootstrap regression test suite | Test module; extension model resolution tests. |
+| `src/sdk/recovery.rs` | Retry and failover recovery for every SDK turn entry point | Unit; `src/sdk/tests/recovery.rs`, `tests/sdk_multimodal.rs`. |
+| `src/sdk/tests/recovery.rs` | SDK entry-point recovery regression suite | Test module; retry, failover, abort and persistence-quarantine tests. |
 | `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
+| `src/secrets/structured.rs` | Transactional secret screening for structured outbound values | Unit (14 in-module tests); `tests/secrets.rs`. |
 | `src/security_scan.rs` | Agent-facing security scanner tool: plan/run/disposition/compare (bd-cv653.2.6) | Unit (6 tests); `tests/security_scan.rs`. |
 | `src/security_scan/dependencies.rs` | Cargo dependency security analysis | Unit; `tests/security_scan.rs`. |
 | `src/security_scan/dependencies/tests.rs` | Dependency security scanning tests | Test support module; exercises dependency scanner. |
@@ -414,6 +422,8 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/swarm_progress_slo.rs` | Swarm progress SLO evaluation | Unit; `tests/swarm_progress_slo_contract.rs`, `tests/swarm_progress_cli.rs`, and `tests/swarm_progress_slo_e2e.rs`. |
 | `src/swarm_replay.rs` | Swarm trace replay and policy comparison | Unit; `tests/swarm_replay_trace_contract.rs`, `tests/swarm_replay_ingestor.rs`, and `tests/swarm_replay_preview_cli.rs`. |
 | `src/terminal_images.rs` | Terminal images | Unit; interactive/TUI rendering tests. |
+| `src/text_completion.rs` | Bounded, terminal-validated completions for tool-free auxiliary model calls | Unit (23 in-module tests). |
+| `src/text_completion/request.rs` | Owner-scoped deadlines for inline auxiliary provider requests | Unit (8 in-module tests). |
 | `src/theme.rs` | Theme loading | Unit; `tests/tui_snapshot.rs`, interactive UI tests. |
 | `src/todo.rs` | Todo tracking | Covered through TUI/session suites. |
 | `src/token_count.rs` | BPE token counting | In-source tests; `tests/compaction.rs` cut-point calibration. |
