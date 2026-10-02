@@ -2604,6 +2604,7 @@ impl Agent {
     /// cloned vault and owned context, and the live vault is installed only
     /// after every field succeeds. This prevents a late refusal from learning
     /// credentials or consuming placeholder identities.
+    #[allow(clippy::too_many_lines)] // one transaction; splitting it would scatter the commit point
     fn apply_secrets_outbound(
         &mut self,
         mut context: Context<'static>,
@@ -2627,14 +2628,11 @@ impl Agent {
         // one field. A later assignment such as {"api_key": "..."} can
         // therefore identify an earlier bare echo of the same opaque value.
         // Binary image/media bytes and provider-opaque redacted reasoning are
-        // deliberately absent from this projection.
+        // deliberately absent from this projection. Block mode refuses here on
+        // any detection, signed and paused content included; discovery never
+        // rewrites, so it cannot fail on content that is replayed verbatim.
         let discovery = Self::secrets_discovery_projection(&context);
-        let _ = crate::secrets::transform_outbound_json(
-            &discovery,
-            &mut staged_vault,
-            mode,
-            &extra,
-        )?;
+        crate::secrets::discover_outbound_json(&discovery, &mut staged_vault, mode, &extra)?;
 
         let mut total = 0usize;
         let mut labels: Vec<String> = Vec::new();
@@ -2662,26 +2660,29 @@ impl Agent {
                 )?,
                 Message::Assistant(assistant) => {
                     // Paused server-tool responses and signed blocks must remain
-                    // byte/structure stable for provider replay. Screen them to
-                    // detect leakage, but refuse rather than invalidate a
-                    // signature or alter a verbatim continuation.
+                    // byte/structure stable for provider replay. Block mode has
+                    // already refused any detection in them (discovery above);
+                    // obfuscate mode replays them as the provider produced them.
+                    // Refusing there wedged every later request in the session
+                    // (a signature can be a plain OpenAI item id, and model-made
+                    // text such as a DSN matches the detector).
                     if assistant.stop_reason == StopReason::PauseTurn {
-                        let original = serde_json::to_value(assistant.as_ref()).map_err(|_| {
-                            Error::validation(
-                                "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
-                                    .to_string(),
-                            )
-                        })?;
-                        let protected = Self::secrets_transform_json(
-                            &original,
-                            &mut staged_vault,
-                            mode,
-                            &extra,
-                            &mut total,
-                            &mut labels,
-                        )?;
-                        if protected != original {
-                            return Err(Self::secret_signed_content_error());
+                        if mode == crate::secrets::SecretsMode::Block {
+                            let original =
+                                serde_json::to_value(assistant.as_ref()).map_err(|_| {
+                                    Error::validation(
+                                        "PI_SECRET_SERIALIZE: failed to screen paused assistant message"
+                                            .to_string(),
+                                    )
+                                })?;
+                            Self::secrets_transform_json(
+                                &original,
+                                &mut staged_vault,
+                                mode,
+                                &extra,
+                                &mut total,
+                                &mut labels,
+                            )?;
                         }
                         continue;
                     }
@@ -2690,6 +2691,7 @@ impl Agent {
                     for block in &mut assistant_mut.content {
                         Self::secrets_transform_content_block(
                             block,
+                            true,
                             &mut staged_vault,
                             mode,
                             &extra,
@@ -2725,6 +2727,7 @@ impl Agent {
                     for block in &mut result_mut.content {
                         Self::secrets_transform_content_block(
                             block,
+                            false,
                             &mut staged_vault,
                             mode,
                             &extra,
@@ -2768,7 +2771,9 @@ impl Agent {
 
         for tool in context.tools.to_mut().iter_mut() {
             // Tool names are routing identifiers. A replacement here would
-            // advertise a name the local registry cannot execute.
+            // advertise a name the local registry cannot execute, so names are
+            // never rewritten. Only block mode refuses; obfuscate mode sends
+            // the name as registered (MCP server keys are user configuration).
             let screened_name = Self::secrets_transform_text(
                 &tool.name,
                 &mut staged_vault,
@@ -2777,7 +2782,7 @@ impl Agent {
                 &mut total,
                 &mut labels,
             )?;
-            if screened_name != tool.name {
+            if screened_name != tool.name && mode == crate::secrets::SecretsMode::Block {
                 return Err(Error::validation(
                     "PI_SECRET_IDENTIFIER: tool name contains secret material and cannot be rewritten safely"
                         .to_string(),
@@ -2876,13 +2881,6 @@ impl Agent {
         }
     }
 
-    fn secret_signed_content_error() -> Error {
-        Error::validation(
-            "PI_SECRET_SIGNED_CONTENT: secret replacement would alter signed or verbatim provider content; refusing to send"
-                .to_string(),
-        )
-    }
-
     fn secrets_add_audit(
         audit: crate::secrets::TransformAudit,
         total: &mut usize,
@@ -2904,8 +2902,7 @@ impl Agent {
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<Value> {
-        let (output, audit) =
-            crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
+        let (output, audit) = crate::secrets::transform_outbound_json(value, vault, mode, extra)?;
         Self::secrets_add_audit(audit, total, labels);
         Ok(output)
     }
@@ -2919,8 +2916,7 @@ impl Agent {
         labels: &mut Vec<String>,
     ) -> Result<String> {
         let value = Value::String(text.to_string());
-        let output =
-            Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
+        let output = Self::secrets_transform_json(&value, vault, mode, extra, total, labels)?;
         output.as_str().map(ToString::to_string).ok_or_else(|| {
             Error::validation(
                 "PI_SECRET_JSON_PRIMITIVE: text screening changed the JSON value type".to_string(),
@@ -2928,41 +2924,57 @@ impl Agent {
         })
     }
 
+    /// `honor_signatures` is true only for assistant blocks: a provider signs
+    /// its own output. User and tool-result blocks are rewritten even when
+    /// they carry a signature field (an extension can set one on any JSON).
     fn secrets_transform_content_block(
         block: &mut ContentBlock,
+        honor_signatures: bool,
         vault: &mut crate::secrets::SecretVault,
         mode: crate::secrets::SecretsMode,
         extra: &[regex::Regex],
         total: &mut usize,
         labels: &mut Vec<String>,
     ) -> Result<()> {
+        // A signed assistant block (a real provider signature, or a plain item
+        // id such as OpenAI's `fc_`/`msg_` that replay is keyed on) is never
+        // rewritten outside block mode: see the paused-turn comment in
+        // `apply_secrets_outbound`. Skipping the rewrite (not just discarding
+        // it) also keeps a type-changing replacement from refusing the request.
+        let keep_signed = honor_signatures && mode != crate::secrets::SecretsMode::Block;
         match block {
             ContentBlock::Text(text) => {
-                let screened = Self::secrets_transform_text(
-                    &text.text, vault, mode, extra, total, labels,
-                )?;
-                if text.text_signature.is_some() && screened != text.text {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && text.text_signature.is_some() {
+                    return Ok(());
                 }
-                text.text = screened;
+                text.text =
+                    Self::secrets_transform_text(&text.text, vault, mode, extra, total, labels)?;
             }
             ContentBlock::Thinking(thinking) => {
-                let screened = Self::secrets_transform_text(
-                    &thinking.thinking, vault, mode, extra, total, labels,
-                )?;
-                if thinking.thinking_signature.is_some() && screened != thinking.thinking {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && thinking.thinking_signature.is_some() {
+                    return Ok(());
                 }
-                thinking.thinking = screened;
+                thinking.thinking = Self::secrets_transform_text(
+                    &thinking.thinking,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
             }
             ContentBlock::ToolCall(call) => {
-                let screened = Self::secrets_transform_json(
-                    &call.arguments, vault, mode, extra, total, labels,
-                )?;
-                if call.thought_signature.is_some() && screened != call.arguments {
-                    return Err(Self::secret_signed_content_error());
+                if keep_signed && call.thought_signature.is_some() {
+                    return Ok(());
                 }
-                call.arguments = screened;
+                call.arguments = Self::secrets_transform_json(
+                    &call.arguments,
+                    vault,
+                    mode,
+                    extra,
+                    total,
+                    labels,
+                )?;
             }
             ContentBlock::RedactedThinking(_) | ContentBlock::Image(_) | ContentBlock::Media(_) => {
                 // Opaque signed/provider bytes and binary payloads are not
@@ -2988,7 +3000,7 @@ impl Agent {
             UserContent::Blocks(blocks) => {
                 for block in blocks {
                     Self::secrets_transform_content_block(
-                        block, vault, mode, extra, total, labels,
+                        block, false, vault, mode, extra, total, labels,
                     )?;
                 }
             }
@@ -9967,10 +9979,18 @@ mod extensions_integration_tests {
         runtime.block_on(async {
             let provider = Arc::new(TruncatingProvider::new(0));
             let provider_dyn: Arc<dyn Provider> = provider.clone();
+            // The fixture's final reply ("}\n```\nAll done.") reads as an
+            // unclosed fence, so conservative turn recovery would add a
+            // continuation call. Only steering is manual here (follow-up
+            // dispatch, which suppresses recovery, stays automatic), so turn
+            // recovery is switched off to isolate steering dispatch.
             let mut agent = Agent::new(
                 provider_dyn,
                 ToolRegistry::from_tools(vec![]),
-                AgentConfig::default(),
+                AgentConfig {
+                    turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                    ..AgentConfig::default()
+                },
             );
             let polls = Arc::new(AtomicUsize::new(0));
             let polls_for_fetcher = Arc::clone(&polls);
