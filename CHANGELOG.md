@@ -29,9 +29,11 @@ compatible, and session files are compatible in both directions.
   with `..Default::default()` (as every example in `docs/sdk.md` does) is
   unaffected.
 - **SDK retry and failover.** `prompt()` and `continue_turn()` now apply the
-  configured retry policy, and `FailoverStart.attempt` counts from 1. After a
-  save that cannot be confirmed durable, later prompts on that SDK handle
-  return an error until a new or resumed session replaces it. A prompt or
+  configured retry policy, and `FailoverStart.attempt` counts from 1. When a
+  model-selection or failover switch cannot be saved durably, later prompts on
+  that SDK handle return an error until a new or resumed session replaces it
+  (a failed turn save during an image-prompt retry is not fenced yet; see
+  **Known issues**). A prompt or
   continuation started with an already-aborted signal
   (`prompt_with_abort`, `continue_turn_with_abort`) now returns
   `Err(Error::Aborted)` before any provider or session work, instead of an
@@ -124,7 +126,25 @@ compatible, and session files are compatible in both directions.
 
 ### Known issues
 
-Tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
+Three tests of features added in this release do not pass yet. They are not
+regressions of anything v0.6.1 shipped:
+
+- `sdk_mml_img_failed_retry_save_fences_later_image_prompts`
+  (`tests/sdk_multimodal.rs`): when the retry attempt of an image prompt cannot
+  save the session, the next prompt on the same SDK handle is not refused.
+  Callers that see a session-persistence error should start a new or resumed
+  session before prompting again (bead
+  `bd-sdk-image-retry-durable-save-fence-5a2b1`).
+- `sdk::tests::recovery::recovery_events_reach_subscribers_without_double_firing_typed_hooks`:
+  the typed `on_stream_event` hook does not receive the provider's terminal
+  `Done`/`Error` events (as in v0.6.1); session subscribers do see the turn's
+  outcome (bead `bd-sdk-stream-hook-terminal-events-494a4`).
+- `lsp::client::request::tests::dropping_a_posted_request_cancels_it_before_the_next_dispatch`:
+  an LSP request dropped before the outbound writer sends it is neither sent
+  nor cancelled, rather than sent and then cancelled (bead
+  `bd-lsp-cancel-ordering-nonblocking-queue-pr0qa`).
+
+Also tracked as beads: in a bash child, an authenticated SOCKS proxy is exported
 without credentials (`curl`/`git` then fail to authenticate); extension
 providers that end a turn with `stop` while returning tool calls are
 rejected; on the default stack a built-in command such as `/plan` or
