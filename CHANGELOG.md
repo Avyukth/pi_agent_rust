@@ -14,7 +14,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
-## [v0.7.0] — 2026-10-01 — Release
+## [v0.7.1] — 2026-10-02 — Release
+
+The first release of the 0.7 line. v0.7.0 was tagged but could not be built
+by the strict release builder: two vendored test-fixture documents had `&` in
+their names, which its source archive refuses, and release tags cannot be
+moved. v0.7.1 is v0.7.0 with those two files renamed. Everything below is new
+since v0.6.1.
 
 A minor release because two library structs that `docs/sdk.md` marks Stable
 gained public fields (see **Changed**). The CLI's flags and settings stay
@@ -151,6 +157,11 @@ rejected; on the default stack a built-in command such as `/plan` or
 `/status` takes precedence over an extension command of the same name; a
 full LSP request queue restarts the language server; a bare `/advisor` on
 the classic stack toggles instead of showing status.
+
+## [v0.7.0] — 2026-10-01 — Tag-only
+
+Tagged at `1e4548aa7` with the changes listed under v0.7.1, but never released:
+see the note at the top of v0.7.1. There are no v0.7.0 binaries or crate.
 
 ## [v0.6.1] — 2026-09-24 — Release
 
