@@ -1,7 +1,7 @@
 //! Native Windows console-input ownership for the FTUI lifecycle.
 //!
-//! ANSI mouse reporting does not disable ConHost QuickEdit. Crossterm raw
-//! mode also leaves QuickEdit, mouse-input and window-input flags alone.
+//! ANSI mouse reporting does not disable `ConHost` `QuickEdit`. Crossterm raw
+//! mode also leaves `QuickEdit`, mouse-input and window-input flags alone.
 //! Keep one original mode across release/reacquire; never snapshot a child's
 //! mode as the shell's baseline. No terminal input is read by this module.
 
@@ -27,7 +27,7 @@ struct ModeLease {
 
 #[cfg(any(windows, test))]
 impl ModeLease {
-    fn capture(self, current: u32) -> u32 {
+    const fn capture(self, current: u32) -> u32 {
         let current = (current | WINDOW_INPUT) & !MOUSE_INPUT;
         if self.mouse {
             (current | MOUSE_INPUT | EXTENDED_FLAGS) & !QUICK_EDIT
@@ -38,17 +38,17 @@ impl ModeLease {
         }
     }
 
-    fn restore_steps(self) -> [u32; 2] {
+    const fn restore_steps(self) -> [u32; 2] {
         // Without EXTENDED_FLAGS, SetConsoleMode ignores QuickEdit changes.
         // The second write restores a baseline that did not include that bit.
         [self.original | EXTENDED_FLAGS, self.original]
     }
 }
 
-/// A same-thread lease, held outside App::run but inside its cleanup scope.
-/// The guard must be dropped before any process::exit/restart path.
+/// A same-thread lease, held outside `App::run` but inside its cleanup scope.
+/// The guard must be dropped before any `process::exit`/restart path.
 #[must_use]
-pub(crate) struct Guard {
+pub struct Guard {
     active: bool,
     _thread_bound: PhantomData<Rc<()>>,
 }
@@ -79,11 +79,7 @@ impl Drop for Guard {
 /// Run an app under the native-input lease, including failed startup paths.
 /// The app owns channels the driver waits on, so it must be dropped before
 /// returning an acquisition error to a caller that will join that driver.
-pub(crate) fn run<A>(
-    app: A,
-    mouse: bool,
-    run_app: impl FnOnce(A) -> io::Result<()>,
-) -> io::Result<()> {
+pub fn run<A>(app: A, mouse: bool, run_app: impl FnOnce(A) -> io::Result<()>) -> io::Result<()> {
     run_with_lease(app, || enter(mouse), run_app, Guard::finish)
 }
 
@@ -110,11 +106,8 @@ fn run_with_lease<A, G>(
 }
 
 /// Preserve the primary error kind and both diagnostics when cleanup fails
-/// too. Used after App::run and after a fatal model-side terminal failure.
-pub(super) fn combine_results(
-    primary: io::Result<()>,
-    cleanup: io::Result<()>,
-) -> io::Result<()> {
+/// too. Used after `App::run` and after a fatal model-side terminal failure.
+pub fn combine_results(primary: io::Result<()>, cleanup: io::Result<()>) -> io::Result<()> {
     match (primary, cleanup) {
         (Err(primary), Err(cleanup)) => Err(io::Error::new(
             primary.kind(),
@@ -126,8 +119,11 @@ pub(super) fn combine_results(
 }
 
 /// Acquire native input ownership before FTUI performs its first output write.
-#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
-pub(crate) fn enter(mouse: bool) -> io::Result<Guard> {
+#[cfg_attr(
+    not(windows),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
+pub fn enter(mouse: bool) -> io::Result<Guard> {
     #[cfg(windows)]
     {
         native::begin(mouse)?;
@@ -150,8 +146,11 @@ pub(crate) fn enter(mouse: bool) -> io::Result<Guard> {
 }
 
 /// Restore the shell mode while a synchronous external editor owns the console.
-#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
-pub(crate) fn suspend() -> io::Result<()> {
+#[cfg_attr(
+    not(windows),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
+pub fn suspend() -> io::Result<()> {
     #[cfg(windows)]
     {
         native::suspend()
@@ -163,8 +162,11 @@ pub(crate) fn suspend() -> io::Result<()> {
 }
 
 /// Reapply native input flags after raw mode is re-enabled, before rendering.
-#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
-pub(crate) fn resume() -> io::Result<()> {
+#[cfg_attr(
+    not(windows),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
+pub fn resume() -> io::Result<()> {
     #[cfg(windows)]
     {
         native::resume()
@@ -175,7 +177,10 @@ pub(crate) fn resume() -> io::Result<()> {
     }
 }
 
-#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+#[cfg_attr(
+    not(windows),
+    allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)
+)]
 fn restore() -> io::Result<()> {
     #[cfg(windows)]
     {
@@ -207,17 +212,22 @@ mod native {
         SESSION.with(|slot| {
             let mut slot = slot.borrow_mut();
             if slot.is_some() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists,
-                    "FTUI already owns this thread's console input mode"));
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "FTUI already owns this thread's console input mode",
+                ));
             }
             // CONIN$ is independent of redirected stdin. Both access rights
             // are intentional; do not regress issue #239's access-denied fix.
-            let input = Handle::from_file(OpenOptions::new()
-                .read(true).write(true).open("CONIN$")?);
+            let input =
+                Handle::from_file(OpenOptions::new().read(true).write(true).open("CONIN$")?);
             let original = console::mode(&input)?;
             tracing::debug!(target: "pi::ftui::console", original, mouse,
                 "captured shell console input mode");
-            *slot = Some(Session { input, lease: ModeLease { original, mouse } });
+            *slot = Some(Session {
+                input,
+                lease: ModeLease { original, mouse },
+            });
             Ok(())
         })
     }
@@ -301,11 +311,17 @@ mod tests {
         assert_ne!(raw & QUICK_EDIT, 0);
         // Merely clearing QuickEdit in a mode without EXTENDED is not a fix.
         assert_ne!(conhost_set_mode(raw, 0) & QUICK_EDIT, 0);
-        let lease = ModeLease { original: shell, mouse: true };
+        let lease = ModeLease {
+            original: shell,
+            mouse: true,
+        };
         let captured = conhost_set_mode(raw, lease.capture(raw));
         assert_eq!(captured & QUICK_EDIT, 0);
         assert_eq!(captured & COOKED, 0);
-        assert_eq!(captured & (WINDOW_INPUT | MOUSE_INPUT), WINDOW_INPUT | MOUSE_INPUT);
+        assert_eq!(
+            captured & (WINDOW_INPUT | MOUSE_INPUT),
+            WINDOW_INPUT | MOUSE_INPUT
+        );
     }
 
     #[test]
@@ -313,7 +329,10 @@ mod tests {
         let owned = WINDOW_INPUT | MOUSE_INPUT | QUICK_EDIT | EXTENDED_FLAGS;
         for low in 0..=0x03ff {
             let current = low | 0x8000_0000;
-            let lease = ModeLease { original: current, mouse: true };
+            let lease = ModeLease {
+                original: current,
+                mouse: true,
+            };
             let captured = conhost_set_mode(current, lease.capture(current));
             assert_eq!(captured & !owned, current & !owned);
             assert_eq!(captured & QUICK_EDIT, 0);
@@ -324,7 +343,10 @@ mod tests {
     #[test]
     fn restoration_handles_baselines_without_extended_flags() {
         for original in 0..=0x03ff {
-            let lease = ModeLease { original, mouse: true };
+            let lease = ModeLease {
+                original,
+                mouse: true,
+            };
             let mut mode = lease.capture(original ^ QUICK_EDIT);
             for requested in lease.restore_steps() {
                 mode = conhost_set_mode(mode, requested);
@@ -336,7 +358,10 @@ mod tests {
     #[test]
     fn child_changes_never_replace_the_original_baseline() {
         let original = 0x0007 | QUICK_EDIT;
-        let lease = ModeLease { original, mouse: true };
+        let lease = ModeLease {
+            original,
+            mouse: true,
+        };
         let mut current = lease.capture(original & !0x0007);
         for child in [0x03ff, 0, QUICK_EDIT, EXTENDED_FLAGS | QUICK_EDIT] {
             for requested in lease.restore_steps() {
@@ -356,7 +381,10 @@ mod tests {
     #[test]
     fn mouse_opt_out_preserves_native_selection_policy() {
         for original in 0..=0x03ff {
-            let lease = ModeLease { original, mouse: false };
+            let lease = ModeLease {
+                original,
+                mouse: false,
+            };
             assert_eq!(
                 lease.capture(original),
                 (original | WINDOW_INPUT) & !MOUSE_INPUT
@@ -416,7 +444,12 @@ mod tests {
         let error = run_with_lease(
             (),
             || Ok(()),
-            |()| Err(io::Error::new(io::ErrorKind::BrokenPipe, "frame write failed")),
+            |()| {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "frame write failed",
+                ))
+            },
             |()| Err(io::Error::other("shell mode restore failed")),
         )
         .unwrap_err();

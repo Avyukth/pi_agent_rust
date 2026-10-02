@@ -280,7 +280,10 @@ async fn element_call(
         .as_u64()
         .ok_or_else(|| Error::tool("browser", "isolated world has no execution context"))?;
     if cdp.frame_selected() && document(owner, cdp).await? != doc {
-        return Err(Error::tool("browser", "selected frame navigated before element access"));
+        return Err(Error::tool(
+            "browser",
+            "selected frame navigated before element access",
+        ));
     }
     let resolved = cdp
         .command(
@@ -335,7 +338,10 @@ pub(super) async fn execute(
                 frame_input::ensure_focus(owner, cdp, id).await?;
             }
         } else if scoped {
-            return Err(Error::tool("browser", "frame-scoped keypress requires a selector"));
+            return Err(Error::tool(
+                "browser",
+                "frame-scoped keypress requires a selector",
+            ));
         }
         let key = required(args, "key")?;
         press(owner, cdp, key).await?;
@@ -352,11 +358,21 @@ pub(super) async fn execute(
             let id = resolve(owner, cdp, selector, refs)
                 .await?
                 .ok_or_else(|| Error::tool("browser", "selector did not match an element"))?;
-            cdp.command(owner, "DOM.scrollIntoViewIfNeeded", json!({"backendNodeId": id})).await?;
+            cdp.command(
+                owner,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({"backendNodeId": id}),
+            )
+            .await?;
             let (point_x, point_y) = frame_input::click_point(owner, cdp, id).await?;
-            cdp.command(owner, "Input.dispatchMouseEvent", json!({
-                "type": "mouseWheel", "x": point_x, "y": point_y, "deltaX": x, "deltaY": y,
-            })).await?;
+            cdp.command(
+                owner,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseWheel", "x": point_x, "y": point_y, "deltaX": x, "deltaY": y,
+                }),
+            )
+            .await?;
             return Ok(output(
                 format!("Scrolled over {selector} in the selected frame of tab {tab}"),
                 json!({"action": action, "tab": tab, "selector": selector, "delta_x": x, "delta_y": y, "backend": "cdp"}),
@@ -416,11 +432,15 @@ pub(super) async fn execute(
                 let x = point["x"]
                     .as_f64()
                     .filter(|v| v.is_finite())
-                    .ok_or_else(|| Error::tool("browser", "element has no clickable x coordinate"))?;
+                    .ok_or_else(|| {
+                        Error::tool("browser", "element has no clickable x coordinate")
+                    })?;
                 let y = point["y"]
                     .as_f64()
                     .filter(|v| v.is_finite())
-                    .ok_or_else(|| Error::tool("browser", "element has no clickable y coordinate"))?;
+                    .ok_or_else(|| {
+                        Error::tool("browser", "element has no clickable y coordinate")
+                    })?;
                 (x, y)
             };
             for (kind, buttons) in [("mousePressed", 1), ("mouseReleased", 0)] {

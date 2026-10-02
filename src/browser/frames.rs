@@ -25,9 +25,7 @@ fn identifier(value: &Value, key: &str, empty: bool) -> Result<String> {
         .get(key)
         .and_then(Value::as_str)
         .filter(|text| {
-            (empty || !text.is_empty())
-                && text.len() <= 256
-                && !text.chars().any(char::is_control)
+            (empty || !text.is_empty()) && text.len() <= 256 && !text.chars().any(char::is_control)
         })
         .map(str::to_owned)
         .ok_or_else(|| error("frame metadata contains an invalid identifier"))
@@ -67,7 +65,9 @@ impl Tree {
 
     fn visit(&mut self, node: &Value, parent: Option<&str>, depth: usize) -> Result<()> {
         if depth > MAX_DEPTH || self.frames.len() >= MAX_FRAMES {
-            return Err(error("browser frame tree exceeds its depth or frame-count limit"));
+            return Err(error(
+                "browser frame tree exceeds its depth or frame-count limit",
+            ));
         }
         let frame = node
             .get("frame")
@@ -129,9 +129,10 @@ impl Tree {
             if path.len() > MAX_DEPTH {
                 return Err(error("browser frame ancestry exceeds its depth limit"));
             }
-            let frame = self.frames.get(id).ok_or_else(|| {
-                error("frame is not in the selected tab; use list_frames again")
-            })?;
+            let frame = self
+                .frames
+                .get(id)
+                .ok_or_else(|| error("frame is not in the selected tab; use list_frames again"))?;
             path.push(frame.identity.clone());
             next = frame.identity.parent.as_deref();
         }
@@ -186,22 +187,47 @@ pub(super) fn validate(args: &Value) -> Result<()> {
     let Some(frame) = args.get("frame") else {
         return Ok(());
     };
-    if frame.as_str().is_none_or(|id| {
-        id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
-    }) {
-        return Err(error("frame must be a nonempty frame ID of at most 256 bytes"));
+    if frame
+        .as_str()
+        .is_none_or(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+    {
+        return Err(error(
+            "frame must be a nonempty frame ID of at most 256 bytes",
+        ));
     }
-    if args.get("tab").and_then(Value::as_str).is_none_or(str::is_empty) {
+    if args
+        .get("tab")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
         return Err(error("frame selection requires an explicit tab"));
     }
     let action = required(args, "action")?;
-    if !matches!(action, "snapshot" | "ax_tree" | "evaluate" | "click" | "type" | "fill" | "press" | "scroll" | "wait_for") {
-        return Err(error("frame selection is supported by inspection, evaluation and input actions only"));
+    if !matches!(
+        action,
+        "snapshot"
+            | "ax_tree"
+            | "evaluate"
+            | "click"
+            | "type"
+            | "fill"
+            | "press"
+            | "scroll"
+            | "wait_for"
+    ) {
+        return Err(error(
+            "frame selection is supported by inspection, evaluation and input actions only",
+        ));
     }
     if matches!(action, "press" | "scroll")
-        && args.get("selector").and_then(Value::as_str).is_none_or(str::is_empty)
+        && args
+            .get("selector")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
     {
-        return Err(error("frame-scoped press and scroll require an explicit selector"));
+        return Err(error(
+            "frame-scoped press and scroll require an explicit selector",
+        ));
     }
     if args.get("dialog_response").is_some() {
         return Err(error("frame-scoped dialog responses are not supported"));
@@ -262,8 +288,14 @@ pub(super) async fn list(
         .map(|row| {
             format!(
                 "- [{}] parent={} url={}{}",
-                row["frame_id"], row["parent_id"], row["url"],
-                if row["allowed"] == true { "" } else { " [blocked]" },
+                row["frame_id"],
+                row["parent_id"],
+                row["url"],
+                if row["allowed"] == true {
+                    ""
+                } else {
+                    " [blocked]"
+                },
             )
         })
         .collect::<Vec<_>>()
@@ -322,7 +354,9 @@ mod tests {
     fn frame_tree_count_and_depth_are_bounded() {
         let mut root = node("main", "about:blank");
         root["childFrames"] = Value::Array(
-            (0..MAX_FRAMES).map(|i| node(&format!("child-{i}"), "about:blank")).collect(),
+            (0..MAX_FRAMES)
+                .map(|i| node(&format!("child-{i}"), "about:blank"))
+                .collect(),
         );
         assert!(Tree::parse(&json!({"frameTree":root})).is_err());
         let mut nested = node("leaf", "about:blank");
@@ -341,7 +375,8 @@ mod tests {
         let parsed = Tree::parse(&source).unwrap();
         assert!(admit_path(&parsed.path("nested").unwrap(), Some(&rules)).is_ok());
         let mut blocked = source;
-        blocked["frameTree"]["childFrames"][0]["frame"]["url"] = json!("https://blocked.test/private");
+        blocked["frameTree"]["childFrames"][0]["frame"]["url"] =
+            json!("https://blocked.test/private");
         let parsed = Tree::parse(&blocked).unwrap();
         let error = admit_path(&parsed.path("nested").unwrap(), Some(&rules)).unwrap_err();
         assert!(!error.to_string().contains("private"));
@@ -352,7 +387,10 @@ mod tests {
     #[test]
     fn scope_pins_selected_document_and_every_ancestor() {
         let source = tree();
-        let scope = Scope { ancestry: Tree::parse(&source).unwrap().path("nested").unwrap(), context: 7 };
+        let scope = Scope {
+            ancestry: Tree::parse(&source).unwrap().path("nested").unwrap(),
+            context: 7,
+        };
         assert_eq!(scope.check(&source).unwrap()["id"], "nested");
         for pointer in [
             "/frameTree/frame/loaderId",
@@ -380,15 +418,39 @@ mod tests {
 
     #[test]
     fn frame_selection_is_explicit_and_never_ignored_by_unsupported_actions() {
-        for action in ["snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press", "scroll", "wait_for"] {
-            assert!(validate(&json!({"action":action,"tab":"work","frame":"child","selector":"#control"})).is_ok());
+        for action in [
+            "snapshot", "ax_tree", "evaluate", "click", "type", "fill", "press", "scroll",
+            "wait_for",
+        ] {
+            assert!(
+                validate(
+                    &json!({"action":action,"tab":"work","frame":"child","selector":"#control"})
+                )
+                .is_ok()
+            );
         }
-        for action in ["open", "goto", "close", "list_tabs", "list_frames", "upload", "download", "screenshot", "print_pdf", "stop"] {
+        for action in [
+            "open",
+            "goto",
+            "close",
+            "list_tabs",
+            "list_frames",
+            "upload",
+            "download",
+            "screenshot",
+            "print_pdf",
+            "stop",
+        ] {
             assert!(validate(&json!({"action":action,"tab":"work","frame":"child"})).is_err());
         }
         assert!(validate(&json!({"action":"snapshot","frame":"child"})).is_err());
         assert!(validate(&json!({"action":"snapshot","tab":"work","frame":null})).is_err());
-        assert!(validate(&json!({"action":"evaluate","tab":"work","frame":"child","dialog_response":{}})).is_err());
+        assert!(
+            validate(
+                &json!({"action":"evaluate","tab":"work","frame":"child","dialog_response":{}})
+            )
+            .is_err()
+        );
         assert!(validate(&json!({"action":"snapshot"})).is_ok());
     }
 

@@ -2,8 +2,8 @@
 //! cancellation drops it instead of reusing a possibly partially written frame.
 
 use super::{
-    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch, output,
-    policy, required,
+    BrowserLaunchOptions, BrowserTabInfo, dialog, download, exports, frames, interaction, launch,
+    output, policy, required,
 };
 use crate::agent_cx::AgentCx;
 use crate::error::{Error, Result};
@@ -564,12 +564,15 @@ impl Cdp {
     /// requested. Never substitute the root after a detach or navigation.
     pub(super) async fn frame_document(&mut self, owner: &AgentCx) -> Result<Value> {
         let tree = self.command(owner, "Page.getFrameTree", json!({})).await?;
-        if let Some(scope) = &self.frame_scope {
-            scope.check(&tree)
-        } else {
-            tree["frameTree"].get("frame").cloned()
-                .ok_or_else(|| Error::tool("browser", "page has no main-frame document"))
-        }
+        self.frame_scope.as_ref().map_or_else(
+            || {
+                tree["frameTree"]
+                    .get("frame")
+                    .cloned()
+                    .ok_or_else(|| Error::tool("browser", "page has no main-frame document"))
+            },
+            |scope| scope.check(&tree),
+        )
     }
 
     pub(super) async fn evaluate(&mut self, owner: &AgentCx, expression: &str) -> Result<Value> {
@@ -949,7 +952,8 @@ impl Session {
                 Ok(result)
             }
             "click" | "type" | "fill" | "press" | "scroll" | "wait_for" => {
-                interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args).await
+                interaction::execute(owner, cdp, &tab, self.references.get(&reference_key), args)
+                    .await
             }
             "upload" => {
                 self.uploads
@@ -1058,10 +1062,28 @@ mod tests {
     #[test]
     fn frame_preflight_runs_before_any_connection_or_launch() {
         assert!(validate(&json!({"action":"list_frames","tab":"work"}), None).is_ok());
-        assert!(validate(&json!({"action":"snapshot","tab":"work","frame":"child"}), None).is_ok());
+        assert!(
+            validate(
+                &json!({"action":"snapshot","tab":"work","frame":"child"}),
+                None
+            )
+            .is_ok()
+        );
         assert!(validate(&json!({"action":"snapshot","frame":"child"}), None).is_err());
-        assert!(validate(&json!({"action":"goto","tab":"work","frame":"child","url":"https://example.com"}), None).is_err());
-        assert!(validate(&json!({"action":"evaluate","tab":"work","frame":"child"}), None).is_err());
+        assert!(
+            validate(
+                &json!({"action":"goto","tab":"work","frame":"child","url":"https://example.com"}),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &json!({"action":"evaluate","tab":"work","frame":"child"}),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

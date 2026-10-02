@@ -231,7 +231,14 @@ impl Tool for BrowserTool {
         if self.is_mock() {
             if matches!(
                 action,
-                "start" | "status" | "stop" | "list_frames" | "upload" | "download" | "print_pdf" | "handle_dialog"
+                "start"
+                    | "status"
+                    | "stop"
+                    | "list_frames"
+                    | "upload"
+                    | "download"
+                    | "print_pdf"
+                    | "handle_dialog"
             ) || args.get("frame").is_some()
                 || args.get("full_page").is_some()
                 || args.get("dialog_response").is_some()

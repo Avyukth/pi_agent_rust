@@ -405,7 +405,7 @@ fn reader_loop(
                 Err(err) => break format!("frame read error: {err}"),
             }
         };
-        outbound::close_pending(&pending, &alive, TransportError::Closed(close_reason));
+        outbound::close_pending(&pending, &alive, &TransportError::Closed(close_reason));
     }
 }
 
@@ -591,7 +591,7 @@ impl JsonRpcClient {
     > {
         let id = self
             .next_id
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| TransportError::Io("request id space exhausted".to_string()))?;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         {
@@ -599,10 +599,14 @@ impl JsonRpcClient {
             // No request can appear after the terminal pending-map drain.
             let mut pending = lock(&self.pending);
             if !self.is_alive() {
-                return Err(TransportError::Closed("server transport is not alive".to_string()));
+                return Err(TransportError::Closed(
+                    "server transport is not alive".to_string(),
+                ));
             }
             if pending.len() >= MAX_PENDING_REQUESTS {
-                return Err(TransportError::Io("pending request limit exceeded".to_string()));
+                return Err(TransportError::Io(
+                    "pending request limit exceeded".to_string(),
+                ));
             }
             pending.insert(id, tx);
         }
@@ -643,7 +647,9 @@ impl JsonRpcClient {
         };
         if let Err(err) = write_result {
             self.kill();
-            return Err(TransportError::Io(format!("notification queue failed: {err}")));
+            return Err(TransportError::Io(format!(
+                "notification queue failed: {err}"
+            )));
         }
         Ok(())
     }
@@ -700,7 +706,7 @@ impl JsonRpcClient {
         outbound::close_pending(
             &self.pending,
             &self.alive,
-            TransportError::Closed("server transport stopped".to_string()),
+            &TransportError::Closed("server transport stopped".to_string()),
         );
         let _ = lock(&self.child).kill();
     }
@@ -974,8 +980,14 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&client.pending).insert(99, sender);
         client.kill();
-        assert!(matches!(receiver.try_recv(), Ok(Err(TransportError::Closed(_)))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Err(TransportError::Closed(_)))
+        ));
         assert!(lock(&client.pending).is_empty());
-        assert!(matches!(client.request("later", Value::Null), Err(TransportError::Closed(_))));
+        assert!(matches!(
+            client.request("later", Value::Null),
+            Err(TransportError::Closed(_))
+        ));
     }
 }

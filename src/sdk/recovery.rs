@@ -117,14 +117,12 @@ impl LogicalTurnState {
                 restored_primary: false,
                 ..
             } => {
-                if let Some(target) = self.fallback.take() {
-                    // Pair the end with the target that its Start announced,
-                    // even if another runtime mutation changed the live model.
+                // Pair the end with the target that its Start announced,
+                // even if another runtime mutation changed the live model.
+                self.fallback.take().is_some_and(|target| {
                     (*provider, *model) = target;
                     true
-                } else {
-                    false
-                }
+                })
             }
             AgentEvent::AutoCompactionEnd {
                 aborted: false,
@@ -214,6 +212,7 @@ impl LogicalTurn {
                     messages: std::mem::take(&mut state.messages),
                     error,
                 });
+            drop(state);
             [retry_end, fallback_end, terminal]
         };
         for event in events.into_iter().flatten() {
@@ -246,8 +245,12 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_recoverable_turn(Some(UserContent::Text(input.into())), abort_signal, on_event)
-            .await
+        self.run_recoverable_turn(
+            Some(UserContent::Text(input.into())),
+            abort_signal,
+            on_event,
+        )
+        .await
     }
 
     /// Send text and image attachments as one recoverable user prompt.
@@ -312,7 +315,8 @@ impl AgentSessionHandle {
         abort_signal: AbortSignal,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_recoverable_turn(None, abort_signal, on_event).await
+        self.run_recoverable_turn(None, abort_signal, on_event)
+            .await
     }
 
     async fn run_recoverable_turn(
@@ -471,7 +475,8 @@ impl AgentSessionHandle {
             return Ok(false);
         };
         self.failover_state.set_lifecycle_id(Some(lifecycle_id));
-        self.failover_state.set_chain_position(outcome.next_position);
+        self.failover_state
+            .set_chain_position(outcome.next_position);
         self.failover_state.record_swap(
             primary,
             (committed.to_provider.clone(), committed.to_model.clone()),
@@ -496,12 +501,7 @@ impl AgentSessionHandle {
         Ok(true)
     }
 
-    fn close_failover_lifecycle(
-        &self,
-        failed_over: bool,
-        success: bool,
-        shared: &EventCallback,
-    ) {
+    fn close_failover_lifecycle(&self, failed_over: bool, success: bool, shared: &EventCallback) {
         if failed_over {
             let provider = self.session.agent.provider();
             shared(AgentEvent::FailoverEnd {
@@ -645,8 +645,10 @@ impl AgentSessionHandle {
                 Err(error) => TurnOutcome::Failed(error),
             };
             let decision = crate::failover::decide(outcome, &progress, &policy, window);
-            if matches!(decision, TurnDecision::Retry { .. } | TurnDecision::FailOver)
-                && abort_signal.is_aborted()
+            if matches!(
+                decision,
+                TurnDecision::Retry { .. } | TurnDecision::FailOver
+            ) && abort_signal.is_aborted()
             {
                 current = Err(Error::Aborted);
                 self.finish_recovery(&current, progress.retry_count, failed_over, shared);
@@ -859,10 +861,15 @@ impl RpcControlHandle {
 /// Reject missing correlation before consuming an ID or touching the pipe.
 fn rpc_ui_response_payload(request_id: &str) -> Result<Map<String, Value>> {
     if request_id.trim().is_empty() {
-        return Err(Error::validation("RPC UI response requires a nonempty request ID"));
+        return Err(Error::validation(
+            "RPC UI response requires a nonempty request ID",
+        ));
     }
     let mut payload = Map::new();
-    payload.insert("requestId".to_string(), Value::String(request_id.to_string()));
+    payload.insert(
+        "requestId".to_string(),
+        Value::String(request_id.to_string()),
+    );
     Ok(payload)
 }
 

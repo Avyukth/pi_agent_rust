@@ -52,11 +52,7 @@ fn closed() -> io::Error {
 
 /// Publish terminal state before draining, sharing the pending-map lock with
 /// request admission. Completions are sent outside the lock and never block.
-pub(super) fn close_pending(
-    pending: &PendingMap,
-    alive: &AtomicBool,
-    error: TransportError,
-) {
+pub(super) fn close_pending(pending: &PendingMap, alive: &AtomicBool, error: &TransportError) {
     alive.store(false, Ordering::Release);
     let abandoned = std::mem::take(&mut *lock(pending));
     for (_, sender) in abandoned {
@@ -118,17 +114,17 @@ impl QueuedWriter {
                     // Drop releases the byte reservation only after the entire
                     // frame was written. There is no replay on a partial write.
                 };
-                close_pending(&pending, &alive, error);
+                close_pending(&pending, &alive, &error);
                 // Dropping the receiver also releases every queued reservation.
             })?;
         Ok(writer)
     }
 
-    pub(super) fn write_request(&mut self, bytes: &[u8], id: u64) -> io::Result<()> {
+    pub(super) fn write_request(&self, bytes: &[u8], id: u64) -> io::Result<()> {
         self.enqueue(bytes, Some(id)).map(|_| ())
     }
 
-    fn enqueue(&mut self, bytes: &[u8], request_id: Option<u64>) -> io::Result<usize> {
+    fn enqueue(&self, bytes: &[u8], request_id: Option<u64>) -> io::Result<usize> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(closed());
         }
@@ -137,12 +133,15 @@ impl QueuedWriter {
         }
         self.budget
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes.len())
                     .filter(|total| *total <= self.budget.limit)
             })
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::WouldBlock, "server writer byte budget exhausted")
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "server writer byte budget exhausted",
+                )
             })?;
         let reservation = Reservation {
             budget: Arc::clone(&self.budget),
@@ -192,12 +191,18 @@ mod tests {
         let (mut writer, receiver) = QueuedWriter::channel(alive, 2, 8);
         writer.write_all(b"abc").expect("first frame");
         writer.write_all(b"def").expect("second frame");
-        assert_eq!(writer.write(b"g").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            writer.write(b"g").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 6);
         let first = receiver.try_recv().expect("first frame");
         assert_eq!(first.bytes, b"abc");
         // Moving a frame out of the queue does not free its in-flight budget.
-        assert_eq!(writer.write(b"ghi").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            writer.write(b"ghi").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 6);
         drop(first);
         writer.write_all(b"ghi").expect("released budget reused");
@@ -208,14 +213,19 @@ mod tests {
 
     #[test]
     fn rejected_and_disconnected_frames_release_their_reservations() {
-        let (mut writer, receiver) =
-            QueuedWriter::channel(Arc::new(AtomicBool::new(true)), 1, 4);
-        assert_eq!(writer.write(b"12345").unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let (mut writer, receiver) = QueuedWriter::channel(Arc::new(AtomicBool::new(true)), 1, 4);
+        assert_eq!(
+            writer.write(b"12345").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
         writer.write_all(b"1234").expect("exact limit");
         drop(receiver);
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
-        assert_eq!(writer.write(b"x").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            writer.write(b"x").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(writer.budget.used.load(Ordering::Acquire), 0);
     }
 
@@ -227,12 +237,22 @@ mod tests {
         let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
         let first = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize"});
         let second = serde_json::json!({"jsonrpc":"2.0", "method":"initialized"});
-        writer.write_all(&super::super::encode_frame(&first)).expect("first");
-        writer.write_all(&super::super::encode_frame(&second)).expect("second");
+        writer
+            .write_all(&super::super::encode_frame(&first))
+            .expect("first");
+        writer
+            .write_all(&super::super::encode_frame(&second))
+            .expect("second");
         drop(writer);
         let mut reader = BufReader::new(reader);
-        assert_eq!(super::super::read_frame(&mut reader).expect("read first"), Some(first));
-        assert_eq!(super::super::read_frame(&mut reader).expect("read second"), Some(second));
+        assert_eq!(
+            super::super::read_frame(&mut reader).expect("read first"),
+            Some(first)
+        );
+        assert_eq!(
+            super::super::read_frame(&mut reader).expect("read second"),
+            Some(second)
+        );
         assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
     }
 
@@ -243,13 +263,22 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = QueuedWriter::start(pipe, pending, alive).expect("pump");
         // The wait owner has already removed request 7's pending slot.
-        let abandoned = serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"workspace/executeCommand"});
-        writer.write_request(&super::super::encode_frame(&abandoned), 7).expect("queue");
-        let notification = serde_json::json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":7}});
-        writer.write_all(&super::super::encode_frame(&notification)).expect("cancel");
+        let abandoned =
+            serde_json::json!({"jsonrpc":"2.0", "id":7, "method":"workspace/executeCommand"});
+        writer
+            .write_request(&super::super::encode_frame(&abandoned), 7)
+            .expect("queue");
+        let notification =
+            serde_json::json!({"jsonrpc":"2.0", "method":"$/cancelRequest", "params":{"id":7}});
+        writer
+            .write_all(&super::super::encode_frame(&notification))
+            .expect("cancel");
         drop(writer);
         let mut reader = BufReader::new(reader);
-        assert_eq!(super::super::read_frame(&mut reader).expect("notification"), Some(notification));
+        assert_eq!(
+            super::super::read_frame(&mut reader).expect("notification"),
+            Some(notification)
+        );
         assert_eq!(super::super::read_frame(&mut reader).expect("EOF"), None);
     }
 
@@ -261,14 +290,19 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         lock(&pending).insert(7, sender);
         let alive = Arc::new(AtomicBool::new(true));
-        let mut writer = QueuedWriter::start(pipe, Arc::clone(&pending), Arc::clone(&alive))
-            .expect("pump");
+        let mut writer =
+            QueuedWriter::start(pipe, Arc::clone(&pending), Arc::clone(&alive)).expect("pump");
         writer.write_all(b"frame").expect("queue admission");
-        let result = receiver.recv_timeout(Duration::from_secs(5)).expect("failure delivered");
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("failure delivered");
         assert!(matches!(result, Err(TransportError::Io(_))));
         assert!(!alive.load(Ordering::Acquire));
         assert!(lock(&pending).is_empty());
-        assert_eq!(writer.write(b"later").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            writer.write(b"later").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
     }
 
     #[test]
@@ -278,8 +312,15 @@ mod tests {
         sender.send(Ok(Value::Null)).expect("completed");
         lock(&pending).insert(1, sender);
         let alive = AtomicBool::new(true);
-        close_pending(&pending, &alive, TransportError::Closed("stop".to_string()));
-        assert_eq!(receiver.try_recv().expect("original result").unwrap(), Value::Null);
+        close_pending(
+            &pending,
+            &alive,
+            &TransportError::Closed("stop".to_string()),
+        );
+        assert_eq!(
+            receiver.try_recv().expect("original result").unwrap(),
+            Value::Null
+        );
         assert!(!alive.load(Ordering::Acquire));
         assert!(lock(&pending).is_empty());
     }
