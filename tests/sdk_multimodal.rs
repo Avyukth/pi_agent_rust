@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5mEAAAAASUVORK5CYII=";
+const PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5mEAAAAASUVORK5CYII=";
 const GIF: &str = "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
 fn images() -> Vec<ImageContent> {
@@ -78,6 +79,11 @@ impl ApiFixture {
                         Err(error) => panic!("fixture accept failed: {error}"),
                     }
                 };
+                // An accepted socket can inherit the listener's non-blocking
+                // mode (macOS), which would bypass the read timeout below.
+                stream
+                    .set_nonblocking(false)
+                    .expect("blocking request socket");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .expect("read timeout");
@@ -126,13 +132,32 @@ impl Drop for ApiFixture {
     }
 }
 
+/// One read where a socket timeout means "nothing yet", not failure: macOS
+/// reports it as `WouldBlock` (bd-eg6ng). Callers loop on a wall deadline.
+fn read_some(stream: &mut TcpStream, buffer: &mut [u8], what: &str) -> Option<usize> {
+    match stream.read(buffer) {
+        Ok(read) => Some(read),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            None
+        }
+        Err(error) => panic!("{what}: {error}"),
+    }
+}
+
 fn read_request(stream: &mut TcpStream, deadline: Instant) -> Value {
     const LIMIT: usize = 256 * 1024;
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     let (header_end, body_len) = loop {
         assert!(Instant::now() < deadline, "fixture headers timed out");
-        let read = stream.read(&mut buffer).expect("read request headers");
+        let Some(read) = read_some(stream, &mut buffer, "read request headers") else {
+            continue;
+        };
         assert!(read > 0, "request ended before headers");
         bytes.extend_from_slice(&buffer[..read]);
         assert!(bytes.len() <= LIMIT, "oversized fixture request");
@@ -159,7 +184,9 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> Value {
     };
     while bytes.len() < header_end + body_len {
         assert!(Instant::now() < deadline, "fixture body timed out");
-        let read = stream.read(&mut buffer).expect("read request body");
+        let Some(read) = read_some(stream, &mut buffer, "read request body") else {
+            continue;
+        };
         assert!(read > 0, "request ended before body");
         bytes.extend_from_slice(&buffer[..read]);
         assert!(bytes.len() <= LIMIT + 16 * 1024);
@@ -231,7 +258,7 @@ fn handle(url: &str, root: &Path, block_images: bool) -> AgentSessionHandle {
     AgentSessionHandle::from_session_with_listeners(session, EventListeners::default())
 }
 
-fn retry_policy(retries: u32, failovers: u32) -> RetryPolicy {
+const fn retry_policy(retries: u32, failovers: u32) -> RetryPolicy {
     RetryPolicy {
         max_retries: retries,
         max_failovers_per_turn: failovers,
@@ -247,7 +274,11 @@ fn user_wire_content(request: &Value) -> &Value {
         .iter()
         .filter(|message| message["role"] == "user")
         .collect::<Vec<_>>();
-    assert_eq!(users.len(), 1, "recovery must not duplicate the user prompt");
+    assert_eq!(
+        users.len(),
+        1,
+        "recovery must not duplicate the user prompt"
+    );
     &users[0]["content"]
 }
 
@@ -343,7 +374,7 @@ fn sdk_mml_img_retry_preserves_wire_attachments_and_one_durable_prompt() {
         let stored = reopen(&handle).to_messages_for_current_path();
         assert_stored_images(&stored);
         assert_eq!(stored.len(), 2, "only user and final assistant remain");
-        let events = events.lock().expect("event lock");
+        let events = events.lock().expect("event lock").clone();
         assert_eq!(
             events
                 .iter()
@@ -417,8 +448,7 @@ fn sdk_mml_img_preabort_has_no_provider_or_session_side_effects() {
 fn sdk_mml_img_backoff_abort_keeps_attachments_without_reissuing() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![503, 200]);
-    let mut handle =
-        handle(&server.url, root.path(), false).with_retry(Some(retry_policy(2, 0)));
+    let mut handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(2, 0)));
     let (abort, signal) = AbortHandle::new();
     let result = run_async(handle.prompt_with_images_with_abort(
         "keep images",
@@ -484,20 +514,21 @@ fn sdk_mml_img_provider_image_blocking_still_applies() {
 fn sdk_mml_img_failed_retry_save_fences_later_image_prompts() {
     let root = tempfile::tempdir().expect("tempdir");
     let mut server = ApiFixture::new(vec![503, 200]);
-    let mut handle =
-        handle(&server.url, root.path(), false).with_retry(Some(retry_policy(1, 0)));
+    let mut handle = handle(&server.url, root.path(), false).with_retry(Some(retry_policy(1, 0)));
     let blocked = root.path().join("directory-not-session.jsonl");
     std::fs::create_dir(&blocked).expect("blocked persistence path");
     let store = handle.session_store();
     let original = Arc::new(Mutex::new(None::<PathBuf>));
     let captured = Arc::clone(&original);
-    let result = run_async(handle.prompt_with_images("persist once", images(), move |event| {
-        if matches!(event, AgentEvent::AutoRetryStart { .. }) {
-            let mut session = store.try_lock().expect("between-attempt session lock");
-            *captured.lock().expect("path lock") = session.path.clone();
-            session.path = Some(blocked.clone());
-        }
-    }));
+    let result = run_async(
+        handle.prompt_with_images("persist once", images(), move |event| {
+            if matches!(event, AgentEvent::AutoRetryStart { .. }) {
+                let mut session = store.try_lock().expect("between-attempt session lock");
+                *captured.lock().expect("path lock") = session.path.clone();
+                session.path = Some(blocked.clone());
+            }
+        }),
+    );
     assert!(result.as_ref().is_err_and(Error::is_session_persistence));
     handle.session_store().try_lock().unwrap().path = original.lock().unwrap().clone();
     let before = serde_json::to_value(run_async(handle.messages()).unwrap()).unwrap();
@@ -572,7 +603,7 @@ mod live_ui {
         .expect("spawn protocol fixture")
     }
 
-    /// The subprocess cannot send AgentEnd until it reads each control reply.
+    /// The subprocess cannot send `AgentEnd` until it reads each control reply.
     /// Echo raw frames so the test checks the real writer's JSON, not a second
     /// copy of the SDK's serialization logic. Control acknowledgements are
     /// interleaved to exercise the prompt's single stdout reader.
@@ -624,10 +655,22 @@ printf '{"type":"response","command":"get_state","id":"%s","success":true,"data"
     #[test]
     fn extension_responses_unblock_live_images_and_preserve_exact_generations() {
         let responses = [
-            (RpcExtensionUiResponse::Confirmed { confirmed: true }, "confirmed", json!(true)),
-            (RpcExtensionUiResponse::Confirmed { confirmed: false }, "confirmed", json!(false)),
+            (
+                RpcExtensionUiResponse::Confirmed { confirmed: true },
+                "confirmed",
+                json!(true),
+            ),
+            (
+                RpcExtensionUiResponse::Confirmed { confirmed: false },
+                "confirmed",
+                json!(false),
+            ),
             (RpcExtensionUiResponse::Cancelled, "cancelled", json!(true)),
-            (RpcExtensionUiResponse::Value { value: Value::Null }, "value", Value::Null),
+            (
+                RpcExtensionUiResponse::Value { value: Value::Null },
+                "value",
+                Value::Null,
+            ),
             (
                 RpcExtensionUiResponse::Value {
                     value: json!({"text": "quote: \"line\"\n雪", "id": "nested-id", "type": "not-a-command"}),
@@ -689,7 +732,11 @@ printf '{"type":"response","command":"get_state","id":"%s","success":true,"data"
                 assert_eq!(frame["requestId"], request_id);
                 assert_eq!(frame["requestGeneration"], generations[index]);
                 assert_eq!(frame[field], expected);
-                assert_eq!(frame.as_object().unwrap().len(), 5, "exactly one answer field");
+                assert_eq!(
+                    frame.as_object().unwrap().len(),
+                    5,
+                    "exactly one answer field"
+                );
             }
             let prompt = &events
                 .iter()
@@ -786,7 +833,10 @@ printf '{"type":"response","command":"get_state","id":"%s","success":true,"data"
                 assert_eq!(frame["dismissed"], true);
                 assert!(frame.get("answers").is_none());
             } else {
-                assert_eq!(frame["answers"], serde_json::to_value(expected.answers).unwrap());
+                assert_eq!(
+                    frame["answers"],
+                    serde_json::to_value(expected.answers).unwrap()
+                );
                 assert!(frame.get("dismissed").is_none());
             }
             assert_eq!(frame.as_object().unwrap().len(), 4);
@@ -843,18 +893,20 @@ printf '{"type":"response","command":"prompt","id":"rpc-1","success":false,"erro
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
         let mut transport = SessionTransport::RpcSubprocess(client);
-        let result = run_async(transport.prompt_with_images("refused", images(), move |event| {
-            observed.store(true, Ordering::SeqCst);
-            if let SessionTransportEvent::Rpc(event) = event
-                && event["type"] == "extension_ui_request"
-            {
-                let _ = control.extension_ui_response(
-                    event["id"].as_str().unwrap(),
-                    event["requestGeneration"].as_u64().unwrap(),
-                    RpcExtensionUiResponse::Cancelled,
-                );
-            }
-        }));
+        let result = run_async(
+            transport.prompt_with_images("refused", images(), move |event| {
+                observed.store(true, Ordering::SeqCst);
+                if let SessionTransportEvent::Rpc(event) = event
+                    && event["type"] == "extension_ui_request"
+                {
+                    let _ = control.extension_ui_response(
+                        event["id"].as_str().unwrap(),
+                        event["requestGeneration"].as_u64().unwrap(),
+                        RpcExtensionUiResponse::Cancelled,
+                    );
+                }
+            }),
+        );
         assert!(result.is_err());
         assert!(!invoked.load(Ordering::SeqCst));
         transport.shutdown().expect("shutdown fixture");

@@ -33,9 +33,16 @@ fn public_frame_schema_and_preflight_reject_ambiguous_input_without_connecting()
         .with_mock(false)
         .with_cdp_endpoint("http://not-a-loopback-host.invalid:9222");
     let schema = tool.parameters();
-    assert!(schema["properties"]["action"]["enum"].as_array().unwrap().contains(&json!("list_frames")));
+    assert!(
+        schema["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("list_frames"))
+    );
     assert_eq!(schema["properties"]["frame"]["type"], "string");
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         for args in [
             json!({"action":"snapshot","frame":"child"}),
@@ -43,9 +50,16 @@ fn public_frame_schema_and_preflight_reject_ambiguous_input_without_connecting()
             json!({"action":"scroll","tab":"work","frame":"child"}),
             json!({"action":"upload","tab":"work","frame":"child","files":[]}),
         ] {
-            let error = tool.execute("invalid-frame", args, None).await.unwrap_err().to_string();
+            let error = tool
+                .execute("invalid-frame", args, None)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("frame"), "{error}");
-            assert!(!error.contains("CDP endpoint"), "frame validation must precede connection configuration: {error}");
+            assert!(
+                !error.contains("CDP endpoint"),
+                "frame validation must precede connection configuration: {error}"
+            );
         }
     });
 }
@@ -53,6 +67,7 @@ fn public_frame_schema_and_preflight_reject_ambiguous_input_without_connecting()
 #[test]
 #[ignore = "requires an installed sandbox-capable Chromium; select explicitly in the DSR browser lane"]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::literal_string_with_formatting_args)] // inline CSS braces, not format arguments
 fn live_chromium_frame_forms_use_native_input_and_cannot_hit_ancestor_overlays() {
     let dir = tempfile::tempdir().unwrap();
     let tool = BrowserTool::new(dir.path())
@@ -62,7 +77,9 @@ fn live_chromium_frame_forms_use_native_input_and_cannot_hit_ancestor_overlays()
             ..Default::default()
         })
         .with_domain_allowlist(Some(Vec::new()));
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
     runtime.block_on(async {
         call(&tool, json!({"action":"open","tab":"frames","url":"about:blank"})).await;
         let html = r#"<!doctype html><title>Child form</title>
