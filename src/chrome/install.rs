@@ -147,10 +147,60 @@ pub fn discover_chrome_path() -> Result<PathBuf, InstallError> {
     Err(InstallError::ChromeNotFound)
 }
 
-/// Return the platform-specific native messaging hosts directory.
+/// Per-user profile roots (relative to `$HOME`) of Chromium-family browsers.
+/// Each browser only scans `<root>/NativeMessagingHosts/` for host manifests,
+/// so a manifest written for Google Chrome is invisible to Chromium.
+///
+/// `(root, always)`: `always` roots are written even if the browser has never
+/// been launched; the rest only when their profile root already exists.
+#[cfg(target_os = "macos")]
+const BROWSER_PROFILE_ROOTS: &[(&str, bool)] = &[
+    ("Library/Application Support/Google/Chrome", true),
+    ("Library/Application Support/Chromium", true),
+    ("Library/Application Support/Google/Chrome Beta", false),
+    ("Library/Application Support/Google/Chrome Canary", false),
+];
+
+#[cfg(target_os = "linux")]
+const BROWSER_PROFILE_ROOTS: &[(&str, bool)] = &[
+    (".config/google-chrome", true),
+    (".config/chromium", true),
+    (".config/google-chrome-beta", false),
+    (".config/google-chrome-unstable", false),
+    ("snap/chromium/common/chromium", false),
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const BROWSER_PROFILE_ROOTS: &[(&str, bool)] = &[];
+
+/// Return every native messaging hosts directory the manifest must be written to.
+///
+/// The first entry is always the Google Chrome directory (see
+/// [`native_messaging_hosts_dir`]); Chromium is always included as well, and
+/// other Chromium-family channels are included when their profile root exists.
+pub fn native_messaging_hosts_dirs() -> Result<Vec<PathBuf>, InstallError> {
+    native_messaging_hosts_dirs_in(&home_dir()?)
+}
+
+fn native_messaging_hosts_dirs_in(home: &Path) -> Result<Vec<PathBuf>, InstallError> {
+    let dirs: Vec<PathBuf> = BROWSER_PROFILE_ROOTS
+        .iter()
+        .map(|(root, always)| (home.join(root), *always))
+        .filter(|(root, always)| *always || root.is_dir())
+        .map(|(root, _)| root.join("NativeMessagingHosts"))
+        .collect();
+    if dirs.is_empty() {
+        return Err(InstallError::HostsDirNotFound);
+    }
+    Ok(dirs)
+}
+
+/// Return the platform-specific native messaging hosts directory for Google Chrome.
 ///
 /// macOS: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`
 /// Linux: `~/.config/google-chrome/NativeMessagingHosts/`
+///
+/// Setup writes to all of [`native_messaging_hosts_dirs`]; this is the primary one.
 pub fn native_messaging_hosts_dir() -> Result<PathBuf, InstallError> {
     let home = home_dir()?;
 
@@ -234,7 +284,10 @@ exec "{pi_binary}" --mode chrome-native-host "$@"
 /// Result of a successful setup.
 #[derive(Debug, Clone)]
 pub struct SetupResult {
+    /// Google Chrome manifest path (first entry of `manifest_paths`).
     pub manifest_path: PathBuf,
+    /// Every manifest written, one per Chromium-family browser profile root.
+    pub manifest_paths: Vec<PathBuf>,
     pub wrapper_path: PathBuf,
     pub chrome_path: Option<PathBuf>,
 }
@@ -257,13 +310,18 @@ pub fn setup_chrome(
     };
 
     // 3. Determine paths
-    let hosts_dir = native_messaging_hosts_dir()?;
+    let hosts_dirs = native_messaging_hosts_dirs()?;
     let wrapper_dir = wrapper_script_dir()?;
-    let manifest_path = hosts_dir.join(MANIFEST_FILENAME);
+    let manifest_paths: Vec<PathBuf> = hosts_dirs
+        .iter()
+        .map(|dir| dir.join(MANIFEST_FILENAME))
+        .collect();
     let wrapper_path = wrapper_dir.join(WRAPPER_SCRIPT_NAME);
 
     // 4. Create directories
-    ensure_dir(&hosts_dir)?;
+    for hosts_dir in &hosts_dirs {
+        ensure_dir(hosts_dir)?;
+    }
     ensure_dir(&wrapper_dir)?;
 
     // 5. Write wrapper script
@@ -276,16 +334,21 @@ pub fn setup_chrome(
     let manifest_bytes = manifest
         .to_json_bytes()
         .map_err(|e| InstallError::WriteFile {
-            path: manifest_path.clone(),
+            path: manifest_paths[0].clone(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
-    write_file(&manifest_path, &manifest_bytes)?;
+    for manifest_path in &manifest_paths {
+        write_file(manifest_path, &manifest_bytes)?;
+    }
 
     // 7. Verify
-    verify_installation(&manifest_path, &wrapper_path)?;
+    for manifest_path in &manifest_paths {
+        verify_installation(manifest_path, &wrapper_path)?;
+    }
 
     Ok(SetupResult {
-        manifest_path,
+        manifest_path: manifest_paths[0].clone(),
+        manifest_paths,
         wrapper_path,
         chrome_path,
     })
@@ -512,6 +575,62 @@ mod tests {
                 // Acceptable in CI environments without $HOME
             }
             Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_hosts_dirs_include_chrome_and_chromium_on_fresh_home() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dirs = native_messaging_hosts_dirs_in(home.path()).expect("dirs");
+        assert_eq!(
+            dirs,
+            vec![
+                home.path()
+                    .join(".config/google-chrome/NativeMessagingHosts"),
+                home.path().join(".config/chromium/NativeMessagingHosts"),
+            ],
+            "Chrome must come first and Chromium must always be registered"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_hosts_dirs_include_existing_optional_profile_roots() {
+        let home = tempfile::tempdir().expect("tempdir");
+        fs::create_dir_all(home.path().join("snap/chromium/common/chromium")).expect("mkdir");
+        fs::create_dir_all(home.path().join(".config/google-chrome-beta")).expect("mkdir");
+        let dirs = native_messaging_hosts_dirs_in(home.path()).expect("dirs");
+        assert!(
+            dirs.contains(
+                &home
+                    .path()
+                    .join("snap/chromium/common/chromium/NativeMessagingHosts")
+            )
+        );
+        assert!(
+            dirs.contains(
+                &home
+                    .path()
+                    .join(".config/google-chrome-beta/NativeMessagingHosts")
+            )
+        );
+        assert!(
+            !dirs.contains(
+                &home
+                    .path()
+                    .join(".config/google-chrome-unstable/NativeMessagingHosts")
+            ),
+            "absent optional roots must not be created"
+        );
+    }
+
+    #[test]
+    fn test_primary_hosts_dir_is_first_of_all_dirs() {
+        if let (Ok(primary), Ok(all)) =
+            (native_messaging_hosts_dir(), native_messaging_hosts_dirs())
+        {
+            assert_eq!(all.first(), Some(&primary));
         }
     }
 

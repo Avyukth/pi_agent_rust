@@ -212,7 +212,9 @@ fn main_impl() -> Result<()> {
         match pi::chrome::install::setup_chrome(cli.chrome_extension_id.as_deref(), None) {
             Ok(result) => {
                 println!("Chrome native host setup successful:");
-                println!("  Manifest: {}", result.manifest_path.display());
+                for manifest_path in &result.manifest_paths {
+                    println!("  Manifest: {}", manifest_path.display());
+                }
                 println!("  Wrapper:  {}", result.wrapper_path.display());
                 if let Some(ref chrome_path) = result.chrome_path {
                     println!("  Chrome:   {}", chrome_path.display());
