@@ -938,6 +938,25 @@ fn main_impl() -> Result<()> {
         return Ok(());
     }
 
+    // --setup-chrome: install native host manifest and wrapper script, then exit.
+    // Ultra-fast path — no async runtime, no logging needed.
+    if cli.setup_chrome {
+        match pi::chrome::install::setup_chrome(cli.chrome_extension_id.as_deref(), None) {
+            Ok(result) => {
+                println!("Chrome native host setup successful:");
+                println!("  Manifest: {}", result.manifest_path.display());
+                println!("  Wrapper:  {}", result.wrapper_path.display());
+                if let Some(ref chrome_path) = result.chrome_path {
+                    println!("  Chrome:   {}", chrome_path.display());
+                } else {
+                    println!("  Chrome:   (not found — install Chrome to enable browser tools)");
+                }
+                return Ok(());
+            }
+            Err(err) => bail!("Chrome setup failed: {err}"),
+        }
+    }
+
     // List-models is an offline query; avoid loading resources or booting the runtime when possible.
     //
     // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
@@ -1051,11 +1070,21 @@ fn main_impl() -> Result<()> {
 
     // Run the application
     let reactor = create_reactor()?;
-    let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 2)
-        .with_reactor(reactor)
-        .build()
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    // Native host mode uses a single-threaded runtime: it only processes one
+    // connection at a time (accept → relay → loop) so multi_thread's worker
+    // threads would busy-spin via cthread_yield, wasting CPU on idle.
+    let runtime = if is_chrome_native_host_mode(&cli) {
+        RuntimeBuilder::current_thread()
+            .with_reactor(reactor)
+            .build()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    } else {
+        RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 2)
+            .with_reactor(reactor)
+            .build()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?
+    };
     let handle = runtime.handle();
     let result = runtime.block_on(run(cli, extension_flags, handle, package_subcommand_trust));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
@@ -1069,6 +1098,70 @@ fn main_impl() -> Result<()> {
         Ok(()) => std::process::exit(0),
         Err(err) => report_fatal_error_and_exit(&err),
     }
+}
+
+fn is_chrome_native_host_mode(cli: &cli::Cli) -> bool {
+    cli.mode.as_deref() == Some("chrome-native-host")
+}
+
+fn validate_chrome_native_host_mode_args(cli: &cli::Cli) -> Result<()> {
+    if cli.print {
+        bail!("--mode chrome-native-host cannot be combined with --print");
+    }
+    // Chrome passes the extension origin (e.g. "chrome-extension://...") as a
+    // positional argument — silently ignore it rather than rejecting.
+    if cli.export.is_some() {
+        bail!("--mode chrome-native-host cannot be combined with --export");
+    }
+    if cli.r#continue || cli.resume {
+        bail!("--mode chrome-native-host cannot be combined with --continue/--resume");
+    }
+    Ok(())
+}
+
+async fn run_chrome_native_host_mode_with_config(
+    config: pi::chrome::native_host::NativeHostConfig,
+) -> Result<()> {
+    use pi::chrome::native_host::NativeHostRunOutcome;
+
+    let mut host = pi::chrome::native_host::NativeHost::new(config)?;
+
+    // Loop: keep the native host alive across idle timeouts and agent
+    // disconnect/reconnect cycles. The host only exits on fatal I/O errors
+    // (Chrome closes stdin pipe). Chrome sends SIGTERM shortly after closing
+    // stdin if the process doesn't exit on its own.
+    //
+    // idle_timeout_ms is kept short (100ms) because asupersync's runtime
+    // busy-polls non-blocking sockets during the accept window. Between
+    // accept attempts we sleep 5s via std::thread::sleep (kernel-level block)
+    // so that the process idles near 0% CPU. Discovery lease is refreshed
+    // every ~25s (once per 5 accept/sleep cycles).
+    let mut idle_cycles: u32 = 0;
+    loop {
+        match host.run().await {
+            Ok(NativeHostRunOutcome::IdleTimeout) => {
+                idle_cycles += 1;
+                if idle_cycles % 5 == 0 {
+                    host.refresh_discovery_lease()?;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            Ok(NativeHostRunOutcome::AgentConnected) => {
+                idle_cycles = 0;
+                host.refresh_discovery_lease()?;
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+async fn run_chrome_native_host_mode(cli: &cli::Cli) -> Result<()> {
+    validate_chrome_native_host_mode_args(cli)?;
+    let mut config = pi::chrome::native_host::NativeHostConfig::default();
+    config.idle_timeout_ms = 100;
+    run_chrome_native_host_mode_with_config(config).await
 }
 
 fn print_error_with_hints(err: &anyhow::Error) {
@@ -1475,6 +1568,10 @@ async fn run(
         };
         handle_subcommand(command, &cwd, project_trusted).await?;
         return Ok(());
+    }
+
+    if is_chrome_native_host_mode(&cli) {
+        return run_chrome_native_host_mode(&cli).await;
     }
 
     if let Some(provider) = cli.fetch_models.take() {
@@ -2389,6 +2486,45 @@ async fn run(
     )
     .with_runtime_handle(runtime_handle.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
+    // Chrome browser automation (S1 opt-in): --chrome creates the ChromeBridge
+    // and registers the browser tools; --chrome-voice additionally registers
+    // the voice tools and enables voice observation processing (VS1).
+    if cli.chrome {
+        let mut bridge_config = pi::chrome::ChromeBridgeConfig::new(
+            format!("pi-{}", std::process::id()),
+            format!("cli-{}", std::process::id()),
+        );
+        if cli.chrome_voice {
+            bridge_config.want_capabilities.push("voice".to_string());
+        }
+        let bridge = Arc::new(pi::chrome::ChromeBridge::new(bridge_config));
+        let observer_registry = Arc::new(StdMutex::new(
+            pi::chrome::observer::ObserverRegistry::new(),
+        ));
+        agent_session
+            .agent
+            .extend_tools(pi::chrome::tools::chrome_tool_set(
+                Arc::clone(&bridge),
+                observer_registry,
+            ));
+        if cli.chrome_voice {
+            agent_session
+                .agent
+                .extend_tools(pi::chrome::tools::voice_tool_set(Arc::clone(&bridge)));
+            agent_session.agent.set_voice_enabled(true);
+            tracing::info!("Voice tools registered (--chrome-voice)");
+        }
+        // Discover and connect to the Chrome native host (non-fatal on failure —
+        // bridge tools return "not connected" errors until a host appears).
+        match bridge.connect().await {
+            Ok(()) => tracing::info!("ChromeBridge connected to native host"),
+            Err(err) => tracing::warn!(
+                "ChromeBridge initial connect failed (will retry on tool use): {err}"
+            ),
+        }
+        // Wire the bridge into the agent for observation draining between turns.
+        agent_session.agent.set_chrome_bridge(bridge);
+    }
     if foreign_rules.scoped_rules().next().is_some() {
         agent_session
             .agent

@@ -111,6 +111,7 @@ pub mod btw;
 #[doc(hidden)]
 pub mod buffer_shim;
 pub mod checkpoint;
+pub mod chrome;
 #[doc(hidden)]
 pub mod cli;
 pub mod commit_split;

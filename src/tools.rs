@@ -5991,6 +5991,24 @@ impl ToolRegistry {
     }
 
     /// Find a tool by name.
+    /// Register all Chrome browser automation tools.
+    ///
+    /// Requires `--chrome` opt-in (S1 security invariant). Tools are split into
+    /// two groups: observer tools (need the `ObserverRegistry`) and bridge tools
+    /// (need the `ChromeBridge` for extension communication).
+    pub fn register_chrome_tools(
+        &mut self,
+        bridge: Arc<crate::chrome::ChromeBridge>,
+        registry: Arc<std::sync::Mutex<crate::chrome::observer::ObserverRegistry>>,
+    ) {
+        self.extend(crate::chrome::tools::chrome_tool_set(bridge, registry));
+    }
+
+    /// Register voice tools. Only called when `--chrome-voice` is enabled (VS1).
+    pub fn register_voice_tools(&mut self, bridge: Arc<crate::chrome::ChromeBridge>) {
+        self.extend(crate::chrome::tools::voice_tool_set(bridge));
+    }
+
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
             .iter()
@@ -22376,5 +22394,55 @@ mod host_picker_registry_tests {
             assert!(message.contains("not approved"), "{message}");
             assert!(!message.contains("no approval handler"), "{message}");
         });
+    }
+}
+
+#[cfg(test)]
+mod chrome_registration_tests {
+    use super::ToolRegistry;
+
+    fn bridge_and_registry() -> (
+        std::sync::Arc<crate::chrome::ChromeBridge>,
+        std::sync::Arc<std::sync::Mutex<crate::chrome::observer::ObserverRegistry>>,
+    ) {
+        (
+            std::sync::Arc::new(crate::chrome::ChromeBridge::new(Default::default())),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::chrome::observer::ObserverRegistry::new(),
+            )),
+        )
+    }
+
+    // Voice tool registration gating (bd-19o.1.5.3)
+    #[test]
+    fn voice_tools_registered_when_enabled() {
+        let mut registry = ToolRegistry::from_tools(vec![]);
+        let (bridge, observer_registry) = bridge_and_registry();
+        registry.register_chrome_tools(bridge.clone(), observer_registry);
+        let count_before = registry.tools().len();
+        assert_eq!(count_before, 21, "21 browser tools registered by --chrome");
+
+        registry.register_voice_tools(bridge);
+        let count_after = registry.tools().len();
+
+        assert_eq!(count_after - count_before, 3, "exactly 3 voice tools added");
+        assert!(registry.get("voice_tts_speak").is_some());
+        assert!(registry.get("voice_tts_stop").is_some());
+        assert!(registry.get("voice_status").is_some());
+    }
+
+    #[test]
+    fn voice_tools_absent_when_disabled() {
+        let mut registry = ToolRegistry::from_tools(vec![]);
+        let (bridge, observer_registry) = bridge_and_registry();
+        registry.register_chrome_tools(bridge, observer_registry);
+
+        assert!(
+            registry.get("voice_tts_speak").is_none(),
+            "voice tools should not be registered without --chrome-voice"
+        );
+        assert!(registry.get("voice_tts_stop").is_none());
+        assert!(registry.get("voice_status").is_none());
+        assert!(registry.get("navigate").is_some());
     }
 }

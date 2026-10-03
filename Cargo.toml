@@ -470,7 +470,7 @@ win32job = "2.0.3"
 winapi-util = "0.1.11"
 
 [features]
-default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]
+default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui", "image-resize"]
 full = [
     "image-resize",
     "jemalloc",

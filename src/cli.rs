@@ -105,7 +105,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "charmed"
         | "bubbletea"
         | "inline"
-        | "hide-cwd-in-prompt" => (false, false),
+        | "hide-cwd-in-prompt"
+        | "chrome"
+        | "chrome-voice"
+        | "setup-chrome" => (false, false),
         "provider"
         | "model"
         | "api-key"
@@ -136,7 +139,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "max-time"
         | "request-timeout"
         | "export"
-        | "fetch-models" => (true, false),
+        | "fetch-models"
+        | "chrome-extension-id" => (true, false),
         "list-models" => (true, true),
         _ => return None,
     };
@@ -488,8 +492,8 @@ pub struct Cli {
     pub no_mouse_capture: bool,
 
     // === Mode & Output ===
-    /// Output mode for print mode (text, json, rpc)
-    #[arg(long, value_parser = ["text", "json", "rpc"])]
+    /// Output mode for print mode (text, json, rpc) or internal host mode (chrome-native-host)
+    #[arg(long, value_parser = ["text", "json", "rpc", "chrome-native-host"])]
     pub mode: Option<String>,
 
     /// Non-interactive mode (process & exit)
@@ -523,6 +527,23 @@ pub struct Cli {
         default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan,jobs,hub,current_time"
     )]
     pub tools: String,
+
+    // === Chrome Browser Automation ===
+    /// Enable Chrome browser automation tools for this session (S1 opt-in)
+    #[arg(long)]
+    pub chrome: bool,
+
+    /// Install Chrome native host manifest and wrapper script, then exit
+    #[arg(long)]
+    pub setup_chrome: bool,
+
+    /// Enable voice input/output for Chrome sessions (VS1 opt-in)
+    #[arg(long)]
+    pub chrome_voice: bool,
+
+    /// Chrome extension ID for native messaging allowed_origins (used with --setup-chrome)
+    #[arg(long)]
+    pub chrome_extension_id: Option<String>,
 
     // === Extensions ===
     /// Load extension file (can use multiple times)

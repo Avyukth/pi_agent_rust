@@ -101,6 +101,8 @@ pub struct Config {
     pub computer: Option<crate::computer::ComputerSettings>,
     /// Opt-in browser tool settings (bd-cv653.2.4).
     pub browser: Option<crate::browser::BrowserSettings>,
+    /// Opt-in Chrome extension bridge settings (PLAN §4.7).
+    pub chrome: Option<crate::chrome::config::ChromeConfig>,
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
@@ -910,6 +912,7 @@ impl Config {
             media: merge_media(base.media, other.media),
             computer: merge_computer(base.computer, other.computer),
             browser: merge_browser(base.browser, other.browser),
+            chrome: other.chrome.or(base.chrome),
             secrets: other.secrets.or(base.secrets),
             keywords: merge_keywords(base.keywords, other.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pi Chrome Test: Navigation</title>
+</head>
+<body>
+  <h1 id="heading">Navigation Fixture</h1>
+  <p id="status">initial</p>
+  <nav>
+    <a id="link-page2" href="/page2.html">Go to Page 2</a>
+    <a id="link-external" href="https://example.com">External Link</a>
+  </nav>
+  <button id="btn-pushstate" onclick="history.pushState({page: 2}, 'Page 2', '/page2')">
+    Push State
+  </button>
+  <script>
+    document.getElementById('status').textContent = 'loaded';
+    window.addEventListener('popstate', function(e) {
+      document.getElementById('status').textContent = 'popstate:' + JSON.stringify(e.state);
+    });
+  </script>
+</body>
+</html>

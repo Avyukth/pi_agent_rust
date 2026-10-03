@@ -8,6 +8,14 @@
 use std::future::Future;
 use std::sync::OnceLock;
 
+pub mod artifact_bundle;
+#[allow(dead_code)]
+pub mod voice_helpers;
+#[allow(unused_imports)]
+pub use artifact_bundle::{
+    ArtifactBundle, BUNDLE_MANIFEST_SCHEMA_V1, BundleFile, BundleManifest,
+    PROTOCOL_TRACE_SCHEMA_V1, ProtocolDirection, ProtocolTraceEntry,
+};
 pub mod harness;
 pub mod logging;
 #[allow(

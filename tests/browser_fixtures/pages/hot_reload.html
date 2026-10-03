@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pi Chrome Test: Hot Reload</title>
+</head>
+<body>
+  <h1 id="heading">Hot Reload Fixture</h1>
+  <p id="version">v1</p>
+  <p id="update-count">0</p>
+  <div id="content">Initial content that will change on hot reload.</div>
+  <script>
+    var updateCount = 0;
+
+    // Simulate hot-reload via SSE or polling
+    if (typeof EventSource !== 'undefined') {
+      var es = new EventSource('/sse/updates');
+      es.onmessage = function(event) {
+        updateCount++;
+        document.getElementById('update-count').textContent = String(updateCount);
+        var data = JSON.parse(event.data);
+        if (data.version) {
+          document.getElementById('version').textContent = data.version;
+        }
+        if (data.content) {
+          document.getElementById('content').textContent = data.content;
+        }
+      };
+      es.onerror = function() {
+        // SSE connection lost — expected during test teardown
+      };
+    }
+
+    // DOM mutation for observation pipeline testing
+    window.triggerDomMutation = function() {
+      var el = document.createElement('div');
+      el.id = 'dynamic-' + Date.now();
+      el.className = 'dynamic-element';
+      el.textContent = 'Dynamically added at ' + new Date().toISOString();
+      document.body.appendChild(el);
+      updateCount++;
+      document.getElementById('update-count').textContent = String(updateCount);
+    };
+  </script>
+</body>
+</html>

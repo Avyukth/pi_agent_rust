@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pi Chrome Test: Console Errors</title>
+</head>
+<body>
+  <h1>Console Error Fixture</h1>
+  <p id="status">ready</p>
+  <button id="trigger-error" onclick="triggerError()">Trigger Error</button>
+  <button id="trigger-warn" onclick="triggerWarn()">Trigger Warning</button>
+  <button id="trigger-multiple" onclick="triggerMultiple()">Trigger Multiple</button>
+  <script>
+    // Immediate console output for observation testing
+    console.log('[Pi Chrome Test] Console fixture loaded');
+    console.warn('[Pi Chrome Test] Initial warning: fixture ready');
+
+    function triggerError() {
+      console.error('[Pi Chrome Test] Triggered error: something went wrong');
+      document.getElementById('status').textContent = 'error-triggered';
+    }
+
+    function triggerWarn() {
+      console.warn('[Pi Chrome Test] Triggered warning: potential issue');
+      document.getElementById('status').textContent = 'warn-triggered';
+    }
+
+    function triggerMultiple() {
+      console.error('[Pi Chrome Test] Error 1: validation failed');
+      console.error('[Pi Chrome Test] Error 2: network timeout');
+      console.warn('[Pi Chrome Test] Warning 1: deprecated API');
+      console.log('[Pi Chrome Test] Info: operation complete');
+      document.getElementById('status').textContent = 'multiple-triggered';
+    }
+
+    // Unhandled error for observation pipeline testing
+    window.onerror = function(msg, source, line, col, error) {
+      document.getElementById('status').textContent = 'unhandled:' + msg;
+    };
+  </script>
+</body>
+</html>
